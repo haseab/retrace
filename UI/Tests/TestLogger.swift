@@ -2755,7 +2755,7 @@ final class SystemMonitorOCRBacklogAttributionTests: XCTestCase {
         viewModel.ocrQueueDepth = 24
         viewModel.ocrProcessingCount = 0
 
-        XCTAssertFalse(viewModel.shouldShowOCRMemoryAttribution)
+        XCTAssertFalse(viewModel.shouldShowOCRBacklogAttribution)
     }
 
     func testOCRMemoryAttributionHiddenWhenOnlyRewriteIsActive() {

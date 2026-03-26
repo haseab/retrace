@@ -2704,21 +2704,21 @@ private actor ProcessCPULogSampler {
     }
 
     private static func makeLogFileURL() -> URL {
-        let rootURL = URL(fileURLWithPath: AppPaths.expandedStorageRoot, isDirectory: true)
+        let rootURL = URL(fileURLWithPath: AppPaths.expandedAppSupportRoot, isDirectory: true)
         return rootURL
             .appendingPathComponent("logs", isDirectory: true)
             .appendingPathComponent("cpu_process_usage.jsonl", isDirectory: false)
     }
 
     private static func makeTallyFileURL() -> URL {
-        let rootURL = URL(fileURLWithPath: AppPaths.expandedStorageRoot, isDirectory: true)
+        let rootURL = URL(fileURLWithPath: AppPaths.expandedAppSupportRoot, isDirectory: true)
         return rootURL
             .appendingPathComponent("logs", isDirectory: true)
             .appendingPathComponent("cpu_process_usage_tally.json", isDirectory: false)
     }
 
     private static func makeDisplayNamesFileURL() -> URL {
-        let rootURL = URL(fileURLWithPath: AppPaths.expandedStorageRoot, isDirectory: true)
+        let rootURL = URL(fileURLWithPath: AppPaths.expandedAppSupportRoot, isDirectory: true)
         return rootURL
             .appendingPathComponent("logs", isDirectory: true)
             .appendingPathComponent("cpu_process_groups.json", isDirectory: false)

@@ -4,22 +4,26 @@ import Shared
 /// Manages on-disk directory structure for Storage.
 actor DirectoryManager {
     private let fileManager = FileManager.default
-    private var storageRoot: URL
+    private var vaultRoot: URL
+    private var appSupportRoot: URL
 
-    init(storageRoot: URL) {
-        self.storageRoot = storageRoot
+    init(storageRoot: URL, appSupportRoot: URL? = nil) {
+        self.vaultRoot = storageRoot
+        self.appSupportRoot = appSupportRoot ?? storageRoot
     }
 
-    func updateRoot(_ url: URL) {
-        storageRoot = url
+    func updateRoots(storageRoot: URL, appSupportRoot: URL) {
+        vaultRoot = storageRoot
+        self.appSupportRoot = appSupportRoot
     }
 
     func ensureBaseDirectories() throws {
-        let chunks = storageRoot.appendingPathComponent("chunks", isDirectory: true)
-        let temp = storageRoot.appendingPathComponent("temp", isDirectory: true)
+        let chunks = vaultRoot.appendingPathComponent("chunks", isDirectory: true)
+        let temp = appSupportRoot.appendingPathComponent("temp", isDirectory: true)
 
-        // Create root directory if needed
-        try createDirIfNeeded(storageRoot)
+        // Create vault and app-home roots if needed
+        try createDirIfNeeded(vaultRoot)
+        try createDirIfNeeded(appSupportRoot)
 
         // For chunks: only create if it doesn't exist
         // This prevents creating empty chunks folder when database already has data elsewhere
@@ -44,7 +48,7 @@ actor DirectoryManager {
         let yearMonth = String(format: "%04d%02d", year, month)
         let dayStr = String(format: "%02d", day)
 
-        let dir = storageRoot
+        let dir = vaultRoot
             .appendingPathComponent("chunks", isDirectory: true)
             .appendingPathComponent(yearMonth, isDirectory: true)
             .appendingPathComponent(dayStr, isDirectory: true)
@@ -57,7 +61,7 @@ actor DirectoryManager {
     }
 
     func relativePath(from url: URL) -> String {
-        let rootPath = storageRoot.path
+        let rootPath = vaultRoot.path
         let fullPath = url.path
         if fullPath.hasPrefix(rootPath) {
             let idx = fullPath.index(fullPath.startIndex, offsetBy: rootPath.count)
@@ -68,7 +72,7 @@ actor DirectoryManager {
     }
 
     func listAllSegmentFiles() throws -> [URL] {
-        let chunksRoot = storageRoot.appendingPathComponent("chunks", isDirectory: true)
+        let chunksRoot = vaultRoot.appendingPathComponent("chunks", isDirectory: true)
         guard fileManager.fileExists(atPath: chunksRoot.path) else { return [] }
         let enumerator = fileManager.enumerator(
             at: chunksRoot,
@@ -94,4 +98,3 @@ actor DirectoryManager {
         }
     }
 }
-

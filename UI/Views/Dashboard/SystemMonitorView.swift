@@ -2,6 +2,7 @@ import SwiftUI
 import Shared
 import App
 import Processing
+import Database
 
 /// System monitor view showing background task status
 public struct SystemMonitorView: View {
@@ -40,15 +41,15 @@ public struct SystemMonitorView: View {
                     // Main content
                     ScrollView(showsIndicators: false) {
                         VStack(alignment: .leading, spacing: 16) {
-                            // OCR Processing Section
-                            ocrProcessingSection
-                            videoRewritingSection
-                                .padding(.bottom, 40)
+                            if viewModel.isMigrationMode {
+                                migrationModeBanner
+                                migrationProgressSection
+                            } else {
+                                ocrProcessingSection
+                                videoRewritingSection
+                                    .padding(.bottom, 40)
+                            }
                             processResourceSummarySection(isCompactLayout: isCompactLayout)
-
-                            // Future sections placeholder
-                            // - Data Transfers
-                            // - Migrations
                         }
                         .frame(maxWidth: monitorMaxWidth)
                         .frame(maxWidth: .infinity)
@@ -65,10 +66,12 @@ public struct SystemMonitorView: View {
         .onAppear {
             installScrollMonitorIfNeeded()
             ProcessCPUMonitor.shared.setConsumerVisible(.systemMonitor, isVisible: true)
-            DashboardViewModel.recordSystemMonitorOpened(
-                coordinator: coordinator,
-                source: "dashboard_window"
-            )
+            if !coordinator.migrationStatusHolder.status.isActive {
+                DashboardViewModel.recordSystemMonitorOpened(
+                    coordinator: coordinator,
+                    source: "dashboard_window"
+                )
+            }
         }
         .onDisappear {
             removeScrollMonitor()
@@ -76,8 +79,8 @@ public struct SystemMonitorView: View {
             viewModel.stopMonitoring()
         }
         .background(
-            // Cmd+[ to go back to dashboard
             Button("") {
+                guard !viewModel.isMigrationMode else { return }
                 NotificationCenter.default.post(name: .openDashboard, object: nil)
             }
             .keyboardShortcut("[", modifiers: .command)
@@ -125,29 +128,35 @@ public struct SystemMonitorView: View {
 
     private var header: some View {
         HStack(alignment: .center) {
-            // Back button
-            Button(action: {
-                NotificationCenter.default.post(name: .openDashboard, object: nil)
-            }) {
-                HStack(spacing: 6) {
-                    Image(systemName: "chevron.left")
-                        .font(.system(size: 12, weight: .semibold))
-                    Text("Dashboard")
-                        .font(.retraceCaptionMedium)
-                }
-                .foregroundColor(.retraceSecondary)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .background(Color.white.opacity(isHoveringBack ? 0.08 : 0.05))
-                .cornerRadius(8)
-            }
-            .buttonStyle(.plain)
-            .onHover { hovering in
-                isHoveringBack = hovering
-                if hovering {
-                    NSCursor.pointingHand.push()
+            Group {
+                if viewModel.isMigrationMode {
+                    Color.clear
+                        .frame(width: 92, height: 32)
                 } else {
-                    NSCursor.pop()
+                    Button(action: {
+                        NotificationCenter.default.post(name: .openDashboard, object: nil)
+                    }) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "chevron.left")
+                                .font(.system(size: 12, weight: .semibold))
+                            Text("Dashboard")
+                                .font(.retraceCaptionMedium)
+                        }
+                        .foregroundColor(.retraceSecondary)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(Color.white.opacity(isHoveringBack ? 0.08 : 0.05))
+                        .cornerRadius(8)
+                    }
+                    .buttonStyle(.plain)
+                    .onHover { hovering in
+                        isHoveringBack = hovering
+                        if hovering {
+                            NSCursor.pointingHand.push()
+                        } else {
+                            NSCursor.pop()
+                        }
+                    }
                 }
             }
 
@@ -171,56 +180,145 @@ public struct SystemMonitorView: View {
                 // Live indicator
                 HStack(spacing: 6) {
                     Circle()
-                        .fill(Color.green)
+                        .fill(viewModel.isMigrationMode ? Color.orange : Color.green)
                         .frame(width: 8, height: 8)
                         .overlay(
                             Circle()
-                                .stroke(Color.green.opacity(0.5), lineWidth: 2)
+                                .stroke((viewModel.isMigrationMode ? Color.orange : Color.green).opacity(0.5), lineWidth: 2)
                                 .scaleEffect(viewModel.pulseScale)
                                 .opacity(viewModel.pulseOpacity)
                         )
 
-                    Text("Live")
+                    Text(viewModel.isMigrationMode ? "Migration" : "Live")
                         .font(.retraceCaption2Medium)
                         .foregroundColor(.retraceSecondary)
                 }
 
-                // Settings button
-                Button(action: {
-                    withAnimation(.easeInOut(duration: 0.3)) {
-                        settingsRotation += 90
-                    }
-                    DashboardViewModel.recordSystemMonitorSettingsOpened(
-                        coordinator: coordinator,
-                        source: "monitor_header_settings"
-                    )
-                    NotificationCenter.default.post(name: .openSettingsPower, object: nil)
-                }) {
-                    Image(systemName: "gearshape")
-                        .font(.retraceCalloutMedium)
-                        .foregroundColor(.retraceSecondary)
-                        .rotationEffect(.degrees(settingsRotation + (isHoveringSettings ? 30 : 0)))
-                        .animation(.easeInOut(duration: 0.2), value: isHoveringSettings)
-                        .padding(10)
-                        .background(Color.white.opacity(0.05))
-                        .cornerRadius(8)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 8)
-                                .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                if !viewModel.isMigrationMode {
+                    Button(action: {
+                        withAnimation(.easeInOut(duration: 0.3)) {
+                            settingsRotation += 90
+                        }
+                        DashboardViewModel.recordSystemMonitorSettingsOpened(
+                            coordinator: coordinator,
+                            source: "monitor_header_settings"
                         )
-                }
-                .buttonStyle(.plain)
-                .contentShape(Rectangle())
-                .onHover { hovering in
-                    isHoveringSettings = hovering
-                    if hovering {
-                        NSCursor.pointingHand.push()
-                    } else {
-                        NSCursor.pop()
+                        NotificationCenter.default.post(name: .openSettingsPower, object: nil)
+                    }) {
+                        Image(systemName: "gearshape")
+                            .font(.retraceCalloutMedium)
+                            .foregroundColor(.retraceSecondary)
+                            .rotationEffect(.degrees(settingsRotation + (isHoveringSettings ? 30 : 0)))
+                            .animation(.easeInOut(duration: 0.2), value: isHoveringSettings)
+                            .padding(10)
+                            .background(Color.white.opacity(0.05))
+                            .cornerRadius(8)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 8)
+                                    .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                            )
+                    }
+                    .buttonStyle(.plain)
+                    .contentShape(Rectangle())
+                    .onHover { hovering in
+                        isHoveringSettings = hovering
+                        if hovering {
+                            NSCursor.pointingHand.push()
+                        } else {
+                            NSCursor.pop()
+                        }
                     }
                 }
             }
         }
+    }
+
+    private var migrationModeBanner: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.retraceCallout)
+                .foregroundColor(.orange)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Migration mode active")
+                    .font(.retraceCalloutBold)
+                    .foregroundColor(.retracePrimary)
+
+                Text("Other views are unavailable until the database migration finishes. OCR progress, timeline, search, dashboard, and settings are blocked during this operation.")
+                    .font(.retraceCaption)
+                    .foregroundColor(.retraceSecondary)
+            }
+
+            Spacer()
+        }
+        .padding(16)
+        .background(
+            RoundedRectangle(cornerRadius: 14)
+                .fill(Color.orange.opacity(0.08))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 14)
+                .stroke(Color.orange.opacity(0.25), lineWidth: 1)
+        )
+    }
+
+    private var migrationProgressSection: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Image(systemName: "externaldrive.badge.timemachine")
+                    .font(.retraceCallout)
+                    .foregroundColor(.retraceSecondary)
+                Text("Database Migration")
+                    .font(.retraceCalloutBold)
+                    .foregroundColor(.retracePrimary)
+                Spacer()
+                Text(viewModel.migrationPhaseLabel)
+                    .font(.retraceCaption2Bold)
+                    .foregroundColor(.orange)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Color.orange.opacity(0.12))
+                    .cornerRadius(999)
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                GeometryReader { geometry in
+                    ZStack(alignment: .leading) {
+                        RoundedRectangle(cornerRadius: 999)
+                            .fill(Color.white.opacity(0.06))
+                        RoundedRectangle(cornerRadius: 999)
+                            .fill(
+                                LinearGradient(
+                                    colors: [Color.orange.opacity(0.8), Color.retraceAccent.opacity(0.8)],
+                                    startPoint: .leading,
+                                    endPoint: .trailing
+                                )
+                            )
+                            .frame(width: geometry.size.width * viewModel.migrationProgress)
+                    }
+                }
+                .frame(height: 10)
+
+                HStack {
+                    Text(viewModel.migrationMessage)
+                        .font(.retraceCaption)
+                        .foregroundColor(.retraceSecondary)
+                    Spacer()
+                    Text(viewModel.migrationETA)
+                        .font(.retraceCaption2Bold)
+                        .foregroundColor(.retracePrimary)
+                }
+            }
+        }
+        .padding(18)
+        .background(
+            RoundedRectangle(cornerRadius: 16)
+                .fill(Color.white.opacity(0.03))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 16)
+                .stroke(Color.white.opacity(0.08), lineWidth: 1)
+        )
     }
 
     // MARK: - OCR Processing Section
@@ -1350,6 +1448,7 @@ class SystemMonitorViewModel: ObservableObject {
     @Published var pauseOnBatterySetting: Bool = false
     @Published var pauseOnLowPowerModeSetting: Bool = false
     @Published var isRecordingActive: Bool = false
+    @Published var migrationStatus: DatabaseMigrationStatus = .inactive
 
     // Chart data
     @Published var ocrProcessingHistory: [ProcessingDataPoint] = []
@@ -1540,6 +1639,51 @@ class SystemMonitorViewModel: ObservableObject {
         ocrProcessingCount > 0
     }
 
+    var isMigrationMode: Bool {
+        migrationStatus.isActive
+    }
+
+    var migrationProgress: CGFloat {
+        CGFloat(migrationStatus.progress)
+    }
+
+    var migrationMessage: String {
+        migrationStatus.message ?? "Preparing database migration"
+    }
+
+    var migrationPhaseLabel: String {
+        guard let phase = migrationStatus.phase else {
+            return "Preparing"
+        }
+        switch phase {
+        case .preflight:
+            return "Preflight"
+        case .shadowA:
+            return "Shadow Copy"
+        case .shadowBTransform:
+            return "Transform"
+        case .verify:
+            return "Verify"
+        case .swap:
+            return "Swap"
+        case .cleanup:
+            return "Cleanup"
+        case .completed:
+            return "Completed"
+        case .failed:
+            return "Failed"
+        }
+    }
+
+    var migrationETA: String {
+        guard let remaining = migrationStatus.estimatedSecondsRemaining else {
+            return "Estimating..."
+        }
+
+        let minutes = max(Int(ceil(remaining / 60)), 0)
+        return minutes <= 1 ? "<1 min left" : "\(minutes) min left"
+    }
+
     func startMonitoring() async {
         // Start pulse animation
         startPulseAnimation()
@@ -1576,6 +1720,10 @@ class SystemMonitorViewModel: ObservableObject {
 
     private func loadHistoricalData() async {
         let nowKey = minuteKey(for: Date())
+        if coordinator.migrationStatusHolder.status.isActive {
+            migrationStatus = coordinator.migrationStatusHolder.status
+            return
+        }
 
         if let historicalCounts = try? await coordinator.getFramesProcessedPerMinute(lastMinutes: 30) {
             for (minuteOffset, count) in historicalCounts {
@@ -1596,6 +1744,23 @@ class SystemMonitorViewModel: ObservableObject {
     }
 
     private func updateStats() async {
+        let currentMigrationStatus = coordinator.migrationStatusHolder.status
+        migrationStatus = currentMigrationStatus
+        if currentMigrationStatus.isActive {
+            ocrQueueDepth = 0
+            ocrPendingCount = 0
+            ocrProcessingCount = 0
+            rewriteQueueDepth = 0
+            rewritePendingCount = 0
+            rewriteProcessingCount = 0
+            ocrTotalProcessed = 0
+            totalRewritten = 0
+            ocrEnabled = false
+            isPausedForBattery = false
+            isRecordingActive = false
+            return
+        }
+
         let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
 
         // Get queue statistics

@@ -370,6 +370,7 @@ public actor StorageManager: StorageProtocol {
     private static let discardableQuarantinedWALRetentionInterval: TimeInterval = 7 * 24 * 60 * 60
     private var config: StorageConfig?
     private var storageRootURL: URL
+    private var appSupportRootURL: URL
     private let directoryManager: DirectoryManager
     private let encoderConfig: VideoEncoderConfig
     private let walRootURL: URL
@@ -400,6 +401,7 @@ public actor StorageManager: StorageProtocol {
     private struct GeneratorCacheEntry {
         let generator: AVAssetImageGenerator
         let symlinkURL: URL?  // Keep symlink alive while generator is cached
+        let retainedResourceLoaderDelegate: AnyObject?
         var lastAccessTime: Date
     }
 
@@ -409,11 +411,16 @@ public actor StorageManager: StorageProtocol {
 
     public init(
         storageRoot: URL = URL(fileURLWithPath: StorageConfig.default.expandedStorageRootPath, isDirectory: true),
+        appSupportRoot: URL? = nil,
         encoderConfig: VideoEncoderConfig = .default,
         crashReportDirectory: String = EmergencyDiagnostics.crashReportDirectory
     ) {
         self.storageRootURL = storageRoot
-        self.directoryManager = DirectoryManager(storageRoot: storageRoot)
+        self.appSupportRootURL = appSupportRoot ?? storageRoot
+        self.directoryManager = DirectoryManager(
+            storageRoot: storageRoot,
+            appSupportRoot: appSupportRoot ?? storageRoot
+        )
         self.encoderConfig = encoderConfig
         self.crashReportDirectory = crashReportDirectory
 
@@ -443,7 +450,7 @@ public actor StorageManager: StorageProtocol {
         self.config = config
         let rootPath = config.expandedStorageRootPath
         storageRootURL = URL(fileURLWithPath: rootPath, isDirectory: true)
-        await directoryManager.updateRoot(storageRootURL)
+        await directoryManager.updateRoots(storageRoot: storageRootURL, appSupportRoot: appSupportRootURL)
         try await directoryManager.ensureBaseDirectories()
 
         // Initialize WAL
@@ -550,10 +557,14 @@ public actor StorageManager: StorageProtocol {
             throw StorageError.fileNotFound(path: videoURL.path)
         }
 
+        let isEncryptedBundle = isEncryptedFragmentBundleDirectory(at: videoURL)
+
         // Check if file is empty
-        let fileSize = (try? FileManager.default.attributesOfItem(atPath: videoURL.path)[.size] as? Int64) ?? 0
-        if fileSize == 0 {
-            throw StorageError.fileReadFailed(path: videoURL.path, underlying: "Video file is empty (still being written)")
+        if !isEncryptedBundle {
+            let fileSize = (try? FileManager.default.attributesOfItem(atPath: videoURL.path)[.size] as? Int64) ?? 0
+            if fileSize == 0 {
+                throw StorageError.fileReadFailed(path: videoURL.path, underlying: "Video file is empty (still being written)")
+            }
         }
 
         // Calculate CMTime from frame index
@@ -587,25 +598,11 @@ public actor StorageManager: StorageProtocol {
                     Log.info("[VideoExtract] Invalidated stale cache for \(videoURL.lastPathComponent), creating fresh generator", category: .storage)
                 }
 
-                // Handle extensionless files by creating symlink
-                let assetURL: URL
-                if videoURL.pathExtension.lowercased() == "mp4" {
-                    assetURL = videoURL
-                } else {
-                    let tempPath = FileManager.default.temporaryDirectory
-                        .appendingPathComponent(UUID().uuidString + ".mp4")
-                    symlinkURL = tempPath
-
-                    try FileManager.default.createSymbolicLink(
-                        at: tempPath,
-                        withDestinationURL: videoURL
-                    )
-                    assetURL = tempPath
-                }
+                let assetContext = try makeFrameExtractionAssetContext(for: videoURL)
+                symlinkURL = assetContext.symlinkURL
 
                 // Create and configure the generator
-                let asset = AVAsset(url: assetURL)
-                let generator = AVAssetImageGenerator(asset: asset)
+                let generator = AVAssetImageGenerator(asset: assetContext.asset)
                 generator.appliesPreferredTrackTransform = true
                 generator.requestedTimeToleranceAfter = .zero
                 generator.requestedTimeToleranceBefore = .zero
@@ -614,6 +611,7 @@ public actor StorageManager: StorageProtocol {
                 generatorCache[cacheKey] = GeneratorCacheEntry(
                     generator: generator,
                     symlinkURL: symlinkURL,
+                    retainedResourceLoaderDelegate: assetContext.retainedResourceLoaderDelegate,
                     lastAccessTime: Date()
                 )
                 imageGenerator = generator

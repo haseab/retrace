@@ -284,6 +284,7 @@ struct DashboardContentView: View {
     @State private var showOnboarding: Bool? = nil
     @State private var initialSettingsTab: SettingsTab? = nil
     @State private var initialSettingsScrollTargetID: String? = nil
+    @State private var initialDatabaseEncryptionRequestID: UUID? = nil
     @State private var hasLoadedDashboard = false
     /// Forces a SwiftUI refresh when global appearance preferences change.
     @State private var appearanceRefreshTick = 0
@@ -297,6 +298,146 @@ struct DashboardContentView: View {
     }
 
     var body: some View {
+        configuredBody
+    }
+
+    private var configuredBody: some View {
+        secondaryConfiguredBody
+        .onReceive(NotificationCenter.default.publisher(for: .settingsSelectedTabDidChange)) { notification in
+            guard let tab = notification.userInfo?["tab"] as? String, !tab.isEmpty else {
+                return
+            }
+            currentSettingsTabTitle = tab
+            if selectedView == .settings {
+                updateDashboardWindowTitle()
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openFeedback)) { _ in
+            showFeedbackSheet = true
+            DashboardWindowController.shared.show()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openSystemMonitor)) { _ in
+            withAnimation(.easeInOut(duration: 0.2)) {
+                selectedView = .monitor
+            }
+            DashboardWindowController.shared.show()
+            updateDashboardWindowTitle()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .toggleSystemMonitor)) { _ in
+            if selectedView == .monitor,
+               DashboardWindowController.shared.isVisible,
+               let window = DashboardWindowController.shared.window,
+               (window.isKeyWindow || window.attachedSheet != nil) && NSApp.isActive {
+                DashboardWindowController.shared.hide()
+            } else {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    selectedView = .monitor
+                }
+                DashboardWindowController.shared.show()
+                updateDashboardWindowTitle()
+            }
+        }
+        .sheet(isPresented: $showFeedbackSheet) {
+            FeedbackFormView()
+                .environmentObject(coordinatorWrapper)
+        }
+    }
+
+    private var secondaryConfiguredBody: some View {
+        primaryConfiguredBody
+        .onReceive(NotificationCenter.default.publisher(for: .openSettingsAppearance)) { _ in
+            openSettingsView(initialTab: nil, scrollTargetID: nil, title: nil)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openSettingsPower)) { _ in
+            openSettingsView(initialTab: .power, scrollTargetID: nil, title: SettingsTab.power.rawValue)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openSettingsTags)) { _ in
+            openSettingsView(initialTab: .tags, scrollTargetID: nil, title: SettingsTab.tags.rawValue)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openSettingsPauseReminderInterval)) { _ in
+            openSettingsView(
+                initialTab: .capture,
+                scrollTargetID: SettingsView.pauseReminderIntervalTargetID,
+                title: SettingsTab.capture.rawValue
+            )
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openSettingsPowerOCRCard)) { _ in
+            openSettingsView(
+                initialTab: .power,
+                scrollTargetID: SettingsView.powerOCRCardTargetID,
+                title: SettingsTab.power.rawValue
+            )
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openSettingsPowerOCRPriority)) { _ in
+            openSettingsView(
+                initialTab: .power,
+                scrollTargetID: SettingsView.powerOCRPriorityTargetID,
+                title: SettingsTab.power.rawValue
+            )
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openSettingsDatabaseEncryption)) { _ in
+            openSettingsView(
+                initialTab: .privacy,
+                scrollTargetID: SettingsView.databaseEncryptionTargetID,
+                title: SettingsTab.privacy.rawValue,
+                initialDatabaseEncryptionRequestID: coordinator.migrationStatusHolder.status.isActive
+                    ? nil
+                    : UUID()
+            )
+        }
+    }
+
+    private var primaryConfiguredBody: some View {
+        dashboardRoot
+        .frame(
+            minWidth: DashboardWindowSizing.minWidth,
+            minHeight: DashboardWindowSizing.minHeight
+        )
+        .task {
+            await checkOnboarding()
+        }
+        .onAppear {
+            updateDashboardWindowTitle()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openDashboard)) { notification in
+            let target = notification.userInfo?["target"] as? String
+            withAnimation(.easeInOut(duration: 0.2)) {
+                if coordinator.migrationStatusHolder.status.isActive {
+                    selectedView = .monitor
+                } else {
+                    selectedView = target == "changelog" ? .changelog : .dashboard
+                }
+            }
+            updateDashboardWindowTitle()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .dashboardShowSettings)) { _ in
+            withAnimation(.easeInOut(duration: 0.2)) {
+                selectedView = coordinator.migrationStatusHolder.status.isActive ? .monitor : .settings
+            }
+            updateDashboardWindowTitle()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .colorThemeDidChange)) { _ in
+            appearanceRefreshTick &+= 1
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .fontStyleDidChange)) { _ in
+            appearanceRefreshTick &+= 1
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .toggleSettings)) { _ in
+            withAnimation(.easeInOut(duration: 0.2)) {
+                if coordinator.migrationStatusHolder.status.isActive {
+                    selectedView = .monitor
+                } else {
+                    selectedView = selectedView == .settings ? .dashboard : .settings
+                }
+            }
+            updateDashboardWindowTitle()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openSettings)) { _ in
+            openSettingsView(initialTab: nil, scrollTargetID: nil, title: nil)
+        }
+    }
+
+    private var dashboardRoot: some View {
         ZStack {
             if let showOnboarding = showOnboarding {
                 if showOnboarding {
@@ -324,185 +465,67 @@ struct DashboardContentView: View {
                     .ignoresSafeArea()
             }
         }
-        .frame(
-            minWidth: DashboardWindowSizing.minWidth,
-            minHeight: DashboardWindowSizing.minHeight
-        )
-        .task {
-            await checkOnboarding()
-        }
-        .onAppear {
-            updateDashboardWindowTitle()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .openDashboard)) { notification in
-            let target = notification.userInfo?["target"] as? String
-            withAnimation(.easeInOut(duration: 0.2)) {
-                selectedView = target == "changelog" ? .changelog : .dashboard
-            }
-            updateDashboardWindowTitle()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .dashboardShowSettings)) { _ in
-            withAnimation(.easeInOut(duration: 0.2)) {
-                selectedView = .settings
-            }
-            updateDashboardWindowTitle()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .colorThemeDidChange)) { _ in
-            appearanceRefreshTick &+= 1
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .fontStyleDidChange)) { _ in
-            appearanceRefreshTick &+= 1
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .toggleSettings)) { _ in
-            // Toggle: if on settings go to dashboard, otherwise go to settings
-            withAnimation(.easeInOut(duration: 0.2)) {
-                selectedView = selectedView == .settings ? .dashboard : .settings
-            }
-            updateDashboardWindowTitle()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .openSettings)) { _ in
-            initialSettingsTab = nil
-            initialSettingsScrollTargetID = nil
-            withAnimation(.easeInOut(duration: 0.2)) {
-                selectedView = .settings
-            }
-            DashboardWindowController.shared.show()
-            updateDashboardWindowTitle()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .openSettingsAppearance)) { _ in
-            initialSettingsTab = nil
-            initialSettingsScrollTargetID = nil
-            withAnimation(.easeInOut(duration: 0.2)) {
-                selectedView = .settings
-            }
-            DashboardWindowController.shared.show()
-            // General tab contains Appearance settings - it's the default tab
-            updateDashboardWindowTitle()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .openSettingsPower)) { _ in
-            initialSettingsTab = .power
-            initialSettingsScrollTargetID = nil
-            currentSettingsTabTitle = SettingsTab.power.rawValue
-            withAnimation(.easeInOut(duration: 0.2)) {
-                selectedView = .settings
-            }
-            DashboardWindowController.shared.show()
-            updateDashboardWindowTitle()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .openSettingsTags)) { _ in
-            initialSettingsTab = .tags
-            initialSettingsScrollTargetID = nil
-            currentSettingsTabTitle = SettingsTab.tags.rawValue
-            withAnimation(.easeInOut(duration: 0.2)) {
-                selectedView = .settings
-            }
-            DashboardWindowController.shared.show()
-            updateDashboardWindowTitle()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .openSettingsPauseReminderInterval)) { _ in
-            initialSettingsTab = .capture
-            initialSettingsScrollTargetID = SettingsView.pauseReminderIntervalTargetID
-            currentSettingsTabTitle = SettingsTab.capture.rawValue
-            withAnimation(.easeInOut(duration: 0.2)) {
-                selectedView = .settings
-            }
-            DashboardWindowController.shared.show()
-            updateDashboardWindowTitle()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .openSettingsPowerOCRCard)) { _ in
-            initialSettingsTab = .power
-            initialSettingsScrollTargetID = SettingsView.powerOCRCardTargetID
-            currentSettingsTabTitle = SettingsTab.power.rawValue
-            withAnimation(.easeInOut(duration: 0.2)) {
-                selectedView = .settings
-            }
-            DashboardWindowController.shared.show()
-            updateDashboardWindowTitle()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .openSettingsPowerOCRPriority)) { _ in
-            initialSettingsTab = .power
-            initialSettingsScrollTargetID = SettingsView.powerOCRPriorityTargetID
-            currentSettingsTabTitle = SettingsTab.power.rawValue
-            withAnimation(.easeInOut(duration: 0.2)) {
-                selectedView = .settings
-            }
-            DashboardWindowController.shared.show()
-            updateDashboardWindowTitle()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .settingsSelectedTabDidChange)) { notification in
-            guard let tab = notification.userInfo?["tab"] as? String, !tab.isEmpty else {
-                return
-            }
-            currentSettingsTabTitle = tab
-            if selectedView == .settings {
-                updateDashboardWindowTitle()
-            }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .openFeedback)) { _ in
-            showFeedbackSheet = true
-            DashboardWindowController.shared.show()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .openSystemMonitor)) { _ in
-            withAnimation(.easeInOut(duration: 0.2)) {
-                selectedView = .monitor
-            }
-            DashboardWindowController.shared.show()
-            updateDashboardWindowTitle()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .toggleSystemMonitor)) { _ in
-            if selectedView == .monitor,
-               DashboardWindowController.shared.isVisible,
-               let window = DashboardWindowController.shared.window,
-               (window.isKeyWindow || window.attachedSheet != nil) && NSApp.isActive {
-                // Already showing monitor and frontmost — toggle monitor off by hiding window
-                DashboardWindowController.shared.hide()
-            } else {
-                // Show system monitor
-                withAnimation(.easeInOut(duration: 0.2)) {
-                    selectedView = .monitor
-                }
-                DashboardWindowController.shared.show()
-                updateDashboardWindowTitle()
-            }
-        }
-        .sheet(isPresented: $showFeedbackSheet) {
-            FeedbackFormView()
-                .environmentObject(coordinatorWrapper)
-        }
     }
 
     @ViewBuilder
     private var selectedContent: some View {
-        switch selectedView {
-        case .dashboard:
-            DashboardView(
-                viewModel: dashboardViewModel,
-                coordinator: coordinator,
-                launchOnLoginReminderManager: launchOnLoginReminderManager,
-                milestoneCelebrationManager: milestoneCelebrationManager,
-                hasLoadedInitialData: $hasLoadedDashboard
-            )
-
-        case .settings:
-            SettingsView(
-                initialTab: initialSettingsTab,
-                initialScrollTargetID: initialSettingsScrollTargetID
-            )
-            .environmentObject(coordinatorWrapper)
-            .onDisappear {
-                // Clear the initial tab when leaving settings
-                initialSettingsTab = nil
-                initialSettingsScrollTargetID = nil
-            }
-
-        case .changelog:
-            ChangelogView()
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-        case .monitor:
+        if coordinator.migrationStatusHolder.status.isActive {
             SystemMonitorView(coordinator: coordinator)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            switch selectedView {
+            case .dashboard:
+                DashboardView(
+                    viewModel: dashboardViewModel,
+                    coordinator: coordinator,
+                    launchOnLoginReminderManager: launchOnLoginReminderManager,
+                    milestoneCelebrationManager: milestoneCelebrationManager,
+                    hasLoadedInitialData: $hasLoadedDashboard
+                )
+
+            case .settings:
+                SettingsView(
+                    initialTab: initialSettingsTab,
+                    initialScrollTargetID: initialSettingsScrollTargetID,
+                    initialDatabaseEncryptionRequestID: initialDatabaseEncryptionRequestID
+                )
+                .environmentObject(coordinatorWrapper)
+                .onDisappear {
+                    // Clear the initial tab when leaving settings
+                    initialSettingsTab = nil
+                    initialSettingsScrollTargetID = nil
+                    initialDatabaseEncryptionRequestID = nil
+                }
+
+            case .changelog:
+                ChangelogView()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            case .monitor:
+                SystemMonitorView(coordinator: coordinator)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
         }
+    }
+
+    private func openSettingsView(
+        initialTab: SettingsTab?,
+        scrollTargetID: String?,
+        title: String?,
+        initialDatabaseEncryptionRequestID: UUID? = nil
+    ) {
+        initialSettingsTab = initialTab
+        initialSettingsScrollTargetID = scrollTargetID
+        self.initialDatabaseEncryptionRequestID = initialDatabaseEncryptionRequestID
+        if let title {
+            currentSettingsTabTitle = title
+        }
+
+        withAnimation(.easeInOut(duration: 0.2)) {
+            selectedView = coordinator.migrationStatusHolder.status.isActive ? .monitor : .settings
+        }
+        DashboardWindowController.shared.show()
+        updateDashboardWindowTitle()
     }
 
     private func checkOnboarding() async {
@@ -513,6 +536,11 @@ struct DashboardContentView: View {
     }
 
     private func updateDashboardWindowTitle() {
+        if coordinator.migrationStatusHolder.status.isActive {
+            DashboardWindowController.shared.updateWindowTitle("System Monitor")
+            return
+        }
+
         let title: String
         switch selectedView {
         case .dashboard:
@@ -572,4 +600,5 @@ extension Notification.Name {
     static let dashboardDidBecomeKey = Notification.Name("dashboardDidBecomeKey")
     static let toggleSettings = Notification.Name("toggleSettings")
     static let settingsSelectedTabDidChange = Notification.Name("settingsSelectedTabDidChange")
+    static let openSettingsDatabaseEncryption = Notification.Name("openSettingsDatabaseEncryption")
 }

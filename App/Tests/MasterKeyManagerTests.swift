@@ -1,5 +1,6 @@
 import XCTest
 @testable import Shared
+import Security
 
 final class MasterKeyManagerTests: XCTestCase {
     override func tearDown() {
@@ -43,6 +44,42 @@ final class MasterKeyManagerTests: XCTestCase {
         XCTAssertTrue(document.contains("protected data cannot be recovered"))
     }
 
+    func testRecoveryDocumentIncludesSelectedStoragePolicy() {
+        let phrase = Array(repeating: "bab", count: 22).joined(separator: " ")
+        let document = MasterKeyManager.recoveryDocumentText(
+            recoveryPhrase: phrase,
+            storagePolicy: .iCloudKeychain
+        )
+
+        XCTAssertTrue(document.contains("iCloud Keychain sync enabled"))
+    }
+
+    func testDerivedDatabaseKeyIsStableAndDistinctFromMasterKey() {
+        let masterKeyData = Data((0..<32).map { UInt8($0) })
+
+        let first = MasterKeyManager.derivedKeyData(from: masterKeyData, purpose: .databaseEncryption)
+        let second = MasterKeyManager.derivedKeyData(from: masterKeyData, purpose: .databaseEncryption)
+
+        XCTAssertEqual(first, second)
+        XCTAssertEqual(first.count, 32)
+        XCTAssertNotEqual(first, masterKeyData)
+    }
+
+    func testDerivedRedactionKeyIsStableAndDistinctFromOtherKeyMaterial() {
+        let masterKeyData = Data((0..<32).map { UInt8($0) })
+
+        let redactionKey = MasterKeyManager.derivedKeyData(from: masterKeyData, purpose: .phraseRedaction)
+        let databaseKey = MasterKeyManager.derivedKeyData(from: masterKeyData, purpose: .databaseEncryption)
+
+        XCTAssertEqual(
+            redactionKey,
+            MasterKeyManager.derivedKeyData(from: masterKeyData, purpose: .phraseRedaction)
+        )
+        XCTAssertEqual(redactionKey.count, 32)
+        XCTAssertNotEqual(redactionKey, masterKeyData)
+        XCTAssertNotEqual(redactionKey, databaseKey)
+    }
+
     func testRecoveryPhraseCanBeRecoveredFromDocumentText() throws {
         let keyData = Data((0..<32).map { UInt8($0) })
         let phrase = MasterKeyManager.recoveryPhrase(for: keyData)
@@ -71,6 +108,91 @@ final class MasterKeyManagerTests: XCTestCase {
             ),
             "/Users/alice/dev/retrace/.build/debug/Retrace"
         )
+    }
+
+    func testHasMasterKeyTreatsLegacyInteractionRequiredStatusAsPresent() {
+        var queriedServices: [String] = []
+
+        let hasMasterKey = MasterKeyManager.hasMasterKey { query, _ in
+            let service = (query as NSDictionary)[kSecAttrService as String] as? String ?? ""
+            queriedServices.append(service)
+
+            switch service {
+            case MasterKeyManager.keychainService:
+                return errSecItemNotFound
+            case MasterKeyManager.legacyKeychainService:
+                return errSecInteractionNotAllowed
+            default:
+                XCTFail("Unexpected keychain service \(service)")
+                return errSecItemNotFound
+            }
+        }
+
+        XCTAssertTrue(hasMasterKey)
+        XCTAssertEqual(
+            queriedServices,
+            [MasterKeyManager.keychainService, MasterKeyManager.legacyKeychainService]
+        )
+    }
+
+    func testLoadMasterKeyPrefersCanonicalItemWhenPresent() throws {
+        let canonicalKeyData = Data((0..<32).map { UInt8(255 - $0) })
+        var addWasCalled = false
+
+        let loadedKey = try MasterKeyManager.loadMasterKey(
+            copyMatching: { query, result in
+                let service = (query as NSDictionary)[kSecAttrService as String] as? String ?? ""
+                XCTAssertEqual(service, MasterKeyManager.keychainService)
+                result?.pointee = canonicalKeyData as CFTypeRef
+                return errSecSuccess
+            },
+            addItem: { _, _ in
+                addWasCalled = true
+                return errSecSuccess
+            }
+        )
+
+        XCTAssertEqual(loadedKey, canonicalKeyData)
+        XCTAssertFalse(addWasCalled)
+    }
+
+    func testLoadMasterKeyPromotesLegacyItemIntoCanonicalService() throws {
+        let legacyKeyData = Data((0..<32).map { UInt8($0 ^ 0x5A) })
+        var queriedServices: [String] = []
+        var addedService: String?
+        var addedData: Data?
+
+        let loadedKey = try MasterKeyManager.loadMasterKey(
+            copyMatching: { query, result in
+                let service = (query as NSDictionary)[kSecAttrService as String] as? String ?? ""
+                queriedServices.append(service)
+
+                switch service {
+                case MasterKeyManager.keychainService:
+                    return errSecItemNotFound
+                case MasterKeyManager.legacyKeychainService:
+                    result?.pointee = legacyKeyData as CFTypeRef
+                    return errSecSuccess
+                default:
+                    XCTFail("Unexpected keychain service \(service)")
+                    return errSecItemNotFound
+                }
+            },
+            addItem: { query, _ in
+                let dictionary = query as NSDictionary
+                addedService = dictionary[kSecAttrService as String] as? String
+                addedData = dictionary[kSecValueData as String] as? Data
+                return errSecSuccess
+            }
+        )
+
+        XCTAssertEqual(loadedKey, legacyKeyData)
+        XCTAssertEqual(
+            queriedServices,
+            [MasterKeyManager.keychainService, MasterKeyManager.legacyKeychainService]
+        )
+        XCTAssertEqual(addedService, MasterKeyManager.keychainService)
+        XCTAssertEqual(addedData, legacyKeyData)
     }
 
     func testResetMasterKeyPreservesDefaultsWhenDeleteFails() throws {
@@ -122,6 +244,25 @@ final class MasterKeyManagerTests: XCTestCase {
         XCTAssertFalse(removed)
         XCTAssertNil(defaults.object(forKey: MasterKeyManager.createdAtDefaultsKey))
         XCTAssertNil(defaults.object(forKey: MasterKeyManager.lastShownRecoveryDefaultsKey))
+    }
+
+    func testResetMasterKeyDeletesCanonicalAndLegacyItems() throws {
+        var deletedServices: [String] = []
+
+        let removed = try MasterKeyManager.resetMasterKey(
+            defaults: makeDefaults(),
+            deleteMasterKey: { query in
+                let service = (query as NSDictionary)[kSecAttrService as String] as? String ?? ""
+                deletedServices.append(service)
+                return service == MasterKeyManager.keychainService ? errSecSuccess : errSecItemNotFound
+            }
+        )
+
+        XCTAssertTrue(removed)
+        XCTAssertEqual(
+            deletedServices,
+            [MasterKeyManager.keychainService, MasterKeyManager.legacyKeychainService]
+        )
     }
 
     private func makeDefaults() -> UserDefaults {

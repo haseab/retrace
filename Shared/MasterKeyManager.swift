@@ -1,17 +1,53 @@
 import CryptoKit
 import Foundation
+import LocalAuthentication
 import Security
+
+public enum MasterKeyStoragePolicy: String, Codable, CaseIterable, Sendable {
+    case localOnly = "local_only"
+    case iCloudKeychain = "icloud_keychain"
+
+    public var isSynchronizable: Bool {
+        self == .iCloudKeychain
+    }
+
+    public var accessibleAttribute: CFString {
+        switch self {
+        case .localOnly:
+            return kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        case .iCloudKeychain:
+            return kSecAttrAccessibleAfterFirstUnlock
+        }
+    }
+
+    public var recoveryDocumentStorageLabel: String {
+        switch self {
+        case .localOnly:
+            return "Keychain (this device only)"
+        case .iCloudKeychain:
+            return "iCloud Keychain sync enabled"
+        }
+    }
+}
+
+public enum MasterKeyDerivedKeyPurpose: String, Sendable {
+    case databaseEncryption = "database_encryption"
+    case phraseRedaction = "phrase_redaction"
+}
 
 public struct MasterKeyCreationResult: Sendable {
     public let created: Bool
     public let recoveryPhrase: String?
+    public let storagePolicy: MasterKeyStoragePolicy?
 
     public init(
         created: Bool,
-        recoveryPhrase: String?
+        recoveryPhrase: String?,
+        storagePolicy: MasterKeyStoragePolicy?
     ) {
         self.created = created
         self.recoveryPhrase = recoveryPhrase
+        self.storagePolicy = storagePolicy
     }
 }
 
@@ -52,17 +88,22 @@ public enum MasterKeyManagerError: LocalizedError, Sendable {
 
 public enum MasterKeyManager {
     public static let settingsSuiteName = "io.retrace.app"
-    public static let keychainService = "io.retrace.app.masterkey"
+    public static let keychainService = "io.retrace.app.masterkey.v2"
+    public static let legacyKeychainService = "io.retrace.app.masterkey"
     public static let keychainAccount = "master-key"
     public static let createdAtDefaultsKey = "masterKeyCreatedAtMs"
     public static let lastShownRecoveryDefaultsKey = "masterKeyRecoveryShownAtMs"
+    public static let storagePolicyDefaultsKey = "masterKeyStoragePolicy"
 
     private static let keyByteCount = 32
     private static let checksumByteCount = 1
     private static let recoveryPhraseWordCount = 22
+    private static let derivationSalt = Data("io.retrace.app.masterkey.hkdf.v1".utf8)
+    private static let keychainServices = [keychainService, legacyKeychainService]
     private static let cacheLock = NSLock()
     private static var cachedMasterKeyData: Data?
     private static var cachedScrambleSecret: String?
+    private static var cachedLegacyScrambleSecret: String?
     private static var cachedHasMasterKey: Bool?
 
     private static let onsetSyllables = [
@@ -97,84 +138,163 @@ public enum MasterKeyManager {
         return mapping
     }()
 
-    public static func hasMasterKey() -> Bool {
-        if let cachedValue = cachedHasMasterKeyValue() {
+    public static func hasMasterKey(account: String = keychainAccount) -> Bool {
+        hasMasterKey(account: account, copyMatching: SecItemCopyMatching)
+    }
+
+    public static func hasMasterKeyAsync(account: String = keychainAccount) async -> Bool {
+        await Task.detached(priority: .utility) {
+            hasMasterKey(account: account)
+        }.value
+    }
+
+    static func hasMasterKey(
+        account: String = keychainAccount,
+        copyMatching: (CFDictionary, UnsafeMutablePointer<CFTypeRef?>?) -> OSStatus
+    ) -> Bool {
+        if account == keychainAccount, let cachedValue = cachedHasMasterKeyValue() {
             return cachedValue
         }
 
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: keychainService,
-            kSecAttrAccount as String: keychainAccount,
-            kSecReturnAttributes as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
+        for service in keychainServices {
+            let status = copyMatching(
+                makeLookupQuery(
+                    service: service,
+                    account: account,
+                    returnAttributes: true,
+                    authenticationContext: noInteractionAuthenticationContext()
+                ) as CFDictionary,
+                nil
+            )
 
-        let status = SecItemCopyMatching(query as CFDictionary, nil)
-        if status == errSecSuccess {
-            cacheHasMasterKeyValue(true)
-            return true
+            switch status {
+            case errSecSuccess, errSecInteractionNotAllowed:
+                if account == keychainAccount {
+                    cacheHasMasterKeyValue(true)
+                }
+                return true
+            case errSecItemNotFound:
+                continue
+            default:
+                continue
+            }
         }
-        if status == errSecItemNotFound {
+
+        if account == keychainAccount {
             cacheHasMasterKeyValue(false)
         }
         return false
     }
 
-    public static func createMasterKeyIfNeeded(defaults: UserDefaults? = nil) throws -> MasterKeyCreationResult {
-        if hasMasterKey() {
+    public static func createMasterKeyIfNeeded(
+        defaults: UserDefaults? = nil,
+        storagePolicy: MasterKeyStoragePolicy? = nil,
+        keychainAccount: String = keychainAccount
+    ) throws -> MasterKeyCreationResult {
+        if hasMasterKey(account: keychainAccount) {
             return MasterKeyCreationResult(
                 created: false,
-                recoveryPhrase: nil
+                recoveryPhrase: nil,
+                storagePolicy: nil
             )
         }
 
-        let defaults = defaults ?? (UserDefaults(suiteName: settingsSuiteName) ?? .standard)
+        let defaults = resolvedDefaults(defaults)
+        let resolvedStoragePolicy = storagePolicy ?? Self.storagePolicy(defaults: defaults)
         let masterKeyData = randomMasterKeyData()
-        let created = try saveMasterKeyIfAbsent(masterKeyData)
+        let created = try saveMasterKeyIfAbsent(
+            masterKeyData,
+            service: keychainService,
+            account: keychainAccount,
+            storagePolicy: resolvedStoragePolicy
+        )
         guard created else {
             return MasterKeyCreationResult(
                 created: false,
-                recoveryPhrase: nil
+                recoveryPhrase: nil,
+                storagePolicy: nil
             )
         }
 
-        let createdAtMs = Int64(Date().timeIntervalSince1970 * 1_000)
-        defaults.set(createdAtMs, forKey: createdAtDefaultsKey)
-        cacheMasterKey(masterKeyData)
+        if keychainAccount == self.keychainAccount {
+            let createdAtMs = Int64(Date().timeIntervalSince1970 * 1_000)
+            defaults.set(createdAtMs, forKey: createdAtDefaultsKey)
+            defaults.set(resolvedStoragePolicy.rawValue, forKey: storagePolicyDefaultsKey)
+            cacheMasterKey(masterKeyData)
+        }
 
         return MasterKeyCreationResult(
             created: true,
-            recoveryPhrase: recoveryPhrase(for: masterKeyData)
+            recoveryPhrase: recoveryPhrase(for: masterKeyData),
+            storagePolicy: resolvedStoragePolicy
         )
     }
 
-    public static func loadMasterKey() throws -> Data {
-        if let cachedKey = cachedMasterKeyDataValue() {
+    public static func createMasterKeyIfNeededAsync(
+        defaults: UserDefaults? = nil,
+        storagePolicy: MasterKeyStoragePolicy? = nil,
+        keychainAccount: String = keychainAccount
+    ) async throws -> MasterKeyCreationResult {
+        let defaultsReference = UserDefaultsReference(defaults: resolvedDefaults(defaults))
+        return try await Task.detached(priority: .userInitiated) {
+            try createMasterKeyIfNeeded(
+                defaults: defaultsReference.defaults,
+                storagePolicy: storagePolicy,
+                keychainAccount: keychainAccount
+            )
+        }.value
+    }
+
+    public static func loadMasterKey(account: String = keychainAccount) throws -> Data {
+        try loadMasterKey(
+            account: account,
+            copyMatching: SecItemCopyMatching,
+            addItem: SecItemAdd
+        )
+    }
+
+    public static func loadMasterKeyAsync(account: String = keychainAccount) async throws -> Data {
+        try await Task.detached(priority: .userInitiated) {
+            try loadMasterKey(account: account)
+        }.value
+    }
+
+    static func loadMasterKey(
+        account: String = keychainAccount,
+        copyMatching: (CFDictionary, UnsafeMutablePointer<CFTypeRef?>?) -> OSStatus,
+        addItem: (CFDictionary, UnsafeMutablePointer<CFTypeRef?>?) -> OSStatus
+    ) throws -> Data {
+        if account == keychainAccount, let cachedKey = cachedMasterKeyDataValue() {
             return cachedKey
         }
 
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: keychainService,
-            kSecAttrAccount as String: keychainAccount,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
+        if let canonicalKey = try loadMasterKey(
+            service: keychainService,
+            account: account,
+            copyMatching: copyMatching
+        ) {
+            if account == keychainAccount {
+                cacheMasterKey(canonicalKey)
+            }
+            return canonicalKey
+        }
 
-        var result: AnyObject?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-        guard status == errSecSuccess, let keyData = result as? Data else {
-            if status == errSecItemNotFound {
+        guard let legacyKey = try loadMasterKey(
+            service: legacyKeychainService,
+            account: account,
+            copyMatching: copyMatching
+        ) else {
+            if account == keychainAccount {
                 cacheHasMasterKeyValue(false)
             }
-            throw MasterKeyManagerError.keychainLoadFailed(status)
+            throw MasterKeyManagerError.keychainLoadFailed(errSecItemNotFound)
         }
-        guard keyData.count == keyByteCount else {
-            throw MasterKeyManagerError.invalidKeyLength(keyData.count)
+
+        if account == keychainAccount {
+            cacheMasterKey(legacyKey)
         }
-        cacheMasterKey(keyData)
-        return keyData
+        promoteLegacyMasterKeyIfNeeded(legacyKey, account: account, addItem: addItem)
+        return legacyKey
     }
 
     public static func currentScrambleSecret() -> String? {
@@ -184,7 +304,34 @@ public enum MasterKeyManager {
         guard let masterKey = try? loadMasterKey() else {
             return nil
         }
+        return derivedKeyData(from: masterKey, purpose: .phraseRedaction).hexEncodedString()
+    }
+
+    public static func legacyScrambleSecret() -> String? {
+        if let cachedSecret = cachedLegacyScrambleSecretValue() {
+            return cachedSecret
+        }
+        guard let masterKey = try? loadMasterKey() else {
+            return nil
+        }
         return masterKey.hexEncodedString()
+    }
+
+    public static func derivedKeyData(
+        for purpose: MasterKeyDerivedKeyPurpose,
+        account: String = keychainAccount
+    ) throws -> Data {
+        let masterKey = try loadMasterKey(account: account)
+        return derivedKeyData(from: masterKey, purpose: purpose)
+    }
+
+    public static func storagePolicy(defaults: UserDefaults? = nil) -> MasterKeyStoragePolicy {
+        let defaults = resolvedDefaults(defaults)
+        guard let rawValue = defaults.string(forKey: storagePolicyDefaultsKey),
+              let policy = MasterKeyStoragePolicy(rawValue: rawValue) else {
+            return .localOnly
+        }
+        return policy
     }
 
     public static func recoveryPhrase(for keyData: Data) -> String {
@@ -257,36 +404,73 @@ public enum MasterKeyManager {
     @discardableResult
     public static func restoreMasterKey(
         fromRecoveryPhrase phrase: String,
-        defaults: UserDefaults? = nil
+        defaults: UserDefaults? = nil,
+        storagePolicy: MasterKeyStoragePolicy? = nil,
+        keychainAccount: String = keychainAccount
     ) throws -> Bool {
-        guard !hasMasterKey() else {
+        guard !hasMasterKey(account: keychainAccount) else {
             return false
         }
 
         let keyData = try keyData(fromRecoveryPhrase: phrase)
-        let defaults = defaults ?? (UserDefaults(suiteName: settingsSuiteName) ?? .standard)
-        let created = try saveMasterKeyIfAbsent(keyData)
+        let defaults = resolvedDefaults(defaults)
+        let resolvedStoragePolicy = storagePolicy ?? Self.storagePolicy(defaults: defaults)
+        let created = try saveMasterKeyIfAbsent(
+            keyData,
+            service: keychainService,
+            account: keychainAccount,
+            storagePolicy: resolvedStoragePolicy
+        )
         guard created else {
             return false
         }
 
-        defaults.set(Int64(Date().timeIntervalSince1970 * 1_000), forKey: createdAtDefaultsKey)
-        cacheMasterKey(keyData)
+        if keychainAccount == self.keychainAccount {
+            defaults.set(Int64(Date().timeIntervalSince1970 * 1_000), forKey: createdAtDefaultsKey)
+            defaults.set(resolvedStoragePolicy.rawValue, forKey: storagePolicyDefaultsKey)
+            cacheMasterKey(keyData)
+        }
         return true
     }
 
     @discardableResult
     public static func restoreMasterKey(
         fromRecoveryText text: String,
-        defaults: UserDefaults? = nil
+        defaults: UserDefaults? = nil,
+        storagePolicy: MasterKeyStoragePolicy? = nil,
+        keychainAccount: String = keychainAccount
     ) throws -> Bool {
         let phrase = try recoveryPhrase(fromRecoveryText: text)
-        return try restoreMasterKey(fromRecoveryPhrase: phrase, defaults: defaults)
+        return try restoreMasterKey(
+            fromRecoveryPhrase: phrase,
+            defaults: defaults,
+            storagePolicy: storagePolicy,
+            keychainAccount: keychainAccount
+        )
+    }
+
+    @discardableResult
+    public static func restoreMasterKeyAsync(
+        fromRecoveryText text: String,
+        defaults: UserDefaults? = nil,
+        storagePolicy: MasterKeyStoragePolicy? = nil,
+        keychainAccount: String = keychainAccount
+    ) async throws -> Bool {
+        let defaultsReference = UserDefaultsReference(defaults: resolvedDefaults(defaults))
+        return try await Task.detached(priority: .userInitiated) {
+            try restoreMasterKey(
+                fromRecoveryText: text,
+                defaults: defaultsReference.defaults,
+                storagePolicy: storagePolicy,
+                keychainAccount: keychainAccount
+            )
+        }.value
     }
 
     public static func recoveryDocumentText(
         recoveryPhrase: String,
-        createdAt: Date = Date()
+        createdAt: Date = Date(),
+        storagePolicy: MasterKeyStoragePolicy = .localOnly
     ) -> String {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -296,7 +480,7 @@ public enum MasterKeyManager {
         Retrace Recovery Phrase
 
         Created At: \(timestamp)
-        Storage: Keychain (this device only)
+        Storage: \(storagePolicy.recoveryDocumentStorageLabel)
 
         Keep this phrase offline and private.
         If this Mac loses its Keychain copy and you also lose this phrase, protected data cannot be recovered.
@@ -307,42 +491,59 @@ public enum MasterKeyManager {
     }
 
     public static func noteRecoveryPhraseShown(defaults: UserDefaults? = nil) {
-        let defaults = defaults ?? (UserDefaults(suiteName: settingsSuiteName) ?? .standard)
+        let defaults = resolvedDefaults(defaults)
         defaults.set(Int64(Date().timeIntervalSince1970 * 1_000), forKey: lastShownRecoveryDefaultsKey)
     }
 
     @discardableResult
-    public static func resetMasterKey(defaults: UserDefaults? = nil) throws -> Bool {
-        try resetMasterKey(defaults: defaults) { deleteQuery in
+    public static func resetMasterKey(
+        defaults: UserDefaults? = nil,
+        keychainAccount: String = keychainAccount
+    ) throws -> Bool {
+        try resetMasterKey(defaults: defaults, keychainAccount: keychainAccount) { deleteQuery in
             SecItemDelete(deleteQuery)
         }
     }
 
     @discardableResult
+    public static func resetMasterKeyAsync(
+        defaults: UserDefaults? = nil,
+        keychainAccount: String = keychainAccount
+    ) async throws -> Bool {
+        let defaultsReference = UserDefaultsReference(defaults: resolvedDefaults(defaults))
+        return try await Task.detached(priority: .utility) {
+            try resetMasterKey(defaults: defaultsReference.defaults, keychainAccount: keychainAccount)
+        }.value
+    }
+
+    @discardableResult
     static func resetMasterKey(
         defaults: UserDefaults? = nil,
+        keychainAccount: String = keychainAccount,
         deleteMasterKey: (CFDictionary) -> OSStatus
     ) throws -> Bool {
-        let deleteQuery: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: keychainService,
-            kSecAttrAccount as String: keychainAccount
-        ]
+        let defaults = resolvedDefaults(defaults)
+        var removedAnyItem = false
 
-        let defaults = defaults ?? (UserDefaults(suiteName: settingsSuiteName) ?? .standard)
-        let status = deleteMasterKey(deleteQuery as CFDictionary)
+        for service in keychainServices {
+            let status = deleteMasterKey(
+                makeDeleteQuery(service: service, account: keychainAccount) as CFDictionary
+            )
+            switch status {
+            case errSecSuccess:
+                removedAnyItem = true
+            case errSecItemNotFound:
+                continue
+            default:
+                throw MasterKeyManagerError.keychainDeleteFailed(status)
+            }
+        }
 
-        if status == errSecItemNotFound {
+        if keychainAccount == self.keychainAccount {
             clearCache()
             clearMasterKeyDefaults(in: defaults)
-            return false
         }
-        guard status == errSecSuccess else {
-            throw MasterKeyManagerError.keychainDeleteFailed(status)
-        }
-        clearCache()
-        clearMasterKeyDefaults(in: defaults)
-        return true
+        return removedAnyItem
     }
 
     private static func randomMasterKeyData() -> Data {
@@ -353,51 +554,210 @@ public enum MasterKeyManager {
     private static func clearMasterKeyDefaults(in defaults: UserDefaults) {
         defaults.removeObject(forKey: createdAtDefaultsKey)
         defaults.removeObject(forKey: lastShownRecoveryDefaultsKey)
+        defaults.removeObject(forKey: storagePolicyDefaultsKey)
     }
 
     private static func saveMasterKeyIfAbsent(_ keyData: Data) throws -> Bool {
+        try saveMasterKeyIfAbsent(
+            keyData,
+            service: keychainService,
+            account: keychainAccount,
+            storagePolicy: .localOnly,
+            addItem: SecItemAdd
+        )
+    }
+
+    private static func saveMasterKeyIfAbsent(
+        _ keyData: Data,
+        service: String,
+        account: String,
+        storagePolicy: MasterKeyStoragePolicy
+    ) throws -> Bool {
+        try saveMasterKeyIfAbsent(
+            keyData,
+            service: service,
+            account: account,
+            storagePolicy: storagePolicy,
+            addItem: SecItemAdd
+        )
+    }
+
+    private static func saveMasterKeyIfAbsent(
+        _ keyData: Data,
+        service: String,
+        account: String,
+        storagePolicy: MasterKeyStoragePolicy,
+        addItem: (CFDictionary, UnsafeMutablePointer<CFTypeRef?>?) -> OSStatus
+    ) throws -> Bool {
         guard keyData.count == keyByteCount else {
             throw MasterKeyManagerError.invalidKeyLength(keyData.count)
         }
 
-        var addQuery: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: keychainService,
-            kSecAttrAccount as String: keychainAccount,
-            kSecValueData as String: keyData
-        ]
-
-        if let trustedPath = trustedApplicationPathForCurrentExecution() {
-            addQuery[kSecAttrAccess as String] = try makeTrustedAccess(for: trustedPath)
-        } else {
-            addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-            addQuery[kSecAttrSynchronizable as String] = false
-        }
-
-        let status = SecItemAdd(addQuery as CFDictionary, nil)
+        // The canonical v2 item intentionally uses the modern accessible-item
+        // format instead of the legacy trusted-application ACL.
+        let status = addItem(
+            makeAddQuery(
+                service: service,
+                account: account,
+                keyData: keyData,
+                storagePolicy: storagePolicy
+            ) as CFDictionary,
+            nil
+        )
         if status == errSecDuplicateItem {
-            cacheHasMasterKeyValue(true)
+            if account == keychainAccount {
+                cacheHasMasterKeyValue(true)
+            }
             return false
         }
         guard status == errSecSuccess else {
             throw MasterKeyManagerError.keychainStoreFailed(status)
         }
-        cacheMasterKey(keyData)
+        if account == keychainAccount {
+            cacheMasterKey(keyData)
+        }
         return true
+    }
+
+    private static func resolvedDefaults(_ defaults: UserDefaults?) -> UserDefaults {
+        defaults ?? (UserDefaults(suiteName: settingsSuiteName) ?? .standard)
+    }
+
+    private static func makeLookupQuery(
+        service: String,
+        account: String,
+        returnAttributes: Bool = false,
+        authenticationContext: LAContext? = nil
+    ) -> [String: Any] {
+        var query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecAttrSynchronizable as String: kSecAttrSynchronizableAny,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+
+        if returnAttributes {
+            query[kSecReturnAttributes as String] = true
+        } else {
+            query[kSecReturnData as String] = true
+        }
+
+        if let authenticationContext {
+            query[kSecUseAuthenticationContext as String] = authenticationContext
+        }
+
+        return query
+    }
+
+    private static func noInteractionAuthenticationContext() -> LAContext {
+        let context = LAContext()
+        context.interactionNotAllowed = true
+        return context
+    }
+
+    private static func makeAddQuery(
+        service: String,
+        account: String,
+        keyData: Data,
+        storagePolicy: MasterKeyStoragePolicy
+    ) -> [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecValueData as String: keyData,
+            kSecAttrAccessible as String: storagePolicy.accessibleAttribute,
+            kSecAttrSynchronizable as String: storagePolicy.isSynchronizable
+        ]
+    }
+
+    private static func makeDeleteQuery(service: String, account: String) -> [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecAttrSynchronizable as String: kSecAttrSynchronizableAny
+        ]
+    }
+
+    private static func loadMasterKey(
+        service: String,
+        account: String,
+        copyMatching: (CFDictionary, UnsafeMutablePointer<CFTypeRef?>?) -> OSStatus
+    ) throws -> Data? {
+        var result: CFTypeRef?
+        let status = copyMatching(
+            makeLookupQuery(service: service, account: account) as CFDictionary,
+            &result
+        )
+
+        if status == errSecItemNotFound {
+            return nil
+        }
+
+        guard status == errSecSuccess, let keyData = result as? Data else {
+            throw MasterKeyManagerError.keychainLoadFailed(status)
+        }
+
+        guard keyData.count == keyByteCount else {
+            throw MasterKeyManagerError.invalidKeyLength(keyData.count)
+        }
+
+        return keyData
+    }
+
+    private static func promoteLegacyMasterKeyIfNeeded(
+        _ keyData: Data,
+        account: String,
+        addItem: (CFDictionary, UnsafeMutablePointer<CFTypeRef?>?) -> OSStatus
+    ) {
+        do {
+            _ = try saveMasterKeyIfAbsent(
+                keyData,
+                service: keychainService,
+                account: account,
+                storagePolicy: .localOnly,
+                addItem: addItem
+            )
+        } catch {
+            Log.warning(
+                "[MasterKeyManager] Failed to promote legacy master key into canonical v2 item: \(error.localizedDescription)",
+                category: .app
+            )
+        }
     }
 
     private static func cacheMasterKey(_ keyData: Data) {
         cacheLock.lock()
         cachedMasterKeyData = keyData
-        cachedScrambleSecret = keyData.hexEncodedString()
+        cachedScrambleSecret = derivedKeyData(
+            from: keyData,
+            purpose: .phraseRedaction
+        ).hexEncodedString()
+        cachedLegacyScrambleSecret = keyData.hexEncodedString()
         cachedHasMasterKey = true
         cacheLock.unlock()
+    }
+
+    public static func derivedKeyData(
+        from masterKeyData: Data,
+        purpose: MasterKeyDerivedKeyPurpose
+    ) -> Data {
+        let derived = HKDF<SHA256>.deriveKey(
+            inputKeyMaterial: SymmetricKey(data: masterKeyData),
+            salt: derivationSalt,
+            info: Data(purpose.rawValue.utf8),
+            outputByteCount: keyByteCount
+        )
+        return derived.withUnsafeBytes { Data($0) }
     }
 
     private static func clearCache() {
         cacheLock.lock()
         cachedMasterKeyData = nil
         cachedScrambleSecret = nil
+        cachedLegacyScrambleSecret = nil
         cachedHasMasterKey = false
         cacheLock.unlock()
     }
@@ -406,6 +766,7 @@ public enum MasterKeyManager {
         cacheLock.lock()
         cachedMasterKeyData = nil
         cachedScrambleSecret = nil
+        cachedLegacyScrambleSecret = nil
         cachedHasMasterKey = nil
         cacheLock.unlock()
     }
@@ -424,6 +785,13 @@ public enum MasterKeyManager {
         return value
     }
 
+    private static func cachedLegacyScrambleSecretValue() -> String? {
+        cacheLock.lock()
+        let value = cachedLegacyScrambleSecret
+        cacheLock.unlock()
+        return value
+    }
+
     private static func cachedHasMasterKeyValue() -> Bool? {
         cacheLock.lock()
         let value = cachedHasMasterKey
@@ -437,6 +805,7 @@ public enum MasterKeyManager {
         if value == false {
             cachedMasterKeyData = nil
             cachedScrambleSecret = nil
+            cachedLegacyScrambleSecret = nil
         }
         cacheLock.unlock()
     }
@@ -491,6 +860,10 @@ public enum MasterKeyManager {
     fileprivate static func recoveryIndex(for word: String) -> Int? {
         recoveryWordToIndex[word]
     }
+}
+
+private struct UserDefaultsReference: @unchecked Sendable {
+    let defaults: UserDefaults
 }
 
 private extension Data {

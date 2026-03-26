@@ -64,6 +64,385 @@ final class DatabaseManagerTests: XCTestCase {
         try await db.close()
     }
 
+    func testInitializeSelfHealsEncryptedPreferenceWhenPlaintextDatabaseOpens() async throws {
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let previousEncryptionEnabled = defaults.object(forKey: "encryptionEnabled")
+        let previousKeyData = try? DatabaseManager.loadDatabaseKeyFromKeychain()
+        defer {
+            if let previousEncryptionEnabled {
+                defaults.set(previousEncryptionEnabled, forKey: "encryptionEnabled")
+            } else {
+                defaults.removeObject(forKey: "encryptionEnabled")
+            }
+
+            if let previousKeyData {
+                try? DatabaseManager.saveDatabaseKeyToKeychain(previousKeyData)
+            } else {
+                DatabaseManager.deleteDatabaseKeyFromKeychain(account: AppPaths.keychainAccount)
+            }
+        }
+
+        DatabaseManager.deleteDatabaseKeyFromKeychain(account: AppPaths.keychainAccount)
+        defaults.set(true, forKey: "encryptionEnabled")
+
+        let testRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RetracePlaintextSelfHealTests_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: testRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: testRoot) }
+
+        let dbPath = testRoot.appendingPathComponent("retrace.db").path
+        try createPlaintextDatabase(at: dbPath)
+
+        let fileDatabase = DatabaseManager(databasePath: dbPath, storageRootPath: testRoot.path)
+        try await fileDatabase.initialize()
+        try await fileDatabase.close()
+
+        XCTAssertFalse(defaults.bool(forKey: "encryptionEnabled"))
+    }
+
+    func testInitializeSelfHealsPlaintextPreferenceWhenEncryptedDatabaseOpens() async throws {
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let previousEncryptionEnabled = defaults.object(forKey: "encryptionEnabled")
+        let previousKeyData = try? DatabaseManager.loadDatabaseKeyFromKeychain()
+        defer {
+            if let previousEncryptionEnabled {
+                defaults.set(previousEncryptionEnabled, forKey: "encryptionEnabled")
+            } else {
+                defaults.removeObject(forKey: "encryptionEnabled")
+            }
+
+            if let previousKeyData {
+                try? DatabaseManager.saveDatabaseKeyToKeychain(previousKeyData)
+            } else {
+                DatabaseManager.deleteDatabaseKeyFromKeychain(account: AppPaths.keychainAccount)
+            }
+        }
+
+        let keyData = DatabaseManager.generateDatabaseKey()
+        try DatabaseManager.saveDatabaseKeyToKeychain(keyData)
+        defaults.set(false, forKey: "encryptionEnabled")
+
+        let testRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RetraceEncryptedSelfHealTests_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: testRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: testRoot) }
+
+        let dbPath = testRoot.appendingPathComponent("retrace.db").path
+        try createEncryptedDatabase(at: dbPath, keyData: keyData)
+
+        let fileDatabase = DatabaseManager(databasePath: dbPath, storageRootPath: testRoot.path)
+        try await fileDatabase.initialize()
+        try await fileDatabase.close()
+
+        XCTAssertTrue(defaults.bool(forKey: "encryptionEnabled"))
+    }
+
+    func testInitializeCreatesDatabaseIdentityAndLibraryManifest() async throws {
+        let testRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RetraceDatabaseIdentityInit_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: testRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: testRoot) }
+
+        let dbPath = testRoot.appendingPathComponent("retrace.db").path
+        let fileDatabase = DatabaseManager(
+            databasePath: dbPath,
+            storageRootPath: testRoot.path
+        )
+
+        do {
+            try await fileDatabase.initialize()
+            let identity = try await fileDatabase.currentDatabaseIdentity()
+            try await fileDatabase.close()
+
+            XCTAssertFalse(identity.libraryID.isEmpty)
+            XCTAssertFalse(identity.shardID.isEmpty)
+            XCTAssertFalse(identity.generationID.isEmpty)
+
+            let manifest = try XCTUnwrap(
+                DatabaseIdentityStore.loadManifest(storageRootPath: testRoot.path)
+            )
+            XCTAssertEqual(manifest.libraryID, identity.libraryID)
+            XCTAssertEqual(manifest.formatVersion, 1)
+        } catch {
+            try? await fileDatabase.close()
+            throw error
+        }
+    }
+
+    func testInitializeReusesManifestLibraryIDForReplacementDatabase() async throws {
+        let testRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RetraceDatabaseIdentityReuse_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: testRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: testRoot) }
+
+        let dbPath = testRoot.appendingPathComponent("retrace.db").path
+
+        let firstDatabase = DatabaseManager(
+            databasePath: dbPath,
+            storageRootPath: testRoot.path
+        )
+        let firstIdentity: DatabaseIdentity
+        do {
+            try await firstDatabase.initialize()
+            firstIdentity = try await firstDatabase.currentDatabaseIdentity()
+            try await firstDatabase.close()
+        } catch {
+            try? await firstDatabase.close()
+            throw error
+        }
+
+        try removeDatabaseArtifacts(at: dbPath)
+
+        let replacementDatabase = DatabaseManager(
+            databasePath: dbPath,
+            storageRootPath: testRoot.path
+        )
+
+        do {
+            try await replacementDatabase.initialize()
+            let replacementIdentity = try await replacementDatabase.currentDatabaseIdentity()
+            try await replacementDatabase.close()
+
+            XCTAssertEqual(replacementIdentity.libraryID, firstIdentity.libraryID)
+            XCTAssertNotEqual(replacementIdentity.shardID, firstIdentity.shardID)
+            XCTAssertNotEqual(replacementIdentity.generationID, firstIdentity.generationID)
+        } catch {
+            try? await replacementDatabase.close()
+            throw error
+        }
+    }
+
+    func testLoadVaultMetadataDefaultsBootstrapPendingForLegacyMetadata() throws {
+        let testRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RetraceVaultMetadataLegacy_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: testRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: testRoot) }
+
+        let formatter = ISO8601DateFormatter()
+        let now = Date()
+        let legacyMetadata = """
+            {
+              "createdAt" : "\(formatter.string(from: now))",
+              "formatVersion" : 1,
+              "libraryID" : "library-123",
+              "updatedAt" : "\(formatter.string(from: now))",
+              "vaultID" : "vault-123"
+            }
+            """
+        let metadataURL = testRoot.appendingPathComponent(".retrace-vault.json", isDirectory: false)
+        try Data(legacyMetadata.utf8).write(to: metadataURL, options: .atomic)
+
+        let loadedMetadata = try XCTUnwrap(
+            DatabaseIdentityStore.loadVaultMetadata(vaultPath: testRoot.path)
+        )
+
+        XCTAssertEqual(loadedMetadata.vaultID, "vault-123")
+        XCTAssertEqual(loadedMetadata.libraryID, "library-123")
+        XCTAssertFalse(loadedMetadata.bootstrapPending)
+    }
+
+    func testPrepareRootLayoutUsesCompleteCanonicalVaultWithoutTouchingNakedLegacyAssets() throws {
+        let testRoot = try makeTemporaryDirectory(prefix: "RetraceCanonicalVaultRule1")
+        let appHomeRoot = try makeTemporaryDirectory(prefix: "RetraceCanonicalVaultRule1AppHome")
+        let context = VaultLayoutContext(appHomeRootPath: appHomeRoot.path)
+        defer {
+            try? FileManager.default.removeItem(at: testRoot)
+            try? FileManager.default.removeItem(at: appHomeRoot)
+        }
+
+        let vaultPath = testRoot
+            .appendingPathComponent("Vaults", isDirectory: true)
+            .appendingPathComponent("vault-abc123", isDirectory: true)
+        try FileManager.default.createDirectory(at: vaultPath, withIntermediateDirectories: true)
+        try createPlaintextDatabase(at: vaultPath.appendingPathComponent("retrace.db").path)
+        try FileManager.default.createDirectory(
+            at: vaultPath.appendingPathComponent("chunks", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+
+        try createPlaintextDatabase(at: testRoot.appendingPathComponent("retrace.db").path)
+        try FileManager.default.createDirectory(
+            at: testRoot.appendingPathComponent("chunks", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+
+        let prepared = try RetraceVaultLayoutManager.prepareRootLayoutIfNeeded(
+            at: testRoot.path,
+            allowDefaultBootstrapCreation: false,
+            context: context
+        )
+
+        XCTAssertEqual(normalizedFilesystemPath(prepared), vaultPath.standardizedFileURL.path)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: testRoot.appendingPathComponent("retrace.db").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: testRoot.appendingPathComponent("chunks", isDirectory: true).path))
+    }
+
+    func testPrepareRootLayoutRequiresRecoveryWhenVaultsExistsButNoCompleteVaultOrLegacyRoot() throws {
+        let testRoot = try makeTemporaryDirectory(prefix: "RetraceVaultsRecoveryRule2")
+        let appHomeRoot = try makeTemporaryDirectory(prefix: "RetraceVaultsRecoveryRule2AppHome")
+        let context = VaultLayoutContext(appHomeRootPath: appHomeRoot.path)
+        defer {
+            try? FileManager.default.removeItem(at: testRoot)
+            try? FileManager.default.removeItem(at: appHomeRoot)
+        }
+
+        try FileManager.default.createDirectory(
+            at: testRoot.appendingPathComponent("Vaults", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+
+        XCTAssertThrowsError(
+            try RetraceVaultLayoutManager.prepareRootLayoutIfNeeded(
+                at: testRoot.path,
+                allowDefaultBootstrapCreation: false,
+                context: context
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? RetraceVaultLayoutError,
+                .recoveryRequired(rootPath: testRoot.path)
+            )
+        }
+    }
+
+    func testPrepareRootLayoutMigratesNakedLegacyAssetsIntoExistingVaultsDirectory() throws {
+        let testRoot = try makeTemporaryDirectory(prefix: "RetraceVaultsMigrateRule3")
+        let appHomeRoot = try makeTemporaryDirectory(prefix: "RetraceVaultsMigrateRule3AppHome")
+        let context = VaultLayoutContext(appHomeRootPath: appHomeRoot.path)
+        defer {
+            try? FileManager.default.removeItem(at: testRoot)
+            try? FileManager.default.removeItem(at: appHomeRoot)
+        }
+
+        try FileManager.default.createDirectory(
+            at: testRoot.appendingPathComponent("Vaults", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        try createPlaintextDatabase(at: testRoot.appendingPathComponent("retrace.db").path)
+        try FileManager.default.createDirectory(
+            at: testRoot.appendingPathComponent("chunks", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+
+        let prepared = try RetraceVaultLayoutManager.prepareRootLayoutIfNeeded(
+            at: testRoot.path,
+            allowDefaultBootstrapCreation: false,
+            context: context
+        )
+
+        XCTAssertTrue(prepared.hasPrefix(testRoot.appendingPathComponent("Vaults", isDirectory: true).path + "/"))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: (prepared as NSString).appendingPathComponent("retrace.db")))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: (prepared as NSString).appendingPathComponent("chunks")))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: testRoot.appendingPathComponent("retrace.db").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: testRoot.appendingPathComponent("chunks", isDirectory: true).path))
+    }
+
+    func testPrepareRootLayoutMovesLooseCompleteVaultIntoVaultsDirectory() throws {
+        let testRoot = try makeTemporaryDirectory(prefix: "RetraceLooseVaultRule4")
+        let appHomeRoot = try makeTemporaryDirectory(prefix: "RetraceLooseVaultRule4AppHome")
+        let context = VaultLayoutContext(appHomeRootPath: appHomeRoot.path)
+        defer {
+            try? FileManager.default.removeItem(at: testRoot)
+            try? FileManager.default.removeItem(at: appHomeRoot)
+        }
+
+        let looseVaultPath = testRoot.appendingPathComponent("vault-abc123", isDirectory: true)
+        try FileManager.default.createDirectory(at: looseVaultPath, withIntermediateDirectories: true)
+        try createPlaintextDatabase(at: looseVaultPath.appendingPathComponent("retrace.db").path)
+        try FileManager.default.createDirectory(
+            at: looseVaultPath.appendingPathComponent("chunks", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+
+        let prepared = try RetraceVaultLayoutManager.prepareRootLayoutIfNeeded(
+            at: testRoot.path,
+            allowDefaultBootstrapCreation: false,
+            context: context
+        )
+
+        let expectedPath = testRoot
+            .appendingPathComponent("Vaults", isDirectory: true)
+            .appendingPathComponent("vault-abc123", isDirectory: true)
+        XCTAssertEqual(normalizedFilesystemPath(prepared), expectedPath.standardizedFileURL.path)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: looseVaultPath.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: expectedPath.path))
+    }
+
+    func testPrepareRootLayoutRequiresRecoveryForPartialLegacyRootWithoutVaultsDirectory() throws {
+        let testRoot = try makeTemporaryDirectory(prefix: "RetraceRecoveryRule5")
+        let appHomeRoot = try makeTemporaryDirectory(prefix: "RetraceRecoveryRule5AppHome")
+        let context = VaultLayoutContext(appHomeRootPath: appHomeRoot.path)
+        defer {
+            try? FileManager.default.removeItem(at: testRoot)
+            try? FileManager.default.removeItem(at: appHomeRoot)
+        }
+
+        try createPlaintextDatabase(at: testRoot.appendingPathComponent("retrace.db").path)
+
+        XCTAssertThrowsError(
+            try RetraceVaultLayoutManager.prepareRootLayoutIfNeeded(
+                at: testRoot.path,
+                allowDefaultBootstrapCreation: false,
+                context: context
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? RetraceVaultLayoutError,
+                .recoveryRequired(rootPath: testRoot.path)
+            )
+        }
+    }
+
+    func testPrepareRootLayoutMigratesNakedLegacyAssetsIntoNewVaultsDirectory() throws {
+        let testRoot = try makeTemporaryDirectory(prefix: "RetraceLegacyMigrateRule6")
+        let appHomeRoot = try makeTemporaryDirectory(prefix: "RetraceLegacyMigrateRule6AppHome")
+        let context = VaultLayoutContext(appHomeRootPath: appHomeRoot.path)
+        defer {
+            try? FileManager.default.removeItem(at: testRoot)
+            try? FileManager.default.removeItem(at: appHomeRoot)
+        }
+
+        try createPlaintextDatabase(at: testRoot.appendingPathComponent("retrace.db").path)
+        try FileManager.default.createDirectory(
+            at: testRoot.appendingPathComponent("chunks", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+
+        let prepared = try RetraceVaultLayoutManager.prepareRootLayoutIfNeeded(
+            at: testRoot.path,
+            allowDefaultBootstrapCreation: false,
+            context: context
+        )
+
+        XCTAssertTrue(prepared.hasPrefix(testRoot.appendingPathComponent("Vaults", isDirectory: true).path + "/"))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: (prepared as NSString).appendingPathComponent("retrace.db")))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: (prepared as NSString).appendingPathComponent("chunks")))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: testRoot.appendingPathComponent("retrace.db").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: testRoot.appendingPathComponent("chunks", isDirectory: true).path))
+    }
+
+    func testPrepareRootLayoutCreatesDefaultVaultForFreshBootstrap() throws {
+        let appHomeRoot = try makeTemporaryDirectory(prefix: "RetraceDefaultBootstrap")
+        let context = VaultLayoutContext(appHomeRootPath: appHomeRoot.path)
+        defer { try? FileManager.default.removeItem(at: appHomeRoot) }
+
+        try FileManager.default.createDirectory(
+            at: appHomeRoot.appendingPathComponent("logs", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+
+        let prepared = try RetraceVaultLayoutManager.prepareRootLayoutIfNeeded(
+            at: appHomeRoot.path,
+            allowDefaultBootstrapCreation: true,
+            context: context
+        )
+
+        XCTAssertTrue(prepared.hasPrefix(appHomeRoot.appendingPathComponent("Vaults", isDirectory: true).path + "/"))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: DatabaseIdentityStore.vaultMetadataURL(vaultPath: prepared).path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: (prepared as NSString).appendingPathComponent("retrace.db")))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: (prepared as NSString).appendingPathComponent("chunks")))
+    }
+
     func testDBStorageSnapshotMigrationCreatesExpectedColumns() async throws {
         let columnNames = try await tableColumnNames("db_storage_snapshot")
 
@@ -1594,7 +1973,7 @@ final class DatabaseManagerTests: XCTestCase {
         let columnNames = try await tableColumnNames("frame_in_page_url")
         let storedRows = try await database.getFrameInPageURLRows(frameID: frameID)
 
-        XCTAssertGreaterThanOrEqual(currentVersion, 13)
+        XCTAssertEqual(currentVersion, Int64(MigrationRunner.latestVersion))
         XCTAssertTrue(columnNames.contains("frameId"))
         XCTAssertTrue(columnNames.contains("ord"))
         XCTAssertTrue(columnNames.contains("urlId"))
@@ -2628,7 +3007,9 @@ final class DatabaseManagerTests: XCTestCase {
             V11_SegmentCommentLinkCompositeIndex(),
             V12_FrameMetadata(),
             V13_RemoveInPageURLRects(),
-            V14_DBStorageSnapshot()
+            V14_DBStorageSnapshot(),
+            V15_NodeRedactionFlag(),
+            V16_DatabaseIdentity()
         ]
 
         for migration in migrations where migration.version <= version {
@@ -2638,5 +3019,70 @@ final class DatabaseManagerTests: XCTestCase {
                 db: db
             )
         }
+    }
+
+    private func createPlaintextDatabase(at path: String) throws {
+        var db: OpaquePointer?
+        defer {
+            if let db {
+                sqlite3_close_v2(db)
+            }
+        }
+
+        guard sqlite3_open_v2(path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK,
+              let db else {
+            XCTFail("Failed to open plaintext database at \(path)")
+            return
+        }
+
+        XCTAssertEqual(
+            sqlite3_exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT);", nil, nil, nil),
+            SQLITE_OK
+        )
+    }
+
+    private func createEncryptedDatabase(at path: String, keyData: Data) throws {
+        var db: OpaquePointer?
+        defer {
+            if let db {
+                sqlite3_close_v2(db)
+            }
+        }
+
+        guard sqlite3_open_v2(path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK,
+              let db else {
+            XCTFail("Failed to open encrypted database at \(path)")
+            return
+        }
+
+        try DatabaseManager.applyRetraceSQLCipherSettings(keyData, to: db)
+        XCTAssertEqual(
+            sqlite3_exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT);", nil, nil, nil),
+            SQLITE_OK
+        )
+    }
+
+    private func removeDatabaseArtifacts(at path: String) throws {
+        let fileManager = FileManager.default
+        let urls = [
+            URL(fileURLWithPath: path),
+            URL(fileURLWithPath: path + "-wal"),
+            URL(fileURLWithPath: path + "-shm")
+        ]
+
+        for url in urls where fileManager.fileExists(atPath: url.path) {
+            try fileManager.removeItem(at: url)
+        }
+    }
+
+    private func makeTemporaryDirectory(prefix: String) throws -> URL {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("\(prefix)_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        return directory
+    }
+
+    private func normalizedFilesystemPath(_ path: String) -> String {
+        URL(fileURLWithPath: path).standardizedFileURL.path
     }
 }

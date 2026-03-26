@@ -9,9 +9,12 @@ You are responsible for the **Database** module of Retrace. Your job is to imple
 ```
 Database/
 ├── DatabaseManager.swift      # Main DatabaseProtocol implementation
+├── DatabaseIdentity.swift     # DB lineage metadata + app-home/vault metadata sync
 ├── FTSManager.swift           # FTSProtocol implementation
 ├── Schema.swift               # Table definitions
 ├── Migrations/
+│   ├── DatabaseMigrationEngine.swift # Unified encrypt/decrypt/schema migration engine
+│   ├── DatabaseMigrationJob.swift    # Persisted migration job + recovery phrase support
 │   ├── MigrationRunner.swift  # Run migrations in order
 │   ├── V1_InitialSchema.swift # Initial schema migration
 │   ├── V2_UnfinalisedVideoTracking.swift
@@ -27,12 +30,14 @@ Database/
 │   ├── V12_FrameMetadata.swift
 │   ├── V13_RemoveInPageURLRects.swift
 │   ├── V14_DBStorageSnapshot.swift
-│   └── V15_NodeRedactionFlag.swift
+│   ├── V15_NodeRedactionFlag.swift
+│   └── V16_DatabaseIdentity.swift
 ├── Queries/
 │   ├── FrameQueries.swift     # Frame CRUD operations
 │   ├── SegmentQueries.swift   # Segment CRUD operations
 │   └── DocumentQueries.swift  # Document/FTS operations
 └── Tests/
+    ├── DatabaseMigrationEngineTests.swift # Migration sizing + recovery phrase tests
     ├── DatabaseManagerTests.swift
     └── FTSManagerTests.swift
 ```

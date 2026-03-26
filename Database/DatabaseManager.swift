@@ -2,6 +2,7 @@ import Foundation
 import SQLCipher
 import Shared
 import CryptoKit
+import Security
 
 public struct FrameInPageURLRow: Sendable, Equatable {
     public let order: Int
@@ -58,6 +59,43 @@ public enum DatabaseActorTraceContext {
     @TaskLocal public static var traceID: String?
 }
 
+public enum DatabaseFileEncryptionState: String, Sendable {
+    case missing
+    case empty
+    case plaintext
+    case encrypted
+
+    public var isEncrypted: Bool {
+        self == .encrypted
+    }
+}
+
+public enum DatabaseConnectionMode: String, Sendable {
+    case plaintext
+    case encrypted
+}
+
+public enum DatabaseKeyMaterialSource: String, Codable, Sendable {
+    case legacyDatabaseKey = "legacy_database_key"
+    case masterKeyDerived = "master_key_derived"
+}
+
+public struct DatabaseConnectionResolution: Sendable {
+    public let mode: DatabaseConnectionMode
+    public let keychainAccount: String?
+    public let keyMaterialSource: DatabaseKeyMaterialSource?
+
+    public init(
+        mode: DatabaseConnectionMode,
+        keychainAccount: String? = nil,
+        keyMaterialSource: DatabaseKeyMaterialSource? = nil
+    ) {
+        self.mode = mode
+        self.keychainAccount = keychainAccount
+        self.keyMaterialSource = keyMaterialSource
+    }
+}
+
 /// Main database manager implementing DatabaseProtocol
 /// Owner: DATABASE agent
 ///
@@ -69,10 +107,14 @@ public actor DatabaseManager: DatabaseProtocol {
     private var db: OpaquePointer?
     private let databasePath: String
     private let storageRootPath: String
+    private let appSupportRootPath: String
     private var isInitialized = false
     private var dbActorOperationSequence: UInt64 = 0
     private var dbActorOperationStack: [(id: UInt64, name: String, startedAt: CFAbsoluteTime)] = []
     private static let dbActorSlowHoldWarningMs: Double = 200
+    private static let sqliteHeader = Data("SQLite format 3\0".utf8)
+    public nonisolated static let retraceSQLCipherCompatibility = 4
+    public nonisolated static let pendingMigrationKeychainAccount = AppPaths.keychainAccount + ".pending"
 
     /// Public accessor for the database connection (needed for query classes)
     public func getConnection() -> OpaquePointer? {
@@ -82,6 +124,19 @@ public actor DatabaseManager: DatabaseProtocol {
     /// Check if the database has been fully initialized
     public func isReady() -> Bool {
         isInitialized && db != nil
+    }
+
+    public func currentDatabaseIdentity() throws -> DatabaseIdentity {
+        guard let db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        return try DatabaseIdentityStore.ensureIdentity(
+            for: db,
+            databasePath: databasePath,
+            vaultPath: storageRootPath,
+            appSupportRootPath: appSupportRootPath
+        )
     }
 
     // MARK: - DB Actor Occupancy Tracing
@@ -150,15 +205,23 @@ public actor DatabaseManager: DatabaseProtocol {
 
     // MARK: - Initialization
 
-    public init(databasePath: String, storageRootPath: String = AppPaths.expandedStorageRoot) {
+    public init(
+        databasePath: String,
+        storageRootPath: String = AppPaths.expandedStorageRoot,
+        appSupportRootPath: String? = nil
+    ) {
         self.databasePath = databasePath
         self.storageRootPath = NSString(string: storageRootPath).expandingTildeInPath
+        self.appSupportRootPath = NSString(
+            string: appSupportRootPath ?? storageRootPath
+        ).expandingTildeInPath
     }
 
     /// Convenience initializer for in-memory database (testing)
     public init() {
         self.databasePath = ":memory:"
         self.storageRootPath = AppPaths.expandedStorageRoot
+        self.appSupportRootPath = AppPaths.expandedAppSupportRoot
     }
 
     // MARK: - Lifecycle
@@ -216,6 +279,17 @@ public actor DatabaseManager: DatabaseProtocol {
         let migrationRunner = MigrationRunner(db: db!)
         try await migrationRunner.runMigrations()
         Log.debug("[DatabaseManager] Migrations complete", category: .database)
+
+        let databaseIdentity = try DatabaseIdentityStore.ensureIdentity(
+            for: db!,
+            databasePath: expandedPath,
+            vaultPath: storageRootPath,
+            appSupportRootPath: appSupportRootPath
+        )
+        Log.debug(
+            "[DatabaseManager] Database identity verified library=\(databaseIdentity.libraryID) vault=\(databaseIdentity.vaultID) generation=\(databaseIdentity.generationID)",
+            category: .database
+        )
 
         try FrameQueries.ensureInPageURLSchema(db: db!)
         Log.debug("[DatabaseManager] In-page URL schema verified", category: .database)
@@ -2842,56 +2916,34 @@ public actor DatabaseManager: DatabaseProtocol {
         // Check if encryption is enabled in UserDefaults
         // Default to false (disabled) - user must explicitly enable it during onboarding
         let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
-        let encryptionEnabled = defaults.object(forKey: "encryptionEnabled") as? Bool ?? false
+        let preferredEncrypted = defaults.object(forKey: "encryptionEnabled") as? Bool ?? false
+        let resolution = try Self.resolveDatabaseConnection(
+            at: databasePath,
+            preferredEncrypted: preferredEncrypted
+        )
 
-        // For unencrypted databases, simply don't set any PRAGMA key.
-        // SQLCipher will operate as regular SQLite when no key is provided on a new/plaintext database.
-        if !encryptionEnabled {
-            Log.debug("[DatabaseManager] Database encryption disabled - no key set", category: .database)
-            return
+        if preferredEncrypted != (resolution.mode == .encrypted) {
+            defaults.set(resolution.mode == .encrypted, forKey: "encryptionEnabled")
+            Log.warning(
+                "[DatabaseManager] Self-healed encryption preference to \(resolution.mode.rawValue) after validating the on-disk database",
+                category: .database
+            )
         }
 
-        // TODO(master-key-recovery): When DB encryption is formally integrated into the
-        // missing-key UX, stop silently generating a replacement SQLCipher key here.
-        // We want a startup decision tree that lets the user recover the original DB key,
-        // explicitly create a new one with destructive confirmation, or abort opening the
-        // encrypted database. That branch is intentionally deferred for now.
+        // Missing-key recovery is handled before startup reaches this point.
+        // Opening an existing encrypted database must never mint a replacement key here.
+        try Self.applyDatabaseConnectionResolution(resolution, to: db)
 
-        // Get or generate encryption key from Keychain
-        let keychainService = AppPaths.keychainService
-        let keychainAccount = AppPaths.keychainAccount
-
-        var keyData: Data
-        do {
-            keyData = try loadKeyFromKeychain(service: keychainService, account: keychainAccount)
-            Log.debug("[DatabaseManager] Loaded existing database encryption key from Keychain", category: .database)
-        } catch {
-            // Generate new key
-            let key = SymmetricKey(size: .bits256)
-            keyData = key.withUnsafeBytes { Data($0) }
-            try saveKeyToKeychain(keyData, service: keychainService, account: keychainAccount)
-            Log.debug("[DatabaseManager] Generated and saved new database encryption key to Keychain", category: .database)
+        switch resolution.mode {
+        case .encrypted:
+            let account = resolution.keychainAccount ?? AppPaths.keychainAccount
+            Log.debug(
+                "[DatabaseManager] Opened encrypted Retrace database with key account '\(account)'",
+                category: .database
+            )
+        case .plaintext:
+            Log.debug("[DatabaseManager] Opened plaintext Retrace database", category: .database)
         }
-
-        // Set key using PRAGMA key (SQLCipher)
-        // Convert key data to hex string for PRAGMA
-        let keyHex = keyData.map { String(format: "%02hhx", $0) }.joined()
-        let pragma = "PRAGMA key = \"x'\(keyHex)'\";"
-
-        var errorMessage: UnsafeMutablePointer<CChar>?
-        defer {
-            sqlite3_free(errorMessage)
-        }
-
-        guard sqlite3_exec(db, pragma, nil, nil, &errorMessage) == SQLITE_OK else {
-            let message = errorMessage.map { String(cString: $0) } ?? "Unknown error"
-            Log.error("[DatabaseManager] Failed to set database encryption key: \(message)", category: .database)
-            Log.warning("[DatabaseManager] SQLCipher may not be available - falling back to unencrypted database", category: .database)
-            // Don't throw - fall back to unencrypted database
-            return
-        }
-
-        Log.debug("[DatabaseManager] Database encryption key set successfully", category: .database)
     }
 
     /// Save encryption key to Keychain
@@ -2936,108 +2988,269 @@ public actor DatabaseManager: DatabaseProtocol {
         return data
     }
 
-    // MARK: - Static Keychain Setup (for onboarding)
+    public static func generateDatabaseKey() -> Data {
+        let key = SymmetricKey(size: .bits256)
+        return key.withUnsafeBytes { Data($0) }
+    }
 
-    /// Setup encryption key in Keychain during onboarding
-    /// Call this when user selects "Yes" for encryption and clicks Continue
-    public static func setupEncryptionKeychain() throws {
-        let keychainService = AppPaths.keychainService
-        let keychainAccount = AppPaths.keychainAccount
+    public static func loadDatabaseKeyFromKeychain(
+        account: String = AppPaths.keychainAccount,
+        source: DatabaseKeyMaterialSource? = nil
+    ) throws -> Data {
+        if let source {
+            return try keyData(for: source, account: account)
+        }
 
-        // Check if key already exists (without retrieving data to avoid prompts)
-        let checkQuery: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: keychainService,
-            kSecAttrAccount as String: keychainAccount,
-            kSecReturnAttributes as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
+        if let candidate = databaseKeyCandidates(for: account).first {
+            return candidate.keyData
+        }
 
-        var result: AnyObject?
-        let checkStatus = SecItemCopyMatching(checkQuery as CFDictionary, &result)
+        throw DatabaseError.connectionFailed(underlying: "Failed to load encryption key from Keychain")
+    }
 
-        if checkStatus == errSecSuccess {
-            // Key already exists, no need to create again
-            Log.debug("[DatabaseManager] Encryption key already exists in Keychain, skipping setup", category: .database)
+    public static func saveDatabaseKeyToKeychain(
+        _ key: Data,
+        account: String = AppPaths.keychainAccount,
+        storagePolicy: MasterKeyStoragePolicy = .localOnly
+    ) throws {
+        try saveKeyToKeychainStatic(
+            key,
+            service: AppPaths.keychainService,
+            account: account,
+            storagePolicy: storagePolicy
+        )
+    }
+
+    public static func deleteDatabaseKeyFromKeychain(account: String = AppPaths.keychainAccount) {
+        deleteKeyFromKeychainStatic(service: AppPaths.keychainService, account: account)
+    }
+
+    public static func hasDatabaseKeyInKeychain(
+        account: String = AppPaths.keychainAccount,
+        source: DatabaseKeyMaterialSource? = nil
+    ) -> Bool {
+        if let source {
+            switch source {
+            case .legacyDatabaseKey:
+                return hasKeyInKeychainStatic(service: AppPaths.keychainService, account: account)
+            case .masterKeyDerived:
+                return MasterKeyManager.hasMasterKey(account: account)
+            }
+        }
+
+        return hasKeyInKeychainStatic(service: AppPaths.keychainService, account: account)
+            || MasterKeyManager.hasMasterKey(account: account)
+    }
+
+    @discardableResult
+    public static func promoteDatabaseKeyIfAvailable(
+        from sourceAccount: String,
+        to destinationAccount: String = AppPaths.keychainAccount
+    ) throws -> Bool {
+        guard let candidate = databaseKeyCandidates(for: sourceAccount)
+            .first(where: { $0.source == .legacyDatabaseKey }) else {
+            return false
+        }
+
+        try saveDatabaseKeyToKeychain(candidate.keyData, account: destinationAccount)
+        return true
+    }
+
+    public nonisolated static func databaseFileEncryptionState(at path: String) -> DatabaseFileEncryptionState {
+        let expandedPath = NSString(string: path).expandingTildeInPath
+        if expandedPath == ":memory:" || expandedPath.contains("mode=memory") {
+            return .empty
+        }
+
+        var isDirectory = ObjCBool(false)
+        guard FileManager.default.fileExists(atPath: expandedPath, isDirectory: &isDirectory),
+              !isDirectory.boolValue else {
+            return .missing
+        }
+
+        if let attributes = try? FileManager.default.attributesOfItem(atPath: expandedPath),
+           let fileSize = attributes[.size] as? NSNumber,
+           fileSize.int64Value == 0 {
+            return .empty
+        }
+
+        let url = URL(fileURLWithPath: expandedPath)
+        guard let handle = try? FileHandle(forReadingFrom: url) else {
+            return .encrypted
+        }
+        defer { try? handle.close() }
+
+        guard let headerData = try? handle.read(upToCount: sqliteHeader.count) ?? Data() else {
+            return .encrypted
+        }
+
+        if headerData.isEmpty {
+            return .empty
+        }
+
+        return headerData == sqliteHeader ? .plaintext : .encrypted
+    }
+
+    public nonisolated static func applyRetraceSQLCipherSettings(
+        _ keyData: Data,
+        to db: OpaquePointer
+    ) throws {
+        let keyHex = keyData.map { String(format: "%02hhx", $0) }.joined()
+        try executeSQLStatic("PRAGMA key = \"x'\(keyHex)'\";", db: db)
+        try executeSQLStatic("PRAGMA cipher_compatibility = \(retraceSQLCipherCompatibility);", db: db)
+        _ = try queryIntStatic("SELECT count(*) FROM sqlite_master;", db: db)
+    }
+
+    public nonisolated static func resolveDatabaseConnection(
+        at path: String,
+        preferredEncrypted: Bool,
+        encryptedKeyAccounts: [String] = [AppPaths.keychainAccount]
+    ) throws -> DatabaseConnectionResolution {
+        let expandedPath = NSString(string: path).expandingTildeInPath
+        let fileState = databaseFileEncryptionState(at: expandedPath)
+        let candidateAccounts = orderedUniqueAccounts(encryptedKeyAccounts)
+
+        switch fileState {
+        case .missing, .empty:
+            guard preferredEncrypted else {
+                return DatabaseConnectionResolution(mode: .plaintext)
+            }
+
+            for account in candidateAccounts {
+                if MasterKeyManager.hasMasterKey(account: account) {
+                    return DatabaseConnectionResolution(
+                        mode: .encrypted,
+                        keychainAccount: account,
+                        keyMaterialSource: .masterKeyDerived
+                    )
+                }
+                if hasKeyInKeychainStatic(service: AppPaths.keychainService, account: account) {
+                    return DatabaseConnectionResolution(
+                        mode: .encrypted,
+                        keychainAccount: account,
+                        keyMaterialSource: .legacyDatabaseKey
+                    )
+                }
+            }
+
+            return DatabaseConnectionResolution(mode: .plaintext)
+
+        case .plaintext, .encrypted:
+            let preferredMode: DatabaseConnectionMode = preferredEncrypted ? .encrypted : .plaintext
+            let fallbackMode: DatabaseConnectionMode = preferredEncrypted ? .plaintext : .encrypted
+
+            if let resolution = resolveExistingDatabaseConnection(
+                at: expandedPath,
+                mode: preferredMode,
+                candidateAccounts: candidateAccounts
+            ) {
+                return resolution
+            }
+
+            if let resolution = resolveExistingDatabaseConnection(
+                at: expandedPath,
+                mode: fallbackMode,
+                candidateAccounts: candidateAccounts
+            ) {
+                return resolution
+            }
+
+            throw DatabaseError.connectionFailed(
+                underlying: "Unable to open database at \(expandedPath) using either plaintext or encrypted mode"
+            )
+        }
+    }
+
+    public nonisolated static func applyDatabaseConnectionResolution(
+        _ resolution: DatabaseConnectionResolution,
+        to db: OpaquePointer
+    ) throws {
+        guard resolution.mode == .encrypted else {
             return
         }
 
-        // Generate new key
-        let key = SymmetricKey(size: .bits256)
-        let keyData = key.withUnsafeBytes { Data($0) }
+        let account = resolution.keychainAccount ?? AppPaths.keychainAccount
+        let keyData = try loadDatabaseKeyFromKeychain(
+            account: account,
+            source: resolution.keyMaterialSource
+        )
+        try applyRetraceSQLCipherSettings(keyData, to: db)
+    }
 
-        // Use kSecAttrAccessibleAfterFirstUnlock directly (without SecAccessControlCreateWithFlags)
-        // This allows access without prompting after the device is unlocked
-        // kSecAttrSynchronizable = false ensures it stays local and doesn't prompt for iCloud Keychain
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: keychainService,
-            kSecAttrAccount as String: keychainAccount,
-            kSecValueData as String: keyData,
-            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock,
-            kSecAttrSynchronizable as String: false  // Don't sync to iCloud, stay local
-        ]
+    public nonisolated static func verifyDatabaseAccess(
+        at path: String,
+        keyData: Data? = nil
+    ) throws {
+        let expandedPath = NSString(string: path).expandingTildeInPath
+        let fileState = databaseFileEncryptionState(at: expandedPath)
 
-        // Delete existing item first (in case of partial state)
-        let deleteQuery: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: keychainService,
-            kSecAttrAccount as String: keychainAccount
-        ]
-        SecItemDelete(deleteQuery as CFDictionary)
-
-        // Add new item
-        let status = SecItemAdd(query as CFDictionary, nil)
-        guard status == errSecSuccess else {
-            throw NSError(domain: "com.retrace.keychain", code: Int(status), userInfo: [NSLocalizedDescriptionKey: "Failed to save encryption key to Keychain (status: \(status))"])
+        guard fileState != .missing else {
+            throw DatabaseError.connectionFailed(
+                underlying: "Database file does not exist at \(expandedPath)"
+            )
         }
 
-        Log.debug("[DatabaseManager] Generated and saved new database encryption key to Keychain during onboarding", category: .database)
+        guard fileState != .empty else {
+            throw DatabaseError.connectionFailed(
+                underlying: "Database file is empty at \(expandedPath)"
+            )
+        }
+
+        var db: OpaquePointer?
+        defer {
+            if let db {
+                sqlite3_close_v2(db)
+            }
+        }
+
+        guard sqlite3_open_v2(expandedPath, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_URI, nil) == SQLITE_OK,
+              let db else {
+            throw DatabaseError.connectionFailed(
+                underlying: db.map { String(cString: sqlite3_errmsg($0)) } ?? "Failed to open database"
+            )
+        }
+
+        if fileState.isEncrypted {
+            guard let keyData else {
+                throw DatabaseError.connectionFailed(
+                    underlying: "Missing encryption key for encrypted database"
+                )
+            }
+            try applyRetraceSQLCipherSettings(keyData, to: db)
+        }
+
+        _ = try queryIntStatic("SELECT count(*) FROM sqlite_master;", db: db)
+    }
+
+    public nonisolated static func canOpenDatabase(
+        at path: String,
+        keyData: Data? = nil
+    ) -> Bool {
+        (try? verifyDatabaseAccess(at: path, keyData: keyData)) != nil
+    }
+
+    // MARK: - Static Keychain Setup (for onboarding)
+
+    /// Legacy helper retained only to fail fast if an old caller survives.
+    /// New database encryption derives its key from the master key instead.
+    @available(*, deprecated, message: "Create or restore the master key instead; the database key is now derived from it.")
+    @discardableResult
+    public static func setupEncryptionKeychain() throws -> DatabaseRecoveryPhrase {
+        throw DatabaseError.connectionFailed(
+            underlying: "Direct database recovery-key setup is no longer supported. Create or restore the Retrace master key instead."
+        )
     }
 
     /// Verify we can read the encryption key from Keychain
     /// This triggers the keychain access prompt if needed, so it's best called immediately after setup
     public static func verifyEncryptionKeychain() throws -> Bool {
-        let keychainService = AppPaths.keychainService
-        let keychainAccount = AppPaths.keychainAccount
-
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: keychainService,
-            kSecAttrAccount as String: keychainAccount,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
-
-        var result: AnyObject?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-
-        guard status == errSecSuccess, let _ = result as? Data else {
-            throw NSError(domain: "com.retrace.keychain", code: Int(status), userInfo: [NSLocalizedDescriptionKey: "Failed to verify encryption key in Keychain (status: \(status))"])
-        }
-
+        _ = try loadDatabaseKeyFromKeychain(account: AppPaths.keychainAccount)
         return true
     }
 
     /// Delete the encryption key from Keychain (useful for resetting)
     public static func deleteEncryptionKeychain() {
-        let keychainService = AppPaths.keychainService
-        let keychainAccount = AppPaths.keychainAccount
-
-        let deleteQuery: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: keychainService,
-            kSecAttrAccount as String: keychainAccount
-        ]
-
-        let status = SecItemDelete(deleteQuery as CFDictionary)
-        if status == errSecSuccess {
-            Log.debug("[DatabaseManager] Deleted encryption key from Keychain", category: .database)
-        } else if status == errSecItemNotFound {
-            Log.debug("[DatabaseManager] No encryption key found in Keychain to delete", category: .database)
-        } else {
-            Log.error("[DatabaseManager] Failed to delete encryption key from Keychain (status: \(status))", category: .database)
-        }
+        deleteDatabaseKeyFromKeychain(account: AppPaths.keychainAccount)
     }
 
     // MARK: - Processing Queue Operations
@@ -3760,5 +3973,198 @@ public actor DatabaseManager: DatabaseProtocol {
             return 0
         }
         return try allocatedFileSize(at: url)
+    }
+}
+
+private extension DatabaseManager {
+    struct DatabaseKeyCandidate {
+        let source: DatabaseKeyMaterialSource
+        let keyData: Data
+    }
+
+    static func resolveExistingDatabaseConnection(
+        at path: String,
+        mode: DatabaseConnectionMode,
+        candidateAccounts: [String]
+    ) -> DatabaseConnectionResolution? {
+        switch mode {
+        case .plaintext:
+            guard canOpenDatabase(at: path) else {
+                return nil
+            }
+            return DatabaseConnectionResolution(mode: .plaintext)
+
+        case .encrypted:
+            for account in candidateAccounts {
+                for candidate in databaseKeyCandidates(for: account) {
+                    guard canOpenDatabase(at: path, keyData: candidate.keyData) else {
+                        continue
+                    }
+                    return DatabaseConnectionResolution(
+                        mode: .encrypted,
+                        keychainAccount: account,
+                        keyMaterialSource: candidate.source
+                    )
+                }
+            }
+            return nil
+        }
+    }
+
+    static func databaseKeyCandidates(for account: String) -> [DatabaseKeyCandidate] {
+        var candidates: [DatabaseKeyCandidate] = []
+
+        if let legacyKeyData = try? loadKeyFromKeychainStatic(
+            service: AppPaths.keychainService,
+            account: account
+        ) {
+            candidates.append(
+                DatabaseKeyCandidate(
+                    source: .legacyDatabaseKey,
+                    keyData: legacyKeyData
+                )
+            )
+        }
+
+        if let masterDerivedKey = try? MasterKeyManager.derivedKeyData(
+            for: .databaseEncryption,
+            account: account
+        ) {
+            candidates.append(
+                DatabaseKeyCandidate(
+                    source: .masterKeyDerived,
+                    keyData: masterDerivedKey
+                )
+            )
+        }
+
+        return candidates
+    }
+
+    static func keyData(
+        for source: DatabaseKeyMaterialSource,
+        account: String
+    ) throws -> Data {
+        switch source {
+        case .legacyDatabaseKey:
+            return try loadKeyFromKeychainStatic(service: AppPaths.keychainService, account: account)
+        case .masterKeyDerived:
+            return try MasterKeyManager.derivedKeyData(for: .databaseEncryption, account: account)
+        }
+    }
+
+    static func orderedUniqueAccounts(_ accounts: [String]) -> [String] {
+        var seen = Set<String>()
+        return accounts.filter { seen.insert($0).inserted }
+    }
+
+    static func executeSQLStatic(_ sql: String, db: OpaquePointer) throws {
+        var errorMessage: UnsafeMutablePointer<CChar>?
+        defer {
+            sqlite3_free(errorMessage)
+        }
+
+        guard sqlite3_exec(db, sql, nil, nil, &errorMessage) == SQLITE_OK else {
+            let message = errorMessage.map { String(cString: $0) } ?? String(cString: sqlite3_errmsg(db))
+            throw DatabaseError.queryFailed(query: sql, underlying: message)
+        }
+    }
+
+    static func queryIntStatic(_ sql: String, db: OpaquePointer) throws -> Int {
+        var statement: OpaquePointer?
+        defer {
+            sqlite3_finalize(statement)
+        }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            throw DatabaseError.queryFailed(query: sql, underlying: "No rows")
+        }
+
+        return Int(sqlite3_column_int(statement, 0))
+    }
+
+    static func saveKeyToKeychainStatic(
+        _ key: Data,
+        service: String,
+        account: String,
+        storagePolicy: MasterKeyStoragePolicy = .localOnly
+    ) throws {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecValueData as String: key,
+            kSecAttrAccessible as String: storagePolicy.accessibleAttribute,
+            kSecAttrSynchronizable as String: storagePolicy.isSynchronizable
+        ]
+
+        SecItemDelete([
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecAttrSynchronizable as String: kSecAttrSynchronizableAny
+        ] as CFDictionary)
+
+        let status = SecItemAdd(query as CFDictionary, nil)
+        guard status == errSecSuccess else {
+            throw DatabaseError.connectionFailed(underlying: "Failed to save encryption key to Keychain (status: \(status))")
+        }
+    }
+
+    static func loadKeyFromKeychainStatic(service: String, account: String) throws -> Data {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecAttrSynchronizable as String: kSecAttrSynchronizableAny,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        guard status == errSecSuccess, let data = result as? Data else {
+            throw DatabaseError.connectionFailed(underlying: "Failed to load encryption key from Keychain")
+        }
+        return data
+    }
+
+    static func deleteKeyFromKeychainStatic(service: String, account: String) {
+        let deleteQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecAttrSynchronizable as String: kSecAttrSynchronizableAny
+        ]
+
+        let status = SecItemDelete(deleteQuery as CFDictionary)
+        if status == errSecSuccess {
+            Log.debug("[DatabaseManager] Deleted encryption key from Keychain", category: .database)
+        } else if status == errSecItemNotFound {
+            Log.debug("[DatabaseManager] No encryption key found in Keychain to delete", category: .database)
+        } else {
+            Log.error("[DatabaseManager] Failed to delete encryption key from Keychain (status: \(status))", category: .database)
+        }
+    }
+
+    static func hasKeyInKeychainStatic(service: String, account: String) -> Bool {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecAttrSynchronizable as String: kSecAttrSynchronizableAny,
+            kSecReturnAttributes as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+
+        var result: AnyObject?
+        return SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess
     }
 }

@@ -411,7 +411,6 @@ public struct OnboardingView: View {
             .buttonStyle(.plain)
 
         // case 6: - COMMENTED OUT - Screen Recording Indicator step not needed for now
-        // case 7: - COMMENTED OUT - Encryption step removed (no reliable encrypt/decrypt migration)
 
         case 7:
             // Rewind data - requires selection if data exists
@@ -528,8 +527,6 @@ public struct OnboardingView: View {
             menuBarIconStep
         // case 6: - COMMENTED OUT - Screen Recording Indicator step not needed for now
         //     screenRecordingIndicatorStep
-        // case 7: - COMMENTED OUT - Encryption step removed (no reliable encrypt/decrypt migration)
-        //     encryptionStep
         case 6:
             launchAtLoginStep
         case 7:

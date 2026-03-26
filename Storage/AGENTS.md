@@ -40,13 +40,23 @@ Storage/
 
 ## Directory Structure on Disk
 
-Location: `AppPaths.storageRoot` (default: `~/Library/Application Support/Retrace/`, configurable in Settings)
+Location:
+- App home: `~/Library/Application Support/Retrace/` for logs, caches, manifests, and temp files
+- Active vault: explicit `vault-xxxxxx/` folder for `retrace.db`, SQLite sidecars, `chunks/`, and vault-local `wal/`
 
 ```
-{storageRoot}/
-├── config.json                    # App configuration
+{appSupportRoot}/
+├── .retrace-library.json          # Public library/origin metadata
+├── logs/
+├── models/
+└── temp/                          # Temporary files during encoding
+
+{vaultRoot}/
+├── .retrace-vault.json            # Public vault metadata
 ├── retrace.db                     # SQLite database (owned by DATABASE)
-├── segments/
+├── retrace.db-wal                 # SQLite WAL sidecar
+├── retrace.db-shm                 # SQLite shared-memory sidecar
+├── chunks/
 │   ├── 2024/
 │   │   ├── 01/
 │   │   │   ├── 15/
@@ -57,7 +67,7 @@ Location: `AppPaths.storageRoot` (default: `~/Library/Application Support/Retrac
 │   │   └── 02/
 │   │       └── ...
 │   └── ...
-└── temp/                          # Temporary files during encoding
+└── wal/                           # Vault-local crash recovery WAL
 ```
 
 ## Key Implementation Details

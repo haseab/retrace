@@ -86,6 +86,169 @@ final class InPageURLCaptureRoutingTests: XCTestCase {
     }
 }
 
+final class DeferredMigrationMetricTests: XCTestCase {
+    func testDeferredMigrationMetricFlushesAfterCoordinatorInitialization() async throws {
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let previousDeferredMetrics = defaults.data(forKey: AppCoordinator.deferredMigrationMetricsDefaultsKey)
+        let previousUseRewindData = defaults.object(forKey: "useRewindData")
+        defer {
+            if let previousDeferredMetrics {
+                defaults.set(previousDeferredMetrics, forKey: AppCoordinator.deferredMigrationMetricsDefaultsKey)
+            } else {
+                defaults.removeObject(forKey: AppCoordinator.deferredMigrationMetricsDefaultsKey)
+            }
+            if let previousUseRewindData {
+                defaults.set(previousUseRewindData, forKey: "useRewindData")
+            } else {
+                defaults.removeObject(forKey: "useRewindData")
+            }
+        }
+        defaults.removeObject(forKey: AppCoordinator.deferredMigrationMetricsDefaultsKey)
+        defaults.set(false, forKey: "useRewindData")
+
+        let coordinator = AppCoordinator(services: ServiceContainer(inMemory: true))
+        try await coordinator.recordMetricEvent(
+            metricType: .migrationInterrupted,
+            metadata: "source=test"
+        )
+        XCTAssertNotNil(defaults.data(forKey: AppCoordinator.deferredMigrationMetricsDefaultsKey))
+
+        try await coordinator.initialize()
+
+        let start = Calendar.current.startOfDay(for: Date()).addingTimeInterval(-60)
+        let end = Date().addingTimeInterval(60)
+        let results = try await coordinator.getDailyMetrics(
+            metricType: .migrationInterrupted,
+            from: start,
+            to: end
+        )
+
+        XCTAssertEqual(results.reduce(Int64(0)) { $0 + $1.value }, 1)
+        XCTAssertNil(defaults.data(forKey: AppCoordinator.deferredMigrationMetricsDefaultsKey))
+        try await coordinator.shutdown()
+    }
+
+    func testPrepareDatabaseMigrationJobSkipsAutomaticSchemaRetryAfterFailure() async throws {
+        let testRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RetraceFailedSchemaRetryTests_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: testRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: testRoot) }
+
+        let dbPath = testRoot.appendingPathComponent("retrace.db").path
+        try createPlaintextDatabase(at: dbPath)
+
+        let engine = DatabaseMigrationEngine(
+            databasePath: dbPath,
+            storageRootPath: testRoot.path
+        )
+        try await engine.persist(
+            job: DatabaseMigrationJob(
+                kind: .schema,
+                phase: .failed,
+                databasePath: dbPath,
+                storageRootPath: testRoot.path,
+                lastError: "schema failed"
+            )
+        )
+
+        let coordinator = AppCoordinator(
+            services: ServiceContainer(inMemory: true),
+            databaseMigrationEngine: engine
+        )
+
+        let job = await coordinator.prepareDatabaseMigrationJobIfNeeded()
+        XCTAssertNil(job)
+    }
+
+    func testRunDatabaseMigrationReportsPostflightFailureSeparatelyAfterSuccessfulMigration() async throws {
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let previousDeferredMetrics = defaults.data(forKey: AppCoordinator.deferredMigrationMetricsDefaultsKey)
+        defer {
+            if let previousDeferredMetrics {
+                defaults.set(previousDeferredMetrics, forKey: AppCoordinator.deferredMigrationMetricsDefaultsKey)
+            } else {
+                defaults.removeObject(forKey: AppCoordinator.deferredMigrationMetricsDefaultsKey)
+            }
+        }
+        defaults.removeObject(forKey: AppCoordinator.deferredMigrationMetricsDefaultsKey)
+
+        let testRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RetraceMigrationPostflightFailureTests_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: testRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: testRoot) }
+
+        let migrationDBPath = testRoot.appendingPathComponent("retrace.db").path
+        let failingDatabaseDirectory = testRoot.appendingPathComponent("invalid-db", isDirectory: true)
+        try FileManager.default.createDirectory(at: failingDatabaseDirectory, withIntermediateDirectories: true)
+
+        let engine = DatabaseMigrationEngine(
+            databasePath: migrationDBPath,
+            storageRootPath: testRoot.path
+        )
+        let job = try await engine.scheduleJob(kind: .schema)
+
+        let coordinator = AppCoordinator(
+            services: ServiceContainer(databasePath: failingDatabaseDirectory.path),
+            databaseMigrationEngine: engine
+        )
+
+        do {
+            _ = try await coordinator.runDatabaseMigration(job: job)
+            XCTFail("Expected post-migration service reinitialization to fail")
+        } catch let error as AppError {
+            guard case .migrationPostflightFailed(let reason) = error else {
+                return XCTFail("Expected migrationPostflightFailed, got \(error)")
+            }
+            XCTAssertFalse(reason.isEmpty)
+        }
+
+        let hasPendingSchemaMigration = try await engine.detectPendingSchemaMigration()
+        XCTAssertFalse(hasPendingSchemaMigration)
+
+        let deferredEvents = loadDeferredMetricEvents(from: defaults)
+        XCTAssertEqual(
+            deferredEvents.filter { $0.metricTypeRawValue == DailyMetricsQueries.MetricType.migrationCompleted.rawValue }.count,
+            1
+        )
+        XCTAssertEqual(
+            deferredEvents.filter { $0.metricTypeRawValue == DailyMetricsQueries.MetricType.migrationPostflightFailed.rawValue }.count,
+            1
+        )
+        XCTAssertEqual(
+            deferredEvents.filter { $0.metricTypeRawValue == DailyMetricsQueries.MetricType.migrationFailed.rawValue }.count,
+            0
+        )
+    }
+
+    private func createPlaintextDatabase(at path: String) throws {
+        var db: OpaquePointer?
+        defer {
+            if let db {
+                sqlite3_close_v2(db)
+            }
+        }
+
+        guard sqlite3_open_v2(path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK,
+              let db else {
+            XCTFail("Failed to open plaintext database at \(path)")
+            return
+        }
+
+        XCTAssertEqual(
+            sqlite3_exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT);", nil, nil, nil),
+            SQLITE_OK
+        )
+    }
+
+    private func loadDeferredMetricEvents(from defaults: UserDefaults) -> [DeferredMetricEvent] {
+        guard let data = defaults.data(forKey: AppCoordinator.deferredMigrationMetricsDefaultsKey) else {
+            return []
+        }
+
+        return (try? JSONDecoder().decode([DeferredMetricEvent].self, from: data)) ?? []
+    }
+}
+
 final class SegmentUsageAlignmentTests: XCTestCase {
     func testSegmentEndDateForSessionTransitionUsesTransitionTimestampWhenNotIdle() {
         let lastFrame = Date(timeIntervalSince1970: 1_700_000_000)

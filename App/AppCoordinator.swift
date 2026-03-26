@@ -144,6 +144,23 @@ public final class PipelineStatusHolder: @unchecked Sendable {
     }
 }
 
+public final class DatabaseMigrationStatusHolder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _status = DatabaseMigrationStatus.inactive
+
+    public var status: DatabaseMigrationStatus {
+        lock.lock()
+        defer { lock.unlock() }
+        return _status
+    }
+
+    public func update(_ status: DatabaseMigrationStatus) {
+        lock.lock()
+        _status = status
+        lock.unlock()
+    }
+}
+
 /// Main coordinator that wires all modules together
 /// Implements the core data pipeline: Capture → Storage → Processing → Database → Search
 /// Owner: APP integration
@@ -255,6 +272,11 @@ public actor AppCoordinator {
 
     /// Thread-safe status holder for UI polling without actor hop
     public nonisolated let statusHolder = PipelineStatusHolder()
+    public nonisolated let migrationStatusHolder = DatabaseMigrationStatusHolder()
+    private let databaseMigrationEngine: DatabaseMigrationEngine
+    private var isDatabaseMigrationModeActive = false
+    private var shouldResumeRecordingAfterDatabaseMigration = false
+    private var servicesWereInitializedBeforeDatabaseMigration = false
 
     // Segment tracking (app focus sessions - Rewind compatible)
     private var currentSegmentID: Int64?
@@ -299,17 +321,23 @@ public actor AppCoordinator {
     private static let memoryLedgerActiveWritersTag = "app.capture.activeWriters"
     private static let dbStorageSnapshotIntervalNanoseconds: Int64 = 60_000_000_000
     private static let timelineDiskCacheJPEGCompressionQuality: CGFloat = 0.80
+    static let deferredMigrationMetricsDefaultsKey = "deferredMigrationMetrics"
 
     // MARK: - Initialization
 
-    public init(services: ServiceContainer) {
+    public init(
+        services: ServiceContainer,
+        databaseMigrationEngine: DatabaseMigrationEngine = DatabaseMigrationEngine()
+    ) {
         self.services = services
+        self.databaseMigrationEngine = databaseMigrationEngine
         Log.info("AppCoordinator created", category: .app)
     }
 
     /// Convenience initializer with default configuration
-    public init() {
+    public init(databaseMigrationEngine: DatabaseMigrationEngine = DatabaseMigrationEngine()) {
         self.services = ServiceContainer()
+        self.databaseMigrationEngine = databaseMigrationEngine
         Log.info("AppCoordinator created with default services", category: .app)
     }
 
@@ -385,6 +413,7 @@ public actor AppCoordinator {
     public func initialize() async throws {
         Log.info("Initializing AppCoordinator...", category: .app)
         try await services.initialize()
+        await flushDeferredMetricEventsIfNeeded()
 
         if await services.storage.isWALReady() {
             _ = scheduleCrashRecoveryIfNeeded(
@@ -651,6 +680,9 @@ public actor AppCoordinator {
 
     /// Start the capture pipeline
     public func startPipeline() async throws {
+        guard !isDatabaseMigrationModeActive else {
+            throw AppError.migrationInProgress
+        }
         guard !isRunning else {
             Log.warning("Pipeline already running", category: .app)
             return
@@ -2229,6 +2261,9 @@ public actor AppCoordinator {
 
     /// Get current OCR processing queue statistics
     public func getQueueStatistics() async -> QueueStatistics? {
+        if isDatabaseMigrationModeActive {
+            return nil
+        }
         guard let queue = await services.processingQueue else {
             return nil
         }
@@ -2249,6 +2284,9 @@ public actor AppCoordinator {
     /// Get frames processed per minute for the last N minutes
     /// Returns dictionary of [minuteOffset: count] where minuteOffset 0 = current minute
     public func getFramesProcessedPerMinute(lastMinutes: Int) async throws -> [Int: Int] {
+        if isDatabaseMigrationModeActive {
+            return [:]
+        }
         let db = services.database
         return try await db.getFramesProcessedPerMinute(lastMinutes: lastMinutes)
     }
@@ -2256,6 +2294,9 @@ public actor AppCoordinator {
     /// Get frames rewritten per minute for the last N minutes.
     /// Returns dictionary of [minuteOffset: count] where minuteOffset 0 = current minute.
     public func getFramesRewrittenPerMinute(lastMinutes: Int) async throws -> [Int: Int] {
+        if isDatabaseMigrationModeActive {
+            return [:]
+        }
         let db = services.database
         return try await db.getFramesRewrittenPerMinute(lastMinutes: lastMinutes)
     }
@@ -3330,11 +3371,178 @@ public actor AppCoordinator {
         timestamp: Date = Date(),
         metadata: String? = nil
     ) async throws {
+        let servicesInitialized = await services.initialized
+        if isDatabaseMigrationModeActive || !servicesInitialized {
+            if shouldDeferMetricEvent(metricType) {
+                deferMetricEvent(
+                    metricType: metricType,
+                    timestamp: timestamp,
+                    metadata: metadata
+                )
+            }
+            return
+        }
         try await services.database.recordMetricEvent(
             metricType: metricType,
             timestamp: timestamp,
             metadata: metadata
         )
+    }
+
+    public func getDatabaseMigrationStatus() -> DatabaseMigrationStatus {
+        migrationStatusHolder.status
+    }
+
+    public func isDatabaseMigrationActive() -> Bool {
+        isDatabaseMigrationModeActive
+    }
+
+    public func prepareDatabaseMigrationJobIfNeeded() async -> DatabaseMigrationJob? {
+        if let pendingJob = try? await databaseMigrationEngine.loadPendingJob() {
+            if !pendingJob.isTerminal {
+                return pendingJob
+            }
+
+            if pendingJob.kind == .schema, pendingJob.phase == .failed {
+                Log.warning(
+                    "[AppCoordinator] Skipping automatic schema migration retry after a previous failed attempt",
+                    category: .app
+                )
+                return nil
+            }
+        }
+
+        if (try? await databaseMigrationEngine.detectPendingSchemaMigration()) == true {
+            let resolution = try? DatabaseManager.resolveDatabaseConnection(
+                at: AppPaths.databasePath,
+                preferredEncrypted: true,
+                encryptedKeyAccounts: [AppPaths.keychainAccount]
+            )
+            return try? await databaseMigrationEngine.scheduleJob(
+                kind: .schema,
+                keychainAccount: resolution?.keychainAccount ?? AppPaths.keychainAccount,
+                keyMaterialSource: resolution?.keyMaterialSource
+            )
+        }
+
+        return nil
+    }
+
+    public func scheduleDatabaseMigration(
+        kind: DatabaseMigrationKind,
+        keychainAccount: String? = nil,
+        keyMaterialSource: DatabaseKeyMaterialSource? = nil
+    ) async throws -> DatabaseMigrationJob {
+        let job = try await databaseMigrationEngine.scheduleJob(
+            kind: kind,
+            keychainAccount: keychainAccount,
+            keyMaterialSource: keyMaterialSource
+        )
+        try? await recordMetricEvent(
+            metricType: .migrationScheduled,
+            metadata: migrationMetricMetadata(job: job)
+        )
+        return job
+    }
+
+    public func markDatabaseMigrationInterrupted(reason: String) async {
+        try? await databaseMigrationEngine.markInterrupted(reason: reason)
+        try? await recordMetricEvent(metricType: .migrationInterrupted, metadata: reason)
+        let current = migrationStatusHolder.status
+        migrationStatusHolder.update(
+            DatabaseMigrationStatus(
+                isActive: current.isActive,
+                jobID: current.jobID,
+                kind: current.kind,
+                phase: current.phase,
+                progress: current.progress,
+                message: "Interrupted: \(reason)",
+                estimatedSecondsRemaining: current.estimatedSecondsRemaining,
+                updatedAt: Date()
+            )
+        )
+    }
+
+    @discardableResult
+    public func runPreparedDatabaseMigrationIfNeeded() async throws -> DatabaseMigrationJob? {
+        guard let job = await prepareDatabaseMigrationJobIfNeeded() else {
+            return nil
+        }
+        return try await runDatabaseMigration(job: job)
+    }
+
+    @discardableResult
+    public func runDatabaseMigration(job: DatabaseMigrationJob) async throws -> DatabaseMigrationJob {
+        let resumedJob = try? await databaseMigrationEngine.loadPendingJob()
+        let didResume = resumedJob?.id == job.id && resumedJob?.startedAt != nil
+        let jobDescription = migrationMetricMetadata(job: job)
+
+        if didResume {
+            try? await recordMetricEvent(metricType: .migrationResumed, metadata: jobDescription)
+        }
+        try? await recordMetricEvent(metricType: .migrationStarted, metadata: jobDescription)
+
+        try await enterDatabaseMigrationMode(for: job)
+
+        let finalJob: DatabaseMigrationJob
+        do {
+            finalJob = try await databaseMigrationEngine.run(
+                job: job,
+                progress: { [migrationStatusHolder] status in
+                    migrationStatusHolder.update(status)
+                }
+            )
+        } catch {
+            if error.localizedDescription.localizedCaseInsensitiveContains("insufficient disk space") {
+                try? await recordMetricEvent(
+                    metricType: .migrationBlockedInsufficientDisk,
+                    metadata: migrationMetricMetadata(job: job, extra: error.localizedDescription)
+                )
+            }
+
+            do {
+                try await leaveDatabaseMigrationMode()
+            } catch {
+                Log.warning(
+                    "[AppCoordinator] Failed to leave migration mode after migration error: \(error.localizedDescription)",
+                    category: .app
+                )
+            }
+
+            try? await recordMetricEvent(
+                metricType: .migrationFailed,
+                metadata: migrationMetricMetadata(job: job, extra: error.localizedDescription)
+            )
+            throw error
+        }
+
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        switch finalJob.kind {
+        case .encrypt:
+            defaults.set(true, forKey: "encryptionEnabled")
+        case .decrypt:
+            defaults.set(false, forKey: "encryptionEnabled")
+        case .schema:
+            break
+        }
+
+        try? await recordMetricEvent(
+            metricType: .migrationCompleted,
+            metadata: migrationMetricMetadata(job: finalJob)
+        )
+
+        do {
+            try await leaveDatabaseMigrationMode()
+        } catch {
+            let postflightError = AppError.migrationPostflightFailed(reason: error.localizedDescription)
+            try? await recordMetricEvent(
+                metricType: .migrationPostflightFailed,
+                metadata: migrationMetricMetadata(job: finalJob, extra: error.localizedDescription)
+            )
+            throw postflightError
+        }
+
+        return finalJob
     }
 
     /// Get daily counts for a metric type (for 7-day graphs)
@@ -4392,7 +4600,175 @@ public actor AppCoordinator {
     }
 }
 
+private extension AppCoordinator {
+    func enterDatabaseMigrationMode(for job: DatabaseMigrationJob) async throws {
+        guard !isDatabaseMigrationModeActive else { return }
+
+        isDatabaseMigrationModeActive = true
+        servicesWereInitializedBeforeDatabaseMigration = await services.initialized
+        shouldResumeRecordingAfterDatabaseMigration = isRunning
+        migrationStatusHolder.update(
+            DatabaseMigrationStatus(
+                isActive: true,
+                jobID: job.id,
+                kind: job.kind,
+                phase: job.phase,
+                progress: 0,
+                message: "Preparing migration mode",
+                estimatedSecondsRemaining: job.estimatedDurationSeconds,
+                updatedAt: Date()
+            )
+        )
+
+        if isRunning {
+            try? await stopPipeline(persistState: false)
+        }
+
+        stopOrphanedVideoCleanup()
+        stopDBStorageSnapshotTask()
+
+        if servicesWereInitializedBeforeDatabaseMigration {
+            try await services.shutdown()
+        }
+    }
+
+    func leaveDatabaseMigrationMode() async throws {
+        if !(await services.initialized) {
+            try await services.initialize()
+            await flushDeferredMetricEventsIfNeeded()
+            await applyPowerSettings()
+            startOrphanedVideoCleanup()
+            await recordDBStorageSnapshot(reason: "post_database_migration")
+            startDBStorageSnapshotTask()
+        }
+
+        isDatabaseMigrationModeActive = false
+        migrationStatusHolder.update(.inactive)
+
+        if shouldResumeRecordingAfterDatabaseMigration {
+            shouldResumeRecordingAfterDatabaseMigration = false
+            try? await startPipeline()
+        }
+    }
+
+    func migrationMetricMetadata(job: DatabaseMigrationJob, extra: String? = nil) -> String {
+        let required = job.requiredFreeSpaceBytes ?? 0
+        let footprint = job.observedFootprintBytes ?? 0
+        let account = job.keychainAccount ?? AppPaths.keychainAccount
+        let extraValue = extra ?? ""
+        return [
+            "kind=\(job.kind.rawValue)",
+            "phase=\(job.phase.rawValue)",
+            "db=\(job.databasePath)",
+            "footprint=\(footprint)",
+            "required=\(required)",
+            "keychain=\(account)",
+            "key_source=\(job.keyMaterialSource?.rawValue ?? "")",
+            "extra=\(extraValue)"
+        ].joined(separator: ";")
+    }
+
+    func shouldDeferMetricEvent(_ metricType: DailyMetricsQueries.MetricType) -> Bool {
+        switch metricType {
+        case .migrationScheduled,
+             .migrationStarted,
+             .migrationCompleted,
+             .migrationFailed,
+             .migrationPostflightFailed,
+             .migrationInterrupted,
+             .migrationResumed,
+             .migrationBlockedInsufficientDisk,
+             .recoveryKeyGenerated,
+             .recoveryKeyRestored,
+             .encryptionPromptShown,
+             .encryptionPromptCTA,
+             .encryptionPromptSnoozed:
+            return true
+        default:
+            return false
+        }
+    }
+
+    func deferMetricEvent(
+        metricType: DailyMetricsQueries.MetricType,
+        timestamp: Date,
+        metadata: String?
+    ) {
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        var events = loadDeferredMetricEvents(from: defaults)
+        events.append(
+            DeferredMetricEvent(
+                metricTypeRawValue: metricType.rawValue,
+                timestamp: timestamp,
+                metadata: metadata
+            )
+        )
+        storeDeferredMetricEvents(events, in: defaults)
+    }
+
+    func flushDeferredMetricEventsIfNeeded() async {
+        guard await services.initialized else {
+            return
+        }
+
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let events = loadDeferredMetricEvents(from: defaults)
+        guard !events.isEmpty else {
+            return
+        }
+
+        var remaining: [DeferredMetricEvent] = []
+        for event in events {
+            guard let metricType = DailyMetricsQueries.MetricType(rawValue: event.metricTypeRawValue) else {
+                continue
+            }
+
+            do {
+                try await services.database.recordMetricEvent(
+                    metricType: metricType,
+                    timestamp: event.timestamp,
+                    metadata: event.metadata
+                )
+            } catch {
+                remaining.append(event)
+            }
+        }
+
+        storeDeferredMetricEvents(remaining, in: defaults)
+    }
+
+    func loadDeferredMetricEvents(from defaults: UserDefaults) -> [DeferredMetricEvent] {
+        guard let data = defaults.data(forKey: Self.deferredMigrationMetricsDefaultsKey) else {
+            return []
+        }
+
+        do {
+            return try JSONDecoder().decode([DeferredMetricEvent].self, from: data)
+        } catch {
+            defaults.removeObject(forKey: Self.deferredMigrationMetricsDefaultsKey)
+            return []
+        }
+    }
+
+    func storeDeferredMetricEvents(_ events: [DeferredMetricEvent], in defaults: UserDefaults) {
+        guard !events.isEmpty else {
+            defaults.removeObject(forKey: Self.deferredMigrationMetricsDefaultsKey)
+            return
+        }
+
+        if let data = try? JSONEncoder().encode(events) {
+            defaults.set(data, forKey: Self.deferredMigrationMetricsDefaultsKey)
+        }
+    }
+}
+
 // MARK: - Supporting Types
+
+struct DeferredMetricEvent: Codable, Sendable {
+    let metricTypeRawValue: String
+    let timestamp: Date
+    let metadata: String?
+}
 
 public struct AppStatistics: Sendable {
     public let isRunning: Bool
@@ -4498,6 +4874,8 @@ public enum AppError: Error {
     case notRunning
     case processingQueueNotAvailable
     case ocrReprocessBlockedForRedactedFrame(frameID: Int64)
+    case migrationInProgress
+    case migrationPostflightFailed(reason: String)
 }
 
 extension AppError: LocalizedError {
@@ -4517,6 +4895,10 @@ extension AppError: LocalizedError {
             return "The processing queue is not available."
         case .ocrReprocessBlockedForRedactedFrame(let frameID):
             return "OCR refresh is not available for frame \(frameID) because it contains protected redacted text."
+        case .migrationInProgress:
+            return "A database migration is in progress."
+        case .migrationPostflightFailed(let reason):
+            return "Database migration completed, but post-migration reinitialization failed: \(reason)"
         }
     }
 }

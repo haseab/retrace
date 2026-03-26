@@ -10068,13 +10068,18 @@ public class SimpleTimelineViewModel: ObservableObject {
         currentNodesVersion += 1
     }
 
-    private func decryptedOCRText(for node: OCRNodeWithText, secret: String) -> String? {
+    private func decryptedOCRText(
+        for node: OCRNodeWithText,
+        currentSecret: String,
+        legacySecret: String?
+    ) -> String? {
         guard let encryptedText = node.encryptedText else { return nil }
         return ReversibleOCRScrambler.decryptOCRText(
             encryptedText,
             frameID: node.frameId,
             nodeOrder: node.nodeOrder,
-            secret: secret
+            secret: currentSecret,
+            legacySecret: legacySecret
         )
     }
 
@@ -10089,11 +10094,16 @@ public class SimpleTimelineViewModel: ObservableObject {
             return visibleText
         }
 
-        guard let secret = ReversibleOCRScrambler.currentAppWideSecret() else {
+        guard let currentSecret = ReversibleOCRScrambler.currentAppWideSecret() else {
             return nil
         }
+        let legacySecret = ReversibleOCRScrambler.legacyAppWideSecret()
 
-        return decryptedOCRText(for: currentNode, secret: secret)?
+        return decryptedOCRText(
+            for: currentNode,
+            currentSecret: currentSecret,
+            legacySecret: legacySecret
+        )?
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
@@ -10119,13 +10129,14 @@ public class SimpleTimelineViewModel: ObservableObject {
             )
             return
         }
-        guard let secret = ReversibleOCRScrambler.currentAppWideSecret() else {
+        guard let currentSecret = ReversibleOCRScrambler.currentAppWideSecret() else {
             Log.warning(
                 "[PhraseRedaction][UI] Skip reveal node=\(node.id) frame=\(node.frameId) because no master key exists",
                 category: .ui
             )
             return
         }
+        let legacySecret = ReversibleOCRScrambler.legacyAppWideSecret()
 
         if revealedRedactedNodePatches[node.id] != nil {
             revealedRedactedNodePatches.removeValue(forKey: node.id)
@@ -10144,14 +10155,23 @@ public class SimpleTimelineViewModel: ObservableObject {
             guard let self else { return }
             do {
                 let sourceImage = try await self.sourceCGImageForCurrentFrame(frame: frame)
+                let patchSecret = self.patchRevealSecret(
+                    for: node,
+                    currentSecret: currentSecret,
+                    legacySecret: legacySecret
+                )
                 guard let patch = self.buildDescrambledPatchImage(
                     node: node,
                     sourceImage: sourceImage,
-                    secret: secret
+                    secret: patchSecret
                 ) else {
                     return
                 }
-                let revealedText = self.decryptedOCRText(for: node, secret: secret)
+                let revealedText = self.decryptedOCRText(
+                    for: node,
+                    currentSecret: currentSecret,
+                    legacySecret: legacySecret
+                )
 
                 await MainActor.run {
                     guard self.currentTimelineFrame?.frame.id == frame.id else { return }
@@ -10265,6 +10285,18 @@ public class SimpleTimelineViewModel: ObservableObject {
         ) else { return nil }
 
         return patchImage
+    }
+
+    private func patchRevealSecret(
+        for node: OCRNodeWithText,
+        currentSecret: String,
+        legacySecret: String?
+    ) -> String {
+        if ReversibleOCRScrambler.shouldUseLegacySecret(for: node.encryptedText),
+           let legacySecret {
+            return legacySecret
+        }
+        return currentSecret
     }
 
     private func nsImageFromBGRA(data: Data, width: Int, height: Int, bytesPerRow: Int) -> NSImage? {

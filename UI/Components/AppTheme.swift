@@ -103,8 +103,7 @@ public class AppNameResolver {
     private var isDirty = false
 
     private init() {
-        // Use AppPaths which respects custom storage location
-        let retraceDir = URL(fileURLWithPath: AppPaths.expandedStorageRoot)
+        let retraceDir = URL(fileURLWithPath: AppPaths.expandedAppSupportRoot, isDirectory: true)
         try? FileManager.default.createDirectory(at: retraceDir, withIntermediateDirectories: true)
         cacheFileURL = retraceDir.appendingPathComponent("app_names.json")
         loadFromDisk()
@@ -570,8 +569,7 @@ public class FaviconProvider {
     }()
 
     private init() {
-        // Store favicon cache in AppPaths.storageRoot (respects custom location)
-        let retraceDir = URL(fileURLWithPath: AppPaths.expandedStorageRoot)
+        let retraceDir = URL(fileURLWithPath: AppPaths.expandedAppSupportRoot, isDirectory: true)
         try? FileManager.default.createDirectory(at: retraceDir, withIntermediateDirectories: true)
         cacheFileURL = retraceDir.appendingPathComponent("favicon_cache")
 
@@ -1014,8 +1012,7 @@ public class AppIconColorCache {
     private var pendingExtractions: Set<String> = []
 
     private init() {
-        // Store in AppPaths.storageRoot (respects custom location)
-        let retraceDir = URL(fileURLWithPath: AppPaths.expandedStorageRoot)
+        let retraceDir = URL(fileURLWithPath: AppPaths.expandedAppSupportRoot, isDirectory: true)
 
         // Create directory if needed
         try? FileManager.default.createDirectory(at: retraceDir, withIntermediateDirectories: true)

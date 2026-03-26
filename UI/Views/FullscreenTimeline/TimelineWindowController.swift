@@ -642,6 +642,16 @@ public class TimelineWindowController: NSObject {
         moveWindowToMouseScreen()
     }
 
+    private func routeToSystemMonitorIfDatabaseMigrationActive() -> Bool {
+        guard coordinator?.migrationStatusHolder.status.isActive == true else {
+            return false
+        }
+
+        DashboardWindowController.shared.show()
+        NotificationCenter.default.post(name: .openSystemMonitor, object: nil)
+        return true
+    }
+
     // MARK: - Pre-rendering
 
     /// Prepare a metadata-only timeline state at startup.
@@ -681,6 +691,9 @@ public class TimelineWindowController: NSObject {
 
 	    /// Show the timeline overlay on the current screen
     public func show() {
+        if routeToSystemMonitorIfDatabaseMigrationActive() {
+            return
+        }
         cancelDeferredHostingViewDetach()
 
         // If we're in the middle of hiding, cancel the animation and snap back to visible
@@ -1401,6 +1414,9 @@ public class TimelineWindowController: NSObject {
             "[TimelineToggle] toggle invoked currentlyVisible=\(isVisible) searchOverlayVisible=\(timelineViewModel?.isSearchOverlayVisible ?? false)",
             category: .ui
         )
+        if routeToSystemMonitorIfDatabaseMigrationActive() {
+            return
+        }
         if isVisible {
             hide()
         } else {
@@ -1417,6 +1433,9 @@ public class TimelineWindowController: NSObject {
 
     /// Show the timeline and navigate to a specific date
     public func showAndNavigate(to date: Date) {
+        if routeToSystemMonitorIfDatabaseMigrationActive() {
+            return
+        }
         show()
 
         // Navigate after a brief delay to allow the view to initialize
@@ -1428,6 +1447,9 @@ public class TimelineWindowController: NSObject {
 
     /// Show timeline and apply deeplink search state (`q`, `app`, `t`/`timestamp`).
     public func showSearch(query: String?, timestamp: Date?, appBundleID: String?, source: String = "unknown") {
+        if routeToSystemMonitorIfDatabaseMigrationActive() {
+            return
+        }
         deeplinkSearchInvocationCounter += 1
         let invocationID = deeplinkSearchInvocationCounter
         Log.info(
@@ -1697,6 +1719,9 @@ public class TimelineWindowController: NSObject {
     ///   - endDate: Optional end date for filtering (e.g., now)
     ///   - clickStartTime: Optional start time from when the tab was clicked (for end-to-end timing)
     public func showWithFilter(bundleID: String, windowName: String?, browserUrl: String? = nil, startDate: Date? = nil, endDate: Date? = nil, clickStartTime: CFAbsoluteTime? = nil) {
+        if routeToSystemMonitorIfDatabaseMigrationActive() {
+            return
+        }
         let startTime = clickStartTime ?? CFAbsoluteTimeGetCurrent()
 
         // Build the filter criteria upfront

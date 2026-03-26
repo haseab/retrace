@@ -18,6 +18,7 @@ private let phraseLevelRedactionEnabledDefaultsKey = "phraseLevelRedactionEnable
 
 private enum MasterKeyProtectedFeature: String, Identifiable {
     case phraseLevelRedaction
+    case databaseEncryption
 
     var id: String { rawValue }
 
@@ -30,7 +31,12 @@ private enum MasterKeyProtectedFeature: String, Identifiable {
     }
 
     var setupPromptMessage: String {
-        "Turning on keyword redaction requires a master key stored in your Keychain. Retrace will create it locally on this Mac before enabling the feature."
+        switch self {
+        case .phraseLevelRedaction:
+            return "Turning on keyword redaction requires a master key. Choose whether Retrace stores it only on this Mac or syncs it with iCloud Keychain."
+        case .databaseEncryption:
+            return "Encrypting the database now uses the same master key as protected redaction. Choose whether Retrace stores it only on this Mac or syncs it with iCloud Keychain."
+        }
     }
 
     var successTitle: String {
@@ -47,6 +53,8 @@ private struct MasterKeySetupSession: Identifiable {
     let id = UUID()
     let feature: MasterKeyProtectedFeature
     let recoveryPhrase: String
+    let storagePolicy: MasterKeyStoragePolicy
+    let continuesWithDatabaseEncryption: Bool
     var step: Step = .created
 }
 
@@ -102,7 +110,7 @@ enum SettingsDefaults {
     static let phraseLevelRedactionPhrases = "[]"
     static let excludeSafariPrivate = true
     static let excludeChromeIncognito = true
-    static let encryptionEnabled = true
+    static let encryptionEnabled = false
 
     // MARK: Developer
     static let showFrameIDs = false
@@ -225,6 +233,7 @@ public struct SettingsView: View {
 
     /// Optional initial tab to open (passed from parent when navigating to specific section)
     private let initialTab: SettingsTab?
+    private let initialDatabaseEncryptionRequestID: UUID?
 
     @State private var selectedTab: SettingsTab = .general
     @State private var hoveredTab: SettingsTab? = nil
@@ -245,8 +254,13 @@ public struct SettingsView: View {
 
     // MARK: - Initialization
 
-    public init(initialTab: SettingsTab? = nil, initialScrollTargetID: String? = nil) {
+    public init(
+        initialTab: SettingsTab? = nil,
+        initialScrollTargetID: String? = nil,
+        initialDatabaseEncryptionRequestID: UUID? = nil
+    ) {
         self.initialTab = initialTab
+        self.initialDatabaseEncryptionRequestID = initialDatabaseEncryptionRequestID
         // Set initial selected tab if provided
         if let tab = initialTab {
             _selectedTab = State(initialValue: tab)
@@ -352,6 +366,7 @@ public struct SettingsView: View {
     @State private var pendingMasterKeyFeature: MasterKeyProtectedFeature?
     @State private var masterKeySetupSession: MasterKeySetupSession?
     @State private var isCreatingMasterKey = false
+    @State private var isUnlockingMasterKey = false
     @State private var animateMasterKeyCreatedState = false
 
     // Computed property to manage excluded apps as array
@@ -510,6 +525,20 @@ public struct SettingsView: View {
     // Database schema display
     @State private var showingDatabaseSchema = false
     @State private var databaseSchemaText: String = ""
+    @State private var showDatabaseMigrationWizard = false
+    @State private var showRecoveryKeyRestoreSheet = false
+    @State private var databaseMigrationKind: DatabaseMigrationKind = .encrypt
+    @State private var databaseMigrationStep: DatabaseMigrationWizardStep = .warning
+    @State private var migrationEstimateMinutes = 0
+    @State private var migrationRequiredSpaceBytes: Int64?
+    @State private var migrationAvailableSpaceBytes: Int64?
+    @State private var migrationShortfallBytes: Int64?
+    @State private var isPreparingDatabaseMigrationEstimate = false
+    @State private var isRunningDatabaseMigration = false
+    @State private var detectedDatabaseEncryptionState: DatabaseFileEncryptionState = .missing
+    @State private var recoveryPhraseImportText = ""
+    @State private var recoveryPhraseImportError: String?
+    @State private var recoveryPhraseRestorePolicy: MasterKeyStoragePolicy = .localOnly
 
     // App coordinator for deletion operations
     @EnvironmentObject private var coordinatorWrapper: AppCoordinatorWrapper
@@ -555,6 +584,8 @@ public struct SettingsView: View {
         // Privacy
         SettingsSearchEntry(id: "privacy.excludedApps", tab: .privacy, cardTitle: "App Level Redaction", cardIcon: "app.badge.checkmark",
             searchableText: ["excluded apps", "block app", "privacy", "apps not recorded", "app exclusion"]),
+        SettingsSearchEntry(id: "privacy.databaseEncryption", tab: .privacy, cardTitle: "Database Encryption", cardIcon: "lock.doc",
+            searchableText: ["database encryption", "encrypt database", "decrypt database", "recovery key", "migration mode", "maintenance mode"]),
         SettingsSearchEntry(id: "privacy.frameRedaction", tab: .privacy, cardTitle: "Window Level Redaction", cardIcon: "eye.slash",
             searchableText: ["redaction", "window title", "browser url", "black frames", "privacy rules", "incognito", "private browsing", "automation", "vivaldi", "sigmaos"]),
         SettingsSearchEntry(id: "privacy.phraseRedaction", tab: .privacy, cardTitle: "Phrase Level Redaction", cardIcon: "text.viewfinder",
@@ -605,6 +636,7 @@ public struct SettingsView: View {
     private let settingsMinWidth: CGFloat = 760
     static let pauseReminderIntervalTargetID = "settings.pauseReminderInterval"
     private static let pauseReminderCardAnchorID = "settings.pauseReminderCard"
+    static let databaseEncryptionTargetID = "settings.databaseEncryption"
     static let timelineScrollOrientationTargetID = "settings.timelineScrollOrientation"
     private static let timelineScrollOrientationAnchorID = "settings.timelineScrollOrientationAnchor"
     static let powerOCRCardTargetID = "settings.powerOCRCard"
@@ -686,6 +718,140 @@ public struct SettingsView: View {
     }
 
     public var body: some View {
+        configuredBody
+    }
+
+    private var configuredBody: some View {
+        tertiaryConfiguredBody
+        .background {
+            Button("") {
+                openSettingsSearch(source: "keyboard_cmd_k")
+            }
+            .keyboardShortcut("k", modifiers: .command)
+            .frame(width: 0, height: 0)
+            .opacity(0)
+        }
+    }
+
+    private var tertiaryConfiguredBody: some View {
+        secondaryConfiguredBody
+        .overlay {
+            settingsSearchOverlay
+                .animation(.easeOut(duration: 0.15), value: showSettingsSearch)
+        }
+        .overlay(alignment: .top) {
+            if let message = settingsToastMessage {
+                HStack(spacing: 10) {
+                    Image(systemName: settingsToastIsError ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundColor(settingsToastIsError ? .orange : .green)
+                    Text(message)
+                        .font(.retraceCaption)
+                        .foregroundColor(.retracePrimary)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .background(.ultraThinMaterial, in: Capsule())
+                .overlay(
+                    Capsule()
+                        .stroke((settingsToastIsError ? Color.orange : Color.green).opacity(0.35), lineWidth: 1)
+                )
+                .shadow(color: Color.black.opacity(0.18), radius: 16, x: 0, y: 10)
+                .padding(.top, 16)
+                .scaleEffect(settingsToastVisible ? 1.0 : 0.9)
+                .opacity(settingsToastVisible ? 1.0 : 0.0)
+            }
+        }
+    }
+
+    private var secondaryConfiguredBody: some View {
+        primaryConfiguredBody
+        .onReceive(NotificationCenter.default.publisher(for: .openSettingsPower)) { _ in
+            selectedTab = .power
+            pendingScrollTargetID = nil
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openSettingsTags)) { _ in
+            selectedTab = .tags
+            pendingScrollTargetID = nil
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openSettingsPauseReminderInterval)) { _ in
+            requestNavigation(to: Self.pauseReminderIntervalTargetID)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openSettingsTimelineScrollOrientation)) { _ in
+            requestNavigation(to: Self.timelineScrollOrientationTargetID)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openSettingsPowerOCRCard)) { _ in
+            requestNavigation(to: Self.powerOCRCardTargetID)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openSettingsPowerOCRPriority)) { _ in
+            requestNavigation(to: Self.powerOCRPriorityTargetID)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openSettingsDatabaseEncryption)) { _ in
+            requestNavigation(to: Self.databaseEncryptionTargetID)
+        }
+        .task(id: initialDatabaseEncryptionRequestID) {
+            guard initialDatabaseEncryptionRequestID != nil else {
+                return
+            }
+            openDatabaseMigrationWizard(kind: .encrypt)
+        }
+        .onDisappear {
+            pauseReminderHighlightTask?.cancel()
+            pauseReminderHighlightTask = nil
+            isPauseReminderCardHighlighted = false
+            ocrCardHighlightTask?.cancel()
+            ocrCardHighlightTask = nil
+            isOCRCardHighlighted = false
+            ocrPrioritySliderHighlightTask?.cancel()
+            ocrPrioritySliderHighlightTask = nil
+            isOCRPrioritySliderHighlighted = false
+            timelineScrollOrientationHighlightTask?.cancel()
+            timelineScrollOrientationHighlightTask = nil
+            isTimelineScrollOrientationHighlighted = false
+            settingsToastDismissTask?.cancel()
+            settingsToastDismissTask = nil
+            rewindCutoffRefreshTask?.cancel()
+            rewindCutoffRefreshTask = nil
+            cancelAllInPageURLIconLoads()
+        }
+    }
+
+    private var primaryConfiguredBody: some View {
+        settingsContainer
+        .onAppear {
+            if !launchedPathInitialized {
+                launchedWithRetraceDBPath = customRetraceDBLocation
+                launchedPathInitialized = true
+            }
+
+            let systemLaunchAtLoginEnabled = SMAppService.mainApp.status == .enabled
+            if launchAtLogin != systemLaunchAtLoginEnabled {
+                launchAtLogin = systemLaunchAtLoginEnabled
+            }
+
+            postSelectedTabNotification(selectedTab)
+        }
+        .onChange(of: selectedTab) { newTab in
+            postSelectedTabNotification(newTab)
+        }
+        .onChange(of: timelineShortcut) { _ in
+            Task { await saveShortcuts() }
+        }
+        .onChange(of: dashboardShortcut) { _ in
+            Task { await saveShortcuts() }
+        }
+        .onChange(of: recordingShortcut) { _ in
+            Task { await saveShortcuts() }
+        }
+        .onChange(of: systemMonitorShortcut) { _ in
+            Task { await saveShortcuts() }
+        }
+        .onChange(of: feedbackShortcut) { _ in
+            Task { await saveShortcuts() }
+        }
+    }
+
+    private var settingsContainer: some View {
         GeometryReader { geometry in
             let windowWidth = geometry.size.width
             let detached = windowWidth > settingsMaxWidth
@@ -932,7 +1098,11 @@ public struct SettingsView: View {
                     .font(.retraceMediumNumber)
                     .foregroundColor(.retracePrimary)
 
-                Text("Stored in Keychain on this Mac")
+                Text(
+                    masterKeySetupSession?.storagePolicy == .iCloudKeychain
+                        ? "Stored in iCloud Keychain"
+                        : "Stored in Keychain on this Mac"
+                )
                     .font(.retraceCaption)
                     .foregroundColor(.retraceSecondary)
                     .multilineTextAlignment(.center)
@@ -969,7 +1139,11 @@ public struct SettingsView: View {
                     .font(.retraceMediumNumber)
                     .foregroundColor(.retracePrimary)
 
-                Text("This is the only recovery path if the Keychain copy on this Mac is lost.")
+                Text(
+                    session.storagePolicy == .iCloudKeychain
+                        ? "iCloud Keychain sync is enabled, but this recovery phrase is still your fallback if the synced copy is unavailable."
+                        : "This is the only recovery path if the Keychain copy on this Mac is lost."
+                )
                     .font(.retraceCaption)
                     .foregroundColor(.retraceSecondary)
             }
@@ -977,7 +1151,9 @@ public struct SettingsView: View {
             alertBanner(
                 icon: "exclamationmark.triangle.fill",
                 title: "Store this offline and keep it private",
-                message: "Anyone with this phrase can recover your protected data. If you lose both this phrase and the Keychain entry on this Mac, that data is gone."
+                message: session.storagePolicy == .iCloudKeychain
+                    ? "Anyone with this phrase can recover your protected data. Keep it somewhere private even if the master key syncs with iCloud Keychain."
+                    : "Anyone with this phrase can recover your protected data. If you lose both this phrase and the Keychain entry on this Mac, that data is gone."
             )
 
             VStack(alignment: .leading, spacing: 10) {
@@ -1103,8 +1279,11 @@ public struct SettingsView: View {
             phraseLevelRedactionEnabled = !phraseLevelRedactionPhrases.isEmpty
         }
 
-        hasMasterKeyInKeychain = MasterKeyManager.hasMasterKey()
         phraseLevelRedactionToggleInitialized = true
+
+        Task { @MainActor in
+            await refreshMasterKeyPresence()
+        }
     }
 
     private func setPrivateWindowRedactionEnabled(_ enabled: Bool) {
@@ -1127,18 +1306,35 @@ public struct SettingsView: View {
     private func setPhraseLevelRedactionEnabled(_ enabled: Bool) {
         guard enabled != phraseLevelRedactionEnabled else { return }
 
-        if enabled && !hasMasterKeyInKeychain {
-            promptForMasterKey(feature: .phraseLevelRedaction)
+        if enabled {
+            guard hasMasterKeyInKeychain else {
+                promptForMasterKey(feature: .phraseLevelRedaction)
+                return
+            }
+
+            Task { @MainActor in
+                guard await unlockMasterKeyForProtectedFeature(.phraseLevelRedaction) else {
+                    return
+                }
+
+                phraseLevelRedactionEnabled = true
+                settingsStore.set(true, forKey: phraseLevelRedactionEnabledDefaultsKey)
+                showSettingsToast("Keyword redaction enabled")
+                recordMasterKeyMetric(
+                    action: "feature_enabled",
+                    source: MasterKeyProtectedFeature.phraseLevelRedaction.metricSource
+                )
+            }
             return
         }
 
-        phraseLevelRedactionEnabled = enabled
-        settingsStore.set(enabled, forKey: phraseLevelRedactionEnabledDefaultsKey)
+        phraseLevelRedactionEnabled = false
+        settingsStore.set(false, forKey: phraseLevelRedactionEnabledDefaultsKey)
         Task { @MainActor in
-            showSettingsToast(enabled ? "Keyword redaction enabled" : "Keyword redaction disabled")
+            showSettingsToast("Keyword redaction disabled")
         }
         recordMasterKeyMetric(
-            action: enabled ? "feature_enabled" : "feature_disabled",
+            action: "feature_disabled",
             source: MasterKeyProtectedFeature.phraseLevelRedaction.metricSource
         )
     }
@@ -1162,27 +1358,40 @@ public struct SettingsView: View {
                 }
             )
 
-            hasMasterKeyInKeychain = MasterKeyManager.hasMasterKey()
             switch outcome {
             case .deferred:
                 return
             case .recoveredExistingKey, .keyAlreadyAvailable:
-                applyProtectedFeatureActivation(feature, showToast: false)
-                showSettingsToast(
-                    state.hasPendingRedactionRewrites
-                        ? "Master key recovered; pending redaction rewrites will resume"
-                        : "Master key recovered; keyword redaction enabled"
-                )
-            case .createdFreshKey(let recoveryPhrase, let abandonedRewriteCount):
-                applyProtectedFeatureActivation(feature, showToast: false)
-                showSettingsToast(
-                    abandonedRewriteCount > 0
-                        ? "Master key created; old pending rewrites were marked failed"
-                        : "Keyword redaction enabled"
-                )
+                hasMasterKeyInKeychain = true
+                switch feature {
+                case .phraseLevelRedaction:
+                    applyProtectedFeatureActivation(feature, showToast: false)
+                    showSettingsToast(
+                        state.hasPendingRedactionRewrites
+                            ? "Master key recovered; pending redaction rewrites will resume"
+                            : "Master key recovered; keyword redaction enabled"
+                    )
+                case .databaseEncryption:
+                    showSettingsToast("Master key recovered")
+                    openDatabaseMigrationWizard(kind: .encrypt, skipMasterKeyCheck: true)
+                }
+            case .createdFreshKey(let recoveryPhrase, let storagePolicy, let abandonedRewriteCount):
+                hasMasterKeyInKeychain = true
+                if feature == .phraseLevelRedaction {
+                    applyProtectedFeatureActivation(feature, showToast: false)
+                    showSettingsToast(
+                        abandonedRewriteCount > 0
+                            ? "Master key created; old pending rewrites were marked failed"
+                            : "Keyword redaction enabled"
+                    )
+                } else {
+                    showSettingsToast("Master key created")
+                }
                 masterKeySetupSession = MasterKeySetupSession(
                     feature: feature,
-                    recoveryPhrase: recoveryPhrase
+                    recoveryPhrase: recoveryPhrase,
+                    storagePolicy: storagePolicy,
+                    continuesWithDatabaseEncryption: feature == .databaseEncryption
                 )
             }
         }
@@ -1192,43 +1401,98 @@ public struct SettingsView: View {
         guard !isCreatingMasterKey else { return }
         isCreatingMasterKey = true
 
-        do {
-            let result = try MasterKeyManager.createMasterKeyIfNeeded(defaults: settingsStore)
-            hasMasterKeyInKeychain = MasterKeyManager.hasMasterKey()
-            pendingMasterKeyFeature = nil
-            isCreatingMasterKey = false
+        Task { @MainActor in
+            do {
+                guard let storagePolicy = MasterKeyPromptUI.presentStoragePolicyPrompt(
+                    title: "Choose Master Key Storage",
+                    message: "Store the master key only on this Mac or sync it with iCloud Keychain. Retrace will still show a recovery phrase backup."
+                ) else {
+                    pendingMasterKeyFeature = nil
+                    isCreatingMasterKey = false
+                    recordMasterKeyMetric(
+                        action: "create_cancelled",
+                        source: feature.metricSource,
+                        metadata: ["reason": "storage_policy_cancelled"]
+                    )
+                    return
+                }
 
-            applyProtectedFeatureActivation(feature)
-            if feature == .phraseLevelRedaction, hasMasterKeyInKeychain {
-                Task {
-                    if !result.created {
-                        await coordinatorWrapper.coordinator.recoverPendingPhraseRedactionRewritesIfPossible()
+                let result = try await MasterKeyManager.createMasterKeyIfNeededAsync(
+                    defaults: settingsStore,
+                    storagePolicy: storagePolicy
+                )
+                hasMasterKeyInKeychain = true
+                pendingMasterKeyFeature = nil
+                isCreatingMasterKey = false
+
+                if feature == .phraseLevelRedaction {
+                    applyProtectedFeatureActivation(feature)
+                }
+                if feature == .phraseLevelRedaction, hasMasterKeyInKeychain {
+                    Task {
+                        if !result.created {
+                            await coordinatorWrapper.coordinator.recoverPendingPhraseRedactionRewritesIfPossible()
+                        }
                     }
                 }
-            }
 
-            if result.created, let recoveryPhrase = result.recoveryPhrase {
-                masterKeySetupSession = MasterKeySetupSession(
-                    feature: feature,
-                    recoveryPhrase: recoveryPhrase
-                )
-                recordMasterKeyMetric(action: "created", source: feature.metricSource)
-            } else {
-                recordMasterKeyMetric(action: "already_exists", source: feature.metricSource)
-            }
-        } catch {
-            pendingMasterKeyFeature = nil
-            isCreatingMasterKey = false
-            Task { @MainActor in
+                if result.created, let recoveryPhrase = result.recoveryPhrase {
+                    masterKeySetupSession = MasterKeySetupSession(
+                        feature: feature,
+                        recoveryPhrase: recoveryPhrase,
+                        storagePolicy: result.storagePolicy ?? storagePolicy,
+                        continuesWithDatabaseEncryption: feature == .databaseEncryption
+                    )
+                    recordMasterKeyMetric(
+                        action: "created",
+                        source: feature.metricSource,
+                        metadata: ["storagePolicy": (result.storagePolicy ?? storagePolicy).rawValue]
+                    )
+                } else {
+                    recordMasterKeyMetric(action: "already_exists", source: feature.metricSource)
+                    if feature == .databaseEncryption {
+                        openDatabaseMigrationWizard(kind: .encrypt, skipMasterKeyCheck: true)
+                    }
+                }
+            } catch {
+                pendingMasterKeyFeature = nil
+                isCreatingMasterKey = false
+                await refreshMasterKeyPresence()
                 showSettingsToast("Couldn't create the master key", isError: true)
+                Log.error("[SettingsView] Failed to create master key: \(error)", category: .ui)
+                recordMasterKeyMetric(
+                    action: "create_failed",
+                    source: feature.metricSource,
+                    metadata: ["error": error.localizedDescription]
+                )
             }
-            hasMasterKeyInKeychain = MasterKeyManager.hasMasterKey()
-            Log.error("[SettingsView] Failed to create master key: \(error)", category: .ui)
+        }
+    }
+
+    @MainActor
+    private func refreshMasterKeyPresence() async {
+        hasMasterKeyInKeychain = await MasterKeyManager.hasMasterKeyAsync()
+    }
+
+    @MainActor
+    private func unlockMasterKeyForProtectedFeature(_ feature: MasterKeyProtectedFeature) async -> Bool {
+        guard !isUnlockingMasterKey else { return false }
+        isUnlockingMasterKey = true
+        defer { isUnlockingMasterKey = false }
+
+        do {
+            _ = try await MasterKeyManager.loadMasterKeyAsync()
+            return true
+        } catch {
+            await refreshMasterKeyPresence()
+            showSettingsToast("Couldn't unlock the master key", isError: true)
+            Log.error("[SettingsView] Failed to unlock master key: \(error)", category: .ui)
             recordMasterKeyMetric(
-                action: "create_failed",
+                action: "unlock_failed",
                 source: feature.metricSource,
                 metadata: ["error": error.localizedDescription]
             )
+            return false
         }
     }
 
@@ -1236,12 +1500,17 @@ public struct SettingsView: View {
         _ feature: MasterKeyProtectedFeature,
         showToast: Bool = true
     ) {
-        phraseLevelRedactionEnabled = true
-        settingsStore.set(true, forKey: phraseLevelRedactionEnabledDefaultsKey)
-        if showToast {
-            Task { @MainActor in
-                showSettingsToast("Keyword redaction enabled")
+        switch feature {
+        case .phraseLevelRedaction:
+            phraseLevelRedactionEnabled = true
+            settingsStore.set(true, forKey: phraseLevelRedactionEnabledDefaultsKey)
+            if showToast {
+                Task { @MainActor in
+                    showSettingsToast("Keyword redaction enabled")
+                }
             }
+        case .databaseEncryption:
+            break
         }
     }
 
@@ -1261,6 +1530,9 @@ public struct SettingsView: View {
             source: session.feature.metricSource
         )
         masterKeySetupSession = nil
+        if session.continuesWithDatabaseEncryption {
+            openDatabaseMigrationWizard(kind: .encrypt, skipMasterKeyCheck: true)
+        }
     }
 
     private func copyMasterKeyRecoveryPhrase(_ recoveryPhrase: String) {
@@ -1320,6 +1592,26 @@ public struct SettingsView: View {
     private var retraceDBLocationChanged: Bool {
         guard launchedPathInitialized else { return false }
         return customRetraceDBLocation != launchedWithRetraceDBPath
+    }
+
+    private var launchedRetraceStorageRoot: String {
+        NSString(string: launchedWithRetraceDBPath ?? AppPaths.defaultStorageRoot).expandingTildeInPath
+    }
+
+    private var launchedRetraceDatabasePath: String {
+        "\(launchedRetraceStorageRoot)/retrace.db"
+    }
+
+    private var activeMigrationStorageRoot: String {
+        launchedPathInitialized ? launchedRetraceStorageRoot : AppPaths.expandedStorageRoot
+    }
+
+    private var activeMigrationDatabasePath: String {
+        launchedPathInitialized ? launchedRetraceDatabasePath : AppPaths.databasePath
+    }
+
+    private var databaseMigrationRequiresRestart: Bool {
+        retraceDBLocationChanged
     }
 
     /// Confirmation message for retention policy change
@@ -3492,7 +3784,7 @@ public struct SettingsView: View {
                             Image(systemName: "exclamationmark.triangle.fill")
                                 .foregroundColor(.orange)
                                 .font(.system(size: 12))
-                            Text("Stop recording to change Retrace database location")
+                            Text("Stop recording to change the active Retrace vault")
                                 .font(.retraceCaption)
                                 .foregroundColor(.retraceSecondary)
                         }
@@ -3502,12 +3794,12 @@ public struct SettingsView: View {
                         .cornerRadius(8)
                     }
 
-                    // Retrace Database Location
+                    // Retrace Vault Location
                     VStack(alignment: .leading, spacing: 8) {
                         HStack {
                             VStack(alignment: .leading, spacing: 4) {
                                 HStack(spacing: 6) {
-                                    Text("Retrace Database Folder")
+                                    Text("Retrace Vault")
                                         .font(.retraceCalloutMedium)
                                         .foregroundColor(.retracePrimary)
                                     PingDotView(
@@ -3530,22 +3822,22 @@ public struct SettingsView: View {
                                 }
                             }
                             Spacer()
-                            Button("Choose Folder...") {
+                            Button("Change Retrace Vault...") {
                                 selectRetraceDBLocation()
                             }
                             .buttonStyle(.bordered)
                             .controlSize(.regular)
                             .disabled(coordinatorWrapper.isRunning)
-                            .help(coordinatorWrapper.isRunning ? "Stop recording to change Retrace database location" : "Select a folder to store the Retrace database")
+                            .help(coordinatorWrapper.isRunning ? "Stop recording to change the active Retrace vault" : "Select the vault folder Retrace should use")
                         }
-                        Text("Select a folder where retrace.db will be stored")
+                        Text("Select the vault folder that contains retrace.db, SQLite sidecars, chunks, and vault-local WAL data")
                             .font(.retraceCaption2)
                             .foregroundColor(.retraceSecondary.opacity(0.7))
 
-                        // Restart prompt directly under Retrace Database if it changed
+                        // Restart prompt directly under Retrace Vault if it changed
                         if retraceDBLocationChanged {
                             HStack(spacing: 8) {
-                                Text("Restart the app to apply Retrace database changes")
+                                Text("Restart the app to apply Retrace vault changes")
                                     .font(.retraceCaption)
                                     .foregroundColor(.retraceSecondary)
                                 Spacer()
@@ -3627,7 +3919,7 @@ public struct SettingsView: View {
                         .buttonStyle(.bordered)
                         .controlSize(.small)
                         .disabled(coordinatorWrapper.isRunning && customRetraceDBLocation != nil)
-                        .help(coordinatorWrapper.isRunning && customRetraceDBLocation != nil ? "Stop recording to reset Retrace database location" : "")
+                        .help(coordinatorWrapper.isRunning && customRetraceDBLocation != nil ? "Stop recording to reset the active Retrace vault" : "")
                     }
                 }
         }
@@ -3940,6 +4232,7 @@ public struct SettingsView: View {
         VStack(alignment: .leading, spacing: 20) {
             appLevelRedactionCard
                 .zIndex(excludedAppsPopoverShown ? 50 : 0)
+            databaseEncryptionCard
             windowLevelRedactionCard
             phraseLevelRedactionCard
             quickDeleteCard
@@ -4029,6 +4322,89 @@ public struct SettingsView: View {
         }
         .task {
             loadExcludedAppsForRedaction()
+        }
+    }
+
+    @ViewBuilder
+    private var databaseEncryptionCard: some View {
+        ModernSettingsCard(title: "Database Encryption", icon: "lock.doc") {
+            VStack(alignment: .leading, spacing: 14) {
+                Text(databaseEncryptionSummaryText)
+                    .font(.retraceCaption)
+                    .foregroundColor(.retraceSecondary)
+
+                if databaseMigrationRequiresRestart {
+                    Text("Restart Retrace to apply the new database folder before managing encryption or recovery. Until then, these controls stay bound to the currently running database.")
+                        .font(.retraceCaption)
+                        .foregroundColor(.orange)
+                        .padding(12)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(
+                            RoundedRectangle(cornerRadius: 10)
+                                .fill(Color.orange.opacity(0.08))
+                        )
+                }
+
+                if effectiveDatabaseEncryptionEnabled && !DatabaseManager.hasDatabaseKeyInKeychain() {
+                    Text("The database is marked encrypted, but the required key is missing. Restore the master key before using encrypted data.")
+                        .font(.retraceCaption)
+                        .foregroundColor(.orange)
+                        .padding(12)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(
+                            RoundedRectangle(cornerRadius: 10)
+                                .fill(Color.orange.opacity(0.08))
+                        )
+                }
+
+                HStack(spacing: 12) {
+                    ModernButton(
+                        title: effectiveDatabaseEncryptionEnabled ? "Decrypt Database" : "Encrypt Database",
+                        icon: effectiveDatabaseEncryptionEnabled ? "lock.open.rotation" : "lock.rotation",
+                        style: effectiveDatabaseEncryptionEnabled ? .secondary : .primary
+                    ) {
+                        openDatabaseMigrationWizard(kind: effectiveDatabaseEncryptionEnabled ? .decrypt : .encrypt)
+                    }
+                    .disabled(
+                        isRunningDatabaseMigration ||
+                        databaseMigrationRequiresRestart ||
+                        !databaseSupportsMigration ||
+                        (effectiveDatabaseEncryptionEnabled && !DatabaseManager.hasDatabaseKeyInKeychain())
+                    )
+
+                    ModernButton(title: "Restore Key", icon: "key.fill", style: .secondary) {
+                        recoveryPhraseImportText = ""
+                        recoveryPhraseImportError = nil
+                        recoveryPhraseRestorePolicy = MasterKeyManager.storagePolicy(defaults: settingsStore)
+                        showRecoveryKeyRestoreSheet = true
+                    }
+                    .disabled(isRunningDatabaseMigration || databaseMigrationRequiresRestart)
+                }
+
+                if !databaseMigrationRequiresRestart,
+                   let required = migrationRequiredSpaceBytes,
+                   let available = migrationAvailableSpaceBytes {
+                    Text("Latest estimate: requires \(Self.formatBytes(required)) free, currently \(Self.formatBytes(available)) available.")
+                        .font(.retraceCaption2)
+                        .foregroundColor(.retraceSecondary.opacity(0.85))
+                }
+
+                if !databaseSupportsMigration {
+                    Text("Retrace has not created a database yet. Record once to create it, then come back here to encrypt or decrypt it.")
+                        .font(.retraceCaption2)
+                        .foregroundColor(.retraceSecondary.opacity(0.85))
+                }
+            }
+            .task(id: activeMigrationStorageRoot) {
+                await refreshDetectedDatabaseEncryptionState()
+            }
+        }
+        .id(Self.databaseEncryptionTargetID)
+        .sheet(isPresented: $showDatabaseMigrationWizard) {
+            databaseMigrationWizardSheet
+        }
+        .sheet(isPresented: $showRecoveryKeyRestoreSheet) {
+            recoveryKeyRestoreSheet
         }
     }
 
@@ -5849,6 +6225,7 @@ public struct SettingsView: View {
         case "storage.retentionPolicy": retentionPolicyCard
         case "exportData.comingSoon": comingSoonCard
         case "privacy.excludedApps": appLevelRedactionCard
+        case "privacy.databaseEncryption": databaseEncryptionCard
         case "privacy.frameRedaction": windowLevelRedactionCard
         case "privacy.phraseRedaction": phraseLevelRedactionCard
         case "privacy.quickDelete": quickDeleteCard
@@ -7640,14 +8017,14 @@ extension SettingsView {
         panel.canChooseDirectories = true
         panel.canCreateDirectories = true
         panel.allowsMultipleSelection = false
-        panel.message = "Choose a location for the Retrace database"
+        panel.message = "Choose a Retrace vault folder"
         panel.prompt = "Select"
 
-        // Open to current location if set, otherwise default storage root
+        // Open to current location if set, otherwise the fixed Retrace app-home folder.
         if let currentPath = customRetraceDBLocation {
             panel.directoryURL = URL(fileURLWithPath: (currentPath as NSString).deletingLastPathComponent)
         } else {
-            panel.directoryURL = URL(fileURLWithPath: AppPaths.expandedStorageRoot)
+            panel.directoryURL = URL(fileURLWithPath: AppPaths.expandedAppSupportRoot)
         }
 
         guard panel.runModal() == .OK, let url = panel.url else {
@@ -7660,7 +8037,7 @@ extension SettingsView {
 
         // Check if selecting the same location that's currently active
         if selectedPath == currentPath {
-            Log.info("Retrace database location unchanged (same as current): \(selectedPath)", category: .ui)
+            Log.info("Retrace vault location unchanged (same as current): \(selectedPath)", category: .ui)
             return
         }
 
@@ -7675,7 +8052,7 @@ extension SettingsView {
             case .missingChunks:
                 let shouldContinue = showDatabaseConfirmation(
                     title: "Missing Chunks Folder",
-                    message: "The selected folder has retrace.db but is missing the 'chunks' folder with video files.\n\nRetrace may not be able to load existing video frames.\n\nDo you want to continue anyway?",
+                    message: "The selected vault has retrace.db but is missing the 'chunks' folder with video files.\n\nRetrace may not be able to load existing video frames.\n\nDo you want to continue anyway?",
                     primaryButton: "Continue Anyway"
                 )
                 if !shouldContinue {
@@ -7686,13 +8063,17 @@ extension SettingsView {
                 break
             }
 
-            // If selecting the default location, clear custom path
-            if selectedPath == defaultPath {
+            let canonicalPath = (try? RetraceVaultLayoutManager.canonicalizeSelectedVaultPath(selectedPath)) ?? selectedPath
+
+            let defaultVaultPrefix = AppPaths.expandedDefaultVaultsRoot + "/"
+
+            // If selecting the built-in app-home vault location, clear the custom path override.
+            if canonicalPath.hasPrefix(defaultVaultPrefix) {
                 customRetraceDBLocation = nil
-                Log.info("Retrace database location reset to default: \(selectedPath)", category: .ui)
+                Log.info("Retrace vault location reset to default: \(canonicalPath)", category: .ui)
             } else {
-                customRetraceDBLocation = selectedPath
-                Log.info("Retrace database location changed to: \(selectedPath)", category: .ui)
+                customRetraceDBLocation = canonicalPath
+                Log.info("Retrace vault location changed to: \(canonicalPath)", category: .ui)
             }
         }
     }
@@ -7778,8 +8159,14 @@ extension SettingsView {
         let fm = FileManager.default
         let dbPath = "\(selectedPath)/retrace.db"
         let chunksPath = "\(selectedPath)/chunks"
+        let walPath = "\(selectedPath)/wal"
+        let vaultMetadataPath = "\(selectedPath)/.retrace-vault.json"
         let hasDatabase = fm.fileExists(atPath: dbPath)
         let hasChunks = fm.fileExists(atPath: chunksPath)
+        let hasCaptureWAL = fm.fileExists(atPath: walPath)
+        let hasVaultMetadata = fm.fileExists(atPath: vaultMetadataPath)
+        let lastComponent = (selectedPath as NSString).lastPathComponent
+        let isExplicitVaultFolder = hasVaultMetadata || lastComponent.hasPrefix(AppPaths.vaultFolderPrefix)
 
         if hasDatabase {
             let verification = verifyRetraceDatabase(at: dbPath)
@@ -7800,23 +8187,21 @@ extension SettingsView {
             return hasChunks ? .valid : .missingChunks
         }
 
-        let contents = (try? fm.contentsOfDirectory(atPath: selectedPath)) ?? []
-        let visibleContents = contents.filter { !$0.hasPrefix(".") }
-        guard visibleContents.isEmpty else {
-            return .invalid(
-                title: "Invalid Folder Selection",
-                message: "The selected folder contains other files but is not a valid Retrace database folder.\n\nPlease select either:\n• An existing Retrace folder (with retrace.db)\n• An empty folder for a new database"
-            )
+        if isExplicitVaultFolder || hasChunks || hasCaptureWAL {
+            if let writeProbeFailure = probeRetraceFolderWriteAccess(at: selectedPath) {
+                return .invalid(
+                    title: "Folder Not Writable",
+                    message: writeProbeFailure
+                )
+            }
+
+            return .valid
         }
 
-        if let writeProbeFailure = probeRetraceFolderWriteAccess(at: selectedPath) {
-            return .invalid(
-                title: "Folder Not Writable",
-                message: writeProbeFailure
-            )
-        }
-
-        return .valid
+        return .invalid(
+            title: "Invalid Vault Selection",
+            message: "Select a specific Retrace vault folder.\n\nChoose a folder named `vault-xxxxxx`, or a legacy Retrace folder that still contains retrace.db and chunks directly inside it."
+        )
     }
 
     nonisolated private static func probeRetraceFolderWriteAccess(at selectedPath: String) -> String? {
@@ -8110,6 +8495,442 @@ extension SettingsView {
         alert.addButton(withTitle: "Cancel")
         return alert.runModal() == .alertFirstButtonReturn
     }
+
+    private var databaseEncryptionSummaryText: String {
+        if databaseMigrationRequiresRestart {
+            return "Retrace is still using the database location it launched with. Restart the app before running encryption, decryption, or key-recovery actions so they target the same on-disk database."
+        }
+
+        if !databaseSupportsMigration {
+            return "Retrace has not created a local database yet, so there is nothing to migrate. Capture some data first, then you can encrypt or decrypt the on-disk database here."
+        }
+
+        if effectiveDatabaseEncryptionEnabled {
+            if DatabaseManager.hasDatabaseKeyInKeychain() {
+                return "Your Retrace database is currently encrypted. Decryption will place the app in migration mode, but the master key remains available for future encrypt or recovery operations."
+            }
+            return "Your database is marked encrypted, but the required key is missing. Restore the master key before continuing."
+        }
+
+        return "Your Retrace database is currently plaintext. Encryption runs in maintenance mode with a dual-shadow copy, verify, and atomic swap."
+    }
+
+    private var databaseMigrationWizardSheet: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Text(databaseMigrationKind == .encrypt ? "Encrypt Database" : "Decrypt Database")
+                .font(.retraceTitle2)
+                .foregroundColor(.retracePrimary)
+
+            if databaseMigrationKind == .encrypt && databaseMigrationStep == .recovery {
+                VStack(alignment: .leading, spacing: 14) {
+                    Text("Master Key Ready")
+                        .font(.retraceCalloutBold)
+                        .foregroundColor(.retracePrimary)
+
+                    Text("Database encryption now derives its SQLCipher key from your Retrace master key. No separate database recovery key will be generated for new encryptions.")
+                        .font(.retraceCaption)
+                        .foregroundColor(.retraceSecondary)
+
+                    Text(
+                        MasterKeyManager.storagePolicy(defaults: settingsStore) == .iCloudKeychain
+                            ? "The master key is configured to sync with iCloud Keychain. Keep the 22-word recovery phrase anyway in case the synced copy is unavailable."
+                            : "The master key is stored only on this Mac. Keep the 22-word recovery phrase somewhere safe because it is the only fallback if the local Keychain copy is lost."
+                    )
+                    .font(.retraceCaption)
+                    .foregroundColor(.retraceSecondary)
+
+                    if !hasMasterKeyInKeychain {
+                        Text("Restore or create the master key before continuing.")
+                            .font(.retraceCaption)
+                            .foregroundColor(.retraceDanger)
+                    }
+                }
+            } else if databaseMigrationStep == .warning {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("Warnings")
+                        .font(.retraceCalloutBold)
+                        .foregroundColor(.retracePrimary)
+
+                    Text("The app will enter database migration mode. Recording stops immediately, timeline/search/dashboard/settings are blocked, and OCR queue polling is disabled until the migration completes.")
+                        .font(.retraceCaption)
+                        .foregroundColor(.retraceSecondary)
+
+                    Text("Quitting during migration will mark the job interrupted and Retrace will auto-resume it on next launch.")
+                        .font(.retraceCaption)
+                        .foregroundColor(.retraceSecondary)
+                }
+            } else {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("Final Confirmation")
+                        .font(.retraceCalloutBold)
+                        .foregroundColor(.retracePrimary)
+
+                    Text("Retrace will be unusable for about \(max(migrationEstimateMinutes, 1)) minute(s) while the database is migrated.")
+                        .font(.retraceCaption)
+                        .foregroundColor(.retraceSecondary)
+
+                    if let required = migrationRequiredSpaceBytes,
+                       let available = migrationAvailableSpaceBytes {
+                        Text("Free space required: \(Self.formatBytes(required)). Available now: \(Self.formatBytes(available)).")
+                            .font(.retraceCaption)
+                            .foregroundColor(.retraceSecondary)
+                    }
+
+                    if let shortfall = migrationShortfallBytes, shortfall > 0 {
+                        Text("Not enough disk space. Free at least \(Self.formatBytes(shortfall)) before starting. No bypass is available.")
+                            .font(.retraceCaption)
+                            .foregroundColor(.retraceDanger)
+                    }
+                }
+            }
+
+            Spacer()
+
+            HStack {
+                Button("Cancel") {
+                    showDatabaseMigrationWizard = false
+                }
+
+                Spacer()
+
+                if databaseMigrationKind == .encrypt && databaseMigrationStep == .warning {
+                    Button("Back") {
+                        databaseMigrationStep = .recovery
+                    }
+                } else if databaseMigrationStep == .confirm {
+                    Button("Back") {
+                        databaseMigrationStep = .warning
+                    }
+                }
+
+                Button(databaseMigrationStep == .confirm ? "Start Migration" : "Continue") {
+                    if databaseMigrationStep == .recovery {
+                        databaseMigrationStep = .warning
+                    } else if databaseMigrationStep == .warning {
+                        databaseMigrationStep = .confirm
+                    } else {
+                        Task { await startSelectedDatabaseMigration() }
+                    }
+                }
+                .disabled(
+                    isRunningDatabaseMigration ||
+                    (databaseMigrationStep == .recovery && !recoveryPhraseStepIsComplete) ||
+                    (databaseMigrationStep == .confirm && (migrationShortfallBytes ?? 0) > 0)
+                )
+            }
+        }
+        .padding(24)
+        .frame(width: 640, height: 520)
+        .background(Color.retraceBackground)
+    }
+
+    private var recoveryKeyRestoreSheet: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Restore Master Key")
+                .font(.retraceTitle3)
+                .foregroundColor(.retracePrimary)
+
+            Text("Paste the 22-word master recovery phrase or load a `.txt` export. Older encrypted libraries can also restore from the legacy 24-word database recovery key.")
+                .font(.retraceCaption)
+                .foregroundColor(.retraceSecondary)
+
+            Picker("Restore To", selection: $recoveryPhraseRestorePolicy) {
+                Text("This Mac Only").tag(MasterKeyStoragePolicy.localOnly)
+                Text("iCloud Keychain").tag(MasterKeyStoragePolicy.iCloudKeychain)
+            }
+            .pickerStyle(.segmented)
+
+            TextEditor(text: $recoveryPhraseImportText)
+                .font(.retraceCaption)
+                .scrollContentBackground(.hidden)
+                .padding(10)
+                .background(
+                    RoundedRectangle(cornerRadius: 12)
+                        .fill(Color.white.opacity(0.04))
+                )
+
+            if let recoveryPhraseImportError {
+                Text(recoveryPhraseImportError)
+                    .font(.retraceCaption2)
+                    .foregroundColor(.retraceDanger)
+            }
+
+            HStack(spacing: 12) {
+                ModernButton(title: "Load TXT", icon: "doc.text", style: .secondary) {
+                    let panel = NSOpenPanel()
+                    panel.allowedContentTypes = [.plainText]
+                    panel.allowsMultipleSelection = false
+                    if panel.runModal() == .OK,
+                       let url = panel.url,
+                       let contents = try? String(contentsOf: url) {
+                        recoveryPhraseImportText = contents
+                    }
+                }
+
+                ModernButton(title: "Restore Key", icon: "key.fill", style: .primary) {
+                    restoreRecoveryKeyFromPhrase()
+                }
+            }
+
+            Spacer()
+        }
+        .padding(24)
+        .frame(width: 560, height: 360)
+        .background(Color.retraceBackground)
+    }
+
+    private var recoveryPhraseStepIsComplete: Bool {
+        if databaseMigrationKind != .encrypt || databaseMigrationStep != .recovery {
+            return true
+        }
+        return hasMasterKeyInKeychain
+    }
+
+    private func openDatabaseMigrationWizard(
+        kind: DatabaseMigrationKind,
+        skipMasterKeyCheck: Bool = false
+    ) {
+        guard !databaseMigrationRequiresRestart else {
+            showDatabaseAlert(
+                type: .warning,
+                title: "Restart Required",
+                message: "Restart Retrace to apply the new database folder before starting an encryption or decryption migration."
+            )
+            return
+        }
+
+        guard databaseSupportsMigration else {
+            showDatabaseAlert(
+                type: .error,
+                title: "Database Not Ready",
+                message: "Retrace has not created a database yet. Record once before starting an encryption or decryption migration."
+            )
+            return
+        }
+
+        if kind == .encrypt, !skipMasterKeyCheck, !hasMasterKeyInKeychain {
+            promptForMasterKey(feature: .databaseEncryption)
+            return
+        }
+
+        databaseMigrationKind = kind
+        databaseMigrationStep = .warning
+        migrationEstimateMinutes = 0
+        migrationRequiredSpaceBytes = nil
+        migrationAvailableSpaceBytes = nil
+        migrationShortfallBytes = nil
+        showDatabaseMigrationWizard = true
+
+        Task {
+            await prepareDatabaseMigrationEstimate(for: kind)
+        }
+    }
+
+    private func prepareDatabaseMigrationEstimate(for kind: DatabaseMigrationKind) async {
+        isPreparingDatabaseMigrationEstimate = true
+        let engine = DatabaseMigrationEngine(
+            databasePath: activeMigrationDatabasePath,
+            storageRootPath: activeMigrationStorageRoot
+        )
+
+        let footprint = (try? await engine.sourceFootprintBytes()) ?? 0
+        let required = await engine.requiredFreeSpace(forFootprintBytes: footprint, kind: kind)
+        let estimate = await engine.estimateDuration(forFootprintBytes: footprint, kind: kind)
+        let available = Self.availableCapacityBytes(at: activeMigrationStorageRoot) ?? 0
+
+        migrationEstimateMinutes = max(Int(ceil(estimate / 60)), 1)
+        migrationRequiredSpaceBytes = required
+        migrationAvailableSpaceBytes = available
+        migrationShortfallBytes = max(required - available, 0)
+        isPreparingDatabaseMigrationEstimate = false
+    }
+
+    private var effectiveDatabaseEncryptionEnabled: Bool {
+        switch detectedDatabaseEncryptionState {
+        case .encrypted:
+            return true
+        case .plaintext:
+            return false
+        case .missing, .empty:
+            return false
+        }
+    }
+
+    private var databaseSupportsMigration: Bool {
+        switch detectedDatabaseEncryptionState {
+        case .encrypted, .plaintext:
+            return true
+        case .missing, .empty:
+            return false
+        }
+    }
+
+    private func refreshDetectedDatabaseEncryptionState() async {
+        let databasePath = activeMigrationDatabasePath
+        let state = await Task.detached(priority: .utility) {
+            DatabaseManager.databaseFileEncryptionState(at: databasePath)
+        }.value
+        detectedDatabaseEncryptionState = state
+    }
+
+    private func startSelectedDatabaseMigration() async {
+        guard !isRunningDatabaseMigration else { return }
+        isRunningDatabaseMigration = true
+
+        do {
+            if databaseMigrationRequiresRestart {
+                showDatabaseAlert(
+                    type: .warning,
+                    title: "Restart Required",
+                    message: "Restart Retrace to apply the new database folder before starting a migration."
+                )
+                isRunningDatabaseMigration = false
+                return
+            }
+
+            let migrationKeychainAccount: String?
+            let migrationKeyMaterialSource: DatabaseKeyMaterialSource?
+
+            if databaseMigrationKind == .decrypt, !DatabaseManager.hasDatabaseKeyInKeychain() {
+                showDatabaseAlert(
+                    type: .error,
+                    title: "Master Key Required",
+                    message: "Restore the master key before attempting decryption."
+                )
+                isRunningDatabaseMigration = false
+                return
+            }
+
+            switch databaseMigrationKind {
+            case .encrypt:
+                migrationKeychainAccount = AppPaths.keychainAccount
+                migrationKeyMaterialSource = .masterKeyDerived
+            case .decrypt:
+                let resolution = try DatabaseManager.resolveDatabaseConnection(
+                    at: activeMigrationDatabasePath,
+                    preferredEncrypted: true
+                )
+                guard resolution.mode == .encrypted else {
+                    throw DatabaseError.connectionFailed(
+                        underlying: "The current database is not encrypted."
+                    )
+                }
+                migrationKeychainAccount = resolution.keychainAccount
+                migrationKeyMaterialSource = resolution.keyMaterialSource
+            case .schema:
+                migrationKeychainAccount = nil
+                migrationKeyMaterialSource = nil
+            }
+
+            let job = try await coordinatorWrapper.coordinator.scheduleDatabaseMigration(
+                kind: databaseMigrationKind,
+                keychainAccount: migrationKeychainAccount,
+                keyMaterialSource: migrationKeyMaterialSource
+            )
+            _ = job
+
+            showDatabaseMigrationWizard = false
+            AppRelaunch.relaunch()
+            return
+        } catch {
+            showDatabaseAlert(type: .error, title: "Database Migration Failed", message: error.localizedDescription)
+        }
+
+        isRunningDatabaseMigration = false
+    }
+
+    private func restoreRecoveryKeyFromPhrase() {
+        do {
+            guard !databaseMigrationRequiresRestart else {
+                throw DatabaseError.connectionFailed(
+                    underlying: "Restart Retrace to apply the new database folder before restoring a key."
+                )
+            }
+            guard DatabaseManager.databaseFileEncryptionState(at: activeMigrationDatabasePath).isEncrypted else {
+                throw DatabaseError.connectionFailed(
+                    underlying: "Key restore is only available when the current database is encrypted."
+                )
+            }
+
+            if let masterPhrase = try? MasterKeyManager.recoveryPhrase(fromRecoveryText: recoveryPhraseImportText) {
+                let masterKeyData = try MasterKeyManager.keyData(fromRecoveryPhrase: masterPhrase)
+                let databaseKeyData = MasterKeyManager.derivedKeyData(
+                    from: masterKeyData,
+                    purpose: .databaseEncryption
+                )
+                try DatabaseManager.verifyDatabaseAccess(
+                    at: activeMigrationDatabasePath,
+                    keyData: databaseKeyData
+                )
+                _ = try MasterKeyManager.restoreMasterKey(
+                    fromRecoveryPhrase: masterPhrase,
+                    defaults: settingsStore,
+                    storagePolicy: recoveryPhraseRestorePolicy
+                )
+                recoveryPhraseImportError = nil
+                showRecoveryKeyRestoreSheet = false
+                showSettingsToast("Master key restored.")
+                hasMasterKeyInKeychain = true
+                Task {
+                    try? await coordinatorWrapper.coordinator.recordMetricEvent(
+                        metricType: .masterKeyFlow,
+                        metadata: Self.inPageURLMetricMetadata([
+                            "action": "database_key_restored",
+                            "source": MasterKeyProtectedFeature.databaseEncryption.metricSource,
+                            "storagePolicy": recoveryPhraseRestorePolicy.rawValue,
+                            "kind": "master_key"
+                        ])
+                    )
+                }
+                return
+            }
+
+            let phrase = try DatabaseRecoveryPhrase.parse(recoveryPhraseImportText)
+            try DatabaseManager.verifyDatabaseAccess(
+                at: activeMigrationDatabasePath,
+                keyData: phrase.derivedKeyData
+            )
+            try DatabaseManager.saveDatabaseKeyToKeychain(
+                phrase.derivedKeyData,
+                account: AppPaths.keychainAccount,
+                storagePolicy: recoveryPhraseRestorePolicy
+            )
+            recoveryPhraseImportError = nil
+            showRecoveryKeyRestoreSheet = false
+            showSettingsToast("Legacy database key restored.")
+            Task {
+                try? await coordinatorWrapper.coordinator.recordMetricEvent(
+                    metricType: .recoveryKeyRestored,
+                    metadata: "restored=true;kind=legacy_database_key"
+                )
+            }
+        } catch {
+            recoveryPhraseImportError = error.localizedDescription
+        }
+    }
+
+    private static func availableCapacityBytes(at path: String) -> Int64? {
+        let url = URL(fileURLWithPath: path, isDirectory: true)
+        if let values = try? url.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
+           let capacity = values.volumeAvailableCapacityForImportantUsage {
+            return Int64(capacity)
+        }
+        if let values = try? FileManager.default.attributesOfFileSystem(forPath: path),
+           let free = values[.systemFreeSize] as? NSNumber {
+            return free.int64Value
+        }
+        return nil
+    }
+
+    private static func formatBytes(_ bytes: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+    }
+}
+
+private enum DatabaseMigrationWizardStep {
+    case recovery
+    case warning
+    case confirm
 }
 
 // MARK: - Supporting Types
@@ -11154,31 +11975,33 @@ extension SettingsView {
     }
 
     private func resetMasterKeyForDebug() {
-        do {
-            let removed = try MasterKeyManager.resetMasterKey(defaults: settingsStore)
-            hasMasterKeyInKeychain = MasterKeyManager.hasMasterKey()
-            pendingMasterKeyFeature = nil
-            masterKeySetupSession = nil
-            isCreatingMasterKey = false
-            animateMasterKeyCreatedState = false
-            phraseLevelRedactionEnabled = false
-            settingsStore.set(false, forKey: phraseLevelRedactionEnabledDefaultsKey)
+        Task { @MainActor in
+            do {
+                let removed = try await MasterKeyManager.resetMasterKeyAsync(defaults: settingsStore)
+                hasMasterKeyInKeychain = false
+                pendingMasterKeyFeature = nil
+                masterKeySetupSession = nil
+                isCreatingMasterKey = false
+                animateMasterKeyCreatedState = false
+                phraseLevelRedactionEnabled = false
+                settingsStore.set(false, forKey: phraseLevelRedactionEnabledDefaultsKey)
 
-            showSettingsToast(
-                removed ? "Master key reset for this Mac" : "No master key was stored on this Mac"
-            )
-            recordMasterKeyMetric(
-                action: removed ? "debug_reset" : "debug_reset_noop",
-                source: "developer"
-            )
-        } catch {
-            showSettingsToast("Couldn't reset the master key", isError: true)
-            Log.error("[SettingsView] Failed to reset master key: \(error)", category: .ui)
-            recordMasterKeyMetric(
-                action: "debug_reset_failed",
-                source: "developer",
-                metadata: ["error": error.localizedDescription]
-            )
+                showSettingsToast(
+                    removed ? "Master key reset for this Mac" : "No master key was stored on this Mac"
+                )
+                recordMasterKeyMetric(
+                    action: removed ? "debug_reset" : "debug_reset_noop",
+                    source: "developer"
+                )
+            } catch {
+                showSettingsToast("Couldn't reset the master key", isError: true)
+                Log.error("[SettingsView] Failed to reset master key: \(error)", category: .ui)
+                recordMasterKeyMetric(
+                    action: "debug_reset_failed",
+                    source: "developer",
+                    metadata: ["error": error.localizedDescription]
+                )
+            }
         }
     }
 

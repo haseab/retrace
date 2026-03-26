@@ -182,17 +182,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var isTerminationDecisionInProgress = false
     private var bypassQuitConfirmationPromptOnce = false
     private var singleInstanceLockFileDescriptor: CInt = -1
+    private var hasConfiguredMigrationLaunchSurface = false
+    private var hasConfiguredNormalLaunchInfrastructure = false
+    private var shouldRecordRecoveryKeyRestoreMetricAfterInitialization = false
     private let settingsStore = UserDefaults(suiteName: "io.retrace.app") ?? .standard
     private static let devDeeplinkEnvKey = "RETRACE_DEV_DEEPLINK_URL"
     private static let externalDashboardRevealNotification = Notification.Name("io.retrace.app.externalDashboardReveal")
     private static let quitConfirmationPreferenceKey = "quitConfirmationPreference"
     private static let showDockIconPreferenceKey = "showDockIcon"
+    private static let encryptionPromptSnoozeUntilKey = "databaseEncryptionPromptSnoozeUntil"
+    private static let encryptionPromptHasSnoozedKey = "databaseEncryptionPromptHasSnoozed"
     private static let canonicalBundleIdentifier = "io.retrace.app"
     private static let singleInstanceLockPath = "/tmp/io.retrace.app.instance.lock"
     private static let relaunchLockRetryAttempts = 30
     private static let relaunchLockRetryDelay: Duration = .milliseconds(100)
     nonisolated private static let watchdogSleepSuspensionSeconds: TimeInterval = 12 * 60 * 60
     nonisolated private static let watchdogWakeGracePeriodSeconds: TimeInterval = 60
+    nonisolated private static let encryptionPromptSnoozeDuration: TimeInterval = 7 * 24 * 60 * 60
 
     private enum QuitTerminationPreference: String {
         case ask
@@ -334,42 +340,43 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return // User chose to quit or we're waiting for them to reconnect
         }
 
+        var databaseEncryptionState = synchronizeEncryptionPreferenceWithOnDiskState()
+
+        if !(await ensureDatabaseKeyAvailableForStartup(databaseEncryptionState: databaseEncryptionState)) {
+            return
+        }
+
+        do {
+            let preparedVaultPath = try RetraceVaultLayoutManager.prepareActiveVaultIfNeeded()
+            Log.info("[AppDelegate] Prepared active Retrace vault at \(preparedVaultPath)", category: .app)
+            databaseEncryptionState = synchronizeEncryptionPreferenceWithOnDiskState()
+        } catch let error as RetraceVaultLayoutError {
+            if await recoverFromVaultLayoutIssue(error: error) {
+                await initializeApp()
+            }
+            return
+        } catch {
+            presentVaultPreparationFailureAlert(error: error)
+            return
+        }
+
         do {
             let wrapper = AppCoordinatorWrapper()
             self.coordinatorWrapper = wrapper
+            var bootstrappedMigration = false
+            var startupMigrationError: Error?
+            do {
+                bootstrappedMigration = try await runStartupDatabaseMigrationIfNeeded(using: wrapper)
+            } catch {
+                startupMigrationError = error
+                Log.error("[AppDelegate] Startup migration failed, attempting normal initialization", category: .app, error: error)
+            }
+
             try await wrapper.initialize(autoStartRecording: false)
             Log.info("[AppDelegate] Coordinator initialized successfully", category: .app)
+            databaseEncryptionState = synchronizeEncryptionPreferenceWithOnDiskState()
 
-            configureWatchdogAutoQuit()
-
-            // Start the main thread watchdog to detect UI freezes
-            MainThreadWatchdog.shared.start()
-
-            // Setup menu bar icon
-            let menuBar = MenuBarManager(
-                coordinator: wrapper.coordinator,
-                onboardingManager: wrapper.coordinator.onboardingManager
-            )
-            menuBar.setup()
-            self.menuBarManager = menuBar
-
-            // Configure the timeline window controller
-            TimelineWindowController.shared.configure(coordinator: wrapper.coordinator)
-
-            // Configure the dashboard window controller
-            DashboardWindowController.shared.configure(coordinator: wrapper.coordinator)
-
-            // Configure the pause reminder window controller
-            PauseReminderWindowController.shared.configure(coordinator: wrapper.coordinator)
-
-            // Setup sleep/wake observers to properly handle segment tracking
-            setupSleepWakeObservers()
-
-            // Setup power settings change observer
-            setupPowerSettingsObserver()
-            ProcessCPUMonitor.shared.start()
-
-            Log.info("[AppDelegate] Menu bar and window controllers initialized", category: .app)
+            configureNormalLaunchInfrastructure(with: wrapper)
 
             let launchRequestedAutoStart = AppCoordinator.shouldAutoStartRecording()
             let shouldAllowLaunchAutoStart = await handleMissingMasterKeyRedactionIfNeeded(
@@ -387,6 +394,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
             // Mark as initialized before processing pending deeplinks
             isInitialized = true
+
+            if shouldRecordRecoveryKeyRestoreMetricAfterInitialization {
+                shouldRecordRecoveryKeyRestoreMetricAfterInitialization = false
+                try? await wrapper.coordinator.recordMetricEvent(
+                    metricType: .recoveryKeyRestored,
+                    metadata: "source=startup_recovery"
+                )
+            }
 
             // Process any deeplinks that arrived before initialization completed
             var didHandleInitialDeeplink = false
@@ -408,14 +423,292 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             if shouldShowDashboardAfterInitialization {
                 requestDashboardReveal(source: "pendingExternalDashboardReveal")
                 shouldShowDashboardAfterInitialization = false
-            } else if !didHandleInitialDeeplink {
+            } else if !didHandleInitialDeeplink,
+                      !(bootstrappedMigration && DashboardWindowController.shared.isVisible) {
                 // Show dashboard on first launch (only if no deeplinks)
                 DashboardWindowController.shared.show()
+            }
+
+            await presentEncryptionPromptIfNeeded(
+                coordinator: wrapper.coordinator,
+                databaseEncryptionState: databaseEncryptionState
+            )
+
+            if let startupMigrationError {
+                presentStartupMigrationFailureAlert(error: startupMigrationError)
             }
 
         } catch {
             Log.error("[AppDelegate] Failed to initialize: \(error)", category: .app)
         }
+    }
+
+    @MainActor
+    private func configureMigrationLaunchSurface(with coordinator: AppCoordinator) {
+        guard !hasConfiguredMigrationLaunchSurface else { return }
+
+        TimelineWindowController.shared.configure(coordinator: coordinator)
+        DashboardWindowController.shared.configure(coordinator: coordinator)
+        PauseReminderWindowController.shared.configure(coordinator: coordinator)
+        ProcessCPUMonitor.shared.start()
+
+        hasConfiguredMigrationLaunchSurface = true
+        Log.info("[AppDelegate] Migration launch surface configured", category: .app)
+    }
+
+    @MainActor
+    private func configureNormalLaunchInfrastructure(with wrapper: AppCoordinatorWrapper) {
+        configureMigrationLaunchSurface(with: wrapper.coordinator)
+        guard !hasConfiguredNormalLaunchInfrastructure else { return }
+
+        configureWatchdogAutoQuit()
+        MainThreadWatchdog.shared.start()
+
+        let menuBar = MenuBarManager(
+            coordinator: wrapper.coordinator,
+            onboardingManager: wrapper.coordinator.onboardingManager
+        )
+        menuBar.setup()
+        self.menuBarManager = menuBar
+
+        setupSleepWakeObservers()
+        setupPowerSettingsObserver()
+
+        hasConfiguredNormalLaunchInfrastructure = true
+        Log.info("[AppDelegate] Menu bar and observers initialized", category: .app)
+    }
+
+    @MainActor
+    private func runStartupDatabaseMigrationIfNeeded(using wrapper: AppCoordinatorWrapper) async throws -> Bool {
+        guard let job = await wrapper.coordinator.prepareDatabaseMigrationJobIfNeeded() else {
+            return false
+        }
+
+        configureMigrationLaunchSurface(with: wrapper.coordinator)
+        DashboardWindowController.shared.show()
+        NotificationCenter.default.post(name: .openSystemMonitor, object: nil)
+        _ = try await wrapper.coordinator.runDatabaseMigration(job: job)
+        return true
+    }
+
+    @MainActor
+    private func synchronizeEncryptionPreferenceWithOnDiskState() -> DatabaseFileEncryptionState {
+        let encryptionState = DatabaseManager.databaseFileEncryptionState(at: AppPaths.databasePath)
+        switch encryptionState {
+        case .encrypted:
+            settingsStore.set(true, forKey: "encryptionEnabled")
+        case .plaintext:
+            settingsStore.set(false, forKey: "encryptionEnabled")
+        case .missing, .empty:
+            if !DatabaseManager.hasDatabaseKeyInKeychain() {
+                settingsStore.set(false, forKey: "encryptionEnabled")
+            }
+        }
+        return encryptionState
+    }
+
+    @MainActor
+    private func ensureDatabaseKeyAvailableForStartup(
+        databaseEncryptionState: DatabaseFileEncryptionState
+    ) async -> Bool {
+        guard databaseEncryptionState.isEncrypted else { return true }
+        guard !DatabaseManager.hasDatabaseKeyInKeychain() else { return true }
+        if await recoverPendingMigrationKeyIfNeeded(databaseEncryptionState: databaseEncryptionState) {
+            return true
+        }
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.icon = NSApp.applicationIconImage
+        alert.messageText = "Encrypted Database Key Missing"
+        alert.informativeText = """
+        Retrace found an encrypted database, but the key needed to open it is missing.
+
+        Normal startup is blocked until you restore the 22-word master recovery phrase or `.txt` backup. Older encrypted libraries can also restore from the legacy 24-word database recovery key. Retrace will never auto-generate a replacement key for an existing encrypted database.
+        """
+        alert.addButton(withTitle: "Restore Key")
+        alert.addButton(withTitle: "Quit")
+
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else {
+            requestImmediateTermination(skipQuitConfirmation: true)
+            return false
+        }
+
+        let restored = await presentStartupRecoveryKeyRestoreWindow()
+        guard restored else {
+            requestImmediateTermination(skipQuitConfirmation: true)
+            return false
+        }
+
+        shouldRecordRecoveryKeyRestoreMetricAfterInitialization = true
+        return true
+    }
+
+    @MainActor
+    private func recoverPendingMigrationKeyIfNeeded(
+        databaseEncryptionState: DatabaseFileEncryptionState
+    ) async -> Bool {
+        guard databaseEncryptionState.isEncrypted else { return false }
+        guard !DatabaseManager.hasDatabaseKeyInKeychain() else { return false }
+
+        let engine = DatabaseMigrationEngine()
+        guard let pendingJob = try? await engine.loadPendingJob(),
+              pendingJob.kind == .encrypt,
+              let pendingAccount = pendingJob.keychainAccount,
+              pendingAccount != AppPaths.keychainAccount else {
+            return false
+        }
+
+        do {
+            let resolution = try DatabaseManager.resolveDatabaseConnection(
+                at: AppPaths.databasePath,
+                preferredEncrypted: true,
+                encryptedKeyAccounts: [pendingAccount]
+            )
+            guard resolution.mode == .encrypted,
+                  resolution.keychainAccount == pendingAccount,
+                  let keyData = try? DatabaseManager.loadDatabaseKeyFromKeychain(account: pendingAccount) else {
+                return false
+            }
+            try DatabaseManager.saveDatabaseKeyToKeychain(keyData, account: AppPaths.keychainAccount)
+            Log.warning(
+                "[AppDelegate] Promoted pending migration key into the canonical keychain account during startup recovery",
+                category: .app
+            )
+            return true
+        } catch {
+            Log.error("[AppDelegate] Failed to promote pending migration key during startup recovery", category: .app, error: error)
+            return false
+        }
+    }
+
+    @MainActor
+    private func presentStartupRecoveryKeyRestoreWindow() async -> Bool {
+        await withCheckedContinuation { continuation in
+            let panel = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 620, height: 420),
+                styleMask: [.titled, .closable],
+                backing: .buffered,
+                defer: false
+            )
+            panel.title = "Restore Key"
+            panel.titleVisibility = .hidden
+            panel.titlebarAppearsTransparent = true
+            panel.isReleasedWhenClosed = false
+            panel.center()
+
+            var closeObserver: NSObjectProtocol?
+            var didResume = false
+
+            let finish: (Bool) -> Void = { restored in
+                guard !didResume else { return }
+                didResume = true
+                if let closeObserver {
+                    NotificationCenter.default.removeObserver(closeObserver)
+                }
+                panel.orderOut(nil)
+                panel.close()
+                continuation.resume(returning: restored)
+            }
+
+            closeObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.willCloseNotification,
+                object: panel,
+                queue: .main
+            ) { _ in
+                finish(false)
+            }
+
+            panel.contentView = NSHostingView(
+                rootView: StartupRecoveryKeyRestoreView(
+                    onRestoreSuccess: { finish(true) },
+                    onQuit: { finish(false) }
+                )
+            )
+
+            NSApp.activate(ignoringOtherApps: true)
+            panel.makeKeyAndOrderFront(nil)
+        }
+    }
+
+    @MainActor
+    private func presentEncryptionPromptIfNeeded(
+        coordinator: AppCoordinator,
+        databaseEncryptionState: DatabaseFileEncryptionState
+    ) async {
+        guard databaseEncryptionState == .plaintext else { return }
+        guard await coordinator.onboardingManager.hasCompletedOnboarding else { return }
+
+        if let snoozeUntil = settingsStore.object(forKey: Self.encryptionPromptSnoozeUntilKey) as? Date,
+           snoozeUntil > Date() {
+            return
+        }
+
+        let hasUsedSnooze = settingsStore.bool(forKey: Self.encryptionPromptHasSnoozedKey)
+        try? await coordinator.recordMetricEvent(
+            metricType: .encryptionPromptShown,
+            metadata: "source=launch_prompt;snooze_used=\(hasUsedSnooze)"
+        )
+
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.icon = NSApp.applicationIconImage
+        alert.messageText = "Encrypt Your Retrace Database"
+        if hasUsedSnooze {
+            alert.informativeText = """
+            Your Retrace database is still plaintext. Encrypting it runs a verified dual-shadow migration and uses your Retrace master key, including the recovery-phrase backup flow.
+
+            If you choose Not Now, Retrace will ask again on a future launch until encryption is enabled.
+            """
+        } else {
+            alert.informativeText = """
+            Your Retrace database is still plaintext. Encrypting it runs a verified dual-shadow migration and uses your Retrace master key, including the recovery-phrase backup flow.
+
+            You can choose Not Now once. Retrace will snooze this reminder for 7 days, then show it again on launch until encryption is enabled.
+            """
+        }
+        alert.addButton(withTitle: "Encrypt Database")
+        alert.addButton(withTitle: "Not Now")
+
+        NSApp.activate(ignoringOtherApps: true)
+        let response = alert.runModal()
+
+        if response == .alertFirstButtonReturn {
+            try? await coordinator.recordMetricEvent(
+                metricType: .encryptionPromptCTA,
+                metadata: "source=launch_prompt"
+            )
+            DashboardWindowController.shared.show()
+            NotificationCenter.default.post(name: .openSettingsDatabaseEncryption, object: nil)
+            return
+        }
+
+        guard !hasUsedSnooze else { return }
+
+        let snoozeUntil = Date().addingTimeInterval(Self.encryptionPromptSnoozeDuration)
+        settingsStore.set(snoozeUntil, forKey: Self.encryptionPromptSnoozeUntilKey)
+        settingsStore.set(true, forKey: Self.encryptionPromptHasSnoozedKey)
+        try? await coordinator.recordMetricEvent(
+            metricType: .encryptionPromptSnoozed,
+            metadata: "source=launch_prompt;until=\(ISO8601DateFormatter().string(from: snoozeUntil))"
+        )
+    }
+
+    @MainActor
+    private func presentStartupMigrationFailureAlert(error: Error) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.icon = NSApp.applicationIconImage
+        alert.messageText = "Database Migration Failed"
+        alert.informativeText = """
+        Retrace reopened using the last readable database state, but the startup migration did not complete.
+
+        \(error.localizedDescription)
+        """
+        alert.addButton(withTitle: "OK")
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
     }
 
     private func configureWatchdogAutoQuit() {
@@ -549,6 +842,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return .terminateLater
         }
 
+        if coordinatorWrapper?.coordinator.migrationStatusHolder.status.isActive == true {
+            isTerminationDecisionInProgress = true
+            presentMigrationQuitConfirmationAlert()
+            return .terminateLater
+        }
+
         switch terminationPreferenceForCurrentRequest() {
         case .quit:
             beginTerminationFlush()
@@ -634,6 +933,50 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
         let response = alert.runModal()
         handleQuitAlertResponse(response, dontAskAgain: alert.suppressionButton?.state == .on)
+    }
+
+    private func presentMigrationQuitConfirmationAlert() {
+        Log.info("[AppDelegate] Presenting migration quit confirmation alert", category: .app)
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.icon = NSApp.applicationIconImage
+        alert.messageText = "Database Migration In Progress"
+        alert.informativeText = "Quitting now will interrupt the database migration. Retrace will auto-resume the migration on the next launch, but the app will remain unusable until that migration completes."
+        alert.addButton(withTitle: "Quit and Resume Next Launch")
+        alert.addButton(withTitle: "Cancel")
+        styleQuitAlertPrimaryButton(alert, context: "migration-initial")
+        scheduleQuitButtonStyleEnforcement(for: alert, context: "migration-sheet")
+
+        let handleResponse: @MainActor (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard let self else { return }
+
+            Task { @MainActor in
+                if response == .alertFirstButtonReturn {
+                    if let coordinator = self.coordinatorWrapper?.coordinator {
+                        await coordinator.markDatabaseMigrationInterrupted(reason: "user_requested_quit")
+                    }
+                    self.isTerminationDecisionInProgress = false
+                    NSApp.reply(toApplicationShouldTerminate: true)
+                } else {
+                    self.isTerminationDecisionInProgress = false
+                    NSApp.reply(toApplicationShouldTerminate: false)
+                }
+            }
+        }
+
+        if let anchorWindow = currentTerminationAnchorWindow() {
+            alert.beginSheetModal(for: anchorWindow) { response in
+                Task { @MainActor in
+                    handleResponse(response)
+                }
+            }
+            return
+        }
+
+        NSApp.activate(ignoringOtherApps: true)
+        let response = alert.runModal()
+        handleResponse(response)
     }
 
     private func handleQuitAlertResponse(_ response: NSApplication.ModalResponse, dontAskAgain: Bool) {
@@ -751,7 +1094,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         autoStartRequested: Bool
     ) async -> Bool {
         let state = await coordinator.missingMasterKeyRedactionState()
-        guard state.requiresRecoveryPrompt else { return true }
+        guard state.requiresRecoveryPrompt else {
+            return await unlockMasterKeyForStartupIfNeeded(
+                coordinator: coordinator,
+                state: state,
+                autoStartRequested: autoStartRequested
+            )
+        }
 
         let outcome = await MasterKeyRedactionFlowCoordinator.resolveMissingKey(
             coordinator: coordinator,
@@ -773,10 +1122,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         case .recoveredExistingKey, .keyAlreadyAvailable:
             MasterKeyPromptUI.showRecoveredAlert(hasPendingRewrites: state.hasPendingRedactionRewrites)
             return true
-        case .createdFreshKey(let recoveryPhrase, let abandonedRewriteCount):
+        case .createdFreshKey(let recoveryPhrase, let storagePolicy, let abandonedRewriteCount):
             await presentRecoveryPhraseSavePrompt(
                 coordinator: coordinator,
                 recoveryPhrase: recoveryPhrase,
+                storagePolicy: storagePolicy,
                 abandonedRewriteCount: abandonedRewriteCount
             )
             return true
@@ -792,11 +1142,56 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func unlockMasterKeyForStartupIfNeeded(
+        coordinator: AppCoordinator,
+        state: AppCoordinator.MissingMasterKeyRedactionState,
+        autoStartRequested: Bool
+    ) async -> Bool {
+        let requiresStartupUnlock =
+            state.hasMasterKey
+            && (
+                state.phraseLevelRedactionEnabled
+                    || state.hasProtectedRedactionData
+                    || state.hasPendingRedactionRewrites
+            )
+
+        guard requiresStartupUnlock else { return true }
+
+        do {
+            _ = try await MasterKeyManager.loadMasterKeyAsync()
+            return true
+        } catch {
+            Log.warning(
+                "[AppDelegate] Failed to unlock master key during startup: \(error.localizedDescription)",
+                category: .app
+            )
+            await recordMasterKeyLaunchMetric(
+                coordinator: coordinator,
+                action: "startup_unlock_failed",
+                metadata: ["error": error.localizedDescription]
+            )
+
+            if autoStartRequested && state.phraseLevelRedactionEnabled {
+                await recordMasterKeyLaunchMetric(
+                    coordinator: coordinator,
+                    action: "startup_unlock_autostart_blocked"
+                )
+                return false
+            }
+
+            return true
+        }
+    }
+
     private func presentRecoveryPhraseSavePrompt(
         coordinator: AppCoordinator,
         recoveryPhrase: String,
+        storagePolicy: MasterKeyStoragePolicy,
         abandonedRewriteCount: Int
     ) async {
+        let storageMessage = storagePolicy == .iCloudKeychain
+            ? "This master key is configured to sync with iCloud Keychain. Keep the recovery phrase anyway in case the sync copy is unavailable."
+            : "Anyone with this phrase can recover your protected data. If you lose both this phrase and the Keychain copy on this Mac, that data is gone."
         let abandonmentMessage: String
         if abandonedRewriteCount > 0 {
             abandonmentMessage = "\n\n\(abandonedRewriteCount) pending redaction rewrite job(s) tied to the missing key were marked failed."
@@ -812,7 +1207,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             alert.informativeText = """
                 Store this offline and keep it private.
 
-                Anyone with this phrase can recover your protected data. If you lose both this phrase and the Keychain copy on this Mac, that data is gone.\(abandonmentMessage)
+                \(storageMessage)\(abandonmentMessage)
 
                 Recovery Phrase:
                 \(recoveryPhrase)
@@ -879,6 +1274,109 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         )
     }
 
+    @MainActor
+    private func presentVaultPreparationFailureAlert(error: Error) {
+        let alert = NSAlert()
+        alert.alertStyle = .critical
+        alert.icon = NSApp.applicationIconImage
+        alert.messageText = "Failed to Prepare Retrace Vault"
+        alert.informativeText = """
+        Retrace could not prepare the selected vault layout.
+
+        \(error.localizedDescription)
+        """
+        alert.addButton(withTitle: "Quit")
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
+        requestImmediateTermination(skipQuitConfirmation: true)
+    }
+
+    @MainActor
+    private func recoverFromVaultLayoutIssue(error: RetraceVaultLayoutError) async -> Bool {
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
+        let rootPath: String
+
+        switch error {
+        case .recoveryRequired(let path):
+            rootPath = path
+        }
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.icon = NSApp.applicationIconImage
+        alert.messageText = "Retrace Vault Recovery Needed"
+        alert.informativeText = """
+        Retrace found a partial or ambiguous vault layout at:
+        \(rootPath)
+
+        Choose an existing vault or create a new default vault.
+        """
+        alert.addButton(withTitle: "Browse for Vault")
+        alert.addButton(withTitle: "Create New Default Vault")
+        alert.addButton(withTitle: "Quit")
+
+        NSApp.activate(ignoringOtherApps: true)
+
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            if let newPath = await browseForDatabaseFolder(startingAt: browseStartDirectory(for: rootPath)) {
+                applySelectedVaultPath(newPath, defaults: defaults)
+                Log.info("[AppDelegate] Recovered vault layout by selecting \(newPath)", category: .app)
+                return true
+            }
+            return await recoverFromVaultLayoutIssue(error: error)
+
+        case .alertSecondButtonReturn:
+            do {
+                try createAndActivateNewDefaultVault(defaults: defaults)
+                Log.info("[AppDelegate] Recovered vault layout by creating a new default vault", category: .app)
+                return true
+            } catch {
+                presentVaultPreparationFailureAlert(error: error)
+                return false
+            }
+
+        default:
+            Log.info("[AppDelegate] User chose to quit during vault recovery", category: .app)
+            requestImmediateTermination(skipQuitConfirmation: true)
+            return false
+        }
+    }
+
+    private func applySelectedVaultPath(_ newPath: String, defaults: UserDefaults) {
+        let defaultVaultPrefix = AppPaths.expandedDefaultVaultsRoot + "/"
+        if newPath.hasPrefix(defaultVaultPrefix) {
+            defaults.removeObject(forKey: AppPaths.customRetraceVaultLocationDefaultsKey)
+            defaults.set(newPath, forKey: AppPaths.defaultRetraceVaultLocationDefaultsKey)
+        } else {
+            defaults.set(newPath, forKey: AppPaths.customRetraceVaultLocationDefaultsKey)
+        }
+        defaults.synchronize()
+    }
+
+    private func createAndActivateNewDefaultVault(defaults: UserDefaults) throws {
+        let newDefaultVaultPath = try RetraceVaultLayoutManager.forceCreateDefaultVault()
+        defaults.removeObject(forKey: AppPaths.customRetraceVaultLocationDefaultsKey)
+        defaults.set(newDefaultVaultPath, forKey: AppPaths.defaultRetraceVaultLocationDefaultsKey)
+        defaults.synchronize()
+    }
+
+    private func browseStartDirectory(for rootPath: String) -> String {
+        let expandedRoot = NSString(string: rootPath).expandingTildeInPath
+        let fileManager = FileManager.default
+
+        if fileManager.fileExists(atPath: expandedRoot) {
+            return expandedRoot
+        }
+
+        let parentDirectory = (expandedRoot as NSString).deletingLastPathComponent
+        if fileManager.fileExists(atPath: parentDirectory) {
+            return parentDirectory
+        }
+
+        return AppPaths.expandedAppSupportRoot
+    }
+
     // MARK: - Storage Path Validation
 
     /// Pre-flight check to ensure custom storage path is accessible
@@ -911,7 +1409,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if isDriveDisconnected {
             alert.messageText = "Storage Drive Not Found"
             alert.informativeText = """
-                Retrace is configured to store data at:
+                Retrace is configured to use the vault at:
                 \(customPath)
 
                 This location is not accessible. The drive may be disconnected.
@@ -919,9 +1417,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 What would you like to do?
                 """
         } else {
-            alert.messageText = "Database Folder Not Found"
+            alert.messageText = "Retrace Vault Not Found"
             alert.informativeText = """
-                Retrace is configured to store data at:
+                Retrace is configured to use the vault at:
                 \(customPath)
 
                 This folder no longer exists. It may have been moved or deleted.
@@ -931,7 +1429,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         alert.alertStyle = .warning
 
-        alert.addButton(withTitle: "Browse for Folder")
+        alert.addButton(withTitle: "Browse for Vault")
         alert.addButton(withTitle: "Reset to Default Location")
         alert.addButton(withTitle: "Quit")
 
@@ -939,11 +1437,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         switch response {
         case .alertFirstButtonReturn:
-            // Browse for folder - open at parent of the missing path
+            // Browse for vault - open at parent of the missing path
             if let newPath = await browseForDatabaseFolder(startingAt: parentDir) {
-                defaults.set(newPath, forKey: "customRetraceDBLocation")
+                let defaultVaultPrefix = AppPaths.expandedDefaultVaultsRoot + "/"
+                if newPath.hasPrefix(defaultVaultPrefix) {
+                    defaults.removeObject(forKey: "customRetraceDBLocation")
+                } else {
+                    defaults.set(newPath, forKey: "customRetraceDBLocation")
+                }
                 defaults.synchronize()
-                Log.info("[AppDelegate] User selected new storage location: \(newPath)", category: .app)
+                Log.info("[AppDelegate] User selected new vault location: \(newPath)", category: .app)
                 return true
             } else {
                 // User cancelled - show dialog again
@@ -954,7 +1457,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // Reset to default location
             defaults.removeObject(forKey: "customRetraceDBLocation")
             defaults.synchronize()
-            Log.info("[AppDelegate] Reset to default storage location", category: .app)
+            Log.info("[AppDelegate] Reset to default vault location", category: .app)
             return true
 
         default:
@@ -965,7 +1468,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Shows folder picker for selecting database location
+    /// Shows folder picker for selecting vault location
     /// Returns the selected path if valid, nil if cancelled or invalid
     @MainActor
     private func browseForDatabaseFolder(startingAt directory: String?) async -> String? {
@@ -974,7 +1477,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         panel.canChooseDirectories = true
         panel.canCreateDirectories = true
         panel.allowsMultipleSelection = false
-        panel.message = "Choose a folder for the Retrace database"
+        panel.message = "Choose a Retrace vault folder"
         panel.prompt = "Select"
 
         // Open at the specified directory if it exists
@@ -991,12 +1494,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         switch validationResult {
         case .valid:
-            return selectedPath
+            return try? RetraceVaultLayoutManager.canonicalizeSelectedVaultPath(selectedPath)
 
         case .missingChunks:
             let alert = NSAlert()
             alert.messageText = "Missing Chunks Folder"
-            alert.informativeText = "The selected folder has retrace.db but is missing the 'chunks' folder with video files.\n\nRetrace may not be able to load existing video frames.\n\nDo you want to continue anyway?"
+            alert.informativeText = "The selected vault has retrace.db but is missing the 'chunks' folder with video files.\n\nRetrace may not be able to load existing video frames.\n\nDo you want to continue anyway?"
             alert.alertStyle = .warning
             alert.addButton(withTitle: "Continue Anyway")
             alert.addButton(withTitle: "Cancel")
@@ -1005,12 +1508,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 // User cancelled - let them pick again
                 return await browseForDatabaseFolder(startingAt: directory)
             }
-            return selectedPath
+            return try? RetraceVaultLayoutManager.canonicalizeSelectedVaultPath(selectedPath)
 
         case .invalidFolder:
             let alert = NSAlert()
-            alert.messageText = "Invalid Folder Selection"
-            alert.informativeText = "The selected folder contains other files but is not a valid Retrace database folder.\n\nPlease select either:\n• An existing Retrace folder (with retrace.db)\n• An empty folder for a new database"
+            alert.messageText = "Invalid Vault Selection"
+            alert.informativeText = "Select a specific Retrace vault folder.\n\nChoose a folder named `vault-xxxxxx`, or a legacy Retrace folder that still contains retrace.db and chunks directly inside it."
             alert.alertStyle = .critical
             alert.addButton(withTitle: "OK")
             alert.runModal()
@@ -1060,8 +1563,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let fm = FileManager.default
         let dbPath = "\(selectedPath)/retrace.db"
         let chunksPath = "\(selectedPath)/chunks"
+        let walPath = "\(selectedPath)/wal"
+        let vaultMetadataPath = "\(selectedPath)/.retrace-vault.json"
         let hasDatabase = fm.fileExists(atPath: dbPath)
         let hasChunks = fm.fileExists(atPath: chunksPath)
+        let hasCaptureWAL = fm.fileExists(atPath: walPath)
+        let hasVaultMetadata = fm.fileExists(atPath: vaultMetadataPath)
+        let lastComponent = (selectedPath as NSString).lastPathComponent
+        let isExplicitVaultFolder = hasVaultMetadata || lastComponent.hasPrefix(AppPaths.vaultFolderPrefix)
 
         if hasDatabase {
             let verification = verifyRetraceDatabase(at: dbPath)
@@ -1075,17 +1584,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return hasChunks ? .valid : .missingChunks
         }
 
-        let contents = (try? fm.contentsOfDirectory(atPath: selectedPath)) ?? []
-        let visibleContents = contents.filter { !$0.hasPrefix(".") }
-        guard visibleContents.isEmpty else {
-            return .invalidFolder
+        if isExplicitVaultFolder {
+            if let writeProbeFailure = probeRetraceFolderWriteAccess(at: selectedPath) {
+                return .unwritableFolder(error: writeProbeFailure)
+            }
+            return .valid
         }
 
-        if let writeProbeFailure = probeRetraceFolderWriteAccess(at: selectedPath) {
-            return .unwritableFolder(error: writeProbeFailure)
+        if hasChunks || hasCaptureWAL {
+            if let writeProbeFailure = probeRetraceFolderWriteAccess(at: selectedPath) {
+                return .unwritableFolder(error: writeProbeFailure)
+            }
+            return .valid
         }
 
-        return .valid
+        return .invalidFolder
     }
 
     nonisolated private static func probeRetraceFolderWriteAccess(at selectedPath: String) -> String? {
@@ -1892,6 +2405,120 @@ private enum QuitConfirmationAction {
 private struct QuitConfirmationResult {
     let action: QuitConfirmationAction
     let dontAskAgain: Bool
+}
+
+private struct StartupRecoveryKeyRestoreView: View {
+    let onRestoreSuccess: () -> Void
+    let onQuit: () -> Void
+
+    @State private var recoveryPhraseText = ""
+    @State private var recoveryError: String?
+    @State private var storagePolicy: MasterKeyStoragePolicy = .localOnly
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Restore Key")
+                .font(.title2.weight(.semibold))
+
+            Text("Paste the 22-word master recovery phrase or load the exported `.txt` file. Older encrypted libraries can also restore from the legacy 24-word database recovery key.")
+                .font(.body)
+                .foregroundStyle(.secondary)
+
+            Picker("Restore To", selection: $storagePolicy) {
+                Text("This Mac Only").tag(MasterKeyStoragePolicy.localOnly)
+                Text("iCloud Keychain").tag(MasterKeyStoragePolicy.iCloudKeychain)
+            }
+            .pickerStyle(.segmented)
+
+            TextEditor(text: $recoveryPhraseText)
+                .font(.system(.body, design: .monospaced))
+                .scrollContentBackground(.hidden)
+                .padding(10)
+                .background(
+                    RoundedRectangle(cornerRadius: 10)
+                        .fill(Color.black.opacity(0.15))
+                )
+                .frame(minHeight: 180)
+
+            if let recoveryError {
+                Text(recoveryError)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+
+            HStack {
+                Button("Load TXT") {
+                    let panel = NSOpenPanel()
+                    panel.allowedContentTypes = [.plainText]
+                    panel.allowsMultipleSelection = false
+                    if panel.runModal() == .OK,
+                       let url = panel.url,
+                       let contents = try? String(contentsOf: url) {
+                        recoveryPhraseText = contents
+                    }
+                }
+
+                Spacer()
+
+                Button("Quit") {
+                    onQuit()
+                }
+
+                Button("Restore Key") {
+                    restoreKey()
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(24)
+        .frame(width: 620, height: 420)
+        .background(Color(NSColor.windowBackgroundColor))
+    }
+
+    private func restoreKey() {
+        do {
+            guard DatabaseManager.databaseFileEncryptionState(at: AppPaths.databasePath).isEncrypted else {
+                throw DatabaseError.connectionFailed(
+                    underlying: "Key restore is only available for an encrypted database."
+                )
+            }
+
+            if let masterPhrase = try? MasterKeyManager.recoveryPhrase(fromRecoveryText: recoveryPhraseText) {
+                let masterKeyData = try MasterKeyManager.keyData(fromRecoveryPhrase: masterPhrase)
+                let databaseKeyData = MasterKeyManager.derivedKeyData(
+                    from: masterKeyData,
+                    purpose: .databaseEncryption
+                )
+                try DatabaseManager.verifyDatabaseAccess(
+                    at: AppPaths.databasePath,
+                    keyData: databaseKeyData
+                )
+                _ = try MasterKeyManager.restoreMasterKey(
+                    fromRecoveryPhrase: masterPhrase,
+                    defaults: UserDefaults(suiteName: "io.retrace.app") ?? .standard,
+                    storagePolicy: storagePolicy
+                )
+                recoveryError = nil
+                onRestoreSuccess()
+                return
+            }
+
+            let phrase = try DatabaseRecoveryPhrase.parse(recoveryPhraseText)
+            try DatabaseManager.verifyDatabaseAccess(
+                at: AppPaths.databasePath,
+                keyData: phrase.derivedKeyData
+            )
+            try DatabaseManager.saveDatabaseKeyToKeychain(
+                phrase.derivedKeyData,
+                account: AppPaths.keychainAccount,
+                storagePolicy: storagePolicy
+            )
+            recoveryError = nil
+            onRestoreSuccess()
+        } catch {
+            recoveryError = error.localizedDescription
+        }
+    }
 }
 
 // MARK: - URL Handling

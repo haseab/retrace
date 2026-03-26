@@ -46,9 +46,8 @@ public actor ModelManager {
         if let modelsDirectory = modelsDirectory {
             self.modelsDirectory = modelsDirectory
         } else {
-            // Use AppPaths which respects custom storage location
-            self.modelsDirectory = URL(fileURLWithPath: AppPaths.expandedStorageRoot)
-                .appendingPathComponent("models")
+            self.modelsDirectory = URL(fileURLWithPath: AppPaths.expandedAppSupportRoot)
+                .appendingPathComponent("models", isDirectory: true)
         }
     }
 

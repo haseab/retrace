@@ -236,7 +236,7 @@ public struct StorageConfig: Codable, Sendable {
     public let segmentDurationSeconds: Int
 
     public init(
-        storageRootPath: String = AppPaths.defaultStorageRoot,
+        storageRootPath: String = AppPaths.storageRoot,
         retentionDays: Int? = 90,
         maxStorageGB: Double? = 50.0,
         segmentDurationSeconds: Int = 300  // 5 minutes

@@ -95,12 +95,18 @@ retrace/
 │   ├── DatabaseManager.swift    # Main database coordinator
 │   ├── DatabaseConnection.swift # SQLite connection management
 │   ├── DatabaseConfig.swift     # Database configuration
+│   ├── DatabaseIdentity.swift   # DB lineage metadata + app-home/vault metadata sync
 │   ├── FTSManager.swift         # Full-text search management
 │   ├── IDMappingService.swift   # ID mapping between sources
 │   ├── Schema.swift             # Current schema definition
 │   ├── Migrations/              # Schema migration scripts
+│   │   ├── DatabaseMigrationEngine.swift # Unified encrypt/decrypt/schema migration engine
+│   │   ├── DatabaseMigrationJob.swift    # Persisted migration job + recovery phrase models
+│   │   ├── V15_NodeRedactionFlag.swift   # Protected OCR text + rewrite metadata migration
+│   │   └── V16_DatabaseIdentity.swift    # DB lineage/vault metadata + fork reconciliation
 │   ├── Queries/                 # Query implementations
 │   └── Tests/
+│       └── DatabaseMigrationEngineTests.swift # Migration sizing + recovery phrase coverage
 │
 ├── Storage/                     # File I/O, HEVC encoding
 │   ├── AGENTS.md
@@ -263,7 +269,7 @@ CAPTURE Module:
 
 STORAGE Module (Video Path):
   Input:  CGImage stream
-  Output: .mp4 file (HEVC encoded) → {AppPaths.storageRoot}/videos/
+  Output: .mp4 file (HEVC encoded) → {activeVault}/chunks/
 
 PROCESSING Module (OCR Path):
   Input:  CGImage

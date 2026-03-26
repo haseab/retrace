@@ -73,12 +73,15 @@ public actor ServiceContainer {
         // Initialize all managers
         self.database = DatabaseManager(
             databasePath: databasePath,
-            storageRootPath: storageConfig.expandedStorageRootPath
+            storageRootPath: storageConfig.expandedStorageRootPath,
+            appSupportRootPath: AppPaths.expandedAppSupportRoot
         )
         self.ftsEngine = FTSManager(databasePath: databasePath)
         let storageRootURL = URL(fileURLWithPath: storageConfig.expandedStorageRootPath, isDirectory: true)
+        let appSupportRootURL = URL(fileURLWithPath: AppPaths.expandedAppSupportRoot, isDirectory: true)
         self.storage = StorageManager(
             storageRoot: storageRootURL,
+            appSupportRoot: appSupportRootURL,
             crashReportDirectory: storageCrashReportDirectory
         )
         self.capture = CaptureManager(config: captureConfig)
@@ -159,14 +162,16 @@ public actor ServiceContainer {
 
         self.database = DatabaseManager(
             databasePath: sharedMemoryPath,
-            storageRootPath: StorageConfig.default.expandedStorageRootPath
+            storageRootPath: StorageConfig.default.expandedStorageRootPath,
+            appSupportRootPath: StorageConfig.default.expandedStorageRootPath
         )
         self.ftsEngine = FTSManager(databasePath: sharedMemoryPath)
         let storageRootURL = URL(
             fileURLWithPath: StorageConfig.default.expandedStorageRootPath,
             isDirectory: true
         )
-        self.storage = StorageManager(storageRoot: storageRootURL)
+        let appSupportRootURL = storageRootURL
+        self.storage = StorageManager(storageRoot: storageRootURL, appSupportRoot: appSupportRootURL)
         self.capture = CaptureManager()
         // ⚠️ RELEASE 2 ONLY
         // self.audioCapture = AudioCaptureManager()

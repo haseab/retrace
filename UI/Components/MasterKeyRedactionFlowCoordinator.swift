@@ -16,7 +16,7 @@ enum MissingMasterKeyPromptAction {
 }
 
 enum MasterKeyRecoveryPromptAction {
-    case recover(text: String, method: MasterKeyRecoveryMethod)
+    case recover(text: String, method: MasterKeyRecoveryMethod, storagePolicy: MasterKeyStoragePolicy)
     case cancel
 }
 
@@ -103,7 +103,11 @@ enum MasterKeyRedactionFlowOutcome: Equatable {
     case deferred
     case recoveredExistingKey
     case keyAlreadyAvailable
-    case createdFreshKey(recoveryPhrase: String, abandonedRewriteCount: Int)
+    case createdFreshKey(
+        recoveryPhrase: String,
+        storagePolicy: MasterKeyStoragePolicy,
+        abandonedRewriteCount: Int
+    )
 }
 
 @MainActor
@@ -173,18 +177,22 @@ enum MasterKeyRedactionFlowCoordinator {
                     recordMetric(metrics.importSelected, [:])
                 }
             ) {
-            case .recover(let recoveryText, let method):
+            case .recover(let recoveryText, let method, let storagePolicy):
                 do {
-                    let restored = try MasterKeyManager.restoreMasterKey(
+                    let restored = try await MasterKeyManager.restoreMasterKeyAsync(
                         fromRecoveryText: recoveryText,
-                        defaults: defaults
+                        defaults: defaults,
+                        storagePolicy: storagePolicy
                     )
                     if state.hasPendingRedactionRewrites {
                         await coordinator.recoverPendingPhraseRedactionRewritesIfPossible()
                     }
                     recordMetric(
                         restored ? metrics.recovered : metrics.alreadyExists,
-                        ["method": method.rawValue]
+                        [
+                            "method": method.rawValue,
+                            "storagePolicy": storagePolicy.rawValue
+                        ]
                     )
                     return restored ? .recoveredExistingKey : .keyAlreadyAvailable
                 } catch {
@@ -192,6 +200,7 @@ enum MasterKeyRedactionFlowCoordinator {
                         metrics.recoverFailed,
                         [
                             "method": method.rawValue,
+                            "storagePolicy": storagePolicy.rawValue,
                             "error": error.localizedDescription
                         ]
                     )
@@ -216,18 +225,33 @@ enum MasterKeyRedactionFlowCoordinator {
             return nil
         }
 
-        recordMetric(metrics.createConfirmed, [:])
+        guard let storagePolicy = MasterKeyPromptUI.presentStoragePolicyPrompt(
+            title: "Choose Master Key Storage",
+            message: "Store the master key only on this Mac or sync it through iCloud Keychain. Retrace will still show a recovery phrase backup."
+        ) else {
+            recordMetric(metrics.createCancelled, ["reason": "storage_policy_cancelled"])
+            return nil
+        }
+
+        recordMetric(metrics.createConfirmed, ["storagePolicy": storagePolicy.rawValue])
 
         do {
-            let result = try MasterKeyManager.createMasterKeyIfNeeded(defaults: defaults)
+            let result = try await MasterKeyManager.createMasterKeyIfNeededAsync(
+                defaults: defaults,
+                storagePolicy: storagePolicy
+            )
             if result.created, let recoveryPhrase = result.recoveryPhrase {
                 let abandonedRewriteCount = await coordinator.abandonPendingPhraseRedactionRewritesForFreshKey()
                 recordMetric(
                     metrics.createdFresh,
-                    ["abandonedRewriteCount": abandonedRewriteCount]
+                    [
+                        "abandonedRewriteCount": abandonedRewriteCount,
+                        "storagePolicy": storagePolicy.rawValue
+                    ]
                 )
                 return .createdFreshKey(
                     recoveryPhrase: recoveryPhrase,
+                    storagePolicy: storagePolicy,
                     abandonedRewriteCount: abandonedRewriteCount
                 )
             }
@@ -297,13 +321,25 @@ enum MasterKeyPromptUI {
                     showRecoveryErrorAlert("Enter the recovery phrase or import the TXT file.")
                     continue
                 }
-                return .recover(text: recoveryText, method: .manualText)
+                guard let storagePolicy = presentStoragePolicyPrompt(
+                    title: "Restore Master Key To",
+                    message: "Choose where Retrace should restore this master key."
+                ) else {
+                    continue
+                }
+                return .recover(text: recoveryText, method: .manualText, storagePolicy: storagePolicy)
             case .alertSecondButtonReturn:
                 onImportSelection?()
                 guard let importedText = importRecoveryTextFile() else {
                     continue
                 }
-                return .recover(text: importedText, method: .txtImport)
+                guard let storagePolicy = presentStoragePolicyPrompt(
+                    title: "Restore Master Key To",
+                    message: "Choose where Retrace should restore this master key."
+                ) else {
+                    continue
+                }
+                return .recover(text: importedText, method: .txtImport, storagePolicy: storagePolicy)
             default:
                 return .cancel
             }
@@ -332,12 +368,39 @@ enum MasterKeyPromptUI {
         }
 
         do {
-            let contents = MasterKeyManager.recoveryDocumentText(recoveryPhrase: recoveryPhrase)
+            let contents = MasterKeyManager.recoveryDocumentText(
+                recoveryPhrase: recoveryPhrase,
+                storagePolicy: MasterKeyManager.storagePolicy()
+            )
             try contents.write(to: url, atomically: true, encoding: .utf8)
             return .saved
         } catch {
             showRecoveryErrorAlert("Couldn't save the recovery phrase.")
             return .failed
+        }
+    }
+
+    static func presentStoragePolicyPrompt(
+        title: String,
+        message: String,
+        icon: NSImage? = nil
+    ) -> MasterKeyStoragePolicy? {
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.icon = icon ?? NSApp.applicationIconImage
+        alert.messageText = title
+        alert.informativeText = message
+        alert.addButton(withTitle: "This Mac Only")
+        alert.addButton(withTitle: "iCloud Keychain")
+        alert.addButton(withTitle: "Cancel")
+
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            return .localOnly
+        case .alertSecondButtonReturn:
+            return .iCloudKeychain
+        default:
+            return nil
         }
     }
 

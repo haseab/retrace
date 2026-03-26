@@ -25,6 +25,8 @@ public actor FTSManager: FTSProtocol {
     /// Initialize the FTS manager (opens existing database connection)
     public func initialize() async throws {
         let expandedPath = NSString(string: databasePath).expandingTildeInPath
+        let isInMemory = databasePath == ":memory:" || databasePath.contains("mode=memory")
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
 
         // Use sqlite3_open_v2 with SQLITE_OPEN_URI to support URI filenames like:
         // file:memdb_xxx?mode=memory&cache=shared (used by tests to share one in-memory DB)
@@ -32,6 +34,25 @@ public actor FTSManager: FTSProtocol {
         guard sqlite3_open_v2(expandedPath, &db, flags, nil) == SQLITE_OK else {
             let errorMsg = db.map { String(cString: sqlite3_errmsg($0)) } ?? "Unknown error"
             throw DatabaseError.connectionFailed(underlying: errorMsg)
+        }
+
+        guard !isInMemory, let db else {
+            return
+        }
+
+        let preferredEncrypted = defaults.object(forKey: "encryptionEnabled") as? Bool ?? false
+        let resolution = try DatabaseManager.resolveDatabaseConnection(
+            at: expandedPath,
+            preferredEncrypted: preferredEncrypted
+        )
+
+        if preferredEncrypted != (resolution.mode == .encrypted) {
+            defaults.set(resolution.mode == .encrypted, forKey: "encryptionEnabled")
+        }
+
+        try DatabaseManager.applyDatabaseConnectionResolution(resolution, to: db)
+        if resolution.mode == .encrypted {
+            Log.debug("[FTSManager] Opened encrypted FTS connection", category: .database)
         }
     }
 

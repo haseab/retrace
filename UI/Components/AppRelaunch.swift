@@ -15,7 +15,8 @@ enum AppRelaunch {
     }
 
     /// Relaunch the app from the best available location.
-    /// Prefers the current launch target, otherwise falls back to /Applications/Retrace.app.
+    /// Prefers the current launch target so follow-up work stays on the same build.
+    /// Falls back to /Applications/Retrace.app when no launch target can be recovered.
     static func relaunch() {
         relaunch(markAsCrashRecovery: false, crashRecoverySource: nil)
     }

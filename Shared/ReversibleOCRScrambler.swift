@@ -5,7 +5,8 @@ import Foundation
 /// Deterministic block-permutation scrambler for OCR regions.
 /// The same key + frameID + nodeID always produces the same permutation.
 public enum ReversibleOCRScrambler {
-    private static let protectedTextPrefix = "rtx1."
+    private static let legacyProtectedTextPrefix = "rtx1."
+    private static let currentProtectedTextPrefix = "rtx2."
     public static let settingsSuiteName = "io.retrace.app"
 
     /// Returns the current scramble secret derived from the Keychain-backed
@@ -13,6 +14,15 @@ public enum ReversibleOCRScrambler {
     /// calling into scrambling.
     public static func currentAppWideSecret() -> String? {
         MasterKeyManager.currentScrambleSecret()
+    }
+
+    public static func legacyAppWideSecret() -> String? {
+        MasterKeyManager.legacyScrambleSecret()
+    }
+
+    public static func shouldUseLegacySecret(for encryptedText: String?) -> Bool {
+        guard let encryptedText else { return false }
+        return !encryptedText.hasPrefix(currentProtectedTextPrefix)
     }
 
     public static func appWideSecret() -> String {
@@ -101,7 +111,7 @@ public enum ReversibleOCRScrambler {
                 using: textProtectionKey(frameID: frameID, nodeOrder: nodeOrder, secret: secret)
             )
             guard let combined = sealedBox.combined else { return nil }
-            return protectedTextPrefix + base64URLEncode(combined)
+            return currentProtectedTextPrefix + base64URLEncode(combined)
         } catch {
             return nil
         }
@@ -111,17 +121,25 @@ public enum ReversibleOCRScrambler {
         _ encryptedText: String,
         frameID: Int64,
         nodeOrder: Int,
-        secret: String
+        secret: String,
+        legacySecret: String? = nil
     ) -> String? {
+        let secretsToTry = candidateSecrets(
+            for: encryptedText,
+            currentSecret: secret,
+            legacySecret: legacySecret
+        )
         let candidateFrameIDs: [Int64] = frameID == 0 ? [0] : [frameID, 0]
         for candidateFrameID in candidateFrameIDs {
-            if let plaintext = decryptOCRText(
-                encryptedText,
-                exactFrameID: candidateFrameID,
-                nodeOrder: nodeOrder,
-                secret: secret
-            ) {
-                return plaintext
+            for candidateSecret in secretsToTry {
+                if let plaintext = decryptOCRText(
+                    encryptedText,
+                    exactFrameID: candidateFrameID,
+                    nodeOrder: nodeOrder,
+                    secret: candidateSecret
+                ) {
+                    return plaintext
+                }
             }
         }
         return nil
@@ -133,9 +151,10 @@ public enum ReversibleOCRScrambler {
         nodeOrder: Int,
         secret: String
     ) -> String? {
-        if encryptedText.hasPrefix(protectedTextPrefix) {
+        if let prefix = protectedTextPrefix(for: encryptedText) {
             return decryptProtectedOCRText(
                 encryptedText,
+                prefix: prefix,
                 exactFrameID: frameID,
                 nodeOrder: nodeOrder,
                 secret: secret
@@ -200,11 +219,12 @@ public enum ReversibleOCRScrambler {
 
     private static func decryptProtectedOCRText(
         _ encryptedText: String,
+        prefix: String,
         exactFrameID frameID: Int64,
         nodeOrder: Int,
         secret: String
     ) -> String? {
-        let encodedPayload = String(encryptedText.dropFirst(protectedTextPrefix.count))
+        let encodedPayload = String(encryptedText.dropFirst(prefix.count))
         guard let combined = base64URLDecode(encodedPayload) else { return nil }
 
         do {
@@ -350,6 +370,36 @@ public enum ReversibleOCRScrambler {
         }
 
         return Data(base64Encoded: base64)
+    }
+
+    private static func protectedTextPrefix(for encryptedText: String) -> String? {
+        if encryptedText.hasPrefix(currentProtectedTextPrefix) {
+            return currentProtectedTextPrefix
+        }
+        if encryptedText.hasPrefix(legacyProtectedTextPrefix) {
+            return legacyProtectedTextPrefix
+        }
+        return nil
+    }
+
+    private static func candidateSecrets(
+        for encryptedText: String,
+        currentSecret: String,
+        legacySecret: String?
+    ) -> [String] {
+        if encryptedText.hasPrefix(currentProtectedTextPrefix) {
+            return [currentSecret]
+        }
+
+        if encryptedText.hasPrefix(legacyProtectedTextPrefix) {
+            return [legacySecret ?? currentSecret]
+        }
+
+        var secrets = [currentSecret]
+        if let legacySecret, legacySecret != currentSecret {
+            secrets.append(legacySecret)
+        }
+        return secrets
     }
 
     private static func applyPermutationLegacy(

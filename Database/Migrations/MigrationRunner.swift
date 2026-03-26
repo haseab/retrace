@@ -17,6 +17,7 @@ protocol Migration {
 
 /// Handles execution of database migrations in order
 actor MigrationRunner {
+    static let latestVersion = 16
 
     private let db: OpaquePointer
 
@@ -102,7 +103,8 @@ actor MigrationRunner {
             V12_FrameMetadata(),
             V13_RemoveInPageURLRects(),
             V14_DBStorageSnapshot(),
-            V15_NodeRedactionFlag()
+            V15_NodeRedactionFlag(),
+            V16_DatabaseIdentity()
         ]
     }
 

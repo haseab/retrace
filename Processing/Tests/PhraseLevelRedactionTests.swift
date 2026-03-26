@@ -82,7 +82,7 @@ final class PhraseLevelRedactionTests: XCTestCase {
             )
         )
 
-        XCTAssertTrue(encrypted.hasPrefix("rtx1."))
+        XCTAssertTrue(encrypted.hasPrefix("rtx2."))
         XCTAssertNotEqual(encrypted, plaintext)
         XCTAssertEqual(
             ReversibleOCRScrambler.decryptOCRText(
@@ -126,6 +126,30 @@ final class PhraseLevelRedactionTests: XCTestCase {
         )
     }
 
+    func testEncryptedOCRTextSupportsLegacySecretFallback() throws {
+        let legacySecret = "legacy-secret"
+        let currentSecret = "derived-secret"
+        let encrypted = try XCTUnwrap(
+            legacyProtectedText(
+                "legacy secret",
+                frameID: 42,
+                nodeOrder: 2,
+                secret: legacySecret
+            )
+        )
+
+        XCTAssertEqual(
+            ReversibleOCRScrambler.decryptOCRText(
+                encrypted,
+                frameID: 42,
+                nodeOrder: 2,
+                secret: currentSecret,
+                legacySecret: legacySecret
+            ),
+            "legacy secret"
+        )
+    }
+
     func testPhraseLevelRedactionUsesActualFrameIDForEncryptedText() throws {
         let extracted = makeExtractedText(
             frameID: FrameID(value: 0),
@@ -141,7 +165,7 @@ final class PhraseLevelRedactionTests: XCTestCase {
 
         let encrypted = try XCTUnwrap(result.encryptedRedactedTexts[0])
         XCTAssertEqual(result.redactedCombinedNodeOrders, Set([0]))
-        XCTAssertTrue(encrypted.hasPrefix("rtx1."))
+        XCTAssertTrue(encrypted.hasPrefix("rtx2."))
         XCTAssertEqual(
             ReversibleOCRScrambler.decryptOCRText(
                 encrypted,
