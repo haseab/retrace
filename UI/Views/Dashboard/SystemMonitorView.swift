@@ -901,7 +901,8 @@ struct ActivityBarChart: View {
     // Cap for each backlog bar and maximum number of visible backlog bars.
     private let backlogBarCap = 100
     private let maxVisibleBacklogBars = 10
-    private let tooltipEstimatedHeight: CGFloat = 56
+    private let standardTooltipEstimatedHeight: CGFloat = 56
+    private let liveTooltipEstimatedHeight: CGFloat = 76
     private let tooltipGapAboveBar: CGFloat = 8
     private let tooltipTopOverflowAllowance: CGFloat = 14
     private let tooltipBubbleWidth: CGFloat = 60
@@ -1222,14 +1223,16 @@ struct ActivityBarChart: View {
         isLive: Bool,
         pointerOffset: CGFloat
     ) -> some View {
-        floatingTooltip(pointerOffset: pointerOffset, width: tooltipBubbleWidth) {
+        let shouldStackMetrics = isLive && processingCount > 0
+
+        return floatingTooltip(pointerOffset: pointerOffset, width: tooltipBubbleWidth) {
             VStack(spacing: 5) {
                 Text(isLive ? "LIVE NOW" : point.minute.formatted(date: .omitted, time: .shortened))
                     .font(.system(size: 9, weight: .semibold, design: .rounded))
                     .tracking(0.45)
                     .foregroundColor(.white.opacity(0.72))
 
-                HStack(spacing: 6) {
+                VStack(spacing: shouldStackMetrics ? 4 : 0) {
                     tooltipMetricChip(
                         text: "\(point.count)",
                         tint: completedTint
@@ -1361,6 +1364,9 @@ struct ActivityBarChart: View {
     ) -> CGFloat {
         let barHeight = mainBarVisualHeight(for: point, isLive: isLive, maxValue: maxValue, chartHeight: chartHeight)
         let barTopY = chartHeight - barHeight
+        let tooltipEstimatedHeight = isLive && processingCount > 0
+            ? liveTooltipEstimatedHeight
+            : standardTooltipEstimatedHeight
         let desiredY = barTopY - tooltipEstimatedHeight - tooltipGapAboveBar
         return max(-tooltipTopOverflowAllowance, desiredY)
     }
@@ -1373,7 +1379,7 @@ struct ActivityBarChart: View {
         let normalizedHeight = CGFloat(min(max(pendingCount, 0), backlogBarCap)) / CGFloat(max(maxValue, 1))
         let barHeight = max(chartHeight * normalizedHeight, 6)
         let barTopY = chartHeight - barHeight
-        let desiredY = barTopY - tooltipEstimatedHeight - tooltipGapAboveBar
+        let desiredY = barTopY - standardTooltipEstimatedHeight - tooltipGapAboveBar
         return max(-tooltipTopOverflowAllowance, desiredY)
     }
 
