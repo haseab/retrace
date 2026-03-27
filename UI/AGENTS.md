@@ -132,7 +132,8 @@ UI/
     ├── CaptureIntervalSettingsTests.swift # Live capture-interval config update coverage
     ├── ProcessCPUDisplayMetricsTests.swift # CPU sampler display math and live ranking coverage
     ├── SearchHighlightTooltipTests.swift # Search highlight tooltip hover/dismiss coverage
-    ├── Dashboard/                        # Dashboard-specific XCTestCase files
+    ├── Dashboard/                        # Dashboard-specific XCTestCase files (title formatting, storage tooltip breakdown)
+    │   └── StorageTooltipBreakdownTests.swift # Storage chart tooltip breakdown coverage
     ├── MenuBar/                          # Menu bar interaction tests
     ├── Search/                           # Search/deeplink/overlay XCTestCase files
     ├── Settings/                         # Settings-focused XCTestCase files, including shell/view-model coverage

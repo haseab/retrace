@@ -1756,7 +1756,16 @@ public class DashboardViewModel: ObservableObject {
                 )
             }
             let dbEstimate = dbEstimateByDay[calendar.startOfDay(for: day)] ?? 0
-            dataPoints.append(DailyDataPoint(date: day, value: dayStorage + dbEstimate))
+            dataPoints.append(
+                DailyDataPoint(
+                    date: day,
+                    value: dayStorage + dbEstimate,
+                    storageBreakdown: DailyStorageBreakdown(
+                        databaseBytes: dbEstimate,
+                        mp4Bytes: dayStorage
+                    )
+                )
+            )
         }
 
         let totalElapsedMs = elapsedMs(since: totalStartedAt)
@@ -2785,16 +2794,27 @@ public struct WindowUsageData: Identifiable {
     }
 }
 
+struct DailyStorageBreakdown: Equatable, Sendable {
+    let databaseBytes: Int64
+    let mp4Bytes: Int64
+}
+
 /// Represents a single data point for daily graphs
 public struct DailyDataPoint: Identifiable {
     public let id = UUID()
     public let date: Date
     public let value: Int64
     public let label: String  // Formatted as MM/DD
+    let storageBreakdown: DailyStorageBreakdown?
 
     public init(date: Date, value: Int64) {
+        self.init(date: date, value: value, storageBreakdown: nil)
+    }
+
+    init(date: Date, value: Int64, storageBreakdown: DailyStorageBreakdown?) {
         self.date = date
         self.value = value
+        self.storageBreakdown = storageBreakdown
 
         let formatter = DateFormatter()
         formatter.dateFormat = "MM/dd"

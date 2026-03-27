@@ -1059,7 +1059,7 @@ public struct SimpleTimelineView: View {
                 inFrameSearchBar
                     .transition(.move(edge: .trailing).combined(with: .opacity))
             }
-            helpButton
+            // helpButton
             closeButton
         }
         .animation(.easeOut(duration: 0.15), value: viewModel.isInFrameSearchVisible)
