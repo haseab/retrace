@@ -181,6 +181,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var lastKnownLowPowerMode: Bool?
     private var isHandlingSystemSleep = false
     private var isHandlingSystemWake = false
+    private var isScreenAsleep = false
     private var pendingDeeplinkURLs: [URL] = []
     private var shouldShowDashboardAfterInitialization = false
     private var isActivationRevealInFlight = false
@@ -1354,6 +1355,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             reason: "system will sleep"
         )
 
+        isScreenAsleep = true
+        if let wrapper = coordinatorWrapper {
+            wrapper.coordinator.isScreenAsleep = true
+        }
+
         guard let wrapper = coordinatorWrapper else { return }
         guard !isHandlingSystemSleep else { return }
         isHandlingSystemSleep = true
@@ -1377,6 +1383,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             after: Self.watchdogWakeGracePeriodSeconds,
             reason: "system did wake"
         )
+
+        isScreenAsleep = false
+        if let wrapper = coordinatorWrapper {
+            wrapper.coordinator.isScreenAsleep = false
+            schedulePowerSettingsApply()
+        }
 
         guard let wrapper = coordinatorWrapper else { return }
         guard !isHandlingSystemWake else { return }
@@ -1405,6 +1417,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             for: Self.watchdogSleepSuspensionSeconds,
             reason: "screens did sleep"
         )
+
+        isScreenAsleep = true
+        if let wrapper = coordinatorWrapper {
+            wrapper.coordinator.isScreenAsleep = true
+            schedulePowerSettingsApply()
+        }
     }
 
     @MainActor
@@ -1413,6 +1431,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             after: Self.watchdogWakeGracePeriodSeconds,
             reason: "screens did wake"
         )
+
+        isScreenAsleep = false
+        if let wrapper = coordinatorWrapper {
+            wrapper.coordinator.isScreenAsleep = false
+            schedulePowerSettingsApply()
+        }
     }
 
     // MARK: - Recording Control

@@ -24,6 +24,7 @@ public struct OCRPowerSettingsSnapshot: Sendable {
     public let processingLevel: Int
     public let appFilterModeRaw: String
     public let filteredAppsJSON: String
+    public let autoMaxOCR: Bool
 
     public init(
         ocrEnabled: Bool,
@@ -31,7 +32,8 @@ public struct OCRPowerSettingsSnapshot: Sendable {
         pauseOnLowPowerMode: Bool,
         processingLevel: Int,
         appFilterModeRaw: String,
-        filteredAppsJSON: String
+        filteredAppsJSON: String,
+        autoMaxOCR: Bool = false
     ) {
         self.ocrEnabled = ocrEnabled
         self.pauseOnBattery = pauseOnBattery
@@ -39,6 +41,7 @@ public struct OCRPowerSettingsSnapshot: Sendable {
         self.processingLevel = processingLevel
         self.appFilterModeRaw = appFilterModeRaw
         self.filteredAppsJSON = filteredAppsJSON
+        self.autoMaxOCR = autoMaxOCR
     }
 
     public static func fromDefaults(
@@ -50,7 +53,8 @@ public struct OCRPowerSettingsSnapshot: Sendable {
             pauseOnLowPowerMode: defaults.bool(forKey: "ocrPauseInLowPowerMode"),
             processingLevel: (defaults.object(forKey: "ocrProcessingLevel") as? NSNumber)?.intValue ?? 3,
             appFilterModeRaw: defaults.string(forKey: "ocrAppFilterMode") ?? "all",
-            filteredAppsJSON: defaults.string(forKey: "ocrFilteredApps") ?? ""
+            filteredAppsJSON: defaults.string(forKey: "ocrFilteredApps") ?? "",
+            autoMaxOCR: defaults.bool(forKey: "autoMaxOCR")
         )
     }
 }
@@ -291,6 +295,9 @@ public actor AppCoordinator {
     // must join the same task so recovery and live writes never overlap.
     private var crashRecoveryTask: Task<Bool, Error>?
     private var hasCompletedCrashRecoverySinceLaunch = false
+
+    /// Whether the screen is currently asleep (set by AppDelegate on sleep/wake transitions)
+    public var isScreenAsleep: Bool = false
 
     // Periodic task to finalize orphaned videos (processingState stuck at 1)
     private var orphanedVideoCleanupTask: Task<Void, Never>?
@@ -878,6 +885,16 @@ public actor AppCoordinator {
         let pauseOnLowPowerMode = snapshot.pauseOnLowPowerMode
         let processingLevel = min(max(snapshot.processingLevel, 1), 5)
 
+        // Auto-boost to Max when screen is asleep, on AC, and battery > 80%
+        var effectiveProcessingLevel = processingLevel
+        if snapshot.autoMaxOCR && isScreenAsleep {
+            let batteryInfo = PowerStateMonitor.shared.getBatteryInfo()
+            if batteryInfo.isOnAC && (batteryInfo.level ?? 100) > 80 {
+                effectiveProcessingLevel = 5
+                Log.info("[AppCoordinator] Auto Max OCR active — boosting to level 5 (screen asleep, on AC, battery \(batteryInfo.level.map { "\($0)%" } ?? "N/A"))", category: .app)
+            }
+        }
+
         // Parse app filter mode and filtered apps
         let filterModeRaw = snapshot.appFilterModeRaw
         let filterMode = OCRAppFilterMode(rawValue: filterModeRaw) ?? .allApps
@@ -926,7 +943,7 @@ public actor AppCoordinator {
         let taskPriority: TaskPriority
         let maxFPS: Double
         let workerCount: Int
-        switch processingLevel {
+        switch effectiveProcessingLevel {
         case 1:
             taskPriority = .background; maxFPS = 0.5; workerCount = 1
         case 2:

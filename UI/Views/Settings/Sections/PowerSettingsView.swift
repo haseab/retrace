@@ -293,6 +293,18 @@ extension SettingsView {
                             }
                         }
 
+                        Divider()
+                            .background(Color.retraceBorder)
+
+                        ModernToggleRow(
+                            title: "Auto Max when idle & charging",
+                            subtitle: "Boost to Max when screen is off, plugged in, and battery over 80%",
+                            isOn: $autoMaxOCR
+                        )
+                        .onChange(of: autoMaxOCR) { _ in
+                            notifyPowerSettingsChanged()
+                        }
+
                     }
         }
     }
@@ -664,7 +676,8 @@ extension SettingsView {
             pauseOnLowPowerMode: ocrPauseInLowPowerMode,
             processingLevel: ocrProcessingLevel,
             appFilterModeRaw: ocrAppFilterMode.rawValue,
-            filteredAppsJSON: ocrFilteredAppsString
+            filteredAppsJSON: ocrFilteredAppsString,
+            autoMaxOCR: autoMaxOCR
         )
 
         NotificationCenter.default.post(name: OCRPowerSettingsNotification.didChange, object: snapshot)
@@ -677,6 +690,7 @@ extension SettingsView {
         ocrProcessingLevel = SettingsDefaults.ocrProcessingLevel
         ocrAppFilterMode = SettingsDefaults.ocrAppFilterMode
         ocrFilteredAppsString = SettingsDefaults.ocrFilteredApps
+        autoMaxOCR = SettingsDefaults.autoMaxOCR
         notifyPowerSettingsChanged()
     }
 
