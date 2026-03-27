@@ -251,7 +251,7 @@ extension SettingsView {
 
     @ViewBuilder
     var pauseReminderCard: some View {
-        ModernSettingsCard(title: "Pause Reminder", icon: "bell.badge") {
+        ModernSettingsCard(title: "Recording Stopped Reminder", icon: "bell.badge") {
             VStack(alignment: .leading, spacing: 16) {
                 HStack {
                     Text("\"Remind Me Later\" interval")
@@ -270,7 +270,7 @@ extension SettingsView {
                 PauseReminderDelayPicker(selectedMinutes: $pauseReminderDelayMinutes)
 
                 HStack {
-                    Text("How long to wait before reminding you again when capture is paused")
+                    Text("How long to wait before reminding you again when recording is stopped")
                         .font(.retraceCaption2)
                         .foregroundColor(.retraceSecondary.opacity(0.7))
 

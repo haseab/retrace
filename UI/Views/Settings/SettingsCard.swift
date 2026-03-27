@@ -537,7 +537,7 @@ struct PauseReminderDelayPicker: View {
     @Binding var selectedMinutes: Double
 
     private let options: [(minutes: Double, label: String)] = [
-        (5, "5m"), (15, "15m"), (30, "30m"), (60, "1h"),
+        (1, "1m"), (5, "5m"), (15, "15m"), (30, "30m"), (60, "1h"),
         (120, "2h"), (240, "4h"), (480, "8h"), (0, "Never"),
     ]
 
