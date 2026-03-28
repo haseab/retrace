@@ -9,6 +9,8 @@ You are responsible for the **Database** module of Retrace. Your job is to imple
 ```
 Database/
 ├── DatabaseManager.swift      # Main DatabaseProtocol implementation
+├── DatabaseConnection.swift   # SQLite/SQLCipher connection wrappers + shared errors
+├── ReadConnectionSupport.swift # Read-only connection factory, pool, and in-memory shared-connection bridge
 ├── FTSManager.swift           # FTSProtocol implementation
 ├── Schema.swift               # Table definitions
 ├── Migrations/
@@ -27,7 +29,8 @@ Database/
 │   ├── V12_FrameMetadata.swift
 │   ├── V13_RemoveInPageURLRects.swift
 │   ├── V14_DBStorageSnapshot.swift
-│   └── V15_NodeRedactionFlag.swift
+│   ├── V15_NodeRedactionFlag.swift
+│   └── V16_ProcessingQueueFrameIDIndex.swift
 ├── Queries/
 │   ├── FrameQueries.swift     # Frame CRUD operations
 │   ├── SegmentQueries.swift   # Segment CRUD operations

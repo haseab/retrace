@@ -369,6 +369,75 @@ final class InFrameSearchTests: XCTestCase {
         XCTAssertEqual(viewModel.currentTimelineFrame?.frame.id.value, 2)
     }
 
+    func testNavigateToSearchResultSlowPathResetsBoundaryStateForNewerPagination() async {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let baseDate = Date(timeIntervalSince1970: 1_700_000_000)
+        viewModel.frames = [
+            makeTimelineFrame(id: 1, frameIndex: 0, bundleID: "com.apple.Safari"),
+            makeTimelineFrame(id: 2, frameIndex: 1, bundleID: "com.apple.Safari"),
+            makeTimelineFrame(id: 3, frameIndex: 2, bundleID: "com.apple.Safari")
+        ]
+        viewModel.currentIndex = 1
+
+        var newerWindowFetches = 0
+
+        viewModel.test_windowFetchHooks.getFramesWithVideoInfo = { _, _, _, _, reason in
+            switch reason {
+            case "navigateToSearchResult":
+                return [
+                    self.makeFrameWithVideoInfo(
+                        id: 49,
+                        timestamp: baseDate.addingTimeInterval(119),
+                        frameIndex: 49,
+                        bundleID: "com.apple.Safari"
+                    ),
+                    self.makeFrameWithVideoInfo(
+                        id: 50,
+                        timestamp: baseDate.addingTimeInterval(120),
+                        frameIndex: 50,
+                        bundleID: "com.apple.Safari"
+                    ),
+                    self.makeFrameWithVideoInfo(
+                        id: 51,
+                        timestamp: baseDate.addingTimeInterval(121),
+                        frameIndex: 51,
+                        bundleID: "com.apple.Safari"
+                    )
+                ]
+            case "loadNewerFrames.reason=unspecified":
+                newerWindowFetches += 1
+                return [
+                    self.makeFrameWithVideoInfo(
+                        id: 52,
+                        timestamp: baseDate.addingTimeInterval(122),
+                        frameIndex: 52,
+                        bundleID: "com.apple.Safari"
+                    )
+                ]
+            default:
+                return []
+            }
+        }
+        viewModel.test_windowFetchHooks.getFramesWithVideoInfoBefore = { _, _, _, _ in [] }
+        viewModel.test_windowFetchHooks.getFramesWithVideoInfoAfter = { _, _, _, _ in [] }
+        viewModel.test_frameOverlayLoadHooks.getOCRStatus = { _ in .completed }
+        viewModel.test_frameOverlayLoadHooks.getAllOCRNodes = { _, _ in [] }
+
+        // Simulate stale boundary state from a previous "hit end" pagination result.
+        viewModel.test_setBoundaryPaginationState(hasMoreOlder: true, hasMoreNewer: false)
+
+        await viewModel.navigateToSearchResult(
+            frameID: FrameID(value: 51),
+            timestamp: baseDate.addingTimeInterval(121),
+            highlightQuery: "error"
+        )
+
+        try? await Task.sleep(for: .milliseconds(50), clock: .continuous)
+
+        XCTAssertGreaterThanOrEqual(newerWindowFetches, 1)
+        XCTAssertTrue(viewModel.frames.contains(where: { $0.frame.id.value == 52 }))
+    }
+
     func testUndoAndRedoRestoreSearchResultHighlightQuery() async {
         let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
         viewModel.frames = [

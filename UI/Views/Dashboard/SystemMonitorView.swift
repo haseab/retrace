@@ -60,7 +60,7 @@ public struct SystemMonitorView: View {
             }
         }
         .task {
-            await viewModel.startMonitoring()
+            viewModel.startMonitoring()
         }
         .onAppear {
             installScrollMonitorIfNeeded()
@@ -1517,6 +1517,20 @@ struct ProcessingDataPoint: Identifiable {
 
 // MARK: - ViewModel
 
+protocol SystemMonitorDataProviding: AnyObject {
+    func getQueueStatistics() async -> QueueStatistics?
+    func getFramesProcessedPerMinute(lastMinutes: Int) async throws -> [Int: Int]
+    func getFramesRewrittenPerMinute(lastMinutes: Int) async throws -> [Int: Int]
+    func getCurrentPowerState() -> (source: PowerStateMonitor.PowerSource, isPaused: Bool)
+    var isSystemMonitorRecordingActive: Bool { get }
+}
+
+extension AppCoordinator: SystemMonitorDataProviding {
+    nonisolated var isSystemMonitorRecordingActive: Bool {
+        statusHolder.status.isRunning
+    }
+}
+
 @MainActor
 class SystemMonitorViewModel: ObservableObject {
     #if DEBUG
@@ -1554,8 +1568,11 @@ class SystemMonitorViewModel: ObservableObject {
     @Published var pulseScale: CGFloat = 1.0
     @Published var pulseOpacity: Double = 1.0
 
-    private let coordinator: AppCoordinator
+    private let dataProvider: any SystemMonitorDataProviding
     private var monitoringTask: Task<Void, Never>?
+    private var historicalLoadTask: Task<Void, Never>?
+    private var pulseAnimationTask: Task<Void, Never>?
+    private let historyWindowMinutes = 30
 
     // Track frames processed per minute using minute key (minutes since epoch)
     // Using Int key instead of Date to avoid timezone/rounding issues at minute boundaries
@@ -1569,8 +1586,12 @@ class SystemMonitorViewModel: ObservableObject {
     private let minimumQueueTrendWindowSeconds: TimeInterval = 12
     private let queueDepthGrowthEpsilonPerMinute: Double = 0.5
 
-    init(coordinator: AppCoordinator) {
-        self.coordinator = coordinator
+    convenience init(coordinator: AppCoordinator) {
+        self.init(dataProvider: coordinator)
+    }
+
+    init(dataProvider: any SystemMonitorDataProviding) {
+        self.dataProvider = dataProvider
         initializeHistories()
     }
 
@@ -1585,9 +1606,9 @@ class SystemMonitorViewModel: ObservableObject {
     }
 
     private func initializeHistories() {
-        // Create 30 empty data points (one per minute)
+        // Create empty data points (one per minute in the visible window).
         let nowKey = minuteKey(for: Date())
-        let emptyHistory = (0..<30).reversed().map { minutesAgo in
+        let emptyHistory = (0..<historyWindowMinutes).reversed().map { minutesAgo in
             let key = nowKey - minutesAgo
             return ProcessingDataPoint(minute: date(fromMinuteKey: key), count: 0)
         }
@@ -1733,34 +1754,42 @@ class SystemMonitorViewModel: ObservableObject {
         ocrProcessingCount > 0
     }
 
-    func startMonitoring() async {
-        // Start pulse animation
+    func startMonitoring() {
         startPulseAnimation()
 
-        // Load historical data on first load
-        await loadHistoricalData()
+        monitoringTask?.cancel()
+        historicalLoadTask?.cancel()
 
         monitoringTask = Task {
             while !Task.isCancelled {
                 await updateStats()
-                try? await Task.sleep(for: .nanoseconds(Int64(1_000_000_000)), clock: .continuous) // 1 second
+                try? await Task.sleep(for: .seconds(1), clock: .continuous)
             }
+        }
+
+        historicalLoadTask = Task {
+            await loadHistoricalData()
         }
     }
 
     func stopMonitoring() {
         monitoringTask?.cancel()
+        historicalLoadTask?.cancel()
+        pulseAnimationTask?.cancel()
         monitoringTask = nil
+        historicalLoadTask = nil
+        pulseAnimationTask = nil
     }
 
     private func startPulseAnimation() {
-        Task { @MainActor in
+        pulseAnimationTask?.cancel()
+        pulseAnimationTask = Task { @MainActor in
             while !Task.isCancelled {
                 withAnimation(.easeOut(duration: 1.0)) {
                     pulseScale = 1.6
                     pulseOpacity = 0
                 }
-                try? await Task.sleep(for: .nanoseconds(Int64(1_000_000_000)), clock: .continuous)
+                try? await Task.sleep(for: .seconds(1), clock: .continuous)
                 pulseScale = 1.0
                 pulseOpacity = 1.0
             }
@@ -1770,29 +1799,33 @@ class SystemMonitorViewModel: ObservableObject {
     private func loadHistoricalData() async {
         let nowKey = minuteKey(for: Date())
 
-        if let historicalCounts = try? await coordinator.getFramesProcessedPerMinute(lastMinutes: 30) {
-            for (minuteOffset, count) in historicalCounts {
-                let key = nowKey - minuteOffset
-                ocrMinuteProcessingCounts[key] = count
-            }
+        if let historicalCounts = try? await dataProvider.getFramesProcessedPerMinute(
+            lastMinutes: historyWindowMinutes
+        ), !Task.isCancelled {
+            mergeHistoricalCounts(historicalCounts, into: &ocrMinuteProcessingCounts, nowKey: nowKey)
+            updateOCRProcessingHistory()
         }
 
-        if let rewriteCounts = try? await coordinator.getFramesRewrittenPerMinute(lastMinutes: 30) {
-            for (minuteOffset, count) in rewriteCounts {
-                let key = nowKey - minuteOffset
-                rewriteMinuteCounts[key] = count
-            }
+        if let rewriteCounts = try? await dataProvider.getFramesRewrittenPerMinute(
+            lastMinutes: historyWindowMinutes
+        ), !Task.isCancelled {
+            mergeHistoricalCounts(rewriteCounts, into: &rewriteMinuteCounts, nowKey: nowKey)
+            updateRewriteHistory()
         }
+    }
 
-        updateOCRProcessingHistory()
-        updateRewriteHistory()
+    private func mergeHistoricalCounts(_ counts: [Int: Int], into target: inout [Int: Int], nowKey: Int) {
+        for (minuteOffset, count) in counts where minuteOffset >= 0 && minuteOffset < historyWindowMinutes {
+            let key = nowKey - minuteOffset
+            target[key] = count
+        }
     }
 
     private func updateStats() async {
         let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
 
         // Get queue statistics
-        if let stats = await coordinator.getQueueStatistics() {
+        if let stats = await dataProvider.getQueueStatistics() {
             ocrQueueDepth = stats.ocrQueueDepth
             ocrPendingCount = stats.ocrPendingCount
             ocrProcessingCount = stats.ocrProcessingCount
@@ -1827,7 +1860,7 @@ class SystemMonitorViewModel: ObservableObject {
         recordQueueDepthSample(ocrQueueDepth)
 
         // Get power state
-        let powerState = coordinator.getCurrentPowerState()
+        let powerState = dataProvider.getCurrentPowerState()
         powerSource = powerState.source
         isPausedForBattery = powerState.isPaused
 
@@ -1835,7 +1868,7 @@ class SystemMonitorViewModel: ObservableObject {
         // with the power configuration shown in Settings.
         let powerSettings = OCRPowerSettingsSnapshot.fromDefaults(defaults)
         ocrEnabled = powerSettings.ocrEnabled
-        isRecordingActive = coordinator.statusHolder.status.isRunning
+        isRecordingActive = dataProvider.isSystemMonitorRecordingActive
         ocrProcessingLevel = min(max(powerSettings.processingLevel, 1), 5)
         pauseOnBatterySetting = powerSettings.pauseOnBattery
         pauseOnLowPowerModeSetting = powerSettings.pauseOnLowPowerMode
@@ -1868,7 +1901,7 @@ class SystemMonitorViewModel: ObservableObject {
 
         var newHistory: [ProcessingDataPoint] = []
 
-        for minutesAgo in (0..<30).reversed() {
+        for minutesAgo in (0..<historyWindowMinutes).reversed() {
             let key = nowKey - minutesAgo
             let count = ocrMinuteProcessingCounts[key] ?? 0
             newHistory.append(ProcessingDataPoint(minute: date(fromMinuteKey: key), count: count))
@@ -1876,7 +1909,7 @@ class SystemMonitorViewModel: ObservableObject {
 
         ocrProcessingHistory = newHistory
 
-        let cutoffKey = nowKey - 31
+        let cutoffKey = nowKey - (historyWindowMinutes + 1)
         ocrMinuteProcessingCounts = ocrMinuteProcessingCounts.filter { $0.key > cutoffKey }
     }
 
@@ -1885,7 +1918,7 @@ class SystemMonitorViewModel: ObservableObject {
 
         var newHistory: [ProcessingDataPoint] = []
 
-        for minutesAgo in (0..<30).reversed() {
+        for minutesAgo in (0..<historyWindowMinutes).reversed() {
             let key = nowKey - minutesAgo
             let count = rewriteMinuteCounts[key] ?? 0
             newHistory.append(ProcessingDataPoint(minute: date(fromMinuteKey: key), count: count))
@@ -1893,7 +1926,7 @@ class SystemMonitorViewModel: ObservableObject {
 
         rewriteHistory = newHistory
 
-        let cutoffKey = nowKey - 31
+        let cutoffKey = nowKey - (historyWindowMinutes + 1)
         rewriteMinuteCounts = rewriteMinuteCounts.filter { $0.key > cutoffKey }
     }
 

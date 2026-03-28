@@ -2077,6 +2077,10 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Task for debouncing scroll end detection
     private var scrollDebounceTask: Task<Void, Never>?
 
+    /// Once the user scrubs during a visible timeline session, background refreshes should stop
+    /// auto-advancing the playhead until the next show cycle.
+    private var hasStartedScrubbingThisVisibleSession = false
+
     /// Task for tape drag momentum animation
     private var tapeDragMomentumTask: Task<Void, Never>?
     private var presentationOverlayIdleTask: Task<Void, Never>?
@@ -2909,6 +2913,25 @@ public class SimpleTimelineViewModel: ObservableObject {
         cancelForegroundFrameLoad(reason: "timeline closed")
         cancelCacheExpansion(reason: "timeline closed")
         scheduleDiskFrameBufferInactivityCleanup()
+    }
+
+    public func resetVisibleSessionScrubTracking(reason: String = "timeline shown") {
+        hasStartedScrubbingThisVisibleSession = false
+        if Self.isVerboseTimelineLoggingEnabled {
+            Log.debug(
+                "[TIMELINE-REOPEN] reset visible-session scrub tracking reason=\(reason)",
+                category: .ui
+            )
+        }
+    }
+
+    func markVisibleSessionScrubStarted(source: String) {
+        guard !hasStartedScrubbingThisVisibleSession else { return }
+        hasStartedScrubbingThisVisibleSession = true
+        Log.info(
+            "[TIMELINE-REOPEN] suppressing auto-advance after visible-session scrub source=\(source) index=\(currentIndex) frames=\(frames.count)",
+            category: .ui
+        )
     }
 
     private func readFrameDataFromDiskFrameBuffer(frameID: FrameID) async -> Data? {
@@ -6790,6 +6813,25 @@ public class SimpleTimelineViewModel: ObservableObject {
         hasReachedAbsoluteEnd = false
     }
 
+    private func applyNavigationFrameWindow(
+        _ framesWithVideoInfo: [FrameWithVideoInfo],
+        clearDiskBufferReason: String,
+        memoryLogContext: String? = nil
+    ) {
+        let oldCacheCount = diskFrameBufferIndex.count
+        clearDiskFrameBuffer(reason: clearDiskBufferReason)
+        if let memoryLogContext, oldCacheCount > 0 {
+            Log.info(
+                "[Memory] Cleared disk frame buffer on \(memoryLogContext) (\(oldCacheCount) frames removed)",
+                category: .ui
+            )
+        }
+
+        frames = framesWithVideoInfo.map { TimelineFrame(frameWithVideoInfo: $0) }
+        updateWindowBoundaries()
+        resetBoundaryStateForReloadWindow()
+    }
+
     private func logFrameWindowSummary(context: String, traceID: UInt64? = nil) {
         let trace = traceID.map { "[DateJump:\($0)] " } ?? ""
 
@@ -7545,6 +7587,8 @@ public class SimpleTimelineViewModel: ObservableObject {
                         filters: filterCriteria,
                         reason: "refreshFrameData.navigateToNewest=\(shouldNavigateToNewest)"
                     )
+                    let shouldAutoAdvanceAfterFetch =
+                        shouldNavigateToNewest && !hasStartedScrubbingThisVisibleSession
 
                     // Filter to only truly new frames
                     let newFrames = newerFrames.filter { $0.frame.timestamp > newestCachedTimestamp }
@@ -7557,8 +7601,13 @@ public class SimpleTimelineViewModel: ObservableObject {
                             // Preserve historical playhead when caller explicitly opted out of
                             // auto-advancing (timeline hide/reopen while scrubbing older frames).
                             // A full reload here would hard-reset to newest and break continuity.
-                            if shouldNavigateToNewest {
+                            if shouldAutoAdvanceAfterFetch {
                                 await loadMostRecentFrame(refreshPresentation: refreshPresentation)
+                            } else if shouldNavigateToNewest {
+                                Log.info(
+                                    "[TIMELINE-REOPEN] refreshSnap suppressed source=fullReload currentIndex=\(currentIndex) total=\(frames.count) appended=\(newFrames.count)",
+                                    category: .ui
+                                )
                             }
                             return
                         }
@@ -7572,7 +7621,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                         updateWindowBoundaries()
 
                         // Navigate to newest frame
-                        if shouldNavigateToNewest {
+                        if shouldAutoAdvanceAfterFetch {
                             let oldIndex = currentIndex
                             currentIndex = frames.count - 1
                             if oldIndex != currentIndex {
@@ -7581,11 +7630,16 @@ public class SimpleTimelineViewModel: ObservableObject {
                                     category: .ui
                                 )
                             }
+                        } else if shouldNavigateToNewest {
+                            Log.info(
+                                "[TIMELINE-REOPEN] refreshSnap suppressed source=newFrames currentIndex=\(currentIndex) total=\(frames.count) appended=\(newTimelineFrames.count)",
+                                category: .ui
+                            )
                         }
 
                         // Trim if we've exceeded max frames (preserve newer since we just added new frames)
                         trimWindowIfNeeded(preserveDirection: .newer)
-                    } else if shouldNavigateToNewest {
+                    } else if shouldAutoAdvanceAfterFetch {
                         // Reopen policy requested newest even if no fresh frame was appended.
                         // Without this, users can remain a few frames behind indefinitely on static screens.
                         let newestIndex = max(0, frames.count - 1)
@@ -7597,6 +7651,11 @@ public class SimpleTimelineViewModel: ObservableObject {
                                 category: .ui
                             )
                         }
+                    } else if shouldNavigateToNewest {
+                        Log.info(
+                            "[TIMELINE-REOPEN] refreshSnap suppressed source=noNewFrames currentIndex=\(currentIndex) total=\(frames.count)",
+                            category: .ui
+                        )
                     }
                 } catch {
                     Log.error("[TIMELINE-REFRESH] Failed to check for new frames: \(error)", category: .ui)
@@ -8236,23 +8295,10 @@ public class SimpleTimelineViewModel: ObservableObject {
                 return
             }
 
-            // Clear disk frame buffer since we're jumping to a new time window
-            let oldCacheCount = diskFrameBufferIndex.count
-            clearDiskFrameBuffer(reason: "search navigation")
-            if oldCacheCount > 0 {
-            }
-
-            // Convert to TimelineFrame - video info is already included from the JOIN
-            let timelineFrames = framesWithVideoInfo.map { TimelineFrame(frameWithVideoInfo: $0) }
-
-            // Replace current frames with new window
-            frames = timelineFrames
-
-            // Update window boundaries
-            if let firstFrame = frames.first, let lastFrame = frames.last {
-                oldestLoadedTimestamp = firstFrame.frame.timestamp
-                newestLoadedTimestamp = lastFrame.frame.timestamp
-            }
+            applyNavigationFrameWindow(
+                framesWithVideoInfo,
+                clearDiskBufferReason: "search navigation"
+            )
 
             // Find and navigate to the target frame by ID
             if let index = frames.firstIndex(where: { $0.frame.id == frameID }) {
@@ -13265,6 +13311,8 @@ public class SimpleTimelineViewModel: ObservableObject {
             stopPlayback()
         }
 
+        markVisibleSessionScrubStarted(source: isTrackpad ? "trackpad-scroll" : "mouse-wheel")
+
         // Exit live mode on first scroll
         if isInLiveMode {
             exitLiveMode()
@@ -13756,17 +13804,11 @@ public class SimpleTimelineViewModel: ObservableObject {
                 return
             }
 
-            // Clear disk frame buffer
-            let oldCacheCount = diskFrameBufferIndex.count
-            clearDiskFrameBuffer(reason: "calendar navigation")
-            if oldCacheCount > 0 {
-                Log.info("[Memory] Cleared disk frame buffer on calendar navigation (\(oldCacheCount) frames removed)", category: .ui)
-            }
-
-            frames = framesWithVideoInfo.map { TimelineFrame(frameWithVideoInfo: $0) }
-
-            updateWindowBoundaries()
-            resetBoundaryStateForReloadWindow()
+            applyNavigationFrameWindow(
+                framesWithVideoInfo,
+                clearDiskBufferReason: "calendar navigation",
+                memoryLogContext: "calendar navigation"
+            )
 
             let closestIndex = findClosestFrameIndex(to: targetDate)
             currentIndex = closestIndex
@@ -13900,19 +13942,11 @@ public class SimpleTimelineViewModel: ObservableObject {
                 return
             }
 
-            // Clear disk frame buffer since we're jumping to a new time window
-            let oldCacheCount = diskFrameBufferIndex.count
-            clearDiskFrameBuffer(reason: "date search")
-            if oldCacheCount > 0 {
-                Log.info("[Memory] Cleared disk frame buffer on date search (\(oldCacheCount) frames removed)", category: .ui)
-            }
-
-            // Convert to TimelineFrame - video info is already included from the JOIN
-            frames = framesWithVideoInfo.map { TimelineFrame(frameWithVideoInfo: $0) }
-
-            // Reset infinite scroll state for new window
-            updateWindowBoundaries()
-            resetBoundaryStateForReloadWindow()
+            applyNavigationFrameWindow(
+                framesWithVideoInfo,
+                clearDiskBufferReason: "date search",
+                memoryLogContext: "date search"
+            )
 
             // Find the frame closest to the target date in our centered set
             let closestIndex = findClosestFrameIndex(to: anchoredTargetDate)
@@ -14011,19 +14045,11 @@ public class SimpleTimelineViewModel: ObservableObject {
                 return false
             }
 
-            // Clear disk frame buffer since we're jumping to a new time window
-            let oldCacheCount = diskFrameBufferIndex.count
-            clearDiskFrameBuffer(reason: "frame ID search")
-            if oldCacheCount > 0 {
-                Log.info("[Memory] Cleared disk frame buffer on frame ID search (\(oldCacheCount) frames removed)", category: .ui)
-            }
-
-            // Convert to TimelineFrame
-            frames = framesWithVideoInfo.map { TimelineFrame(frameWithVideoInfo: $0) }
-
-            // Reset infinite scroll state for new window
-            updateWindowBoundaries()
-            resetBoundaryStateForReloadWindow()
+            applyNavigationFrameWindow(
+                framesWithVideoInfo,
+                clearDiskBufferReason: "frame ID search",
+                memoryLogContext: "frame ID search"
+            )
 
             // Find the exact frame by ID in our loaded frames
             if let exactIndex = frames.firstIndex(where: { $0.frame.id.value == frameID }) {

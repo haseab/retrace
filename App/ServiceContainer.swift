@@ -12,6 +12,8 @@ import SQLCipher
 /// Owner: APP integration
 public actor ServiceContainer {
     private static let rewindCutoffDateDefaultsKey = "rewindCutoffDate"
+    private static let rewindSQLCipherPassword = "soiZ58XZJhdka55hLUp18yOtTUTDXz7Diu7Z4JzuwhRwGG13N6Z9RTVU1fGiKkuF"
+    private static let rewindCipherCompatibility = 4
 
     // MARK: - Services
 
@@ -45,6 +47,7 @@ public actor ServiceContainer {
     private let searchConfig: SearchConfig
 
     private var isInitialized = false
+    private var ownedRewindConnection: DatabaseConnection?
 
     // MARK: - Initialization
 
@@ -329,6 +332,7 @@ public actor ServiceContainer {
 
         let adapter = DataAdapter(
             retraceConnection: retraceConnection,
+            retraceReadConnectionPool: database.readConnectionPool,
             retraceConfig: retraceConfig,
             retraceImageExtractor: retraceImageExtractor,
             database: database
@@ -426,6 +430,7 @@ public actor ServiceContainer {
         } else {
             // Disconnect Rewind source
             await adapter.disconnectRewind()
+            closeOwnedRewindConnection()
             Log.info("✓ Rewind source disconnected", category: .app)
         }
     }
@@ -474,50 +479,11 @@ public actor ServiceContainer {
             return
         }
 
-        // Open encrypted database in serialized mode for safe concurrent reads.
-        var db: OpaquePointer?
-        let flags = SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX
-        guard sqlite3_open_v2(rewindDBPath, &db, flags, nil) == SQLITE_OK else {
-            let errorMsg = db.map { String(cString: sqlite3_errmsg($0)) } ?? "Unknown error"
-            Log.error("[ServiceContainer] Failed to open Rewind database: \(errorMsg)", category: .app)
-            return
-        }
-
-        // Set encryption key
-        let rewindPassword = "soiZ58XZJhdka55hLUp18yOtTUTDXz7Diu7Z4JzuwhRwGG13N6Z9RTVU1fGiKkuF"
-        let keySQL = "PRAGMA key = '\(rewindPassword)'"
-        var keyError: UnsafeMutablePointer<Int8>?
-        if sqlite3_exec(db, keySQL, nil, nil, &keyError) != SQLITE_OK {
-            let error = keyError.map { String(cString: $0) } ?? "Unknown error"
-            sqlite3_free(keyError)
-            Log.error("[ServiceContainer] Failed to set Rewind encryption key: \(error)", category: .app)
-            sqlite3_close(db)
-            return
-        }
-
-        // Set cipher compatibility (Rewind uses SQLCipher 4)
-        var compatError: UnsafeMutablePointer<Int8>?
-        if sqlite3_exec(db, "PRAGMA cipher_compatibility = 4", nil, nil, &compatError) != SQLITE_OK {
-            let error = compatError.map { String(cString: $0) } ?? "Unknown error"
-            sqlite3_free(compatError)
-            Log.error("[ServiceContainer] Failed to set cipher compatibility: \(error)", category: .app)
-            sqlite3_close(db)
-            return
-        }
-
-        // Verify connection
-        var testStmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, "SELECT count(*) FROM sqlite_master", -1, &testStmt, nil) == SQLITE_OK,
-              sqlite3_step(testStmt) == SQLITE_ROW else {
-            sqlite3_finalize(testStmt)
-            sqlite3_close(db)
-            Log.error("[ServiceContainer] Failed to verify Rewind encryption", category: .app)
-            return
-        }
-        sqlite3_finalize(testStmt)
-
-        guard let rewindDB = db else {
-            Log.error("[ServiceContainer] Rewind database pointer unexpectedly nil after verification", category: .app)
+        let rewindConnection: DatabaseConnection
+        do {
+            rewindConnection = try Self.makeRewindConnection(databasePath: rewindDBPath)
+        } catch {
+            Log.error("[ServiceContainer] Failed to open Rewind database: \(error)", category: .app)
             return
         }
 
@@ -530,7 +496,13 @@ public actor ServiceContainer {
         }
 
         // Create connection and config
-        let rewindConnection = SQLCipherConnection(db: rewindDB)
+        ownedRewindConnection = rewindConnection
+        let rewindSearchConnectionPool = SQLiteReadConnectionPool(
+            label: "rewind_search",
+            connectionFactory: { [rewindDBPath] in
+                try Self.makeRewindConnection(databasePath: rewindDBPath)
+            }
+        )
         let rewindConfig = DatabaseConfig.rewind(cutoffDate: cutoffDate)
         // Chunks directory is always in the same parent directory as the database
         let rewindDBDir = (rewindDBPath as NSString).deletingLastPathComponent
@@ -541,9 +513,36 @@ public actor ServiceContainer {
             connection: rewindConnection,
             config: rewindConfig,
             imageExtractor: rewindImageExtractor,
-            cutoffDate: cutoffDate
+            cutoffDate: cutoffDate,
+            searchConnectionPool: rewindSearchConnectionPool
         )
         Log.info("✓ Rewind source configured during initialization", category: .app)
+    }
+
+    private func closeOwnedRewindConnection() {
+        guard let db = ownedRewindConnection?.getConnection() else {
+            ownedRewindConnection = nil
+            return
+        }
+
+        let rc = sqlite3_close_v2(db)
+        if rc != SQLITE_OK {
+            let message = String(cString: sqlite3_errmsg(db))
+            Log.warning(
+                "[ServiceContainer] Failed to close Rewind database connection (\(rc)): \(message)",
+                category: .app
+            )
+        }
+
+        ownedRewindConnection = nil
+    }
+
+    private nonisolated static func makeRewindConnection(databasePath: String) throws -> DatabaseConnection {
+        try SQLiteReadOnlyConnectionFactory.makeRewindConnection(
+            databasePath: databasePath,
+            password: rewindSQLCipherPassword,
+            cipherCompatibility: rewindCipherCompatibility
+        )
     }
 
     public nonisolated static func defaultRewindCutoffDate(calendar: Calendar = .current) -> Date {
@@ -614,9 +613,9 @@ public actor ServiceContainer {
 
         // Shutdown DataAdapter (disconnects all sources)
         await dataAdapter?.shutdown()
+        closeOwnedRewindConnection()
         Log.info("✓ DataAdapter shutdown", category: .app)
 
-        // Close database connections
         try await ftsEngine.close()
         Log.info("✓ FTS engine closed", category: .app)
 
@@ -806,4 +805,5 @@ extension SearchConfig {
 
 enum ServiceError: Error {
     case databaseNotReady
+    case initializationFailed(String)
 }

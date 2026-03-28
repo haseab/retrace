@@ -391,6 +391,35 @@ final class DBStorageSnapshotEstimateTests: XCTestCase {
 }
 
 final class DataAdapterRewindBoundaryTests: XCTestCase {
+    private final class BrokenDatabaseConnection: DatabaseConnection, @unchecked Sendable {
+        func getConnection() -> OpaquePointer? {
+            nil
+        }
+
+        func prepare(sql: String) throws -> OpaquePointer? {
+            throw DatabaseConnectionError.notConnected
+        }
+
+        @discardableResult
+        func execute(sql: String) throws -> Int {
+            throw DatabaseConnectionError.notConnected
+        }
+
+        func beginTransaction() throws {
+            throw DatabaseConnectionError.notConnected
+        }
+
+        func commit() throws {
+            throw DatabaseConnectionError.notConnected
+        }
+
+        func rollback() throws {
+            throw DatabaseConnectionError.notConnected
+        }
+
+        func finalize(_ statement: OpaquePointer?) {}
+    }
+
     private struct StubImageExtractor: ImageExtractor {
         enum StubError: Error {
             case notImplemented
@@ -411,7 +440,10 @@ final class DataAdapterRewindBoundaryTests: XCTestCase {
         let rewindDatabase: DatabaseManager
     }
 
-    private func makeFixture(cutoffDate: Date) async throws -> AdapterFixture {
+    private func makeFixture(
+        cutoffDate: Date,
+        retraceReadConnectionPool: SQLiteReadConnectionPool? = nil
+    ) async throws -> AdapterFixture {
         let retraceDatabase = DatabaseManager(
             databasePath: "file:retrace_boundary_\(UUID().uuidString)?mode=memory&cache=private"
         )
@@ -430,8 +462,13 @@ final class DataAdapterRewindBoundaryTests: XCTestCase {
 
         let retraceConnection = SQLiteConnection(db: retracePointer)
         let rewindConnection = SQLiteConnection(db: rewindPointer)
+        let activeRetraceReadConnectionPool = retraceReadConnectionPool ?? SQLiteReadConnectionPool(
+            label: "test_retrace_search",
+            sharedConnection: retraceConnection
+        )
         let adapter = DataAdapter(
             retraceConnection: retraceConnection,
+            retraceReadConnectionPool: activeRetraceReadConnectionPool,
             retraceConfig: .retrace(),
             retraceImageExtractor: StubImageExtractor(),
             database: retraceDatabase
@@ -599,6 +636,115 @@ final class DataAdapterRewindBoundaryTests: XCTestCase {
         XCTAssertTrue(resultKeys.contains("rewind:\(preCutoffRewindFrame.value)"))
     }
 
+    func testMostRecentFramesTreatInactiveFiltersSameAsNilFilters() async throws {
+        let cutoffDate = makeCutoffDate()
+        let fixture = try await makeFixture(cutoffDate: cutoffDate)
+        defer {
+            Task {
+                try? await self.close(fixture)
+            }
+        }
+
+        let nativeFrame = try await seedFrame(
+            in: fixture.retraceDatabase,
+            timestamp: cutoffDate.addingTimeInterval(3600),
+            bundleID: "com.retrace.filtered.native",
+            text: "native frame after cutoff",
+            source: .native
+        )
+        let rewindFrame = try await seedFrame(
+            in: fixture.rewindDatabase,
+            timestamp: cutoffDate.addingTimeInterval(-1800),
+            bundleID: "com.rewind.filtered",
+            text: "rewind frame before cutoff",
+            source: .rewind
+        )
+
+        let baseline = try await fixture.adapter.getMostRecentFrames(limit: 10)
+        let inactiveFilterResults = try await fixture.adapter.getMostRecentFrames(
+            limit: 10,
+            filters: FilterCriteria()
+        )
+
+        let baselineKeys = baseline.map { "\($0.source.rawValue):\($0.id.value)" }
+        let inactiveFilterKeys = inactiveFilterResults.map { "\($0.source.rawValue):\($0.id.value)" }
+
+        XCTAssertEqual(baselineKeys, inactiveFilterKeys)
+        XCTAssertEqual(
+            baselineKeys,
+            ["native:\(nativeFrame.value)", "rewind:\(rewindFrame.value)"]
+        )
+    }
+
+    func testTimelineReadsTreatInactiveFiltersSameAsNilFilters() async throws {
+        let cutoffDate = makeCutoffDate()
+        let fixture = try await makeFixture(cutoffDate: cutoffDate)
+        defer {
+            Task {
+                try? await self.close(fixture)
+            }
+        }
+
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone.current
+        let dayOne = calendar.date(from: DateComponents(year: 2026, month: 2, day: 5, hour: 0, minute: 0, second: 0))!
+
+        let firstFrameID = try await seedFrame(
+            in: fixture.retraceDatabase,
+            timestamp: dayOne.addingTimeInterval(8 * 3600),
+            bundleID: "com.retrace.filtered.one",
+            text: "first filtered frame",
+            source: .native
+        )
+        let secondFrameID = try await seedFrame(
+            in: fixture.retraceDatabase,
+            timestamp: dayOne.addingTimeInterval(12 * 3600),
+            bundleID: "com.retrace.filtered.two",
+            text: "second filtered frame",
+            source: .native
+        )
+
+        let filters = FilterCriteria()
+
+        let baselineRange = try await fixture.adapter.getFramesWithVideoInfo(
+            from: dayOne,
+            to: dayOne.addingTimeInterval(86399),
+            limit: 10
+        )
+        let inactiveFilterRange = try await fixture.adapter.getFramesWithVideoInfo(
+            from: dayOne,
+            to: dayOne.addingTimeInterval(86399),
+            limit: 10,
+            filters: filters
+        )
+        XCTAssertEqual(baselineRange.map(\.frame.id.value), inactiveFilterRange.map(\.frame.id.value))
+        XCTAssertEqual(inactiveFilterRange.map(\.frame.id.value), [firstFrameID.value, secondFrameID.value])
+
+        let baselineBefore = try await fixture.adapter.getFramesWithVideoInfoBefore(
+            timestamp: dayOne.addingTimeInterval(10 * 3600),
+            limit: 10
+        )
+        let inactiveFilterBefore = try await fixture.adapter.getFramesWithVideoInfoBefore(
+            timestamp: dayOne.addingTimeInterval(10 * 3600),
+            limit: 10,
+            filters: filters
+        )
+        XCTAssertEqual(baselineBefore.map(\.frame.id.value), inactiveFilterBefore.map(\.frame.id.value))
+        XCTAssertEqual(inactiveFilterBefore.map(\.frame.id.value), [firstFrameID.value])
+
+        let baselineAfter = try await fixture.adapter.getFramesWithVideoInfoAfter(
+            timestamp: dayOne.addingTimeInterval(10 * 3600),
+            limit: 10
+        )
+        let inactiveFilterAfter = try await fixture.adapter.getFramesWithVideoInfoAfter(
+            timestamp: dayOne.addingTimeInterval(10 * 3600),
+            limit: 10,
+            filters: filters
+        )
+        XCTAssertEqual(baselineAfter.map(\.frame.id.value), inactiveFilterAfter.map(\.frame.id.value))
+        XCTAssertEqual(inactiveFilterAfter.map(\.frame.id.value), [secondFrameID.value])
+    }
+
     func testSearchExcludesRetraceMatchesBeforeCutoff() async throws {
         let cutoffDate = makeCutoffDate()
         let fixture = try await makeFixture(cutoffDate: cutoffDate)
@@ -630,6 +776,40 @@ final class DataAdapterRewindBoundaryTests: XCTestCase {
         XCTAssertTrue(resultKeys.contains("rewind:\(preCutoffRewindFrame.value)"))
         XCTAssertEqual(results.results.count, 1)
         XCTAssertEqual(results.results.first?.source, .rewind)
+    }
+
+    func testSearchThrowsWhenNativeSourceFailsUnexpectedlyAndRewindHasNoMatches() async throws {
+        let cutoffDate = makeCutoffDate()
+        let brokenRetracePool = SQLiteReadConnectionPool(
+            label: "broken_retrace_search",
+            sharedConnection: BrokenDatabaseConnection()
+        )
+        let fixture = try await makeFixture(
+            cutoffDate: cutoffDate,
+            retraceReadConnectionPool: brokenRetracePool
+        )
+        defer {
+            Task {
+                try? await self.close(fixture)
+            }
+        }
+
+        _ = try await seedFrame(
+            in: fixture.rewindDatabase,
+            timestamp: cutoffDate.addingTimeInterval(-1800),
+            bundleID: "com.rewind.nomatch",
+            text: "completely different content",
+            source: .rewind
+        )
+
+        do {
+            _ = try await fixture.adapter.search(query: SearchQuery(text: "needle"))
+            XCTFail("Expected unexpected native search failure to be surfaced")
+        } catch DatabaseConnectionError.notConnected {
+            // Expected: unexpected source failures should no longer be converted into empty results.
+        } catch {
+            XCTFail("Expected notConnected, got \(error)")
+        }
     }
 
     func testDistinctDatesExcludePreCutoffRetraceDates() async throws {

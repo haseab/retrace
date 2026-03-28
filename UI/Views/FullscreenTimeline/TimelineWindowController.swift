@@ -32,6 +32,7 @@ public class TimelineWindowController: NSObject {
     private var localEventMonitor: Any?
     private var mouseEventMonitor: Any?  // Debug monitor for shift-drag investigation
     private var timelineViewModel: SimpleTimelineViewModel?
+    private var pendingTimelineViewModelWaiters: [CheckedContinuation<SimpleTimelineViewModel, Never>] = []
     private var hostingView: NSView?
     private var deferredHostingViewDetachTask: Task<Void, Never>?
     private var tapeShowAnimationTask: Task<Void, Never>?
@@ -942,7 +943,7 @@ public class TimelineWindowController: NSObject {
         // Fallback: Create presentation and view model from scratch (prerender disabled or unavailable).
         Log.info("[TIMELINE-SHOW] ⚠️ Using FALLBACK path - creating new window and viewModel from scratch", category: .ui)
         let viewModel = SimpleTimelineViewModel(coordinator: coordinator)
-        self.timelineViewModel = viewModel
+        setTimelineViewModel(viewModel)
         prepareLiveModeState(shouldUseLiveMode: shouldUseLiveMode, viewModel: viewModel)
         viewModel.isTapeHidden = true
         tapeShowAnimationTask?.cancel()
@@ -1076,6 +1077,7 @@ public class TimelineWindowController: NSObject {
         // Track session start time for duration metrics
         sessionStartTime = Date()
         sessionScrubDistance = 0  // Reset scrub distance for new session
+        timelineViewModel?.resetVisibleSessionScrubTracking()
 
         // Post notification so menu bar can hide recording indicator
         NotificationCenter.default.post(name: .timelineDidOpen, object: nil)
@@ -1442,7 +1444,7 @@ public class TimelineWindowController: NSObject {
         }
 
         let viewModel = SimpleTimelineViewModel(coordinator: coordinator)
-        timelineViewModel = viewModel
+        setTimelineViewModel(viewModel)
         isPrepared = true
         return viewModel
     }
@@ -1556,21 +1558,81 @@ public class TimelineWindowController: NSObject {
 
         Task { @MainActor [weak self] in
             guard let self else { return }
-
-            // Wait briefly for the pre-rendered view model to be ready on first launch.
-            var attempts = 0
-            while self.timelineViewModel == nil && attempts < 20 {
-                try? await Task.sleep(for: .nanoseconds(Int64(50_000_000)), clock: .continuous) // 50ms
-                attempts += 1
-            }
-
-            guard let viewModel = self.timelineViewModel else {
-                Log.warning("[DeeplinkSearch] Invocation #\(invocationID) failed - timeline view model unavailable", category: .ui)
+            guard self.coordinator != nil else {
+                Log.warning("[DeeplinkSearch] Invocation #\(invocationID) failed - timeline coordinator unavailable", category: .ui)
                 return
             }
+            let viewModel = await self.awaitTimelineViewModelReady()
 
             Log.info("[DeeplinkSearch] Invocation #\(invocationID) applying deeplink payload", category: .ui)
             viewModel.applySearchDeeplink(query: query, appBundleID: appBundleID, source: source)
+        }
+    }
+
+    /// Show the timeline and open the spotlight search overlay, preserving any existing search state.
+    public func showSearchOverlay(
+        source: String = "unknown",
+        recentEntriesRevealDelay: TimeInterval = 0.3
+    ) {
+        Log.info(
+            "[TimelineSearchOverlay] showSearchOverlay source=\(source) isVisible=\(isVisible) searchOverlayVisible=\(timelineViewModel?.isSearchOverlayVisible ?? false)",
+            category: .ui
+        )
+        show()
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard self.coordinator != nil else {
+                Log.warning(
+                    "[TimelineSearchOverlay] Failed to open search overlay because the timeline coordinator is unavailable source=\(source)",
+                    category: .ui
+                )
+                return
+            }
+            let viewModel = await self.awaitTimelineViewModelReady()
+
+            _ = Self.presentSearchOverlay(
+                on: viewModel,
+                coordinator: self.coordinator,
+                recentEntriesRevealDelay: recentEntriesRevealDelay
+            )
+        }
+    }
+
+    @MainActor
+    private func awaitTimelineViewModelReady() async -> SimpleTimelineViewModel {
+        if let timelineViewModel {
+            return timelineViewModel
+        }
+
+        return await withCheckedContinuation { continuation in
+            pendingTimelineViewModelWaiters.append(continuation)
+        }
+    }
+
+    @discardableResult
+    static func presentSearchOverlay(
+        on viewModel: SimpleTimelineViewModel,
+        coordinator: AppCoordinator?,
+        recentEntriesRevealDelay: TimeInterval = 0.3
+    ) -> Bool {
+        let wasVisible = viewModel.isSearchOverlayVisible
+        viewModel.openSearchOverlay(recentEntriesRevealDelay: recentEntriesRevealDelay)
+
+        if !wasVisible, let coordinator {
+            DashboardViewModel.recordSearchDialogOpen(coordinator: coordinator)
+        }
+
+        return !wasVisible
+    }
+
+    private func setTimelineViewModel(_ viewModel: SimpleTimelineViewModel) {
+        timelineViewModel = viewModel
+
+        let waiters = pendingTimelineViewModelWaiters
+        pendingTimelineViewModelWaiters.removeAll(keepingCapacity: false)
+        for waiter in waiters {
+            waiter.resume(returning: viewModel)
         }
     }
 
@@ -2697,12 +2759,14 @@ public class TimelineWindowController: NSObject {
                     "[TimelineShortcut] Cmd+K wasVisible=\(wasVisible) queryEmpty=\(viewModel.searchViewModel.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)",
                     category: .ui
                 )
-                viewModel.toggleSearchOverlay(recentEntriesRevealDelayOnOpen: 0.3)
-                // Record search dialog open metric when opening
-                if !wasVisible {
-                    if let coordinator = coordinator {
-                        DashboardViewModel.recordSearchDialogOpen(coordinator: coordinator)
-                    }
+                if wasVisible {
+                    viewModel.closeSearchOverlay()
+                } else {
+                    _ = Self.presentSearchOverlay(
+                        on: viewModel,
+                        coordinator: coordinator,
+                        recentEntriesRevealDelay: 0.3
+                    )
                 }
             }
             return true

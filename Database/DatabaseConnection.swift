@@ -34,6 +34,9 @@ public enum DatabaseConnectionError: Error, CustomStringConvertible {
     case executionFailed(sql: String, error: String)
     case transactionFailed(error: String)
     case notConnected
+    case connectionOpenFailed(path: String, error: String)
+    case connectionConfigurationFailed(error: String)
+    case readPoolClosed
 
     public var description: String {
         switch self {
@@ -45,6 +48,12 @@ public enum DatabaseConnectionError: Error, CustomStringConvertible {
             return "Transaction failed: \(error)"
         case .notConnected:
             return "Database not connected"
+        case .connectionOpenFailed(let path, let error):
+            return "Failed to open database at '\(path)': \(error)"
+        case .connectionConfigurationFailed(let error):
+            return "Failed to configure database connection: \(error)"
+        case .readPoolClosed:
+            return "Read connection pool is closed"
         }
     }
 }

@@ -5,6 +5,24 @@ import AppKit
 
 private let searchLog = "[SpotlightSearch]"
 
+private enum SpotlightSearchLayoutMetrics {
+    static let searchFieldHeight: CGFloat = 30
+    static let searchControlButtonSize: CGFloat = 24
+    static let searchBarHorizontalPadding: CGFloat = 20
+    static let searchBarVerticalPadding: CGFloat = 16
+    static let dividerHeight: CGFloat = 1
+    static let filterBarReservedHeight: CGFloat = 48
+    static let filterBarResultsGap: CGFloat = 4
+
+    static var searchBarHeight: CGFloat {
+        max(searchFieldHeight, searchControlButtonSize) + (searchBarVerticalPadding * 2)
+    }
+
+    static var filterBarTopOffset: CGFloat {
+        searchBarHeight + dividerHeight
+    }
+}
+
 /// Spotlight-style search overlay that appears center-screen
 /// Triggered by Cmd+K or search icon click
 public struct SpotlightSearchOverlay: View {
@@ -130,12 +148,12 @@ public struct SpotlightSearchOverlay: View {
                         VStack(spacing: 0) {
                             // Reserve vertical space for the filter bar so results don't jump when it appears.
                             Color.clear
-                                .frame(height: 48)
+                                .frame(height: SpotlightSearchLayoutMetrics.filterBarReservedHeight)
                                 .allowsHitTesting(false)
 
                             if hasResults {
                                 // Small gap before divider to maintain visual spacing below filter bar
-                                Color.clear.frame(height: 4)
+                                Color.clear.frame(height: SpotlightSearchLayoutMetrics.filterBarResultsGap)
 
                                 Divider()
                                     .background(Color.white.opacity(0.1))
@@ -176,7 +194,7 @@ public struct SpotlightSearchOverlay: View {
                 if isExpanded {
                     VStack(spacing: 0) {
                         // Offset to position below search bar + divider
-                        Color.clear.frame(height: 57) // searchBar height (~56px) + divider (1px)
+                        Color.clear.frame(height: SpotlightSearchLayoutMetrics.filterBarTopOffset)
                         SearchFilterBar(viewModel: viewModel)
                     }
                     .frame(width: panelWidth)
@@ -270,7 +288,7 @@ public struct SpotlightSearchOverlay: View {
             // Log results when search completes
             if !isSearching {
                 if let results = viewModel.results {
-                    Log.info("\(searchLog) Results received: \(results.results.count) results, totalCount=\(results.totalCount), searchTime=\(results.searchTimeMs)ms", category: .ui)
+                    Log.info("\(searchLog) Results received: \(results.results.count) results, nextPage=\(results.nextCursor != nil), searchTime=\(results.searchTimeMs)ms", category: .ui)
                 }
                 if shouldFocusFirstResultAfterSubmit {
                     focusFirstResultIfAvailable()
@@ -420,7 +438,7 @@ public struct SpotlightSearchOverlay: View {
                     },
                     refocusTrigger: refocusSearchField
                 )
-                .frame(height: 30)
+                .frame(height: SpotlightSearchLayoutMetrics.searchFieldHeight)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(Rectangle())
@@ -432,7 +450,10 @@ public struct SpotlightSearchOverlay: View {
             if viewModel.isSearching {
                 SpinnerView(size: 20, lineWidth: 2, color: .white)
                     // Keep search row height stable while loading so filter bar offset does not shift.
-                    .frame(width: 24, height: 24)
+                    .frame(
+                        width: SpotlightSearchLayoutMetrics.searchControlButtonSize,
+                        height: SpotlightSearchLayoutMetrics.searchControlButtonSize
+                    )
             }
 
             // Filter button (expands to show filters)
@@ -448,7 +469,10 @@ public struct SpotlightSearchOverlay: View {
                         .font(.system(size: 10, weight: .bold))
                         .foregroundColor(isExpanded || viewModel.hasActiveFilters ? .white : .white.opacity(0.6))
                 }
-                .frame(width: 24, height: 24)
+                .frame(
+                    width: SpotlightSearchLayoutMetrics.searchControlButtonSize,
+                    height: SpotlightSearchLayoutMetrics.searchControlButtonSize
+                )
                 .overlay(alignment: .topTrailing) {
                     if viewModel.activeFilterCount > 0 {
                         Text("\(viewModel.activeFilterCount)")
@@ -474,12 +498,15 @@ public struct SpotlightSearchOverlay: View {
                         .font(.system(size: 10, weight: .bold))
                         .foregroundColor(.white.opacity(0.6))
                 }
-                .frame(width: 24, height: 24)
+                .frame(
+                    width: SpotlightSearchLayoutMetrics.searchControlButtonSize,
+                    height: SpotlightSearchLayoutMetrics.searchControlButtonSize
+                )
             }
             .buttonStyle(.plain)
         }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 16)
+        .padding(.horizontal, SpotlightSearchLayoutMetrics.searchBarHorizontalPadding)
+        .padding(.vertical, SpotlightSearchLayoutMetrics.searchBarVerticalPadding)
         .overlay(
             UnevenRoundedRectangle(
                 topLeadingRadius: 12,

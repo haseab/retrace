@@ -158,8 +158,10 @@ public actor DatabaseManager: DatabaseProtocol {
     // MARK: - Properties
 
     private var db: OpaquePointer?
+    nonisolated public let readConnectionPool: SQLiteReadConnectionPool
     private let databasePath: String
     private let storageRootPath: String
+    private let inMemorySharedConnection: SharedSQLiteConnection?
     private var isInitialized = false
     private var dbActorOperationSequence: UInt64 = 0
     private var dbActorOperationStack: [(id: UInt64, name: String, startedAt: CFAbsoluteTime)] = []
@@ -242,14 +244,41 @@ public actor DatabaseManager: DatabaseProtocol {
     // MARK: - Initialization
 
     public init(databasePath: String, storageRootPath: String = AppPaths.expandedStorageRoot) {
+        if Self.isInMemoryDatabasePath(databasePath) {
+            let sharedConnection = SharedSQLiteConnection()
+            self.readConnectionPool = SQLiteReadConnectionPool(
+                label: "retrace",
+                sharedConnection: sharedConnection
+            )
+            self.inMemorySharedConnection = sharedConnection
+        } else {
+            self.readConnectionPool = SQLiteReadConnectionPool(
+                label: "retrace",
+                connectionFactory: {
+                    try SQLiteReadOnlyConnectionFactory.makeRetraceConnection(databasePath: databasePath)
+                }
+            )
+            self.inMemorySharedConnection = nil
+        }
+
         self.databasePath = databasePath
         self.storageRootPath = NSString(string: storageRootPath).expandingTildeInPath
     }
 
     /// Convenience initializer for in-memory database (testing)
     public init() {
+        let sharedConnection = SharedSQLiteConnection()
+        self.readConnectionPool = SQLiteReadConnectionPool(
+            label: "retrace",
+            sharedConnection: sharedConnection
+        )
+        self.inMemorySharedConnection = sharedConnection
         self.databasePath = ":memory:"
         self.storageRootPath = AppPaths.expandedStorageRoot
+    }
+
+    private nonisolated static func isInMemoryDatabasePath(_ databasePath: String) -> Bool {
+        databasePath == ":memory:" || databasePath.contains("mode=memory")
     }
 
     // MARK: - Lifecycle
@@ -290,6 +319,7 @@ public actor DatabaseManager: DatabaseProtocol {
             Log.critical("[DatabaseManager] Failed to open database at: \(expandedPath) - \(errorMsg)", category: .database)
             throw DatabaseError.connectionFailed(underlying: errorMsg)
         }
+        inMemorySharedConnection?.setConnection(db)
         Log.debug("[DatabaseManager] Database opened successfully", category: .database)
         SQLiteRuntimeDiagnostics.log(label: "DatabaseManager/open", db: db)
 
@@ -328,6 +358,8 @@ public actor DatabaseManager: DatabaseProtocol {
     public func close() async throws {
         guard let db = db else { return }
 
+        await readConnectionPool.close()
+
         // Checkpoint WAL before closing (if not in-memory)
         let isInMemory = databasePath == ":memory:" || databasePath.contains("mode=memory")
         if !isInMemory {
@@ -347,6 +379,7 @@ public actor DatabaseManager: DatabaseProtocol {
         }
 
         self.db = nil
+        inMemorySharedConnection?.setConnection(nil)
         isInitialized = false
         Log.info("[DatabaseManager] Database closed", category: .database)
     }
@@ -971,32 +1004,28 @@ public actor DatabaseManager: DatabaseProtocol {
         )
     }
 
-    public func getAppUsageStats(
+    private nonisolated func withDashboardReadConnection<T>(
+        operation: String,
+        _ body: @escaping @Sendable (OpaquePointer) throws -> T
+    ) async throws -> T {
+        try await readConnectionPool.withConnection(operation: operation) { connection in
+            guard let db = connection.getConnection() else {
+                throw DatabaseError.connectionFailed(underlying: "Read connection unavailable")
+            }
+            return try body(db)
+        }
+    }
+
+    nonisolated public func getAppUsageStats(
         from startDate: Date,
         to endDate: Date
     ) async throws -> [(bundleID: String, duration: TimeInterval, uniqueItemCount: Int)] {
-        let startedAt = CFAbsoluteTimeGetCurrent()
-        do {
-            let results = try withTracedDatabaseOperation("get_app_usage_stats") { db in
-                try AppSegmentQueries.getAppUsageStats(db: db, from: startDate, to: endDate)
-            }
-            let elapsedMs = (CFAbsoluteTimeGetCurrent() - startedAt) * 1000
-            Log.recordLatency(
-                "dashboard.path.database_manager.get_app_usage_stats_ms",
-                valueMs: elapsedMs,
-                category: .database,
-                summaryEvery: 10,
-                warningThresholdMs: 800,
-                criticalThresholdMs: 2500
+        try await withDashboardReadConnection(operation: "get_app_usage_stats") { db in
+            try AppSegmentQueries.getAppUsageStats(
+                db: db,
+                from: startDate,
+                to: endDate
             )
-            return results
-        } catch {
-            let elapsedMs = (CFAbsoluteTimeGetCurrent() - startedAt) * 1000
-            Log.error(
-                "[DASHBOARD-PATH][DatabaseManager] getAppUsageStats failed range=[\(Log.timestamp(from: startDate)) -> \(Log.timestamp(from: endDate))] after \(String(format: "%.1f", elapsedMs))ms: \(error)",
-                category: .database
-            )
-            throw error
         }
     }
 
@@ -2548,36 +2577,16 @@ public actor DatabaseManager: DatabaseProtocol {
 
     /// Get daily screen time totals (for graphs)
     /// Returns array of (date, totalSeconds) tuples sorted by date ascending
-    public func getDailyScreenTime(
+    nonisolated public func getDailyScreenTime(
         from startDate: Date,
         to endDate: Date
     ) async throws -> [(date: Date, value: Int64)] {
-        let startedAt = CFAbsoluteTimeGetCurrent()
-        do {
-            let results = try withTracedDatabaseOperation("get_daily_screen_time") { db in
-                try AppSegmentQueries.getDailyScreenTime(
-                    db: db,
-                    from: startDate,
-                    to: endDate
-                )
-            }
-            let elapsedMs = (CFAbsoluteTimeGetCurrent() - startedAt) * 1000
-            Log.recordLatency(
-                "dashboard.path.database_manager.get_daily_screen_time_ms",
-                valueMs: elapsedMs,
-                category: .database,
-                summaryEvery: 10,
-                warningThresholdMs: 1200,
-                criticalThresholdMs: 5000
+        try await withDashboardReadConnection(operation: "get_daily_screen_time") { db in
+            try AppSegmentQueries.getDailyScreenTime(
+                db: db,
+                from: startDate,
+                to: endDate
             )
-            return results
-        } catch {
-            let elapsedMs = (CFAbsoluteTimeGetCurrent() - startedAt) * 1000
-            Log.error(
-                "[DASHBOARD-PATH][DatabaseManager] getDailyScreenTime failed range=[\(Log.timestamp(from: startDate)) -> \(Log.timestamp(from: endDate))] after \(String(format: "%.1f", elapsedMs))ms: \(error)",
-                category: .database
-            )
-            throw error
         }
     }
 
@@ -2637,15 +2646,11 @@ public actor DatabaseManager: DatabaseProtocol {
         }
     }
 
-    /// Read daily DB/WAL size snapshots for the requested local-date range.
-    public func getDBStorageSnapshots(
+    private static func readDBStorageSnapshots(
+        db: OpaquePointer,
         from startDate: Date,
         to endDate: Date
-    ) async throws -> [(date: Date, dbBytes: Int64, walBytes: Int64, sampledAt: Date)] {
-        guard let db = db else {
-            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
-        }
-
+    ) throws -> [(date: Date, dbBytes: Int64, walBytes: Int64, sampledAt: Date)] {
         let sql = """
             SELECT local_day, db_bytes, wal_bytes, sampled_at
             FROM db_storage_snapshot
@@ -2683,6 +2688,20 @@ public actor DatabaseManager: DatabaseProtocol {
         }
 
         return snapshots
+    }
+
+    /// Read daily DB/WAL size snapshots for the requested local-date range.
+    nonisolated public func getDBStorageSnapshots(
+        from startDate: Date,
+        to endDate: Date
+    ) async throws -> [(date: Date, dbBytes: Int64, walBytes: Int64, sampledAt: Date)] {
+        try await withDashboardReadConnection(operation: "get_db_storage_snapshots") { db in
+            try Self.readDBStorageSnapshots(
+                db: db,
+                from: startDate,
+                to: endDate
+            )
+        }
     }
 
     // MARK: - Statistics
@@ -3507,10 +3526,6 @@ public actor DatabaseManager: DatabaseProtocol {
         extraWhereClause: String,
         logLabel: String
     ) async throws -> [Int: Int] {
-        guard let db = db else {
-            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
-        }
-
         // Query frames by timestampColumn (stored as INTEGER Unix timestamp in milliseconds)
         // Use clean minute boundaries (floor to start of minute) for consistent bucketing
         // e.g., 17:05:23 becomes minute key for 17:05:00
@@ -3518,35 +3533,38 @@ public actor DatabaseManager: DatabaseProtocol {
         let currentMinuteMs = (nowMs / 60000) * 60000  // Floor to start of current minute
         let cutoffMs = currentMinuteMs - Int64(lastMinutes * 60 * 1000)
 
-        // Group by which minute bucket the frame was processed in
-        // minuteOffset 0 = current minute (e.g., 17:05:00 to 17:05:59)
-        // minuteOffset 1 = previous minute (e.g., 17:04:00 to 17:04:59)
+        // Group by minute bucket only; ordering is unnecessary because callers merge into dictionaries.
         let sql = """
             SELECT
-                CAST((\(currentMinuteMs) - (\(timestampColumn) / 60000) * 60000) / 60000 AS INTEGER) as minuteOffset,
+                CAST((?1 - ((\(timestampColumn) / 60000) * 60000)) / 60000 AS INTEGER) AS minuteOffset,
                 COUNT(*) as count
             FROM frame
             WHERE \(timestampColumn) IS NOT NULL
-              AND \(timestampColumn) >= \(cutoffMs)
+              AND \(timestampColumn) >= ?2
               \(extraWhereClause)
             GROUP BY minuteOffset
-            ORDER BY minuteOffset ASC;
         """
 
-        var stmt: OpaquePointer?
-        defer { sqlite3_finalize(stmt) }
+        let result = try withTracedDatabaseOperation("get_frames_\(logLabel)_per_minute", warningMs: 250) { db in
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
 
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
-        }
-
-        var result: [Int: Int] = [:]
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            let minuteOffset = Int(sqlite3_column_int(stmt, 0))
-            let count = Int(sqlite3_column_int(stmt, 1))
-            if minuteOffset >= 0 && minuteOffset < lastMinutes {
-                result[minuteOffset] = count
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
             }
+
+            sqlite3_bind_int64(stmt, 1, currentMinuteMs)
+            sqlite3_bind_int64(stmt, 2, cutoffMs)
+
+            var result: [Int: Int] = [:]
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                let minuteOffset = Int(sqlite3_column_int(stmt, 0))
+                let count = Int(sqlite3_column_int(stmt, 1))
+                if minuteOffset >= 0 && minuteOffset < lastMinutes {
+                    result[minuteOffset] = count
+                }
+            }
+            return result
         }
 
         Log.debug(
@@ -3807,9 +3825,14 @@ public actor DatabaseManager: DatabaseProtocol {
     public func getPendingFrameIDsNotInQueue(limit: Int = 1000) async throws -> [Int64] {
         return try withTracedDatabaseOperation("get_pending_frame_ids_not_in_queue") { db in
             let sql = """
-                SELECT f.id FROM frame f
-                LEFT JOIN processing_queue pq ON f.id = pq.frameId
-                WHERE f.processingStatus = 0 AND pq.frameId IS NULL
+                SELECT f.id
+                FROM frame f
+                WHERE f.processingStatus = 0
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM processing_queue pq
+                      WHERE pq.frameId = f.id
+                  )
                 ORDER BY f.id DESC
                 LIMIT ?;
             """
@@ -3833,27 +3856,30 @@ public actor DatabaseManager: DatabaseProtocol {
 
     /// Count frames with pending status (processingStatus=0) that are NOT in the processing queue
     public func countPendingFramesNotInQueue() async throws -> Int {
-        guard let db = db else {
-            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        return try withTracedDatabaseOperation("count_pending_frames_not_in_queue") { db in
+            let sql = """
+                SELECT COUNT(*)
+                FROM frame f
+                WHERE f.processingStatus = 0
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM processing_queue pq
+                      WHERE pq.frameId = f.id
+                  );
+            """
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+            }
+
+            guard sqlite3_step(stmt) == SQLITE_ROW else {
+                return 0
+            }
+
+            return Int(sqlite3_column_int(stmt, 0))
         }
-
-        let sql = """
-            SELECT COUNT(*) FROM frame f
-            LEFT JOIN processing_queue pq ON f.id = pq.frameId
-            WHERE f.processingStatus = 0 AND pq.frameId IS NULL;
-        """
-        var stmt: OpaquePointer?
-        defer { sqlite3_finalize(stmt) }
-
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
-        }
-
-        guard sqlite3_step(stmt) == SQLITE_ROW else {
-            return 0
-        }
-
-        return Int(sqlite3_column_int(stmt, 0))
     }
 
     // MARK: - Schema Inspection

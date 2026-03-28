@@ -10,14 +10,13 @@ private actor NoopSearch: SearchProtocol {
     func initialize(config: SearchConfig) async throws {}
 
     func search(query: SearchQuery) async throws -> SearchResults {
-        SearchResults(query: query, results: [], totalCount: 0, searchTimeMs: 0)
+        SearchResults(query: query, results: [], searchTimeMs: 0)
     }
 
     func search(text: String, limit: Int) async throws -> SearchResults {
         SearchResults(
             query: SearchQuery(text: text, limit: limit),
             results: [],
-            totalCount: 0,
             searchTimeMs: 0
         )
     }

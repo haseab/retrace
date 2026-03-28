@@ -255,30 +255,27 @@ public struct SearchResult: Codable, Sendable, Identifiable {
     }
 }
 
-/// Collection of search results with metadata
+/// A single paginated search response.
 public struct SearchResults: Codable, Sendable {
     public let query: SearchQuery
     public var results: [SearchResult]  // var to allow source tagging
-    public let totalCount: Int       // Total matches (may be > results.count due to limit)
     public let searchTimeMs: Int     // How long the search took
     public let nextCursor: SearchPageCursor?
 
     public init(
         query: SearchQuery,
         results: [SearchResult],
-        totalCount: Int,
         searchTimeMs: Int,
         nextCursor: SearchPageCursor? = nil
     ) {
         self.query = query
         self.results = results
-        self.totalCount = totalCount
         self.searchTimeMs = searchTimeMs
         self.nextCursor = nextCursor
     }
 
     public var isEmpty: Bool { results.isEmpty }
-    public var hasMore: Bool { results.count < totalCount }
+    public var hasMore: Bool { nextCursor != nil }
 }
 
 // MARK: - Grouped Search Results

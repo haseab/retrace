@@ -29,4 +29,17 @@ final class MenuBarManagerClickBehaviorTests: XCTestCase {
     func testMissingEventDefaultsToOpenStatusMenu() {
         XCTAssertTrue(MenuBarManager.shouldOpenStatusMenu(for: nil))
     }
+
+    func testPrimaryActionsPlaceSearchDirectlyUnderTimeline() {
+        let actions = MenuBarManager.primaryActions(
+            isDashboardFrontAndCenter: false,
+            isSystemMonitorFrontAndCenter: false
+        )
+
+        XCTAssertEqual(actions.timeline.title, "Open Timeline")
+        XCTAssertEqual(actions.search.title, "Search Screen History")
+        XCTAssertEqual(actions.dashboard.title, "Open Dashboard")
+        XCTAssertEqual(actions.monitor.title, "Open System Monitor")
+        XCTAssertEqual(actions.search.imageSystemName, "magnifyingglass")
+    }
 }

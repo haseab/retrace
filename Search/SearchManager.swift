@@ -108,9 +108,6 @@ public actor SearchManager: SearchProtocol {
             offset: query.offset
         )
 
-        // Get total count for pagination
-        let totalCount = try await ftsEngine.getMatchCount(query: searchableColumnsFTSQuery, filters: filters)
-
         // Convert FTS matches to SearchResults
         var results: [SearchResult] = []
         for match in ftsMatches {
@@ -158,7 +155,6 @@ public actor SearchManager: SearchProtocol {
         return SearchResults(
             query: query,
             results: filteredResults,
-            totalCount: totalCount,
             searchTimeMs: searchTimeMs
         )
     }

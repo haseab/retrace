@@ -73,6 +73,250 @@ final class DatabaseManagerTests: XCTestCase {
         )
     }
 
+    func testReadConnectionPoolCloseRejectsQueuedCheckout() async throws {
+        let testRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RetraceReadPoolCloseTests_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: testRoot, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: testRoot)
+        }
+
+        let dbPath = testRoot.appendingPathComponent("retrace.db").path
+        let fileDatabase = DatabaseManager(databasePath: dbPath)
+        defer {
+            Task {
+                try? await fileDatabase.close()
+            }
+        }
+
+        try await fileDatabase.initialize()
+
+        let pool = SQLiteReadConnectionPool(
+            label: "test_read_pool_close",
+            maxConnections: 1,
+            connectionFactory: {
+                try SQLiteReadOnlyConnectionFactory.makeRetraceConnection(databasePath: dbPath)
+            }
+        )
+        let firstLeaseStarted = DispatchSemaphore(value: 0)
+        let releaseFirstLease = DispatchSemaphore(value: 0)
+        let queuedCheckoutStarted = DispatchSemaphore(value: 0)
+
+        let firstTask = Task.detached(priority: .userInitiated) {
+            try await pool.withConnection(operation: "hold_first_connection") { _ in
+                firstLeaseStarted.signal()
+                _ = releaseFirstLease.wait(timeout: .now() + 2)
+            }
+        }
+
+        XCTAssertEqual(firstLeaseStarted.wait(timeout: .now() + 1), .success)
+
+        let queuedTask = Task.detached(priority: .userInitiated) {
+            queuedCheckoutStarted.signal()
+            try await pool.withConnection(operation: "queued_checkout") { _ in
+                XCTFail("Queued checkout should not receive a connection after close begins")
+            }
+        }
+
+        XCTAssertEqual(queuedCheckoutStarted.wait(timeout: .now() + 1), .success)
+        try await Task.sleep(for: .milliseconds(50), clock: .continuous)
+
+        let closeTask = Task {
+            await pool.close()
+        }
+
+        releaseFirstLease.signal()
+        try await firstTask.value
+        await closeTask.value
+
+        do {
+            try await queuedTask.value
+            XCTFail("Expected queued checkout to fail once the pool closes")
+        } catch DatabaseConnectionError.readPoolClosed {
+            // Expected.
+        } catch {
+            XCTFail("Expected readPoolClosed, got \(error)")
+        }
+    }
+
+    func testReadConnectionPoolInterruptsCancelledRunningQuery() async throws {
+        let testRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RetraceReadPoolInterruptTests_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: testRoot, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: testRoot)
+        }
+
+        let dbPath = testRoot.appendingPathComponent("retrace.db").path
+        let fileDatabase = DatabaseManager(databasePath: dbPath)
+        defer {
+            Task {
+                try? await fileDatabase.close()
+            }
+        }
+
+        try await fileDatabase.initialize()
+
+        let pool = fileDatabase.readConnectionPool
+        let queryStarted = DispatchSemaphore(value: 0)
+
+        let task = Task.detached(priority: .userInitiated) {
+            try await pool.withConnection(operation: "interrupt_cancelled_query") { connection in
+                guard let db = connection.getConnection() else {
+                    throw DatabaseConnectionError.notConnected
+                }
+
+                let functionName = "test_slow_identity"
+                let functionResult = sqlite3_create_function_v2(
+                    db,
+                    functionName,
+                    1,
+                    SQLITE_UTF8,
+                    nil,
+                    { context, argc, argv in
+                        guard let context, argc == 1, let argv else { return }
+                        usleep(1_000)
+                        sqlite3_result_int64(context, sqlite3_value_int64(argv[0]))
+                    },
+                    nil,
+                    nil,
+                    nil
+                )
+                guard functionResult == SQLITE_OK else {
+                    let message = String(cString: sqlite3_errmsg(db))
+                    throw DatabaseConnectionError.connectionConfigurationFailed(error: message)
+                }
+
+                let sql = """
+                WITH RECURSIVE cnt(x) AS (
+                    VALUES(0)
+                    UNION ALL
+                    SELECT x + 1 FROM cnt WHERE x < 1000
+                )
+                SELECT \(functionName)(x) FROM cnt;
+                """
+
+                var statement: OpaquePointer?
+                guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+                    let message = String(cString: sqlite3_errmsg(db))
+                    throw DatabaseConnectionError.statementPreparationFailed(sql: sql, error: message)
+                }
+                defer {
+                    sqlite3_finalize(statement)
+                }
+
+                queryStarted.signal()
+
+                while true {
+                    let rc = sqlite3_step(statement)
+                    switch rc {
+                    case SQLITE_ROW:
+                        continue
+                    case SQLITE_DONE:
+                        return
+                    case SQLITE_INTERRUPT:
+                        throw DatabaseConnectionError.executionFailed(sql: sql, error: "interrupted")
+                    default:
+                        let message = String(cString: sqlite3_errmsg(db))
+                        throw DatabaseConnectionError.executionFailed(sql: sql, error: message)
+                    }
+                }
+            }
+        }
+
+        XCTAssertEqual(queryStarted.wait(timeout: .now() + 1), .success)
+        try await Task.sleep(for: .milliseconds(25), clock: .continuous)
+        task.cancel()
+
+        do {
+            try await task.value
+            XCTFail("Expected cancelled query to throw CancellationError")
+        } catch is CancellationError {
+            // Expected.
+        } catch {
+            XCTFail("Expected CancellationError, got \(error)")
+        }
+
+        let sanityCheck = try await pool.withConnection(operation: "post_interrupt_sanity_check") { connection in
+            guard let db = connection.getConnection() else {
+                throw DatabaseConnectionError.notConnected
+            }
+
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(db, "SELECT 1", -1, &statement, nil) == SQLITE_OK else {
+                let message = String(cString: sqlite3_errmsg(db))
+                throw DatabaseConnectionError.statementPreparationFailed(sql: "SELECT 1", error: message)
+            }
+            defer {
+                sqlite3_finalize(statement)
+            }
+
+            guard sqlite3_step(statement) == SQLITE_ROW else {
+                let message = String(cString: sqlite3_errmsg(db))
+                throw DatabaseConnectionError.executionFailed(sql: "SELECT 1", error: message)
+            }
+
+            return sqlite3_column_int(statement, 0)
+        }
+
+        XCTAssertEqual(sanityCheck, 1)
+    }
+
+    func testDBStorageSnapshotsQueryReturnsRecordedRowsForFileDatabase() async throws {
+        let testRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RetraceReadSnapshotTests_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: testRoot, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: testRoot)
+        }
+
+        let dbPath = testRoot.appendingPathComponent("retrace.db").path
+        let fileDatabase = DatabaseManager(databasePath: dbPath)
+        defer {
+            Task {
+                try? await fileDatabase.close()
+            }
+        }
+
+        try await fileDatabase.initialize()
+
+        let firstDay = makeDate(year: 2026, month: 3, day: 25, hour: 9, minute: 0)
+        let secondDay = makeDate(year: 2026, month: 3, day: 26, hour: 9, minute: 0)
+
+        try await fileDatabase.recordDBStorageSnapshot(timestamp: firstDay)
+        try await fileDatabase.recordDBStorageSnapshot(timestamp: secondDay)
+
+        let snapshots = try await fileDatabase.getDBStorageSnapshots(
+            from: firstDay,
+            to: secondDay
+        )
+
+        XCTAssertEqual(snapshots.count, 2)
+        XCTAssertEqual(
+            snapshots.map { Calendar.current.startOfDay(for: $0.date) },
+            [firstDay, secondDay].map { Calendar.current.startOfDay(for: $0) }
+        )
+    }
+
+    func testDBStorageSnapshotsQueryUsesNamedInMemoryDatabase() async throws {
+        let day = makeDate(year: 2026, month: 3, day: 27, hour: 10, minute: 0)
+        let sampledAt = Int64(day.timeIntervalSince1970 * 1000)
+        try await executeRawSQL(
+            """
+            INSERT INTO db_storage_snapshot (local_day, db_bytes, wal_bytes, sampled_at)
+            VALUES ('\(localDayString(for: day))', 111, 22, \(sampledAt));
+            """
+        )
+
+        let snapshots = try await database.getDBStorageSnapshots(from: day, to: day)
+
+        XCTAssertEqual(snapshots.count, 1)
+        XCTAssertEqual(
+            snapshots.first.map { Calendar.current.startOfDay(for: $0.date) },
+            Calendar.current.startOfDay(for: day)
+        )
+    }
+
     func testDatabaseSupportsFTS5VirtualTablesAtRuntime() async throws {
         guard let db = await database.getConnection() else {
             XCTFail("Database connection should be available after initialization")
@@ -1637,6 +1881,86 @@ final class DatabaseManagerTests: XCTestCase {
         )
     }
 
+    func testMigrationRunner_V16AddsProcessingQueueRewrittenAndDocSegmentIndexes() async throws {
+        let dbPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RetraceV16Migration-\(UUID().uuidString).sqlite")
+            .path
+        let db = try openRawDatabase(at: dbPath)
+
+        defer {
+            sqlite3_close(db)
+            try? FileManager.default.removeItem(atPath: dbPath)
+            try? FileManager.default.removeItem(atPath: dbPath + "-wal")
+            try? FileManager.default.removeItem(atPath: dbPath + "-shm")
+        }
+
+        try await runLegacyMigrations(throughVersion: 15, db: db)
+
+        let preMigrationIndexCount = try fetchInt64(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_processing_queue_frameid';",
+            db: db
+        )
+        let preMigrationRewrittenIndexCount = try fetchInt64(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_frame_rewritten_at';",
+            db: db
+        )
+        let preMigrationDocSegmentIndexCount = try fetchInt64(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'index_doc_segment_on_docid_frameid';",
+            db: db
+        )
+        XCTAssertEqual(preMigrationIndexCount, 0)
+        XCTAssertEqual(preMigrationRewrittenIndexCount, 0)
+        XCTAssertEqual(preMigrationDocSegmentIndexCount, 0)
+
+        let runner = MigrationRunner(db: db)
+        try await runner.runMigrations()
+
+        let currentVersion = try fetchInt64("SELECT MAX(version) FROM schema_migrations;", db: db)
+        let processingQueueIndexCount = try fetchInt64(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_processing_queue_frameid';",
+            db: db
+        )
+        let rewrittenIndexCount = try fetchInt64(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_frame_rewritten_at';",
+            db: db
+        )
+        let docSegmentIndexCount = try fetchInt64(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'index_doc_segment_on_docid_frameid';",
+            db: db
+        )
+
+        XCTAssertGreaterThanOrEqual(currentVersion, 16)
+        XCTAssertEqual(processingQueueIndexCount, 1)
+        XCTAssertEqual(rewrittenIndexCount, 1)
+        XCTAssertEqual(docSegmentIndexCount, 1)
+    }
+
+    func testGetPendingFrameIDsNotInQueueReturnsOnlyNewestOrphanedFrames() async throws {
+        let oldestFrame = try await insertTestFrame(
+            browserURL: "https://example.com/oldest",
+            timestamp: Date(timeIntervalSince1970: 1_000)
+        )
+        let queuedFrame = try await insertTestFrame(
+            browserURL: "https://example.com/queued",
+            timestamp: Date(timeIntervalSince1970: 2_000)
+        )
+        let newestFrame = try await insertTestFrame(
+            browserURL: "https://example.com/newest",
+            timestamp: Date(timeIntervalSince1970: 3_000)
+        )
+
+        try await executeRawSQL(
+            "UPDATE frame SET processingStatus = 0 WHERE id IN (\(oldestFrame.value), \(queuedFrame.value), \(newestFrame.value));"
+        )
+        try await database.enqueueFrameForProcessing(frameID: queuedFrame.value, priority: 0)
+
+        let orphanedFrameIDs = try await database.getPendingFrameIDsNotInQueue(limit: 10)
+        let orphanedCount = try await database.countPendingFramesNotInQueue()
+
+        XCTAssertEqual(orphanedFrameIDs, [newestFrame.value, oldestFrame.value])
+        XCTAssertEqual(orphanedCount, 2)
+    }
+
     func testGetFramesByTimeRange() async throws {
         let startTime = Date()
         let videoSegment = VideoSegment(
@@ -2563,6 +2887,30 @@ final class DatabaseManagerTests: XCTestCase {
         return FrameID(value: try await database.insertFrame(frame))
     }
 
+    private func makeDate(year: Int, month: Int, day: Int, hour: Int, minute: Int) -> Date {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .current
+        return calendar.date(
+            from: DateComponents(
+                year: year,
+                month: month,
+                day: day,
+                hour: hour,
+                minute: minute,
+                second: 0
+            )
+        )!
+    }
+
+    private func localDayString(for date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar.current
+        formatter.timeZone = .current
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: date)
+    }
+
     private func databaseConnection() async throws -> OpaquePointer {
         guard let db = await database.getConnection() else {
             throw NSError(domain: "DatabaseManagerTests", code: 1, userInfo: [NSLocalizedDescriptionKey: "Expected active database connection"])
@@ -2697,7 +3045,9 @@ final class DatabaseManagerTests: XCTestCase {
             V11_SegmentCommentLinkCompositeIndex(),
             V12_FrameMetadata(),
             V13_RemoveInPageURLRects(),
-            V14_DBStorageSnapshot()
+            V14_DBStorageSnapshot(),
+            V15_NodeRedactionFlag(),
+            V16_ProcessingQueueFrameIDIndex()
         ]
 
         for migration in migrations where migration.version <= version {

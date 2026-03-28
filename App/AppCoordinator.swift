@@ -244,7 +244,7 @@ public actor AppCoordinator {
 
     // MARK: - Properties
 
-    private let services: ServiceContainer
+    private nonisolated let services: ServiceContainer
     private var captureTask: Task<Void, Never>?
     // ⚠️ RELEASE 2 ONLY
     // private var audioTask: Task<Void, Never>?
@@ -287,10 +287,12 @@ public actor AppCoordinator {
     // Storage health notifications (volume mount, used to trigger cache validation)
     private var storageHealthObserverTokens: [NSObjectProtocol] = []
 
-    // Crash recovery can start in the background during launch, but capture start
-    // must join the same task so recovery and live writes never overlap.
+    // Critical crash recovery can start in the background during launch, but capture
+    // start must join the same task so WAL recovery and live writes never overlap.
+    // Best-effort orphaned-frame re-enqueue is deferred to a separate background task.
     private var crashRecoveryTask: Task<Bool, Error>?
     private var hasCompletedCrashRecoverySinceLaunch = false
+    private var orphanedFrameRecoveryTask: Task<Void, Never>?
 
     // Periodic task to finalize orphaned videos (processingState stuck at 1)
     private var orphanedVideoCleanupTask: Task<Void, Never>?
@@ -598,10 +600,30 @@ public actor AppCoordinator {
             Log.info("No crash recovery needed", category: .app)
         }
 
-        // Re-enqueue orphaned frames (processingStatus=0 but not in queue)
-        // These are frames that were captured but never enqueued due to app restart
-        await reEnqueueOrphanedFrames()
+        // Re-enqueueing pending frames that were never queued is best-effort work and
+        // should not hold startup-critical readers behind a long anti-join.
+        scheduleOrphanedFrameRecoveryIfNeeded()
         return true
+    }
+
+    private func scheduleOrphanedFrameRecoveryIfNeeded() {
+        guard orphanedFrameRecoveryTask == nil else { return }
+
+        orphanedFrameRecoveryTask = Task.detached(priority: .background) { [weak self] in
+            await self?.reEnqueueOrphanedFrames()
+            await self?.clearOrphanedFrameRecoveryTask()
+        }
+
+        Log.info("[ORPHAN-RECOVERY] Scheduled background orphaned-frame re-enqueue", category: .app)
+    }
+
+    private func clearOrphanedFrameRecoveryTask() {
+        orphanedFrameRecoveryTask = nil
+    }
+
+    private func stopOrphanedFrameRecovery() {
+        orphanedFrameRecoveryTask?.cancel()
+        orphanedFrameRecoveryTask = nil
     }
 
     /// Re-enqueue frames that have processingStatus=0 but are not in the processing queue
@@ -613,34 +635,37 @@ public actor AppCoordinator {
         }
 
         do {
-            let orphanedCount = try await services.database.countPendingFramesNotInQueue()
-            if orphanedCount == 0 {
-                Log.info("[ORPHAN-RECOVERY] No orphaned frames found", category: .app)
-                return
-            }
-
-            Log.info("[ORPHAN-RECOVERY] Found \(orphanedCount) orphaned frames (pending but not in queue)", category: .app)
-
-            // Process in batches to avoid memory issues
             let batchSize = 500
             var totalEnqueued = 0
+            var hasLoggedDiscovery = false
 
             while true {
+                guard !Task.isCancelled else {
+                    Log.info("[ORPHAN-RECOVERY] Background orphaned-frame re-enqueue cancelled", category: .app)
+                    return
+                }
+
                 let frameIDs = try await services.database.getPendingFrameIDsNotInQueue(limit: batchSize)
                 if frameIDs.isEmpty {
                     break
                 }
 
-                for frameID in frameIDs {
-                    // Enqueue without frame data (will extract from video)
-                    try await queue.enqueue(frameID: frameID, priority: -1) // Low priority so new frames process first
+                if !hasLoggedDiscovery {
+                    Log.info("[ORPHAN-RECOVERY] Found orphaned frames; starting background re-enqueue", category: .app)
+                    hasLoggedDiscovery = true
                 }
 
+                try await queue.enqueueBatch(frameIDs: frameIDs, priority: -1)
                 totalEnqueued += frameIDs.count
-                Log.info("[ORPHAN-RECOVERY] Enqueued batch of \(frameIDs.count) frames (total: \(totalEnqueued)/\(orphanedCount))", category: .app)
+                Log.info("[ORPHAN-RECOVERY] Enqueued batch of \(frameIDs.count) frames (total: \(totalEnqueued))", category: .app)
 
-                // Small delay between batches to avoid overwhelming the queue
+                // Small delay between batches to avoid overwhelming the queue.
                 try? await Task.sleep(for: .nanoseconds(Int64(100_000_000)), clock: .continuous) // 100ms
+            }
+
+            if totalEnqueued == 0 {
+                Log.info("[ORPHAN-RECOVERY] No orphaned frames found", category: .app)
+                return
             }
 
             Log.info("[ORPHAN-RECOVERY] Completed - enqueued \(totalEnqueued) orphaned frames for OCR processing", category: .app)
@@ -852,6 +877,7 @@ public actor AppCoordinator {
         }
 
         // Stop periodic cleanup tasks
+        stopOrphanedFrameRecovery()
         stopOrphanedVideoCleanup()
         stopDBStorageSnapshotTask()
         await recordDBStorageSnapshot(reason: "shutdown")
@@ -1142,10 +1168,7 @@ public actor AppCoordinator {
     private func currentDBStorageSnapshotLogState() async throws -> DBStorageSnapshotLogState? {
         let calendar = Calendar.current
         let today = calendar.startOfDay(for: Date())
-        let snapshots = try await services.database.getDBStorageSnapshots(
-            from: today,
-            to: today
-        )
+        let snapshots = try await services.database.getDBStorageSnapshots(from: today, to: today)
         guard let snapshot = snapshots.last else {
             return nil
         }
@@ -2344,22 +2367,20 @@ public actor AppCoordinator {
     /// Get frames processed per minute for the last N minutes
     /// Returns dictionary of [minuteOffset: count] where minuteOffset 0 = current minute
     public func getFramesProcessedPerMinute(lastMinutes: Int) async throws -> [Int: Int] {
-        let db = services.database
-        return try await db.getFramesProcessedPerMinute(lastMinutes: lastMinutes)
+        try await services.database.getFramesProcessedPerMinute(lastMinutes: lastMinutes)
     }
 
     /// Get frames rewritten per minute for the last N minutes.
     /// Returns dictionary of [minuteOffset: count] where minuteOffset 0 = current minute.
     public func getFramesRewrittenPerMinute(lastMinutes: Int) async throws -> [Int: Int] {
-        let db = services.database
-        return try await db.getFramesRewrittenPerMinute(lastMinutes: lastMinutes)
+        try await services.database.getFramesRewrittenPerMinute(lastMinutes: lastMinutes)
     }
 
     // MARK: - Search Interface
 
     /// Get all distinct app bundle IDs from the database for filter UI
     /// Caller should use AppNameResolver.shared.resolveAll() to get display names
-    public func getDistinctAppBundleIDs() async throws -> [String] {
+    public nonisolated func getDistinctAppBundleIDs() async throws -> [String] {
         guard let adapter = await services.dataAdapter else {
             return []
         }
@@ -2367,20 +2388,23 @@ public actor AppCoordinator {
     }
 
     /// Search for text across all captured frames
-    public func search(query: String, limit: Int = 50) async throws -> SearchResults {
+    public nonisolated func search(query: String, limit: Int = 50) async throws -> SearchResults {
         let searchQuery = SearchQuery(text: query, filters: .none, limit: limit, offset: 0)
         return try await search(query: searchQuery)
     }
 
     /// Advanced search with filters
     /// Routes to DataAdapter which prioritizes Rewind data source
-    public func search(query: SearchQuery) async throws -> SearchResults {
+    public nonisolated func search(query: SearchQuery) async throws -> SearchResults {
         // Try DataAdapter first (routes to Rewind if available)
         if let adapter = await services.dataAdapter {
             do {
                 return try await adapter.search(query: query)
             } catch {
-                Log.warning("[AppCoordinator] DataAdapter search failed, falling back to FTS: \(error)", category: .app)
+                Log.warning(
+                    "[AppCoordinator] DataAdapter search failed, falling back to FTS: \(error)",
+                    category: .app
+                )
             }
         }
 
@@ -2650,35 +2674,7 @@ public actor AppCoordinator {
         from startDate: Date,
         to endDate: Date
     ) async throws -> [(bundleID: String, duration: TimeInterval, uniqueItemCount: Int)] {
-        let startedAt = CFAbsoluteTimeGetCurrent()
-        let traceID = String(UUID().uuidString.prefix(8))
-        do {
-            let enqueuedAt = CFAbsoluteTimeGetCurrent()
-            let results = try await DatabaseActorTraceContext.$requestEnqueuedAt.withValue(enqueuedAt) {
-                try await DatabaseActorTraceContext.$operationName.withValue("get_app_usage_stats") {
-                    try await DatabaseActorTraceContext.$traceID.withValue(traceID) {
-                        try await services.database.getAppUsageStats(from: startDate, to: endDate)
-                    }
-                }
-            }
-            let elapsedMs = (CFAbsoluteTimeGetCurrent() - startedAt) * 1000
-            Log.recordLatency(
-                "dashboard.path.app_coordinator.get_app_usage_stats_ms",
-                valueMs: elapsedMs,
-                category: .app,
-                summaryEvery: 10,
-                warningThresholdMs: 800,
-                criticalThresholdMs: 2500
-            )
-            return results
-        } catch {
-            let elapsedMs = (CFAbsoluteTimeGetCurrent() - startedAt) * 1000
-            Log.error(
-                "[DASHBOARD-PATH][AppCoordinator] getAppUsageStats failed trace=\(traceID) range=[\(Log.timestamp(from: startDate)) -> \(Log.timestamp(from: endDate))] after \(String(format: "%.1f", elapsedMs))ms: \(error)",
-                category: .app
-            )
-            throw error
-        }
+        try await services.database.getAppUsageStats(from: startDate, to: endDate)
     }
 
     /// Get window usage aggregated by windowName or domain for a specific app
@@ -3524,49 +3520,7 @@ public actor AppCoordinator {
         from startDate: Date,
         to endDate: Date
     ) async throws -> [(date: Date, value: Int64)] {
-        let startedAt = CFAbsoluteTimeGetCurrent()
-        let traceID = String(UUID().uuidString.prefix(8))
-        do {
-            let enqueuedAt = CFAbsoluteTimeGetCurrent()
-            let results = try await DatabaseActorTraceContext.$requestEnqueuedAt.withValue(enqueuedAt) {
-                try await DatabaseActorTraceContext.$operationName.withValue("get_daily_screen_time") {
-                    try await DatabaseActorTraceContext.$traceID.withValue(traceID) {
-                        try await services.database.getDailyScreenTime(
-                            from: startDate,
-                            to: endDate
-                        )
-                    }
-                }
-            }
-            let elapsedMs = (CFAbsoluteTimeGetCurrent() - startedAt) * 1000
-            Log.recordLatency(
-                "dashboard.path.app_coordinator.get_daily_screen_time_ms",
-                valueMs: elapsedMs,
-                category: .app,
-                summaryEvery: 10,
-                warningThresholdMs: 1200,
-                criticalThresholdMs: 5000
-            )
-            return results
-        } catch {
-            let elapsedMs = (CFAbsoluteTimeGetCurrent() - startedAt) * 1000
-            Log.error(
-                "[DASHBOARD-PATH][AppCoordinator] getDailyScreenTime failed trace=\(traceID) range=[\(Log.timestamp(from: startDate)) -> \(Log.timestamp(from: endDate))] after \(String(format: "%.1f", elapsedMs))ms: \(error)",
-                category: .app
-            )
-            throw error
-        }
-    }
-
-    /// Get local-day DB/WAL size snapshots for the requested date range.
-    public func getDBStorageSnapshots(
-        from startDate: Date,
-        to endDate: Date
-    ) async throws -> [(date: Date, dbBytes: Int64, walBytes: Int64, sampledAt: Date)] {
-        try await services.database.getDBStorageSnapshots(
-            from: startDate,
-            to: endDate
-        )
+        try await services.database.getDailyScreenTime(from: startDate, to: endDate)
     }
 
     /// Estimate per-day durable DB growth from daily snapshots.

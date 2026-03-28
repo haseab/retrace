@@ -349,7 +349,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @MainActor
     private func initializeApp() async {
         // Pre-flight check: Ensure custom storage path is accessible (if set)
-        if !(await checkStoragePathAvailable()) {
+        let storagePathAvailable = await checkStoragePathAvailable()
+        if !storagePathAvailable {
             return // User chose to quit or we're waiting for them to reconnect
         }
 
@@ -409,8 +410,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
             // Process any deeplinks that arrived before initialization completed
             var didHandleInitialDeeplink = false
-            if !pendingDeeplinkURLs.isEmpty {
-                Log.info("[AppDelegate] Processing \(pendingDeeplinkURLs.count) pending deeplink(s)", category: .app)
+            let pendingDeeplinkCount = pendingDeeplinkURLs.count
+            if pendingDeeplinkCount > 0 {
+                Log.info("[AppDelegate] Processing \(pendingDeeplinkCount) pending deeplink(s)", category: .app)
                 for url in pendingDeeplinkURLs {
                     handleDeeplink(url)
                 }
@@ -420,7 +422,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
             // Dev-only startup deeplink simulation from terminal:
             // RETRACE_DEV_DEEPLINK_URL='retrace://search?...' swift run Retrace
-            if processDevDeeplinkFromEnvironment() {
+            let didHandleDevDeeplink = processDevDeeplinkFromEnvironment()
+            if didHandleDevDeeplink {
                 didHandleInitialDeeplink = true
             }
 

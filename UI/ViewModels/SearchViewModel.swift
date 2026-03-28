@@ -14,6 +14,7 @@ private struct CachedAppInfo: Codable {
 /// Handles search queries, filtering, and result management with debouncing
 @MainActor
 public class SearchViewModel: ObservableObject {
+    typealias SearchExecutor = @Sendable (SearchQuery) async throws -> SearchResults
 
     // MARK: - Recent Search Entry
 
@@ -391,11 +392,13 @@ public class SearchViewModel: ObservableObject {
     // MARK: - Dependencies
 
     public let coordinator: AppCoordinator
+    private let executeSearch: SearchExecutor
     private var cancellables = Set<AnyCancellable>()
 
     // Active search tasks that can be cancelled
     private var currentSearchTask: Task<Void, Never>?
     private var currentLoadMoreTask: Task<Void, Never>?
+    private var pendingOtherAppsRefreshTask: Task<Void, Never>?
     private var memoryReportTask: Task<Void, Never>?
     private var thumbnailCacheBytes: Int64 = 0
     private var appIconCacheBytes: Int64 = 0
@@ -406,6 +409,7 @@ public class SearchViewModel: ObservableObject {
     private let debounceDelay: TimeInterval = 0.3
     private let defaultResultLimit = 50
     private let maxSearchWords = 15  // Limit search queries to prevent performance issues
+    private let otherAppsRefreshDelayNs: UInt64 = 2_000_000_000
     private let memoryReportIntervalNs: UInt64 = 5_000_000_000
     private let maxInMemoryThumbnailCount = 60
     nonisolated private static let memoryLedgerSummaryIntervalSeconds: TimeInterval = 30
@@ -495,6 +499,18 @@ public class SearchViewModel: ObservableObject {
 
     public init(coordinator: AppCoordinator) {
         self.coordinator = coordinator
+        self.executeSearch = { query in
+            try await coordinator.search(query: query)
+        }
+        loadRecentSearchEntries()
+        setupBindings()
+        startMemoryReporting()
+        prepareThumbnailDiskCache()
+    }
+
+    init(coordinator: AppCoordinator, executeSearch: @escaping SearchExecutor) {
+        self.coordinator = coordinator
+        self.executeSearch = executeSearch
         loadRecentSearchEntries()
         setupBindings()
         startMemoryReporting()
@@ -517,6 +533,9 @@ public class SearchViewModel: ObservableObject {
                     self?.resetSearchOrderToDefault()
                     self?.clearInMemoryThumbnailCache()
                     self?.clearSearchCache()
+                } else {
+                    self?.pendingOtherAppsRefreshTask?.cancel()
+                    self?.pendingOtherAppsRefreshTask = nil
                 }
             }
             .store(in: &cancellables)
@@ -561,11 +580,7 @@ public class SearchViewModel: ObservableObject {
                   !self.isRestoringFromCache,
                   self.hasSubmittedSearch else { return }
 
-            // Cancel any existing search before starting a new one
-            self.currentSearchTask?.cancel()
-            self.currentSearchTask = Task {
-                await self.performSearch(query: self.searchQuery, trigger: "filter-change")
-            }
+            self.startFreshSearchTask(query: self.searchQuery, trigger: "filter-change")
         }
         .store(in: &cancellables)
     }
@@ -1162,11 +1177,25 @@ public class SearchViewModel: ObservableObject {
 
     // MARK: - Search
 
+    private func cancelInFlightLoadMore(reason: String) {
+        guard currentLoadMoreTask != nil || isLoadingMore else { return }
+
+        currentLoadMoreTask?.cancel()
+        currentLoadMoreTask = nil
+        isLoadingMore = false
+        Log.info("[SearchViewModel] Cancelled in-flight load more due to \(reason)", category: .ui)
+    }
+
+    private func startFreshSearchTask(query: String, trigger: String) {
+        currentSearchTask?.cancel()
+        cancelInFlightLoadMore(reason: trigger)
+        currentSearchTask = Task {
+            await performSearch(query: query, trigger: trigger)
+        }
+    }
+
     /// Trigger search with current query (called on Enter key)
     public func submitSearch(trigger: String = "submit") {
-        // Cancel any existing search before starting a new one
-        currentSearchTask?.cancel()
-
         // Mark that user has submitted a search - enables filter auto-refresh
         hasSubmittedSearch = true
 
@@ -1189,9 +1218,7 @@ public class SearchViewModel: ObservableObject {
             }
         }
 
-        currentSearchTask = Task {
-            await performSearch(query: query, trigger: trigger)
-        }
+        startFreshSearchTask(query: query, trigger: trigger)
     }
 
     /// Re-run the current query immediately without recording a new "submitted search" analytics event.
@@ -1201,10 +1228,7 @@ public class SearchViewModel: ObservableObject {
         guard !query.isEmpty else { return }
         guard hasSubmittedSearch else { return }
 
-        currentSearchTask?.cancel()
-        currentSearchTask = Task {
-            await performSearch(query: query, trigger: trigger)
-        }
+        startFreshSearchTask(query: query, trigger: trigger)
     }
 
     /// Build JSON representation of active filters for metrics
@@ -1302,6 +1326,8 @@ public class SearchViewModel: ObservableObject {
     }
 
     public func performSearch(query: String, trigger: String = "unknown") async {
+        cancelInFlightLoadMore(reason: trigger)
+
         guard !query.isEmpty else {
             results = nil
             committedSearchQuery = ""
@@ -1310,6 +1336,9 @@ public class SearchViewModel: ObservableObject {
             nextPageCursor = nil
             return
         }
+
+        pendingOtherAppsRefreshTask?.cancel()
+        pendingOtherAppsRefreshTask = nil
 
         isSearching = true
         error = nil
@@ -1327,15 +1356,10 @@ public class SearchViewModel: ObservableObject {
             try Task.checkCancellation()
 
             let searchQuery = buildSearchQuery(query)
-
-            let searchResults = try await coordinator.search(query: searchQuery)
+            let searchResults = try await executeSearch(searchQuery)
 
             // Check for cancellation after the search completes
             try Task.checkCancellation()
-
-            if !searchResults.results.isEmpty {
-                let firstResult = searchResults.results[0]
-            }
 
             // Ensure UI updates happen on main actor
             await MainActor.run {
@@ -1349,7 +1373,6 @@ public class SearchViewModel: ObservableObject {
                 isSearching = false
             }
         } catch {
-            Log.error("[SearchViewModel] Search failed: \(error.localizedDescription)", category: .ui)
             // Ensure UI updates happen on main actor
             await MainActor.run {
                 self.error = "Search failed: \(error.localizedDescription)"
@@ -1544,11 +1567,7 @@ public class SearchViewModel: ObservableObject {
         searchMode = mode
         // Clear results and re-search with new mode (only if user has submitted a search)
         if !searchQuery.isEmpty && hasSubmittedSearch {
-            // Cancel any existing search before starting a new one
-            currentSearchTask?.cancel()
-            currentSearchTask = Task {
-                await performSearch(query: searchQuery, trigger: "search-mode-change")
-            }
+            startFreshSearchTask(query: searchQuery, trigger: "search-mode-change")
         }
     }
 
@@ -1558,10 +1577,7 @@ public class SearchViewModel: ObservableObject {
         sortOrder = order
         // Re-search with new sort order (only if user has submitted a search)
         if !searchQuery.isEmpty && hasSubmittedSearch {
-            currentSearchTask?.cancel()
-            currentSearchTask = Task {
-                await performSearch(query: searchQuery, trigger: "sort-order-change")
-            }
+            startFreshSearchTask(query: searchQuery, trigger: "sort-order-change")
         }
     }
 
@@ -1582,10 +1598,7 @@ public class SearchViewModel: ObservableObject {
         guard didChange else { return }
 
         if !searchQuery.isEmpty && hasSubmittedSearch {
-            currentSearchTask?.cancel()
-            currentSearchTask = Task {
-                await performSearch(query: searchQuery, trigger: "search-mode-or-sort-change")
-            }
+            startFreshSearchTask(query: searchQuery, trigger: "search-mode-or-sort-change")
         }
     }
 
@@ -1599,7 +1612,11 @@ public class SearchViewModel: ObservableObject {
 
     /// Load more results for infinite scroll
     public func loadMore() {
-        currentLoadMoreTask?.cancel()
+        guard currentLoadMoreTask == nil, !isLoadingMore, !isSearching else {
+            Log.debug("[SearchViewModel] Ignoring duplicate load more trigger while pagination is already in flight", category: .ui)
+            return
+        }
+
         currentLoadMoreTask = Task { @MainActor [weak self] in
             await self?.performLoadMore()
         }
@@ -1620,7 +1637,7 @@ public class SearchViewModel: ObservableObject {
             try Task.checkCancellation()
 
             let query = buildSearchQuery(searchQuery, offset: 0, cursor: nextPageCursor)
-            let moreResults = try await coordinator.search(query: query)
+            let moreResults = try await executeSearch(query)
 
             // Check for cancellation after the search completes
             try Task.checkCancellation()
@@ -1633,8 +1650,8 @@ public class SearchViewModel: ObservableObject {
                 results = SearchResults(
                     query: currentResults.query,
                     results: currentResults.results,
-                    totalCount: currentResults.results.count,
-                    searchTimeMs: moreResults.searchTimeMs
+                    searchTimeMs: moreResults.searchTimeMs,
+                    nextCursor: nil
                 )
                 isLoadingMore = false
                 return
@@ -1645,8 +1662,8 @@ public class SearchViewModel: ObservableObject {
             results = SearchResults(
                 query: moreResults.query,
                 results: combinedResults,
-                totalCount: moreResults.totalCount,
-                searchTimeMs: moreResults.searchTimeMs
+                searchTimeMs: moreResults.searchTimeMs,
+                nextCursor: moreResults.nextCursor
             )
             nextPageCursor = moreResults.nextCursor
             didReachPaginationEnd = moreResults.nextCursor == nil
@@ -1736,13 +1753,38 @@ public class SearchViewModel: ObservableObject {
 
         // If cache is stale or empty, refresh from DB in background.
         if snapshot.cacheIsStale || snapshot.cachedOtherApps.isEmpty {
-            Task.detached { [weak self] in
-                await self?.refreshOtherAppsFromDB(installedBundleIDs: snapshot.installedBundleIDs)
-            }
+            scheduleOtherAppsRefresh(installedBundleIDs: snapshot.installedBundleIDs)
         }
 
         let totalTime = CFAbsoluteTimeGetCurrent() - startTime
         Log.info("[SearchViewModel] Total: \(installedApps.count) installed + \(otherApps.count) other apps in \(Int(totalTime * 1000))ms", category: .ui)
+    }
+
+    private func scheduleOtherAppsRefresh(installedBundleIDs: Set<String>) {
+        pendingOtherAppsRefreshTask?.cancel()
+        pendingOtherAppsRefreshTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+
+            do {
+                try await Task.sleep(nanoseconds: otherAppsRefreshDelayNs)
+            } catch {
+                return
+            }
+
+            guard !Task.isCancelled else { return }
+            guard searchQuery.isEmpty, !isSearching, !hasSubmittedSearch else {
+                Log.info(
+                    "[SearchViewModel] Skipping deferred other apps refresh because search became active",
+                    category: .ui
+                )
+                pendingOtherAppsRefreshTask = nil
+                return
+            }
+
+            Log.info("[SearchViewModel] Starting deferred other apps refresh", category: .ui)
+            await refreshOtherAppsFromDB(installedBundleIDs: installedBundleIDs)
+            pendingOtherAppsRefreshTask = nil
+        }
     }
 
     // MARK: - Other Apps Cache
@@ -1785,7 +1827,9 @@ public class SearchViewModel: ObservableObject {
 
         do {
             let bundleIDs = try await coordinator.getDistinctAppBundleIDs()
+            guard !Task.isCancelled else { return }
             let dbApps = AppNameResolver.shared.resolveAll(bundleIDs: bundleIDs)
+            guard !Task.isCancelled else { return }
 
             // Filter to only apps that aren't currently installed
             let uninstalledApps = dbApps
@@ -1801,7 +1845,11 @@ public class SearchViewModel: ObservableObject {
             // This way if an app gets uninstalled later, it will appear in "Other Apps"
             saveOtherAppsToCache(dbApps)
 
-            Log.info("[SearchViewModel] Refreshed \(uninstalledApps.count) other apps from DB in \(Int((CFAbsoluteTimeGetCurrent() - startTime) * 1000))ms", category: .ui)
+            let elapsedMs = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
+            Log.info(
+                "[SearchViewModel] Refreshed \(uninstalledApps.count) other apps from DB in \(Int(elapsedMs))ms",
+                category: .ui
+            )
         } catch {
             Log.error("[SearchViewModel] Failed to refresh other apps from DB: \(error)", category: .ui)
         }
@@ -2435,6 +2483,8 @@ public class SearchViewModel: ObservableObject {
         currentSearchTask = nil
         currentLoadMoreTask?.cancel()
         currentLoadMoreTask = nil
+        pendingOtherAppsRefreshTask?.cancel()
+        pendingOtherAppsRefreshTask = nil
         isSearching = false
         isLoadingMore = false
     }
@@ -2443,6 +2493,7 @@ public class SearchViewModel: ObservableObject {
         // Cancel tasks directly - deinit is not actor-isolated so we can't call cancelSearch()
         currentSearchTask?.cancel()
         currentLoadMoreTask?.cancel()
+        pendingOtherAppsRefreshTask?.cancel()
         memoryReportTask?.cancel()
         cancellables.removeAll()
 

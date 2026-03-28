@@ -140,6 +140,61 @@ final class TimelineRefreshTrimRegressionTests: XCTestCase {
         )
     }
 
+    func testRefreshFrameDataDoesNotAutoAdvanceToNewestAfterVisibleSessionScrubStartsDuringFetch() async {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let baseDate = Date(timeIntervalSince1970: 1_700_035_000)
+        let fetchStarted = expectation(description: "fetch started")
+        var releaseFetchContinuation: CheckedContinuation<Void, Never>?
+
+        viewModel.frames = (0..<100).map { offset in
+            makeTimelineFrame(
+                id: Int64(offset + 1),
+                timestamp: baseDate.addingTimeInterval(TimeInterval(offset)),
+                frameIndex: offset,
+                processingStatus: 4
+            )
+        }
+        viewModel.currentIndex = 76
+        viewModel.isActivelyScrolling = true
+        viewModel.resetVisibleSessionScrubTracking(reason: "unit-test")
+
+        viewModel.test_refreshFrameDataHooks.getMostRecentFramesWithVideoInfo = { limit, _ in
+            XCTAssertEqual(limit, 50)
+            fetchStarted.fulfill()
+            await withCheckedContinuation { continuation in
+                releaseFetchContinuation = continuation
+            }
+            return (100..<103).reversed().map { offset in
+                let timestamp = baseDate.addingTimeInterval(TimeInterval(offset))
+                return self.makeFrameWithVideoInfo(
+                    id: Int64(offset + 1),
+                    timestamp: timestamp,
+                    frameIndex: offset,
+                    processingStatus: 4
+                )
+            }
+        }
+
+        let refreshTask = Task {
+            await viewModel.refreshFrameData(navigateToNewest: true)
+        }
+
+        await fulfillment(of: [fetchStarted], timeout: 1.0)
+        viewModel.markVisibleSessionScrubStarted(source: "unit-test")
+        releaseFetchContinuation?.resume()
+        await refreshTask.value
+
+        XCTAssertEqual(viewModel.frames.count, 103)
+        XCTAssertEqual(viewModel.currentIndex, 76)
+        XCTAssertEqual(viewModel.currentTimelineFrame?.frame.id.value, 77)
+
+        viewModel.isActivelyScrolling = false
+
+        XCTAssertEqual(viewModel.frames.count, 100)
+        XCTAssertEqual(viewModel.currentIndex, 73)
+        XCTAssertEqual(viewModel.currentTimelineFrame?.frame.id.value, 77)
+    }
+
     func testRefreshFrameDataDoesNotForceNewestReloadWhenNavigateToNewestIsFalseAndWindowIsStale() async {
         let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
         let baseDate = Date(timeIntervalSince1970: 1_700_100_000)

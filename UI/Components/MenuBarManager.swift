@@ -6,6 +6,7 @@ import Dispatch
 
 /// Manages the macOS menu bar icon and status menu
 public class MenuBarManager: ObservableObject {
+    typealias PrimaryAction = (title: String, imageSystemName: String)
 
     // MARK: - Shared Instance
 
@@ -908,39 +909,50 @@ public class MenuBarManager: ObservableObject {
     private func setupMenu() {
         let menu = NSMenu()
         let visibleDashboardContent = visibleDashboardContentInFront()
+        let primaryActions = Self.primaryActions(
+            isDashboardFrontAndCenter: visibleDashboardContent == .dashboard,
+            isSystemMonitorFrontAndCenter: visibleDashboardContent == .monitor
+        )
 
         // Open Timeline
         let timelineItem = NSMenuItem(
-            title: "Open Timeline",
+            title: primaryActions.timeline.title,
             action: #selector(openTimeline),
             keyEquivalent: timelineShortcut.menuKeyEquivalent
         )
         timelineItem.keyEquivalentModifierMask = timelineShortcut.modifiers.nsModifiers
-        timelineItem.image = NSImage(systemSymbolName: "clock.arrow.circlepath", accessibilityDescription: nil)
+        timelineItem.image = NSImage(systemSymbolName: primaryActions.timeline.imageSystemName, accessibilityDescription: nil)
         menu.addItem(timelineItem)
 
+        // Search Screen History
+        let searchItem = NSMenuItem(
+            title: primaryActions.search.title,
+            action: #selector(openSearch),
+            keyEquivalent: ""
+        )
+        searchItem.image = NSImage(systemSymbolName: primaryActions.search.imageSystemName, accessibilityDescription: nil)
+        menu.addItem(searchItem)
+
         // Open Dashboard
-        let isDashboardFrontAndCenter = visibleDashboardContent == .dashboard
         let dashboardItem = NSMenuItem(
-            title: isDashboardFrontAndCenter ? "Hide Dashboard" : "Open Dashboard",
-            action: isDashboardFrontAndCenter ? #selector(hideDashboardFromMenu) : #selector(openDashboard),
+            title: primaryActions.dashboard.title,
+            action: visibleDashboardContent == .dashboard ? #selector(hideDashboardFromMenu) : #selector(openDashboard),
             keyEquivalent: dashboardShortcut.menuKeyEquivalent
         )
         dashboardItem.keyEquivalentModifierMask = dashboardShortcut.modifiers.nsModifiers
-        dashboardItem.image = NSImage(systemSymbolName: "rectangle.3.group", accessibilityDescription: nil)
+        dashboardItem.image = NSImage(systemSymbolName: primaryActions.dashboard.imageSystemName, accessibilityDescription: nil)
         menu.addItem(dashboardItem)
 
         // System Monitor
-        let isSystemMonitorFrontAndCenter = visibleDashboardContent == .monitor
         let monitorItem = NSMenuItem(
-            title: isSystemMonitorFrontAndCenter ? "Hide System Monitor" : "Open System Monitor",
-            action: isSystemMonitorFrontAndCenter ? #selector(hideSystemMonitorFromMenu) : #selector(openSystemMonitor),
+            title: primaryActions.monitor.title,
+            action: visibleDashboardContent == .monitor ? #selector(hideSystemMonitorFromMenu) : #selector(openSystemMonitor),
             keyEquivalent: systemMonitorShortcut.key.isEmpty ? "" : systemMonitorShortcut.menuKeyEquivalent
         )
         if !systemMonitorShortcut.key.isEmpty {
             monitorItem.keyEquivalentModifierMask = systemMonitorShortcut.modifiers.nsModifiers
         }
-        monitorItem.image = NSImage(systemSymbolName: "waveform.path.ecg", accessibilityDescription: nil)
+        monitorItem.image = NSImage(systemSymbolName: primaryActions.monitor.imageSystemName, accessibilityDescription: nil)
         menu.addItem(monitorItem)
 
         menu.addItem(NSMenuItem.separator())
@@ -1206,11 +1218,10 @@ public class MenuBarManager: ObservableObject {
     }
 
     @objc private func openSearch() {
-        // Open timeline with search focused
+        // Open the timeline search overlay without resetting existing search state.
         Task { @MainActor in
-            TimelineWindowController.shared.show()
+            TimelineWindowController.shared.showSearchOverlay(source: "menu_bar_menu")
         }
-        // The search panel will auto-show when timeline opens
     }
 
     @objc private func openDashboard() {
@@ -1331,6 +1342,29 @@ public class MenuBarManager: ObservableObject {
         case dashboard
         case monitor
         case other
+    }
+
+    static func primaryActions(
+        isDashboardFrontAndCenter: Bool,
+        isSystemMonitorFrontAndCenter: Bool
+    ) -> (
+        timeline: PrimaryAction,
+        search: PrimaryAction,
+        dashboard: PrimaryAction,
+        monitor: PrimaryAction
+    ) {
+        (
+            timeline: (title: "Open Timeline", imageSystemName: "clock.arrow.circlepath"),
+            search: (title: "Search Screen History", imageSystemName: "magnifyingglass"),
+            dashboard: (
+                title: isDashboardFrontAndCenter ? "Hide Dashboard" : "Open Dashboard",
+                imageSystemName: "rectangle.3.group"
+            ),
+            monitor: (
+                title: isSystemMonitorFrontAndCenter ? "Hide System Monitor" : "Open System Monitor",
+                imageSystemName: "waveform.path.ecg"
+            )
+        )
     }
 
     private func visibleDashboardContentInFront() -> VisibleDashboardContent {
