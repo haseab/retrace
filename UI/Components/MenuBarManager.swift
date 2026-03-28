@@ -178,13 +178,25 @@ public class MenuBarManager: ObservableObject {
         )
     }
 
+    @MainActor
+    private func reloadShortcutsMainActor() async {
+        await loadShortcuts()
+        setupGlobalHotkey()
+        setupMenu()
+    }
+
     /// Reload shortcuts from storage and re-register hotkeys (called from Settings)
     public func reloadShortcuts() {
         Task { @MainActor in
-            await loadShortcuts()
-            setupGlobalHotkey()
-            setupMenu()
+            await reloadShortcutsMainActor()
         }
+    }
+
+    /// Reload shortcuts immediately on the main actor for flows that must
+    /// finish registration before dismissing their UI.
+    @MainActor
+    public func reloadShortcutsNow() async {
+        await reloadShortcutsMainActor()
     }
 
     @MainActor

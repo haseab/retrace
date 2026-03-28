@@ -471,10 +471,16 @@ public struct OnboardingView: View {
                 UserDefaults.standard.removeObject(forKey: Self.onboardingStepKey)
                 Task {
                     await coordinator.onboardingManager.markOnboardingCompleted()
+                    if let menuBarManager = MenuBarManager.shared {
+                        await menuBarManager.reloadShortcutsNow()
+                    }
+                    HotkeyManager.shared.retrySetupIfNeeded()
+                    await MainActor.run {
+                        onComplete()
+                    }
                     // Register Rewind data source if user opted in during onboarding
                     try? await coordinator.registerRewindSourceIfEnabled()
                 }
-                onComplete()
             }) {
                 Text("Finish")
                     .font(.retraceHeadline)
