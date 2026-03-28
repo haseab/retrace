@@ -74,6 +74,36 @@ final class QuitConfirmationPresentationTests: XCTestCase {
             .activateExistingInstance
         )
     }
+
+    func testLaunchAfterLockErrorContinuesForRelaunch() {
+        XCTAssertEqual(
+            AppDelegate.launchActionAfterLockError(
+                isRelaunch: true,
+                matchingRunningAppDetected: true
+            ),
+            .continueLaunch
+        )
+    }
+
+    func testLaunchAfterLockErrorActivatesExistingInstanceForFreshLaunchWhenMatchExists() {
+        XCTAssertEqual(
+            AppDelegate.launchActionAfterLockError(
+                isRelaunch: false,
+                matchingRunningAppDetected: true
+            ),
+            .activateExistingInstance
+        )
+    }
+
+    func testLaunchAfterLockErrorContinuesFreshLaunchWhenNoMatchExists() {
+        XCTAssertEqual(
+            AppDelegate.launchActionAfterLockError(
+                isRelaunch: false,
+                matchingRunningAppDetected: false
+            ),
+            .continueLaunch
+        )
+    }
 }
 
 private final class StubQuitConfirmationWindow: NSWindow {

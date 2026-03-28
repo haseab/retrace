@@ -65,6 +65,11 @@ enum SingleInstanceLockRetryResult: Equatable {
     case failedError(code: Int32, attempts: Int)
 }
 
+enum SingleInstanceLockErrorAction: Equatable {
+    case continueLaunch
+    case activateExistingInstance
+}
+
 enum SingleInstanceLockRetrier {
     static func acquire(
         maxAttempts: Int,
@@ -265,12 +270,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         Task { @MainActor in
             let retryAttempts = isRelaunch ? Self.relaunchLockRetryAttempts : Self.launchLockRetryAttempts
-            let hasSingleInstanceLock = await self.acquireSingleInstanceLock(
+            let singleInstanceLockResult = await self.acquireSingleInstanceLock(
                 maxAttempts: retryAttempts,
                 reason: isRelaunch ? "relaunch handoff" : "launch"
             )
 
-            guard hasSingleInstanceLock else {
+            switch singleInstanceLockResult {
+            case .acquired:
+                break
+
+            case .failedHeldByAnotherProcess:
                 if isRelaunch {
                     Log.warning(
                         "[AppDelegate] Relaunch could not reacquire the single-instance lock after handoff window; activating existing instance and terminating duplicate.",
@@ -285,9 +294,39 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 self.activateExistingInstance()
                 self.requestImmediateTermination(skipQuitConfirmation: true)
                 return
+
+            case .failedError:
+                let matchingRunningAppDetected = isRelaunch ? false : self.isAnotherInstanceRunning()
+
+                switch Self.launchActionAfterLockError(
+                    isRelaunch: isRelaunch,
+                    matchingRunningAppDetected: matchingRunningAppDetected
+                ) {
+                case .continueLaunch:
+                    if isRelaunch {
+                        Log.warning(
+                            "[AppDelegate] Continuing relaunch after single-instance lock error because relaunch handoff is authoritative.",
+                            category: .app
+                        )
+                    } else {
+                        Log.warning(
+                            "[AppDelegate] Continuing launch after single-instance lock error because no matching running instance was detected.",
+                            category: .app
+                        )
+                    }
+
+                case .activateExistingInstance:
+                    Log.warning(
+                        "[AppDelegate] Single-instance lock failed during launch and a matching running instance was detected; activating existing instance and terminating duplicate.",
+                        category: .app
+                    )
+                    self.activateExistingInstance()
+                    self.requestImmediateTermination(skipQuitConfirmation: true)
+                    return
+                }
             }
 
-            if !isRelaunch {
+            if !isRelaunch, case .acquired = singleInstanceLockResult {
                 switch Self.freshLaunchAction(
                     hasSingleInstanceLock: true,
                     matchingRunningAppDetected: self.isAnotherInstanceRunning()
@@ -1586,7 +1625,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return Self.canonicalBundleIdentifier
     }
 
-    private func acquireSingleInstanceLock(maxAttempts: Int, reason: String) async -> Bool {
+    private func acquireSingleInstanceLock(
+        maxAttempts: Int,
+        reason: String
+    ) async -> SingleInstanceLockRetryResult {
         let result = await SingleInstanceLockRetrier.acquire(
             maxAttempts: maxAttempts,
             retryDelay: Self.singleInstanceLockRetryDelay,
@@ -1609,7 +1651,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 )
             }
 
-            return true
+            return .acquired(descriptor: descriptor, attempts: attempts)
 
         case .failedHeldByAnotherProcess(let attempts):
             let holder = lockFileInstancePID().map { String($0) } ?? "unknown"
@@ -1617,14 +1659,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 "[AppDelegate] Could not acquire single-instance lock for \(reason) after \(attempts) attempts because another process still holds it; holder pid=\(holder)",
                 category: .app
             )
-            return false
+            return .failedHeldByAnotherProcess(attempts: attempts)
 
         case .failedError(let lockError, let attempts):
             Log.error(
                 "[AppDelegate] Failed to acquire single-instance lock for \(reason) at \(Self.singleInstanceLockPath) after \(attempts) attempts: \(String(cString: strerror(lockError)))",
                 category: .app
             )
-            return false
+            return .failedError(code: lockError, attempts: attempts)
         }
     }
 
@@ -1645,6 +1687,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         return .continueLaunch
+    }
+
+    static func launchActionAfterLockError(
+        isRelaunch: Bool,
+        matchingRunningAppDetected: Bool
+    ) -> SingleInstanceLockErrorAction {
+        if isRelaunch {
+            return .continueLaunch
+        }
+
+        return matchingRunningAppDetected ? .activateExistingInstance : .continueLaunch
     }
 
     private func lockFileInstancePID() -> pid_t? {

@@ -331,6 +331,7 @@ public actor CaptureManager: CaptureProtocol {
         lastKeptMousePosition = nil
         lastNormalizedTitle = nil
         lastBundleID = nil
+        updateCaptureMemoryLedger(currentFrameBytes: 0)
         totalCapturedBytes = 0
         lastActualCaptureTime = nil
         hasShownAccessibilityWarning = false

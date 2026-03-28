@@ -2776,15 +2776,15 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     nonisolated static func timelineDiskFrameBufferDirectoryURL() -> URL {
-        defaultDiskFrameBufferDirectoryURL()
-    }
-
-    private static func defaultDiskFrameBufferDirectoryURL() -> URL {
         let cachesDirectory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
             ?? FileManager.default.temporaryDirectory
         return cachesDirectory
             .appendingPathComponent("io.retrace.app", isDirectory: true)
             .appendingPathComponent("TimelineFrameBuffer", isDirectory: true)
+    }
+
+    private static func defaultDiskFrameBufferDirectoryURL() -> URL {
+        timelineDiskFrameBufferDirectoryURL()
     }
 
     nonisolated static func timelineDiskFrameBufferFileURL(for frameID: FrameID) -> URL {
