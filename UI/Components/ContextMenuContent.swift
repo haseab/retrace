@@ -134,16 +134,7 @@ struct ContextMenuContent: View {
     }
 
     private func copyImageToClipboard() {
-        let coordinator = coordinatorWrapper.coordinator
-        let frameID = viewModel.currentFrame?.id.value
-        getCurrentFrameImage { image in
-            guard let image = image else { return }
-            let pasteboard = NSPasteboard.general
-            pasteboard.clearContents()
-            pasteboard.writeObjects([image])
-            // Record image copy metric with frame ID
-            DashboardViewModel.recordImageCopy(coordinator: coordinator, frameID: frameID)
-        }
+        viewModel.copyCurrentFrameImageToClipboard()
     }
 
     private func openDashboard() {

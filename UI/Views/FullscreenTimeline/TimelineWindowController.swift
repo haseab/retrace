@@ -3384,16 +3384,7 @@ public class TimelineWindowController: NSObject {
 
     private func copyCurrentFrameImage() {
         guard let viewModel = timelineViewModel else { return }
-        getCurrentFrameImage(viewModel: viewModel) { [weak self] image in
-            guard let image = image else { return }
-            let pasteboard = NSPasteboard.general
-            pasteboard.clearContents()
-            pasteboard.writeObjects([image])
-            viewModel.showToast("Image copied")
-            if let coordinator = self?.coordinator {
-                DashboardViewModel.recordImageCopy(coordinator: coordinator, frameID: viewModel.currentFrame?.id.value)
-            }
-        }
+        viewModel.copyCurrentFrameImageToClipboard()
     }
 
     private func saveCurrentFrameImage() {

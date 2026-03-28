@@ -13048,14 +13048,55 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
+        showToast("Text copied", icon: "doc.on.doc.fill")
 
-        // Track text copy event with the copied text
-        // Track text copy event with the copied text
+        // Track text copy event with the copied text.
         DashboardViewModel.recordTextCopy(coordinator: coordinator, text: text)
         
         // Track shift+drag text copy if this was from a manual selection
         if hasSelection {
             DashboardViewModel.recordShiftDragTextCopy(coordinator: coordinator, copiedText: text)
+        }
+    }
+
+    /// Copy all text visible within the active zoom region.
+    public func copyZoomedRegionText() {
+        guard let _ = zoomRegion, isZoomRegionActive else {
+            showToast("Text unavailable", icon: "exclamationmark.circle.fill")
+            return
+        }
+
+        let text = visibleZoomRegionText()
+        guard !text.isEmpty else {
+            showToast("Text unavailable", icon: "exclamationmark.circle.fill")
+            return
+        }
+
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        showToast("Text copied", icon: "doc.on.doc.fill")
+        DashboardViewModel.recordTextCopy(coordinator: coordinator, text: text)
+    }
+
+    /// Copy the currently displayed frame image to the clipboard.
+    public func copyCurrentFrameImageToClipboard() {
+        getCurrentFrameImage { image in
+            guard let image = image else {
+                self.showToast("Failed to copy image", icon: "exclamationmark.triangle.fill")
+                return
+            }
+
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            let didWrite = pasteboard.writeObjects([image])
+
+            guard didWrite else {
+                self.showToast("Failed to copy image", icon: "exclamationmark.triangle.fill")
+                return
+            }
+
+            self.showToast("Image copied")
+            DashboardViewModel.recordImageCopy(coordinator: self.coordinator, frameID: self.currentFrame?.id.value)
         }
     }
 
@@ -13116,6 +13157,40 @@ public class SimpleTimelineViewModel: ObservableObject {
             self.showToast("Image copied")
             DashboardViewModel.recordImageCopy(coordinator: self.coordinator, frameID: self.currentFrame?.id.value)
         }
+    }
+
+    private func visibleZoomRegionText() -> String {
+        let sortedNodes = ocrNodesInZoomRegion.sorted { node1, node2 in
+            let yTolerance: CGFloat = 0.02
+            if abs(node1.y - node2.y) > yTolerance {
+                return node1.y < node2.y
+            }
+            return node1.x < node2.x
+        }
+
+        return sortedNodes.compactMap { visibleTextInZoomRegion(for: $0) }
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func visibleTextInZoomRegion(for node: OCRNodeWithText) -> String? {
+        let rawText: String
+        if let range = getVisibleCharacterRange(for: node) {
+            let clampedStart = max(0, min(range.start, node.text.count))
+            let clampedEnd = max(clampedStart, min(range.end, node.text.count))
+            guard clampedStart < clampedEnd else {
+                return nil
+            }
+
+            let startIndex = node.text.index(node.text.startIndex, offsetBy: clampedStart)
+            let endIndex = node.text.index(node.text.startIndex, offsetBy: clampedEnd)
+            rawText = String(node.text[startIndex..<endIndex])
+        } else {
+            rawText = node.text
+        }
+
+        let trimmedText = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmedText.isEmpty ? nil : trimmedText
     }
 
     /// Get the current frame as an image (handles both static images and video frames)

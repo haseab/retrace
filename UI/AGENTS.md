@@ -139,6 +139,7 @@ UI/
     ├── Settings/                         # Settings-focused XCTestCase files, including shell/view-model coverage
     ├── Support/                          # Shared XCTest helpers and support-only tests
     ├── SystemMonitor/                    # System monitor XCTestCase files
+    ├── Timeline/TimelineCopyFeedbackTests.swift # Timeline copy image/text toast feedback coverage
     └── Timeline/                         # Timeline XCTestCase files
 ```
 

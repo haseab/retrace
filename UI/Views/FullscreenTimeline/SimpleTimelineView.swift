@@ -3862,38 +3862,12 @@ struct ZoomActionMenu: View {
     }
 
     private func copyZoomedImageToClipboard() {
-        getZoomedImage { image in
-            guard let image = image else { return }
-            let pasteboard = NSPasteboard.general
-            pasteboard.clearContents()
-            pasteboard.writeObjects([image])
-        }
+        viewModel.copyZoomedRegionImage()
         viewModel.exitZoomRegion()
     }
 
     private func copyTextFromZoomRegion() {
-        // Get text from OCR nodes within the zoom region
-        let textInRegion = viewModel.ocrNodes
-            .filter { node in
-                let nodeRight = node.x + node.width
-                let nodeBottom = node.y + node.height
-                let regionRight = zoomRegion.origin.x + zoomRegion.width
-                let regionBottom = zoomRegion.origin.y + zoomRegion.height
-
-                return nodeRight > zoomRegion.origin.x &&
-                       node.x < regionRight &&
-                       nodeBottom > zoomRegion.origin.y &&
-                       node.y < regionBottom
-            }
-            .sorted { ($0.y, $0.x) < ($1.y, $1.x) }  // Sort top-to-bottom, left-to-right
-            .map { $0.text }
-            .joined(separator: " ")
-
-        if !textInRegion.isEmpty {
-            let pasteboard = NSPasteboard.general
-            pasteboard.clearContents()
-            pasteboard.setString(textInRegion, forType: .string)
-        }
+        viewModel.copyZoomedRegionText()
         viewModel.exitZoomRegion()
     }
 
