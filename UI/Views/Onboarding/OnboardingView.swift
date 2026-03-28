@@ -266,6 +266,11 @@ public struct OnboardingView: View {
         .onChange(of: currentStep) { newStep in
             // Save the current step so user can resume if they quit
             UserDefaults.standard.set(newStep, forKey: Self.onboardingStepKey)
+            if newStep == 8 {
+                Task { @MainActor in
+                    await refreshActiveGlobalShortcuts()
+                }
+            }
         }
     }
 
@@ -356,7 +361,9 @@ public struct OnboardingView: View {
                     Task {
                         try? await coordinator.startPipeline()
                     }
-                    MenuBarManager.shared?.reloadShortcuts()
+                    Task { @MainActor in
+                        await refreshActiveGlobalShortcuts()
+                    }
                     withAnimation { currentStep = 5 }
                 }) {
                     Text("Continue")
@@ -438,6 +445,7 @@ public struct OnboardingView: View {
                     // Save shortcuts to UserDefaults (full config with key + modifiers)
                     await coordinator.onboardingManager.setTimelineShortcut(timelineShortcut.toConfig)
                     await coordinator.onboardingManager.setDashboardShortcut(dashboardShortcut.toConfig)
+                    await refreshActiveGlobalShortcuts()
                 }
                 withAnimation { currentStep = 9 }
             }) {
@@ -471,10 +479,7 @@ public struct OnboardingView: View {
                 UserDefaults.standard.removeObject(forKey: Self.onboardingStepKey)
                 Task {
                     await coordinator.onboardingManager.markOnboardingCompleted()
-                    if let menuBarManager = MenuBarManager.shared {
-                        await menuBarManager.reloadShortcutsNow()
-                    }
-                    HotkeyManager.shared.retrySetupIfNeeded()
+                    await refreshActiveGlobalShortcuts()
                     await MainActor.run {
                         onComplete()
                     }
@@ -1942,7 +1947,7 @@ public struct OnboardingView: View {
                         Task {
                             await coordinator.onboardingManager.setTimelineShortcut(newShortcut.toConfig)
                             // Reload shortcuts and re-register hotkeys so the new shortcut works immediately
-                            MenuBarManager.shared?.reloadShortcuts()
+                            await refreshActiveGlobalShortcuts()
                         }
                     }
                 )
@@ -1960,7 +1965,7 @@ public struct OnboardingView: View {
                         Task {
                             await coordinator.onboardingManager.setDashboardShortcut(newShortcut.toConfig)
                             // Reload shortcuts and re-register hotkeys so the new shortcut works immediately
-                            MenuBarManager.shared?.reloadShortcuts()
+                            await refreshActiveGlobalShortcuts()
                         }
                     }
                 )
@@ -2707,6 +2712,14 @@ public struct OnboardingView: View {
                 }
             }
         }
+    }
+
+    @MainActor
+    private func refreshActiveGlobalShortcuts() async {
+        if let menuBarManager = MenuBarManager.shared {
+            await menuBarManager.reloadShortcutsNow()
+        }
+        HotkeyManager.shared.retrySetupIfNeeded()
     }
 
     // MARK: - Permission Monitoring

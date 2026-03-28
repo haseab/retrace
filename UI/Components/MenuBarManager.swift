@@ -192,8 +192,8 @@ public class MenuBarManager: ObservableObject {
         }
     }
 
-    /// Reload shortcuts immediately on the main actor for flows that must
-    /// finish registration before dismissing their UI.
+    /// Reload shortcuts immediately on the main actor for flows that need the
+    /// hotkeys active before dismissing or advancing their UI.
     @MainActor
     public func reloadShortcutsNow() async {
         await reloadShortcutsMainActor()
