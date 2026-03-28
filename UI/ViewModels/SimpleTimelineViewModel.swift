@@ -969,6 +969,9 @@ public class SimpleTimelineViewModel: ObservableObject {
     @Published public var shiftDragDisplaySnapshot: NSImage?
     @Published public var shiftDragDisplaySnapshotFrameID: Int64?
     private var shiftDragDisplayRequestID: Int = 0
+    private var shiftDragDisplayGenerator: AVAssetImageGenerator?
+    private var zoomCopyRequestID: Int = 0
+    private var zoomCopyGenerator: AVAssetImageGenerator?
 
     // MARK: - Text Selection Hint Banner State
 
@@ -8042,6 +8045,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         cancelDiskFrameBufferInactivityCleanup()
         cancelForegroundFrameLoad(reason: "compactPresentationState.\(reason)")
         cancelCacheExpansion(reason: "compactPresentationState.\(reason)")
+        cancelPendingDirectDecodeGenerators(reason: "compactPresentationState.\(reason)")
 
         isInLiveMode = false
         liveScreenshot = nil
@@ -12626,6 +12630,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     ) {
         shiftDragDisplayRequestID += 1
         let requestID = shiftDragDisplayRequestID
+        cancelShiftDragDisplayDecode(reason: "ui.timeline.shift_drag_decode")
 
         if isInLiveMode {
             shiftDragDisplaySnapshot = liveScreenshot
@@ -12654,6 +12659,8 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         let asset = AVURLAsset(url: url)
         let imageGenerator = AVAssetImageGenerator(asset: asset)
+        let generatorID = ObjectIdentifier(imageGenerator)
+        shiftDragDisplayGenerator = imageGenerator
         imageGenerator.appliesPreferredTrackTransform = true
         imageGenerator.requestedTimeToleranceBefore = .zero
         imageGenerator.requestedTimeToleranceAfter = .zero
@@ -12665,6 +12672,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                     reason: "ui.timeline.shift_drag_decode",
                     bytes: directDecodeBytes
                 )
+                self.clearShiftDragDisplayGeneratorIfMatching(generatorID)
                 guard requestID == self.shiftDragDisplayRequestID else {
                     return
                 }
@@ -12719,6 +12727,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Clear all zoom region state (called after exit animation completes)
     private func clearZoomRegionState() {
+        cancelShiftDragDisplayDecode(reason: "ui.timeline.shift_drag_cleanup")
         isZoomRegionActive = false
         isZoomExitTransitioning = false
         isZoomTransitioning = false
@@ -13558,6 +13567,9 @@ public class SimpleTimelineViewModel: ObservableObject {
             completion(nil)
             return
         }
+        zoomCopyRequestID &+= 1
+        let requestID = zoomCopyRequestID
+        cancelZoomCopyDecode(reason: "ui.timeline.zoom_copy_decode")
         let asset = AVURLAsset(url: url)
         let directDecodeBytes = UIDirectFrameDecodeMemoryLedger.begin(
             tag: UIDirectFrameDecodeMemoryLedger.zoomCopyGeneratorTag,
@@ -13566,6 +13578,8 @@ public class SimpleTimelineViewModel: ObservableObject {
             videoInfo: videoInfo
         )
         let imageGenerator = AVAssetImageGenerator(asset: asset)
+        let generatorID = ObjectIdentifier(imageGenerator)
+        zoomCopyGenerator = imageGenerator
         imageGenerator.appliesPreferredTrackTransform = true
         imageGenerator.requestedTimeToleranceBefore = .zero
         imageGenerator.requestedTimeToleranceAfter = .zero
@@ -13579,6 +13593,10 @@ public class SimpleTimelineViewModel: ObservableObject {
                     reason: "ui.timeline.zoom_copy_decode",
                     bytes: directDecodeBytes
                 )
+                self.clearZoomCopyGeneratorIfMatching(generatorID)
+                guard requestID == self.zoomCopyRequestID else {
+                    return
+                }
                 if let cgImage = cgImage {
                     let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
                     completion(nsImage)
@@ -13588,6 +13606,37 @@ public class SimpleTimelineViewModel: ObservableObject {
                 }
             }
         }
+    }
+
+    private func cancelPendingDirectDecodeGenerators(reason: String) {
+        cancelShiftDragDisplayDecode(reason: reason)
+        cancelZoomCopyDecode(reason: reason)
+    }
+
+    private func cancelShiftDragDisplayDecode(reason: String) {
+        guard let shiftDragDisplayGenerator else { return }
+        shiftDragDisplayGenerator.cancelAllCGImageGeneration()
+        self.shiftDragDisplayGenerator = nil
+        Log.debug("[Timeline-Decode] Cancelled shift-drag generator (\(reason))", category: .ui)
+    }
+
+    private func cancelZoomCopyDecode(reason: String) {
+        guard let zoomCopyGenerator else { return }
+        zoomCopyGenerator.cancelAllCGImageGeneration()
+        self.zoomCopyGenerator = nil
+        Log.debug("[Timeline-Decode] Cancelled zoom-copy generator (\(reason))", category: .ui)
+    }
+
+    private func clearShiftDragDisplayGeneratorIfMatching(_ generatorID: ObjectIdentifier) {
+        guard let shiftDragDisplayGenerator else { return }
+        guard ObjectIdentifier(shiftDragDisplayGenerator) == generatorID else { return }
+        self.shiftDragDisplayGenerator = nil
+    }
+
+    private func clearZoomCopyGeneratorIfMatching(_ generatorID: ObjectIdentifier) {
+        guard let zoomCopyGenerator else { return }
+        guard ObjectIdentifier(zoomCopyGenerator) == generatorID else { return }
+        self.zoomCopyGenerator = nil
     }
 
     /// Handle scroll delta to navigate frames

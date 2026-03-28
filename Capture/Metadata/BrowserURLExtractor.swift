@@ -1,5 +1,6 @@
 import Foundation
 import ApplicationServices
+import Darwin
 import Shared
 
 // MARK: - AppleScript Coordination
@@ -79,7 +80,7 @@ actor BrowserURLAppleScriptCoordinator {
 
     private struct CacheEntry: Sendable {
         let url: String
-        let timestamp: Date
+        let expiresAt: Date
     }
 
     private struct BackoffState: Sendable {
@@ -169,6 +170,7 @@ actor BrowserURLAppleScriptCoordinator {
         let now = Date()
         maybeEmitBenchmarkLogIfNeeded(now: now)
         benchmark.attempts += 1
+        pruneExpiredEntries(now: now)
         let effectiveCacheTTL = max(0, cacheTTLOverrideSeconds ?? cacheTTLSeconds)
 
         if let task = inFlight[key] {
@@ -176,22 +178,13 @@ actor BrowserURLAppleScriptCoordinator {
             return await task.value
         }
 
-        if let cached = cache[key] {
-            let ageSeconds = now.timeIntervalSince(cached.timestamp)
-            if ageSeconds <= effectiveCacheTTL {
-                if cacheTTLOverrideSeconds != nil {
-                    Log.debug(
-                        "[AppleScript] [\(browserBundleID):\(pid)] [\(scriptLabel)] cache hit age=\(String(format: "%.2f", ageSeconds))s ttl=\(String(format: "%.2f", effectiveCacheTTL))s windowKey=\(normalizedWindowIdentity.isEmpty ? "<empty>" : normalizedWindowIdentity)",
-                        category: .capture
-                    )
-                }
-                benchmark.cacheHits += 1
-                return BrowserURLAppleScriptResult(
-                    output: cached.url,
-                    completedWithoutTimeout: true,
-                    returnedFromCache: true
-                )
-            }
+        if let cached = cache[key], cached.expiresAt > now {
+            benchmark.cacheHits += 1
+            return BrowserURLAppleScriptResult(
+                output: cached.url,
+                completedWithoutTimeout: true,
+                returnedFromCache: true
+            )
         }
 
         if let nextAllowedAt = backoffByKey[key]?.nextAllowedAt, nextAllowedAt > now {
@@ -230,7 +223,10 @@ actor BrowserURLAppleScriptCoordinator {
            !rawOutput.isEmpty,
            outputValidator(rawOutput) {
             benchmark.successes += 1
-            cache[key] = CacheEntry(url: rawOutput, timestamp: Date())
+            cache[key] = CacheEntry(
+                url: rawOutput,
+                expiresAt: now.addingTimeInterval(effectiveCacheTTL)
+            )
             backoffByKey.removeValue(forKey: key)
             return BrowserURLAppleScriptResult(
                 output: rawOutput,
@@ -290,7 +286,6 @@ actor BrowserURLAppleScriptCoordinator {
                 )
                 backoff.nextAllowedAt = now.addingTimeInterval(delay)
             }
-
             backoffByKey[key] = backoff
         }
 
@@ -346,6 +341,16 @@ actor BrowserURLAppleScriptCoordinator {
         }
 
         benchmark = BenchmarkCounters(periodStart: now)
+    }
+
+    private func pruneExpiredEntries(now: Date) {
+        cache = cache.filter { _, entry in
+            entry.expiresAt > now
+        }
+        backoffByKey = backoffByKey.filter { _, state in
+            guard let nextAllowedAt = state.nextAllowedAt else { return false }
+            return nextAllowedAt > now
+        }
     }
 }
 

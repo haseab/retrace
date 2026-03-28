@@ -402,8 +402,9 @@ public actor StorageManager: StorageProtocol {
     /// Cache is invalidated on time mismatch to handle growing video files
     private var generatorCache: [String: GeneratorCacheEntry] = [:]
 
-    /// Maximum number of generators to keep cached
-    private let maxCachedGenerators = 10
+    /// Evict cached generators that have been idle long enough to likely outlive active scrubbing work.
+    private static let generatorIdleRetentionSeconds = GeneratorCachePolicy.idleRetentionSeconds
+    private static let generatorCacheLimit = GeneratorCachePolicy.defaultCountLimit
 
     /// Cached AVAssetImageGenerator entry
     private struct GeneratorCacheEntry {
@@ -597,6 +598,9 @@ public actor StorageManager: StorageProtocol {
             time = CMTime(seconds: timeInSeconds, preferredTimescale: 600)
         }
 
+        let now = Date()
+        evictOldGenerators(referenceTime: now)
+
         // Try with cached generator first, retry with fresh generator on time mismatch
         for attempt in 0..<2 {
             let useCached = (attempt == 0)
@@ -604,18 +608,25 @@ public actor StorageManager: StorageProtocol {
             let imageGenerator: AVAssetImageGenerator
             var symlinkURL: URL? = nil
 
-            if useCached, var entry = generatorCache[cacheKey] {
+            if useCached,
+               var entry = generatorCache[cacheKey],
+               now.timeIntervalSince(entry.lastAccessTime) <= Self.generatorIdleRetentionSeconds {
                 // Use cached generator
-                entry.lastAccessTime = Date()
+                entry.lastAccessTime = now
                 generatorCache[cacheKey] = entry
                 imageGenerator = entry.generator
             } else {
+                if useCached, let staleEntry = generatorCache.removeValue(forKey: cacheKey) {
+                    releaseGeneratorEntry(staleEntry)
+                    decodeRetainedGenerationByCacheKey.removeValue(forKey: cacheKey)
+                    publishVideoDecodingMemory(reason: "storage.video_decoding.cache")
+                }
+
                 // Create fresh generator - invalidate cache first if this is a retry
                 if attempt > 0 {
                     decodeRetainedGenerationByCacheKey.removeValue(forKey: cacheKey)
-                    if let entry = generatorCache.removeValue(forKey: cacheKey),
-                       let oldSymlink = entry.symlinkURL {
-                        try? FileManager.default.removeItem(at: oldSymlink)
+                    if let entry = generatorCache.removeValue(forKey: cacheKey) {
+                        releaseGeneratorEntry(entry)
                     }
                     publishVideoDecodingMemory(reason: "storage.video_decoding.cache")
                     Log.info("[VideoExtract] Invalidated stale cache for \(videoURL.lastPathComponent), creating fresh generator", category: .storage)
@@ -720,9 +731,8 @@ public actor StorageManager: StorageProtocol {
                 return try convertCGImageToJPEG(cgImage)
             } catch {
                 // Invalidate cache on error
-                if let entry = generatorCache.removeValue(forKey: cacheKey),
-                   let oldSymlink = entry.symlinkURL {
-                    try? FileManager.default.removeItem(at: oldSymlink)
+                if let entry = generatorCache.removeValue(forKey: cacheKey) {
+                    releaseGeneratorEntry(entry)
                 }
                 decodeRetainedGenerationByCacheKey.removeValue(forKey: cacheKey)
                 publishVideoDecodingMemory(reason: "storage.video_decoding.cache")
@@ -738,20 +748,19 @@ public actor StorageManager: StorageProtocol {
     }
 
     /// Evict oldest generators when cache is full
-    private func evictOldGenerators() {
-        guard generatorCache.count > maxCachedGenerators else { return }
+    private func evictOldGenerators(referenceTime: Date = Date()) {
+        let keysToRemove = GeneratorCachePolicy.keysToEvict(
+            lastAccessByKey: generatorCache.mapValues(\.lastAccessTime),
+            referenceTime: referenceTime,
+            countLimit: Self.generatorCacheLimit,
+            idleRetentionSeconds: Self.generatorIdleRetentionSeconds
+        )
+        guard !keysToRemove.isEmpty else { return }
 
-        // Sort by last access time and remove oldest
-        let sorted = generatorCache.sorted { $0.value.lastAccessTime < $1.value.lastAccessTime }
-        let toRemove = sorted.prefix(generatorCache.count - maxCachedGenerators)
-
-        for (key, entry) in toRemove {
-            generatorCache.removeValue(forKey: key)
+        for key in keysToRemove {
+            guard let entry = generatorCache.removeValue(forKey: key) else { continue }
             decodeRetainedGenerationByCacheKey.removeValue(forKey: key)
-            // Clean up symlink
-            if let symlinkURL = entry.symlinkURL {
-                try? FileManager.default.removeItem(at: symlinkURL)
-            }
+            releaseGeneratorEntry(entry)
         }
         publishVideoDecodingMemory(reason: "storage.video_decoding.cache")
     }
@@ -1845,9 +1854,7 @@ public actor StorageManager: StorageProtocol {
 
         // Clean up generator cache and remove any symlinks
         for (_, entry) in generatorCache {
-            if let symlinkURL = entry.symlinkURL {
-                try? FileManager.default.removeItem(at: symlinkURL)
-            }
+            releaseGeneratorEntry(entry)
         }
         generatorCache.removeAll()
         decodeRetainedGenerationByCacheKey.removeAll()
@@ -1861,9 +1868,7 @@ public actor StorageManager: StorageProtocol {
         frameCache.removeAll()
 
         for (_, entry) in generatorCache {
-            if let symlinkURL = entry.symlinkURL {
-                try? FileManager.default.removeItem(at: symlinkURL)
-            }
+            releaseGeneratorEntry(entry)
         }
         generatorCache.removeAll()
         decodeRetainedGenerationByCacheKey.removeAll()
@@ -1894,9 +1899,7 @@ public actor StorageManager: StorageProtocol {
         for (path, entry) in generatorCache {
             if !FileManager.default.fileExists(atPath: path) {
                 invalidPaths.append(path)
-                if let symlinkURL = entry.symlinkURL {
-                    try? FileManager.default.removeItem(at: symlinkURL)
-                }
+                releaseGeneratorEntry(entry)
             }
         }
         for path in invalidPaths {
@@ -1931,6 +1934,13 @@ public actor StorageManager: StorageProtocol {
         }
         publishVideoDecodingMemory(reason: reason)
         return token
+    }
+
+    private func releaseGeneratorEntry(_ entry: GeneratorCacheEntry) {
+        entry.generator.cancelAllCGImageGeneration()
+        if let symlinkURL = entry.symlinkURL {
+            try? FileManager.default.removeItem(at: symlinkURL)
+        }
     }
 
     private func endVideoDecodingTransientBytes(
@@ -1982,7 +1992,8 @@ public actor StorageManager: StorageProtocol {
             unit: "generators",
             function: "storage.video_decoding",
             kind: "decode-generator-cache",
-            note: "estimated-native"
+            note: "estimated-native",
+            category: .inferred
         )
         MemoryLedger.set(
             tag: Self.memoryLedgerDecoderHeapTag,

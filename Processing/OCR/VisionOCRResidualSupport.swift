@@ -7,6 +7,7 @@ struct VisionOCRResetSpec {
     let kind: String
     let note: String
     let unit: String
+    let category: MemoryLedger.ComponentCategory
 }
 
 extension VisionOCR {
@@ -17,40 +18,40 @@ extension VisionOCR {
     static let fullFrameBlindResidualHandoffSeconds: TimeInterval = 0.25
 
     static let fullFrameResetSpecs: [VisionOCRResetSpec] = [
-        VisionOCRResetSpec(tag: "processing.ocr.fullFrameImageBridge", function: "processing.ocr.full_frame", kind: "cgimage-bridge", note: "observed-footprint-delta", unit: "requests"),
-        VisionOCRResetSpec(tag: "processing.ocr.fullFrameOuterResidual", function: "processing.ocr.full_frame", kind: "ocr-blind-residual", note: "epoch-arbited-current-unattributed", unit: "requests"),
-        VisionOCRResetSpec(tag: "processing.ocr.fullFrameRequestSetup", function: "processing.ocr.full_frame", kind: "vision-request-setup", note: "observed-footprint-delta", unit: "requests"),
-        VisionOCRResetSpec(tag: "processing.ocr.fullFrameObservationBridge", function: "processing.ocr.full_frame", kind: "vision-observation-bridge", note: "observed-footprint-delta", unit: "requests"),
-        VisionOCRResetSpec(tag: "processing.ocr.fullFrameRuntimeResidual", function: "processing.ocr.full_frame", kind: "vision-runtime-residual", note: "observed-footprint-delta", unit: "requests"),
-        VisionOCRResetSpec(tag: "processing.ocr.fullFrameResultsGraph", function: "processing.ocr.full_frame", kind: "ocr-results-graph", note: "estimated-results", unit: "requests"),
-        VisionOCRResetSpec(tag: "processing.ocr.fullFrameOCRResultRetention", function: "processing.ocr.full_frame", kind: "full-frame-ocr-results", note: "estimated-results-payload", unit: "requests"),
-        VisionOCRResetSpec(tag: "processing.ocr.fullFrameOCRCallResidual", function: "processing.ocr.full_frame", kind: "full-frame-ocr-call-residual", note: "observed-minus-results-payload-net-blind-residual", unit: "requests"),
-        VisionOCRResetSpec(tag: "processing.ocr.fullFrameMaterializationResidual", function: "processing.ocr.full_frame", kind: "ocr-materialization-residual", note: "observed-footprint-delta", unit: "requests"),
-        VisionOCRResetSpec(tag: "processing.ocr.fullFrameRetainedHeap", function: "processing.ocr.full_frame", kind: "vision-retained-heap", note: "observed-footprint-delta", unit: "requests"),
-        VisionOCRResetSpec(tag: "processing.ocr.fullFrameVisionRequest", function: "processing.ocr.full_frame", kind: "vision-request", note: "estimated-native", unit: "requests"),
-        VisionOCRResetSpec(tag: "processing.ocr.fullFramePrivateHeap", function: "processing.ocr.full_frame", kind: "vision-private-heap", note: "proxy-native", unit: "requests")
+        VisionOCRResetSpec(tag: "processing.ocr.fullFrameImageBridge", function: "processing.ocr.full_frame", kind: "cgimage-bridge", note: "observed-footprint-delta", unit: "requests", category: .explicit),
+        VisionOCRResetSpec(tag: "processing.ocr.fullFrameOuterResidual", function: "processing.ocr.full_frame", kind: "ocr-blind-residual", note: "epoch-arbited-current-unattributed", unit: "requests", category: .inferred),
+        VisionOCRResetSpec(tag: "processing.ocr.fullFrameRequestSetup", function: "processing.ocr.full_frame", kind: "vision-request-setup", note: "observed-footprint-delta", unit: "requests", category: .explicit),
+        VisionOCRResetSpec(tag: "processing.ocr.fullFrameObservationBridge", function: "processing.ocr.full_frame", kind: "vision-observation-bridge", note: "observed-footprint-delta", unit: "requests", category: .inferred),
+        VisionOCRResetSpec(tag: "processing.ocr.fullFrameRuntimeResidual", function: "processing.ocr.full_frame", kind: "vision-runtime-residual", note: "observed-footprint-delta", unit: "requests", category: .inferred),
+        VisionOCRResetSpec(tag: "processing.ocr.fullFrameResultsGraph", function: "processing.ocr.full_frame", kind: "ocr-results-graph", note: "estimated-results", unit: "requests", category: .explicit),
+        VisionOCRResetSpec(tag: "processing.ocr.fullFrameOCRResultRetention", function: "processing.ocr.full_frame", kind: "full-frame-ocr-results", note: "estimated-results-payload", unit: "requests", category: .explicit),
+        VisionOCRResetSpec(tag: "processing.ocr.fullFrameOCRCallResidual", function: "processing.ocr.full_frame", kind: "full-frame-ocr-call-residual", note: "observed-minus-results-payload-net-blind-residual", unit: "requests", category: .inferred),
+        VisionOCRResetSpec(tag: "processing.ocr.fullFrameMaterializationResidual", function: "processing.ocr.full_frame", kind: "ocr-materialization-residual", note: "observed-footprint-delta", unit: "requests", category: .inferred),
+        VisionOCRResetSpec(tag: "processing.ocr.fullFrameRetainedHeap", function: "processing.ocr.full_frame", kind: "vision-retained-heap", note: "observed-footprint-delta", unit: "requests", category: .inferred),
+        VisionOCRResetSpec(tag: "processing.ocr.fullFrameVisionRequest", function: "processing.ocr.full_frame", kind: "vision-request", note: "estimated-native", unit: "requests", category: .inferred),
+        VisionOCRResetSpec(tag: "processing.ocr.fullFramePrivateHeap", function: "processing.ocr.full_frame", kind: "vision-private-heap", note: "proxy-native", unit: "requests", category: .inferred)
     ]
 
     static let regionResetSpecs: [VisionOCRResetSpec] = [
-        VisionOCRResetSpec(tag: "processing.ocr.regionImageBridge", function: "processing.ocr.region_reocr", kind: "cgimage-bridge", note: "observed-footprint-delta", unit: "requests"),
-        VisionOCRResetSpec(tag: "processing.ocr.regionBlindResidual", function: "processing.ocr.region_reocr", kind: "ocr-blind-residual", note: "epoch-arbited-current-unattributed", unit: "requests"),
-        VisionOCRResetSpec(tag: "processing.ocr.regionRequestSetup", function: "processing.ocr.region_reocr", kind: "vision-request-setup", note: "observed-footprint-delta", unit: "requests"),
-        VisionOCRResetSpec(tag: "processing.ocr.regionObservationBridge", function: "processing.ocr.region_reocr", kind: "vision-observation-bridge", note: "observed-footprint-delta", unit: "requests"),
-        VisionOCRResetSpec(tag: "processing.ocr.regionRuntimeResidual", function: "processing.ocr.region_reocr", kind: "vision-runtime-residual", note: "observed-footprint-delta", unit: "requests"),
-        VisionOCRResetSpec(tag: "processing.ocr.regionResultsGraph", function: "processing.ocr.region_reocr", kind: "ocr-results-graph", note: "estimated-results", unit: "requests"),
-        VisionOCRResetSpec(tag: "processing.ocr.regionMaterializationResidual", function: "processing.ocr.region_reocr", kind: "ocr-materialization-residual", note: "observed-footprint-delta", unit: "requests"),
-        VisionOCRResetSpec(tag: "processing.ocr.regionRetainedHeap", function: "processing.ocr.region_reocr", kind: "vision-retained-heap", note: "observed-footprint-delta", unit: "requests"),
-        VisionOCRResetSpec(tag: "processing.ocr.regionVisionRequest", function: "processing.ocr.region_reocr", kind: "vision-request", note: "estimated-native", unit: "requests"),
-        VisionOCRResetSpec(tag: "processing.ocr.regionPrivateHeap", function: "processing.ocr.region_reocr", kind: "vision-private-heap", note: "proxy-native", unit: "requests"),
-        VisionOCRResetSpec(tag: "processing.ocr.regionChangeDetection", function: "processing.ocr.region_reocr", kind: "region-change-detection", note: "observed-plus-buffer", unit: "requests"),
-        VisionOCRResetSpec(tag: "processing.ocr.regionCachePartition", function: "processing.ocr.region_reocr", kind: "region-cache-partition", note: "observed-plus-buffer", unit: "requests"),
-        VisionOCRResetSpec(tag: "processing.ocr.regionTileExpansion", function: "processing.ocr.region_reocr", kind: "region-tile-expansion", note: "observed-plus-buffer", unit: "requests"),
-        VisionOCRResetSpec(tag: "processing.ocr.regionOCRResultRetention", function: "processing.ocr.region_reocr", kind: "region-ocr-results", note: "estimated-results-payload", unit: "requests"),
-        VisionOCRResetSpec(tag: "processing.ocr.regionOCRCallResidual", function: "processing.ocr.region_reocr", kind: "region-ocr-call-residual", note: "observed-minus-results-payload-net-blind-residual", unit: "requests"),
-        VisionOCRResetSpec(tag: "processing.ocr.regionReturnResidual", function: "processing.ocr.region_reocr", kind: "region-return-residual", note: "epoch-arbited-current-unattributed-after-cache-refresh", unit: "requests"),
-        VisionOCRResetSpec(tag: "processing.ocr.regionMergeScratch", function: "processing.ocr.region_reocr", kind: "region-merge-scratch", note: "observed-plus-buffer", unit: "requests"),
-        VisionOCRResetSpec(tag: "processing.ocr.regionCacheRefresh", function: "processing.ocr.region_reocr", kind: "region-cache-refresh", note: "observed-plus-buffer", unit: "requests"),
-        VisionOCRResetSpec(tag: "processing.ocr.regionTailResidual", function: "processing.ocr.region_reocr", kind: "region-tail-residual", note: "observed-delayed-tail-residual", unit: "requests")
+        VisionOCRResetSpec(tag: "processing.ocr.regionImageBridge", function: "processing.ocr.region_reocr", kind: "cgimage-bridge", note: "observed-footprint-delta", unit: "requests", category: .explicit),
+        VisionOCRResetSpec(tag: "processing.ocr.regionBlindResidual", function: "processing.ocr.region_reocr", kind: "ocr-blind-residual", note: "epoch-arbited-current-unattributed", unit: "requests", category: .inferred),
+        VisionOCRResetSpec(tag: "processing.ocr.regionRequestSetup", function: "processing.ocr.region_reocr", kind: "vision-request-setup", note: "observed-footprint-delta", unit: "requests", category: .explicit),
+        VisionOCRResetSpec(tag: "processing.ocr.regionObservationBridge", function: "processing.ocr.region_reocr", kind: "vision-observation-bridge", note: "observed-footprint-delta", unit: "requests", category: .inferred),
+        VisionOCRResetSpec(tag: "processing.ocr.regionRuntimeResidual", function: "processing.ocr.region_reocr", kind: "vision-runtime-residual", note: "observed-footprint-delta", unit: "requests", category: .inferred),
+        VisionOCRResetSpec(tag: "processing.ocr.regionResultsGraph", function: "processing.ocr.region_reocr", kind: "ocr-results-graph", note: "estimated-results", unit: "requests", category: .explicit),
+        VisionOCRResetSpec(tag: "processing.ocr.regionMaterializationResidual", function: "processing.ocr.region_reocr", kind: "ocr-materialization-residual", note: "observed-footprint-delta", unit: "requests", category: .inferred),
+        VisionOCRResetSpec(tag: "processing.ocr.regionRetainedHeap", function: "processing.ocr.region_reocr", kind: "vision-retained-heap", note: "observed-footprint-delta", unit: "requests", category: .inferred),
+        VisionOCRResetSpec(tag: "processing.ocr.regionVisionRequest", function: "processing.ocr.region_reocr", kind: "vision-request", note: "estimated-native", unit: "requests", category: .inferred),
+        VisionOCRResetSpec(tag: "processing.ocr.regionPrivateHeap", function: "processing.ocr.region_reocr", kind: "vision-private-heap", note: "proxy-native", unit: "requests", category: .inferred),
+        VisionOCRResetSpec(tag: "processing.ocr.regionChangeDetection", function: "processing.ocr.region_reocr", kind: "region-change-detection", note: "observed-plus-buffer", unit: "requests", category: .explicit),
+        VisionOCRResetSpec(tag: "processing.ocr.regionCachePartition", function: "processing.ocr.region_reocr", kind: "region-cache-partition", note: "observed-plus-buffer", unit: "requests", category: .explicit),
+        VisionOCRResetSpec(tag: "processing.ocr.regionTileExpansion", function: "processing.ocr.region_reocr", kind: "region-tile-expansion", note: "observed-plus-buffer", unit: "requests", category: .explicit),
+        VisionOCRResetSpec(tag: "processing.ocr.regionOCRResultRetention", function: "processing.ocr.region_reocr", kind: "region-ocr-results", note: "estimated-results-payload", unit: "requests", category: .explicit),
+        VisionOCRResetSpec(tag: "processing.ocr.regionOCRCallResidual", function: "processing.ocr.region_reocr", kind: "region-ocr-call-residual", note: "observed-minus-results-payload-net-blind-residual", unit: "requests", category: .inferred),
+        VisionOCRResetSpec(tag: "processing.ocr.regionReturnResidual", function: "processing.ocr.region_reocr", kind: "region-return-residual", note: "epoch-arbited-current-unattributed-after-cache-refresh", unit: "requests", category: .inferred),
+        VisionOCRResetSpec(tag: "processing.ocr.regionMergeScratch", function: "processing.ocr.region_reocr", kind: "region-merge-scratch", note: "observed-plus-buffer", unit: "requests", category: .explicit),
+        VisionOCRResetSpec(tag: "processing.ocr.regionCacheRefresh", function: "processing.ocr.region_reocr", kind: "region-cache-refresh", note: "observed-plus-buffer", unit: "requests", category: .explicit),
+        VisionOCRResetSpec(tag: "processing.ocr.regionTailResidual", function: "processing.ocr.region_reocr", kind: "region-tail-residual", note: "observed-delayed-tail-residual", unit: "requests", category: .inferred)
     ]
 
     static func measuredLedgerResidualBytes(
@@ -153,7 +154,8 @@ extension VisionOCR {
                 unit: spec.unit,
                 function: spec.function,
                 kind: spec.kind,
-                note: spec.note
+                note: spec.note,
+                category: spec.category
             )
         }
     }

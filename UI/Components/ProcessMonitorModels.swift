@@ -1,4 +1,5 @@
 import Foundation
+import Shared
 
 struct ProcessCPURow: Identifiable {
     let id: String
@@ -21,6 +22,28 @@ struct ProcessMemoryRow: Identifiable {
     let peakBytes: UInt64
     let currentSharePercent: Double
     let averageSharePercent: Double
+}
+
+enum RetraceMemoryAttributionCategory: String, CaseIterable {
+    case explicit
+    case inferred
+    case unattributed
+
+    var displayName: String {
+        rawValue
+    }
+}
+
+struct RetraceMemoryAttributionTree {
+    static let empty = RetraceMemoryAttributionTree(
+        categories: [],
+        familiesByCategory: [:],
+        componentsByCategoryFamily: [:]
+    )
+
+    let categories: [ProcessMemoryRow]
+    let familiesByCategory: [String: [ProcessMemoryRow]]
+    let componentsByCategoryFamily: [String: [ProcessMemoryRow]]
 }
 
 struct ProcessCPUSnapshot {
@@ -46,8 +69,7 @@ struct ProcessCPUSnapshot {
         peakResidentBytesByGroup: [:],
         topMemoryProcesses: [],
         topRetraceChildMemoryProcesses: [],
-        topRetraceMemoryAttributionFamilies: [],
-        retraceMemoryAttributionChildrenByFamily: [:],
+        retraceMemoryAttributionTree: .empty,
         latestSampleTimestamp: nil
     )
 
@@ -72,8 +94,7 @@ struct ProcessCPUSnapshot {
     let peakResidentBytesByGroup: [String: UInt64]
     let topMemoryProcesses: [ProcessMemoryRow]
     let topRetraceChildMemoryProcesses: [ProcessMemoryRow]
-    let topRetraceMemoryAttributionFamilies: [ProcessMemoryRow]
-    let retraceMemoryAttributionChildrenByFamily: [String: [ProcessMemoryRow]]
+    let retraceMemoryAttributionTree: RetraceMemoryAttributionTree
     let latestSampleTimestamp: TimeInterval?
 
     var hasEnoughData: Bool {
@@ -269,56 +290,260 @@ enum ProcessCPUDisplayMetrics {
         return familyKey
     }
 
-    static func buildRetraceMemoryAttributionRows(
+    static func retraceMemoryAttributionFamilyExpansionKey(
+        categoryID: String,
+        familyID: String
+    ) -> String {
+        "\(categoryID)|\(familyID)"
+    }
+
+    static func buildCategorizedRetraceMemoryAttributionTree(
         currentBytesByComponent: [String: UInt64],
+        componentCategoriesByKey: [String: MemoryLedger.ComponentCategory],
         memoryByteSecondsByComponent: [String: Double],
         peakBytesByComponent: [String: UInt64],
-        peakBytesByFamily: [String: UInt64],
+        componentSamples: [[String: UInt64]],
         totalDuration: TimeInterval
-    ) -> (families: [ProcessMemoryRow], childrenByFamily: [String: [ProcessMemoryRow]]) {
-        let componentDisplayNames = currentBytesByComponent.keys.reduce(into: [String: String]()) { result, key in
-            let familyKey = memoryLedgerFamilyKey(for: key)
-            result[key] = memoryLedgerComponentDisplayName(for: key, familyKey: familyKey)
-        }
+    ) -> RetraceMemoryAttributionTree {
+        let componentKeys = Set(currentBytesByComponent.keys)
+            .union(memoryByteSecondsByComponent.keys)
+            .union(peakBytesByComponent.keys)
 
-        let currentBytesByFamily = memoryLedgerFamilyBytes(from: currentBytesByComponent)
-        let memoryByteSecondsByFamily = memoryByteSecondsByComponent.reduce(into: [String: Double]()) { result, element in
-            let (componentKey, byteSeconds) = element
+        var currentBytesByCategory: [String: UInt64] = [:]
+        var averageByteSecondsByCategory: [String: Double] = [:]
+        var peakBytesByCategory: [String: UInt64] = [:]
+
+        var currentBytesByCategoryFamily: [String: UInt64] = [:]
+        var averageByteSecondsByCategoryFamily: [String: Double] = [:]
+        var peakBytesByCategoryFamily: [String: UInt64] = [:]
+
+        var componentDisplayNames: [String: String] = [:]
+        var familyIDsByCategory: [String: Set<String>] = [:]
+        var componentKeysByCategoryFamily: [String: [String]] = [:]
+        var familyDisplayNamesByCategoryFamily: [String: String] = [:]
+
+        for componentKey in componentKeys {
+            let category = retraceMemoryAttributionCategory(
+                for: componentKey,
+                componentCategoriesByKey: componentCategoriesByKey
+            )
+            let categoryID = category.rawValue
             let familyKey = memoryLedgerFamilyKey(for: componentKey)
-            result[familyKey, default: 0] += byteSeconds
-        }
-        let fallbackPeakBytesByFamily = peakBytesByComponent.reduce(into: [String: UInt64]()) { result, element in
-            let (componentKey, peakBytes) = element
-            let familyKey = memoryLedgerFamilyKey(for: componentKey)
-            result[familyKey] = max(result[familyKey] ?? 0, peakBytes)
+            let categoryFamilyKey = retraceMemoryAttributionFamilyExpansionKey(
+                categoryID: categoryID,
+                familyID: familyKey
+            )
+
+            let currentBytes = currentBytesByComponent[componentKey] ?? 0
+            if currentBytes > 0 {
+                currentBytesByCategory[categoryID] = saturatingAdd(
+                    currentBytesByCategory[categoryID] ?? 0,
+                    currentBytes
+                )
+                currentBytesByCategoryFamily[categoryFamilyKey] = saturatingAdd(
+                    currentBytesByCategoryFamily[categoryFamilyKey] ?? 0,
+                    currentBytes
+                )
+            }
+
+            let byteSeconds = memoryByteSecondsByComponent[componentKey] ?? 0
+            if byteSeconds > 0 {
+                averageByteSecondsByCategory[categoryID, default: 0] += byteSeconds
+                averageByteSecondsByCategoryFamily[categoryFamilyKey, default: 0] += byteSeconds
+            }
+
+            componentDisplayNames[componentKey] = memoryLedgerComponentDisplayName(
+                for: componentKey,
+                familyKey: familyKey
+            )
+            familyIDsByCategory[categoryID, default: []].insert(familyKey)
+            componentKeysByCategoryFamily[categoryFamilyKey, default: []].append(componentKey)
+            familyDisplayNamesByCategoryFamily[categoryFamilyKey] = memoryLedgerFamilyDisplayName(
+                for: familyKey
+            )
         }
 
-        let familyRows = buildMemoryRows(
-            currentBytesByKey: currentBytesByFamily,
-            memoryByteSecondsByKey: memoryByteSecondsByFamily,
-            peakBytesByKey: peakBytesByFamily.isEmpty ? fallbackPeakBytesByFamily : peakBytesByFamily,
-            displayNamesByKey: Dictionary(
-                uniqueKeysWithValues: currentBytesByFamily.keys.map { ($0, memoryLedgerFamilyDisplayName(for: $0)) }
-            ),
-            totalDuration: totalDuration
+        for sample in componentSamples {
+            var sampleBytesByCategory: [String: UInt64] = [:]
+            var sampleBytesByCategoryFamily: [String: UInt64] = [:]
+
+            for (componentKey, bytes) in sample where bytes > 0 {
+                let category = retraceMemoryAttributionCategory(
+                    for: componentKey,
+                    componentCategoriesByKey: componentCategoriesByKey
+                )
+                let categoryID = category.rawValue
+                let familyKey = memoryLedgerFamilyKey(for: componentKey)
+                let categoryFamilyKey = retraceMemoryAttributionFamilyExpansionKey(
+                    categoryID: categoryID,
+                    familyID: familyKey
+                )
+
+                sampleBytesByCategory[categoryID] = saturatingAdd(
+                    sampleBytesByCategory[categoryID] ?? 0,
+                    bytes
+                )
+                sampleBytesByCategoryFamily[categoryFamilyKey] = saturatingAdd(
+                    sampleBytesByCategoryFamily[categoryFamilyKey] ?? 0,
+                    bytes
+                )
+            }
+
+            for (categoryID, bytes) in sampleBytesByCategory {
+                peakBytesByCategory[categoryID] = max(peakBytesByCategory[categoryID] ?? 0, bytes)
+            }
+            for (categoryFamilyKey, bytes) in sampleBytesByCategoryFamily {
+                peakBytesByCategoryFamily[categoryFamilyKey] = max(
+                    peakBytesByCategoryFamily[categoryFamilyKey] ?? 0,
+                    bytes
+                )
+            }
+        }
+
+        for (categoryID, currentBytes) in currentBytesByCategory {
+            peakBytesByCategory[categoryID] = max(peakBytesByCategory[categoryID] ?? 0, currentBytes)
+        }
+        for (categoryFamilyKey, currentBytes) in currentBytesByCategoryFamily {
+            peakBytesByCategoryFamily[categoryFamilyKey] = max(
+                peakBytesByCategoryFamily[categoryFamilyKey] ?? 0,
+                currentBytes
+            )
+        }
+
+        let totalCurrentCategoryBytes = currentBytesByCategory.values.reduce(UInt64(0), saturatingAdd)
+        let safeTotalDuration = max(totalDuration, 0)
+        let totalAverageCategoryBytesDouble = safeTotalDuration > 0
+            ? averageByteSecondsByCategory.values.reduce(0, +) / totalDuration
+            : 0
+
+        let categoryRows = RetraceMemoryAttributionCategory.allCases.map { category in
+            let categoryID = category.rawValue
+            let averageBytesDouble = safeTotalDuration > 0
+                ? (averageByteSecondsByCategory[categoryID] ?? 0) / totalDuration
+                : Double(currentBytesByCategory[categoryID] ?? 0)
+            let currentBytes = currentBytesByCategory[categoryID] ?? 0
+            let averageBytes = doubleToUInt64(averageBytesDouble)
+            let peakBytes = max(
+                peakBytesByCategory[categoryID] ?? 0,
+                currentBytes,
+                averageBytes
+            )
+            let currentSharePercent = totalCurrentCategoryBytes > 0
+                ? (Double(currentBytes) / Double(totalCurrentCategoryBytes)) * 100.0
+                : 0
+            let averageSharePercent = totalAverageCategoryBytesDouble > 0
+                ? (averageBytesDouble / totalAverageCategoryBytesDouble) * 100.0
+                : 0
+            return ProcessMemoryRow(
+                id: categoryID,
+                name: category.displayName,
+                currentBytes: currentBytes,
+                averageBytes: averageBytes,
+                peakBytes: peakBytes,
+                currentSharePercent: currentSharePercent,
+                averageSharePercent: averageSharePercent
+            )
+        }
+
+        var categoryFamilies: [String: [ProcessMemoryRow]] = [:]
+        var categoryFamilyComponents: [String: [ProcessMemoryRow]] = [:]
+
+        for category in RetraceMemoryAttributionCategory.allCases {
+            let categoryID = category.rawValue
+            let familyIDs = familyIDsByCategory[categoryID] ?? []
+            guard !familyIDs.isEmpty else {
+                categoryFamilies[categoryID] = []
+                continue
+            }
+
+            var familyCurrentBytes: [String: UInt64] = [:]
+            var familyByteSeconds: [String: Double] = [:]
+            var familyPeakBytes: [String: UInt64] = [:]
+            var familyDisplayNames: [String: String] = [:]
+
+            for familyID in familyIDs {
+                let categoryFamilyKey = retraceMemoryAttributionFamilyExpansionKey(
+                    categoryID: categoryID,
+                    familyID: familyID
+                )
+                familyCurrentBytes[familyID] = currentBytesByCategoryFamily[categoryFamilyKey] ?? 0
+                familyByteSeconds[familyID] = averageByteSecondsByCategoryFamily[categoryFamilyKey] ?? 0
+                familyPeakBytes[familyID] = peakBytesByCategoryFamily[categoryFamilyKey] ?? 0
+                familyDisplayNames[familyID] = familyDisplayNamesByCategoryFamily[categoryFamilyKey] ?? familyID
+            }
+
+            let familyRows = buildMemoryRows(
+                currentBytesByKey: familyCurrentBytes,
+                memoryByteSecondsByKey: familyByteSeconds,
+                peakBytesByKey: familyPeakBytes,
+                displayNamesByKey: familyDisplayNames,
+                totalDuration: totalDuration
+            )
+            categoryFamilies[categoryID] = familyRows
+
+            for familyRow in familyRows {
+                let familyID = familyRow.id
+                let categoryFamilyKey = retraceMemoryAttributionFamilyExpansionKey(
+                    categoryID: categoryID,
+                    familyID: familyID
+                )
+                let componentKeysForFamily = componentKeysByCategoryFamily[categoryFamilyKey] ?? []
+                let familyComponentRows = buildMemoryRows(
+                    currentBytesByKey: Dictionary(
+                        uniqueKeysWithValues: componentKeysForFamily.map {
+                            ($0, currentBytesByComponent[$0] ?? 0)
+                        }
+                    ),
+                    memoryByteSecondsByKey: Dictionary(
+                        uniqueKeysWithValues: componentKeysForFamily.map {
+                            ($0, memoryByteSecondsByComponent[$0] ?? 0)
+                        }
+                    ),
+                    peakBytesByKey: Dictionary(
+                        uniqueKeysWithValues: componentKeysForFamily.map {
+                            ($0, peakBytesByComponent[$0] ?? 0)
+                        }
+                    ),
+                    displayNamesByKey: Dictionary(
+                        uniqueKeysWithValues: componentKeysForFamily.map {
+                            ($0, componentDisplayNames[$0] ?? $0)
+                        }
+                    ),
+                    totalDuration: totalDuration
+                )
+                categoryFamilyComponents[categoryFamilyKey] = familyComponentRows
+            }
+        }
+
+        return RetraceMemoryAttributionTree(
+            categories: categoryRows,
+            familiesByCategory: categoryFamilies,
+            componentsByCategoryFamily: categoryFamilyComponents
         )
+    }
 
-        let componentRows = buildMemoryRows(
-            currentBytesByKey: currentBytesByComponent,
-            memoryByteSecondsByKey: memoryByteSecondsByComponent,
-            peakBytesByKey: peakBytesByComponent,
-            displayNamesByKey: componentDisplayNames,
-            totalDuration: totalDuration
-        )
-
-        var childrenByFamily: [String: [ProcessMemoryRow]] = [:]
-        childrenByFamily.reserveCapacity(familyRows.count)
-        for componentRow in componentRows {
-            let familyKey = memoryLedgerFamilyKey(for: componentRow.id)
-            childrenByFamily[familyKey, default: []].append(componentRow)
+    private static func retraceMemoryAttributionCategory(
+        for componentKey: String,
+        componentCategoriesByKey: [String: MemoryLedger.ComponentCategory]
+    ) -> RetraceMemoryAttributionCategory {
+        guard let category = componentCategoriesByKey[componentKey] else {
+            return componentKey == unattributedMemoryComponentKey ? .unattributed : .explicit
         }
+        switch category {
+        case .explicit:
+            return .explicit
+        case .inferred:
+            return .inferred
+        case .unattributed:
+            return .unattributed
+        }
+    }
 
-        return (families: familyRows, childrenByFamily: childrenByFamily)
+    private static func doubleToUInt64(_ value: Double) -> UInt64 {
+        guard value.isFinite else { return 0 }
+        if value <= 0 { return 0 }
+        if value >= Double(UInt64.max) { return UInt64.max }
+        return UInt64(value.rounded())
     }
 
     private static func cumulativeSharePercent(valueSeconds: Double, totalSeconds: Double) -> Double {

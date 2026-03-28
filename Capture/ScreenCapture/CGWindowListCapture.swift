@@ -170,7 +170,8 @@ private enum CaptureScreenResidualMemoryLedger {
                 unit: entry.unit,
                 function: entry.function,
                 kind: entry.kind,
-                note: entry.note
+                note: entry.note,
+                category: .inferred
             )
         }
     }

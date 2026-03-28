@@ -37,10 +37,6 @@ public actor ProcessingManager: ProcessingProtocol {
 
     private var config: ProcessingConfig
 
-    // Processing queue
-    private var processingQueue: [(CapturedFrame, (Result<ExtractedText, ProcessingError>) -> Void)] = []
-    private var isProcessing = false
-
     // Region-based OCR state
     private var fullFrameCache: FullFrameOCRCache?
     private var previousFrame: CapturedFrame?
@@ -300,30 +296,6 @@ public actor ProcessingManager: ProcessingProtocol {
         }
     }
 
-    // MARK: - Processing Queue
-
-    public func queueFrame(
-        _ frame: CapturedFrame,
-        completion: @escaping @Sendable (Result<ExtractedText, ProcessingError>) -> Void
-    ) async {
-        processingQueue.append((frame, completion))
-
-        // Start processing if not already running
-        if !isProcessing {
-            await processQueue()
-        }
-    }
-
-    public var queuedFrameCount: Int {
-        return processingQueue.count
-    }
-
-    public func waitForQueueDrain() async {
-        while !processingQueue.isEmpty || isProcessing {
-            try? await Task.sleep(for: .nanoseconds(Int64(100_000_000)), clock: .continuous)  // 100ms
-        }
-    }
-
     // MARK: - Configuration
 
     public func updateConfig(_ config: ProcessingConfig) async {
@@ -382,31 +354,6 @@ public actor ProcessingManager: ProcessingProtocol {
         await fullFrameCache?.invalidateAll()
         previousFrame = nil
         await updateMemoryLedger()
-    }
-
-    // MARK: - Private Methods
-
-    private func processQueue() async {
-        isProcessing = true
-
-        while !processingQueue.isEmpty {
-            let (frame, completion) = processingQueue.removeFirst()
-
-            do {
-                let text = try await extractText(from: frame)
-                completion(.success(text))
-            } catch let error as ProcessingError {
-                errorCount += 1
-                Log.error("[ProcessingManager] Queue processing failed for frame: \(error)", category: .processing)
-                completion(.failure(error))
-            } catch {
-                errorCount += 1
-                Log.error("[ProcessingManager] Queue processing failed for frame: \(error.localizedDescription)", category: .processing, error: error)
-                completion(.failure(.ocrFailed(underlying: error.localizedDescription)))
-            }
-        }
-
-        isProcessing = false
     }
 
     private func updateMemoryLedger() async {

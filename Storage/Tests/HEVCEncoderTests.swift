@@ -55,7 +55,7 @@ final class HEVCEncoderTests: XCTestCase {
                     height: 4,
                     bytesPerRow: bytesPerRow
                 )
-                let pixelBuffer = try FrameConverter.createPixelBuffer(from: frame)
+                let pixelBuffer = try await encoder.makePixelBuffer(from: frame)
                 let timestamp = CMTime(seconds: Double(i), preferredTimescale: 600)
                 try await encoder.encode(pixelBuffer: pixelBuffer, timestamp: timestamp)
             }
@@ -152,8 +152,8 @@ final class HEVCEncoderTests: XCTestCase {
             let frame1 = createTestFrame(width: 1920, height: 1080, value: UInt8(i * 20))
             let frame2 = createTestFrame(width: 1280, height: 720, value: UInt8(i * 20 + 10))
 
-            let pb1 = try FrameConverter.createPixelBuffer(from: frame1)
-            let pb2 = try FrameConverter.createPixelBuffer(from: frame2)
+            let pb1 = try await encoder1.makePixelBuffer(from: frame1)
+            let pb2 = try await encoder2.makePixelBuffer(from: frame2)
 
             let timestamp = CMTime(value: Int64(i) * 20, timescale: 600)
 
@@ -255,7 +255,7 @@ final class HEVCEncoderTests: XCTestCase {
                     height: 480,
                     bytesPerRow: bytesPerRow
                 )
-                let pixelBuffer = try FrameConverter.createPixelBuffer(from: frame)
+                let pixelBuffer = try await encoder.makePixelBuffer(from: frame)
 
                 // Timestamp at 30fps (what the encoder expects)
                 let timestamp = CMTime(seconds: Double(i) / 30.0, preferredTimescale: 600)
@@ -346,4 +346,3 @@ final class HEVCEncoderTests: XCTestCase {
         }
     }
 }
-

@@ -794,17 +794,31 @@ public final class FeedbackService: @unchecked Sendable {
         entries.append(memoryProfileLogEntry("Retrace memory hierarchy:"))
         entries.append(memoryProfileLogEntry(formattedRetraceMemoryHierarchyLine(for: retraceRow, indentLevel: 0)))
 
-        if snapshot.topRetraceMemoryAttributionFamilies.isEmpty {
+        let attributionTree = snapshot.retraceMemoryAttributionTree
+        let hasObservedFamilies = attributionTree.categories.contains { category in
+            !(attributionTree.familiesByCategory[category.id] ?? []).isEmpty
+        }
+
+        if !hasObservedFamilies {
             entries.append(memoryProfileLogEntry("  (No internal attribution families observed in this sample window)"))
             return entries
         }
 
-        for familyRow in snapshot.topRetraceMemoryAttributionFamilies {
-            entries.append(memoryProfileLogEntry(formattedRetraceMemoryHierarchyLine(for: familyRow, indentLevel: 1)))
+        for categoryRow in attributionTree.categories {
+            entries.append(memoryProfileLogEntry(formattedRetraceMemoryHierarchyLine(for: categoryRow, indentLevel: 1)))
 
-            let componentRows = snapshot.retraceMemoryAttributionChildrenByFamily[familyRow.id] ?? []
-            for componentRow in componentRows {
-                entries.append(memoryProfileLogEntry(formattedRetraceMemoryHierarchyLine(for: componentRow, indentLevel: 2)))
+            let familyRows = attributionTree.familiesByCategory[categoryRow.id] ?? []
+            for familyRow in familyRows {
+                entries.append(memoryProfileLogEntry(formattedRetraceMemoryHierarchyLine(for: familyRow, indentLevel: 2)))
+
+                let familyExpansionKey = ProcessCPUDisplayMetrics.retraceMemoryAttributionFamilyExpansionKey(
+                    categoryID: categoryRow.id,
+                    familyID: familyRow.id
+                )
+                let componentRows = attributionTree.componentsByCategoryFamily[familyExpansionKey] ?? []
+                for componentRow in componentRows {
+                    entries.append(memoryProfileLogEntry(formattedRetraceMemoryHierarchyLine(for: componentRow, indentLevel: 3)))
+                }
             }
         }
 

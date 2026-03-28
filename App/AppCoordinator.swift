@@ -144,6 +144,142 @@ public final class PipelineStatusHolder: @unchecked Sendable {
     }
 }
 
+/// Best-effort writer for prewarming capture-time timeline stills on disk.
+/// This path is lossy by design: when disk/JPEG work falls behind, we prefer
+/// dropping older pending stills over retaining unbounded raw frame memory.
+actor TimelineStillDiskWriter {
+    struct Diagnostics: Sendable {
+        var enqueuedCount = 0
+        var writtenCount = 0
+        var droppedCount = 0
+        var failureCount = 0
+        var terminatedEnqueueCount = 0
+    }
+
+    private struct WriteRequest: Sendable {
+        let frameID: Int64
+        let frame: CapturedFrame
+    }
+
+    typealias DestinationResolver = @Sendable (Int64) -> URL
+    typealias Encoder = @Sendable (CapturedFrame) throws -> Data
+    typealias WarningLogger = @Sendable (String) -> Void
+
+    private let destinationResolver: DestinationResolver
+    private let encoder: Encoder
+    private let warningLogger: WarningLogger
+    private let stream: AsyncStream<WriteRequest>
+    private let continuation: AsyncStream<WriteRequest>.Continuation
+
+    private var workerTask: Task<Void, Never>?
+    private var diagnostics = Diagnostics()
+    private var isClosed = false
+
+    init(
+        bufferLimit: Int,
+        destinationResolver: @escaping DestinationResolver,
+        encoder: @escaping Encoder,
+        warningLogger: @escaping WarningLogger
+    ) {
+        let (stream, continuation) = AsyncStream<WriteRequest>.makeStream(
+            bufferingPolicy: .bufferingNewest(bufferLimit)
+        )
+        self.destinationResolver = destinationResolver
+        self.encoder = encoder
+        self.warningLogger = warningLogger
+        self.stream = stream
+        self.continuation = continuation
+    }
+
+    func enqueue(frameID: Int64, frame: CapturedFrame) {
+        guard !isClosed else { return }
+
+        startWorkerIfNeeded()
+        diagnostics.enqueuedCount += 1
+
+        switch continuation.yield(WriteRequest(frameID: frameID, frame: frame)) {
+        case .enqueued:
+            break
+        case .dropped(let droppedRequest):
+            diagnostics.droppedCount += 1
+            if diagnostics.droppedCount == 1 || diagnostics.droppedCount.isMultiple(of: 25) {
+                warningLogger(
+                    "[Timeline-DiskBuffer] Dropped backlogged capture-time still for frame \(droppedRequest.frameID) (dropped=\(diagnostics.droppedCount))"
+                )
+            }
+        case .terminated:
+            diagnostics.terminatedEnqueueCount += 1
+        @unknown default:
+            diagnostics.terminatedEnqueueCount += 1
+        }
+    }
+
+    func shutdown() async {
+        guard !isClosed else {
+            if let workerTask {
+                await workerTask.value
+            }
+            return
+        }
+
+        isClosed = true
+        continuation.finish()
+        if let workerTask {
+            await workerTask.value
+            self.workerTask = nil
+        }
+    }
+
+    func diagnosticsSnapshot() -> Diagnostics {
+        diagnostics
+    }
+
+    private func startWorkerIfNeeded() {
+        guard workerTask == nil else { return }
+
+        let stream = self.stream
+        let destinationResolver = self.destinationResolver
+        let encoder = self.encoder
+        let warningLogger = self.warningLogger
+
+        workerTask = Task.detached(priority: .utility) {
+            for await request in stream {
+                do {
+                    let destinationURL = destinationResolver(request.frameID)
+                    let jpegData = try encoder(request.frame)
+                    try FileManager.default.createDirectory(
+                        at: destinationURL.deletingLastPathComponent(),
+                        withIntermediateDirectories: true
+                    )
+                    try jpegData.write(to: destinationURL, options: [.atomic])
+                    await self.recordWriteSuccess()
+                } catch {
+                    await self.recordWriteFailure(
+                        frameID: request.frameID,
+                        error: error,
+                        warningLogger: warningLogger
+                    )
+                }
+            }
+        }
+    }
+
+    private func recordWriteSuccess() {
+        diagnostics.writtenCount += 1
+    }
+
+    private func recordWriteFailure(
+        frameID: Int64,
+        error: Error,
+        warningLogger: WarningLogger
+    ) {
+        diagnostics.failureCount += 1
+        warningLogger(
+            "[Timeline-DiskBuffer] Failed to persist capture-time still for frame \(frameID): \(error.localizedDescription)"
+        )
+    }
+}
+
 /// Main coordinator that wires all modules together
 /// Implements the core data pipeline: Capture → Storage → Processing → Database → Search
 /// Owner: APP integration
@@ -304,17 +440,44 @@ public actor AppCoordinator {
     private static let memoryLedgerActiveWritersTag = "app.capture.activeWriters"
     private static let dbStorageSnapshotIntervalNanoseconds: Int64 = 60_000_000_000
     private static let timelineDiskCacheJPEGCompressionQuality: CGFloat = 0.80
+    private static let timelineStillWriterBufferLimit = 4
+
+    private let timelineStillDiskWriter: TimelineStillDiskWriter
 
     // MARK: - Initialization
 
     public init(services: ServiceContainer) {
         self.services = services
+        self.timelineStillDiskWriter = TimelineStillDiskWriter(
+            bufferLimit: Self.timelineStillWriterBufferLimit,
+            destinationResolver: { frameID in
+                Self.timelineDiskFrameBufferURL(for: frameID)
+            },
+            encoder: { frame in
+                try Self.encodeCapturedFrameAsJPEG(frame)
+            },
+            warningLogger: { message in
+                Log.warning(message, category: .app)
+            }
+        )
         Log.info("AppCoordinator created", category: .app)
     }
 
     /// Convenience initializer with default configuration
     public init() {
         self.services = ServiceContainer()
+        self.timelineStillDiskWriter = TimelineStillDiskWriter(
+            bufferLimit: Self.timelineStillWriterBufferLimit,
+            destinationResolver: { frameID in
+                Self.timelineDiskFrameBufferURL(for: frameID)
+            },
+            encoder: { frame in
+                try Self.encodeCapturedFrameAsJPEG(frame)
+            },
+            warningLogger: { message in
+                Log.warning(message, category: .app)
+            }
+        )
         Log.info("AppCoordinator created with default services", category: .app)
     }
 
@@ -559,9 +722,7 @@ public actor AppCoordinator {
         let recoveryManager = RecoveryManager(
             walManager: walManager,
             storage: services.storage,
-            database: services.database,
-            processing: services.processing,
-            search: services.search
+            database: services.database
         )
 
         // Set callback for enqueueing recovered frames
@@ -822,10 +983,6 @@ public actor AppCoordinator {
         // audioTask?.cancel()
         // audioTask = nil
 
-        // Wait for processing queue to drain
-        await services.processing.waitForQueueDrain()
-        // Audio processing drains automatically when stream ends
-
         isRunning = false
         statusHolder.update(isRunning: false)
 
@@ -881,6 +1038,7 @@ public actor AppCoordinator {
         stopOrphanedVideoCleanup()
         stopDBStorageSnapshotTask()
         await recordDBStorageSnapshot(reason: "shutdown")
+        await timelineStillDiskWriter.shutdown()
 
         Log.info("Shutting down AppCoordinator...", category: .app)
         try await services.shutdown()
@@ -1012,9 +1170,6 @@ public actor AppCoordinator {
         // Cancel pipeline tasks
         captureTask?.cancel()
         captureTask = nil
-
-        // Wait for processing queue to drain
-        await services.processing.waitForQueueDrain()
 
         isRunning = false
         statusHolder.update(isRunning: false)
@@ -1389,7 +1544,7 @@ public actor AppCoordinator {
                     frameID: frameID,
                     capturedFrame: frame
                 )
-                writeCapturedFrameStillToTimelineDiskCache(
+                await writeCapturedFrameStillToTimelineDiskCache(
                     frameID: frameID,
                     frame: frame
                 )
@@ -1722,24 +1877,8 @@ public actor AppCoordinator {
     private func writeCapturedFrameStillToTimelineDiskCache(
         frameID: Int64,
         frame: CapturedFrame
-    ) {
-        let destinationURL = Self.timelineDiskFrameBufferURL(for: frameID)
-
-        Task.detached(priority: .utility) {
-            do {
-                let jpegData = try Self.encodeCapturedFrameAsJPEG(frame)
-                try FileManager.default.createDirectory(
-                    at: destinationURL.deletingLastPathComponent(),
-                    withIntermediateDirectories: true
-                )
-                try jpegData.write(to: destinationURL, options: [.atomic])
-            } catch {
-                Log.warning(
-                    "[Timeline-DiskBuffer] Failed to persist capture-time still for frame \(frameID): \(error.localizedDescription)",
-                    category: .app
-                )
-            }
-        }
+    ) async {
+        await timelineStillDiskWriter.enqueue(frameID: frameID, frame: frame)
     }
 
     private static func encodeCapturedFrameAsJPEG(_ frame: CapturedFrame) throws -> Data {

@@ -23,6 +23,7 @@ enum ProcessingExtractMemoryLedger {
         let function: String
         let kind: String
         let note: String
+        let category: MemoryLedger.ComponentCategory
     }
 
     private static let requestScopedResetSpecs: [ResetSpec] = [
@@ -30,49 +31,57 @@ enum ProcessingExtractMemoryLedger {
             tag: "processing.extract.ocrRegionPayload",
             function: "processing.extract_text.ocr_payload",
             kind: "extract-ocr-region-payload",
-            note: "estimated-result-graph"
+            note: "estimated-result-graph",
+            category: .explicit
         ),
         ResetSpec(
             tag: "processing.extract.ocrCallResidual",
             function: "processing.extract_text.ocr_call",
             kind: "extract-ocr-call-residual",
-            note: "observed-footprint-delta-minus-payload"
+            note: "observed-footprint-delta-minus-payload",
+            category: .inferred
         ),
         ResetSpec(
             tag: "processing.extract.ocrCallObservedResidual",
             function: "processing.extract_text.ocr_call",
             kind: "extract-ocr-call-observed-residual",
-            note: "epoch-arbited-current-unattributed-after-ocr-call"
+            note: "epoch-arbited-current-unattributed-after-ocr-call",
+            category: .inferred
         ),
         ResetSpec(
             tag: "processing.extract.ocrReturnResidual",
             function: "processing.extract_text.ocr_tail",
             kind: "extract-ocr-return-residual",
-            note: "observed-delayed-residual-after-ocr-call"
+            note: "observed-delayed-residual-after-ocr-call",
+            category: .inferred
         ),
         ResetSpec(
             tag: "processing.extract.outputPayload",
             function: "processing.extract_text.output_payload",
             kind: "extract-output-payload",
-            note: "estimated-result-graph"
+            note: "estimated-result-graph",
+            category: .explicit
         ),
         ResetSpec(
             tag: "processing.extract.buildResidual",
             function: "processing.extract_text.build_residual",
             kind: "extract-build-residual",
-            note: "observed-build-residual-net-output-payload"
+            note: "observed-build-residual-net-output-payload",
+            category: .inferred
         ),
         ResetSpec(
             tag: "processing.extract.totalResidual",
             function: "processing.extract_text.residual",
             kind: "extract-total-residual",
-            note: "observed-extract-remainder"
+            note: "observed-extract-remainder",
+            category: .inferred
         ),
         ResetSpec(
             tag: "processing.extract.totalObservedResidual",
             function: "processing.extract_text.residual",
             kind: "extract-total-observed-residual",
-            note: "epoch-arbited-current-unattributed-after-extract"
+            note: "epoch-arbited-current-unattributed-after-extract",
+            category: .inferred
         )
     ]
 
@@ -964,6 +973,7 @@ enum ProcessingExtractMemoryLedger {
             var function: String
             var kind: String
             var note: String?
+            var category: MemoryLedger.ComponentCategory
         }
 
         private let lock = NSLock()
@@ -980,13 +990,15 @@ enum ProcessingExtractMemoryLedger {
                     count: 0,
                     function: spec.function,
                     kind: spec.kind,
-                    note: spec.note
+                    note: spec.note,
+                    category: spec.category
                 )
                 entry.bytes = 0
                 entry.count = 0
                 entry.function = spec.function
                 entry.kind = spec.kind
                 entry.note = spec.note
+                entry.category = spec.category
                 entriesByTag[spec.tag] = entry
                 retainedGenerationByTag[spec.tag] = (retainedGenerationByTag[spec.tag] ?? 0) + 1
             }
@@ -1020,13 +1032,15 @@ enum ProcessingExtractMemoryLedger {
                 count: 0,
                 function: function,
                 kind: kind,
-                note: note
+                note: note,
+                category: .inferred
             )
             entry.bytes = max(0, bytes)
             entry.count = entry.bytes > 0 ? 1 : 0
             entry.function = function
             entry.kind = kind
             entry.note = note
+            entry.category = .inferred
             entriesByTag[tag] = entry
             generation = (retainedGenerationByTag[tag] ?? 0) + 1
             retainedGenerationByTag[tag] = generation
@@ -1062,13 +1076,15 @@ enum ProcessingExtractMemoryLedger {
                 count: 0,
                 function: function,
                 kind: kind,
-                note: note
+                note: note,
+                category: .inferred
             )
             entry.bytes = 0
             entry.count = 0
             entry.function = function
             entry.kind = kind
             entry.note = note
+            entry.category = .inferred
             entriesByTag[tag] = entry
             retainedGenerationByTag[tag] = (retainedGenerationByTag[tag] ?? 0) + 1
             lock.unlock()
@@ -1091,10 +1107,12 @@ enum ProcessingExtractMemoryLedger {
                 count: 0,
                 function: "processing.extract_text",
                 kind: "extract-residual",
-                note: "observed-footprint-delta"
+                note: "observed-footprint-delta",
+                category: .inferred
             )
             entry.bytes = 0
             entry.count = 0
+            entry.category = .inferred
             entriesByTag[tag] = entry
             lock.unlock()
 
@@ -1117,7 +1135,8 @@ enum ProcessingExtractMemoryLedger {
                 unit: "samples",
                 function: entry.function,
                 kind: entry.kind,
-                note: entry.note
+                note: entry.note,
+                category: entry.category
             )
         }
     }

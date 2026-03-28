@@ -46,7 +46,6 @@ Processing/
 
 ### 1. `ProcessingProtocol` (from `Shared/Protocols/ProcessingProtocol.swift`)
 - Text extraction (combined OCR + Accessibility)
-- Processing queue management
 - Configuration
 
 ### 2. `OCRProtocol` (from `Shared/Protocols/ProcessingProtocol.swift`)
@@ -321,87 +320,12 @@ struct TextMerger {
 }
 ```
 
-### 4. Processing Queue
+### 4. Frame-ID Queueing
 
-```swift
-public actor ProcessingManager: ProcessingProtocol {
-    private let ocr: VisionOCR
-    private let accessibility: AccessibilityService
-    private let merger: TextMerger
-    private var config: ProcessingConfig
-
-    private var processingQueue: [(CapturedFrame, (Result<ExtractedText, ProcessingError>) -> Void)] = []
-    private var isProcessing = false
-
-    public var queuedFrameCount: Int { processingQueue.count }
-
-    public func extractText(from frame: CapturedFrame) async throws -> ExtractedText {
-        // OCR
-        let ocrRegions = try await ocr.recognizeText(
-            imageData: frame.imageData,
-            width: frame.width,
-            height: frame.height,
-            config: config
-        )
-
-        // Accessibility (if enabled and permitted)
-        var axResult: AccessibilityResult? = nil
-        if config.accessibilityEnabled && accessibility.hasPermission() {
-            axResult = try? await accessibility.getFocusedAppText()
-        }
-
-        // Merge results
-        var extractedText = merger.merge(ocrRegions: ocrRegions, accessibilityResult: axResult)
-
-        // Set frame ID and metadata
-        extractedText = ExtractedText(
-            frameID: frame.id,
-            timestamp: frame.timestamp,
-            regions: extractedText.regions,
-            fullText: extractedText.fullText,
-            metadata: frame.metadata
-        )
-
-        return extractedText
-    }
-
-    public func queueFrame(
-        _ frame: CapturedFrame,
-        completion: @escaping @Sendable (Result<ExtractedText, ProcessingError>) -> Void
-    ) async {
-        processingQueue.append((frame, completion))
-
-        if !isProcessing {
-            await processQueue()
-        }
-    }
-
-    private func processQueue() async {
-        isProcessing = true
-
-        while !processingQueue.isEmpty {
-            let (frame, completion) = processingQueue.removeFirst()
-
-            do {
-                let text = try await extractText(from: frame)
-                completion(.success(text))
-            } catch let error as ProcessingError {
-                completion(.failure(error))
-            } catch {
-                completion(.failure(.ocrFailed(underlying: error.localizedDescription)))
-            }
-        }
-
-        isProcessing = false
-    }
-
-    public func waitForQueueDrain() async {
-        while !processingQueue.isEmpty || isProcessing {
-            try? await Task.sleep(nanoseconds: 100_000_000)  // 100ms
-        }
-    }
-}
-```
+The live OCR pipeline does **not** queue raw `CapturedFrame` blobs in `ProcessingManager`.
+Capture persists frames first, then `FrameProcessingQueue` schedules OCR by `frameID`, loading
+image bytes from storage only when a worker is ready. Keep new queueing work in that style:
+bounded, storage-backed, and keyed by lightweight identifiers rather than in-memory frame data.
 
 ### 5. Handling Different Image Formats
 

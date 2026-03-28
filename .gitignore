@@ -54,6 +54,7 @@ coverage/
 tmp/
 temp/
 UI/BuildInfo.swift.bak
+UI/BuildMetadata.generated.swift
 
 # Downloaded AI models (runtime downloads)
 # Models are downloaded on first launch, not bundled in repo

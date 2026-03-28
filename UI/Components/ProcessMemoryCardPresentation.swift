@@ -9,8 +9,9 @@ struct ProcessMemoryCardScrollTarget: Equatable {
 struct ProcessMemoryCardDisplayedRow: Identifiable {
     enum Kind {
         case primary(rank: Int, isPinnedRetrace: Bool)
-        case retraceFamily
-        case retraceComponent(familyID: String)
+        case retraceCategory
+        case retraceFamily(categoryID: String)
+        case retraceComponent(categoryID: String, familyID: String)
     }
 
     let row: ProcessMemoryRow
@@ -20,10 +21,15 @@ struct ProcessMemoryCardDisplayedRow: Identifiable {
         switch kind {
         case .primary:
             return row.id
-        case .retraceFamily:
-            return ProcessMemoryCardPresentation.retraceFamilyRowID(row.id)
-        case let .retraceComponent(familyID):
-            return "retraceComponent.\(familyID).\(row.id)"
+        case .retraceCategory:
+            return ProcessMemoryCardPresentation.retraceCategoryRowID(row.id)
+        case let .retraceFamily(categoryID):
+            return ProcessMemoryCardPresentation.retraceFamilyRowID(
+                categoryID: categoryID,
+                familyID: row.id
+            )
+        case let .retraceComponent(categoryID, familyID):
+            return "retraceComponent.\(categoryID).\(familyID).\(row.id)"
         }
     }
 
@@ -31,7 +37,7 @@ struct ProcessMemoryCardDisplayedRow: Identifiable {
         switch kind {
         case let .primary(rank, _):
             return rank
-        case .retraceFamily, .retraceComponent:
+        case .retraceCategory, .retraceFamily, .retraceComponent:
             return nil
         }
     }
@@ -40,9 +46,16 @@ struct ProcessMemoryCardDisplayedRow: Identifiable {
         switch kind {
         case let .primary(_, isPinnedRetrace):
             return isPinnedRetrace
-        case .retraceFamily, .retraceComponent:
+        case .retraceCategory, .retraceFamily, .retraceComponent:
             return false
         }
+    }
+
+    var isRetraceCategory: Bool {
+        if case .retraceCategory = kind {
+            return true
+        }
+        return false
     }
 
     var isRetraceFamily: Bool {
@@ -59,15 +72,39 @@ struct ProcessMemoryCardDisplayedRow: Identifiable {
         return false
     }
 
+    var retraceCategoryID: String? {
+        switch kind {
+        case .primary:
+            return nil
+        case .retraceCategory:
+            return row.id
+        case let .retraceFamily(categoryID):
+            return categoryID
+        case let .retraceComponent(categoryID, _):
+            return categoryID
+        }
+    }
+
     var retraceFamilyID: String? {
         switch kind {
         case .primary:
             return nil
+        case .retraceCategory:
+            return nil
         case .retraceFamily:
             return row.id
-        case let .retraceComponent(familyID):
+        case let .retraceComponent(_, familyID):
             return familyID
         }
+    }
+
+    var retraceFamilyExpansionKey: String? {
+        guard let categoryID = retraceCategoryID,
+              let familyID = retraceFamilyID else { return nil }
+        return ProcessCPUDisplayMetrics.retraceMemoryAttributionFamilyExpansionKey(
+            categoryID: categoryID,
+            familyID: familyID
+        )
     }
 }
 
@@ -83,8 +120,12 @@ struct ProcessMemoryCardPresentation {
         "systemMonitor.memoryProcessRow.\(rowNumber)"
     }
 
-    static func retraceFamilyRowID(_ familyID: String) -> String {
-        "retraceFamily.\(familyID)"
+    static func retraceCategoryRowID(_ categoryID: String) -> String {
+        "retraceCategory.\(categoryID)"
+    }
+
+    static func retraceFamilyRowID(categoryID: String, familyID: String) -> String {
+        "retraceFamily.\(categoryID).\(familyID)"
     }
 
     static func rankColumnWidth(
@@ -100,6 +141,7 @@ struct ProcessMemoryCardPresentation {
         from snapshot: ProcessCPUSnapshot,
         visibleRows: Int,
         isRetraceExpanded: Bool,
+        expandedAttributionCategoryIDs: Set<String>,
         expandedAttributionFamilyIDs: Set<String>
     ) -> [ProcessMemoryCardDisplayedRow] {
         let rankedRows = snapshot.topMemoryProcesses
@@ -137,27 +179,48 @@ struct ProcessMemoryCardPresentation {
         }
 
         var expandedRows: [ProcessMemoryCardDisplayedRow] = []
-        expandedRows.reserveCapacity(displayed.count + snapshot.topRetraceMemoryAttributionFamilies.count)
+        expandedRows.reserveCapacity(
+            displayed.count
+                + snapshot.retraceMemoryAttributionTree.categories.count
+        )
 
         for (index, displayedRow) in displayed.enumerated() {
             expandedRows.append(displayedRow)
             guard index == retraceDisplayIndex else { continue }
 
-            for familyRow in snapshot.topRetraceMemoryAttributionFamilies {
-                let familyDisplayedRow = ProcessMemoryCardDisplayedRow(
-                    row: familyRow,
-                    kind: .retraceFamily
+            let attributionTree = snapshot.retraceMemoryAttributionTree
+            for categoryRow in attributionTree.categories {
+                let categoryDisplayedRow = ProcessMemoryCardDisplayedRow(
+                    row: categoryRow,
+                    kind: .retraceCategory
                 )
-                expandedRows.append(familyDisplayedRow)
+                expandedRows.append(categoryDisplayedRow)
 
-                guard expandedAttributionFamilyIDs.contains(familyRow.id) else { continue }
-                let componentRows = snapshot.retraceMemoryAttributionChildrenByFamily[familyRow.id] ?? []
-                expandedRows.append(contentsOf: componentRows.map {
-                    ProcessMemoryCardDisplayedRow(
-                        row: $0,
-                        kind: .retraceComponent(familyID: familyRow.id)
+                guard expandedAttributionCategoryIDs.contains(categoryRow.id) else { continue }
+                let familyRows = attributionTree.familiesByCategory[categoryRow.id] ?? []
+                for familyRow in familyRows {
+                    let familyDisplayedRow = ProcessMemoryCardDisplayedRow(
+                        row: familyRow,
+                        kind: .retraceFamily(categoryID: categoryRow.id)
                     )
-                })
+                    expandedRows.append(familyDisplayedRow)
+
+                    let familyExpansionKey = ProcessCPUDisplayMetrics.retraceMemoryAttributionFamilyExpansionKey(
+                        categoryID: categoryRow.id,
+                        familyID: familyRow.id
+                    )
+                    guard expandedAttributionFamilyIDs.contains(familyExpansionKey) else { continue }
+                    let componentRows = attributionTree.componentsByCategoryFamily[familyExpansionKey] ?? []
+                    expandedRows.append(contentsOf: componentRows.map {
+                        ProcessMemoryCardDisplayedRow(
+                            row: $0,
+                            kind: .retraceComponent(
+                                categoryID: categoryRow.id,
+                                familyID: familyRow.id
+                            )
+                        )
+                    })
+                }
             }
         }
 
@@ -170,6 +233,7 @@ final class ProcessMemoryCardController: ObservableObject {
     @Published private(set) var visibleRows: Int
     @Published private(set) var isHoveringRows = false
     @Published private(set) var isRetraceExpanded = false
+    @Published private(set) var expandedAttributionCategoryIDs: Set<String> = []
     @Published private(set) var expandedAttributionFamilyIDs: Set<String> = []
     @Published var scrollTarget: ProcessMemoryCardScrollTarget?
 
@@ -190,6 +254,7 @@ final class ProcessMemoryCardController: ObservableObject {
         scrollTarget = nil
         isHoveringRows = false
         isRetraceExpanded = false
+        expandedAttributionCategoryIDs.removeAll()
         expandedAttributionFamilyIDs.removeAll()
     }
 
@@ -197,6 +262,7 @@ final class ProcessMemoryCardController: ObservableObject {
         scrollTarget = nil
         isHoveringRows = false
         isRetraceExpanded = false
+        expandedAttributionCategoryIDs.removeAll()
         expandedAttributionFamilyIDs.removeAll()
     }
 
@@ -228,12 +294,13 @@ final class ProcessMemoryCardController: ObservableObject {
             withAnimation(.easeInOut(duration: 0.18)) {
                 isRetraceExpanded = willExpand
                 if !willExpand {
+                    expandedAttributionCategoryIDs.removeAll()
                     expandedAttributionFamilyIDs.removeAll()
                 }
             }
             if willExpand {
                 scrollTarget = Self.retraceExpansionScrollTarget(
-                    firstFamilyID: snapshot.topRetraceMemoryAttributionFamilies.first?.id,
+                    firstCategoryID: snapshot.retraceMemoryAttributionTree.categories.first?.id,
                     anchorY: retraceExpansionScrollAnchorY
                 )
             }
@@ -241,12 +308,28 @@ final class ProcessMemoryCardController: ObservableObject {
             return
         }
 
-        guard displayedRow.isRetraceFamily, let familyID = displayedRow.retraceFamilyID else { return }
+        if displayedRow.isRetraceCategory,
+           let categoryID = displayedRow.retraceCategoryID {
+            withAnimation(.easeInOut(duration: 0.18)) {
+                if expandedAttributionCategoryIDs.contains(categoryID) {
+                    expandedAttributionCategoryIDs.remove(categoryID)
+                    expandedAttributionFamilyIDs = Set(
+                        expandedAttributionFamilyIDs.filter { !$0.hasPrefix(categoryID + "|") }
+                    )
+                } else {
+                    expandedAttributionCategoryIDs.insert(categoryID)
+                }
+            }
+            return
+        }
+
+        guard displayedRow.isRetraceFamily,
+              let familyExpansionKey = displayedRow.retraceFamilyExpansionKey else { return }
         withAnimation(.easeInOut(duration: 0.18)) {
-            if expandedAttributionFamilyIDs.contains(familyID) {
-                expandedAttributionFamilyIDs.remove(familyID)
+            if expandedAttributionFamilyIDs.contains(familyExpansionKey) {
+                expandedAttributionFamilyIDs.remove(familyExpansionKey)
             } else {
-                expandedAttributionFamilyIDs.insert(familyID)
+                expandedAttributionFamilyIDs.insert(familyExpansionKey)
             }
         }
     }
@@ -263,6 +346,7 @@ final class ProcessMemoryCardController: ObservableObject {
             from: snapshot,
             visibleRows: clampedVisibleRows,
             isRetraceExpanded: isRetraceExpanded,
+            expandedAttributionCategoryIDs: expandedAttributionCategoryIDs,
             expandedAttributionFamilyIDs: expandedAttributionFamilyIDs
         )
         return ProcessMemoryCardPresentation(
@@ -285,12 +369,12 @@ final class ProcessMemoryCardController: ObservableObject {
     }
 
     static func retraceExpansionScrollTarget(
-        firstFamilyID: String?,
+        firstCategoryID: String?,
         anchorY: CGFloat = 0
     ) -> ProcessMemoryCardScrollTarget? {
-        guard let firstFamilyID, !firstFamilyID.isEmpty else { return nil }
+        guard let firstCategoryID, !firstCategoryID.isEmpty else { return nil }
         return ProcessMemoryCardScrollTarget(
-            id: ProcessMemoryCardPresentation.retraceFamilyRowID(firstFamilyID),
+            id: ProcessMemoryCardPresentation.retraceCategoryRowID(firstCategoryID),
             anchorY: anchorY
         )
     }

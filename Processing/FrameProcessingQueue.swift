@@ -195,6 +195,7 @@ enum OCRStageMemoryLedger {
             var kind: String
             var note: String?
             var unit: String
+            var category: MemoryLedger.ComponentCategory
         }
 
         private let lock = NSLock()
@@ -219,7 +220,8 @@ enum OCRStageMemoryLedger {
                 function: function,
                 kind: kind,
                 note: note,
-                unit: unit
+                unit: unit,
+                category: .explicit
             )
             entry.bytes += bytes
             entry.count += 1
@@ -227,6 +229,7 @@ enum OCRStageMemoryLedger {
             entry.kind = kind
             entry.note = note
             entry.unit = unit
+            entry.category = .explicit
             entriesByTag[tag] = entry
             lock.unlock()
 
@@ -248,10 +251,12 @@ enum OCRStageMemoryLedger {
                 function: "processing.ocr.pipeline",
                 kind: "active-frame",
                 note: nil,
-                unit: "items"
+                unit: "items",
+                category: .explicit
             )
             entry.bytes = max(0, entry.bytes - bytes)
             entry.count = max(0, entry.count - 1)
+            entry.category = .explicit
             entriesByTag[tag] = entry
             lock.unlock()
 
@@ -283,7 +288,8 @@ enum OCRStageMemoryLedger {
                 function: function,
                 kind: kind,
                 note: note,
-                unit: unit
+                unit: unit,
+                category: .inferred
             )
             entry.bytes = max(0, bytes)
             entry.count = entry.bytes > 0 ? 1 : 0
@@ -291,6 +297,7 @@ enum OCRStageMemoryLedger {
             entry.kind = kind
             entry.note = note
             entry.unit = unit
+            entry.category = .inferred
             entriesByTag[tag] = entry
             generation = (retainedGenerationByTag[tag] ?? 0) + 1
             retainedGenerationByTag[tag] = generation
@@ -322,10 +329,12 @@ enum OCRStageMemoryLedger {
                 function: "processing.ocr.stage_residual",
                 kind: "stage-residual",
                 note: "observed-unattributed",
-                unit: "samples"
+                unit: "samples",
+                category: .inferred
             )
             entry.bytes = 0
             entry.count = 0
+            entry.category = .inferred
             entriesByTag[tag] = entry
             lock.unlock()
 
@@ -367,7 +376,8 @@ enum OCRStageMemoryLedger {
                 function: function,
                 kind: kind,
                 note: note,
-                unit: unit
+                unit: unit,
+                category: .inferred
             )
             entry.bytes = 0
             entry.count = 0
@@ -375,6 +385,7 @@ enum OCRStageMemoryLedger {
             entry.kind = kind
             entry.note = note
             entry.unit = unit
+            entry.category = .inferred
             entriesByTag[tag] = entry
             lock.unlock()
 
@@ -418,7 +429,8 @@ enum OCRStageMemoryLedger {
                 function: function,
                 kind: kind,
                 note: note,
-                unit: unit
+                unit: unit,
+                category: .explicit
             )
             entry.bytes = totalBytes
             entry.count = sanitizedCount
@@ -426,6 +438,7 @@ enum OCRStageMemoryLedger {
             entry.kind = kind
             entry.note = note
             entry.unit = unit
+            entry.category = .explicit
             entriesByTag[tag] = entry
             lock.unlock()
 
@@ -440,7 +453,8 @@ enum OCRStageMemoryLedger {
                 unit: entry.unit,
                 function: entry.function,
                 kind: entry.kind,
-                note: entry.note
+                note: entry.note,
+                category: entry.category
             )
         }
     }
@@ -481,7 +495,6 @@ public actor FrameProcessingQueue {
     private static let memoryLedgerSummaryIntervalSeconds: TimeInterval = 30
     private static let memoryLedgerQueueTag = "processing.ocr.queueDepth"
     private static let memoryLedgerWorkersTag = "processing.ocr.workers"
-    private static let memoryLedgerRawCacheTag = "processing.ocr.rawFrameCache"
     private static let rewriteResumeDebounceNs: UInt64 = 300_000_000
     private static let phraseRedactionPhrasesDefaultsKey = "phraseLevelRedactionPhrases"
     private static let phraseRedactionEnabledDefaultsKey = "phraseLevelRedactionEnabled"
@@ -3085,7 +3098,7 @@ public actor FrameProcessingQueue {
         } ?? ""
 
         Log.info(
-            "[Queue-Memory] \(processFields)rawCacheFrames=0 rawCacheBytes=0 KB ocrQueueDepth=\(counts.ocrDepth) ocrPending=\(counts.ocrPending) ocrProcessing=\(counts.ocrProcessing) rewritePending=\(counts.rewritePending) rewriteProcessing=\(counts.rewriteProcessing) workers=\(workers.count) memoryPaused=\(isPausedForMemoryPressure)",
+            "[Queue-Memory] \(processFields)ocrQueueDepth=\(counts.ocrDepth) ocrPending=\(counts.ocrPending) ocrProcessing=\(counts.ocrProcessing) rewritePending=\(counts.rewritePending) rewriteProcessing=\(counts.rewriteProcessing) workers=\(workers.count) memoryPaused=\(isPausedForMemoryPressure)",
             category: .processing
         )
 
@@ -3112,15 +3125,6 @@ public actor FrameProcessingQueue {
             function: "processing.ocr",
             kind: "worker-pool",
             note: "count-only"
-        )
-        MemoryLedger.set(
-            tag: Self.memoryLedgerRawCacheTag,
-            bytes: 0,
-            count: 0,
-            unit: "frames",
-            function: "processing.ocr",
-            kind: "raw-frame-cache",
-            note: "currently-disabled"
         )
         MemoryLedger.emitSummary(
             reason: "processing.ocr.memory",

@@ -1721,12 +1721,14 @@ class DoubleBufferedVideoView: NSView {
         playerViewA = createPlayerView()
         playerA = AVPlayer()
         playerA.actionAtItemEnd = .pause
+        playerA.automaticallyWaitsToMinimizeStalling = false
         playerViewA.player = playerA
 
         // Create player B
         playerViewB = createPlayerView()
         playerB = AVPlayer()
         playerB.actionAtItemEnd = .pause
+        playerB.automaticallyWaitsToMinimizeStalling = false
         playerViewB.player = playerB
 
         // Add both to view hierarchy
@@ -1777,6 +1779,7 @@ class DoubleBufferedVideoView: NSView {
         if playerA == nil {
             let player = AVPlayer()
             player.actionAtItemEnd = .pause
+            player.automaticallyWaitsToMinimizeStalling = false
             playerA = player
             playerViewA.player = player
         } else if playerViewA.player == nil {
@@ -1786,6 +1789,7 @@ class DoubleBufferedVideoView: NSView {
         if playerB == nil {
             let player = AVPlayer()
             player.actionAtItemEnd = .pause
+            player.automaticallyWaitsToMinimizeStalling = false
             playerB = player
             playerViewB.player = player
         } else if playerViewB.player == nil {
@@ -1878,7 +1882,9 @@ class DoubleBufferedVideoView: NSView {
 
         let asset = AVURLAsset(url: url, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
         let playerItem = AVPlayerItem(asset: asset)
+        playerItem.preferredForwardBufferDuration = 0
 
+        clearCurrentItem(for: bufferPlayer)
         bufferPlayer?.replaceCurrentItem(with: playerItem)
         let tolerance = seekTolerance(for: frameRate)
         let toleranceFrames = configuredSeekToleranceFrames()
@@ -1986,6 +1992,12 @@ class DoubleBufferedVideoView: NSView {
             return
         }
 
+        clearCurrentItem(for: player)
+        playerView?.player = nil
+    }
+
+    private func clearCurrentItem(for player: AVPlayer?) {
+        guard let player else { return }
         player.pause()
         player.cancelPendingPrerolls()
         if let item = player.currentItem {
@@ -1993,13 +2005,14 @@ class DoubleBufferedVideoView: NSView {
             item.asset.cancelLoading()
         }
         player.replaceCurrentItem(with: nil)
-        playerView?.player = nil
     }
 
     private func configuredSeekToleranceFrames() -> Int {
         let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
-        let value = defaults.integer(forKey: "retrace.debug.timelineSeekToleranceFrames")
-        return max(0, value)
+        if let value = defaults.object(forKey: "retrace.debug.timelineSeekToleranceFrames") as? NSNumber {
+            return max(0, value.intValue)
+        }
+        return 1
     }
 
     private func seekTolerance(for frameRate: Double) -> CMTime {
@@ -2063,7 +2076,7 @@ class DoubleBufferedVideoView: NSView {
         activePlayerView?.isHidden = true
 
         // Clear the old active player's item to free memory
-        oldActivePlayer?.replaceCurrentItem(with: nil)
+        clearCurrentItem(for: oldActivePlayer)
 
         // Swap roles
         isPlayerAActive.toggle()

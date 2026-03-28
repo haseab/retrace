@@ -154,7 +154,8 @@ enum StorageVideoEncodingMemoryLedger {
                 unit: "sessions",
                 function: "storage.video_encoding",
                 kind: "encoder-session",
-                note: "estimated-native"
+                note: "estimated-native",
+                category: .inferred
             )
             MemoryLedger.set(
                 tag: StorageVideoEncodingMemoryLedger.videoToolboxHeapTag,
@@ -163,7 +164,8 @@ enum StorageVideoEncodingMemoryLedger {
                 unit: "sessions",
                 function: "storage.video_encoding",
                 kind: "videotoolbox-private-heap",
-                note: "proxy-native"
+                note: "proxy-native",
+                category: .inferred
             )
             MemoryLedger.set(
                 tag: StorageVideoEncodingMemoryLedger.pixelBufferPoolTag,
@@ -172,7 +174,8 @@ enum StorageVideoEncodingMemoryLedger {
                 unit: "sessions",
                 function: "storage.video_encoding",
                 kind: "pixel-buffer-pool",
-                note: "proxy-native"
+                note: "proxy-native",
+                category: .inferred
             )
             MemoryLedger.emitSummary(
                 reason: reason,
@@ -385,6 +388,11 @@ public actor HEVCEncoder {
         )
 
         Log.info("Video encoder initialized with movieFragmentInterval=0.1s (frames readable after ~3 captures)", category: .storage)
+    }
+
+    func makePixelBuffer(from frame: CapturedFrame) throws -> CVPixelBuffer {
+        let pool = adaptor?.pixelBufferPool
+        return try FrameConverter.createPixelBuffer(from: frame, pool: pool)
     }
 
     public func encode(pixelBuffer: CVPixelBuffer, timestamp: CMTime) async throws {

@@ -242,9 +242,7 @@ final class StorageManagerTests: XCTestCase {
         RecoveryManager(
             walManager: walManager,
             storage: storage,
-            database: database,
-            processing: RecoveryTestProcessing(),
-            search: RecoveryTestSearch()
+            database: database
         )
     }
 
@@ -4252,40 +4250,6 @@ private actor RecoveryTestSegmentWriter: SegmentWriter {
     func cancel() async throws {
         cancelled = true
     }
-}
-
-private actor RecoveryTestProcessing: ProcessingProtocol {
-    var queuedFrameCount: Int { 0 }
-
-    func initialize(config: ProcessingConfig) async throws {}
-    func extractText(from frame: CapturedFrame) async throws -> ExtractedText {
-        throw ProcessingError.ocrFailed(underlying: "unused")
-    }
-    func extractTextViaOCR(from frame: CapturedFrame) async throws -> [TextRegion] { [] }
-    func extractTextViaAccessibility() async throws -> [TextRegion] { [] }
-    func queueFrame(_ frame: CapturedFrame, completion: @escaping @Sendable (Result<ExtractedText, ProcessingError>) -> Void) async {}
-    func waitForQueueDrain() async {}
-    func updateConfig(_ config: ProcessingConfig) async {}
-    func getConfig() async -> ProcessingConfig { .default }
-}
-
-private actor RecoveryTestSearch: SearchProtocol {
-    func initialize(config: SearchConfig) async throws {}
-    func search(query: SearchQuery) async throws -> SearchResults {
-        SearchResults(query: query, results: [], searchTimeMs: 0)
-    }
-    func search(text: String, limit: Int) async throws -> SearchResults {
-        SearchResults(
-            query: SearchQuery(text: text, limit: limit),
-            results: [],
-            searchTimeMs: 0
-        )
-    }
-    func getSuggestions(prefix: String, limit: Int) async throws -> [String] { [] }
-    func index(text: ExtractedText, segmentId: Int64, frameId: Int64) async throws -> Int64 { 0 }
-    func removeFromIndex(frameID: FrameID) async throws {}
-    func rebuildIndex() async throws {}
-    func getStatistics() async -> SearchStatistics { SearchStatistics(totalDocuments: 0, totalSearches: 0, averageSearchTimeMs: 0) }
 }
 
 private actor RecoveryEnqueueCollector {

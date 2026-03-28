@@ -234,9 +234,9 @@ struct ProcessMemorySummaryCard: View {
         ProcessMemoryCardPresentation.memoryProcessRowAnchorID(rowNumber)
     }
 
-    static func retraceExpansionScrollTarget(firstFamilyID: String?) -> MemoryProcessScrollTarget? {
+    static func retraceExpansionScrollTarget(firstCategoryID: String?) -> MemoryProcessScrollTarget? {
         ProcessMemoryCardController.retraceExpansionScrollTarget(
-            firstFamilyID: firstFamilyID,
+            firstCategoryID: firstCategoryID,
             anchorY: retraceExpansionScrollAnchorY
         )
     }
@@ -339,8 +339,15 @@ struct ProcessMemorySummaryCard: View {
                 Image(systemName: cardController.isRetraceExpanded ? "chevron.down" : "chevron.right")
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundColor(.retraceSecondary.opacity(0.85))
+            } else if displayedRow.isRetraceCategory {
+                let isExpanded = displayedRow.retraceCategoryID.map {
+                    cardController.expandedAttributionCategoryIDs.contains($0)
+                } ?? false
+                Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(.retraceSecondary.opacity(0.85))
             } else if displayedRow.isRetraceFamily {
-                let isExpanded = displayedRow.retraceFamilyID.map {
+                let isExpanded = displayedRow.retraceFamilyExpansionKey.map {
                     cardController.expandedAttributionFamilyIDs.contains($0)
                 } ?? false
                 Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
@@ -365,6 +372,9 @@ struct ProcessMemorySummaryCard: View {
         if displayedRow.isPinnedRetrace {
             return Color.retraceAccent.opacity(0.08)
         }
+        if displayedRow.isRetraceCategory {
+            return Color.retraceAccent.opacity(0.055)
+        }
         if displayedRow.isRetraceFamily {
             return Color.retraceAccent.opacity(0.04)
         }
@@ -385,7 +395,7 @@ struct ProcessMemorySummaryCard: View {
                 .padding(.top, 4)
             memoryBoundaryValueRow
 
-            Text("Grouped by app process family. Retrace expands into internal memory-attribution families.")
+            Text("Retrace expands into explicit, inferred, and unattributed memory. Each category expands into families, then individual ledger components.")
                 .font(.system(size: 10))
                 .foregroundColor(.retraceSecondary.opacity(0.88))
                 .lineLimit(nil)
@@ -483,6 +493,11 @@ struct ProcessMemorySummaryCard: View {
         case .primary:
             processIconView(for: displayedRow.row)
                 .frame(width: 17, height: 17)
+        case .retraceCategory:
+            Image(systemName: "square.split.2x1.fill")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(.retraceAccent.opacity(0.95))
+                .frame(width: 17, height: 17)
         case .retraceFamily:
             Image(systemName: "square.stack.3d.up.fill")
                 .font(.system(size: 11, weight: .semibold))
@@ -497,6 +512,9 @@ struct ProcessMemorySummaryCard: View {
     }
 
     private func textColor(for displayedRow: DisplayedMemoryRow) -> Color {
+        if displayedRow.isRetraceCategory {
+            return .retracePrimary.opacity(0.98)
+        }
         if displayedRow.isRetraceFamily {
             return .retracePrimary.opacity(0.96)
         }
@@ -508,9 +526,12 @@ struct ProcessMemorySummaryCard: View {
 
     private func leadingPadding(for displayedRow: DisplayedMemoryRow) -> CGFloat {
         if displayedRow.isRetraceComponent {
-            return 28
+            return 42
         }
         if displayedRow.isRetraceFamily {
+            return 28
+        }
+        if displayedRow.isRetraceCategory {
             return 14
         }
         return 0

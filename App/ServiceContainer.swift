@@ -599,10 +599,6 @@ public actor ServiceContainer {
         await processingQueue?.stopWorkers()
         Log.info("✓ Processing queue workers stopped", category: .app)
 
-        // Wait for processing queue to drain (legacy OCR queue)
-        await processing.waitForQueueDrain()
-        Log.info("✓ Processing queue drained", category: .app)
-
         // ⚠️ RELEASE 2 ONLY
         // // Audio processing will complete when stream ends
         // Log.info("✓ Audio processing drained", category: .app)

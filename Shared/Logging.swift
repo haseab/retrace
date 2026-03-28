@@ -525,8 +525,15 @@ public enum MemoryLedger {
         public let componentCount: Int
     }
 
+    public enum ComponentCategory: String, Sendable, Codable {
+        case explicit
+        case inferred
+        case unattributed
+    }
+
     public struct ComponentSnapshot: Sendable {
         public let tag: String
+        public let category: ComponentCategory
         public let bytes: Int64
         public let count: Int?
         public let unit: String?
@@ -618,6 +625,7 @@ public enum MemoryLedger {
     ///   - function: Functional area (e.g. `ui.search`, `processing.ocr`)
     ///   - kind: Component type (e.g. `images`, `queue`, `telemetry-window`)
     ///   - note: Optional qualifier (e.g. `estimated`, `on-disk`)
+    ///   - category: Attribution bucket used by downstream memory views
     public static func set(
         tag: String,
         bytes: Int64,
@@ -626,6 +634,7 @@ public enum MemoryLedger {
         function: String,
         kind: String,
         note: String? = nil,
+        category: ComponentCategory = .explicit,
         countsTowardTrackedMemory: Bool = true
     ) {
         guard !tag.isEmpty else { return }
@@ -638,6 +647,7 @@ public enum MemoryLedger {
                 function: function,
                 kind: kind,
                 note: note,
+                category: category,
                 countsTowardTrackedMemory: countsTowardTrackedMemory
             )
         }
@@ -651,6 +661,7 @@ public enum MemoryLedger {
         function: String,
         kind: String,
         note: String? = nil,
+        category: ComponentCategory = .explicit,
         countsTowardTrackedMemory: Bool = true
     ) async {
         guard !tag.isEmpty else { return }
@@ -663,6 +674,7 @@ public enum MemoryLedger {
                 function: function,
                 kind: kind,
                 note: note,
+                category: category,
                 countsTowardTrackedMemory: countsTowardTrackedMemory
             )
         }
@@ -771,6 +783,7 @@ private actor MemoryLedgerStore {
 
     private struct ComponentEntry: Sendable {
         let tag: String
+        var category: MemoryLedger.ComponentCategory
         var bytes: Int64
         var count: Int?
         var unit: String?
@@ -814,12 +827,14 @@ private actor MemoryLedgerStore {
         function: String,
         kind: String,
         note: String?,
+        category: MemoryLedger.ComponentCategory,
         countsTowardTrackedMemory: Bool
     ) {
         let normalizedBytes = max(0, bytes)
         let now = Date()
 
         if var existing = entries[tag] {
+            existing.category = category
             existing.bytes = normalizedBytes
             existing.count = count
             existing.unit = unit
@@ -833,6 +848,7 @@ private actor MemoryLedgerStore {
         } else {
             entries[tag] = ComponentEntry(
                 tag: tag,
+                category: category,
                 bytes: normalizedBytes,
                 count: count,
                 unit: unit,
@@ -1099,6 +1115,7 @@ private actor MemoryLedgerStore {
             components: rankedEntries.map {
                 MemoryLedger.ComponentSnapshot(
                     tag: $0.tag,
+                    category: $0.category,
                     bytes: $0.bytes,
                     count: $0.count,
                     unit: $0.unit,

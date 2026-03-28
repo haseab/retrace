@@ -108,7 +108,7 @@ public actor IncrementalSegmentWriter: SegmentWriter {
         let timestamp = CMTime(value: Int64(frameCount) * 20, timescale: 600)
 
         do {
-            let pixelBuffer = try FrameConverter.createPixelBuffer(from: frame)
+            let pixelBuffer = try await encoder.makePixelBuffer(from: frame)
             try await encoder.encode(pixelBuffer: pixelBuffer, timestamp: timestamp)
             await StorageVideoEncodingMemoryLedger.endPixelBuffer(pixelBufferToken)
         } catch {

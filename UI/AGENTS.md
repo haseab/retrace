@@ -88,6 +88,8 @@ UI/
 │   ├── CrashRecoveryManager.swift       # App-side SMAppService/XPC lifecycle manager
 │   ├── SessionTimeline.swift            # App session visualization
 │   ├── DeeplinkHandler.swift            # URL scheme routing
+│   ├── AppMetadataCache.swift           # App name/icon lookup caches and app icon view
+│   ├── FaviconProvider.swift            # Favicon memory+disk cache and favicon view
 │   ├── ProcessCPUMonitor.swift          # Shared process CPU+memory sampler + 24h aggregation service
 │   ├── ProcessMemoryCardPresentation.swift # Local presentation controller + row builder for memory monitor card
 │   ├── ProcessMonitorModels.swift       # System Monitor snapshot/models + ranking/build helpers
@@ -123,6 +125,7 @@ UI/
     ├── FeedbackExportTests.swift         # Feedback report export formatting coverage
     ├── FeedbackSubmissionProgressTests.swift # Feedback sending-state sequence coverage
     ├── HyperlinkMappingTests.swift       # Stored hyperlink row to OCR-node mapping coverage
+    ├── FaviconProviderTests.swift        # Favicon memory-vs-disk cache behavior coverage
     ├── HyperlinkResolutionTests.swift    # Hyperlink parsing/resolution coverage
     ├── InPageURLSettingsTests.swift      # In-page URL setup instructions and toggle coverage
     ├── MilestoneCelebrationViewTests.swift # Milestone dialog action layout coverage

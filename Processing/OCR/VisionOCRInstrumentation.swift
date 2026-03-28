@@ -476,7 +476,8 @@ enum VisionOCRMemoryLedger {
                 unit: "requests",
                 function: entry.function,
                 kind: entry.kind,
-                note: entry.note
+                note: entry.note,
+                category: .inferred
             )
         }
     }

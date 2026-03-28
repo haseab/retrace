@@ -23,21 +23,6 @@ public protocol ProcessingProtocol: Actor {
     /// Extract text using only Accessibility API
     func extractTextViaAccessibility() async throws -> [TextRegion]
 
-    // MARK: - Processing Queue
-
-    /// Queue a frame for background processing
-    /// Returns immediately, text will be sent to the provided handler
-    func queueFrame(
-        _ frame: CapturedFrame,
-        completion: @escaping @Sendable (Result<ExtractedText, ProcessingError>) -> Void
-    ) async
-
-    /// Get number of frames in processing queue
-    var queuedFrameCount: Int { get }
-
-    /// Wait for all queued frames to be processed
-    func waitForQueueDrain() async
-
     // MARK: - Configuration
 
     /// Update processing configuration

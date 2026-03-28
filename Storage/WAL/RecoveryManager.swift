@@ -6,14 +6,12 @@ import Shared
 /// Recovery process:
 /// 1. Scan for active WAL sessions (incomplete video segments)
 /// 2. Read raw frames from WAL
-/// 3. Re-encode frames to video + enqueue for async OCR processing
+/// 3. Re-encode frames to video + enqueue recovered frame IDs via callback
 /// 4. Clean up WAL after successful recovery
 public actor RecoveryManager {
     private let walManager: WALManager
     private let storage: StorageProtocol
     private let database: DatabaseProtocol
-    private let processing: ProcessingProtocol
-    private let search: SearchProtocol
     private var frameEnqueueCallback: (@Sendable ([Int64]) async throws -> Void)?
     private static let maxFramesPerRecoveryBatch = 150
     private static let maxRecoveryBatchBytes: Int64 = 256 * 1024 * 1024
@@ -21,15 +19,11 @@ public actor RecoveryManager {
     public init(
         walManager: WALManager,
         storage: StorageProtocol,
-        database: DatabaseProtocol,
-        processing: ProcessingProtocol,
-        search: SearchProtocol
+        database: DatabaseProtocol
     ) {
         self.walManager = walManager
         self.storage = storage
         self.database = database
-        self.processing = processing
-        self.search = search
     }
 
     /// Set callback for enqueueing frames (called by AppCoordinator)
@@ -559,26 +553,19 @@ public actor RecoveryManager {
             )
         }
 
-        var plannedFrames: [RecoveryLoadedFrame] = []
+        var plannedFrames: [RecoveryBufferedFrame] = []
         plannedFrames.reserveCapacity(frontier.walBackedReadablePrefixCount)
         var rawFramesLoaded = 0
         var mappedFramesRepaired = 0
 
         for descriptor in frontier.descriptors.prefix(frontier.walBackedReadablePrefixCount) {
             if let existingFrame = descriptor.existingFrame {
-                let placeholderFrame = CapturedFrame(
-                    timestamp: existingFrame.timestamp,
-                    imageData: Data(),
-                    width: 0,
-                    height: 0,
-                    bytesPerRow: 0,
-                    metadata: existingFrame.metadata
-                )
                 plannedFrames.append(
-                    RecoveryLoadedFrame(
+                    RecoveryBufferedFrame(
                         frameIndex: descriptor.frameIndex,
                         mappedFrameID: descriptor.mappedFrameID,
-                        frame: placeholderFrame
+                        timestamp: existingFrame.timestamp,
+                        metadata: existingFrame.metadata
                     )
                 )
 
@@ -592,10 +579,11 @@ public actor RecoveryManager {
             let frame = try await walManager.readFrame(videoID: frontier.session.videoID, atOffset: descriptor.walOffset)
             rawFramesLoaded += 1
             plannedFrames.append(
-                RecoveryLoadedFrame(
+                RecoveryBufferedFrame(
                     frameIndex: descriptor.frameIndex,
                     mappedFrameID: descriptor.mappedFrameID,
-                    frame: frame
+                    timestamp: frame.timestamp,
+                    metadata: frame.metadata
                 )
             )
             if descriptor.isMapped {
@@ -627,11 +615,10 @@ public actor RecoveryManager {
     }
 
     private func resolveExistingFrameForRecovery(
-        _ loadedFrame: RecoveryLoadedFrame,
+        _ loadedFrame: RecoveryBufferedFrame,
         matchedExistingFrameIDs: inout Set<Int64>
     ) async throws -> FrameReference? {
-        let frame = loadedFrame.frame
-        let timestampMillis = Int64(frame.timestamp.timeIntervalSince1970 * 1000)
+        let timestampMillis = Int64(loadedFrame.timestamp.timeIntervalSince1970 * 1000)
 
         if let mappedFrameID = loadedFrame.mappedFrameID {
             guard matchedExistingFrameIDs.insert(mappedFrameID).inserted else {
@@ -650,7 +637,7 @@ public actor RecoveryManager {
                 return nil
             }
 
-            guard segmentMetadataMatches(existingFrame: existingFrame, frame: frame) else {
+            guard segmentMetadataMatches(existingFrame: existingFrame, metadata: loadedFrame.metadata) else {
                 Log.warning(
                     "[Recovery] Mapped frameID \(mappedFrameID) for WAL frame \(loadedFrame.frameIndex) metadata differed from the WAL frame; inserting a recovered frame instead",
                     category: .storage
@@ -661,7 +648,7 @@ public actor RecoveryManager {
             return existingFrame
         }
 
-        guard let existingFrameID = try await database.getFrameIDAtTimestamp(frame.timestamp) else {
+        guard let existingFrameID = try await database.getFrameIDAtTimestamp(loadedFrame.timestamp) else {
             return nil
         }
 
@@ -681,7 +668,7 @@ public actor RecoveryManager {
             return nil
         }
 
-        guard segmentMetadataMatches(existingFrame: existingFrame, frame: frame) else {
+        guard segmentMetadataMatches(existingFrame: existingFrame, metadata: loadedFrame.metadata) else {
             Log.warning(
                 "[Recovery] Existing frame \(existingFrameID) timestamp matched but segment metadata differed; inserting a new recovered frame instead",
                 category: .storage
@@ -754,12 +741,15 @@ public actor RecoveryManager {
             for batchStart in stride(from: 0, to: descriptors.count, by: batchSize) {
                 let batchEnd = min(batchStart + batchSize, descriptors.count)
                 let batchDescriptors = Array(descriptors[batchStart..<batchEnd])
-                let walFrames = try await loadFrames(from: session, descriptors: batchDescriptors)
-                rawFramesLoaded += walFrames.count
-
-                var offset = 0
-                while offset < walFrames.count {
-                    let frame = walFrames[offset]
+                for descriptor in batchDescriptors {
+                    let frame = try await walManager.readFrame(videoID: session.videoID, atOffset: descriptor.walOffset)
+                    let bufferedFrame = RecoveryBufferedFrame(
+                        frameIndex: descriptor.frameIndex,
+                        mappedFrameID: descriptor.mappedFrameID,
+                        timestamp: frame.timestamp,
+                        metadata: frame.metadata
+                    )
+                    rawFramesLoaded += 1
 
                     if writerState == nil {
                         writerState = RecoveryWriterState(
@@ -770,11 +760,10 @@ public actor RecoveryManager {
 
                     do {
                         var currentState = writerState!
-                        try await currentState.writer.appendFrame(frame.frame)
-                        currentState.bufferedFrames.append(frame)
+                        try await currentState.writer.appendFrame(frame)
+                        currentState.bufferedFrames.append(bufferedFrame)
                         writerState = currentState
                         framesReencoded += 1
-                        offset += 1
 
                         if currentState.bufferedFrames.count >= maxFramesPerSegment {
                             try await finalizeActiveWriter()
@@ -782,7 +771,7 @@ public actor RecoveryManager {
                     } catch {
                         let bufferedCount = writerState?.bufferedFrames.count ?? 0
                         Log.warning(
-                            "[Recovery] Encoder failed at WAL frame \(frame.frameIndex) after \(bufferedCount) buffered frames: \(error). Finalizing encoded prefix and retrying remaining frames.",
+                            "[Recovery] Encoder failed at WAL frame \(descriptor.frameIndex) after \(bufferedCount) buffered frames: \(error). Finalizing encoded prefix and retrying remaining frames.",
                             category: .storage
                         )
 
@@ -795,15 +784,14 @@ public actor RecoveryManager {
 
                         let retryWriter = try await storage.createSegmentWriter()
                         do {
-                            try await retryWriter.appendFrame(frame.frame)
-                            writerState = RecoveryWriterState(writer: retryWriter, bufferedFrames: [frame])
+                            try await retryWriter.appendFrame(frame)
+                            writerState = RecoveryWriterState(writer: retryWriter, bufferedFrames: [bufferedFrame])
                             framesReencoded += 1
-                            offset += 1
                         } catch {
                             try? await retryWriter.cancel()
                             throw StorageError.fileWriteFailed(
                                 path: "WAL recovery",
-                                underlying: "Failed to encode frame \(frame.frameIndex) after writer rollover: \(error)"
+                                underlying: "Failed to encode frame \(descriptor.frameIndex) after writer rollover: \(error)"
                             )
                         }
                     }
@@ -829,24 +817,6 @@ public actor RecoveryManager {
             await rollbackRecoveryCommits(committedRollbacks)
             throw error
         }
-    }
-
-    private func loadFrames(from session: WALSession, descriptors: [RecoveryFrameDescriptor]) async throws -> [RecoveryLoadedFrame] {
-        var frames: [RecoveryLoadedFrame] = []
-        frames.reserveCapacity(descriptors.count)
-
-        for descriptor in descriptors {
-            let frame = try await walManager.readFrame(videoID: session.videoID, atOffset: descriptor.walOffset)
-            frames.append(
-                RecoveryLoadedFrame(
-                    frameIndex: descriptor.frameIndex,
-                    mappedFrameID: descriptor.mappedFrameID,
-                    frame: frame
-                )
-            )
-        }
-
-        return frames
     }
 
     private func repairExistingFrameVideoLinkIfNeeded(
@@ -963,7 +933,7 @@ public actor RecoveryManager {
 
     private func commitRecoveredSegment(
         videoSegment: VideoSegment,
-        frames: [RecoveryLoadedFrame],
+        frames: [RecoveryBufferedFrame],
         appSegmentState: inout RecoveryAppSegmentState
     ) async throws -> RecoveredSegmentCommitResult {
         guard !frames.isEmpty else {
@@ -1146,83 +1116,16 @@ public actor RecoveryManager {
         state.currentSegmentHasInsertedFrames = false
     }
 
-    private func adoptExistingFrameContext(
-        existingFrame: FrameReference,
-        timestamp: Date,
-        state: inout RecoveryAppSegmentState
-    ) async throws {
-        let bundleID = normalizedBundleID(existingFrame.metadata.appBundleID)
-        let windowName = normalizedWindowName(existingFrame.metadata.windowName)
-        let isSameContext = state.currentSegmentID == existingFrame.segmentID.value
-            && state.currentBundleID == bundleID
-            && state.currentWindowName == windowName
-
-        if !isSameContext {
-            try await flushAppSegmentEndDateIfNeeded(state: &state)
-        }
-
-        state.currentSegmentID = existingFrame.segmentID.value
-        state.currentBundleID = bundleID
-        state.currentWindowName = windowName
-        state.lastFrameTimestamp = timestamp
-        if !isSameContext {
-            state.currentSegmentHasInsertedFrames = false
-        }
-    }
-
-    private func ensureRecoverySegment(
-        for frame: CapturedFrame,
-        state: inout RecoveryAppSegmentState
-    ) async throws -> Int64 {
-        let bundleID = normalizedBundleID(for: frame)
-        let windowName = normalizedWindowName(for: frame)
-        let browserURL = normalizedBrowserURL(for: frame)
-
-        if let currentSegmentID = state.currentSegmentID,
-           state.currentBundleID == bundleID,
-           state.currentWindowName == windowName
-        {
-            state.lastFrameTimestamp = frame.timestamp
-            state.currentSegmentHasInsertedFrames = true
-            return currentSegmentID
-        }
-
-        try await flushAppSegmentEndDateIfNeeded(state: &state)
-
-        let segmentID = try await database.insertSegment(
-            bundleID: bundleID,
-            startDate: frame.timestamp,
-            endDate: frame.timestamp,
-            windowName: windowName,
-            browserUrl: browserURL,
-            type: 0
-        )
-        state.currentSegmentID = segmentID
-        state.currentBundleID = bundleID
-        state.currentWindowName = windowName
-        state.lastFrameTimestamp = frame.timestamp
-        state.currentSegmentHasInsertedFrames = true
-        return segmentID
-    }
-
     private func normalizedBundleID(_ bundleID: String?) -> String {
         bundleID ?? "com.unknown.recovered"
-    }
-
-    private func normalizedBundleID(for frame: CapturedFrame) -> String {
-        normalizedBundleID(frame.metadata.appBundleID)
     }
 
     private func normalizedWindowName(_ windowName: String?) -> String {
         windowName ?? "Recovered Session"
     }
 
-    private func normalizedWindowName(for frame: CapturedFrame) -> String {
-        normalizedWindowName(frame.metadata.windowName)
-    }
-
-    private func normalizedBrowserURL(for frame: CapturedFrame) -> String? {
-        guard let browserURL = frame.metadata.browserURL?.trimmingCharacters(in: .whitespacesAndNewlines),
+    private func normalizedBrowserURL(_ browserURL: String?) -> String? {
+        guard let browserURL = browserURL?.trimmingCharacters(in: .whitespacesAndNewlines),
               !browserURL.isEmpty else {
             return nil
         }
@@ -1263,36 +1166,13 @@ public actor RecoveryManager {
         return byteCount
     }
 
-    private func frameRanges(startingAt start: Int = 0, endingBefore end: Int, batchSize: Int) -> [Range<Int>] {
-        guard end > start else { return [] }
-
-        return stride(from: start, to: end, by: batchSize).map { lowerBound in
-            lowerBound..<min(lowerBound + batchSize, end)
-        }
-    }
-
-    private func loadFrames(from session: WALSession, range: Range<Int>) async throws -> [CapturedFrame] {
-        var frames: [CapturedFrame] = []
-        frames.reserveCapacity(range.count)
-
-        for frameIndex in range {
-            let frame = try await walManager.readFrame(
-                videoID: session.videoID,
-                frameIndex: frameIndex
-            )
-            frames.append(frame)
-        }
-
-        return frames
-    }
-
-    private func segmentMetadataMatches(existingFrame: FrameReference, frame: CapturedFrame) -> Bool {
-        normalizedBundleID(existingFrame.metadata.appBundleID) == normalizedBundleID(for: frame)
-            && normalizedWindowName(existingFrame.metadata.windowName) == normalizedWindowName(for: frame)
+    private func segmentMetadataMatches(existingFrame: FrameReference, metadata: FrameMetadata) -> Bool {
+        normalizedBundleID(existingFrame.metadata.appBundleID) == normalizedBundleID(metadata.appBundleID)
+            && normalizedWindowName(existingFrame.metadata.windowName) == normalizedWindowName(metadata.windowName)
     }
 
     private func planRecoveredSegmentCommit(
-        for frames: [RecoveryLoadedFrame],
+        for frames: [RecoveryBufferedFrame],
         initialState: RecoveryAppSegmentState
     ) async throws -> RecoveryRecoveredSegmentCommitPlan {
         var matchedExistingFrameIDs: Set<Int64> = []
@@ -1373,10 +1253,10 @@ public actor RecoveryManager {
             state.currentSegmentHasInsertedFrames = hasInsertedFrames
         }
 
-        func planSegmentReference(for frame: CapturedFrame) async throws -> RecoverySegmentReference {
-            let bundleID = normalizedBundleID(for: frame)
-            let windowName = normalizedWindowName(for: frame)
-            let browserURL = normalizedBrowserURL(for: frame)
+        func planSegmentReference(for frame: RecoveryBufferedFrame) async throws -> RecoverySegmentReference {
+            let bundleID = normalizedBundleID(frame.metadata.appBundleID)
+            let windowName = normalizedWindowName(frame.metadata.windowName)
+            let browserURL = normalizedBrowserURL(frame.metadata.browserURL)
 
             if let currentSegmentRef = state.currentSegmentRef,
                state.currentBundleID == bundleID,
@@ -1411,8 +1291,6 @@ public actor RecoveryManager {
         }
 
         for (newFrameIndex, loadedFrame) in frames.enumerated() {
-            let frame = loadedFrame.frame
-
             if let existingFrame = try await resolveExistingFrameForRecovery(
                 loadedFrame,
                 matchedExistingFrameIDs: &matchedExistingFrameIDs
@@ -1422,7 +1300,7 @@ public actor RecoveryManager {
                     segmentRef: .existing(existingFrame.segmentID.value),
                     bundleID: normalizedBundleID(existingFrame.metadata.appBundleID),
                     windowName: normalizedWindowName(existingFrame.metadata.windowName),
-                    timestamp: frame.timestamp,
+                    timestamp: loadedFrame.timestamp,
                     hasInsertedFrames: false
                 )
                 frameActions.append(
@@ -1438,8 +1316,8 @@ public actor RecoveryManager {
                 continue
             }
 
-            let segmentRef = try await planSegmentReference(for: frame)
-            frameActions.append(.insertNew(frame: frame, segmentRef: segmentRef, newFrameIndex: newFrameIndex))
+            let segmentRef = try await planSegmentReference(for: loadedFrame)
+            frameActions.append(.insertNew(frame: loadedFrame, segmentRef: segmentRef, newFrameIndex: newFrameIndex))
         }
 
         try await flushCurrentSegmentEndDateIfNeeded()
@@ -1581,7 +1459,7 @@ public actor RecoveryManager {
 
 private struct RecoveryWriterState {
     let writer: SegmentWriter
-    var bufferedFrames: [RecoveryLoadedFrame]
+    var bufferedFrames: [RecoveryBufferedFrame]
 }
 
 private struct RecoveryFrameDescriptor {
@@ -1600,10 +1478,11 @@ private struct RecoveryFrameDescriptor {
     }
 }
 
-private struct RecoveryLoadedFrame {
+private struct RecoveryBufferedFrame {
     let frameIndex: Int
     let mappedFrameID: Int64?
-    let frame: CapturedFrame
+    let timestamp: Date
+    let metadata: FrameMetadata
 }
 
 private struct RecoverySessionFrontier {
@@ -1683,7 +1562,7 @@ private struct RecoveryResolvedVideoTarget {
 
 private enum RecoveryRecoveredFrameCommitAction {
     case updateExisting(rollbackInfo: RecoveryExistingFrameVideoLink, newFrameIndex: Int)
-    case insertNew(frame: CapturedFrame, segmentRef: RecoverySegmentReference, newFrameIndex: Int)
+    case insertNew(frame: RecoveryBufferedFrame, segmentRef: RecoverySegmentReference, newFrameIndex: Int)
 }
 
 private struct RecoveryRecoveredSegmentCommitPlan {

@@ -1,4 +1,5 @@
 import XCTest
+import Shared
 @testable import Retrace
 
 final class ProcessCPUDisplayMetricsTests: XCTestCase {
@@ -22,23 +23,23 @@ final class ProcessCPUDisplayMetricsTests: XCTestCase {
         )
     }
 
-    func testProcessMemorySummaryCardBuildsExpansionScrollTargetForFirstFamilyRow() {
+    func testProcessMemorySummaryCardBuildsExpansionScrollTargetForFirstCategoryRow() {
         let target = ProcessMemorySummaryCard.retraceExpansionScrollTarget(
-            firstFamilyID: "storage.videoEncoding"
+            firstCategoryID: "explicit"
         )
 
         XCTAssertEqual(
             target,
             ProcessMemorySummaryCard.MemoryProcessScrollTarget(
-                id: "retraceFamily.storage.videoEncoding",
+                id: "retraceCategory.explicit",
                 anchorY: 0
             )
         )
     }
 
-    func testProcessMemorySummaryCardReturnsNilExpansionScrollTargetWithoutFamily() {
+    func testProcessMemorySummaryCardReturnsNilExpansionScrollTargetWithoutCategory() {
         XCTAssertNil(
-            ProcessMemorySummaryCard.retraceExpansionScrollTarget(firstFamilyID: nil)
+            ProcessMemorySummaryCard.retraceExpansionScrollTarget(firstCategoryID: nil)
         )
     }
 
@@ -207,54 +208,72 @@ final class ProcessCPUDisplayMetricsTests: XCTestCase {
         XCTAssertEqual(rows[1].currentBytes, 100)
     }
 
-    func testBuildRetraceMemoryAttributionRowsGroupsFamiliesAndShortensChildren() {
-        let rows = ProcessCPUDisplayMetrics.buildRetraceMemoryAttributionRows(
+    func testBuildCategorizedRetraceMemoryAttributionTreeGroupsFamiliesAndShortensChildren() {
+        let tree = ProcessCPUDisplayMetrics.buildCategorizedRetraceMemoryAttributionTree(
             currentBytesByComponent: [
                 "processing.extract.handoffObservedResidual": 320,
-                "processing.extract.ocrCallResidual": 80,
+                "processing.extract.ocrRegionPayload": 80,
                 "storage.videoEncoding.videoToolboxHeap": 220
+            ],
+            componentCategoriesByKey: [
+                "processing.extract.handoffObservedResidual": .inferred,
+                "processing.extract.ocrRegionPayload": .explicit,
+                "storage.videoEncoding.videoToolboxHeap": .inferred
             ],
             memoryByteSecondsByComponent: [
                 "processing.extract.handoffObservedResidual": 2_400,
-                "processing.extract.ocrCallResidual": 800,
+                "processing.extract.ocrRegionPayload": 800,
                 "storage.videoEncoding.videoToolboxHeap": 1_800
             ],
             peakBytesByComponent: [
                 "processing.extract.handoffObservedResidual": 360,
-                "processing.extract.ocrCallResidual": 120,
+                "processing.extract.ocrRegionPayload": 120,
                 "storage.videoEncoding.videoToolboxHeap": 260
             ],
-            peakBytesByFamily: [
-                "processing.extract": 420,
-                "storage.videoEncoding": 260
+            componentSamples: [
+                [
+                    "processing.extract.handoffObservedResidual": 360,
+                    "processing.extract.ocrRegionPayload": 120,
+                    "storage.videoEncoding.videoToolboxHeap": 260
+                ]
             ],
             totalDuration: 10
         )
 
-        XCTAssertEqual(rows.families.map(\.id), [
+        let explicitFamilies = tree.familiesByCategory[RetraceMemoryAttributionCategory.explicit.rawValue]
+        let inferredFamilies = tree.familiesByCategory[RetraceMemoryAttributionCategory.inferred.rawValue]
+
+        XCTAssertEqual(explicitFamilies?.map(\.id), ["processing.extract"])
+        XCTAssertEqual(inferredFamilies?.map(\.id), [
             "processing.extract",
             "storage.videoEncoding"
         ])
-        XCTAssertEqual(rows.families[0].currentBytes, 400)
-        XCTAssertEqual(rows.families[0].averageBytes, 320)
-        XCTAssertEqual(rows.families[0].peakBytes, 420)
+        XCTAssertEqual(explicitFamilies?.first?.currentBytes, 80)
+        XCTAssertEqual(explicitFamilies?.first?.averageBytes, 80)
+        XCTAssertEqual(explicitFamilies?.first?.peakBytes, 120)
 
-        let extractChildren = rows.childrenByFamily["processing.extract"]
-        XCTAssertEqual(extractChildren?.map(\.id), [
-            "processing.extract.handoffObservedResidual",
-            "processing.extract.ocrCallResidual"
+        let explicitExtractKey = ProcessCPUDisplayMetrics.retraceMemoryAttributionFamilyExpansionKey(
+            categoryID: RetraceMemoryAttributionCategory.explicit.rawValue,
+            familyID: "processing.extract"
+        )
+        let explicitExtractChildren = tree.componentsByCategoryFamily[explicitExtractKey]
+        XCTAssertEqual(explicitExtractChildren?.map(\.id), [
+            "processing.extract.ocrRegionPayload"
         ])
-        XCTAssertEqual(extractChildren?.map(\.name), [
-            "handoffObservedResidual",
-            "ocrCallResidual"
+        XCTAssertEqual(explicitExtractChildren?.map(\.name), [
+            "ocrRegionPayload"
         ])
     }
 
-    func testBuildRetraceMemoryAttributionRowsIncludesReadableUnattributedBucket() {
-        let rows = ProcessCPUDisplayMetrics.buildRetraceMemoryAttributionRows(
+    func testBuildCategorizedRetraceMemoryAttributionTreeIncludesReadableUnattributedBucket() {
+        let tree = ProcessCPUDisplayMetrics.buildCategorizedRetraceMemoryAttributionTree(
             currentBytesByComponent: [
                 "memory.unattributed.total": 512,
                 "storage.videoEncoding.videoToolboxHeap": 220
+            ],
+            componentCategoriesByKey: [
+                "memory.unattributed.total": .unattributed,
+                "storage.videoEncoding.videoToolboxHeap": .inferred
             ],
             memoryByteSecondsByComponent: [
                 "memory.unattributed.total": 5_120,
@@ -264,19 +283,115 @@ final class ProcessCPUDisplayMetricsTests: XCTestCase {
                 "memory.unattributed.total": 768,
                 "storage.videoEncoding.videoToolboxHeap": 260
             ],
-            peakBytesByFamily: [
-                "memory.unattributed": 768,
-                "storage.videoEncoding": 260
+            componentSamples: [],
+            totalDuration: 10
+        )
+
+        XCTAssertEqual(
+            tree.familiesByCategory[RetraceMemoryAttributionCategory.unattributed.rawValue]?.map(\.id),
+            ["memory.unattributed"]
+        )
+        XCTAssertEqual(
+            tree.familiesByCategory[RetraceMemoryAttributionCategory.inferred.rawValue]?.map(\.id),
+            ["storage.videoEncoding"]
+        )
+
+        let unattributedKey = ProcessCPUDisplayMetrics.retraceMemoryAttributionFamilyExpansionKey(
+            categoryID: RetraceMemoryAttributionCategory.unattributed.rawValue,
+            familyID: "memory.unattributed"
+        )
+        XCTAssertEqual(tree.componentsByCategoryFamily[unattributedKey]?.map(\.name), ["unattributed"])
+    }
+
+    func testBuildCategorizedRetraceMemoryAttributionTreeSeparatesExplicitInferredAndUnattributed() {
+        let tree = ProcessCPUDisplayMetrics.buildCategorizedRetraceMemoryAttributionTree(
+            currentBytesByComponent: [
+                "processing.extract.ocrRegionPayload": 64,
+                "processing.extract.handoffObservedResidual": 320,
+                "storage.videoEncoding.videoToolboxHeap": 220,
+                "memory.unattributed.total": 512
+            ],
+            componentCategoriesByKey: [
+                "processing.extract.ocrRegionPayload": .explicit,
+                "processing.extract.handoffObservedResidual": .inferred,
+                "storage.videoEncoding.videoToolboxHeap": .inferred,
+                "memory.unattributed.total": .unattributed
+            ],
+            memoryByteSecondsByComponent: [
+                "processing.extract.ocrRegionPayload": 640,
+                "processing.extract.handoffObservedResidual": 3_200,
+                "storage.videoEncoding.videoToolboxHeap": 2_200,
+                "memory.unattributed.total": 5_120
+            ],
+            peakBytesByComponent: [
+                "processing.extract.ocrRegionPayload": 80,
+                "processing.extract.handoffObservedResidual": 360,
+                "storage.videoEncoding.videoToolboxHeap": 260,
+                "memory.unattributed.total": 768
+            ],
+            componentSamples: [
+                [
+                    "processing.extract.ocrRegionPayload": 80,
+                    "processing.extract.handoffObservedResidual": 300,
+                    "storage.videoEncoding.videoToolboxHeap": 180,
+                    "memory.unattributed.total": 400
+                ],
+                [
+                    "processing.extract.ocrRegionPayload": 64,
+                    "processing.extract.handoffObservedResidual": 320,
+                    "storage.videoEncoding.videoToolboxHeap": 220,
+                    "memory.unattributed.total": 512
+                ]
             ],
             totalDuration: 10
         )
 
-        XCTAssertEqual(rows.families.map(\.id), [
-            "memory.unattributed",
+        XCTAssertEqual(tree.categories.map(\.id), ["explicit", "inferred", "unattributed"])
+        XCTAssertEqual(tree.categories[0].currentBytes, 64)
+        XCTAssertEqual(tree.categories[1].currentBytes, 540)
+        XCTAssertEqual(tree.categories[2].currentBytes, 512)
+
+        XCTAssertEqual(tree.familiesByCategory["explicit"]?.map(\.id), ["processing.extract"])
+        XCTAssertEqual(tree.familiesByCategory["inferred"]?.map(\.id), [
+            "processing.extract",
             "storage.videoEncoding"
         ])
-        XCTAssertEqual(rows.families.first?.name, "unattributed")
-        XCTAssertEqual(rows.childrenByFamily["memory.unattributed"]?.map(\.name), ["unattributed"])
+        XCTAssertEqual(tree.familiesByCategory["unattributed"]?.map(\.id), ["memory.unattributed"])
+
+        let explicitExtractKey = ProcessCPUDisplayMetrics.retraceMemoryAttributionFamilyExpansionKey(
+            categoryID: "explicit",
+            familyID: "processing.extract"
+        )
+        let inferredExtractKey = ProcessCPUDisplayMetrics.retraceMemoryAttributionFamilyExpansionKey(
+            categoryID: "inferred",
+            familyID: "processing.extract"
+        )
+        XCTAssertEqual(tree.componentsByCategoryFamily[explicitExtractKey]?.map(\.name), ["ocrRegionPayload"])
+        XCTAssertEqual(tree.componentsByCategoryFamily[inferredExtractKey]?.map(\.name), ["handoffObservedResidual"])
+    }
+
+    func testBuildCategorizedRetraceMemoryAttributionTreeUsesProvidedCategoryMapInsteadOfKeyHeuristics() {
+        let tree = ProcessCPUDisplayMetrics.buildCategorizedRetraceMemoryAttributionTree(
+            currentBytesByComponent: [
+                "custom.named.bucket": 96
+            ],
+            componentCategoriesByKey: [
+                "custom.named.bucket": .inferred
+            ],
+            memoryByteSecondsByComponent: [
+                "custom.named.bucket": 960
+            ],
+            peakBytesByComponent: [
+                "custom.named.bucket": 128
+            ],
+            componentSamples: [
+                ["custom.named.bucket": 128]
+            ],
+            totalDuration: 10
+        )
+
+        XCTAssertEqual(tree.familiesByCategory["inferred"]?.map(\.id), ["custom.named"])
+        XCTAssertTrue(tree.familiesByCategory["explicit"]?.isEmpty ?? true)
     }
 
     func testMemoryLedgerFamilyKeyUsesFirstTwoSegments() {
@@ -318,6 +433,7 @@ final class ProcessCPUDisplayMetricsTests: XCTestCase {
             from: snapshot,
             visibleRows: 10,
             isRetraceExpanded: false,
+            expandedAttributionCategoryIDs: [],
             expandedAttributionFamilyIDs: []
         )
 
@@ -327,8 +443,9 @@ final class ProcessCPUDisplayMetricsTests: XCTestCase {
         XCTAssertTrue(displayed.last?.isPinnedRetrace ?? false)
     }
 
-    func testProcessMemoryCardPresentationAppendsExpandedFamiliesAndChildrenAfterRetrace() {
+    func testProcessMemoryCardPresentationAppendsExpandedCategoriesFamiliesAndChildrenAfterRetrace() {
         let retraceRowID = "bundle:io.retrace.app"
+        let categoryID = "explicit"
         let familyID = "processing.extract"
         let snapshot = makeMemorySnapshot(
             topRows: [
@@ -336,33 +453,56 @@ final class ProcessCPUDisplayMetricsTests: XCTestCase {
                 makeMemoryRow(id: "bundle:com.apple.Safari", name: "Safari", currentBytes: 400, averageBytes: 380, peakBytes: 430)
             ],
             retraceGroupKey: retraceRowID,
-            families: [
-                makeMemoryRow(id: familyID, name: "Processing Extract", currentBytes: 300, averageBytes: 280, peakBytes: 320)
-            ],
-            childrenByFamily: [
-                familyID: [
-                    makeMemoryRow(
-                        id: "processing.extract.ocrCallResidual",
-                        name: "ocrCallResidual",
-                        currentBytes: 120,
-                        averageBytes: 110,
-                        peakBytes: 140
-                    )
+            tree: RetraceMemoryAttributionTree(
+                categories: [
+                    makeMemoryRow(id: "explicit", name: "explicit", currentBytes: 300, averageBytes: 280, peakBytes: 320),
+                    makeMemoryRow(id: "inferred", name: "inferred", currentBytes: 0, averageBytes: 0, peakBytes: 0),
+                    makeMemoryRow(id: "unattributed", name: "unattributed", currentBytes: 0, averageBytes: 0, peakBytes: 0)
+                ],
+                familiesByCategory: [
+                    categoryID: [
+                        makeMemoryRow(id: familyID, name: "Processing Extract", currentBytes: 300, averageBytes: 280, peakBytes: 320)
+                    ],
+                    "inferred": [],
+                    "unattributed": []
+                ],
+                componentsByCategoryFamily: [
+                    ProcessCPUDisplayMetrics.retraceMemoryAttributionFamilyExpansionKey(
+                        categoryID: categoryID,
+                        familyID: familyID
+                    ): [
+                        makeMemoryRow(
+                            id: "processing.extract.ocrCallResidual",
+                            name: "ocrCallResidual",
+                            currentBytes: 120,
+                            averageBytes: 110,
+                            peakBytes: 140
+                        )
+                    ]
                 ]
-            ]
+            )
         )
 
         let displayed = ProcessMemoryCardPresentation.buildDisplayedRows(
             from: snapshot,
             visibleRows: 10,
             isRetraceExpanded: true,
-            expandedAttributionFamilyIDs: [familyID]
+            expandedAttributionCategoryIDs: [categoryID],
+            expandedAttributionFamilyIDs: [
+                ProcessCPUDisplayMetrics.retraceMemoryAttributionFamilyExpansionKey(
+                    categoryID: categoryID,
+                    familyID: familyID
+                )
+            ]
         )
 
         XCTAssertEqual(displayed.map(\.id), [
             retraceRowID,
-            "retraceFamily.processing.extract",
-            "retraceComponent.processing.extract.processing.extract.ocrCallResidual",
+            "retraceCategory.explicit",
+            "retraceFamily.explicit.processing.extract",
+            "retraceComponent.explicit.processing.extract.processing.extract.ocrCallResidual",
+            "retraceCategory.inferred",
+            "retraceCategory.unattributed",
             "bundle:com.apple.Safari"
         ])
     }
@@ -389,8 +529,7 @@ private func makeMemoryRow(
 private func makeMemorySnapshot(
     topRows: [ProcessMemoryRow],
     retraceGroupKey: String?,
-    families: [ProcessMemoryRow] = [],
-    childrenByFamily: [String: [ProcessMemoryRow]] = [:]
+    tree: RetraceMemoryAttributionTree = .empty
 ) -> ProcessCPUSnapshot {
     ProcessCPUSnapshot(
         sampleDurationSeconds: 10,
@@ -414,8 +553,7 @@ private func makeMemorySnapshot(
         peakResidentBytesByGroup: [:],
         topMemoryProcesses: topRows,
         topRetraceChildMemoryProcesses: [],
-        topRetraceMemoryAttributionFamilies: families,
-        retraceMemoryAttributionChildrenByFamily: childrenByFamily,
+        retraceMemoryAttributionTree: tree,
         latestSampleTimestamp: nil
     )
 }
