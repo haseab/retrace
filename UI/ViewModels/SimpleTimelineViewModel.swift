@@ -6616,6 +6616,10 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
     }
 
+    public func recordKeyboardShortcut(_ shortcut: String) {
+        DashboardViewModel.recordKeyboardShortcut(coordinator: coordinator, shortcut: shortcut)
+    }
+
     /// Starts a latency trace for app quick-filter execution.
     /// The trace is consumed by the next filter reload path.
     public func beginCmdFQuickFilterLatencyTrace(

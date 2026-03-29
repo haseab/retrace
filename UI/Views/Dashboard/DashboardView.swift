@@ -1382,6 +1382,9 @@ public struct DashboardView: View {
                         enableKeyboardNavigation: true,
                         allowMultipleRanges: false,
                         maxRangeDays: DashboardViewModel.maxAppUsageRangeDays,
+                        onQuickPresetShortcut: { preset in
+                            viewModel.recordKeyboardShortcut("dashboard.app_usage_date_range.\(preset.rawValue)")
+                        },
                         onDismiss: {
                             withAnimation(.easeOut(duration: 0.15)) {
                                 showAppUsageDatePopover = false

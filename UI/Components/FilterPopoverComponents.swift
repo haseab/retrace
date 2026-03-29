@@ -1897,6 +1897,124 @@ public extension View {
 
 // MARK: - Date Range Filter Popover
 
+public enum DateRangeQuickPreset: String, CaseIterable {
+    case today = "today"
+    case yesterday = "yesterday"
+    case lastSevenDays = "last_7_days"
+    case lastThirtyDays = "last_30_days"
+
+    var chipLabel: String {
+        switch self {
+        case .today:
+            return "Today"
+        case .yesterday:
+            return "1d"
+        case .lastSevenDays:
+            return "7d"
+        case .lastThirtyDays:
+            return "30d"
+        }
+    }
+
+    var focusedItemIndex: Int {
+        switch self {
+        case .today:
+            return 1
+        case .yesterday:
+            return 2
+        case .lastSevenDays:
+            return 3
+        case .lastThirtyDays:
+            return 4
+        }
+    }
+
+    static func preset(
+        for charactersIgnoringModifiers: String?,
+        modifiers: NSEvent.ModifierFlags
+    ) -> Self? {
+        guard let key = charactersIgnoringModifiers?.lowercased(),
+              key.count == 1 else {
+            return nil
+        }
+
+        let relevantModifiers = modifiers.intersection(.deviceIndependentFlagsMask)
+        let disallowedModifiers: NSEvent.ModifierFlags = [.command, .control, .option, .function]
+        guard relevantModifiers.intersection(disallowedModifiers).isEmpty else {
+            return nil
+        }
+
+        switch key {
+        case "a":
+            return .today
+        case "s":
+            return .yesterday
+        case "d":
+            return .lastSevenDays
+        case "f":
+            return .lastThirtyDays
+        default:
+            return nil
+        }
+    }
+
+    func resolvedRange(now: Date = Date(), calendar: Calendar = .current) -> DateRangeCriterion {
+        let today = calendar.startOfDay(for: now)
+        let startDay: Date
+        let endDay: Date
+
+        switch self {
+        case .today:
+            startDay = today
+            endDay = today
+        case .yesterday:
+            let yesterday = calendar.date(byAdding: .day, value: -1, to: today) ?? today
+            startDay = yesterday
+            endDay = yesterday
+        case .lastSevenDays:
+            startDay = calendar.date(byAdding: .day, value: -6, to: today) ?? today
+            endDay = today
+        case .lastThirtyDays:
+            startDay = calendar.date(byAdding: .day, value: -29, to: today) ?? today
+            endDay = today
+        }
+
+        let normalizedStart = calendar.startOfDay(for: startDay)
+        let normalizedEndDay = calendar.startOfDay(for: endDay)
+        let normalizedEnd = calendar.date(
+            bySettingHour: 23,
+            minute: 59,
+            second: 59,
+            of: normalizedEndDay
+        ) ?? normalizedEndDay
+
+        return DateRangeCriterion(start: normalizedStart, end: normalizedEnd)
+    }
+
+    static func matchingPreset(
+        for range: DateRangeCriterion?,
+        now: Date = Date(),
+        calendar: Calendar = .current
+    ) -> Self? {
+        guard let range,
+              let start = range.start ?? range.end,
+              let end = range.end ?? range.start else {
+            return nil
+        }
+
+        return allCases.first { preset in
+            let resolved = preset.resolvedRange(now: now, calendar: calendar)
+            guard let resolvedStart = resolved.start,
+                  let resolvedEnd = resolved.end else {
+                return false
+            }
+
+            return calendar.isDate(start, inSameDayAs: resolvedStart)
+                && calendar.isDate(end, inSameDayAs: resolvedEnd)
+        }
+    }
+}
+
 /// Popover for selecting one or more date ranges with natural-language input and calendar support.
 public struct DateRangeFilterPopover: View {
     let dateRanges: [DateRangeCriterion]
@@ -1908,6 +2026,7 @@ public struct DateRangeFilterPopover: View {
     let maxRangeDays: Int?
     let onMoveToNextFilter: (() -> Void)?
     let onCalendarEditingChange: ((Bool) -> Void)?
+    let onQuickPresetShortcut: ((DateRangeQuickPreset) -> Void)?
     var onDismiss: (() -> Void)?
 
     @State private var localStartDate: Date
@@ -1937,13 +2056,6 @@ public struct DateRangeFilterPopover: View {
     private enum CalendarBoundary {
         case start
         case end
-    }
-
-    private enum DatePreset {
-        case anytime
-        case today
-        case lastWeek
-        case lastMonth
     }
 
     private enum CalendarTarget: Equatable {
@@ -1981,6 +2093,7 @@ public struct DateRangeFilterPopover: View {
         maxRangeDays: Int? = nil,
         onMoveToNextFilter: (() -> Void)? = nil,
         onCalendarEditingChange: ((Bool) -> Void)? = nil,
+        onQuickPresetShortcut: ((DateRangeQuickPreset) -> Void)? = nil,
         onDismiss: (() -> Void)? = nil
     ) {
         let maxRangeCount = allowMultipleRanges ? 5 : 1
@@ -1993,6 +2106,7 @@ public struct DateRangeFilterPopover: View {
         self.maxRangeDays = maxRangeDays.map { max(1, $0) }
         self.onMoveToNextFilter = onMoveToNextFilter
         self.onCalendarEditingChange = onCalendarEditingChange
+        self.onQuickPresetShortcut = onQuickPresetShortcut
         self.onDismiss = onDismiss
 
         let now = Date()
@@ -2262,10 +2376,12 @@ public struct DateRangeFilterPopover: View {
 
             // Quick presets (horizontal chips)
             HStack(spacing: 6) {
-                presetChip("All", preset: .anytime, isHighlighted: enableKeyboardNavigation && focusedItem == 1)
-                presetChip("Today", preset: .today, isHighlighted: enableKeyboardNavigation && focusedItem == 2)
-                presetChip("7d", preset: .lastWeek, isHighlighted: enableKeyboardNavigation && focusedItem == 3)
-                presetChip("30d", preset: .lastMonth, isHighlighted: enableKeyboardNavigation && focusedItem == 4)
+                ForEach(DateRangeQuickPreset.allCases, id: \.self) { preset in
+                    presetChip(
+                        preset,
+                        isHighlighted: enableKeyboardNavigation && focusedItem == preset.focusedItemIndex
+                    )
+                }
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 8)
@@ -2275,11 +2391,17 @@ public struct DateRangeFilterPopover: View {
             configureInitialState()
 
             if enableKeyboardNavigation {
+                focusedItem = initialKeyboardFocusedItem()
                 setupKeyboardMonitor()
             }
 
             DispatchQueue.main.async {
-                isRangeInputFocused = true
+                if enableKeyboardNavigation {
+                    isRangeInputFocused = false
+                    focusedAdditionalRangeID = nil
+                } else {
+                    isRangeInputFocused = true
+                }
             }
         }
         .onDisappear {
@@ -2434,11 +2556,11 @@ public struct DateRangeFilterPopover: View {
 
     // MARK: - Preset Chip
 
-    private func presetChip(_ label: String, preset: DatePreset, isHighlighted: Bool = false) -> some View {
+    private func presetChip(_ preset: DateRangeQuickPreset, isHighlighted: Bool = false) -> some View {
         Button(action: {
-            applyPreset(preset)
+            applyQuickPreset(preset)
         }) {
-            Text(label)
+            Text(preset.chipLabel)
                 .font(.system(size: 11, weight: .medium))
                 .foregroundColor(isHighlighted ? .white : .white.opacity(0.8))
                 .padding(.horizontal, 10)
@@ -2498,6 +2620,18 @@ public struct DateRangeFilterPopover: View {
         additionalParseErrors = Array(repeating: nil, count: extras.count)
         additionalParsedRanges = Array(extras)
         normalizeAdditionalRangeState()
+    }
+
+    private func initialKeyboardFocusedItem(now: Date = Date()) -> Int {
+        guard dateRanges.count == 1,
+              let preset = DateRangeQuickPreset.matchingPreset(
+                for: dateRanges.first,
+                now: now,
+                calendar: calendar
+              ) else {
+            return DateRangeQuickPreset.today.focusedItemIndex
+        }
+        return preset.focusedItemIndex
     }
 
     private func changeMonth(by value: Int) {
@@ -2701,68 +2835,26 @@ public struct DateRangeFilterPopover: View {
         applyAllRanges(moveToNextDropdown: moveToNextDropdown)
     }
 
-    private func applyCustomRange(moveToNextDropdown: Bool = false) {
-        let normalizedRange = normalizeRange(localStartDate, localEndDate)
-        localStartDate = normalizedRange.start
-        localEndDate = normalizedRange.end
-        if let validationError = rangeValidationError(start: localStartDate, end: localEndDate) {
-            parseError = validationError
+    private func applyQuickPreset(_ preset: DateRangeQuickPreset) {
+        let range = preset.resolvedRange(now: Date(), calendar: calendar)
+        guard let start = range.start,
+              let end = range.end else {
             return
         }
-        let start = calendar.startOfDay(for: localStartDate)
 
-        // Set end date to 23:59:59.999 to include the entire day
-        // Use bySettingHour to preserve the date's timezone instead of reconstructing with components
-        let end = calendar.date(bySettingHour: 23, minute: 59, second: 59, of: localEndDate) ?? localEndDate
+        localStartDate = calendar.startOfDay(for: start)
+        localEndDate = calendar.startOfDay(for: end)
+        displayedMonth = localEndDate
+        activeCalendarBoundary = .start
+        activeCalendarTarget = .primary
+        lastFocusedCalendarTarget = .primary
+        focusedItem = preset.focusedItemIndex
+        rangeInputText = formatRangeInput(start: start, end: end)
+        parseError = nil
+        isRangeInputFocused = false
+        focusedAdditionalRangeID = nil
 
-        applyAllRanges(
-            primaryOverride: DateRangeCriterion(start: start, end: end),
-            moveToNextDropdown: moveToNextDropdown
-        )
-    }
-
-    private func applyPreset(_ preset: DatePreset) {
-        let now = Date()
-        let today = calendar.startOfDay(for: now)
-        switch preset {
-        case .anytime:
-            rangeInputText = ""
-            parseError = nil
-            hasCommittedPrimaryRange = false
-            additionalRangeInputTexts.removeAll()
-            additionalRangeIDs.removeAll()
-            additionalParseErrors.removeAll()
-            additionalParsedRanges.removeAll()
-            normalizeAdditionalRangeState()
-            onClear()
-
-        case .today:
-            localStartDate = today
-            localEndDate = today
-            rangeInputText = formatRangeInput(start: localStartDate, end: localEndDate)
-            parseError = nil
-            applyCustomRange()
-
-        case .lastWeek:
-            // Exactly 7 inclusive days: today + previous 6 days.
-            if let weekStart = calendar.date(byAdding: .day, value: -6, to: today) {
-                localStartDate = weekStart
-                localEndDate = today
-                rangeInputText = formatRangeInput(start: localStartDate, end: localEndDate)
-                parseError = nil
-                applyCustomRange()
-            }
-
-        case .lastMonth:
-            // Exactly 30 inclusive days: today + previous 29 days.
-            if let monthStart = calendar.date(byAdding: .day, value: -29, to: today) {
-                localStartDate = monthStart
-                localEndDate = today
-                rangeInputText = formatRangeInput(start: localStartDate, end: localEndDate)
-                parseError = nil
-                applyCustomRange()
-            }
-        }
+        applyAllRanges(primaryOverride: range, moveToNextDropdown: false)
     }
 
     private func addAdditionalRangeInput() {
@@ -3139,7 +3231,6 @@ public struct DateRangeFilterPopover: View {
         // Handle numeric day in context of reference date (e.g., "5 to 8" where "8" should be in same month)
         if let referenceDate, let day = Int(trimmedLower), (1...31).contains(day) {
             var referenceComponents = calendar.dateComponents([.year, .month, .day], from: referenceDate)
-            let referenceDay = referenceComponents.day
             referenceComponents.day = day
 
             if let candidate = calendar.date(from: referenceComponents) {
@@ -3432,6 +3523,14 @@ public struct DateRangeFilterPopover: View {
                 return nil
 
             default:
+                if let preset = DateRangeQuickPreset.preset(
+                    for: event.charactersIgnoringModifiers,
+                    modifiers: event.modifierFlags
+                ), !isAnyRangeInputFocused {
+                    onQuickPresetShortcut?(preset)
+                    applyQuickPreset(preset)
+                    return nil
+                }
                 return event
             }
         }
@@ -3453,10 +3552,10 @@ public struct DateRangeFilterPopover: View {
                     synchronizeCalendarStateFromTarget(lastFocusedCalendarTarget)
                 }
             }
-        case 1: applyPreset(.anytime)
-        case 2: applyPreset(.today)
-        case 3: applyPreset(.lastWeek)
-        case 4: applyPreset(.lastMonth)
+        case let item where (1...4).contains(item):
+            if let preset = DateRangeQuickPreset.allCases.first(where: { $0.focusedItemIndex == item }) {
+                applyQuickPreset(preset)
+            }
         default: break
         }
     }

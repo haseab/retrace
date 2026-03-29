@@ -151,6 +151,9 @@ public struct SearchFilterBar: View {
                     onCalendarEditingChange: { isEditing in
                         viewModel.isDatePopoverHandlingKeys = isEditing
                     },
+                    onQuickPresetShortcut: { preset in
+                        viewModel.recordKeyboardShortcut("search.date_range.\(preset.rawValue)")
+                    },
                     onDismiss: {
                         withAnimation(.easeOut(duration: 0.15)) {
                             showDatePopover = false

@@ -2097,6 +2097,10 @@ public class DashboardViewModel: ObservableObject {
         }
     }
 
+    public func recordKeyboardShortcut(_ shortcut: String) {
+        Self.recordKeyboardShortcut(coordinator: coordinator, shortcut: shortcut)
+    }
+
     /// Record a debug-only watchdog hang trigger from the dashboard.
     public static func recordDebugWatchdogHangTriggered(coordinator: AppCoordinator) {
         recordMetric(coordinator: coordinator, type: .debugWatchdogHangTriggered)

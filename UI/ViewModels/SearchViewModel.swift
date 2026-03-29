@@ -1925,6 +1925,10 @@ public class SearchViewModel: ObservableObject {
         }
     }
 
+    public func recordKeyboardShortcut(_ shortcut: String) {
+        DashboardViewModel.recordKeyboardShortcut(coordinator: coordinator, shortcut: shortcut)
+    }
+
     public func setContentType(_ type: ContentType) {
         contentType = type
     }
