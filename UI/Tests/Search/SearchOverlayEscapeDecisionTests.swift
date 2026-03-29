@@ -33,4 +33,34 @@ final class SearchOverlayEscapeDecisionTests: XCTestCase {
             )
         )
     }
+
+    func testExpandedOverlayEscShouldRefocusSearchFieldBeforeDismissWhenQueryExistsAndFieldIsNotFocused() {
+        XCTAssertTrue(
+            SearchViewModel.shouldRefocusSearchFieldOnEscape(
+                committedSearchQuery: "meeting notes",
+                hasSearchResultsPayload: false,
+                isSearchFieldFocused: false
+            )
+        )
+    }
+
+    func testExpandedOverlayEscShouldRefocusSearchFieldBeforeDismissWhenResultsExistAndFieldIsNotFocused() {
+        XCTAssertTrue(
+            SearchViewModel.shouldRefocusSearchFieldOnEscape(
+                committedSearchQuery: "",
+                hasSearchResultsPayload: true,
+                isSearchFieldFocused: false
+            )
+        )
+    }
+
+    func testExpandedOverlayEscShouldNotRefocusSearchFieldWhenFieldIsAlreadyFocused() {
+        XCTAssertFalse(
+            SearchViewModel.shouldRefocusSearchFieldOnEscape(
+                committedSearchQuery: "meeting notes",
+                hasSearchResultsPayload: true,
+                isSearchFieldFocused: true
+            )
+        )
+    }
 }

@@ -343,6 +343,10 @@ public class SearchViewModel: ObservableObject {
     // Used by timeline-level event routing to keep scroll input inside the expanded overlay.
     @Published public var isSearchOverlayExpanded = false
 
+    // Whether the spotlight search text field currently owns focus.
+    // Used by Escape routing so results return focus to the field before dismissing.
+    @Published public var isSearchFieldFocused = false
+
     // Whether the DateFilterPopover is actively handling keyboard events (Tab/Enter/arrows)
     // When true, SearchFilterBar's tab monitor and TimelineWindowController's arrow key handler skip processing
     public var isDatePopoverHandlingKeys = false
@@ -360,6 +364,9 @@ public class SearchViewModel: ObservableObject {
 
     // Signal to collapse overlay UI back to compact search bar without dismissing.
     @Published public var collapseOverlaySignal: UUID = UUID()
+
+    // Signal to refocus the spotlight search field from parent-level handlers.
+    @Published public var focusSearchFieldSignal: UUID = UUID()
 
     // Signal to dismiss the recent-entries popover as if the user clicked the header "x".
     @Published public var dismissRecentEntriesPopoverSignal: UUID = UUID()
@@ -1141,6 +1148,11 @@ public class SearchViewModel: ObservableObject {
     /// Ask the overlay view to collapse back to compact mode without dismissing.
     public func requestOverlayCollapse() {
         collapseOverlaySignal = UUID()
+    }
+
+    /// Ask the overlay view to move focus back to the search field.
+    public func requestSearchFieldFocus() {
+        focusSearchFieldSignal = UUID()
     }
 
     /// Set a one-shot delay for the next "Recent Entries" popover reveal.
@@ -2133,6 +2145,28 @@ public class SearchViewModel: ObservableObject {
         Self.shouldDismissExpandedOverlayOnEscape(
             committedSearchQuery: committedSearchQuery,
             hasSearchResultsPayload: results != nil
+        )
+    }
+
+    public static func shouldRefocusSearchFieldOnEscape(
+        committedSearchQuery: String,
+        hasSearchResultsPayload: Bool,
+        isSearchFieldFocused: Bool
+    ) -> Bool {
+        guard shouldDismissExpandedOverlayOnEscape(
+            committedSearchQuery: committedSearchQuery,
+            hasSearchResultsPayload: hasSearchResultsPayload
+        ) else {
+            return false
+        }
+        return !isSearchFieldFocused
+    }
+
+    public var shouldRefocusSearchFieldOnEscape: Bool {
+        Self.shouldRefocusSearchFieldOnEscape(
+            committedSearchQuery: committedSearchQuery,
+            hasSearchResultsPayload: results != nil,
+            isSearchFieldFocused: isSearchFieldFocused
         )
     }
 

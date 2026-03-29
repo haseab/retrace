@@ -2644,6 +2644,10 @@ public class TimelineWindowController: NSObject {
                         searchViewModel.requestOverlayCollapse()
                         return true
                     }
+                    if searchViewModel.shouldRefocusSearchFieldOnEscape {
+                        searchViewModel.requestSearchFieldFocus()
+                        return true
+                    }
 
                     // Otherwise keep existing behavior: dismiss the overlay.
                     searchViewModel.requestOverlayDismiss(clearSearchState: true)

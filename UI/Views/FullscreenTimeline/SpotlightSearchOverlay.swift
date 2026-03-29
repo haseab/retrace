@@ -209,6 +209,7 @@ public struct SpotlightSearchOverlay: View {
             overlaySessionID = String(UUID().uuidString.prefix(8))
             overlayOpenStartTime = CFAbsoluteTimeGetCurrent()
             didRecordOpenLatency = false
+            viewModel.isSearchFieldFocused = false
             viewModel.isRecentEntriesPopoverVisible = false
             logRecentEntriesState(context: "onAppear:beforeOpenAnimation")
             withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
@@ -244,6 +245,7 @@ public struct SpotlightSearchOverlay: View {
             removeKeyEventMonitor()
             clearResultKeyboardNavigation()
             viewModel.isSearchOverlayExpanded = false
+            viewModel.isSearchFieldFocused = false
             overlayOpenStartTime = nil
             didRecordOpenLatency = false
             isRecentEntriesPopoverVisible = false
@@ -339,6 +341,9 @@ public struct SpotlightSearchOverlay: View {
         .onChange(of: viewModel.collapseOverlaySignal) { _ in
             collapseToCompactSearchBar(clearFilters: false)
         }
+        .onChange(of: viewModel.focusSearchFieldSignal) { _ in
+            focusSearchFieldFromEscape()
+        }
         .onChange(of: viewModel.dismissRecentEntriesPopoverSignal) { _ in
             dismissRecentEntriesPopoverByUser()
         }
@@ -415,6 +420,7 @@ public struct SpotlightSearchOverlay: View {
                     onFocus: {
                         Log.info("\(searchLog)[\(overlaySessionID)] search field focused", category: .ui)
                         isSearchFieldFocused = true
+                        viewModel.isSearchFieldFocused = true
                         clearResultKeyboardNavigation()
                         // Close any open dropdowns when search field gains focus
                         if viewModel.isDropdownOpen {
@@ -424,6 +430,7 @@ public struct SpotlightSearchOverlay: View {
                     },
                     onBlur: {
                         isSearchFieldFocused = false
+                        viewModel.isSearchFieldFocused = false
                     },
                     onArrowDown: {
                         guard isRecentEntriesPopoverVisible else { return false }
@@ -1777,6 +1784,13 @@ public struct SpotlightSearchOverlay: View {
         dismissOverlay()
     }
 
+    private func focusSearchFieldFromEscape() {
+        clearResultKeyboardNavigation()
+        isSearchFieldFocused = true
+        viewModel.isSearchFieldFocused = true
+        refocusSearchField = UUID()
+    }
+
     private func dismissOverlay(clearSearchState: Bool) {
         guard !isDismissing else { return }
         isDismissing = true
@@ -1862,6 +1876,8 @@ public struct SpotlightSearchOverlay: View {
     }
 
     private func resignSearchFieldFocus() {
+        isSearchFieldFocused = false
+        viewModel.isSearchFieldFocused = false
         DispatchQueue.main.async {
             NSApp.keyWindow?.makeFirstResponder(nil)
         }
