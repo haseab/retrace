@@ -956,6 +956,9 @@ public struct DashboardView: View {
         let isDefaultLastSevenDays = viewModel.isDefaultAppUsageRangeSelected
         let activitySubtitle = isDefaultLastSevenDays ? "Last 7 days" : selectedRangeLabel
         let daysRecordedTitle = isDefaultLastSevenDays ? "Total Days Recorded" : "Days Recorded"
+        let daysRecordedSubtitle = formatRecordedHoursSubtitle(
+            isDefaultLastSevenDays ? viewModel.totalCapturedDuration : viewModel.totalWeeklyTime
+        )
         let storageTitle = isDefaultLastSevenDays ? "Total Storage Used" : "Storage Used"
         let storageValue = formatStorageSize(isDefaultLastSevenDays ? viewModel.totalStorageBytes : viewModel.weeklyStorageBytes)
         let storageSubtitle = isDefaultLastSevenDays ? formatStoragePerMonth() : selectedRangeLabel
@@ -966,7 +969,7 @@ public struct DashboardView: View {
                 icon: "calendar",
                 title: daysRecordedTitle,
                 value: "\(totalDaysValue) days",
-                subtitle: selectedRangeLabel
+                subtitle: daysRecordedSubtitle
             ),
             StatCardData(
                 icon: "clock.fill",
@@ -1736,6 +1739,23 @@ public struct DashboardView: View {
         } else {
             return "\(minutes)m"
         }
+    }
+
+    private func formatRecordedHoursSubtitle(_ seconds: TimeInterval) -> String {
+        guard seconds > 0 else { return "0 hours" }
+
+        let roundedHours = Int((seconds / 3600).rounded())
+        let hours = max(0, roundedHours)
+
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        formatter.minimumFractionDigits = 0
+        formatter.maximumFractionDigits = 0
+
+        let hoursText = formatter.string(from: NSNumber(value: hours))
+            ?? String(hours)
+
+        return "\(hoursText) \(hours == 1 ? "hour" : "hours")"
     }
 
     private func formatScreenTimeFromDaily(_ data: [DailyDataPoint]) -> String {

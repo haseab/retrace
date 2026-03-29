@@ -89,6 +89,7 @@ public class DashboardViewModel: ObservableObject {
     // Overall statistics
     @Published public var totalStorageBytes: Int64 = 0
     @Published public var weeklyStorageBytes: Int64 = 0
+    @Published public var totalCapturedDuration: TimeInterval = 0
     @Published public var daysRecorded: Int = 0
     @Published public var oldestRecordedDate: Date?
 
@@ -1346,6 +1347,20 @@ public class DashboardViewModel: ObservableObject {
                 criticalThresholdMs: 2000
             )
             totalStorageBytes = storage
+        }
+
+        let totalCapturedDurationStartedAt = CFAbsoluteTimeGetCurrent()
+        if let duration = try? await coordinator.getTotalCapturedDuration() {
+            let totalCapturedDurationElapsedMs = (CFAbsoluteTimeGetCurrent() - totalCapturedDurationStartedAt) * 1000
+            Log.recordLatency(
+                "dashboard.query.total_captured_duration_ms",
+                valueMs: totalCapturedDurationElapsedMs,
+                category: .ui,
+                summaryEvery: 10,
+                warningThresholdMs: 500,
+                criticalThresholdMs: 2000
+            )
+            totalCapturedDuration = duration
         }
 
         let distinctDatesStartedAt = CFAbsoluteTimeGetCurrent()
