@@ -5,11 +5,11 @@ final class InPageURLSettingsTests: XCTestCase {
     func testUnsupportedInPageURLReasonsIncludeDuckDuckGoAndSigmaOS() {
         XCTAssertEqual(
             SettingsView.inPageURLUnsupportedReason(for: "com.duckduckgo.macos.browser"),
-            "DuckDuckGo does not support in-page URL extraction in Retrace."
+            "DuckDuckGo does not support in-page URL extraction."
         )
         XCTAssertEqual(
             SettingsView.inPageURLUnsupportedReason(for: "com.sigmaos.sigmaos.macos"),
-            "SigmaOS does not support in-page URL extraction in Retrace."
+            "SigmaOS does not support in-page URL extraction."
         )
     }
 

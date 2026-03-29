@@ -125,11 +125,11 @@ public struct OnboardingView: View {
             "org.mozilla.firefoxbeta",
             "org.mozilla.firefoxdeveloperedition",
             "org.mozilla.nightly":
-            return "Firefox does not support in-page URL extraction in Retrace."
+            return "Firefox does not support in-page URL extraction."
         case "com.openai.atlas":
-            return "ChatGPT Atlas does not support in-page URL extraction in Retrace."
+            return "ChatGPT Atlas does not support in-page URL extraction."
         default:
-            return "This app does not support in-page URL extraction in Retrace."
+            return "This app does not support in-page URL extraction."
         }
     }
     // Load saved shortcuts or use defaults

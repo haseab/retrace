@@ -16,11 +16,11 @@ final class OnboardingAutomationTargetTests: XCTestCase {
     func testAtlasShowsUnsupportedReasonInOnboardingAndSettings() {
         XCTAssertEqual(
             OnboardingView.unsupportedAutomationReason(for: "com.openai.atlas"),
-            "ChatGPT Atlas does not support in-page URL extraction in Retrace."
+            "ChatGPT Atlas does not support in-page URL extraction."
         )
         XCTAssertEqual(
             SettingsView.inPageURLUnsupportedReason(for: "com.openai.atlas"),
-            "ChatGPT Atlas does not support in-page URL extraction in Retrace."
+            "ChatGPT Atlas does not support in-page URL extraction."
         )
     }
 
