@@ -1773,7 +1773,6 @@ public class DashboardViewModel: ObservableObject {
 
             // Calculate total duration for percentage calculation
             let totalDuration = windowStats.reduce(0) { $0 + $1.duration }
-
             return windowStats.map { stat in
                 WindowUsageData(
                     windowName: stat.windowName,

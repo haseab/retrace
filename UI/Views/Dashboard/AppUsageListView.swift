@@ -120,7 +120,6 @@ enum DashboardWindowTitleFormatter {
     }
 }
 
-
 /// List-style view for app usage data with expandable window details
 struct AppUsageListView: View {
     let apps: [AppUsageData]
@@ -833,7 +832,8 @@ struct AppUsageListView: View {
             if hovering {
                 NSCursor.pointingHand.set()
                 // Preload window/website data on hover so it's ready when user clicks
-                if windowUsageCache[app.appBundleID] == nil && !loadingWindows.contains(app.appBundleID) {
+                if windowUsageCache[app.appBundleID] == nil,
+                   !loadingWindows.contains(app.appBundleID) {
                     loadWindowData(for: app)
                 }
             } else {
@@ -851,8 +851,13 @@ struct AppUsageListView: View {
     // MARK: - Expansion Logic
 
     private func toggleExpansion(for app: AppUsageData) {
+        let isExpanded = expandedAppBundleID == app.appBundleID
+        let cachedRows = windowUsageCache[app.appBundleID]
+        let isLoading = loadingWindows.contains(app.appBundleID)
+        let shouldStartLoad = !isExpanded && cachedRows == nil && !isLoading
+
         withAnimation(.easeInOut(duration: 0.2)) {
-            if expandedAppBundleID == app.appBundleID {
+            if isExpanded {
                 // Collapse
                 expandedAppBundleID = nil
                 // Reset displayed window count for next expansion
@@ -864,7 +869,7 @@ struct AppUsageListView: View {
                 displayedWindowCounts[app.appBundleID] = initialWindowCount
 
                 // Load window data if not cached
-                if windowUsageCache[app.appBundleID] == nil && !loadingWindows.contains(app.appBundleID) {
+                if shouldStartLoad {
                     loadWindowData(for: app)
                 }
             }

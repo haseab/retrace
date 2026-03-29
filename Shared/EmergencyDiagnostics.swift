@@ -29,6 +29,7 @@ public enum EmergencyDiagnostics {
 
     /// Maximum number of crash reports to keep on disk
     private static let maxReportsOnDisk = 20
+    private static let mainThreadProbeTimeoutUsec: useconds_t = 50_000
 
     // MARK: - Capture
 
@@ -206,11 +207,8 @@ public enum EmergencyDiagnostics {
     // MARK: - Main Thread Backtrace
 
     /// Capture the main thread's stack trace from a background thread.
-    /// Uses pthread_kill + signal handler to sample the main thread.
-    /// Falls back to a descriptive message if sampling fails.
+    /// Falls back to a descriptive message when captured off-main.
     private static func captureMainThreadBacktrace() -> String {
-        // We can't directly get another thread's stack from Swift.
-        // Instead, check if main thread appears responsive.
         var info = ""
 
         if Thread.isMainThread {
@@ -218,25 +216,10 @@ public enum EmergencyDiagnostics {
             info += Thread.callStackSymbols.joined(separator: "\n")
             info += "\n"
         } else {
-            // We're on a background thread (CGEvent tap thread).
-            // The main thread is likely frozen - we can't get its stack directly.
-            // But we can record that we're NOT on main thread, which itself is diagnostic.
             info += "(Captured from background thread - main thread may be frozen)\n"
             info += "Main thread is NOT responding to emergency escape on main queue.\n"
 
-            // Try to detect if main thread is blocked by dispatching a probe
-            let probeCompleted = UnsafeMutablePointer<Bool>.allocate(capacity: 1)
-            probeCompleted.pointee = false
-            DispatchQueue.main.async {
-                probeCompleted.pointee = true
-            }
-
-            // Wait briefly (50ms) to see if main thread responds
-            usleep(50_000)
-            let mainResponded = probeCompleted.pointee
-            probeCompleted.deallocate()
-
-            if mainResponded {
+            if mainThreadRespondedToProbe(timeoutUsec: mainThreadProbeTimeoutUsec) {
                 info += "Main thread probe: RESPONDED within 50ms (may be intermittently blocked)\n"
             } else {
                 info += "Main thread probe: NO RESPONSE after 50ms (main thread is FROZEN)\n"
@@ -244,6 +227,15 @@ public enum EmergencyDiagnostics {
         }
 
         return info
+    }
+
+    private static func mainThreadRespondedToProbe(timeoutUsec: useconds_t) -> Bool {
+        let probeSemaphore = DispatchSemaphore(value: 0)
+        DispatchQueue.main.async {
+            probeSemaphore.signal()
+        }
+
+        return probeSemaphore.wait(timeout: .now() + .microseconds(Int(timeoutUsec))) == .success
     }
 
     // MARK: - Disk I/O

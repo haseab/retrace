@@ -66,7 +66,6 @@ public enum Log {
 
     /// Path to the log file - persists across crashes
     public static let logFilePath = NSHomeDirectory() + "/Library/Logs/Retrace/retrace.log"
-
     /// Get recent logs from the log file (fast file read, no OSLogStore)
     public static func getRecentLogs(maxCount: Int = 200) -> [String] {
         LogFile.shared.readLastLines(count: maxCount)
@@ -279,14 +278,30 @@ public enum Log {
         line: Int,
         consoleOnly: Bool = false
     ) {
-        let filename = (file as NSString).lastPathComponent
-        let formattedLog = "[\(timestamp())] [\(level)] [\(category.rawValue)] \(filename):\(line) - \(message)"
+        let formattedLog = formattedLogEntry(
+            level: level,
+            message: message,
+            category: category,
+            file: file,
+            line: line
+        )
         print(formattedLog)
 
         if !consoleOnly {
             // Also write to log file for persistence across crashes
             LogFile.shared.append(formattedLog)
         }
+    }
+
+    private static func formattedLogEntry(
+        level: String,
+        message: String,
+        category: Category,
+        file: String,
+        line: Int
+    ) -> String {
+        let filename = (file as NSString).lastPathComponent
+        return "[\(timestamp())] [\(level)] [\(category.rawValue)] \(filename):\(line) - \(message)"
     }
 
     /// Console-only debug log — prints to stdout but NOT to retrace.log.

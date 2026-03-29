@@ -37,7 +37,6 @@ public enum DailyMetricsQueries {
         case keyboardShortcut = "keyboard_shortcut"  // metadata: shortcut identifier (e.g. "cmd+c", "cmd+f")
         case dateSearchSubmitted = "date_search_submitted"
         case dateSearchOutcome = "date_search_outcome"
-
         // Timeline tagging/comments/playback metrics
         case segmentHide = "segment_hide"
         case segmentUnhide = "segment_unhide"

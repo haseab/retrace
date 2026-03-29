@@ -42,7 +42,10 @@ public class FaviconProvider {
         return cache.image(for: normalizedDomain)
     }
 
-    public func loadFaviconIfNeeded(for domain: String, completion: @escaping (NSImage?) -> Void) {
+    public func loadFaviconIfNeeded(
+        for domain: String,
+        completion: @escaping (NSImage?) -> Void
+    ) {
         let normalizedDomain = normalizeDomain(domain)
         guard !normalizedDomain.isEmpty else {
             DispatchQueue.main.async { completion(nil) }
@@ -83,7 +86,10 @@ public class FaviconProvider {
         }
     }
 
-    public func fetchFaviconIfNeeded(for domain: String, completion: @escaping (NSImage?) -> Void) {
+    public func fetchFaviconIfNeeded(
+        for domain: String,
+        completion: @escaping (NSImage?) -> Void
+    ) {
         loadFaviconIfNeeded(for: domain, completion: completion)
     }
 
@@ -134,6 +140,7 @@ public class FaviconProvider {
                 self.finishRequest(domain: domain)
                 return
             }
+
             self.downloadFaviconImage(from: icoURL, domain: domain)
         }.resume()
     }
@@ -209,14 +216,16 @@ public class FaviconProvider {
     }
 
     private func downloadFaviconImage(from url: URL, domain: String) {
-        session.dataTask(with: url) { [weak self] data, response, error in
+        let isFallback = url.path == "/favicon.ico"
+
+        session.dataTask(with: url) { [weak self] data, response, _ in
             guard let self else { return }
 
             guard let data,
                   let httpResponse = response as? HTTPURLResponse,
                   (200...299).contains(httpResponse.statusCode),
                   let image = NSImage(data: data) else {
-                if url.path != "/favicon.ico" {
+                if !isFallback {
                     let fallbackURL = "https://\(domain)/favicon.ico"
                     if let icoURL = URL(string: fallbackURL) {
                         self.downloadFaviconImage(from: icoURL, domain: domain)
