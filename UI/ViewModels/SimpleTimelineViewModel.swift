@@ -14607,15 +14607,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         func finalizeParsedDate(_ parsedDate: Date) -> Date {
             let anchorMode = inferDateSearchAnchorMode(for: normalizedWithCompactTimes)
-            let dateForYearAdjustment: Date
-
-            // For date-only input ("Feb 23"), normalize to start-of-day before
-            // yearless-future coercion so "today" isn't treated as future.
-            if anchorMode == .firstFrameInDay {
-                dateForYearAdjustment = calendar.startOfDay(for: parsedDate)
-            } else {
-                dateForYearAdjustment = parsedDate
-            }
+            let dateForYearAdjustment = normalizedAnchorDate(parsedDate, mode: anchorMode, calendar: calendar)
 
             var normalized = adjustYearlessAbsoluteFutureDateToRecentPastIfNeeded(
                 dateForYearAdjustment,
@@ -14629,10 +14621,23 @@ public class SimpleTimelineViewModel: ObservableObject {
                 now: now,
                 calendar: calendar
             )
-            if anchorMode == .firstFrameInDay {
-                return calendar.startOfDay(for: normalized)
-            }
-            return normalized
+            return normalizedAnchorDate(normalized, mode: anchorMode, calendar: calendar)
+        }
+
+        if let standaloneMonthDate = parseStandaloneMonthReference(
+            normalizedRelativeInput,
+            now: now,
+            calendar: calendar
+        ) {
+            return finalizeParsedDate(standaloneMonthDate)
+        }
+
+        if let standaloneYearDate = parseStandaloneYearReference(
+            normalizedRelativeInput,
+            now: now,
+            calendar: calendar
+        ) {
+            return finalizeParsedDate(standaloneYearDate)
         }
 
         // === PRIMARY: SwiftyChrono NLP Parser ===
@@ -14691,6 +14696,8 @@ public class SimpleTimelineViewModel: ObservableObject {
             "MM/dd h:mm a",           // "12/16 6:05 PM"
             "yyyy-MM-dd HH:mm",       // "2024-12-16 18:05"
             "yyyy-MM-dd'T'HH:mm:ss",  // ISO 8601
+            "MMM yyyy",               // "Jul 2025"
+            "MMMM yyyy",              // "July 2025"
             "MMM d",                  // "Dec 16" (assumes current year, noon)
             "MMMM d",                 // "December 16"
         ]
@@ -14763,6 +14770,8 @@ public class SimpleTimelineViewModel: ObservableObject {
         case firstFrameInMinute
         case firstFrameInHour
         case firstFrameInDay
+        case firstFrameInMonth
+        case firstFrameInYear
     }
 
     private enum PlayheadRelativeDirection {
@@ -14889,8 +14898,8 @@ public class SimpleTimelineViewModel: ObservableObject {
         return anchoredTimestamp
     }
 
-    /// "X hour/day/month before|earlier", "X hour/day/month later|after", and "X hours ago"
-    /// should anchor to the edge frame of the full relative window, not an exact timestamp.
+    /// Relative before/after and ago expressions should anchor to the edge frame of the
+    /// full relative window, not an exact timestamp.
     private func relativeLookbackRangeIfNeeded(parsedDate: Date, input: String) -> RelativeLookbackRange? {
         if let range = playheadLookbackRangeIfNeeded(parsedDate: parsedDate, input: input) {
             return range
@@ -14954,26 +14963,20 @@ public class SimpleTimelineViewModel: ObservableObject {
             return nil
         }
 
-        switch offset.unit {
-        case .hour:
-            break
-        case .minute, .day, .week, .month, .year:
-            return nil
-        }
-
-        guard let endTimestamp = dateByApplyingPlayheadRelativeOffset(
+        let lookbackEnd = Date()
+        guard let lookbackStart = dateByApplyingPlayheadRelativeOffset(
             amount: offset.amount,
             unit: offset.unit,
-            directionSign: 1,
-            to: parsedDate
+            directionSign: -1,
+            to: lookbackEnd
         ) else {
             return nil
         }
 
-        if parsedDate <= endTimestamp {
-            return RelativeLookbackRange(start: parsedDate, end: endTimestamp, anchorEdge: .first)
+        if lookbackStart <= lookbackEnd {
+            return RelativeLookbackRange(start: lookbackStart, end: lookbackEnd, anchorEdge: .first)
         }
-        return RelativeLookbackRange(start: endTimestamp, end: parsedDate, anchorEdge: .first)
+        return RelativeLookbackRange(start: lookbackEnd, end: lookbackStart, anchorEdge: .first)
     }
 
     private func parseAgoRelativeOffset(_ normalizedText: String) -> PlayheadRelativeOffset? {
@@ -15002,12 +15005,109 @@ public class SimpleTimelineViewModel: ObservableObject {
         return PlayheadRelativeOffset(amount: amount, unit: unit, direction: .backward)
     }
 
+    private func parseStandaloneMonthReference(
+        _ normalizedText: String,
+        now: Date,
+        calendar: Calendar
+    ) -> Date? {
+        guard let currentMonthStart = calendar.dateInterval(of: .month, for: now)?.start else {
+            return nil
+        }
+
+        switch normalizedText {
+        case "last month":
+            return calendar.date(byAdding: .month, value: -1, to: currentMonthStart)
+        case "this month":
+            return currentMonthStart
+        case "next month":
+            return calendar.date(byAdding: .month, value: 1, to: currentMonthStart)
+        default:
+            return nil
+        }
+    }
+
+    private func parseStandaloneYearReference(
+        _ normalizedText: String,
+        now: Date,
+        calendar: Calendar
+    ) -> Date? {
+        if let explicitYear = parseExplicitStandaloneYear(normalizedText, calendar: calendar) {
+            return explicitYear
+        }
+
+        guard let currentYearStart = calendar.dateInterval(of: .year, for: now)?.start else {
+            return nil
+        }
+
+        switch normalizedText {
+        case "last year":
+            return calendar.date(byAdding: .year, value: -1, to: currentYearStart)
+        case "this year":
+            return currentYearStart
+        case "next year":
+            return calendar.date(byAdding: .year, value: 1, to: currentYearStart)
+        default:
+            return nil
+        }
+    }
+
+    private func parseExplicitStandaloneYear(_ normalizedText: String, calendar: Calendar) -> Date? {
+        guard normalizedText.range(of: #"^(?:19|20|21)\d{2}$"#, options: .regularExpression) != nil,
+              let year = Int(normalizedText) else {
+            return nil
+        }
+
+        var components = DateComponents()
+        components.calendar = calendar
+        components.timeZone = .current
+        components.year = year
+        components.month = 1
+        components.day = 1
+        components.hour = 0
+        components.minute = 0
+        components.second = 0
+        return calendar.date(from: components)
+    }
+
+    private func isStandaloneMonthBucketInput(_ normalizedText: String) -> Bool {
+        normalizedText.range(
+            of: #"^(?:last|this|next)\s+month$"#,
+            options: .regularExpression
+        ) != nil
+    }
+
+    private func isStandaloneYearBucketInput(_ normalizedText: String) -> Bool {
+        if normalizedText.range(of: #"^(?:19|20|21)\d{2}$"#, options: .regularExpression) != nil {
+            return true
+        }
+
+        return normalizedText.range(
+            of: #"^(?:last|this|next)\s+year$"#,
+            options: .regularExpression
+        ) != nil
+    }
+
     private func inferDateSearchAnchorMode(for input: String) -> DateSearchAnchorMode {
         let normalized = input
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
         let normalizedRelativeInput = normalizeRelativeDateShorthand(normalized)
         let normalizedWithCompactTimes = normalizeCompactTimeFormat(normalizedRelativeInput)
+
+        if isStandaloneMonthBucketInput(normalizedRelativeInput) {
+            return .firstFrameInMonth
+        }
+
+        if isStandaloneYearBucketInput(normalizedRelativeInput) {
+            return .firstFrameInYear
+        }
+
+        if normalizedRelativeInput.range(
+            of: #"^(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)(?:\s+\d{4})?$"#,
+            options: .regularExpression
+        ) != nil {
+            return .firstFrameInMonth
+        }
 
         if normalizedRelativeInput.range(
             of: #"\b\d+\s*(minute|minutes|min|mins)\s+ago\b"#,
@@ -15063,12 +15163,33 @@ public class SimpleTimelineViewModel: ObservableObject {
             interval = calendar.dateInterval(of: .hour, for: date)
         case .firstFrameInDay:
             interval = calendar.dateInterval(of: .day, for: date)
+        case .firstFrameInMonth:
+            interval = calendar.dateInterval(of: .month, for: date)
+        case .firstFrameInYear:
+            interval = calendar.dateInterval(of: .year, for: date)
         }
 
         guard let interval else { return nil }
         let inclusiveEnd = interval.end.addingTimeInterval(-Self.boundedLoadBoundaryEpsilonSeconds)
         guard inclusiveEnd >= interval.start else { return nil }
         return (start: interval.start, end: inclusiveEnd)
+    }
+
+    private func normalizedAnchorDate(
+        _ date: Date,
+        mode: DateSearchAnchorMode,
+        calendar: Calendar
+    ) -> Date {
+        switch mode {
+        case .firstFrameInDay:
+            return calendar.startOfDay(for: date)
+        case .firstFrameInMonth:
+            return calendar.dateInterval(of: .month, for: date)?.start ?? date
+        case .firstFrameInYear:
+            return calendar.dateInterval(of: .year, for: date)?.start ?? date
+        case .exact, .firstFrameInMinute, .firstFrameInHour:
+            return date
+        }
     }
 
     /// Yearless absolute inputs (e.g. "dec 18 2pm") should prefer recent history for timeline jumps.

@@ -143,6 +143,56 @@ final class DateJumpTimeOnlyParsingTests: XCTestCase {
         assertDateComponents(result, year: 2024, month: 2, day: 28, hour: 0, minute: 0)
     }
 
+    func testYearOnlyInputParsesAsStartOfYear() {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let now = makeDate(year: 2026, month: 3, day: 1, hour: 9, minute: 0)
+
+        guard let result = viewModel.test_parseNaturalLanguageDateForDateSearch("2024", now: now) else {
+            XCTFail("Expected parser to resolve year-only input")
+            return
+        }
+
+        assertDateComponents(result, year: 2024, month: 1, day: 1, hour: 0, minute: 0)
+    }
+
+    func testLastYearInputParsesAsStartOfPreviousYear() {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let now = makeDate(year: 2026, month: 3, day: 1, hour: 9, minute: 0)
+
+        guard let result = viewModel.test_parseNaturalLanguageDateForDateSearch("last year", now: now) else {
+            XCTFail("Expected parser to resolve last-year input")
+            return
+        }
+
+        assertDateComponents(result, year: 2025, month: 1, day: 1, hour: 0, minute: 0)
+    }
+
+    func testLastMonthInputParsesAsStartOfPreviousMonth() {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let now = makeDate(year: 2026, month: 8, day: 5, hour: 9, minute: 0)
+
+        guard let result = viewModel.test_parseNaturalLanguageDateForDateSearch("last month", now: now) else {
+            XCTFail("Expected parser to resolve last-month input")
+            return
+        }
+
+        assertDateComponents(result, year: 2026, month: 7, day: 1, hour: 0, minute: 0)
+    }
+
+    func testMonthAndYearInputParses() {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let now = makeDate(year: 2026, month: 3, day: 1, hour: 9, minute: 0)
+
+        guard let result = viewModel.test_parseNaturalLanguageDateForDateSearch("july 2025", now: now) else {
+            XCTFail("Expected parser to resolve month and year input")
+            return
+        }
+
+        let components = Calendar.current.dateComponents([.year, .month], from: result)
+        XCTAssertEqual(components.year, 2025)
+        XCTAssertEqual(components.month, 7)
+    }
+
     private func makeDate(year: Int, month: Int, day: Int, hour: Int, minute: Int) -> Date {
         let calendar = Calendar.current
         let components = DateComponents(

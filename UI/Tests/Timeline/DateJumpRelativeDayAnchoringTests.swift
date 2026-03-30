@@ -7,26 +7,138 @@ import App
 
 @MainActor
 final class DateJumpRelativeDayAnchoringTests: XCTestCase {
-    func testDaysAgoUsesFirstFrameInResolvedDay() async {
+    func testYearOnlyUsesFirstFrameInResolvedYear() async {
         let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let calendar = Calendar.current
+        let year = makeDate(year: 2024, month: 1, day: 1, hour: 0, minute: 0)
+        guard let yearInterval = calendar.dateInterval(of: .year, for: year) else {
+            XCTFail("Failed to construct expected year interval")
+            return
+        }
+
         var anchoredTimestamp: Date?
-        var sawDayAnchorFetch = false
+        var sawYearAnchorFetch = false
         var sawWindowFetch = false
 
         viewModel.test_windowFetchHooks.getFramesWithVideoInfo = { start, end, limit, _, reason in
             switch reason {
-            case "searchForDate.anchor.firstFrameInDay":
-                sawDayAnchorFetch = true
+            case "searchForDate.anchor.firstFrameInYear":
+                sawYearAnchorFetch = true
                 XCTAssertEqual(limit, 1)
-                XCTAssertGreaterThan(end.timeIntervalSince(start), (24 * 60 * 60) - 1)
-                let firstFrameInDay = start.addingTimeInterval(123)
-                anchoredTimestamp = firstFrameInDay
-                return [self.makeFrameWithVideoInfo(id: 7001, timestamp: firstFrameInDay, processingStatus: 4)]
+                XCTAssertEqual(start.timeIntervalSince(yearInterval.start), 0, accuracy: 0.01)
+                XCTAssertEqual(end.timeIntervalSince(yearInterval.end), -0.001, accuracy: 0.01)
+                let firstFrameInYear = start.addingTimeInterval(123)
+                anchoredTimestamp = firstFrameInYear
+                return [self.makeFrameWithVideoInfo(id: 6899, timestamp: firstFrameInYear, processingStatus: 4)]
 
             case "searchForDate":
                 sawWindowFetch = true
                 guard let anchoredTimestamp else {
-                    XCTFail("Expected day anchor to resolve before window fetch")
+                    XCTFail("Expected year anchor to resolve before window fetch")
+                    return []
+                }
+                XCTAssertEqual(limit, 1000)
+                XCTAssertEqual(start.timeIntervalSince(anchoredTimestamp), -600, accuracy: 0.01)
+                XCTAssertEqual(end.timeIntervalSince(anchoredTimestamp), 600, accuracy: 0.01)
+                return [self.makeFrameWithVideoInfo(id: 6899, timestamp: anchoredTimestamp, processingStatus: 4)]
+
+            case "loadNewerFrames.reason=searchForDate",
+                 "loadOlderFrames.reason=searchForDate":
+                return []
+
+            default:
+                XCTFail("Unexpected fetch reason: \(reason)")
+                return []
+            }
+        }
+
+        await viewModel.searchForDate("2024")
+
+        XCTAssertTrue(sawYearAnchorFetch)
+        XCTAssertTrue(sawWindowFetch)
+        XCTAssertEqual(viewModel.currentTimelineFrame?.frame.id.value, 6899)
+        XCTAssertEqual(viewModel.currentTimelineFrame?.frame.timestamp, anchoredTimestamp)
+    }
+
+    func testMonthAndYearUseFirstFrameInResolvedMonth() async {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let calendar = Calendar.current
+        let month = makeDate(year: 2025, month: 7, day: 1, hour: 0, minute: 0)
+        guard let monthInterval = calendar.dateInterval(of: .month, for: month) else {
+            XCTFail("Failed to construct expected month interval")
+            return
+        }
+
+        var anchoredTimestamp: Date?
+        var sawMonthAnchorFetch = false
+        var sawWindowFetch = false
+
+        viewModel.test_windowFetchHooks.getFramesWithVideoInfo = { start, end, limit, _, reason in
+            switch reason {
+            case "searchForDate.anchor.firstFrameInMonth":
+                sawMonthAnchorFetch = true
+                XCTAssertEqual(limit, 1)
+                XCTAssertEqual(start.timeIntervalSince(monthInterval.start), 0, accuracy: 0.01)
+                XCTAssertEqual(end.timeIntervalSince(monthInterval.end), -0.001, accuracy: 0.01)
+                let firstFrameInMonth = start.addingTimeInterval(123)
+                anchoredTimestamp = firstFrameInMonth
+                return [self.makeFrameWithVideoInfo(id: 6999, timestamp: firstFrameInMonth, processingStatus: 4)]
+
+            case "searchForDate":
+                sawWindowFetch = true
+                guard let anchoredTimestamp else {
+                    XCTFail("Expected month anchor to resolve before window fetch")
+                    return []
+                }
+                XCTAssertEqual(limit, 1000)
+                XCTAssertEqual(start.timeIntervalSince(anchoredTimestamp), -600, accuracy: 0.01)
+                XCTAssertEqual(end.timeIntervalSince(anchoredTimestamp), 600, accuracy: 0.01)
+                return [self.makeFrameWithVideoInfo(id: 6999, timestamp: anchoredTimestamp, processingStatus: 4)]
+
+            case "loadNewerFrames.reason=searchForDate",
+                 "loadOlderFrames.reason=searchForDate":
+                return []
+
+            default:
+                XCTFail("Unexpected fetch reason: \(reason)")
+                return []
+            }
+        }
+
+        await viewModel.searchForDate("july 2025")
+
+        XCTAssertTrue(sawMonthAnchorFetch)
+        XCTAssertTrue(sawWindowFetch)
+        XCTAssertEqual(viewModel.currentTimelineFrame?.frame.id.value, 6999)
+        XCTAssertEqual(viewModel.currentTimelineFrame?.frame.timestamp, anchoredTimestamp)
+    }
+
+    func testDaysAgoUsesFirstFrameInRecentLookbackWindow() async {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let calendar = Calendar.current
+        var anchoredTimestamp: Date?
+        var sawLookbackAnchorFetch = false
+        var sawWindowFetch = false
+
+        viewModel.test_windowFetchHooks.getFramesWithVideoInfo = { start, end, limit, _, reason in
+            switch reason {
+            case "searchForDate.anchor.firstFrameInRelativeLookback":
+                sawLookbackAnchorFetch = true
+                XCTAssertEqual(limit, 1)
+                XCTAssertLessThan(abs(end.timeIntervalSinceNow), 5.0)
+                guard let reconstructedEnd = calendar.date(byAdding: .day, value: 2, to: start) else {
+                    XCTFail("Expected two-day lookback window")
+                    return []
+                }
+                XCTAssertEqual(reconstructedEnd.timeIntervalSince(end), 0, accuracy: 1.0)
+                let firstFrameInLookbackWindow = start.addingTimeInterval(123)
+                anchoredTimestamp = firstFrameInLookbackWindow
+                return [self.makeFrameWithVideoInfo(id: 7001, timestamp: firstFrameInLookbackWindow, processingStatus: 4)]
+
+            case "searchForDate":
+                sawWindowFetch = true
+                guard let anchoredTimestamp else {
+                    XCTFail("Expected lookback anchor to resolve before window fetch")
                     return []
                 }
                 XCTAssertEqual(limit, 1000)
@@ -46,7 +158,7 @@ final class DateJumpRelativeDayAnchoringTests: XCTestCase {
 
         await viewModel.searchForDate("2 days ago")
 
-        XCTAssertTrue(sawDayAnchorFetch)
+        XCTAssertTrue(sawLookbackAnchorFetch)
         XCTAssertTrue(sawWindowFetch)
         XCTAssertEqual(viewModel.currentTimelineFrame?.frame.id.value, 7001)
         XCTAssertEqual(viewModel.currentTimelineFrame?.frame.timestamp, anchoredTimestamp)
@@ -64,17 +176,18 @@ final class DateJumpRelativeDayAnchoringTests: XCTestCase {
 
         viewModel.test_windowFetchHooks.getFramesWithVideoInfo = { start, end, limit, filters, reason in
             switch reason {
-            case "searchForDate.anchor.firstFrameInDay":
+            case "searchForDate.anchor.firstFrameInRelativeLookback":
                 anchorFilters.append(filters)
                 XCTAssertEqual(limit, 1)
-                let firstFrameInDay = start.addingTimeInterval(90)
-                anchoredTimestamp = firstFrameInDay
-                return [self.makeFrameWithVideoInfo(id: 7101, timestamp: firstFrameInDay, processingStatus: 4)]
+                XCTAssertLessThan(abs(end.timeIntervalSinceNow), 5.0)
+                let firstFrameInLookbackWindow = start.addingTimeInterval(90)
+                anchoredTimestamp = firstFrameInLookbackWindow
+                return [self.makeFrameWithVideoInfo(id: 7101, timestamp: firstFrameInLookbackWindow, processingStatus: 4)]
 
             case "searchForDate":
                 windowFilters.append(filters)
                 guard let anchoredTimestamp else {
-                    XCTFail("Expected day anchor to resolve before window fetch")
+                    XCTFail("Expected lookback anchor to resolve before window fetch")
                     return []
                 }
                 XCTAssertEqual(start.timeIntervalSince(anchoredTimestamp), -600, accuracy: 0.01)
@@ -99,6 +212,106 @@ final class DateJumpRelativeDayAnchoringTests: XCTestCase {
         XCTAssertEqual(windowFilters.first?.selectedApps, expectedFilters.selectedApps)
         XCTAssertEqual(viewModel.filterCriteria.selectedApps, expectedFilters.selectedApps)
         XCTAssertEqual(viewModel.pendingFilterCriteria.selectedApps, expectedFilters.selectedApps)
+    }
+
+    func testMonthsAgoUsesFirstFrameInRecentLookbackWindow() async {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let calendar = Calendar.current
+        var anchoredTimestamp: Date?
+        var sawLookbackAnchorFetch = false
+        var sawWindowFetch = false
+
+        viewModel.test_windowFetchHooks.getFramesWithVideoInfo = { start, end, limit, _, reason in
+            switch reason {
+            case "searchForDate.anchor.firstFrameInRelativeLookback":
+                sawLookbackAnchorFetch = true
+                XCTAssertEqual(limit, 1)
+                XCTAssertLessThan(abs(end.timeIntervalSinceNow), 5.0)
+                guard let reconstructedEnd = calendar.date(byAdding: .month, value: 2, to: start) else {
+                    XCTFail("Expected two-month lookback window")
+                    return []
+                }
+                XCTAssertEqual(reconstructedEnd.timeIntervalSince(end), 0, accuracy: 1.0)
+                let firstFrameInLookbackWindow = start.addingTimeInterval(150)
+                anchoredTimestamp = firstFrameInLookbackWindow
+                return [self.makeFrameWithVideoInfo(id: 7210, timestamp: firstFrameInLookbackWindow, processingStatus: 4)]
+
+            case "searchForDate":
+                sawWindowFetch = true
+                guard let anchoredTimestamp else {
+                    XCTFail("Expected month lookback anchor to resolve before window fetch")
+                    return []
+                }
+                XCTAssertEqual(start.timeIntervalSince(anchoredTimestamp), -600, accuracy: 0.01)
+                XCTAssertEqual(end.timeIntervalSince(anchoredTimestamp), 600, accuracy: 0.01)
+                return [self.makeFrameWithVideoInfo(id: 7210, timestamp: anchoredTimestamp, processingStatus: 4)]
+
+            case "loadNewerFrames.reason=searchForDate",
+                 "loadOlderFrames.reason=searchForDate":
+                return []
+
+            default:
+                XCTFail("Unexpected fetch reason: \(reason)")
+                return []
+            }
+        }
+
+        await viewModel.searchForDate("2 months ago")
+
+        XCTAssertTrue(sawLookbackAnchorFetch)
+        XCTAssertTrue(sawWindowFetch)
+        XCTAssertEqual(viewModel.currentTimelineFrame?.frame.id.value, 7210)
+        XCTAssertEqual(viewModel.currentTimelineFrame?.frame.timestamp, anchoredTimestamp)
+    }
+
+    func testYearsAgoUsesFirstFrameInRecentLookbackWindow() async {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let calendar = Calendar.current
+        var anchoredTimestamp: Date?
+        var sawLookbackAnchorFetch = false
+        var sawWindowFetch = false
+
+        viewModel.test_windowFetchHooks.getFramesWithVideoInfo = { start, end, limit, _, reason in
+            switch reason {
+            case "searchForDate.anchor.firstFrameInRelativeLookback":
+                sawLookbackAnchorFetch = true
+                XCTAssertEqual(limit, 1)
+                XCTAssertLessThan(abs(end.timeIntervalSinceNow), 5.0)
+                guard let reconstructedEnd = calendar.date(byAdding: .year, value: 1, to: start) else {
+                    XCTFail("Expected one-year lookback window")
+                    return []
+                }
+                XCTAssertEqual(reconstructedEnd.timeIntervalSince(end), 0, accuracy: 1.0)
+                let firstFrameInLookbackWindow = start.addingTimeInterval(165)
+                anchoredTimestamp = firstFrameInLookbackWindow
+                return [self.makeFrameWithVideoInfo(id: 7211, timestamp: firstFrameInLookbackWindow, processingStatus: 4)]
+
+            case "searchForDate":
+                sawWindowFetch = true
+                guard let anchoredTimestamp else {
+                    XCTFail("Expected year lookback anchor to resolve before window fetch")
+                    return []
+                }
+                XCTAssertEqual(start.timeIntervalSince(anchoredTimestamp), -600, accuracy: 0.01)
+                XCTAssertEqual(end.timeIntervalSince(anchoredTimestamp), 600, accuracy: 0.01)
+                return [self.makeFrameWithVideoInfo(id: 7211, timestamp: anchoredTimestamp, processingStatus: 4)]
+
+            case "loadNewerFrames.reason=searchForDate",
+                 "loadOlderFrames.reason=searchForDate":
+                return []
+
+            default:
+                XCTFail("Unexpected fetch reason: \(reason)")
+                return []
+            }
+        }
+
+        await viewModel.searchForDate("1 year ago")
+
+        XCTAssertTrue(sawLookbackAnchorFetch)
+        XCTAssertTrue(sawWindowFetch)
+        XCTAssertEqual(viewModel.currentTimelineFrame?.frame.id.value, 7211)
+        XCTAssertEqual(viewModel.currentTimelineFrame?.frame.timestamp, anchoredTimestamp)
     }
 
     func testHoursAgoUsesFirstFrameInRecentLookbackWindowWithinActiveFilters() async {
