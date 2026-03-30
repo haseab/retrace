@@ -3236,7 +3236,7 @@ struct OCRMemoryBackpressurePolicy: Sendable {
         largestDisplayPixelCount: UInt64? = nil
     ) -> OCRMemoryBackpressurePolicy {
         let enabled = defaults.object(forKey: enabledDefaultsKey) == nil
-            ? true
+            ? false
             : defaults.bool(forKey: enabledDefaultsKey)
 
         let detectedLargestDisplayPixelCount = largestDisplayPixelCount

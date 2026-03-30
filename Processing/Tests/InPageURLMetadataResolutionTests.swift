@@ -553,7 +553,7 @@ final class OCRMemoryBackpressurePolicyTests: XCTestCase {
         XCTAssertFalse(policy.shouldPause(footprintBytes: 59, currentlyPaused: true))
     }
 
-    func testDefaultsUseBaseThresholdsForReferenceDisplaySize() {
+    func testDefaultsDisableBackpressureForReferenceDisplaySize() {
         let suiteName = "OCRMemoryBackpressurePolicyTests.reference.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
 
@@ -562,7 +562,7 @@ final class OCRMemoryBackpressurePolicyTests: XCTestCase {
             largestDisplayPixelCount: OCRMemoryBackpressurePolicy.referenceDisplayPixelCount
         )
 
-        XCTAssertTrue(policy.enabled)
+        XCTAssertFalse(policy.enabled)
         XCTAssertEqual(policy.pauseThresholdBytes, OCRMemoryBackpressurePolicy.defaultPauseThresholdBytes)
         XCTAssertEqual(policy.resumeThresholdBytes, OCRMemoryBackpressurePolicy.defaultResumeThresholdBytes)
         XCTAssertEqual(policy.pollIntervalNs, 1_000_000_000)
