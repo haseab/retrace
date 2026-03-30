@@ -2,31 +2,21 @@ import XCTest
 @testable import Retrace
 import App
 import Shared
-import App
 
 final class SearchHighlightTooltipTests: XCTestCase {
-    func testTooltipSafeZoneIncludesBridgeBetweenHighlightAndTooltip() {
+    func testTooltipDismissesClicksInsideTooltipFrameBecauseTooltipIsNotInteractive() {
         let tooltipFrame = CGRect(x: 120, y: 60, width: 210, height: 34)
-        let sourceRect = CGRect(x: 180, y: 120, width: 80, height: 24)
+        let highlightedRects = [
+            CGRect(x: 180, y: 120, width: 80, height: 24)
+        ]
 
-        let safeZone = SearchHighlightOverlay.tooltipInteractionSafeZone(
-            tooltipFrame: tooltipFrame,
-            sourceRect: sourceRect
+        XCTAssertTrue(
+            SearchHighlightOverlay.shouldDismissTooltip(
+                for: CGPoint(x: 180, y: 76),
+                highlightedRects: highlightedRects,
+                tooltipFrame: tooltipFrame
+            )
         )
-
-        XCTAssertTrue(safeZone.contains(CGPoint(x: 220, y: 100)))
-    }
-
-    func testTooltipSafeZoneDoesNotExtendAcrossWholeHighlightedRow() {
-        let tooltipFrame = CGRect(x: 120, y: 60, width: 210, height: 34)
-        let sourceRect = CGRect(x: 180, y: 120, width: 80, height: 24)
-
-        let safeZone = SearchHighlightOverlay.tooltipInteractionSafeZone(
-            tooltipFrame: tooltipFrame,
-            sourceRect: sourceRect
-        )
-
-        XCTAssertFalse(safeZone.contains(CGPoint(x: sourceRect.maxX + 8, y: sourceRect.midY)))
     }
 
     func testTooltipDismissesOutsideClicks() {
@@ -44,7 +34,7 @@ final class SearchHighlightTooltipTests: XCTestCase {
         )
     }
 
-    func testTooltipStaysVisibleForClicksInsideHighlightOrTooltip() {
+    func testTooltipStaysVisibleForClicksInsideHighlight() {
         let tooltipFrame = CGRect(x: 120, y: 60, width: 210, height: 34)
         let highlightedRects = [
             CGRect(x: 180, y: 120, width: 80, height: 24)
@@ -57,13 +47,53 @@ final class SearchHighlightTooltipTests: XCTestCase {
                 tooltipFrame: tooltipFrame
             )
         )
-        XCTAssertFalse(
-            SearchHighlightOverlay.shouldDismissTooltip(
-                for: CGPoint(x: 180, y: 76),
-                highlightedRects: highlightedRects,
-                tooltipFrame: tooltipFrame
-            )
+    }
+
+    func testHighlightedSearchNodesUsePointingHandCursorInTextSelectionOverlay() {
+        let mode = TextSelectionView.preferredCursorMode(
+            at: CGPoint(x: 210, y: 132),
+            nodeData: [],
+            hyperlinkEntries: [],
+            searchHighlightedRects: [
+                CGRect(x: 180, y: 120, width: 80, height: 24)
+            ]
         )
+
+        XCTAssertEqual(mode, .pointingHand)
+    }
+
+    func testSelectionOverlaySearchHighlightRectUsesFlippedYCoordinates() {
+        let node = OCRNodeWithText(
+            id: 9,
+            frameId: 42,
+            x: 0.20,
+            y: 0.25,
+            width: 0.30,
+            height: 0.10,
+            text: "highlighted text"
+        )
+        let actualFrameRect = CGRect(x: 24, y: 32, width: 400, height: 200)
+
+        let rect = TextSelectionView.searchHighlightRect(
+            for: node,
+            in: actualFrameRect
+        )
+
+        let expectedBaseRect = CGRect(
+            x: actualFrameRect.origin.x + (node.x * actualFrameRect.width),
+            y: actualFrameRect.origin.y + ((1.0 - node.y - node.height) * actualFrameRect.height),
+            width: node.width * actualFrameRect.width,
+            height: node.height * actualFrameRect.height
+        )
+        let expectedRect = SearchHighlightOverlay.paddedHighlightRect(
+            expectedBaseRect,
+            within: actualFrameRect
+        )
+
+        XCTAssertEqual(rect.minX, expectedRect.minX, accuracy: 0.001)
+        XCTAssertEqual(rect.minY, expectedRect.minY, accuracy: 0.001)
+        XCTAssertEqual(rect.width, expectedRect.width, accuracy: 0.001)
+        XCTAssertEqual(rect.height, expectedRect.height, accuracy: 0.001)
     }
 
     func testPaddedHighlightRectExpandsBeyondOriginalBounds() {
@@ -180,7 +210,7 @@ final class SearchHighlightTooltipTests: XCTestCase {
         )
 
         XCTAssertEqual(tooltipFrame.midX, nodeRect.midX, accuracy: 0.5)
-        XCTAssertLessThan(tooltipFrame.maxY, nodeRect.maxY)
+        XCTAssertLessThan(tooltipFrame.maxY, nodeRect.minY)
     }
 
     @MainActor
@@ -193,7 +223,7 @@ final class SearchHighlightTooltipTests: XCTestCase {
         )
 
         XCTAssertEqual(tooltipFrame.midX, nodeRect.midX, accuracy: 0.5)
-        XCTAssertGreaterThan(tooltipFrame.minY, nodeRect.minY)
+        XCTAssertGreaterThan(tooltipFrame.minY, nodeRect.maxY)
     }
 
     @MainActor

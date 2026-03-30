@@ -860,6 +860,17 @@ public class SimpleTimelineViewModel: ObservableObject {
             }
         }
 
+        var tooltipText: String {
+            switch self {
+            case .queued:
+                return "Queued..."
+            case .reveal:
+                return "Reveal"
+            case .copyText:
+                return "Copy text"
+            }
+        }
+
         var isInteractive: Bool {
             switch self {
             case .queued:

@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import Shared
 import App
 import UniformTypeIdentifiers
@@ -1575,6 +1576,28 @@ struct MoreOptionsMenu: View {
 // MARK: - Instant Tooltip
 
 /// Custom instant tooltip that appears above the view on hover
+enum TimelineHoverTooltipStyle {
+    static let fontSize: CGFloat = 13
+    static let horizontalPadding: CGFloat = 12
+    static let verticalPadding: CGFloat = 6
+    static let backgroundColor = Color(white: 0.11)
+
+    static var font: Font {
+        .system(size: fontSize, weight: .medium)
+    }
+
+    static var height: CGFloat {
+        let font = NSFont.systemFont(ofSize: fontSize, weight: .medium)
+        return ceil(font.ascender - font.descender + font.leading + (verticalPadding * 2))
+    }
+
+    static func width(for text: String) -> CGFloat {
+        let font = NSFont.systemFont(ofSize: fontSize, weight: .medium)
+        let size = (text as NSString).size(withAttributes: [.font: font])
+        return ceil(size.width + (horizontalPadding * 2))
+    }
+}
+
 struct InstantTooltip: ViewModifier {
     let text: String
     @Binding var isVisible: Bool
@@ -1584,15 +1607,15 @@ struct InstantTooltip: ViewModifier {
             .overlay(alignment: .top) {
                 if isVisible {
                     Text(text)
-                        .font(.system(size: 13, weight: .medium))
+                        .font(TimelineHoverTooltipStyle.font)
                         .foregroundColor(.white)
                         .lineLimit(1)
                         .fixedSize()
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 6)
+                        .padding(.horizontal, TimelineHoverTooltipStyle.horizontalPadding)
+                        .padding(.vertical, TimelineHoverTooltipStyle.verticalPadding)
                         .background(
                             Capsule()
-                                .fill(Color(white: 0.11))
+                                .fill(TimelineHoverTooltipStyle.backgroundColor)
                         )
                         .offset(y: -44)
                         .transition(.opacity.combined(with: .offset(y: 4)))

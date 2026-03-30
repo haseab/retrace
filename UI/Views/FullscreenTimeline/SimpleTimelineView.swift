@@ -3035,12 +3035,11 @@ struct RedactionTooltipOverlay: View {
     let onReveal: (OCRNodeWithText) -> Void
     let onCopyText: (OCRNodeWithText) -> Void
     @State private var escapeMonitor: Any?
-    @State private var hoveredNodeIDs: Set<Int> = []
-    @State private var hoveredButtonIDs: Set<Int> = []
+    @State private var hoveredNodeID: Int?
 
-    private let buttonHeight: CGFloat = 30
+    private let tooltipHeight: CGFloat = TimelineHoverTooltipStyle.height
     private let edgePadding: CGFloat = 14
-    private let buttonOverlap: CGFloat = 2
+    private let tooltipGap: CGFloat = 10
 
     private var hoverEntries: [RedactionTooltipHoverEntry] {
         entries.compactMap { entry in
@@ -3057,7 +3056,8 @@ struct RedactionTooltipOverlay: View {
         ZStack(alignment: .topLeading) {
             RedactionTooltipHoverTracker(
                 entries: hoverEntries,
-                onHoveredNodeChanged: handleHoveredNodeChanged
+                onHoveredNodeChanged: handleHoveredNodeChanged,
+                onPrimaryClick: handlePrimaryClick(at:)
             )
             .frame(width: containerSize.width, height: containerSize.height)
 
@@ -3068,32 +3068,15 @@ struct RedactionTooltipOverlay: View {
                         state: tooltipState,
                         containerSize: containerSize,
                         edgePadding: edgePadding,
-                        buttonHeight: buttonHeight,
-                        buttonOverlap: buttonOverlap
+                        tooltipHeight: tooltipHeight,
+                        tooltipGap: tooltipGap
                     )
 
-                    if isTooltipVisible(for: entry.node.id) {
-                        Group {
-                            if tooltipState.isInteractive {
-                                Button {
-                                    handlePrimaryAction(for: entry.node, state: tooltipState)
-                                } label: {
-                                    tooltipLabel(for: tooltipState)
-                                }
-                                .buttonStyle(.plain)
-                            } else {
-                                tooltipLabel(for: tooltipState)
-                                    .contentShape(Capsule())
-                                    .onTapGesture {
-                                        // Disabled-looking queued state still absorbs direct taps.
-                                    }
-                            }
-                        }
+                    if hoveredNodeID == entry.node.id {
+                        tooltipLabel(for: tooltipState)
                         .frame(width: tooltipFrame.width, height: tooltipFrame.height)
                         .offset(x: tooltipFrame.minX, y: tooltipFrame.minY)
-                        .onHover { hovering in
-                            updateButtonHoverState(hovering, for: entry.node.id)
-                        }
+                        .allowsHitTesting(false)
                         .transition(.opacity.combined(with: .scale(scale: 0.94)))
                         .zIndex(1)
                     }
@@ -3101,26 +3084,23 @@ struct RedactionTooltipOverlay: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .animation(.easeOut(duration: 0.12), value: hoveredNodeIDs)
-        .animation(.easeOut(duration: 0.12), value: hoveredButtonIDs)
+        .animation(.easeOut(duration: 0.12), value: hoveredNodeID)
         .onChange(of: entries.map(\.node.id)) { nodeIDs in
-            let visibleNodeIDs = Set(nodeIDs)
-            hoveredNodeIDs.formIntersection(visibleNodeIDs)
-            hoveredButtonIDs.formIntersection(visibleNodeIDs)
+            if let hoveredNodeID, !nodeIDs.contains(hoveredNodeID) {
+                clearHoveredNode()
+            }
         }
         .onAppear {
             guard escapeMonitor == nil else { return }
             escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
                 guard event.keyCode == 53 else { return event }
-                guard !hoveredNodeIDs.isEmpty || !hoveredButtonIDs.isEmpty else { return event }
-                hoveredNodeIDs.removeAll()
-                hoveredButtonIDs.removeAll()
+                guard hoveredNodeID != nil else { return event }
+                clearHoveredNode()
                 return nil
             }
         }
         .onDisappear {
-            hoveredNodeIDs.removeAll()
-            hoveredButtonIDs.removeAll()
+            clearHoveredNode()
             if let escapeMonitor {
                 NSEvent.removeMonitor(escapeMonitor)
                 self.escapeMonitor = nil
@@ -3128,19 +3108,17 @@ struct RedactionTooltipOverlay: View {
         }
     }
 
-    private func isTooltipVisible(for nodeID: Int) -> Bool {
-        hoveredNodeIDs.contains(nodeID) || hoveredButtonIDs.contains(nodeID)
-    }
-
     private func handleHoveredNodeChanged(_ nodeID: Int?) {
-        hoveredNodeIDs.removeAll()
-
         guard let nodeID,
               let hoveredEntry = hoverEntries.first(where: { $0.nodeID == nodeID }) else {
+            clearHoveredNode()
             return
         }
 
-        hoveredNodeIDs.insert(nodeID)
+        guard hoveredNodeID != nodeID else { return }
+
+        hoveredNodeID = nodeID
+        viewModel.showRedactionTooltip(for: nodeID)
         viewModel.showRedactionTooltip(for: nodeID, state: hoveredEntry.tooltipState)
     }
 
@@ -3158,12 +3136,20 @@ struct RedactionTooltipOverlay: View {
         }
     }
 
-    private func updateButtonHoverState(_ isHovering: Bool, for nodeID: Int) {
-        if isHovering {
-            hoveredButtonIDs.insert(nodeID)
-        } else {
-            hoveredButtonIDs.remove(nodeID)
+    private func handlePrimaryClick(at location: CGPoint) -> Bool {
+        guard let matchedEntry = entries.first(where: { Self.triggerFrame(for: $0.rect).contains(location) }),
+              let tooltipState = matchedEntry.tooltipState,
+              tooltipState.isInteractive else {
+            return false
         }
+
+        handlePrimaryAction(for: matchedEntry.node, state: tooltipState)
+        return true
+    }
+
+    private func clearHoveredNode() {
+        hoveredNodeID = nil
+        viewModel.dismissRedactionTooltip()
     }
 
     static func triggerFrame(for rect: CGRect) -> CGRect {
@@ -3178,14 +3164,7 @@ struct RedactionTooltipOverlay: View {
     private func tooltipWidth(
         for state: SimpleTimelineViewModel.PhraseLevelRedactionTooltipState
     ) -> CGFloat {
-        switch state {
-        case .queued:
-            return 94
-        case .reveal:
-            return 78
-        case .copyText:
-            return 92
-        }
+        TimelineHoverTooltipStyle.width(for: state.tooltipText)
     }
 
     private func tooltipForegroundColor(
@@ -3197,30 +3176,25 @@ struct RedactionTooltipOverlay: View {
     private func tooltipBackgroundColor(
         for state: SimpleTimelineViewModel.PhraseLevelRedactionTooltipState
     ) -> Color {
-        state.isInteractive ? Color.black.opacity(0.84) : Color.black.opacity(0.58)
-    }
-
-    private func tooltipBorderColor(
-        for state: SimpleTimelineViewModel.PhraseLevelRedactionTooltipState
-    ) -> Color {
-        state.isInteractive ? Color.white.opacity(0.22) : Color.white.opacity(0.12)
+        state.isInteractive
+            ? TimelineHoverTooltipStyle.backgroundColor
+            : TimelineHoverTooltipStyle.backgroundColor.opacity(0.72)
     }
 
     @ViewBuilder
     private func tooltipLabel(
         for state: SimpleTimelineViewModel.PhraseLevelRedactionTooltipState
     ) -> some View {
-        Text(state.title)
-            .font(.system(size: 11, weight: .semibold))
+        Text(state.tooltipText)
+            .font(TimelineHoverTooltipStyle.font)
             .foregroundColor(tooltipForegroundColor(for: state))
-            .frame(width: tooltipWidth(for: state), height: buttonHeight)
+            .lineLimit(1)
+            .fixedSize()
+            .padding(.horizontal, TimelineHoverTooltipStyle.horizontalPadding)
+            .padding(.vertical, TimelineHoverTooltipStyle.verticalPadding)
             .background(
                 Capsule()
                     .fill(tooltipBackgroundColor(for: state))
-            )
-            .overlay(
-                Capsule()
-                    .stroke(tooltipBorderColor(for: state), lineWidth: 1)
             )
     }
 
@@ -3229,18 +3203,10 @@ struct RedactionTooltipOverlay: View {
         state: SimpleTimelineViewModel.PhraseLevelRedactionTooltipState,
         containerSize: CGSize,
         edgePadding: CGFloat = 14,
-        buttonHeight: CGFloat = 30,
-        buttonOverlap: CGFloat = 2
+        tooltipHeight: CGFloat = 28,
+        tooltipGap: CGFloat = 10
     ) -> CGRect {
-        let tooltipWidth: CGFloat
-        switch state {
-        case .queued:
-            tooltipWidth = 94
-        case .reveal:
-            tooltipWidth = 78
-        case .copyText:
-            tooltipWidth = 92
-        }
+        let tooltipWidth = TimelineHoverTooltipStyle.width(for: state.tooltipText)
 
         var originX = rect.midX - (tooltipWidth / 2)
         originX = min(
@@ -3248,19 +3214,19 @@ struct RedactionTooltipOverlay: View {
             containerSize.width - tooltipWidth - edgePadding
         )
 
-        let preferredTopY = rect.minY - buttonHeight + buttonOverlap
-        let fallbackBottomY = rect.maxY - buttonOverlap
+        let preferredTopY = rect.minY - tooltipHeight - tooltipGap
+        let fallbackBottomY = rect.maxY + tooltipGap
         let originY: CGFloat
         if preferredTopY >= edgePadding {
             originY = preferredTopY
         } else {
             originY = min(
                 max(fallbackBottomY, edgePadding),
-                containerSize.height - buttonHeight - edgePadding
+                containerSize.height - tooltipHeight - edgePadding
             )
         }
 
-        return CGRect(x: originX, y: originY, width: tooltipWidth, height: buttonHeight)
+        return CGRect(x: originX, y: originY, width: tooltipWidth, height: tooltipHeight)
     }
 }
 
@@ -3273,10 +3239,12 @@ private struct RedactionTooltipHoverEntry: Equatable {
 private struct RedactionTooltipHoverTracker: NSViewRepresentable {
     let entries: [RedactionTooltipHoverEntry]
     let onHoveredNodeChanged: (Int?) -> Void
+    let onPrimaryClick: (CGPoint) -> Bool
 
     func makeNSView(context: Context) -> RedactionTooltipHoverTrackingView {
         let view = RedactionTooltipHoverTrackingView()
         view.onHoveredNodeChanged = onHoveredNodeChanged
+        view.onPrimaryClick = onPrimaryClick
         return view
     }
 
@@ -3284,6 +3252,7 @@ private struct RedactionTooltipHoverTracker: NSViewRepresentable {
         let didEntriesChange = nsView.entries != entries
         nsView.entries = entries
         nsView.onHoveredNodeChanged = onHoveredNodeChanged
+        nsView.onPrimaryClick = onPrimaryClick
         if didEntriesChange || !nsView.hasPerformedInitialHoverSync {
             nsView.refreshHoverStateForCurrentMouseLocation()
             nsView.hasPerformedInitialHoverSync = true
@@ -3294,12 +3263,35 @@ private struct RedactionTooltipHoverTracker: NSViewRepresentable {
 private final class RedactionTooltipHoverTrackingView: NSView {
     var entries: [RedactionTooltipHoverEntry] = []
     var onHoveredNodeChanged: ((Int?) -> Void)?
+    var onPrimaryClick: ((CGPoint) -> Bool)?
     var hasPerformedInitialHoverSync = false
 
     private var trackingArea: NSTrackingArea?
+    private var localMouseDownMonitor: Any?
 
     override var isFlipped: Bool {
         true
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        hasPerformedInitialHoverSync = false
+        if window == nil {
+            removeLocalMouseDownMonitor()
+        } else {
+            installLocalMouseDownMonitorIfNeeded()
+        }
+    }
+
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        if newWindow == nil {
+            removeLocalMouseDownMonitor()
+        }
+        super.viewWillMove(toWindow: newWindow)
+    }
+
+    deinit {
+        removeLocalMouseDownMonitor()
     }
 
     override func updateTrackingAreas() {
@@ -3341,6 +3333,27 @@ private final class RedactionTooltipHoverTrackingView: NSView {
         guard let window else { return }
         let location = convert(window.mouseLocationOutsideOfEventStream, from: nil)
         onHoveredNodeChanged?(hoveredNodeID(at: location))
+    }
+
+    private func installLocalMouseDownMonitorIfNeeded() {
+        guard localMouseDownMonitor == nil else { return }
+
+        localMouseDownMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
+            guard let self, let eventWindow = event.window, eventWindow == self.window else {
+                return event
+            }
+
+            let location = self.convert(event.locationInWindow, from: nil)
+            guard self.onPrimaryClick?(location) == true else { return event }
+            return nil
+        }
+    }
+
+    private func removeLocalMouseDownMonitor() {
+        if let localMouseDownMonitor {
+            NSEvent.removeMonitor(localMouseDownMonitor)
+            self.localMouseDownMonitor = nil
+        }
     }
 
     private func hoveredNodeID(at location: CGPoint) -> Int? {
@@ -4276,6 +4289,7 @@ struct ZoomedTextSelectionNSView: NSViewRepresentable {
                 rect: rect,
                 text: visibleText,
                 selectionRange: adjustedSelectionRange,
+                isRedacted: node.isRedacted,
                 visibleCharOffset: visibleStartChar,
                 originalX: node.x,
                 originalY: node.y,
@@ -4292,11 +4306,18 @@ struct ZoomedTextSelectionNSView: NSViewRepresentable {
 
 /// Custom NSView for text selection within the zoomed region
 class ZoomedSelectionView: NSView {
+    enum CursorMode: Equatable {
+        case none
+        case iBeam
+        case pointingHand
+    }
+
     struct NodeData {
         let id: Int
         let rect: NSRect
         let text: String
         let selectionRange: (start: Int, end: Int)?
+        let isRedacted: Bool
         /// Offset of the first visible character (for clipped nodes)
         let visibleCharOffset: Int
         /// Original normalized coordinates (for debugging hit-testing)
@@ -4325,13 +4346,13 @@ class ZoomedSelectionView: NSView {
     private var commandDragStartPoint: CGPoint?
     private var commandDragCurrentPoint: CGPoint?
     private var trackingArea: NSTrackingArea?
-    private var isShowingIBeamCursor = false
+    private var cursorMode: CursorMode = .none
     private let boundingBoxPadding: CGFloat = 8.0
 
     override var acceptsFirstResponder: Bool { true }
 
     deinit {
-        if isShowingIBeamCursor {
+        if cursorMode != .none {
             NSCursor.pop()
         }
     }
@@ -4359,28 +4380,50 @@ class ZoomedSelectionView: NSView {
     }
 
     override func mouseExited(with event: NSEvent) {
-        if isShowingIBeamCursor {
-            NSCursor.pop()
-            isShowingIBeamCursor = false
-        }
+        applyCursorMode(.none)
     }
 
-    private func isNearAnyNode(screenPoint: CGPoint) -> Bool {
-        nodeData.contains { node in
-            node.rect.insetBy(dx: -boundingBoxPadding, dy: -boundingBoxPadding).contains(screenPoint)
+    private func applyCursorMode(_ mode: CursorMode) {
+        guard mode != cursorMode else { return }
+
+        if cursorMode != .none {
+            NSCursor.pop()
         }
+
+        switch mode {
+        case .none:
+            break
+        case .iBeam:
+            NSCursor.iBeam.push()
+        case .pointingHand:
+            NSCursor.pointingHand.push()
+        }
+
+        cursorMode = mode
+    }
+
+    static func preferredCursorMode(
+        at screenPoint: CGPoint,
+        nodeData: [NodeData],
+        boundingBoxPadding: CGFloat = 8
+    ) -> CursorMode {
+        guard let node = nodeData.first(where: {
+            $0.rect.insetBy(dx: -boundingBoxPadding, dy: -boundingBoxPadding).contains(screenPoint)
+        }) else {
+            return .none
+        }
+
+        return node.isRedacted ? .pointingHand : .iBeam
     }
 
     private func updateCursorForLocation(_ location: CGPoint) {
-        let isNearNode = isNearAnyNode(screenPoint: location)
-
-        if isNearNode && !isShowingIBeamCursor {
-            NSCursor.iBeam.push()
-            isShowingIBeamCursor = true
-        } else if !isNearNode && isShowingIBeamCursor {
-            NSCursor.pop()
-            isShowingIBeamCursor = false
-        }
+        applyCursorMode(
+            Self.preferredCursorMode(
+                at: location,
+                nodeData: nodeData,
+                boundingBoxPadding: boundingBoxPadding
+            )
+        )
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -4966,9 +5009,11 @@ struct TextSelectionOverlay: NSViewRepresentable {
                 id: node.id,
                 rect: rect,
                 text: node.text,
-                selectionRange: selectionRange
+                selectionRange: selectionRange,
+                isRedacted: node.isRedacted
             )
         }
+        nsView.searchHighlightedRects = searchHighlightedRects()
 
         nsView.containerSize = containerSize
         nsView.actualFrameRect = actualFrameRect
@@ -4990,12 +5035,37 @@ struct TextSelectionOverlay: NSViewRepresentable {
 
         nsView.needsDisplay = true
     }
+
+    private func searchHighlightedRects() -> [CGRect] {
+        guard viewModel.isShowingSearchHighlight else { return [] }
+
+        return viewModel.searchHighlightNodes.flatMap { match in
+            let rects = match.ranges.compactMap { range -> CGRect? in
+                let rect = TextSelectionView.searchHighlightRect(
+                    for: match.node,
+                    range: range,
+                    in: actualFrameRect
+                )
+                return rect.isEmpty ? nil : rect
+            }
+
+            if rects.isEmpty {
+                let fallbackRect = TextSelectionView.searchHighlightRect(
+                    for: match.node,
+                    in: actualFrameRect
+                )
+                return fallbackRect.isEmpty ? [] : [fallbackRect]
+            }
+
+            return rects
+        }
+    }
 }
 
 /// Custom NSView for text selection with mouse tracking
 /// Supports both text selection (normal drag) and zoom region (Shift+Drag)
 class TextSelectionView: NSView {
-    private enum CursorMode {
+    enum CursorMode: Equatable {
         case none
         case iBeam
         case pointingHand
@@ -5007,6 +5077,7 @@ class TextSelectionView: NSView {
         let rect: NSRect
         let text: String
         let selectionRange: (start: Int, end: Int)?  // Character range selected within this node
+        let isRedacted: Bool
     }
 
     struct HyperlinkEntry {
@@ -5015,6 +5086,7 @@ class TextSelectionView: NSView {
     }
 
     var nodeData: [NodeData] = []
+    var searchHighlightedRects: [CGRect] = []
     var containerSize: CGSize = .zero
     var actualFrameRect: CGRect = .zero
     var hyperlinkEntries: [HyperlinkEntry] = []
@@ -5094,18 +5166,6 @@ class TextSelectionView: NSView {
         applyCursorMode(.none)
     }
 
-    /// Check if a screen point is near any OCR bounding box (within padding tolerance)
-    private func isNearAnyNode(screenPoint: CGPoint) -> Bool {
-        for node in nodeData {
-            // Expand the rect by padding on all sides
-            let expandedRect = node.rect.insetBy(dx: -boundingBoxPadding, dy: -boundingBoxPadding)
-            if expandedRect.contains(screenPoint) {
-                return true
-            }
-        }
-        return false
-    }
-
     /// Returns the hyperlink entry near the point, if any.
     private func hyperlinkEntryContaining(screenPoint: CGPoint) -> HyperlinkEntry? {
         for entry in hyperlinkEntries {
@@ -5136,6 +5196,65 @@ class TextSelectionView: NSView {
         cursorMode = mode
     }
 
+    static func preferredCursorMode(
+        at screenPoint: CGPoint,
+        nodeData: [NodeData],
+        hyperlinkEntries: [HyperlinkEntry],
+        searchHighlightedRects: [CGRect] = [],
+        boundingBoxPadding: CGFloat = 8,
+        hyperlinkPadding: CGFloat = 3
+    ) -> CursorMode {
+        if searchHighlightedRects.contains(where: { $0.contains(screenPoint) }) {
+            return .pointingHand
+        }
+
+        if hyperlinkEntries.contains(where: {
+            $0.rect.insetBy(dx: -hyperlinkPadding, dy: -hyperlinkPadding).contains(screenPoint)
+        }) {
+            return .pointingHand
+        }
+
+        guard let node = nodeData.first(where: {
+            $0.rect.insetBy(dx: -boundingBoxPadding, dy: -boundingBoxPadding).contains(screenPoint)
+        }) else {
+            return .none
+        }
+
+        return node.isRedacted ? .pointingHand : .iBeam
+    }
+
+    static func searchHighlightRect(
+        for node: OCRNodeWithText,
+        in actualFrameRect: CGRect
+    ) -> CGRect {
+        let rect = CGRect(
+            x: actualFrameRect.origin.x + (node.x * actualFrameRect.width),
+            y: actualFrameRect.origin.y + ((1.0 - node.y - node.height) * actualFrameRect.height),
+            width: node.width * actualFrameRect.width,
+            height: node.height * actualFrameRect.height
+        )
+        return SearchHighlightOverlay.paddedHighlightRect(rect, within: actualFrameRect)
+    }
+
+    static func searchHighlightRect(
+        for node: OCRNodeWithText,
+        range: Range<String.Index>,
+        in actualFrameRect: CGRect
+    ) -> CGRect {
+        guard !node.text.isEmpty else {
+            return searchHighlightRect(for: node, in: actualFrameRect)
+        }
+
+        let spanFractions = OCRTextLayoutEstimator.spanFractions(in: node.text, range: range)
+        let rect = CGRect(
+            x: actualFrameRect.origin.x + ((node.x + (node.width * spanFractions.start)) * actualFrameRect.width),
+            y: actualFrameRect.origin.y + ((1.0 - node.y - node.height) * actualFrameRect.height),
+            width: node.width * max(spanFractions.end - spanFractions.start, 0) * actualFrameRect.width,
+            height: node.height * actualFrameRect.height
+        )
+        return SearchHighlightOverlay.paddedHighlightRect(rect, within: actualFrameRect)
+    }
+
     /// Re-evaluate cursor using the current pointer location when overlays/data update
     /// without a fresh mouse-move event.
     func refreshCursorForCurrentMouseLocation() {
@@ -5155,17 +5274,16 @@ class TextSelectionView: NSView {
 
     /// Update cursor based on whether we're near an OCR bounding box
     private func updateCursorForLocation(_ location: CGPoint) {
-        let hyperlinkEntry = hyperlinkEntryContaining(screenPoint: location)
-        let isNearNode = isNearAnyNode(screenPoint: location)
-        let targetMode: CursorMode = if hyperlinkEntry != nil {
-            .pointingHand
-        } else if isNearNode {
-            .iBeam
-        } else {
-            .none
-        }
-
-        applyCursorMode(targetMode)
+        applyCursorMode(
+            Self.preferredCursorMode(
+                at: location,
+                nodeData: nodeData,
+                hyperlinkEntries: hyperlinkEntries,
+                searchHighlightedRects: searchHighlightedRects,
+                boundingBoxPadding: boundingBoxPadding,
+                hyperlinkPadding: hyperlinkPadding
+            )
+        )
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -5515,17 +5633,13 @@ struct SearchHighlightOverlay: View {
     @State private var highlightScale: CGFloat = 0.3
 
     @State private var tooltipAnchorPoint: CGPoint?
-    @State private var tooltipSourceRect: CGRect?
-    @State private var isHoveringHighlightedNode = false
-    @State private var isHoveringTooltipButton = false
-    @State private var hasPushedTooltipCursor = false
-    @State private var tooltipHideWorkItem: DispatchWorkItem?
 
-    private let tooltipSize = CGSize(width: 210, height: 34)
+    private let tooltipSize = CGSize(
+        width: TimelineHoverTooltipStyle.width(for: "Copy All Highlighted Text"),
+        height: TimelineHoverTooltipStyle.height
+    )
     private let tooltipInset: CGFloat = 12
-    private let tooltipGap: CGFloat = 8
-    private let tooltipHideDelay: TimeInterval = 0.18
-    private let tooltipHoverExitDelay: TimeInterval = 0.12
+    private let tooltipGap: CGFloat = 10
 
     private var liveMatches: [(node: OCRNodeWithText, ranges: [Range<String.Index>])] {
         viewModel.searchHighlightNodes
@@ -5539,56 +5653,29 @@ struct SearchHighlightOverlay: View {
             SearchHighlightHoverTracker(
                 highlightedRects: highlightedRects,
                 onHoverLocationChanged: handleHoverLocationChanged,
-                onInteractionLocationChanged: handleInteractionLocationChanged
+                onPrimaryClick: handlePrimaryClick(at:)
             )
             .frame(width: containerSize.width, height: containerSize.height)
 
             if let tooltipPosition = tooltipPosition {
-                Button {
-                    viewModel.copySearchHighlightedTextByLine(from: liveMatches)
-                    dismissTooltip()
-                } label: {
-                    HStack(spacing: 8) {
-                        Image(systemName: "doc.on.doc.fill")
-                            .font(.system(size: 12, weight: .semibold))
-                        Text("Copy ALL highlighted text")
-                            .font(.system(size: 12, weight: .semibold))
-                    }
+                Text("Copy All Highlighted Text")
+                    .font(TimelineHoverTooltipStyle.font)
                     .foregroundColor(.white)
-                    .frame(width: tooltipSize.width, height: tooltipSize.height)
+                    .lineLimit(1)
+                    .fixedSize()
+                    .padding(.horizontal, TimelineHoverTooltipStyle.horizontalPadding)
+                    .padding(.vertical, TimelineHoverTooltipStyle.verticalPadding)
                     .background(
                         Capsule()
-                            .fill(isHoveringTooltipButton ? Color.blue.opacity(0.90) : Color.black.opacity(0.72))
-                            .overlay(
-                                Capsule()
-                                    .stroke(isHoveringTooltipButton ? Color.white.opacity(0.55) : Color.white.opacity(0.25), lineWidth: 1)
-                            )
+                            .fill(TimelineHoverTooltipStyle.backgroundColor)
                     )
-                    .shadow(color: .black.opacity(isHoveringTooltipButton ? 0.45 : 0.35), radius: isHoveringTooltipButton ? 14 : 10, y: 6)
-                    .scaleEffect(isHoveringTooltipButton ? 1.03 : 1.0)
-                    .animation(.easeOut(duration: 0.12), value: isHoveringTooltipButton)
-                }
-                .buttonStyle(.plain)
-                .help("Copy ALL highlighted text")
-                .offset(x: tooltipPosition.x, y: tooltipPosition.y)
-                .onHover { isHovering in
-                    isHoveringTooltipButton = isHovering
-                    updateTooltipCursor(isHovering: isHovering)
-                    if isHovering {
-                        cancelTooltipHide()
-                    } else if !isHoveringHighlightedNode {
-                        scheduleTooltipHide(after: tooltipHoverExitDelay)
-                    }
-                }
+                    .shadow(color: .black.opacity(0.28), radius: 8, y: 4)
+                    .offset(x: tooltipPosition.x, y: tooltipPosition.y)
+                    .allowsHitTesting(false)
             }
         }
         .onAppear {
-            tooltipAnchorPoint = nil
-            tooltipSourceRect = nil
-            isHoveringHighlightedNode = false
-            isHoveringTooltipButton = false
-            updateTooltipCursor(isHovering: false)
-            cancelTooltipHide()
+            dismissTooltip()
 
             // Animate the scale from 0.3 to 1.0 with spring
             withAnimation(.spring(response: 0.4, dampingFraction: 0.7, blendDuration: 0)) {
@@ -5596,12 +5683,7 @@ struct SearchHighlightOverlay: View {
             }
         }
         .onDisappear {
-            cancelTooltipHide()
-            tooltipAnchorPoint = nil
-            tooltipSourceRect = nil
-            isHoveringHighlightedNode = false
-            isHoveringTooltipButton = false
-            updateTooltipCursor(isHovering: false)
+            dismissTooltip()
         }
     }
 
@@ -5676,124 +5758,28 @@ struct SearchHighlightOverlay: View {
         }
     }
 
-    private var tooltipFrame: CGRect? {
-        guard let tooltipPosition else { return nil }
-        return CGRect(origin: tooltipPosition, size: tooltipSize)
-    }
-
-    private var tooltipInteractionSafeZone: CGRect? {
-        guard let tooltipFrame else { return nil }
-        return Self.tooltipInteractionSafeZone(
-            tooltipFrame: tooltipFrame,
-            sourceRect: tooltipSourceRect
-        )
-    }
-
     private func handleHoverLocationChanged(_ location: CGPoint?) {
-        guard let location else {
-            isHoveringHighlightedNode = false
-            if !isHoveringTooltipButton {
-                scheduleTooltipHide(after: tooltipHideDelay)
-            }
-            return
-        }
-
-        if let hoveredRect = highlightedRects.first(where: { $0.contains(location) }) {
-            isHoveringHighlightedNode = true
-            cancelTooltipHide()
-            tooltipAnchorPoint = CGPoint(x: hoveredRect.midX, y: hoveredRect.minY)
-            tooltipSourceRect = hoveredRect
-            return
-        }
-
-        isHoveringHighlightedNode = false
-
-        if let tooltipInteractionSafeZone,
-           tooltipInteractionSafeZone.contains(location) {
-            cancelTooltipHide()
-            return
-        }
-
-        if !isHoveringTooltipButton {
-            scheduleTooltipHide(after: tooltipHideDelay)
-        }
-    }
-
-    private func handleInteractionLocationChanged(_ location: CGPoint) {
-        guard Self.shouldDismissTooltip(
-            for: location,
-            highlightedRects: highlightedRects,
-            tooltipFrame: tooltipFrame
-        ) else {
-            return
-        }
-
-        dismissTooltip()
-    }
-
-    private func scheduleTooltipHide(after delay: TimeInterval) {
-        cancelTooltipHide()
-        let workItem = DispatchWorkItem {
+        guard let location,
+              let hoveredRect = highlightedRects.first(where: { $0.contains(location) }) else {
             dismissTooltip()
+            return
         }
-        tooltipHideWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+
+        tooltipAnchorPoint = CGPoint(x: hoveredRect.midX, y: hoveredRect.minY)
     }
 
-    private func cancelTooltipHide() {
-        tooltipHideWorkItem?.cancel()
-        tooltipHideWorkItem = nil
+    private func handlePrimaryClick(at location: CGPoint) -> Bool {
+        guard highlightedRects.contains(where: { $0.contains(location) }) else {
+            return false
+        }
+
+        viewModel.copySearchHighlightedTextByLine(from: liveMatches)
+        dismissTooltip()
+        return true
     }
 
     private func dismissTooltip() {
-        cancelTooltipHide()
         tooltipAnchorPoint = nil
-        tooltipSourceRect = nil
-        isHoveringHighlightedNode = false
-        isHoveringTooltipButton = false
-        updateTooltipCursor(isHovering: false)
-    }
-
-    private func updateTooltipCursor(isHovering: Bool) {
-        if isHovering {
-            guard !hasPushedTooltipCursor else { return }
-            NSCursor.pointingHand.push()
-            hasPushedTooltipCursor = true
-        } else {
-            guard hasPushedTooltipCursor else { return }
-            NSCursor.pop()
-            hasPushedTooltipCursor = false
-        }
-    }
-
-    static func tooltipInteractionSafeZone(
-        tooltipFrame: CGRect,
-        sourceRect: CGRect?
-    ) -> CGRect {
-        var safeZone = tooltipFrame.insetBy(dx: -10, dy: -8)
-        guard let sourceRect else { return safeZone }
-
-        let sourceConnectionY = tooltipFrame.midY < sourceRect.midY ? sourceRect.minY : sourceRect.maxY
-        let sourceAnchorRect = CGRect(
-            x: sourceRect.midX - 12,
-            y: sourceConnectionY - 12,
-            width: 24,
-            height: 24
-        )
-        let bridgeCenterX = (sourceRect.midX + tooltipFrame.midX) / 2
-        let bridgeWidth = abs(sourceRect.midX - tooltipFrame.midX) + 24
-        let bridgeMinY = min(sourceConnectionY, tooltipFrame.minY) - 8
-        let bridgeMaxY = max(sourceConnectionY, tooltipFrame.maxY) + 8
-        let bridgeRect = CGRect(
-            x: bridgeCenterX - (bridgeWidth / 2),
-            y: bridgeMinY,
-            width: max(bridgeWidth, 1),
-            height: max(bridgeMaxY - bridgeMinY, 1)
-        )
-
-        safeZone = safeZone.union(sourceAnchorRect)
-        safeZone = safeZone.union(bridgeRect)
-        return safeZone
     }
 
     static func shouldDismissTooltip(
@@ -5801,13 +5787,8 @@ struct SearchHighlightOverlay: View {
         highlightedRects: [CGRect],
         tooltipFrame: CGRect?
     ) -> Bool {
-        if highlightedRects.contains(where: { $0.contains(location) }) {
-            return false
-        }
-        if let tooltipFrame, tooltipFrame.contains(location) {
-            return false
-        }
-        return true
+        _ = tooltipFrame
+        return !highlightedRects.contains(where: { $0.contains(location) })
     }
 
     static func paddedHighlightRect(_ rect: CGRect, within frameRect: CGRect) -> CGRect {
@@ -5853,12 +5834,12 @@ struct SearchHighlightOverlay: View {
 private struct SearchHighlightHoverTracker: NSViewRepresentable {
     let highlightedRects: [CGRect]
     let onHoverLocationChanged: (CGPoint?) -> Void
-    let onInteractionLocationChanged: (CGPoint) -> Void
+    let onPrimaryClick: (CGPoint) -> Bool
 
     func makeNSView(context: Context) -> SearchHighlightHoverTrackingView {
         let view = SearchHighlightHoverTrackingView()
         view.onHoverLocationChanged = onHoverLocationChanged
-        view.onInteractionLocationChanged = onInteractionLocationChanged
+        view.onPrimaryClick = onPrimaryClick
         return view
     }
 
@@ -5866,7 +5847,7 @@ private struct SearchHighlightHoverTracker: NSViewRepresentable {
         let didRectsChange = nsView.highlightedRects != highlightedRects
         nsView.highlightedRects = highlightedRects
         nsView.onHoverLocationChanged = onHoverLocationChanged
-        nsView.onInteractionLocationChanged = onInteractionLocationChanged
+        nsView.onPrimaryClick = onPrimaryClick
         if didRectsChange || !nsView.hasPerformedInitialHoverSync {
             nsView.refreshHoverStateForCurrentMouseLocation()
             nsView.hasPerformedInitialHoverSync = true
@@ -5877,7 +5858,7 @@ private struct SearchHighlightHoverTracker: NSViewRepresentable {
 private final class SearchHighlightHoverTrackingView: NSView {
     var highlightedRects: [CGRect] = []
     var onHoverLocationChanged: ((CGPoint?) -> Void)?
-    var onInteractionLocationChanged: ((CGPoint) -> Void)?
+    var onPrimaryClick: ((CGPoint) -> Bool)?
     var hasPerformedInitialHoverSync = false
 
     private var trackingArea: NSTrackingArea?
@@ -5953,15 +5934,15 @@ private final class SearchHighlightHoverTrackingView: NSView {
         guard localMouseDownMonitor == nil else { return }
 
         localMouseDownMonitor = NSEvent.addLocalMonitorForEvents(
-            matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+            matching: .leftMouseDown
         ) { [weak self] event in
             guard let self, let eventWindow = event.window, eventWindow == self.window else {
                 return event
             }
 
             let location = self.convert(event.locationInWindow, from: nil)
-            self.onInteractionLocationChanged?(location)
-            return event
+            guard self.onPrimaryClick?(location) == true else { return event }
+            return nil
         }
     }
 
