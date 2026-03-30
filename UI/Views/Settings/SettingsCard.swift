@@ -497,7 +497,7 @@ struct ColorThemePicker: View {
 
 struct CaptureIntervalPicker: View {
     @Binding var selectedInterval: Double
-    static let intervals: [Double] = [0, 2, 5, 10, 15, 30, 60]
+    static let intervals: [Double] = [2, 5, 10, 15, 30, 60, 0]
 
     var body: some View {
         HStack(spacing: 6) {

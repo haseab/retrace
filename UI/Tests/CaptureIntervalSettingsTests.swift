@@ -81,9 +81,12 @@ final class CaptureIntervalSettingsTests: XCTestCase {
         XCTAssertEqual(SettingsView.captureIntervalDisplayText(for: 0), "None")
     }
 
-    func testCaptureIntervalPickerIncludesDisabledOption() {
-        XCTAssertTrue(CaptureIntervalPicker.intervals.contains(0))
-        XCTAssertEqual(CaptureIntervalPicker.intervalLabel(0), "None")
+    func testCaptureIntervalPickerPlacesDisabledOptionAfterTimedIntervals() {
+        XCTAssertEqual(CaptureIntervalPicker.intervals, [2, 5, 10, 15, 30, 60, 0])
+        XCTAssertEqual(
+            CaptureIntervalPicker.intervals.map(CaptureIntervalPicker.intervalLabel),
+            ["2s", "5s", "10s", "15s", "30s", "1m", "None"]
+        )
     }
 
     func testEventDrivenCaptureStorageHeuristicAddsRequestedWindowChangeAndClickOverheads() {
