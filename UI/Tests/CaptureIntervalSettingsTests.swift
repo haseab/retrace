@@ -125,4 +125,43 @@ final class CaptureIntervalSettingsTests: XCTestCase {
             "Estimated: ~6.8-17.0 GB per month"
         )
     }
+
+    func testUsesDefaultShortcutReturnsTrueForMatchingDefaultShortcut() {
+        XCTAssertTrue(
+            SettingsView.usesDefaultShortcut(
+                SettingsShortcutKey(from: .defaultTimeline),
+                for: .timeline
+            )
+        )
+    }
+
+    func testUsesDefaultShortcutReturnsFalseForEmptyShortcut() {
+        XCTAssertFalse(
+            SettingsView.usesDefaultShortcut(
+                .empty,
+                for: .dashboard
+            )
+        )
+    }
+
+    func testUsesDefaultShortcutReturnsFalseForCustomShortcut() {
+        XCTAssertFalse(
+            SettingsView.usesDefaultShortcut(
+                SettingsShortcutKey(key: "K", modifiers: [.command, .shift]),
+                for: .comment
+            )
+        )
+    }
+
+    func testCanClearShortcutReturnsFalseForEmptyShortcut() {
+        XCTAssertFalse(SettingsView.canClearShortcut(.empty))
+    }
+
+    func testCanClearShortcutReturnsTrueForAssignedShortcut() {
+        XCTAssertTrue(
+            SettingsView.canClearShortcut(
+                SettingsShortcutKey(from: .defaultRecording)
+            )
+        )
+    }
 }

@@ -12,6 +12,67 @@ import Carbon
 import UniformTypeIdentifiers
 
 extension SettingsView {
+    static func defaultShortcut(for kind: ManagedShortcutKind) -> SettingsShortcutKey {
+        switch kind {
+        case .timeline:
+            return SettingsShortcutKey(from: .defaultTimeline)
+        case .dashboard:
+            return SettingsShortcutKey(from: .defaultDashboard)
+        case .recording:
+            return SettingsShortcutKey(from: .defaultRecording)
+        case .systemMonitor:
+            return SettingsShortcutKey(from: .defaultSystemMonitor)
+        case .comment:
+            return SettingsShortcutKey(from: .defaultCommentCapture)
+        }
+    }
+
+    static func usesDefaultShortcut(_ shortcut: SettingsShortcutKey, for kind: ManagedShortcutKind) -> Bool {
+        shortcut == defaultShortcut(for: kind)
+    }
+
+    static func canClearShortcut(_ shortcut: SettingsShortcutKey) -> Bool {
+        !shortcut.isEmpty
+    }
+
+    func currentShortcut(for kind: ManagedShortcutKind) -> SettingsShortcutKey {
+        switch kind {
+        case .timeline:
+            return timelineShortcut
+        case .dashboard:
+            return dashboardShortcut
+        case .recording:
+            return recordingShortcut
+        case .systemMonitor:
+            return systemMonitorShortcut
+        case .comment:
+            return commentShortcut
+        }
+    }
+
+    func recordShortcutDefaultStateMetric(for kind: ManagedShortcutKind) {
+        let settingKey: String
+        switch kind {
+        case .timeline:
+            settingKey = "timelineShortcutUsesDefault"
+        case .dashboard:
+            settingKey = "dashboardShortcutUsesDefault"
+        case .recording:
+            settingKey = "recordingShortcutUsesDefault"
+        case .systemMonitor:
+            settingKey = "systemMonitorShortcutUsesDefault"
+        case .comment:
+            settingKey = "commentShortcutUsesDefault"
+        }
+
+        DashboardViewModel.recordDeveloperSettingToggle(
+            coordinator: coordinatorWrapper.coordinator,
+            source: "settings.shortcuts",
+            settingKey: settingKey,
+            isEnabled: Self.usesDefaultShortcut(currentShortcut(for: kind), for: kind)
+        )
+    }
+
     var dashboardAppUsageViewModeSelection: DashboardAppUsageViewModeSetting {
         DashboardAppUsageViewModeSetting(rawValue: dashboardAppUsageViewMode) ?? .list
     }
