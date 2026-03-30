@@ -1,4 +1,5 @@
 import Foundation
+import App
 
 // MARK: - Feedback Type
 
@@ -95,6 +96,7 @@ public struct DiagnosticInfo: Codable {
     public let settingsSnapshot: [String: String]
     public let recentErrors: [String]
     public let recentLogs: [String]
+    public let recentMetricEvents: [FeedbackRecentMetricEvent]
     public let timestamp: Date
 
     // Enhanced diagnostics for debugging edge cases
@@ -229,6 +231,7 @@ public struct DiagnosticInfo: Codable {
         settingsSnapshot: [String: String] = [:],
         recentErrors: [String],
         recentLogs: [String] = [],
+        recentMetricEvents: [FeedbackRecentMetricEvent] = [],
         displayInfo: DisplayInfo = DisplayInfo(count: 0, displays: [], mainDisplayIndex: 0),
         processInfo: ProcessInfo = ProcessInfo(totalRunning: 0, eventMonitoringApps: 0, windowManagementApps: 0, securityApps: 0, hasJamf: false, hasKandji: false, axuiServerCPU: 0, windowServerCPU: 0),
         accessibilityInfo: AccessibilityInfo = AccessibilityInfo(voiceOverEnabled: false, switchControlEnabled: false, reduceMotionEnabled: false, increaseContrastEnabled: false, reduceTransparencyEnabled: false, differentiateWithoutColorEnabled: false, displayHasInvertedColors: false),
@@ -246,6 +249,7 @@ public struct DiagnosticInfo: Codable {
         self.settingsSnapshot = settingsSnapshot
         self.recentErrors = recentErrors
         self.recentLogs = recentLogs
+        self.recentMetricEvents = recentMetricEvents
         self.displayInfo = displayInfo
         self.processInfo = processInfo
         self.accessibilityInfo = accessibilityInfo
@@ -372,6 +376,24 @@ public struct DiagnosticInfo: Codable {
             }
         }
 
+        if !recentMetricEvents.isEmpty {
+            text += "\n\n=== RECENT ACTIONS (\(recentMetricEvents.count)) ==="
+            text += "\n(Relevant recent daily-metrics events with limited metadata, filtered to avoid noisy telemetry)"
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime]
+
+            for event in recentMetricEvents {
+                let detailsText = event.details.keys.sorted().compactMap { key in
+                    event.details[key].map { "\(key)=\($0)" }
+                }.joined(separator: ", ")
+
+                text += "\n- [\(formatter.string(from: event.timestamp))] \(event.summary)"
+                if !detailsText.isEmpty {
+                    text += " (\(detailsText))"
+                }
+            }
+        }
+
         if !recentLogs.isEmpty {
             text += "\nRecent Logs: \(recentLogs.count) entries (recent log tail + Retrace memory summary)"
         }
@@ -406,6 +428,28 @@ public struct DiagnosticInfo: Codable {
         }
 
         return text
+    }
+
+    public func withRecentMetricEvents(_ events: [FeedbackRecentMetricEvent]) -> DiagnosticInfo {
+        DiagnosticInfo(
+            appVersion: appVersion,
+            buildNumber: buildNumber,
+            macOSVersion: macOSVersion,
+            deviceModel: deviceModel,
+            totalDiskSpace: totalDiskSpace,
+            freeDiskSpace: freeDiskSpace,
+            databaseStats: databaseStats,
+            settingsSnapshot: settingsSnapshot,
+            recentErrors: recentErrors,
+            recentLogs: recentLogs,
+            recentMetricEvents: events,
+            displayInfo: displayInfo,
+            processInfo: processInfo,
+            accessibilityInfo: accessibilityInfo,
+            performanceInfo: performanceInfo,
+            emergencyCrashReports: emergencyCrashReports,
+            timestamp: timestamp
+        )
     }
 }
 

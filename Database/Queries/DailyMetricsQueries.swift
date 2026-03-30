@@ -9,10 +9,26 @@ import Shared
 /// Owner: DATABASE agent
 public enum DailyMetricsQueries {
 
+    public struct RecentEvent: Sendable, Equatable {
+        public let metricType: MetricType
+        public let timestamp: Date
+        public let metadata: String?
+
+        public init(
+            metricType: MetricType,
+            timestamp: Date,
+            metadata: String?
+        ) {
+            self.metricType = metricType
+            self.timestamp = timestamp
+            self.metadata = metadata
+        }
+    }
+
     // MARK: - Metric Types
 
     /// Standard metric type identifiers
-    public enum MetricType: String {
+    public enum MetricType: String, Sendable {
         case timelineOpens = "timeline_opens"
         case searches = "searches"
         case textCopies = "text_copies"
@@ -22,8 +38,8 @@ public enum DailyMetricsQueries {
         case imageSaves = "image_saves"
         case deeplinkCopies = "deeplink_copies"
         case timelineSessionDuration = "timeline_session_duration"  // metadata: duration in ms
-        case filteredSearchQuery = "filtered_search_query"  // metadata: JSON {query, filters}
-        case timelineFilterQuery = "timeline_filter_query"  // metadata: JSON {bundleID, windowName, browserUrl, startDate, endDate}
+        case filteredSearchQuery = "filtered_search_query"  // metadata: JSON {queryLength, filterCount}
+        case timelineFilterQuery = "timeline_filter_query"  // metadata: JSON {hasAppFilter, hasWindowFilter, hasURLFilter, hasStartDate, hasEndDate}
         case scrubDistance = "scrub_distance"  // metadata: distance in pixels per session
         case searchDialogOpens = "search_dialog_opens"
         case timelineAutoDismissed = "timeline_auto_dismissed"  // metadata: JSON {trigger: "app_activation", activatedBundleID?}
@@ -237,6 +253,74 @@ public enum DailyMetricsQueries {
         }
 
         return sqlite3_column_int64(statement, 0)
+    }
+
+    static func getRecentEvents(
+        db: OpaquePointer,
+        limit: Int,
+        excluding excludedMetricTypes: Set<MetricType> = []
+    ) throws -> [RecentEvent] {
+        let boundedLimit = max(0, limit)
+        guard boundedLimit > 0 else { return [] }
+        let excludedMetricTypeRawValues = excludedMetricTypes
+            .map(\.rawValue)
+            .sorted()
+        let exclusionClause = excludedMetricTypeRawValues.isEmpty
+            ? ""
+            : "WHERE metricType NOT IN (\(Array(repeating: "?", count: excludedMetricTypeRawValues.count).joined(separator: ", ")))"
+
+        let sql = """
+            SELECT metricType, timestamp, metadata
+            FROM daily_metrics
+            \(exclusionClause)
+            ORDER BY timestamp DESC, id DESC
+            LIMIT ?
+            """
+
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        var bindIndex: Int32 = 1
+        for metricTypeRawValue in excludedMetricTypeRawValues {
+            sqlite3_bind_text(statement, bindIndex, metricTypeRawValue, -1, SQLITE_TRANSIENT)
+            bindIndex += 1
+        }
+
+        sqlite3_bind_int(statement, bindIndex, Int32(boundedLimit))
+
+        var results: [RecentEvent] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard let metricTypeText = sqlite3_column_text(statement, 0) else {
+                continue
+            }
+
+            let metricTypeRawValue = String(cString: metricTypeText)
+            guard let metricType = MetricType(rawValue: metricTypeRawValue) else {
+                continue
+            }
+
+            let timestampMs = sqlite3_column_int64(statement, 1)
+            let timestamp = Date(timeIntervalSince1970: Double(timestampMs) / 1000)
+            let metadata = sqlite3_column_text(statement, 2).map { String(cString: $0) }
+
+            results.append(
+                RecentEvent(
+                    metricType: metricType,
+                    timestamp: timestamp,
+                    metadata: metadata
+                )
+            )
+        }
+
+        return results.reversed()
     }
 
     // MARK: - Helpers

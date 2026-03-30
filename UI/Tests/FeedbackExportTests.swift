@@ -1,4 +1,5 @@
 import XCTest
+import App
 @testable import Retrace
 
 final class FeedbackExportTests: XCTestCase {
@@ -85,6 +86,20 @@ final class FeedbackExportTests: XCTestCase {
                 "2026-03-13T11:58:02Z [FeedbackMemoryProfile]   storage.videoEncoding: now 256 MB | avg 240 MB | peak 320 MB | tracked share now 27.5%",
                 "2026-03-13T11:59:00Z [INFO] Sample log line"
             ],
+            recentMetricEvents: [
+                FeedbackRecentMetricEvent(
+                    timestamp: Date(timeIntervalSince1970: 1_773_485_700),
+                    metricType: "help_opened",
+                    summary: "Help opened",
+                    details: ["source": "dashboard"]
+                ),
+                FeedbackRecentMetricEvent(
+                    timestamp: Date(timeIntervalSince1970: 1_773_485_760),
+                    metricType: "filtered_search_query",
+                    summary: "Filtered search submitted",
+                    details: ["queryLength": "12", "filterCount": "2"]
+                )
+            ],
             displayInfo: DiagnosticInfo.DisplayInfo(
                 count: 1,
                 displays: [
@@ -158,6 +173,9 @@ final class FeedbackExportTests: XCTestCase {
         XCTAssertTrue(text.contains("Description:\nSteps to reproduce"))
         XCTAssertTrue(text.contains("=== DIAGNOSTICS ==="))
         XCTAssertTrue(text.contains("=== RETRACE MEMORY SUMMARY ==="))
+        XCTAssertTrue(text.contains("=== RECENT ACTIONS (2) ==="))
+        XCTAssertTrue(text.contains("Help opened (source=dashboard)"))
+        XCTAssertTrue(text.contains("Filtered search submitted (filterCount=2, queryLength=12)"))
         XCTAssertTrue(text.contains("\nRetrace memory hierarchy:"))
         XCTAssertTrue(text.contains("\n  storage.videoEncoding: now 256 MB | avg 240 MB | peak 320 MB"))
         XCTAssertFalse(text.contains("\n-   storage.videoEncoding"))

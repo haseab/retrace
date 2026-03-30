@@ -2,7 +2,7 @@ import Foundation
 import SwiftUI
 import UniformTypeIdentifiers
 import Dispatch
-import Database
+import App
 import Shared
 
 // MARK: - Feedback View Model
@@ -63,6 +63,7 @@ public final class FeedbackViewModel: ObservableObject {
 
     private let minimumUploadDisplaySeconds: TimeInterval = 8.0
     private let uploadProgressRampSeconds: TimeInterval = 8.0
+    private let recentMetricEventLimit = 100
 
     // MARK: - Computed Properties
 
@@ -571,11 +572,15 @@ public final class FeedbackViewModel: ObservableObject {
         includeLogs: Bool,
         stats: DiagnosticInfo.DatabaseStats
     ) async -> DiagnosticInfo {
+        async let recentMetricEvents = loadRecentMetricEvents()
+
         if includeLogs {
-            return await feedbackService.collectDiagnosticsQuickAsync(with: stats)
+            let diagnostics = await feedbackService.collectDiagnosticsQuickAsync(with: stats)
+            return diagnostics.withRecentMetricEvents(await recentMetricEvents)
         }
 
-        return feedbackService.collectDiagnosticsNoLogs(with: stats)
+        let diagnostics = feedbackService.collectDiagnosticsNoLogs(with: stats)
+        return diagnostics.withRecentMetricEvents(await recentMetricEvents)
     }
 
     private func collectFullDiagnosticsInBackground(
@@ -583,19 +588,38 @@ public final class FeedbackViewModel: ObservableObject {
         stats: DiagnosticInfo.DatabaseStats?
     ) async -> DiagnosticInfo {
         let fallbackStats = fallbackDatabaseStats
+        async let recentMetricEvents = loadRecentMetricEvents()
 
         if let stats {
             if includeLogs {
-                return await feedbackService.collectDiagnosticsAsync(with: stats)
+                let diagnostics = await feedbackService.collectDiagnosticsAsync(with: stats)
+                return diagnostics.withRecentMetricEvents(await recentMetricEvents)
             }
-            return feedbackService.collectDiagnosticsNoLogs(with: stats)
+
+            let diagnostics = feedbackService.collectDiagnosticsNoLogs(with: stats)
+            return diagnostics.withRecentMetricEvents(await recentMetricEvents)
         }
 
         if includeLogs {
-            return await feedbackService.collectDiagnosticsAsync()
+            let diagnostics = await feedbackService.collectDiagnosticsAsync()
+            return diagnostics.withRecentMetricEvents(await recentMetricEvents)
         }
 
-        return feedbackService.collectDiagnosticsNoLogs(with: fallbackStats)
+        let diagnostics = feedbackService.collectDiagnosticsNoLogs(with: fallbackStats)
+        return diagnostics.withRecentMetricEvents(await recentMetricEvents)
+    }
+
+    private func loadRecentMetricEvents() async -> [FeedbackRecentMetricEvent] {
+        guard let coordinator = coordinatorWrapper?.coordinator else {
+            return []
+        }
+
+        do {
+            return try await coordinator.getRecentMetricEvents(limit: recentMetricEventLimit)
+        } catch {
+            Log.warning("[FeedbackViewModel] Failed to load recent metric events: \(error)", category: .ui)
+            return []
+        }
     }
 
     // MARK: - Image Attachment

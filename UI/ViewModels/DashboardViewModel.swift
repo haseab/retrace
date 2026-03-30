@@ -1981,22 +1981,32 @@ public class DashboardViewModel: ObservableObject {
     /// Record a filtered search query
     /// - Parameters:
     ///   - coordinator: The app coordinator
-    ///   - query: The search query text
-    ///   - filters: JSON string of applied filters
-    public static func recordFilteredSearch(coordinator: AppCoordinator, query: String, filters: String) {
+    ///   - metadata: Sanitized filtered-search metric payload
+    public static func recordFilteredSearch(
+        coordinator: AppCoordinator,
+        metadata: FilteredSearchMetricMetadata
+    ) {
         Task {
-            let json = "{\"query\":\"\(query)\",\"filters\":\(filters)}"
-            try? await coordinator.recordMetricEvent(metricType: .filteredSearchQuery, metadata: json)
+            try? await coordinator.recordMetricEvent(
+                metricType: .filteredSearchQuery,
+                metadata: jsonMetadata(metadata)
+            )
         }
     }
 
     /// Record a timeline filter query
     /// - Parameters:
     ///   - coordinator: The app coordinator
-    ///   - filterJson: JSON string of timeline filters
-    public static func recordTimelineFilter(coordinator: AppCoordinator, filterJson: String) {
+    ///   - metadata: Sanitized timeline-filter metric payload
+    public static func recordTimelineFilter(
+        coordinator: AppCoordinator,
+        metadata: TimelineFilterMetricMetadata
+    ) {
         Task {
-            try? await coordinator.recordMetricEvent(metricType: .timelineFilterQuery, metadata: filterJson)
+            try? await coordinator.recordMetricEvent(
+                metricType: .timelineFilterQuery,
+                metadata: jsonMetadata(metadata)
+            )
         }
     }
 
@@ -2191,6 +2201,15 @@ public class DashboardViewModel: ObservableObject {
     private static func jsonMetadata(_ payload: [String: Any]) -> String? {
         guard JSONSerialization.isValidJSONObject(payload),
               let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
+              let json = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+        return json
+    }
+
+    private static func jsonMetadata<T: Encodable>(_ payload: T) -> String? {
+        let encoder = JSONEncoder()
+        guard let data = try? encoder.encode(payload),
               let json = String(data: data, encoding: .utf8) else {
             return nil
         }

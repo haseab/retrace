@@ -37,8 +37,14 @@ Database/
 │   ├── SegmentQueries.swift   # Segment CRUD operations
 │   └── DocumentQueries.swift  # Document/FTS operations
 └── Tests/
+    ├── AsyncQueuePipelineTests.swift
     ├── DatabaseManagerTests.swift
-    └── FTSManagerTests.swift
+    ├── EdgeCaseTests.swift
+    ├── FTSManagerTests.swift
+    ├── IntegrationTests.swift
+    ├── OCRPipelineTests.swift
+    ├── QueryBuilderTests.swift
+    └── TestLogger.swift
 ```
 
 ## Protocols You Must Implement

@@ -148,12 +148,18 @@ retrace/
 ├── App/                         # Main application coordinator
 │   ├── AppCoordinator.swift     # Central coordinator (orchestrates all modules)
 │   ├── DataAdapter.swift        # Data layer adapter (DB queries, transformations)
+│   ├── FeedbackRecentMetricSupport.swift # Shared feedback-export metric models and sanitization helpers
 │   ├── ServiceContainer.swift   # Dependency injection container
 │   ├── AppLifecycle.swift       # App lifecycle management
 │   ├── ModelManager.swift       # Model management
 │   ├── OnboardingManager.swift  # First-run onboarding flow
 │   ├── RetentionManager.swift   # Data retention policies
 │   └── Tests/
+│       ├── FeedbackRecentMetricSupportTests.swift # Feedback-export metric sanitization coverage
+│       ├── InPageURLCaptureRoutingTests.swift
+│       ├── MasterKeyManagerTests.swift
+│       ├── TestLogger.swift
+│       └── TimelineStillDiskWriterTests.swift
 │
 └── UI/                          # SwiftUI interface
     ├── AGENTS.md

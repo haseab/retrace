@@ -6691,9 +6691,10 @@ public class SimpleTimelineViewModel: ObservableObject {
             extra: "applied={\(summarizeFiltersForLog(filterCriteria))}"
         )
 
-        // Record timeline filter metric with JSON of applied filters
-        let filterJson = buildTimelineFilterJson()
-        DashboardViewModel.recordTimelineFilter(coordinator: coordinator, filterJson: filterJson)
+        DashboardViewModel.recordTimelineFilter(
+            coordinator: coordinator,
+            metadata: buildTimelineFilterMetricMetadata()
+        )
 
         if dismissPanel {
             dismissFilterPanel()
@@ -6816,43 +6817,15 @@ public class SimpleTimelineViewModel: ObservableObject {
         saveFilterCriteria()
     }
 
-    /// Build JSON representation of active timeline filters for metrics
-    private func buildTimelineFilterJson() -> String {
-        var components: [String] = []
-
-        if let apps = filterCriteria.selectedApps, !apps.isEmpty {
-            let appsArray = apps.map { "\"\($0)\"" }.joined(separator: ",")
-            components.append("\"bundleIDs\":[\(appsArray)]")
-        }
-
-        if let windowName = filterCriteria.windowNameFilter {
-            let escaped = windowName.replacingOccurrences(of: "\"", with: "\\\"")
-            components.append("\"windowName\":\"\(escaped)\"")
-        }
-
-        if let browserUrl = filterCriteria.browserUrlFilter {
-            let escaped = browserUrl.replacingOccurrences(of: "\"", with: "\\\"")
-            components.append("\"browserUrl\":\"\(escaped)\"")
-        }
-
+    private func buildTimelineFilterMetricMetadata() -> TimelineFilterMetricMetadata {
         let effectiveDateRanges = filterCriteria.effectiveDateRanges
-        if effectiveDateRanges.count == 1 {
-            if let startDate = effectiveDateRanges[0].start {
-                components.append("\"startDate\":\"\(Log.timestamp(from: startDate))\"")
-            }
-            if let endDate = effectiveDateRanges[0].end {
-                components.append("\"endDate\":\"\(Log.timestamp(from: endDate))\"")
-            }
-        } else if !effectiveDateRanges.isEmpty {
-            let encodedRanges = effectiveDateRanges.map { range in
-                let start = range.start.map { "\"\(Log.timestamp(from: $0))\"" } ?? "null"
-                let end = range.end.map { "\"\(Log.timestamp(from: $0))\"" } ?? "null"
-                return "{\"start\":\(start),\"end\":\(end)}"
-            }.joined(separator: ",")
-            components.append("\"dateRanges\":[\(encodedRanges)]")
-        }
-
-        return "{\(components.joined(separator: ","))}"
+        return TimelineFilterMetricMetadata(
+            hasAppFilter: !(filterCriteria.selectedApps?.isEmpty ?? true),
+            hasWindowFilter: !(filterCriteria.windowNameFilter?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true),
+            hasURLFilter: !(filterCriteria.browserUrlFilter?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true),
+            hasStartDate: effectiveDateRanges.contains(where: { $0.start != nil }),
+            hasEndDate: effectiveDateRanges.contains(where: { $0.end != nil })
+        )
     }
 
     // MARK: - Peek Mode (View Full Context)

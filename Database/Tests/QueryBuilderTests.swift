@@ -639,6 +639,98 @@ final class QueryBuilderTests: XCTestCase {
         }
     }
 
+    func testDailyMetricsQueries_GetRecentEvents_ReturnsNewestRowsInChronologicalOrder() throws {
+        let baseTime = Date(timeIntervalSince1970: 1_774_800_000)
+
+        try DailyMetricsQueries.recordEvent(
+            db: db!,
+            metricType: .timelineOpens,
+            timestamp: baseTime,
+            metadata: nil
+        )
+        try DailyMetricsQueries.recordEvent(
+            db: db!,
+            metricType: .helpOpened,
+            timestamp: baseTime.addingTimeInterval(5),
+            metadata: #"{"source":"dashboard"}"#
+        )
+        try DailyMetricsQueries.recordEvent(
+            db: db!,
+            metricType: .feedbackReportExport,
+            timestamp: baseTime.addingTimeInterval(10),
+            metadata: #"{"outcome":"exported","source":"manual"}"#
+        )
+
+        let results = try DailyMetricsQueries.getRecentEvents(
+            db: db!,
+            limit: 2
+        )
+
+        XCTAssertEqual(
+            results.map(\.metricType),
+            [.helpOpened, .feedbackReportExport]
+        )
+        XCTAssertEqual(
+            results.map { Int($0.timestamp.timeIntervalSince1970) },
+            [Int(baseTime.addingTimeInterval(5).timeIntervalSince1970), Int(baseTime.addingTimeInterval(10).timeIntervalSince1970)]
+        )
+        XCTAssertEqual(results.first?.metadata, #"{"source":"dashboard"}"#)
+        XCTAssertEqual(results.last?.metadata, #"{"outcome":"exported","source":"manual"}"#)
+    }
+
+    func testDailyMetricsQueries_GetRecentEvents_ExcludesNoisyMetricTypesBeforeApplyingLimit() throws {
+        let baseTime = Date(timeIntervalSince1970: 1_774_800_100)
+
+        try DailyMetricsQueries.recordEvent(
+            db: db!,
+            metricType: .timelineOpens,
+            timestamp: baseTime,
+            metadata: nil
+        )
+        try DailyMetricsQueries.recordEvent(
+            db: db!,
+            metricType: .mouseClickCapture,
+            timestamp: baseTime.addingTimeInterval(5),
+            metadata: #"{"button":"left","outcome":"debounced","trigger":"mouse_click"}"#
+        )
+        try DailyMetricsQueries.recordEvent(
+            db: db!,
+            metricType: .mouseClickCapture,
+            timestamp: baseTime.addingTimeInterval(10),
+            metadata: #"{"button":"left","outcome":"captured","trigger":"mouse_click"}"#
+        )
+        try DailyMetricsQueries.recordEvent(
+            db: db!,
+            metricType: .phraseLevelRedactionQueuedHover,
+            timestamp: baseTime.addingTimeInterval(12),
+            metadata: #"{"processingStatus":"5"}"#
+        )
+        try DailyMetricsQueries.recordEvent(
+            db: db!,
+            metricType: .helpOpened,
+            timestamp: baseTime.addingTimeInterval(15),
+            metadata: #"{"source":"dashboard"}"#
+        )
+
+        let results = try DailyMetricsQueries.getRecentEvents(
+            db: db!,
+            limit: 2,
+            excluding: [.mouseClickCapture, .phraseLevelRedactionQueuedHover]
+        )
+
+        XCTAssertEqual(
+            results.map(\.metricType),
+            [.timelineOpens, .helpOpened]
+        )
+        XCTAssertEqual(
+            results.map { Int($0.timestamp.timeIntervalSince1970) },
+            [
+                Int(baseTime.timeIntervalSince1970),
+                Int(baseTime.addingTimeInterval(15).timeIntervalSince1970),
+            ]
+        )
+    }
+
     // ╔═════════════════════════════════════════════════════════════════════════╗
     // ║                      DOCUMENT QUERIES TESTS                             ║
     // ╚═════════════════════════════════════════════════════════════════════════╝

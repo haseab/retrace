@@ -2581,6 +2581,19 @@ public actor DatabaseManager: DatabaseProtocol {
         )
     }
 
+    public func getRecentMetricEvents(
+        limit: Int,
+        excluding metricTypes: Set<DailyMetricsQueries.MetricType> = []
+    ) async throws -> [DailyMetricsQueries.RecentEvent] {
+        try withTracedDatabaseOperation("get_recent_metric_events") { db in
+            try DailyMetricsQueries.getRecentEvents(
+                db: db,
+                limit: limit,
+                excluding: metricTypes
+            )
+        }
+    }
+
     /// Get daily screen time totals (for graphs)
     /// Returns array of (date, totalSeconds) tuples sorted by date ascending
     nonisolated public func getDailyScreenTime(

@@ -3653,6 +3653,16 @@ public actor AppCoordinator {
         )
     }
 
+    public func getRecentMetricEvents(
+        limit: Int
+    ) async throws -> [FeedbackRecentMetricEvent] {
+        let rawEvents = try await services.database.getRecentMetricEvents(
+            limit: limit,
+            excluding: FeedbackRecentMetricSupport.excludedMetricTypes
+        )
+        return FeedbackRecentMetricSupport.sanitize(rawEvents)
+    }
+
     /// Get daily screen time totals (for 7-day graphs)
     /// Returns array of (date, totalSeconds) tuples sorted by date ascending
     public func getDailyScreenTime(

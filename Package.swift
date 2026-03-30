@@ -208,6 +208,7 @@ let package = Package(
             name: "AppTests",
             dependencies: [
                 "App",
+                "Database",
                 "Shared"
             ],
             path: "App/Tests"

@@ -1223,8 +1223,10 @@ public class SearchViewModel: ObservableObject {
 
             // Track filtered search if any filters are active
             if hasActiveFilters {
-                let filtersJson = buildFiltersJson()
-                DashboardViewModel.recordFilteredSearch(coordinator: coordinator, query: query, filters: filtersJson)
+                DashboardViewModel.recordFilteredSearch(
+                    coordinator: coordinator,
+                    metadata: buildFilteredSearchMetricMetadata(query: query)
+                )
             }
         }
 
@@ -1241,92 +1243,65 @@ public class SearchViewModel: ObservableObject {
         startFreshSearchTask(query: query, trigger: trigger)
     }
 
-    /// Build JSON representation of active filters for metrics
-    private func buildFiltersJson() -> String {
-        var components: [String] = []
+    private func buildFilteredSearchMetricMetadata(
+        query: String
+    ) -> FilteredSearchMetricMetadata {
+        FilteredSearchMetricMetadata(
+            queryLength: query.count,
+            filterCount: activeFilterMetricCount()
+        )
+    }
+
+    private func activeFilterMetricCount() -> Int {
+        var count = 0
 
         if let apps = selectedAppFilters, !apps.isEmpty {
-            let appsArray = apps.map { "\"\($0)\"" }.joined(separator: ",")
-            components.append("\"apps\":[\(appsArray)]")
-            components.append("\"appMode\":\"\(appFilterMode.rawValue)\"")
+            count += 1
         }
 
-        if effectiveDateRanges.count == 1 {
-            if let startDate = effectiveDateRanges[0].start {
-                components.append("\"startDate\":\"\(Log.timestamp(from: startDate))\"")
-            }
-            if let endDate = effectiveDateRanges[0].end {
-                components.append("\"endDate\":\"\(Log.timestamp(from: endDate))\"")
-            }
-        } else if !effectiveDateRanges.isEmpty {
-            let encodedRanges = effectiveDateRanges.map { range in
-                let start = range.start.map { "\"\(Log.timestamp(from: $0))\"" } ?? "null"
-                let end = range.end.map { "\"\(Log.timestamp(from: $0))\"" } ?? "null"
-                return "{\"start\":\(start),\"end\":\(end)}"
-            }.joined(separator: ",")
-            components.append("\"dateRanges\":[\(encodedRanges)]")
+        if effectiveDateRanges.contains(where: { $0.start != nil || $0.end != nil }) {
+            count += 1
         }
 
         if contentType != .all {
-            components.append("\"contentType\":\"\(contentType.rawValue)\"")
+            count += 1
         }
 
         if let tags = selectedTags, !tags.isEmpty {
-            let tagsArray = tags.map { "\($0)" }.joined(separator: ",")
-            components.append("\"tags\":[\(tagsArray)]")
-            components.append("\"tagMode\":\"\(tagFilterMode.rawValue)\"")
+            count += 1
         }
 
         if hiddenFilter != .hide {
-            components.append("\"hiddenFilter\":\"\(hiddenFilter.rawValue)\"")
+            count += 1
         }
 
         if commentFilter != .allFrames {
-            components.append("\"commentFilter\":\"\(commentFilter.rawValue)\"")
+            count += 1
         }
 
         let normalizedWindowBuckets = normalizedMetadataFilterBuckets(
             include: windowNameTerms,
             exclude: windowNameExcludedTerms
         )
-        if !normalizedWindowBuckets.includeTerms.isEmpty {
-            let escapedTerms = normalizedWindowBuckets.includeTerms
-                .map { "\"\($0.replacingOccurrences(of: "\"", with: "\\\""))\"" }
-                .joined(separator: ",")
-            components.append("\"windowNamesInclude\":[\(escapedTerms)]")
-        }
-        if !normalizedWindowBuckets.excludeTerms.isEmpty {
-            let escapedTerms = normalizedWindowBuckets.excludeTerms
-                .map { "\"\($0.replacingOccurrences(of: "\"", with: "\\\""))\"" }
-                .joined(separator: ",")
-            components.append("\"windowNamesExclude\":[\(escapedTerms)]")
+        if !normalizedWindowBuckets.includeTerms.isEmpty ||
+            !normalizedWindowBuckets.excludeTerms.isEmpty {
+            count += 1
         }
 
         let normalizedBrowserBuckets = normalizedMetadataFilterBuckets(
             include: browserUrlTerms,
             exclude: browserUrlExcludedTerms
         )
-        if !normalizedBrowserBuckets.includeTerms.isEmpty {
-            let escapedTerms = normalizedBrowserBuckets.includeTerms
-                .map { "\"\($0.replacingOccurrences(of: "\"", with: "\\\""))\"" }
-                .joined(separator: ",")
-            components.append("\"browserUrlsInclude\":[\(escapedTerms)]")
-        }
-        if !normalizedBrowserBuckets.excludeTerms.isEmpty {
-            let escapedTerms = normalizedBrowserBuckets.excludeTerms
-                .map { "\"\($0.replacingOccurrences(of: "\"", with: "\\\""))\"" }
-                .joined(separator: ",")
-            components.append("\"browserUrlsExclude\":[\(escapedTerms)]")
+        if !normalizedBrowserBuckets.includeTerms.isEmpty ||
+            !normalizedBrowserBuckets.excludeTerms.isEmpty {
+            count += 1
         }
 
-        if !excludedSearchTerms.isEmpty {
-            let escapedTerms = normalizedExcludedSearchTerms(excludedSearchTerms)
-                .map { "\"\($0.replacingOccurrences(of: "\"", with: "\\\""))\"" }
-                .joined(separator: ",")
-            components.append("\"excludedTerms\":[\(escapedTerms)]")
+        if !normalizedExcludedSearchTerms(excludedSearchTerms).isEmpty {
+            count += 1
         }
 
-        return "{\(components.joined(separator: ","))}"
+        return count
     }
 
     private func armFilterAutoSearchSuppression() {
