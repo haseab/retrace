@@ -10445,6 +10445,7 @@ private let filterPanelSettingsStore = UserDefaults(suiteName: "io.retrace.app")
 
 struct FilterPanel: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel
+    @StateObject private var advancedFilterDraftState = TimelineAdvancedFilterDraftState()
     @GestureState private var dragOffset: CGSize = .zero
     @State private var panelPosition: CGSize = .zero
     @State private var escapeMonitor: Any?
@@ -10575,6 +10576,23 @@ struct FilterPanel: View {
         if hasApplyButton { return .apply }
         if hasClearButton { return .clear }
         return nil
+    }
+
+    private func commitAdvancedDraftInputs() {
+        advancedFilterDraftState.commitDraftInputs()
+        var pendingCriteria = viewModel.pendingFilterCriteria
+        advancedFilterDraftState.applyMetadataFilters(to: &pendingCriteria)
+        if pendingCriteria != viewModel.pendingFilterCriteria {
+            viewModel.pendingFilterCriteria = pendingCriteria
+        }
+    }
+
+    private func applyFiltersByCommittingAdvancedDrafts(dismissPanel: Bool = true) {
+        focusedActionButton = nil
+        commitAdvancedDraftInputs()
+        withAnimation(.easeOut(duration: 0.15)) {
+            viewModel.applyFilters(dismissPanel: dismissPanel)
+        }
     }
 
     var body: some View {
@@ -10765,7 +10783,10 @@ struct FilterPanel: View {
                 .padding(.horizontal, 16)
 
             // Advanced filters section (collapsible)
-            AdvancedFiltersSection(viewModel: viewModel)
+            AdvancedFiltersSection(
+                viewModel: viewModel,
+                draftState: advancedFilterDraftState
+            )
 
             // Divider before apply button
             Rectangle()
@@ -10779,6 +10800,7 @@ struct FilterPanel: View {
                 if hasClearButton {
                     Button(action: {
                         focusedActionButton = nil
+                        advancedFilterDraftState.clearDraftInputs()
                         viewModel.clearPendingFilters()
                         withAnimation(.easeOut(duration: 0.15)) {
                             viewModel.applyFilters(dismissPanel: false)
@@ -10816,10 +10838,7 @@ struct FilterPanel: View {
                 // Apply button
                 if hasApplyButton {
                     Button(action: {
-                        focusedActionButton = nil
-                        withAnimation(.easeOut(duration: 0.15)) {
-                            viewModel.applyFilters()
-                        }
+                        applyFiltersByCommittingAdvancedDrafts()
                     }) {
                         Text("Apply Filters")
                             .font(.system(size: 14, weight: .semibold))
@@ -10914,10 +10933,7 @@ struct FilterPanel: View {
 
                 // Cmd+Enter applies filters from anywhere in the filter panel.
                 if (event.keyCode == 36 || event.keyCode == 76) && modifiers == [.command] {
-                    focusedActionButton = nil
-                    withAnimation(.easeOut(duration: 0.15)) {
-                        viewModel.applyFilters(dismissPanel: hasApplyButton)
-                    }
+                    applyFiltersByCommittingAdvancedDrafts(dismissPanel: hasApplyButton)
                     return nil
                 }
 
@@ -10934,15 +10950,13 @@ struct FilterPanel: View {
                 if (event.keyCode == 36 || event.keyCode == 76), let focusedButton = focusedActionButton {
                     if focusedButton == .clear {
                         focusedActionButton = nil
+                        advancedFilterDraftState.clearDraftInputs()
                         viewModel.clearPendingFilters()
                         withAnimation(.easeOut(duration: 0.15)) {
                             viewModel.applyFilters(dismissPanel: false)
                         }
                     } else {
-                        focusedActionButton = nil
-                        withAnimation(.easeOut(duration: 0.15)) {
-                            viewModel.applyFilters()
-                        }
+                        applyFiltersByCommittingAdvancedDrafts()
                     }
                     return nil
                 }
@@ -11200,31 +11214,20 @@ struct FilterPanel: View {
 
 // MARK: - Advanced Filters Section
 
-/// Collapsible section for advanced text filters (Window Name and Browser URL)
-struct AdvancedFiltersSection: View {
-    @ObservedObject var viewModel: SimpleTimelineViewModel
-    @State private var isExpanded: Bool = false
-    @State private var isHeaderHovered = false
-    @State private var isWindowHovered = false
-    @State private var isBrowserHovered = false
-    @State private var windowInputText = ""
-    @State private var browserInputText = ""
-    @State private var windowNameIncludeTerms: [String] = []
-    @State private var windowNameExcludeTerms: [String] = []
-    @State private var windowNameFilterMode: AppFilterMode = .include
-    @State private var browserUrlIncludeTerms: [String] = []
-    @State private var browserUrlExcludeTerms: [String] = []
-    @State private var browserUrlFilterMode: AppFilterMode = .include
+@MainActor
+final class TimelineAdvancedFilterDraftState: ObservableObject {
+    @Published var windowInputText = ""
+    @Published var browserInputText = ""
+    @Published var windowNameIncludeTerms: [String] = []
+    @Published var windowNameExcludeTerms: [String] = []
+    @Published var windowNameFilterMode: AppFilterMode = .include
+    @Published var browserUrlIncludeTerms: [String] = []
+    @Published var browserUrlExcludeTerms: [String] = []
+    @Published var browserUrlFilterMode: AppFilterMode = .include
 
-    private enum AdvancedField: Hashable {
-        case windowName
-        case browserUrl
-    }
-    @FocusState private var focusedField: AdvancedField?
+    static let metadataFilterPrefix = "__retrace_meta_filter_v1__"
 
-    private static let metadataFilterPrefix = "__retrace_meta_filter_v1__"
-
-    private struct EncodedMetadataFilterPayload: Codable {
+    struct EncodedMetadataFilterPayload: Codable {
         let includeTerms: [String]?
         let excludeTerms: [String]?
         // Legacy fields for backward compatibility.
@@ -11232,7 +11235,7 @@ struct AdvancedFiltersSection: View {
         let terms: [String]?
     }
 
-    private struct DecodedMetadataFilter: Equatable {
+    struct DecodedMetadataFilter: Equatable {
         let includeTerms: [String]
         let excludeTerms: [String]
         let mode: AppFilterMode
@@ -11244,54 +11247,50 @@ struct AdvancedFiltersSection: View {
         }
     }
 
-    private struct MetadataChipTerm: Identifiable {
+    struct MetadataChipTerm: Identifiable {
         let term: String
         let mode: AppFilterMode
         var id: String { "\(mode.rawValue):\(term.lowercased())" }
     }
 
-    /// Whether any advanced filter is active
-    private var hasActiveAdvancedFilters: Bool {
-        viewModel.pendingFilterCriteria.hasAdvancedFilters
+    var windowNameChips: [MetadataChipTerm] {
+        Self.deduplicatedTerms(windowNameIncludeTerms).map { MetadataChipTerm(term: $0, mode: .include) } +
+        Self.deduplicatedTerms(windowNameExcludeTerms).map { MetadataChipTerm(term: $0, mode: .exclude) }
     }
 
-    /// Whether the advanced dropdown is active (for highlight)
-    private var isAdvancedActive: Bool {
-        viewModel.activeFilterDropdown == .advanced
+    var browserUrlChips: [MetadataChipTerm] {
+        Self.deduplicatedTerms(browserUrlIncludeTerms).map { MetadataChipTerm(term: $0, mode: .include) } +
+        Self.deduplicatedTerms(browserUrlExcludeTerms).map { MetadataChipTerm(term: $0, mode: .exclude) }
     }
 
-    /// Keyboard highlight when tab focus is on the Advanced header row.
-    private var isHeaderKeyboardHighlighted: Bool {
-        isAdvancedActive && viewModel.advancedFocusedFieldIndex == 0
+    func commitDraftInputs() {
+        commitWindowNameDraft()
+        commitBrowserUrlDraft()
     }
 
-    private func addWindowNameTermFromInput() {
+    func commitWindowNameDraft() {
         let candidate = windowInputText
         windowInputText = ""
-        guard let normalized = Self.normalizedTerm(candidate) else { return }
-        if windowNameFilterMode == .include {
-            windowNameIncludeTerms = Self.deduplicatedTerms(windowNameIncludeTerms + [normalized])
-            windowNameExcludeTerms.removeAll { $0.caseInsensitiveCompare(normalized) == .orderedSame }
-        } else {
-            windowNameExcludeTerms = Self.deduplicatedTerms(windowNameExcludeTerms + [normalized])
-            windowNameIncludeTerms.removeAll { $0.caseInsensitiveCompare(normalized) == .orderedSame }
-        }
+        Self.commit(
+            candidate,
+            mode: windowNameFilterMode,
+            includeTerms: &windowNameIncludeTerms,
+            excludeTerms: &windowNameExcludeTerms
+        )
     }
 
-    private func addBrowserUrlTermFromInput() {
+    func commitBrowserUrlDraft() {
         let candidate = browserInputText
         browserInputText = ""
-        guard let normalized = Self.normalizedTerm(candidate) else { return }
-        if browserUrlFilterMode == .include {
-            browserUrlIncludeTerms = Self.deduplicatedTerms(browserUrlIncludeTerms + [normalized])
-            browserUrlExcludeTerms.removeAll { $0.caseInsensitiveCompare(normalized) == .orderedSame }
-        } else {
-            browserUrlExcludeTerms = Self.deduplicatedTerms(browserUrlExcludeTerms + [normalized])
-            browserUrlIncludeTerms.removeAll { $0.caseInsensitiveCompare(normalized) == .orderedSame }
-        }
+        Self.commit(
+            candidate,
+            mode: browserUrlFilterMode,
+            includeTerms: &browserUrlIncludeTerms,
+            excludeTerms: &browserUrlExcludeTerms
+        )
     }
 
-    private func removeWindowNameTerm(_ term: String, mode: AppFilterMode) {
+    func removeWindowNameTerm(_ term: String, mode: AppFilterMode) {
         let needle = term.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !needle.isEmpty else { return }
         if mode == .include {
@@ -11305,7 +11304,7 @@ struct AdvancedFiltersSection: View {
         }
     }
 
-    private func removeBrowserUrlTerm(_ term: String, mode: AppFilterMode) {
+    func removeBrowserUrlTerm(_ term: String, mode: AppFilterMode) {
         let needle = term.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !needle.isEmpty else { return }
         if mode == .include {
@@ -11319,18 +11318,13 @@ struct AdvancedFiltersSection: View {
         }
     }
 
-    private var windowNameChips: [MetadataChipTerm] {
-        Self.deduplicatedTerms(windowNameIncludeTerms).map { MetadataChipTerm(term: $0, mode: .include) } +
-        Self.deduplicatedTerms(windowNameExcludeTerms).map { MetadataChipTerm(term: $0, mode: .exclude) }
+    func clearDraftInputs() {
+        windowInputText = ""
+        browserInputText = ""
     }
 
-    private var browserUrlChips: [MetadataChipTerm] {
-        Self.deduplicatedTerms(browserUrlIncludeTerms).map { MetadataChipTerm(term: $0, mode: .include) } +
-        Self.deduplicatedTerms(browserUrlExcludeTerms).map { MetadataChipTerm(term: $0, mode: .exclude) }
-    }
-
-    private func syncStateFromPendingFilters() {
-        let decodedWindowFilter = Self.decodeMetadataFilter(viewModel.pendingFilterCriteria.windowNameFilter)
+    func sync(from criteria: FilterCriteria) {
+        let decodedWindowFilter = Self.decodeMetadataFilter(criteria.windowNameFilter)
         if windowNameIncludeTerms != decodedWindowFilter.includeTerms {
             windowNameIncludeTerms = decodedWindowFilter.includeTerms
         }
@@ -11341,7 +11335,7 @@ struct AdvancedFiltersSection: View {
             windowNameFilterMode = decodedWindowFilter.mode
         }
 
-        let decodedBrowserFilter = Self.decodeMetadataFilter(viewModel.pendingFilterCriteria.browserUrlFilter)
+        let decodedBrowserFilter = Self.decodeMetadataFilter(criteria.browserUrlFilter)
         if browserUrlIncludeTerms != decodedBrowserFilter.includeTerms {
             browserUrlIncludeTerms = decodedBrowserFilter.includeTerms
         }
@@ -11353,21 +11347,18 @@ struct AdvancedFiltersSection: View {
         }
     }
 
-    private func updatePendingWindowFilter() {
-        let encoded = Self.encodedMetadataFilter(includeTerms: windowNameIncludeTerms, excludeTerms: windowNameExcludeTerms)
-        if viewModel.pendingFilterCriteria.windowNameFilter != encoded {
-            viewModel.pendingFilterCriteria.windowNameFilter = encoded
-        }
+    func applyMetadataFilters(to criteria: inout FilterCriteria) {
+        criteria.windowNameFilter = Self.encodedMetadataFilter(
+            includeTerms: windowNameIncludeTerms,
+            excludeTerms: windowNameExcludeTerms
+        )
+        criteria.browserUrlFilter = Self.encodedMetadataFilter(
+            includeTerms: browserUrlIncludeTerms,
+            excludeTerms: browserUrlExcludeTerms
+        )
     }
 
-    private func updatePendingBrowserFilter() {
-        let encoded = Self.encodedMetadataFilter(includeTerms: browserUrlIncludeTerms, excludeTerms: browserUrlExcludeTerms)
-        if viewModel.pendingFilterCriteria.browserUrlFilter != encoded {
-            viewModel.pendingFilterCriteria.browserUrlFilter = encoded
-        }
-    }
-
-    private static func encodedMetadataFilter(includeTerms: [String], excludeTerms: [String]) -> String? {
+    static func encodedMetadataFilter(includeTerms: [String], excludeTerms: [String]) -> String? {
         let normalizedIncludeTerms = deduplicatedTerms(includeTerms)
         let includeKeys = Set(normalizedIncludeTerms.map { $0.lowercased() })
         let normalizedExcludeTerms = deduplicatedTerms(excludeTerms).filter { !includeKeys.contains($0.lowercased()) }
@@ -11383,7 +11374,7 @@ struct AdvancedFiltersSection: View {
         return metadataFilterPrefix + data.base64EncodedString()
     }
 
-    private static func decodeMetadataFilter(_ rawValue: String?) -> DecodedMetadataFilter {
+    static func decodeMetadataFilter(_ rawValue: String?) -> DecodedMetadataFilter {
         guard let rawValue else { return .empty }
         let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return .empty }
@@ -11418,7 +11409,7 @@ struct AdvancedFiltersSection: View {
         return DecodedMetadataFilter(includeTerms: normalizedLegacyTerms, excludeTerms: [], mode: .include)
     }
 
-    private static func deduplicatedTerms(_ terms: [String]) -> [String] {
+    static func deduplicatedTerms(_ terms: [String]) -> [String] {
         var seen = Set<String>()
         var normalizedTerms: [String] = []
 
@@ -11433,13 +11424,100 @@ struct AdvancedFiltersSection: View {
         return normalizedTerms
     }
 
-    private static func normalizedTerm(_ term: String) -> String? {
+    static func normalizedTerm(_ term: String) -> String? {
         let collapsed = term
             .split(whereSeparator: \.isWhitespace)
             .map(String.init)
             .joined(separator: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return collapsed.isEmpty ? nil : collapsed
+    }
+
+    private static func commit(
+        _ candidate: String,
+        mode: AppFilterMode,
+        includeTerms: inout [String],
+        excludeTerms: inout [String]
+    ) {
+        guard let normalized = normalizedTerm(candidate) else { return }
+        if mode == .include {
+            includeTerms = deduplicatedTerms(includeTerms + [normalized])
+            excludeTerms.removeAll { $0.caseInsensitiveCompare(normalized) == .orderedSame }
+        } else {
+            excludeTerms = deduplicatedTerms(excludeTerms + [normalized])
+            includeTerms.removeAll { $0.caseInsensitiveCompare(normalized) == .orderedSame }
+        }
+    }
+}
+
+/// Collapsible section for advanced text filters (Window Name and Browser URL)
+struct AdvancedFiltersSection: View {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+    @ObservedObject var draftState: TimelineAdvancedFilterDraftState
+    @State private var isExpanded: Bool = false
+    @State private var isHeaderHovered = false
+    @State private var isWindowHovered = false
+    @State private var isBrowserHovered = false
+    @State private var lastFocusedField: AdvancedField?
+
+    private enum AdvancedField: Hashable {
+        case windowName
+        case browserUrl
+    }
+    @FocusState private var focusedField: AdvancedField?
+
+    /// Whether any advanced filter is active
+    private var hasActiveAdvancedFilters: Bool {
+        viewModel.pendingFilterCriteria.hasAdvancedFilters
+    }
+
+    /// Whether the advanced dropdown is active (for highlight)
+    private var isAdvancedActive: Bool {
+        viewModel.activeFilterDropdown == .advanced
+    }
+
+    /// Keyboard highlight when tab focus is on the Advanced header row.
+    private var isHeaderKeyboardHighlighted: Bool {
+        isAdvancedActive && viewModel.advancedFocusedFieldIndex == 0
+    }
+
+    private func commitDraftForPreviousFocus(_ previousField: AdvancedField?, newField: AdvancedField?) {
+        guard previousField != newField else { return }
+
+        switch previousField {
+        case .windowName:
+            draftState.commitWindowNameDraft()
+            updatePendingWindowFilter()
+        case .browserUrl:
+            draftState.commitBrowserUrlDraft()
+            updatePendingBrowserFilter()
+        case nil:
+            break
+        }
+    }
+
+    private func syncStateFromPendingFilters() {
+        draftState.sync(from: viewModel.pendingFilterCriteria)
+    }
+
+    private func updatePendingWindowFilter() {
+        let encoded = TimelineAdvancedFilterDraftState.encodedMetadataFilter(
+            includeTerms: draftState.windowNameIncludeTerms,
+            excludeTerms: draftState.windowNameExcludeTerms
+        )
+        if viewModel.pendingFilterCriteria.windowNameFilter != encoded {
+            viewModel.pendingFilterCriteria.windowNameFilter = encoded
+        }
+    }
+
+    private func updatePendingBrowserFilter() {
+        let encoded = TimelineAdvancedFilterDraftState.encodedMetadataFilter(
+            includeTerms: draftState.browserUrlIncludeTerms,
+            excludeTerms: draftState.browserUrlExcludeTerms
+        )
+        if viewModel.pendingFilterCriteria.browserUrlFilter != encoded {
+            viewModel.pendingFilterCriteria.browserUrlFilter = encoded
+        }
     }
 
     var body: some View {
@@ -11511,16 +11589,16 @@ struct AdvancedFiltersSection: View {
                             .foregroundColor(.white.opacity(0.6))
 
                         HStack(spacing: 10) {
-                            TextField("Search titles...", text: $windowInputText)
+                            TextField("Search titles...", text: $draftState.windowInputText)
                                 .focused($focusedField, equals: .windowName)
                                 .textFieldStyle(.plain)
                                 .font(.system(size: 13))
                                 .foregroundColor(.white)
                                 .onSubmit {
-                                    addWindowNameTermFromInput()
+                                    draftState.commitWindowNameDraft()
                                 }
 
-                            IncludeExcludeModeToggle(mode: $windowNameFilterMode)
+                            IncludeExcludeModeToggle(mode: $draftState.windowNameFilterMode)
                                 .frame(width: 138)
                         }
                         .padding(.horizontal, 8)
@@ -11534,7 +11612,7 @@ struct AdvancedFiltersSection: View {
                                 .stroke(
                                     focusedField == .windowName
                                         ? RetraceMenuStyle.filterStrokeStrong
-                                        : (!windowNameChips.isEmpty
+                                        : (!draftState.windowNameChips.isEmpty
                                             ? RetraceMenuStyle.filterStrokeMedium
                                             : (isWindowHovered ? Color.white.opacity(0.65) : RetraceMenuStyle.filterStrokeSubtle)),
                                     lineWidth: 1
@@ -11548,12 +11626,12 @@ struct AdvancedFiltersSection: View {
                             focusedField = .windowName
                         }
 
-                        if !windowNameChips.isEmpty {
+                        if !draftState.windowNameChips.isEmpty {
                             ScrollView(.horizontal, showsIndicators: false) {
                                 HStack(spacing: 8) {
-                                    ForEach(windowNameChips) { chip in
+                                    ForEach(draftState.windowNameChips) { chip in
                                         TimelineMetadataTermChip(term: chip.term, mode: chip.mode) {
-                                            removeWindowNameTerm(chip.term, mode: chip.mode)
+                                            draftState.removeWindowNameTerm(chip.term, mode: chip.mode)
                                         }
                                     }
                                 }
@@ -11569,16 +11647,16 @@ struct AdvancedFiltersSection: View {
                             .foregroundColor(.white.opacity(0.6))
 
                         HStack(spacing: 10) {
-                            TextField("Search URLs...", text: $browserInputText)
+                            TextField("Search URLs...", text: $draftState.browserInputText)
                                 .focused($focusedField, equals: .browserUrl)
                                 .textFieldStyle(.plain)
                                 .font(.system(size: 13))
                                 .foregroundColor(.white)
                                 .onSubmit {
-                                    addBrowserUrlTermFromInput()
+                                    draftState.commitBrowserUrlDraft()
                                 }
 
-                            IncludeExcludeModeToggle(mode: $browserUrlFilterMode)
+                            IncludeExcludeModeToggle(mode: $draftState.browserUrlFilterMode)
                                 .frame(width: 138)
                         }
                         .padding(.horizontal, 8)
@@ -11592,7 +11670,7 @@ struct AdvancedFiltersSection: View {
                                 .stroke(
                                     focusedField == .browserUrl
                                         ? RetraceMenuStyle.filterStrokeStrong
-                                        : (!browserUrlChips.isEmpty
+                                        : (!draftState.browserUrlChips.isEmpty
                                             ? RetraceMenuStyle.filterStrokeMedium
                                             : (isBrowserHovered ? Color.white.opacity(0.65) : RetraceMenuStyle.filterStrokeSubtle)),
                                     lineWidth: 1
@@ -11606,12 +11684,12 @@ struct AdvancedFiltersSection: View {
                             focusedField = .browserUrl
                         }
 
-                        if !browserUrlChips.isEmpty {
+                        if !draftState.browserUrlChips.isEmpty {
                             ScrollView(.horizontal, showsIndicators: false) {
                                 HStack(spacing: 8) {
-                                    ForEach(browserUrlChips) { chip in
+                                    ForEach(draftState.browserUrlChips) { chip in
                                         TimelineMetadataTermChip(term: chip.term, mode: chip.mode) {
-                                            removeBrowserUrlTerm(chip.term, mode: chip.mode)
+                                            draftState.removeBrowserUrlTerm(chip.term, mode: chip.mode)
                                         }
                                     }
                                 }
@@ -11631,16 +11709,16 @@ struct AdvancedFiltersSection: View {
                 isExpanded = true
             }
         }
-        .onChange(of: windowNameIncludeTerms) { _ in
+        .onChange(of: draftState.windowNameIncludeTerms) { _ in
             updatePendingWindowFilter()
         }
-        .onChange(of: windowNameExcludeTerms) { _ in
+        .onChange(of: draftState.windowNameExcludeTerms) { _ in
             updatePendingWindowFilter()
         }
-        .onChange(of: browserUrlIncludeTerms) { _ in
+        .onChange(of: draftState.browserUrlIncludeTerms) { _ in
             updatePendingBrowserFilter()
         }
-        .onChange(of: browserUrlExcludeTerms) { _ in
+        .onChange(of: draftState.browserUrlExcludeTerms) { _ in
             updatePendingBrowserFilter()
         }
         .onChange(of: viewModel.pendingFilterCriteria.windowNameFilter) { _ in
@@ -11695,6 +11773,8 @@ struct AdvancedFiltersSection: View {
             }
         }
         .onChange(of: focusedField) { newValue in
+            commitDraftForPreviousFocus(lastFocusedField, newField: newValue)
+            lastFocusedField = newValue
             // Sync focus state to viewModel for tab monitor
             switch newValue {
             case .windowName: viewModel.advancedFocusedFieldIndex = 1
