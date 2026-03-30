@@ -1745,7 +1745,7 @@ public struct DashboardView: View {
     }
 
     private func formatRecordedHoursSubtitle(_ seconds: TimeInterval) -> String {
-        guard seconds > 0 else { return "0 hours" }
+        guard seconds > 0 else { return "0 hours on Retrace" }
 
         let roundedHours = Int((seconds / 3600).rounded())
         let hours = max(0, roundedHours)
@@ -1758,7 +1758,7 @@ public struct DashboardView: View {
         let hoursText = formatter.string(from: NSNumber(value: hours))
             ?? String(hours)
 
-        return "\(hoursText) \(hours == 1 ? "hour" : "hours")"
+        return "\(hoursText) \(hours == 1 ? "hour" : "hours") on Retrace"
     }
 
     private func formatScreenTimeFromDaily(_ data: [DailyDataPoint]) -> String {
