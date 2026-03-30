@@ -26,6 +26,13 @@ public struct FrameID: Hashable, Codable, Sendable, Identifiable {
 
 // MARK: - Frame Metadata
 
+/// Coarse-grained reason a frame capture was triggered.
+public enum FrameCaptureTrigger: String, Codable, Sendable, Equatable {
+    case window
+    case interval
+    case mouse
+}
+
 /// Metadata associated with a captured frame
 public struct FrameMetadata: Codable, Sendable, Equatable {
     /// Bundle identifier of the active application
@@ -43,6 +50,9 @@ public struct FrameMetadata: Codable, Sendable, Equatable {
     /// Why the frame was redacted (if redacted during capture)
     public let redactionReason: String?
 
+    /// Why the frame capture was triggered.
+    public let captureTrigger: FrameCaptureTrigger?
+
     /// Display ID that was captured
     public let displayID: UInt32
 
@@ -55,6 +65,7 @@ public struct FrameMetadata: Codable, Sendable, Equatable {
         windowName: String? = nil,
         browserURL: String? = nil,
         redactionReason: String? = nil,
+        captureTrigger: FrameCaptureTrigger? = nil,
         displayID: UInt32 = 0,
         mousePosition: CGPoint? = nil
     ) {
@@ -63,6 +74,7 @@ public struct FrameMetadata: Codable, Sendable, Equatable {
         self.windowName = windowName
         self.browserURL = browserURL
         self.redactionReason = redactionReason
+        self.captureTrigger = captureTrigger
         self.displayID = displayID
         self.mousePosition = mousePosition
     }

@@ -477,16 +477,6 @@ final class DatabaseManagerTests: XCTestCase {
         try await migratedDatabase.close()
     }
 
-    func testFrameTableIncludesRewritePurposeColumn() async throws {
-        let columnNames = try await tableColumnNames("frame")
-        XCTAssertTrue(columnNames.contains("rewritePurpose"))
-    }
-
-    func testFrameTableIncludesRewrittenAtColumn() async throws {
-        let columnNames = try await tableColumnNames("frame")
-        XCTAssertTrue(columnNames.contains("rewrittenAt"))
-    }
-
     func testNodeTableIncludesEncryptedTextColumnAndOmitsLegacyRedactedColumn() async throws {
         let columnNames = try await tableColumnNames("node")
         XCTAssertTrue(columnNames.contains("encryptedText"))
@@ -1362,7 +1352,8 @@ final class DatabaseManagerTests: XCTestCase {
                 appBundleID: "com.apple.Safari",
                 appName: "Safari",
                 windowName: "Retrace - GitHub",
-                browserURL: "https://github.com/retrace"
+                browserURL: "https://github.com/retrace",
+                captureTrigger: .mouse
             ),
             source: .native
         )
@@ -1378,6 +1369,7 @@ final class DatabaseManagerTests: XCTestCase {
         XCTAssertEqual(retrieved?.segmentID.value, appSegmentID)
         XCTAssertEqual(retrieved?.metadata.appBundleID, "com.apple.Safari")
         XCTAssertEqual(retrieved?.metadata.windowName, "Retrace - GitHub")
+        XCTAssertEqual(retrieved?.metadata.captureTrigger, .mouse)
     }
 
     func testUpdateAndGetFrameMetadata() async throws {
@@ -1933,6 +1925,82 @@ final class DatabaseManagerTests: XCTestCase {
         XCTAssertEqual(processingQueueIndexCount, 1)
         XCTAssertEqual(rewrittenIndexCount, 1)
         XCTAssertEqual(docSegmentIndexCount, 1)
+    }
+
+    func testMigrationRunner_V17AddsCaptureTriggerColumn() async throws {
+        let dbPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RetraceV17Migration-\(UUID().uuidString).sqlite")
+            .path
+        let db = try openRawDatabase(at: dbPath)
+
+        defer {
+            sqlite3_close(db)
+            try? FileManager.default.removeItem(atPath: dbPath)
+            try? FileManager.default.removeItem(atPath: dbPath + "-wal")
+            try? FileManager.default.removeItem(atPath: dbPath + "-shm")
+        }
+
+        try executeRawSQL(Schema.createSchemaMigrationsTable, db: db)
+        try executeRawSQL(
+            """
+            CREATE TABLE frame (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                imagePath TEXT NOT NULL,
+                timestamp INTEGER NOT NULL,
+                segmentId INTEGER NOT NULL,
+                videoId INTEGER,
+                ocrText TEXT,
+                imageWidth INTEGER NOT NULL,
+                imageHeight INTEGER NOT NULL,
+                isRedacted BOOLEAN DEFAULT 0,
+                redactionConfidence REAL,
+                processingStatus INTEGER DEFAULT 0,
+                processedAt INTEGER,
+                redactionReason INTEGER,
+                metadata TEXT,
+                mousePosition TEXT,
+                scrollPosition TEXT,
+                videoCurrentTime REAL,
+                rewritePurpose INTEGER,
+                rewrittenAt INTEGER
+            );
+            """,
+            db: db
+        )
+        try executeRawSQL(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (16, \(Int64(Date().timeIntervalSince1970 * 1_000)));",
+            db: db
+        )
+
+        var preMigrationStatement: OpaquePointer?
+        defer { sqlite3_finalize(preMigrationStatement) }
+        XCTAssertEqual(sqlite3_prepare_v2(db, "PRAGMA table_info(frame);", -1, &preMigrationStatement, nil), SQLITE_OK)
+
+        var preMigrationColumns: [String] = []
+        while sqlite3_step(preMigrationStatement) == SQLITE_ROW {
+            if let name = sqlite3_column_text(preMigrationStatement, 1).map({ String(cString: $0) }) {
+                preMigrationColumns.append(name)
+            }
+        }
+        XCTAssertFalse(preMigrationColumns.contains("capture_trigger"))
+
+        let runner = MigrationRunner(db: db)
+        try await runner.runMigrations()
+
+        var postMigrationStatement: OpaquePointer?
+        defer { sqlite3_finalize(postMigrationStatement) }
+        XCTAssertEqual(sqlite3_prepare_v2(db, "PRAGMA table_info(frame);", -1, &postMigrationStatement, nil), SQLITE_OK)
+
+        var postMigrationColumns: [String] = []
+        while sqlite3_step(postMigrationStatement) == SQLITE_ROW {
+            if let name = sqlite3_column_text(postMigrationStatement, 1).map({ String(cString: $0) }) {
+                postMigrationColumns.append(name)
+            }
+        }
+
+        let currentVersion = try fetchInt64("SELECT MAX(version) FROM schema_migrations;", db: db)
+        XCTAssertGreaterThanOrEqual(currentVersion, 17)
+        XCTAssertTrue(postMigrationColumns.contains("capture_trigger"))
     }
 
     func testGetPendingFrameIDsNotInQueueReturnsOnlyNewestOrphanedFrames() async throws {
@@ -3088,7 +3156,8 @@ final class DatabaseManagerTests: XCTestCase {
             V13_RemoveInPageURLRects(),
             V14_DBStorageSnapshot(),
             V15_NodeRedactionFlag(),
-            V16_ProcessingQueueFrameIDIndex()
+            V16_ProcessingQueueFrameIDIndex(),
+            V17_FrameCaptureTrigger()
         ]
 
         for migration in migrations where migration.version <= version {

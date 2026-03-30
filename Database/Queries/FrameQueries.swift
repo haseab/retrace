@@ -14,8 +14,8 @@ public enum FrameQueries {
     static func insert(db: OpaquePointer, frame: FrameReference) throws -> Int64 {
         let sql = """
             INSERT INTO frame (
-                createdAt, imageFileName, segmentId, videoId, videoFrameIndex, isStarred, encodingStatus, redactionReason, processingStatus
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 4);
+                createdAt, imageFileName, segmentId, videoId, videoFrameIndex, isStarred, encodingStatus, redactionReason, capture_trigger, processingStatus
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 4);
             """
 
         var statement: OpaquePointer?
@@ -61,6 +61,7 @@ public enum FrameQueries {
 
         // redactionReason: nullable, set when frame pixels were intentionally redacted
         bindTextOrNull(statement, 8, frame.metadata.redactionReason)
+        bindTextOrNull(statement, 9, frame.metadata.captureTrigger?.rawValue)
 
         guard sqlite3_step(statement) == SQLITE_DONE else {
             throw DatabaseError.queryFailed(
@@ -880,7 +881,7 @@ public enum FrameQueries {
     static func getByID(db: OpaquePointer, id: FrameID) throws -> FrameReference? {
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.isStarred, f.encodingStatus,
-                   f.redactionReason, s.bundleID, s.windowName, s.browserUrl, f.mousePosition
+                   f.redactionReason, f.capture_trigger, s.bundleID, s.windowName, s.browserUrl, f.mousePosition
             FROM frame f
             LEFT JOIN segment s ON f.segmentId = s.id
             WHERE f.id = ?;
@@ -917,7 +918,7 @@ public enum FrameQueries {
     ) throws -> [FrameReference] {
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.isStarred, f.encodingStatus,
-                   f.redactionReason, s.bundleID, s.windowName, s.browserUrl, f.mousePosition
+                   f.redactionReason, f.capture_trigger, s.bundleID, s.windowName, s.browserUrl, f.mousePosition
             FROM frame f
             LEFT JOIN segment s ON f.segmentId = s.id
             WHERE f.createdAt >= ? AND f.createdAt <= ?
@@ -959,7 +960,7 @@ public enum FrameQueries {
     ) throws -> [FrameReference] {
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.isStarred, f.encodingStatus,
-                   f.redactionReason, s.bundleID, s.windowName, s.browserUrl, f.mousePosition
+                   f.redactionReason, f.capture_trigger, s.bundleID, s.windowName, s.browserUrl, f.mousePosition
             FROM frame f
             LEFT JOIN segment s ON f.segmentId = s.id
             WHERE f.createdAt < ?
@@ -1000,7 +1001,7 @@ public enum FrameQueries {
     ) throws -> [FrameReference] {
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.isStarred, f.encodingStatus,
-                   f.redactionReason, s.bundleID, s.windowName, s.browserUrl, f.mousePosition
+                   f.redactionReason, f.capture_trigger, s.bundleID, s.windowName, s.browserUrl, f.mousePosition
             FROM frame f
             LEFT JOIN segment s ON f.segmentId = s.id
             WHERE f.createdAt >= ?
@@ -1037,7 +1038,7 @@ public enum FrameQueries {
     static func getMostRecent(db: OpaquePointer, limit: Int) throws -> [FrameReference] {
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.isStarred, f.encodingStatus,
-                   f.redactionReason, s.bundleID, s.windowName, s.browserUrl, f.mousePosition
+                   f.redactionReason, f.capture_trigger, s.bundleID, s.windowName, s.browserUrl, f.mousePosition
             FROM frame f
             LEFT JOIN segment s ON f.segmentId = s.id
             ORDER BY f.createdAt DESC
@@ -1077,7 +1078,7 @@ public enum FrameQueries {
     ) throws -> [FrameReference] {
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.isStarred, f.encodingStatus,
-                   f.redactionReason, s.bundleID, s.windowName, s.browserUrl, f.mousePosition
+                   f.redactionReason, f.capture_trigger, s.bundleID, s.windowName, s.browserUrl, f.mousePosition
             FROM frame f
             INNER JOIN segment s ON f.segmentId = s.id
             WHERE s.bundleID = ?
@@ -1116,7 +1117,7 @@ public enum FrameQueries {
     static func getFramesPendingVideoEncoding(db: OpaquePointer, limit: Int) throws -> [FrameReference] {
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.isStarred, f.encodingStatus,
-                   f.redactionReason, s.bundleID, s.windowName, s.browserUrl, f.mousePosition
+                   f.redactionReason, f.capture_trigger, s.bundleID, s.windowName, s.browserUrl, f.mousePosition
             FROM frame f
             LEFT JOIN segment s ON f.segmentId = s.id
             WHERE f.videoId IS NULL
@@ -1384,12 +1385,13 @@ public enum FrameQueries {
         let statusString = getTextOrNil(statement, 6) ?? "pending"
         let encodingStatus = EncodingStatus(rawValue: statusString) ?? .pending
 
-        // Columns 7-11: Window redaction + metadata from segment JOIN (nullable)
+        // Columns 7-12: Trigger + window metadata from frame/segment JOIN (nullable)
         let redactionReason = getTextOrNil(statement, 7)
-        let appBundleID = getTextOrNil(statement, 8)
-        let windowName = getTextOrNil(statement, 9)
-        let browserURL = getTextOrNil(statement, 10)
-        let mousePosition = decodePoint(getTextOrNil(statement, 11))
+        let captureTrigger = getTextOrNil(statement, 8).flatMap(FrameCaptureTrigger.init(rawValue:))
+        let appBundleID = getTextOrNil(statement, 9)
+        let windowName = getTextOrNil(statement, 10)
+        let browserURL = getTextOrNil(statement, 11)
+        let mousePosition = decodePoint(getTextOrNil(statement, 12))
 
         let metadata = FrameMetadata(
             appBundleID: appBundleID,
@@ -1397,6 +1399,7 @@ public enum FrameQueries {
             windowName: windowName,
             browserURL: browserURL,
             redactionReason: redactionReason,
+            captureTrigger: captureTrigger,
             mousePosition: mousePosition.map { CGPoint(x: $0.x, y: $0.y) }
         )
 
@@ -1447,6 +1450,7 @@ public enum FrameQueries {
                 f.encodingStatus,
                 f.processingStatus,
                 f.redactionReason,
+                f.capture_trigger,
                 s.bundleID,
                 s.windowName,
                 s.browserUrl,
@@ -1454,7 +1458,8 @@ public enum FrameQueries {
                 v.path,
                 v.frameRate,
                 v.width,
-                v.height
+                v.height,
+                v.processingState
             FROM frame f
             LEFT JOIN segment s ON f.segmentId = s.id
             LEFT JOIN video v ON f.videoId = v.id
@@ -1502,10 +1507,10 @@ public enum FrameQueries {
     ) throws -> [FrameWithVideoInfo] {
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, f.processingStatus, f.redactionReason,
-                   s.bundleID, s.windowName, s.browserUrl, f.mousePosition,
+                   f.capture_trigger, s.bundleID, s.windowName, s.browserUrl, f.mousePosition,
                    v.path, v.frameRate, v.width, v.height, v.processingState
             FROM (
-                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, processingStatus, redactionReason, mousePosition
+                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, processingStatus, redactionReason, capture_trigger, mousePosition
                 FROM frame
                 ORDER BY createdAt DESC
                 LIMIT ?
@@ -1550,10 +1555,10 @@ public enum FrameQueries {
     ) throws -> [FrameWithVideoInfo] {
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, f.processingStatus, f.redactionReason,
-                   s.bundleID, s.windowName, s.browserUrl, f.mousePosition,
+                   f.capture_trigger, s.bundleID, s.windowName, s.browserUrl, f.mousePosition,
                    v.path, v.frameRate, v.width, v.height, v.processingState
             FROM (
-                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, processingStatus, redactionReason, mousePosition
+                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, processingStatus, redactionReason, capture_trigger, mousePosition
                 FROM frame
                 WHERE createdAt < ?
                 ORDER BY createdAt DESC
@@ -1598,10 +1603,10 @@ public enum FrameQueries {
     ) throws -> [FrameWithVideoInfo] {
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, f.processingStatus, f.redactionReason,
-                   s.bundleID, s.windowName, s.browserUrl, f.mousePosition,
+                   f.capture_trigger, s.bundleID, s.windowName, s.browserUrl, f.mousePosition,
                    v.path, v.frameRate, v.width, v.height, v.processingState
             FROM (
-                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, processingStatus, redactionReason, mousePosition
+                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, processingStatus, redactionReason, capture_trigger, mousePosition
                 FROM frame
                 WHERE createdAt >= ?
                 ORDER BY createdAt ASC
@@ -1645,7 +1650,7 @@ public enum FrameQueries {
     ) throws -> FrameWithVideoInfo? {
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, f.processingStatus, f.redactionReason,
-                   s.bundleID, s.windowName, s.browserUrl, f.mousePosition,
+                   f.capture_trigger, s.bundleID, s.windowName, s.browserUrl, f.mousePosition,
                    v.path, v.frameRate, v.width, v.height, v.processingState
             FROM frame f
             LEFT JOIN segment s ON f.segmentId = s.id
@@ -1674,7 +1679,7 @@ public enum FrameQueries {
 
     /// Parse a row from a query that JOINs frame with segment and video tables
     /// Columns: f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, f.processingStatus,
-    ///          f.redactionReason, s.bundleID, s.windowName, s.browserUrl, f.mousePosition,
+    ///          f.redactionReason, f.capture_trigger, s.bundleID, s.windowName, s.browserUrl, f.mousePosition,
     ///          v.path, v.frameRate, v.width, v.height, v.processingState
     private static func parseFrameWithVideoInfoRow(
         statement: OpaquePointer,
@@ -1691,12 +1696,13 @@ public enum FrameQueries {
         let encodingStatus = EncodingStatus(rawValue: encodingStatusText) ?? .pending
         let processingStatus = Int(sqlite3_column_int(statement, 6))
         let redactionReason = getTextOrNil(statement, 7)
+        let captureTrigger = getTextOrNil(statement, 8).flatMap(FrameCaptureTrigger.init(rawValue:))
 
         // Parse metadata from segment + frame context columns
-        let appBundleID = getTextOrNil(statement, 8)
-        let windowName = getTextOrNil(statement, 9)
-        let browserURL = getTextOrNil(statement, 10)
-        let mousePosition = decodePoint(getTextOrNil(statement, 11))
+        let appBundleID = getTextOrNil(statement, 9)
+        let windowName = getTextOrNil(statement, 10)
+        let browserURL = getTextOrNil(statement, 11)
+        let mousePosition = decodePoint(getTextOrNil(statement, 12))
 
         let metadata = FrameMetadata(
             appBundleID: appBundleID,
@@ -1704,6 +1710,7 @@ public enum FrameQueries {
             windowName: windowName,
             browserURL: browserURL,
             redactionReason: redactionReason,
+            captureTrigger: captureTrigger,
             displayID: 0,  // Display ID not stored in segment table
             mousePosition: mousePosition.map { CGPoint(x: $0.x, y: $0.y) }
         )
@@ -1719,21 +1726,21 @@ public enum FrameQueries {
             source: .native
         )
 
-        // Parse video info (columns 12-15: v.path, v.frameRate, v.width, v.height)
+        // Parse video info (columns 13-17: v.path, v.frameRate, v.width, v.height, v.processingState)
         var videoInfo: FrameVideoInfo? = nil
-        let videoPath = getTextOrNil(statement, 12)
+        let videoPath = getTextOrNil(statement, 13)
 
         if let videoPath = videoPath,
            videoID.value > 0 {
-            let frameRate = sqlite3_column_double(statement, 13)
-            let width = sqlite3_column_type(statement, 14) != SQLITE_NULL
-                ? Int(sqlite3_column_int(statement, 14))
-                : nil
-            let height = sqlite3_column_type(statement, 15) != SQLITE_NULL
+            let frameRate = sqlite3_column_double(statement, 14)
+            let width = sqlite3_column_type(statement, 15) != SQLITE_NULL
                 ? Int(sqlite3_column_int(statement, 15))
                 : nil
+            let height = sqlite3_column_type(statement, 16) != SQLITE_NULL
+                ? Int(sqlite3_column_int(statement, 16))
+                : nil
             // v.processingState: 0 = finalized/complete, 1 = still being written
-            let videoProcessingState = Int(sqlite3_column_int(statement, 16))
+            let videoProcessingState = Int(sqlite3_column_int(statement, 17))
             let isVideoFinalized = videoProcessingState == 0
 
             let fullPath = (storageRoot as NSString).appendingPathComponent(videoPath)

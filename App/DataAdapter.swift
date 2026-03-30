@@ -1547,6 +1547,7 @@ public actor DataAdapter {
                 f.encodingStatus,
                 \(processingStatusColumn),
                 \(redactionReasonColumn),
+                \(config.source == .rewind ? "NULL as captureTrigger" : "f.capture_trigger"),
                 s.bundleID,
                 s.windowName,
                 s.browserUrl,
@@ -1622,10 +1623,11 @@ public actor DataAdapter {
 
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
+                   \(config.source == .rewind ? "NULL as captureTrigger" : "f.capture_trigger"),
                    s.bundleID, s.windowName, s.browserUrl, \(config.source == .rewind ? "NULL" : "f.mousePosition"), \(config.source == .rewind ? "NULL" : "f.scrollPosition"), \(config.source == .rewind ? "NULL" : "f.videoCurrentTime"),
                    v.path, v.frameRate, v.width, v.height
             FROM (
-                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, \(subqueryProcessingStatus), \(subqueryRedactionReason), \(config.source == .rewind ? "NULL as mousePosition" : "mousePosition"), \(config.source == .rewind ? "NULL as scrollPosition" : "scrollPosition"), \(subqueryVideoCurrentTime)
+                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, \(subqueryProcessingStatus), \(subqueryRedactionReason), \(config.source == .rewind ? "NULL as captureTrigger" : "capture_trigger"), \(config.source == .rewind ? "NULL as mousePosition" : "mousePosition"), \(config.source == .rewind ? "NULL as scrollPosition" : "scrollPosition"), \(subqueryVideoCurrentTime)
                 FROM frame
                 \(boundaryWhereClause)
                 ORDER BY createdAt DESC
@@ -1818,6 +1820,7 @@ public actor DataAdapter {
         let sql = """
             \(combinedCTE)
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
+                   \(config.source == .rewind ? "NULL as captureTrigger" : "f.capture_trigger"),
                    s.bundleID, s.windowName, s.browserUrl, \(config.source == .rewind ? "NULL" : "f.mousePosition"), \(config.source == .rewind ? "NULL" : "f.scrollPosition"), \(config.source == .rewind ? "NULL" : "f.videoCurrentTime"),
                    v.path, v.frameRate, v.width, v.height
             FROM frame f
@@ -2022,6 +2025,7 @@ public actor DataAdapter {
 
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
+                   \(config.source == .rewind ? "NULL as captureTrigger" : "f.capture_trigger"),
                    s.bundleID, s.windowName, s.browserUrl, \(config.source == .rewind ? "NULL" : "f.mousePosition"), \(config.source == .rewind ? "NULL" : "f.scrollPosition"), \(config.source == .rewind ? "NULL" : "f.videoCurrentTime"),
                    v.path, v.frameRate, v.width, v.height
             FROM frame f
@@ -2229,6 +2233,7 @@ public actor DataAdapter {
         let sql = """
             \(combinedCTE)
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
+                   \(config.source == .rewind ? "NULL as captureTrigger" : "f.capture_trigger"),
                    s.bundleID, s.windowName, s.browserUrl, \(config.source == .rewind ? "NULL" : "f.mousePosition"), \(config.source == .rewind ? "NULL" : "f.scrollPosition"), \(config.source == .rewind ? "NULL" : "f.videoCurrentTime"),
                    v.path, v.frameRate, v.width, v.height
             FROM frame f
@@ -2456,6 +2461,7 @@ public actor DataAdapter {
         let sql = """
             \(combinedCTE)
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
+                   \(config.source == .rewind ? "NULL as captureTrigger" : "f.capture_trigger"),
                    s.bundleID, s.windowName, s.browserUrl, \(config.source == .rewind ? "NULL" : "f.mousePosition"), \(config.source == .rewind ? "NULL" : "f.scrollPosition"), \(config.source == .rewind ? "NULL" : "f.videoCurrentTime"),
                    v.path, v.frameRate, v.width, v.height
             FROM frame f
@@ -2682,6 +2688,7 @@ public actor DataAdapter {
         let sql = """
             \(combinedCTE)
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
+                   \(config.source == .rewind ? "NULL as captureTrigger" : "f.capture_trigger"),
                    s.bundleID, s.windowName, s.browserUrl, \(config.source == .rewind ? "NULL" : "f.mousePosition"), \(config.source == .rewind ? "NULL" : "f.scrollPosition"), \(config.source == .rewind ? "NULL" : "f.videoCurrentTime"),
                    v.path, v.frameRate, v.width, v.height
             FROM frame f
@@ -2808,10 +2815,11 @@ public actor DataAdapter {
 
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
+                   \(config.source == .rewind ? "NULL as captureTrigger" : "f.capture_trigger"),
                    s.bundleID, s.windowName, s.browserUrl, \(config.source == .rewind ? "NULL" : "f.mousePosition"), \(config.source == .rewind ? "NULL" : "f.scrollPosition"), \(config.source == .rewind ? "NULL" : "f.videoCurrentTime"),
                    v.path, v.frameRate, v.width, v.height
             FROM (
-                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, \(subqueryProcessingStatus), \(subqueryRedactionReason), \(config.source == .rewind ? "NULL as mousePosition" : "mousePosition"), \(config.source == .rewind ? "NULL as scrollPosition" : "scrollPosition"), \(subqueryVideoCurrentTime)
+                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, \(subqueryProcessingStatus), \(subqueryRedactionReason), \(config.source == .rewind ? "NULL as captureTrigger" : "capture_trigger"), \(config.source == .rewind ? "NULL as mousePosition" : "mousePosition"), \(config.source == .rewind ? "NULL as scrollPosition" : "scrollPosition"), \(subqueryVideoCurrentTime)
                 FROM frame
                 WHERE \(whereClause)
                 ORDER BY createdAt DESC
@@ -2908,10 +2916,11 @@ public actor DataAdapter {
 
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
+                   \(config.source == .rewind ? "NULL as captureTrigger" : "f.capture_trigger"),
                    s.bundleID, s.windowName, s.browserUrl, \(config.source == .rewind ? "NULL" : "f.mousePosition"), \(config.source == .rewind ? "NULL" : "f.scrollPosition"), \(config.source == .rewind ? "NULL" : "f.videoCurrentTime"),
                    v.path, v.frameRate, v.width, v.height
             FROM (
-                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, \(subqueryProcessingStatus), \(subqueryRedactionReason), \(config.source == .rewind ? "NULL as mousePosition" : "mousePosition"), \(config.source == .rewind ? "NULL as scrollPosition" : "scrollPosition"), \(subqueryVideoCurrentTime)
+                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, \(subqueryProcessingStatus), \(subqueryRedactionReason), \(config.source == .rewind ? "NULL as captureTrigger" : "capture_trigger"), \(config.source == .rewind ? "NULL as mousePosition" : "mousePosition"), \(config.source == .rewind ? "NULL as scrollPosition" : "scrollPosition"), \(subqueryVideoCurrentTime)
                 FROM frame
                 WHERE \(whereClause)
                 ORDER BY createdAt ASC
@@ -2977,6 +2986,7 @@ public actor DataAdapter {
 
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
+                   \(config.source == .rewind ? "NULL as captureTrigger" : "f.capture_trigger"),
                    s.bundleID, s.windowName, s.browserUrl, \(config.source == .rewind ? "NULL" : "f.mousePosition"), \(config.source == .rewind ? "NULL" : "f.scrollPosition"), \(config.source == .rewind ? "NULL" : "f.videoCurrentTime"),
                    v.path, v.frameRate, v.width, v.height
             FROM frame f
@@ -3414,6 +3424,7 @@ public actor DataAdapter {
         let ftsQuery = scopeToSearchableTextColumns(ftsQueryComponents)
         let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
         let redactionReasonColumn = source == .rewind ? "NULL as redaction_reason" : "f.redactionReason as redaction_reason"
+        let captureTriggerColumn = source == .rewind ? "NULL as capture_trigger" : "f.capture_trigger as capture_trigger"
         let normalizedOffset = max(0, query.offset)
         let rankCursor = decodeRelevantCursor(sourceCursor)
         let rawBatchLimit = max(query.limit, Self.searchAllRawBatchSize)
@@ -3566,6 +3577,7 @@ public actor DataAdapter {
             let videoPath: String?
             let videoFrameRate: Double?
             let redactionReason: String?
+            let captureTrigger: FrameCaptureTrigger?
             let appBundleID: String?
             let windowName: String?
             let browserUrl: String?
@@ -3601,6 +3613,7 @@ public actor DataAdapter {
                     v.path AS video_path,
                     v.frameRate AS video_frame_rate,
                     \(redactionReasonColumn),
+                    \(captureTriggerColumn),
                     s.bundleID AS bundle_id,
                     s.windowName AS window_name,
                     s.browserUrl AS browser_url,
@@ -3671,6 +3684,7 @@ public actor DataAdapter {
                 b.video_path,
                 b.video_frame_rate,
                 b.redaction_reason,
+                b.capture_trigger,
                 b.bundle_id,
                 b.window_name,
                 b.browser_url,
@@ -3748,26 +3762,29 @@ public actor DataAdapter {
                 return sqlite3_column_double(statement, 6)
             }()
             let redactionReason = sqlite3_column_text(statement, 7).map { String(cString: $0) }
-            let appBundleID = sqlite3_column_text(statement, 8).map { String(cString: $0) }
-            let windowName = sqlite3_column_text(statement, 9).map { String(cString: $0) }
-            let browserUrl = sqlite3_column_text(statement, 10).map { String(cString: $0) }
-            let rank = sqlite3_column_double(statement, 11)
-            let docID = sqlite3_column_int64(statement, 12)
+            let captureTrigger = sqlite3_column_text(statement, 8)
+                .map { String(cString: $0) }
+                .flatMap(FrameCaptureTrigger.init(rawValue:))
+            let appBundleID = sqlite3_column_text(statement, 9).map { String(cString: $0) }
+            let windowName = sqlite3_column_text(statement, 10).map { String(cString: $0) }
+            let browserUrl = sqlite3_column_text(statement, 11).map { String(cString: $0) }
+            let rank = sqlite3_column_double(statement, 12)
+            let docID = sqlite3_column_int64(statement, 13)
 
             let highlightNode: SearchResult.HighlightNode?
-            if sqlite3_column_type(statement, 13) != SQLITE_NULL {
+            if sqlite3_column_type(statement, 14) != SQLITE_NULL {
                 highlightNode = SearchResult.HighlightNode(
-                    nodeID: sqlite3_column_int64(statement, 13),
-                    nodeOrder: Int(sqlite3_column_int(statement, 14)),
-                    x: sqlite3_column_double(statement, 15),
-                    y: sqlite3_column_double(statement, 16),
-                    width: sqlite3_column_double(statement, 17),
-                    height: sqlite3_column_double(statement, 18)
+                    nodeID: sqlite3_column_int64(statement, 14),
+                    nodeOrder: Int(sqlite3_column_int(statement, 15)),
+                    x: sqlite3_column_double(statement, 16),
+                    y: sqlite3_column_double(statement, 17),
+                    width: sqlite3_column_double(statement, 18),
+                    height: sqlite3_column_double(statement, 19)
                 )
             } else {
                 highlightNode = nil
             }
-            let highlightTextSignature = sqlite3_column_text(statement, 19).map { String(cString: $0) }
+            let highlightTextSignature = sqlite3_column_text(statement, 20).map { String(cString: $0) }
 
             batch.append(
                 RelevantSearchRow(
@@ -3779,6 +3796,7 @@ public actor DataAdapter {
                     videoPath: videoPath,
                     videoFrameRate: videoFrameRate,
                     redactionReason: redactionReason,
+                    captureTrigger: captureTrigger,
                     appBundleID: appBundleID,
                     windowName: windowName,
                     browserUrl: browserUrl,
@@ -3870,6 +3888,7 @@ public actor DataAdapter {
                     windowName: row.windowName,
                     browserURL: row.browserUrl,
                     redactionReason: row.redactionReason,
+                    captureTrigger: row.captureTrigger,
                     displayID: 0
                 ),
                 segmentID: AppSegmentID(value: row.segmentId),
@@ -3905,6 +3924,7 @@ public actor DataAdapter {
         let ftsQuery = scopeToSearchableTextColumns(ftsQueryComponents)
         let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
         let redactionReasonColumn = source == .rewind ? "NULL as redaction_reason" : "f.redactionReason as redaction_reason"
+        let captureTriggerColumn = source == .rewind ? "NULL as capture_trigger" : "f.capture_trigger as capture_trigger"
         let normalizedOffset = max(0, query.offset)
 
         // Build WHERE conditions for outer query
@@ -4074,6 +4094,7 @@ public actor DataAdapter {
             let videoPath: String?
             let videoFrameRate: Double?
             let redactionReason: String?
+            let captureTrigger: FrameCaptureTrigger?
             let appBundleID: String?
             let windowName: String?
             let browserUrl: String?
@@ -4141,6 +4162,7 @@ public actor DataAdapter {
                         v.path AS video_path,
                         v.frameRate AS video_frame_rate,
                         \(redactionReasonColumn),
+                        \(captureTriggerColumn),
                         s.bundleID AS bundle_id,
                         s.windowName AS window_name,
                         s.browserUrl AS browser_url,
@@ -4172,6 +4194,7 @@ public actor DataAdapter {
                         v.path AS video_path,
                         v.frameRate AS video_frame_rate,
                         \(redactionReasonColumn),
+                        \(captureTriggerColumn),
                         s.bundleID AS bundle_id,
                         s.windowName AS window_name,
                         s.browserUrl AS browser_url,
@@ -4216,6 +4239,7 @@ public actor DataAdapter {
                         v.path AS video_path,
                         v.frameRate AS video_frame_rate,
                         \(redactionReasonColumn),
+                        \(captureTriggerColumn),
                         s.bundleID AS bundle_id,
                         s.windowName AS window_name,
                         s.browserUrl AS browser_url,
@@ -4295,6 +4319,7 @@ public actor DataAdapter {
                     b.video_path,
                     b.video_frame_rate,
                     b.redaction_reason,
+                    b.capture_trigger,
                     b.bundle_id,
                     b.window_name,
                     b.browser_url,
@@ -4348,19 +4373,22 @@ public actor DataAdapter {
                     return sqlite3_column_double(statement, 6)
                 }()
                 let redactionReason = sqlite3_column_text(statement, 7).map { String(cString: $0) }
-                let appBundleID = sqlite3_column_text(statement, 8).map { String(cString: $0) }
-                let windowName = sqlite3_column_text(statement, 9).map { String(cString: $0) }
-                let browserUrl = sqlite3_column_text(statement, 10).map { String(cString: $0) }
-                let docID = sqlite3_column_int64(statement, 11)
+                let captureTrigger = sqlite3_column_text(statement, 8)
+                    .map { String(cString: $0) }
+                    .flatMap(FrameCaptureTrigger.init(rawValue:))
+                let appBundleID = sqlite3_column_text(statement, 9).map { String(cString: $0) }
+                let windowName = sqlite3_column_text(statement, 10).map { String(cString: $0) }
+                let browserUrl = sqlite3_column_text(statement, 11).map { String(cString: $0) }
+                let docID = sqlite3_column_int64(statement, 12)
 
                 let highlightNode: SearchResult.HighlightNode?
-                if sqlite3_column_type(statement, 12) != SQLITE_NULL {
-                    let nodeID = sqlite3_column_int64(statement, 12)
-                    let nodeOrder = Int(sqlite3_column_int(statement, 13))
-                    let x = sqlite3_column_double(statement, 14)
-                    let y = sqlite3_column_double(statement, 15)
-                    let width = sqlite3_column_double(statement, 16)
-                    let height = sqlite3_column_double(statement, 17)
+                if sqlite3_column_type(statement, 13) != SQLITE_NULL {
+                    let nodeID = sqlite3_column_int64(statement, 13)
+                    let nodeOrder = Int(sqlite3_column_int(statement, 14))
+                    let x = sqlite3_column_double(statement, 15)
+                    let y = sqlite3_column_double(statement, 16)
+                    let width = sqlite3_column_double(statement, 17)
+                    let height = sqlite3_column_double(statement, 18)
                     highlightNode = SearchResult.HighlightNode(
                         nodeID: nodeID,
                         nodeOrder: nodeOrder,
@@ -4372,7 +4400,7 @@ public actor DataAdapter {
                 } else {
                     highlightNode = nil
                 }
-                let highlightTextSignature = sqlite3_column_text(statement, 18).map { String(cString: $0) }
+                let highlightTextSignature = sqlite3_column_text(statement, 19).map { String(cString: $0) }
 
                 batchRows.append(
                     FrameSearchRow(
@@ -4384,6 +4412,7 @@ public actor DataAdapter {
                         videoPath: videoPath,
                         videoFrameRate: videoFrameRate,
                         redactionReason: redactionReason,
+                        captureTrigger: captureTrigger,
                         appBundleID: appBundleID,
                         windowName: windowName,
                         browserUrl: browserUrl,
@@ -4486,6 +4515,7 @@ public actor DataAdapter {
                     windowName: windowName,
                     browserURL: browserUrl,
                     redactionReason: frame.redactionReason,
+                    captureTrigger: frame.captureTrigger,
                     displayID: 0
                 ),
                 segmentID: AppSegmentID(value: frame.segmentId),
@@ -5069,17 +5099,18 @@ public actor DataAdapter {
         let processingStatus = Int(sqlite3_column_int(statement, 6))
 
         let redactionReason = Self.getTextOrNil(statement, 7)
-        let bundleID = Self.getTextOrNil(statement, 8) ?? ""
-        let windowName = Self.getTextOrNil(statement, 9)
-        let browserUrl = Self.getTextOrNil(statement, 10)
-        let mousePosition = Self.decodeStoredPoint(Self.getTextOrNil(statement, 11))
-        let scrollY = Self.decodeStoredPoint(Self.getTextOrNil(statement, 12))?.y
-        let videoCurrentTime = sqlite3_column_type(statement, 13) != SQLITE_NULL ? sqlite3_column_double(statement, 13) : nil
+        let captureTrigger = Self.getTextOrNil(statement, 8).flatMap(FrameCaptureTrigger.init(rawValue:))
+        let bundleID = Self.getTextOrNil(statement, 9) ?? ""
+        let windowName = Self.getTextOrNil(statement, 10)
+        let browserUrl = Self.getTextOrNil(statement, 11)
+        let mousePosition = Self.decodeStoredPoint(Self.getTextOrNil(statement, 12))
+        let scrollY = Self.decodeStoredPoint(Self.getTextOrNil(statement, 13))?.y
+        let videoCurrentTime = sqlite3_column_type(statement, 14) != SQLITE_NULL ? sqlite3_column_double(statement, 14) : nil
 
-        let videoPath = Self.getTextOrNil(statement, 14)
-        let frameRate = sqlite3_column_type(statement, 15) != SQLITE_NULL ? sqlite3_column_double(statement, 15) : nil
-        let width = sqlite3_column_type(statement, 16) != SQLITE_NULL ? Int(sqlite3_column_int(statement, 16)) : nil
-        let height = sqlite3_column_type(statement, 17) != SQLITE_NULL ? Int(sqlite3_column_int(statement, 17)) : nil
+        let videoPath = Self.getTextOrNil(statement, 15)
+        let frameRate = sqlite3_column_type(statement, 16) != SQLITE_NULL ? sqlite3_column_double(statement, 16) : nil
+        let width = sqlite3_column_type(statement, 17) != SQLITE_NULL ? Int(sqlite3_column_int(statement, 17)) : nil
+        let height = sqlite3_column_type(statement, 18) != SQLITE_NULL ? Int(sqlite3_column_int(statement, 18)) : nil
 
         let metadata = FrameMetadata(
             appBundleID: bundleID.isEmpty ? nil : bundleID,
@@ -5087,6 +5118,7 @@ public actor DataAdapter {
             windowName: windowName,
             browserURL: browserUrl,
             redactionReason: redactionReason,
+            captureTrigger: captureTrigger,
             displayID: 0,
             mousePosition: mousePosition.map { CGPoint(x: $0.x, y: $0.y) }
         )

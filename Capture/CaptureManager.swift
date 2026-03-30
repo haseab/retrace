@@ -687,7 +687,7 @@ public actor CaptureManager: CaptureProtocol {
             if shouldKeep {
                 lastKeptFrame = frame
                 lastKeptMousePosition = currentMousePosition
-                let enrichedFrame = await enrichFrameMetadata(frame)
+                let enrichedFrame = await enrichFrameMetadata(frame, trigger: trigger)
                 dedupedFrameContinuation?.yield(enrichedFrame)
 
                 stats = CaptureStatistics(
@@ -732,7 +732,7 @@ public actor CaptureManager: CaptureProtocol {
                 )
             }
         } else {
-            let enrichedFrame = await enrichFrameMetadata(frame)
+            let enrichedFrame = await enrichFrameMetadata(frame, trigger: trigger)
             dedupedFrameContinuation?.yield(enrichedFrame)
 
             stats = CaptureStatistics(
@@ -848,7 +848,10 @@ public actor CaptureManager: CaptureProtocol {
         )
     }
 
-    private func enrichFrameMetadata(_ frame: CapturedFrame) async -> CapturedFrame {
+    private func enrichFrameMetadata(
+        _ frame: CapturedFrame,
+        trigger: CaptureTrigger
+    ) async -> CapturedFrame {
         let preferredDisplayID = frame.metadata.displayID == 0 ? nil : frame.metadata.displayID
         let shouldLookupBrowserURL: Bool = {
             guard frame.metadata.redactionReason == nil else { return false }
@@ -861,6 +864,7 @@ public actor CaptureManager: CaptureProtocol {
         )
         let redactionReason = frame.metadata.redactionReason
         let preservedDisplayID = frame.metadata.displayID != 0 ? frame.metadata.displayID : frontmostMetadata.displayID
+        let captureTrigger = frame.metadata.captureTrigger ?? Self.storedCaptureTrigger(for: trigger)
 
         let enrichedMetadata: FrameMetadata
         if redactionReason == nil {
@@ -870,6 +874,7 @@ public actor CaptureManager: CaptureProtocol {
                 windowName: frame.metadata.windowName ?? frontmostMetadata.windowName,
                 browserURL: frame.metadata.browserURL ?? frontmostMetadata.browserURL,
                 redactionReason: redactionReason,
+                captureTrigger: captureTrigger,
                 displayID: preservedDisplayID
             )
         } else {
@@ -879,6 +884,7 @@ public actor CaptureManager: CaptureProtocol {
                 windowName: nil,
                 browserURL: nil,
                 redactionReason: redactionReason,
+                captureTrigger: captureTrigger,
                 displayID: preservedDisplayID
             )
         }
@@ -891,6 +897,17 @@ public actor CaptureManager: CaptureProtocol {
             bytesPerRow: frame.bytesPerRow,
             metadata: enrichedMetadata
         )
+    }
+
+    private static func storedCaptureTrigger(for trigger: CaptureTrigger) -> FrameCaptureTrigger {
+        switch trigger {
+        case .mouseClick:
+            return .mouse
+        case .windowChange:
+            return .window
+        case .interval:
+            return .interval
+        }
     }
 
     private func syncCaptureDisplayIfNeeded() async {

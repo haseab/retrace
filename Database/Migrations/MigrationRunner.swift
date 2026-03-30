@@ -103,7 +103,8 @@ actor MigrationRunner {
             V13_RemoveInPageURLRects(),
             V14_DBStorageSnapshot(),
             V15_NodeRedactionFlag(),
-            V16_ProcessingQueueFrameIDIndex()
+            V16_ProcessingQueueFrameIDIndex(),
+            V17_FrameCaptureTrigger()
         ]
     }
 

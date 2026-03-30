@@ -30,7 +30,8 @@ Database/
 │   ├── V13_RemoveInPageURLRects.swift
 │   ├── V14_DBStorageSnapshot.swift
 │   ├── V15_NodeRedactionFlag.swift
-│   └── V16_ProcessingQueueFrameIDIndex.swift
+│   ├── V16_ProcessingQueueFrameIDIndex.swift
+│   └── V17_FrameCaptureTrigger.swift
 ├── Queries/
 │   ├── FrameQueries.swift     # Frame CRUD operations
 │   ├── SegmentQueries.swift   # Segment CRUD operations

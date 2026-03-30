@@ -228,6 +228,7 @@ public actor ProcessingManager: ProcessingProtocol {
                 windowName: axResult.appInfo.windowName,
                 browserURL: axResult.appInfo.browserURL ?? frameMetadata.browserURL,
                 redactionReason: frameMetadata.redactionReason,
+                captureTrigger: frameMetadata.captureTrigger,
                 displayID: frameMetadata.displayID
             )
         }
