@@ -6167,38 +6167,40 @@ struct DebugFrameIDBadge: View {
     @State private var isHovering = false
 
     private var renderedMediaText: String {
-        switch viewModel.currentFrameStillDisplayMode {
-        case .currentImage:
-            return "still"
-        case .waitingFallback:
-            return "still (fallback)"
-        case .none:
-            switch viewModel.currentFrameRenderedMediaType {
-            case .still:
-                return "still"
-            case .decodedVideo:
-                return "decoded video"
-            case .noContent:
-                return "--"
-            }
+        if viewModel.currentFrameStillDisplayMode == .waitingFallback {
+            return "decoded still (fallback)"
+        }
+
+        if viewModel.isInLiveMode {
+            return viewModel.liveScreenshot != nil ? "live still" : "--"
+        }
+
+        switch viewModel.currentFrameMediaDisplayMode {
+        case .still:
+            return "decoded still"
+        case .decodedVideo:
+            return "decoded video"
+        case .noContent:
+            return "--"
         }
     }
 
     private var renderedMediaColor: Color {
-        switch viewModel.currentFrameStillDisplayMode {
-        case .currentImage:
-            return .green.opacity(0.85)
-        case .waitingFallback:
+        if viewModel.currentFrameStillDisplayMode == .waitingFallback {
             return .orange.opacity(0.85)
-        case .none:
-            switch viewModel.currentFrameRenderedMediaType {
-            case .still:
-                return .green.opacity(0.85)
-            case .decodedVideo:
-                return .cyan.opacity(0.9)
-            case .noContent:
-                return .white.opacity(0.5)
-            }
+        }
+
+        if viewModel.isInLiveMode {
+            return viewModel.liveScreenshot != nil ? .blue.opacity(0.9) : .white.opacity(0.5)
+        }
+
+        switch viewModel.currentFrameMediaDisplayMode {
+        case .still:
+            return .green.opacity(0.85)
+        case .decodedVideo:
+            return .cyan.opacity(0.9)
+        case .noContent:
+            return .white.opacity(0.5)
         }
     }
 

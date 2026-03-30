@@ -129,6 +129,37 @@ final class CaptureIntervalSettingsTests: XCTestCase {
         )
     }
 
+    func testCaptureStorageEstimateClampsOutOfRangeVideoQuality() {
+        XCTAssertEqual(
+            SettingsView.captureStorageEstimateText(
+                videoQuality: -5,
+                captureIntervalSeconds: 2,
+                captureOnWindowChange: false,
+                captureOnMouseClick: false
+            ),
+            SettingsView.captureStorageEstimateText(
+                videoQuality: 0,
+                captureIntervalSeconds: 2,
+                captureOnWindowChange: false,
+                captureOnMouseClick: false
+            )
+        )
+        XCTAssertEqual(
+            SettingsView.captureStorageEstimateText(
+                videoQuality: 5,
+                captureIntervalSeconds: 2,
+                captureOnWindowChange: false,
+                captureOnMouseClick: false
+            ),
+            SettingsView.captureStorageEstimateText(
+                videoQuality: 1,
+                captureIntervalSeconds: 2,
+                captureOnWindowChange: false,
+                captureOnMouseClick: false
+            )
+        )
+    }
+
     func testUsesDefaultShortcutReturnsTrueForMatchingDefaultShortcut() {
         XCTAssertTrue(
             SettingsView.usesDefaultShortcut(

@@ -207,6 +207,21 @@ enum StorageVideoEncodingMemoryLedger {
 ///
 /// Hardware acceleration is verified at initialization and logged for monitoring.
 public actor HEVCEncoder {
+    struct CompressionTuning: Sendable {
+        let averageBitRate: Int
+        let dataRateLimitBytesPerSecond: Int
+        let quality: Float
+        let bitsPerPixelPerFrame: Double
+        let densityBoost: Double
+    }
+
+    private static let expectedSourceFrameRate = 30
+    private static let referencePixelCount = 3024.0 * 1964.0
+    private static let minimumFlooredDisplayWidth = 1024
+    private static let minimumFlooredDisplayHeight = 665
+    private static let maximumFlooredDisplayWidth = 2200
+    private static let maximumFlooredDisplayHeight = 1250
+
     private var assetWriter: AVAssetWriter?
     private var videoInput: AVAssetWriterInput?
     private var adaptor: AVAssetWriterInputPixelBufferAdaptor?
@@ -231,6 +246,55 @@ public actor HEVCEncoder {
     private var lastDurableFileSizeBytes: Int64 = 0
 
     public init() {}
+
+    static func compressionTuning(
+        width: Int,
+        height: Int,
+        config: VideoEncoderConfig
+    ) -> CompressionTuning {
+        let clampedQuality = min(max(Double(config.quality), 0.0), 1.0)
+        let pixelCount = max(Double(width) * Double(height), 1.0)
+        let baseBitsPerPixelPerFrame = baseScreenContentBitsPerPixelPerFrame(quality: clampedQuality)
+        let defaultDensityBoost = screenContentDensityBoost(
+            width: width,
+            height: height,
+            pixelCount: pixelCount
+        )
+        let defaultBitsPerPixelPerFrame = baseBitsPerPixelPerFrame * defaultDensityBoost
+
+        let averageBitRate: Int
+        if let explicitBitRate = config.targetBitrate, explicitBitRate > 0 {
+            averageBitRate = explicitBitRate
+        } else {
+            let derivedAverageBitRate = Int(
+                (defaultBitsPerPixelPerFrame * pixelCount * Double(expectedSourceFrameRate)).rounded()
+            )
+            let displayClassBitRateFloor = targetedLowResolutionDisplayBitrateFloor(
+                width: width,
+                height: height,
+                pixelCount: pixelCount,
+                quality: clampedQuality
+            )
+            averageBitRate = max(derivedAverageBitRate, displayClassBitRateFloor ?? 0, 750_000)
+        }
+
+        let effectiveBitsPerPixelPerFrame = Double(averageBitRate) / (pixelCount * Double(expectedSourceFrameRate))
+        let effectiveDensityBoost = max(effectiveBitsPerPixelPerFrame / baseBitsPerPixelPerFrame, 1.0)
+
+        // Keep a modest burst cap so bitrate can flex without running away.
+        let burstDataRateLimit = max(
+            Int((Double(averageBitRate) * 1.18 / 8.0).rounded()),
+            128 * 1_024
+        )
+
+        return CompressionTuning(
+            averageBitRate: averageBitRate,
+            dataRateLimitBytesPerSecond: burstDataRateLimit,
+            quality: Float(clampedQuality),
+            bitsPerPixelPerFrame: effectiveBitsPerPixelPerFrame,
+            densityBoost: effectiveDensityBoost
+        )
+    }
 
     /// Check if hardware encoding is available for the given codec
     private static func isHardwareEncodingAvailable(for codecType: CMVideoCodecType) -> Bool {
@@ -295,18 +359,39 @@ public actor HEVCEncoder {
         // Note: AVAssetWriter will automatically use hardware encoding if available
         // We verify availability above but cannot force it through compressionProperties
 
-        // Use quality-based encoding (CRF-style) for consistent quality regardless of content complexity
-        // AVVideoQualityKey: 0.0 = max compression (lowest quality), 1.0 = min compression (highest quality)
-        let quality = config.quality
-        Log.info("Video encoder using quality-based encoding: \(quality) for \(width)x\(height)", category: .storage)
+        let compressionTuning = Self.compressionTuning(width: width, height: height, config: config)
+        Log.info(
+            """
+            Video encoder configured for \(width)x\(height): quality=\(String(format: "%.2f", compressionTuning.quality)) \
+            avgBitrate=\(compressionTuning.averageBitRate) \
+            dataRateLimitBytesPerSecond=\(compressionTuning.dataRateLimitBytesPerSecond) \
+            bpppf=\(String(format: "%.4f", compressionTuning.bitsPerPixelPerFrame)) \
+            densityBoost=\(String(format: "%.2f", compressionTuning.densityBoost))
+            """,
+            category: .storage
+        )
 
         var compressionProperties: [String: Any] = [
-            AVVideoQualityKey: quality,
-            AVVideoMaxKeyFrameIntervalKey: 30,  // Keyframe every 30 frames (like Rewind) for better compression
+            kVTCompressionPropertyKey_Quality as String: compressionTuning.quality,
+            kVTCompressionPropertyKey_AverageBitRate as String: compressionTuning.averageBitRate,
+            // Keep quality increases bounded while allowing bigger GOP-local bursts for sharp reference frames.
+            kVTCompressionPropertyKey_DataRateLimits as String: [
+                compressionTuning.dataRateLimitBytesPerSecond,
+                1,
+            ],
+            kVTCompressionPropertyKey_MaxKeyFrameInterval as String: config.keyframeInterval,
+            kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration as String:
+                Double(config.keyframeInterval) / Double(Self.expectedSourceFrameRate),
+            kVTCompressionPropertyKey_AllowTemporalCompression as String: true,
             // Enable frame reordering (B-frames) for better compression efficiency.
-            AVVideoAllowFrameReorderingKey: true,
-            AVVideoExpectedSourceFrameRateKey: 30
+            kVTCompressionPropertyKey_AllowFrameReordering as String: true,
+            kVTCompressionPropertyKey_ExpectedFrameRate as String: Self.expectedSourceFrameRate
         ]
+
+        if #available(macOS 15.0, *) {
+            compressionProperties[kVTCompressionPropertyKey_SpatialAdaptiveQPLevel as String] =
+                NSNumber(value: kVTQPModulationLevel_Default)
+        }
 
         // Add profile level - must use String for HEVC
         if codecType == .hevc {
@@ -579,5 +664,99 @@ public actor HEVCEncoder {
     /// Returns the on-disk file size at the last known durable fragment boundary.
     public func durableFileSizeBytes() -> Int64 {
         return lastDurableFileSizeBytes
+    }
+}
+
+private extension HEVCEncoder {
+    static func baseScreenContentBitsPerPixelPerFrame(quality: Double) -> Double {
+        interpolate(
+            clampedQuality: quality,
+            points: [
+                (quality: 0.00, bpppf: 0.018),
+                (quality: 0.25, bpppf: 0.032),
+                (quality: 0.50, bpppf: 0.055),
+                (quality: 0.75, bpppf: 0.070),
+                (quality: 1.00, bpppf: 0.085),
+            ]
+        )
+    }
+
+    static func screenContentDensityBoost(
+        width: Int,
+        height: Int,
+        pixelCount: Double
+    ) -> Double {
+        guard pixelCount > 0 else { return 1.0 }
+        let densityRatio = sqrt(referencePixelCount / pixelCount)
+
+        // Smaller full-display captures need extra bitrate to preserve dense UI text,
+        // but tiny surfaces should not inherit the native-display budget.
+        if shouldApplyLowResolutionDisplayFloor(
+            width: width,
+            height: height,
+            pixelCount: pixelCount
+        ) {
+            return max(densityRatio, 1.0)
+        }
+
+        return min(max(densityRatio, 1.0), 1.8)
+    }
+
+    static func targetedLowResolutionDisplayBitrateFloor(
+        width: Int,
+        height: Int,
+        pixelCount: Double,
+        quality: Double
+    ) -> Int? {
+        guard shouldApplyLowResolutionDisplayFloor(
+            width: width,
+            height: height,
+            pixelCount: pixelCount
+        ) else {
+            return nil
+        }
+
+        let baseBitsPerPixelPerFrame = baseScreenContentBitsPerPixelPerFrame(quality: quality)
+        let nativeReferenceBitRate = baseBitsPerPixelPerFrame * referencePixelCount * Double(expectedSourceFrameRate)
+        return Int(nativeReferenceBitRate.rounded())
+    }
+
+    static func shouldApplyLowResolutionDisplayFloor(
+        width: Int,
+        height: Int,
+        pixelCount: Double
+    ) -> Bool {
+        guard pixelCount < referencePixelCount else { return false }
+        guard width >= minimumFlooredDisplayWidth, width <= maximumFlooredDisplayWidth else { return false }
+        guard height >= minimumFlooredDisplayHeight, height <= maximumFlooredDisplayHeight else { return false }
+
+        let aspectRatio = Double(width) / Double(max(height, 1))
+        return aspectRatio >= 1.5 && aspectRatio <= 2.2
+    }
+
+    static func interpolate(
+        clampedQuality: Double,
+        points: [(quality: Double, bpppf: Double)]
+    ) -> Double {
+        let quality = min(max(clampedQuality, 0.0), 1.0)
+        guard let firstPoint = points.first else { return 0.0 }
+        guard let lastPoint = points.last else { return firstPoint.bpppf }
+
+        if quality <= firstPoint.quality {
+            return firstPoint.bpppf
+        }
+
+        for index in 0..<(points.count - 1) {
+            let lower = points[index]
+            let upper = points[index + 1]
+            guard quality <= upper.quality else { continue }
+
+            let span = upper.quality - lower.quality
+            guard span > 0 else { return upper.bpppf }
+            let t = (quality - lower.quality) / span
+            return lower.bpppf + t * (upper.bpppf - lower.bpppf)
+        }
+
+        return lastPoint.bpppf
     }
 }

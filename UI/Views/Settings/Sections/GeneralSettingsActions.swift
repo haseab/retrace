@@ -148,7 +148,7 @@ extension SettingsView {
     }
 
     var videoQualityDisplayText: String {
-        let percentage = Int(videoQuality * 100)
+        let percentage = Int(Self.normalizedVideoQuality(videoQuality) * 100)
         return "\(percentage)%"
     }
 
@@ -191,36 +191,53 @@ extension SettingsView {
         }
     }
 
-    /// Calculate storage multiplier based on video quality setting
-    /// Reference: 50% quality = 1.0x multiplier
+    private static func normalizedVideoQuality(_ videoQuality: Double) -> Double {
+        min(max(videoQuality, 0.0), 1.0)
+    }
+
+    private static func baseScreenContentBitsPerPixelPerFrame(for videoQuality: Double) -> Double {
+        interpolateVideoQuality(
+            normalizedVideoQuality(videoQuality),
+            points: [
+                (quality: 0.00, bpppf: 0.018),
+                (quality: 0.25, bpppf: 0.032),
+                (quality: 0.50, bpppf: 0.055),
+                (quality: 0.75, bpppf: 0.070),
+                (quality: 1.00, bpppf: 0.085),
+            ]
+        )
+    }
+
+    /// Estimate storage impact using the same quality curve the encoder uses.
     private static func videoQualityMultiplier(for videoQuality: Double) -> Double {
-        // Interpolation based on quality percentage
-        // At 50% (0.5): baseline multiplier = 1.0
-        // Multipliers relative to 50%:
-        // 5% → 0.22x, 15% → 0.48x, 30% → 0.76x, 50% → 1.0x, 85% → 3.65x
-        if videoQuality <= 0.05 {
-            return 0.22
-        } else if videoQuality <= 0.15 {
-            // Interpolate between 0.05 (0.22) and 0.15 (0.48)
-            let t = (videoQuality - 0.05) / 0.10
-            return 0.22 + t * (0.48 - 0.22)
-        } else if videoQuality <= 0.30 {
-            // Interpolate between 0.15 (0.48) and 0.30 (0.76)
-            let t = (videoQuality - 0.15) / 0.15
-            return 0.48 + t * (0.76 - 0.48)
-        } else if videoQuality <= 0.50 {
-            // Interpolate between 0.30 (0.76) and 0.50 (1.0)
-            let t = (videoQuality - 0.30) / 0.20
-            return 0.76 + t * (1.0 - 0.76)
-        } else if videoQuality <= 0.85 {
-            // Interpolate between 0.50 (1.0) and 0.85 (3.65)
-            let t = (videoQuality - 0.50) / 0.35
-            return 1.0 + t * (3.65 - 1.0)
-        } else {
-            // Interpolate between 0.85 (3.65) and 1.0 (estimated ~5.0)
-            let t = (videoQuality - 0.85) / 0.15
-            return 3.65 + t * (5.0 - 3.65)
+        let baselineBitsPerPixelPerFrame = baseScreenContentBitsPerPixelPerFrame(for: SettingsDefaults.videoQuality)
+        guard baselineBitsPerPixelPerFrame > 0 else { return 1.0 }
+        return baseScreenContentBitsPerPixelPerFrame(for: videoQuality) / baselineBitsPerPixelPerFrame
+    }
+
+    private static func interpolateVideoQuality(
+        _ videoQuality: Double,
+        points: [(quality: Double, bpppf: Double)]
+    ) -> Double {
+        guard let firstPoint = points.first else { return 0.0 }
+        guard let lastPoint = points.last else { return firstPoint.bpppf }
+
+        if videoQuality <= firstPoint.quality {
+            return firstPoint.bpppf
         }
+
+        for index in 0..<(points.count - 1) {
+            let lower = points[index]
+            let upper = points[index + 1]
+            guard videoQuality <= upper.quality else { continue }
+
+            let span = upper.quality - lower.quality
+            guard span > 0 else { return upper.bpppf }
+            let t = (videoQuality - lower.quality) / span
+            return lower.bpppf + t * (upper.bpppf - lower.bpppf)
+        }
+
+        return lastPoint.bpppf
     }
 
     /// Calculate storage multiplier based on capture interval
@@ -272,7 +289,7 @@ extension SettingsView {
         captureOnWindowChange: Bool,
         captureOnMouseClick: Bool
     ) -> String {
-        let qualityMultiplier = Self.videoQualityMultiplier(for: videoQuality)
+        let qualityMultiplier = Self.videoQualityMultiplier(for: normalizedVideoQuality(videoQuality))
         let intervalMultiplier = Self.captureIntervalMultiplier(for: captureIntervalSeconds)
         let combinedMultiplier = qualityMultiplier * intervalMultiplier
         let eventDrivenHeuristic = Self.eventDrivenCaptureStorageHeuristicGB(

@@ -28,18 +28,54 @@ final class HEVCEncoderTests: XCTestCase {
     // │                         Encoding Tests                                   │
     // └──────────────────────────────────────────────────────────────────────────┘
 
+    func testCompressionTuningHonorsExplicitBitrateOverride() {
+        let tuning = HEVCEncoder.compressionTuning(
+            width: 3024,
+            height: 1964,
+            config: VideoEncoderConfig(targetBitrate: 4_200_000, quality: 0.85)
+        )
+
+        XCTAssertEqual(tuning.averageBitRate, 4_200_000)
+        XCTAssertEqual(tuning.quality, 0.85, accuracy: 0.0001)
+    }
+
+    func testCompressionTuningClampsOutOfRangeQualityIntoEncoderRange() {
+        let lowQualityTuning = HEVCEncoder.compressionTuning(
+            width: 1920,
+            height: 1080,
+            config: VideoEncoderConfig(quality: -1.0)
+        )
+        let highQualityTuning = HEVCEncoder.compressionTuning(
+            width: 1920,
+            height: 1080,
+            config: VideoEncoderConfig(quality: 2.0)
+        )
+
+        XCTAssertEqual(lowQualityTuning.quality, 0.0, accuracy: 0.0001)
+        XCTAssertEqual(highQualityTuning.quality, 1.0, accuracy: 0.0001)
+    }
+
     func testEncodeProducesValidMP4File() async throws {
         let encoder = HEVCEncoder()
         let config = VideoEncoderConfig.default
         let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent("test_\(UUID().uuidString).mp4")
         let startTime = Date()
+        let width = 640
+        let height = 480
+        let bytesPerRow = width * 4
 
         defer {
             try? FileManager.default.removeItem(at: tempURL)
         }
 
         do {
-            try await encoder.initialize(width: 4, height: 4, config: config, outputURL: tempURL, segmentStartTime: startTime)
+            try await encoder.initialize(
+                width: width,
+                height: height,
+                config: config,
+                outputURL: tempURL,
+                segmentStartTime: startTime
+            )
 
             // Verify hardware acceleration status is determined
             let isHardwareAccelerated = await encoder.isHardwareAccelerated()
@@ -47,12 +83,11 @@ final class HEVCEncoderTests: XCTestCase {
 
             // Encode a few frames
             for i in 0..<5 {
-                let bytesPerRow = 4 * 4
-                let imageData = Data(repeating: UInt8(i * 50), count: bytesPerRow * 4)
+                let imageData = Data(repeating: UInt8(i * 50), count: bytesPerRow * height)
                 let frame = CapturedFrame(
                     imageData: imageData,
-                    width: 4,
-                    height: 4,
+                    width: width,
+                    height: height,
                     bytesPerRow: bytesPerRow
                 )
                 let pixelBuffer = try await encoder.makePixelBuffer(from: frame)
