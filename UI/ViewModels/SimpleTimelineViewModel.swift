@@ -318,6 +318,12 @@ enum CurrentFrameMediaDisplayMode: Equatable {
     case noContent
 }
 
+enum CurrentFrameRenderedMediaType: Equatable {
+    case still
+    case decodedVideo
+    case noContent
+}
+
 enum CurrentFrameStillDisplayMode: Equatable {
     case currentImage
     case waitingFallback
@@ -1905,6 +1911,25 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
 
         return hasVideo ? .decodedVideo : .noContent
+    }
+
+    var currentFrameRenderedMediaType: CurrentFrameRenderedMediaType {
+        Self.resolveCurrentFrameRenderedMediaType(
+            currentFrameStillDisplayMode: currentFrameStillDisplayMode,
+            hasVideo: currentTimelineFrame?.videoInfo != nil
+        )
+    }
+
+    static func resolveCurrentFrameRenderedMediaType(
+        currentFrameStillDisplayMode: CurrentFrameStillDisplayMode,
+        hasVideo: Bool
+    ) -> CurrentFrameRenderedMediaType {
+        switch currentFrameStillDisplayMode {
+        case .currentImage, .waitingFallback:
+            return .still
+        case .none:
+            return hasVideo ? .decodedVideo : .noContent
+        }
     }
 
     var currentFrameStillDisplayMode: CurrentFrameStillDisplayMode {

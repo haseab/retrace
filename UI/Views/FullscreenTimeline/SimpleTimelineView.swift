@@ -6166,6 +6166,42 @@ struct DebugFrameIDBadge: View {
     @State private var showCopiedFeedback = false
     @State private var isHovering = false
 
+    private var renderedMediaText: String {
+        switch viewModel.currentFrameStillDisplayMode {
+        case .currentImage:
+            return "still"
+        case .waitingFallback:
+            return "still (fallback)"
+        case .none:
+            switch viewModel.currentFrameRenderedMediaType {
+            case .still:
+                return "still"
+            case .decodedVideo:
+                return "decoded video"
+            case .noContent:
+                return "--"
+            }
+        }
+    }
+
+    private var renderedMediaColor: Color {
+        switch viewModel.currentFrameStillDisplayMode {
+        case .currentImage:
+            return .green.opacity(0.85)
+        case .waitingFallback:
+            return .orange.opacity(0.85)
+        case .none:
+            switch viewModel.currentFrameRenderedMediaType {
+            case .still:
+                return .green.opacity(0.85)
+            case .decodedVideo:
+                return .cyan.opacity(0.9)
+            case .noContent:
+                return .white.opacity(0.5)
+            }
+        }
+    }
+
     var body: some View {
         Button(action: {
             viewModel.copyCurrentFrameID()
@@ -6229,6 +6265,9 @@ struct DebugFrameIDBadge: View {
                             )
                     }
 
+                    Text("Shown: \(renderedMediaText)")
+                        .font(.retraceMonoSmall)
+                        .foregroundColor(renderedMediaColor)
                 }
             }
             .padding(.horizontal, 10)

@@ -373,6 +373,7 @@ final class HyperlinkResolutionTests: XCTestCase {
             .none
         )
     }
+
 }
 
 private func makeYouTubeOCRNode(
