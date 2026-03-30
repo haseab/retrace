@@ -692,7 +692,7 @@ public struct OnboardingView: View {
             stopAutomationWorkspaceObservation()
             cancelAllAutomationPreflightIconLoads()
         }
-        .alert("Allow All Apps?", isPresented: $showBulkAllowAllConfirmation) {
+        .alert("Launch and Allow All Apps?", isPresented: $showBulkAllowAllConfirmation) {
             Button("Cancel", role: .cancel) {}
             Button("Continue") {
                 Task {
@@ -852,7 +852,7 @@ public struct OnboardingView: View {
                                 HStack(spacing: .spacingXS) {
                                     ProgressView()
                                         .controlSize(.small)
-                                    Text("Allowing...")
+                                    Text("Launching and Allowing...")
                                 }
                                 .font(.retraceCaption)
                                 .foregroundColor(.white)
@@ -862,7 +862,7 @@ public struct OnboardingView: View {
                                 .cornerRadius(.cornerRadiusM)
                                 .frame(height: 28)
                             } else {
-                                Text("Allow All")
+                                Text("Launch and Allow All")
                                     .font(.retraceCaption)
                                     .foregroundColor(.white)
                                     .padding(.horizontal, .spacingM)
