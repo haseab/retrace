@@ -85,7 +85,49 @@ public struct DashboardView: View {
         case hardDrive = "squares"
     }
 
+    enum AppUsageSectionBodyState: Equatable {
+        case loading
+        case empty
+        case content
+    }
+
+    struct AppUsageEmptyStateCopy: Equatable {
+        let title: String
+        let message: String
+        let symbolName: String
+    }
+
     private static let pauseMenuWidth: CGFloat = 100
+
+    static func appUsageSectionBodyState(
+        isLoading: Bool,
+        hasAppUsageData: Bool
+    ) -> AppUsageSectionBodyState {
+        if isLoading && !hasAppUsageData {
+            return .loading
+        }
+
+        return hasAppUsageData ? .content : .empty
+    }
+
+    static func appUsageEmptyStateCopy(
+        rangeLabel: String,
+        hasRecordedActivity: Bool
+    ) -> AppUsageEmptyStateCopy {
+        if hasRecordedActivity {
+            return AppUsageEmptyStateCopy(
+                title: "No app usage found",
+                message: "Nothing was recorded for \(rangeLabel). Use the arrows or date picker above to try another range.",
+                symbolName: "tray"
+            )
+        }
+
+        return AppUsageEmptyStateCopy(
+            title: "No activity recorded yet",
+            message: "Start using your Mac and Retrace will track your app usage automatically.",
+            symbolName: "clock.badge.questionmark"
+        )
+    }
 
     private var usageViewMode: AppUsageViewMode {
         AppUsageViewMode(rawValue: usageViewModeRawValue) ?? .list
@@ -1115,71 +1157,77 @@ public struct DashboardView: View {
         let appUsageLayout: AppUsageLayoutSize = .normal
 
         return VStack(alignment: .leading, spacing: 0) {
-            if viewModel.isLoading && viewModel.weeklyAppUsage.isEmpty {
-                loadingStateView
-            } else if viewModel.weeklyAppUsage.isEmpty {
-                emptyStateView
-            } else {
-                VStack(spacing: 0) {
-                    // Header row
-                    HStack {
-                        Text("App Usage")
-                            .font(.retraceHeadline)
-                            .foregroundColor(.retracePrimary)
+            // Header row
+            HStack {
+                Text("App Usage")
+                    .font(.retraceHeadline)
+                    .foregroundColor(.retracePrimary)
 
-                        Spacer()
+                Spacer()
 
-                        appUsageRangeControls
+                appUsageRangeControls
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 16)
+            .zIndex(showAppUsageDatePopover ? 10 : 1)
+
+            Divider()
+                .background(Color.white.opacity(0.06))
+                .zIndex(showAppUsageDatePopover ? 9 : 0)
+
+            appUsageSectionBody(layoutSize: appUsageLayout)
+        }
+        .background(Color.white.opacity(0.03))
+        .cornerRadius(16)
+        .overlay(
+            RoundedRectangle(cornerRadius: 16)
+                .stroke(themeBorderColor.opacity(1.2), lineWidth: 1.2)
+        )
+    }
+
+    @ViewBuilder
+    private func appUsageSectionBody(layoutSize: AppUsageLayoutSize) -> some View {
+        switch Self.appUsageSectionBodyState(
+            isLoading: viewModel.isLoading,
+            hasAppUsageData: !viewModel.weeklyAppUsage.isEmpty
+        ) {
+        case .loading:
+            appUsageLoadingBody
+        case .empty:
+            appUsageEmptyBody
+        case .content:
+            switch usageViewMode {
+            case .list:
+                AppUsageListView(
+                    apps: viewModel.weeklyAppUsage,
+                    totalTime: viewModel.totalWeeklyTime,
+                    layoutSize: layoutSize,
+                    loadWindowUsage: { bundleID in
+                        await viewModel.getWindowUsageForApp(bundleID: bundleID)
+                    },
+                    loadTabsForDomain: { bundleID, domain in
+                        await viewModel.getBrowserTabsForDomain(bundleID: bundleID, domain: domain)
+                    },
+                    onWindowTapped: { app, window in
+                        handleWindowTapped(app, window)
                     }
-                    .padding(.horizontal, 20)
-                    .padding(.vertical, 16)
-                    .zIndex(showAppUsageDatePopover ? 10 : 1)
-
-                    Divider()
-                        .background(Color.white.opacity(0.06))
-                        .zIndex(showAppUsageDatePopover ? 9 : 0)
-
-                    // Content based on view mode
-                    switch usageViewMode {
-                    case .list:
-                        AppUsageListView(
-                            apps: viewModel.weeklyAppUsage,
-                            totalTime: viewModel.totalWeeklyTime,
-                            layoutSize: appUsageLayout,
-                            loadWindowUsage: { bundleID in
-                                await viewModel.getWindowUsageForApp(bundleID: bundleID)
-                            },
-                            loadTabsForDomain: { bundleID, domain in
-                                await viewModel.getBrowserTabsForDomain(bundleID: bundleID, domain: domain)
-                            },
-                            onWindowTapped: { app, window in
-                                handleWindowTapped(app, window)
-                            }
-                        )
-                        .id(
-                            "app-usage-list-\(Int(viewModel.appUsageRangeStart.timeIntervalSince1970))-\(Int(viewModel.appUsageRangeEnd.timeIntervalSince1970))"
-                        )
-                        .zIndex(0)
-                    case .hardDrive:
-                        AppUsageHardDriveView(
-                            apps: viewModel.weeklyAppUsage,
-                            totalTime: viewModel.totalWeeklyTime,
-                            onAppTapped: { app in
-                                handleAppTapped(app)
-                            }
-                        )
-                        .id(
-                            "app-usage-hard-drive-\(Int(viewModel.appUsageRangeStart.timeIntervalSince1970))-\(Int(viewModel.appUsageRangeEnd.timeIntervalSince1970))"
-                        )
-                        .zIndex(0)
-                    }
-                }
-                .background(Color.white.opacity(0.03))
-                .cornerRadius(16)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 16)
-                        .stroke(themeBorderColor.opacity(1.2), lineWidth: 1.2)
                 )
+                .id(
+                    "app-usage-list-\(Int(viewModel.appUsageRangeStart.timeIntervalSince1970))-\(Int(viewModel.appUsageRangeEnd.timeIntervalSince1970))"
+                )
+                .zIndex(0)
+            case .hardDrive:
+                AppUsageHardDriveView(
+                    apps: viewModel.weeklyAppUsage,
+                    totalTime: viewModel.totalWeeklyTime,
+                    onAppTapped: { app in
+                        handleAppTapped(app)
+                    }
+                )
+                .id(
+                    "app-usage-hard-drive-\(Int(viewModel.appUsageRangeStart.timeIntervalSince1970))-\(Int(viewModel.appUsageRangeEnd.timeIntervalSince1970))"
+                )
+                .zIndex(0)
             }
         }
     }
@@ -1482,8 +1530,8 @@ public struct DashboardView: View {
         }
     }
 
-    private var loadingStateView: some View {
-        VStack(spacing: 16) {
+    private var appUsageLoadingBody: some View {
+        return VStack(spacing: 16) {
             SpinnerView(size: 32, lineWidth: 3)
 
             Text("Loading activity...")
@@ -1491,46 +1539,40 @@ public struct DashboardView: View {
                 .foregroundColor(.retraceSecondary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color.white.opacity(0.02))
-        .cornerRadius(16)
-        .overlay(
-            RoundedRectangle(cornerRadius: 16)
-                .stroke(themeBorderColor, lineWidth: 1)
-        )
+        .padding(.vertical, 48)
     }
 
-    private var emptyStateView: some View {
-        VStack(spacing: 16) {
+    private var appUsageEmptyBody: some View {
+        let copy = Self.appUsageEmptyStateCopy(
+            rangeLabel: viewModel.appUsageRangeLabel,
+            hasRecordedActivity: viewModel.daysRecorded > 0
+        )
+
+        return VStack(spacing: 16) {
             ZStack {
                 Circle()
                     .fill(LinearGradient.retraceAccentGradient.opacity(0.2))
                     .frame(width: 80, height: 80)
 
-                Image(systemName: "clock.badge.questionmark")
+                Image(systemName: copy.symbolName)
                     .font(.retraceDisplay3)
                     .foregroundStyle(LinearGradient.retraceAccentGradient)
             }
 
             VStack(spacing: 8) {
-                Text("No activity recorded yet")
+                Text(copy.title)
                     .font(.retraceHeadline)
                     .foregroundColor(.retracePrimary)
 
-                Text("Start using your Mac and Retrace will track your app usage automatically.")
+                Text(copy.message)
                     .font(.retraceCallout)
                     .foregroundColor(.retraceSecondary)
                     .multilineTextAlignment(.center)
-                    .frame(maxWidth: 320)
+                    .frame(maxWidth: 360)
             }
         }
-        .frame(maxWidth: .infinity)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(.vertical, 48)
-        .background(Color.white.opacity(0.02))
-        .cornerRadius(16)
-        .overlay(
-            RoundedRectangle(cornerRadius: 16)
-                .stroke(themeBorderColor, lineWidth: 1)
-        )
     }
 
     // MARK: - Footer

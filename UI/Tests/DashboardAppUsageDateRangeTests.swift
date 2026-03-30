@@ -68,4 +68,5 @@ final class DashboardAppUsageDateRangeTests: XCTestCase {
         XCTAssertEqual(normalized.start, earlier)
         XCTAssertEqual(normalized.end, later)
     }
+
 }
