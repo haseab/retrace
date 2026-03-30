@@ -13967,7 +13967,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Also auto-loads hours for today if today has frames
     public func loadDatesWithFrames() async {
         do {
-            let dates = try await coordinator.getDistinctDates()
+            let dates = try await coordinator.getDistinctDates(filters: filterCriteria)
             await MainActor.run {
                 self.datesWithFrames = Set(dates)
             }
@@ -13989,7 +13989,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Load hours with frames for a specific date (displays available hours in the picker)
     public func loadHoursForDate(_ date: Date) async {
         do {
-            let hours = try await coordinator.getDistinctHoursForDate(date)
+            let hours = try await coordinator.getDistinctHoursForDate(date, filters: filterCriteria)
             await MainActor.run {
                 self.selectedCalendarDate = date
                 self.hoursWithFrames = hours

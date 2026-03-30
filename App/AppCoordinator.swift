@@ -3480,10 +3480,14 @@ public actor AppCoordinator {
 
     // MARK: - Calendar Support
 
-    /// Get all distinct dates that have frames (for calendar display)
-    /// Uses filesystem (chunks folder structure) instead of slow database queries
-    /// Checks both Retrace chunks and Rewind chunks (if Rewind is connected)
-    public func getDistinctDates() async throws -> [Date] {
+    /// Get all distinct dates that have frames for calendar display.
+    /// When active filters are provided, the returned dates reflect the filtered timeline.
+    /// Unfiltered calls keep using the fast filesystem path.
+    public func getDistinctDates(filters: FilterCriteria? = nil) async throws -> [Date] {
+        if let filters, filters.hasActiveFilters, let adapter = await services.dataAdapter {
+            return try await adapter.getDistinctDates(filters: filters)
+        }
+
         var allDates = Set<Date>()
 
         // Get dates from Retrace chunks folder
@@ -3571,11 +3575,11 @@ public actor AppCoordinator {
         try await services.database.getCapturedDurationAfter(date: date)
     }
 
-    /// Get distinct hours for a specific date that have frames
-    /// Uses DataAdapter to query the appropriate database (Retrace or Rewind) based on date
-    public func getDistinctHoursForDate(_ date: Date) async throws -> [Date] {
+    /// Get distinct hours for a specific date that have frames.
+    /// When active filters are provided, the returned hours reflect the filtered timeline.
+    public func getDistinctHoursForDate(_ date: Date, filters: FilterCriteria? = nil) async throws -> [Date] {
         if let adapter = await services.dataAdapter {
-            return try await adapter.getDistinctHoursForDate(date)
+            return try await adapter.getDistinctHoursForDate(date, filters: filters)
         }
         // Fallback to Retrace-only query
         return try await services.database.getDistinctHoursForDate(date)
