@@ -1757,23 +1757,26 @@ public class DashboardViewModel: ObservableObject {
         }
     }
 
-    /// Fetch window usage data for a specific app (aggregated by windowName or domain for browsers)
+    /// Fetch a page of window usage data for a specific app.
     /// For browsers: includes pre-aggregated tab counts for website rows.
-    /// - Parameter bundleID: The app's bundle identifier
-    /// - Returns: Array of window usage sorted by type (websites first) then duration descending
-    public func getWindowUsageForApp(bundleID: String) async -> [WindowUsageData] {
+    /// - Parameters:
+    ///   - bundleID: The app's bundle identifier
+    ///   - limit: Maximum number of rows to fetch for the current UI page
+    /// - Returns: Visible rows plus the full result count for load-more UI
+    public func getWindowUsageForApp(bundleID: String, limit: Int) async -> WindowUsagePage {
         do {
             let queryRange = resolvedAppUsageQueryRange()
 
             let windowStats = try await coordinator.getWindowUsageForApp(
                 bundleID: bundleID,
                 from: queryRange.start,
-                to: queryRange.end
+                to: queryRange.end,
+                limit: limit
             )
 
-            // Calculate total duration for percentage calculation
-            let totalDuration = windowStats.reduce(0) { $0 + $1.duration }
-            return windowStats.map { stat in
+            let totalDuration = windowStats.first?.totalDuration ?? 0
+            let totalCount = windowStats.first?.totalCount ?? 0
+            let rows = windowStats.map { stat in
                 WindowUsageData(
                     windowName: stat.windowName,
                     isWebsite: stat.isWebsite,
@@ -1782,9 +1785,10 @@ public class DashboardViewModel: ObservableObject {
                     tabCount: stat.tabCount
                 )
             }
+            return WindowUsagePage(rows: rows, totalCount: totalCount)
         } catch {
             Log.error("[DashboardViewModel] Failed to fetch window usage for app: \(error)", category: .ui)
-            return []
+            return WindowUsagePage(rows: [], totalCount: 0)
         }
     }
 
@@ -2725,6 +2729,16 @@ public struct AppSessionDetail: Identifiable {
 }
 
 /// Represents aggregated window usage within an app
+public struct WindowUsagePage {
+    public let rows: [WindowUsageData]
+    public let totalCount: Int
+
+    public init(rows: [WindowUsageData], totalCount: Int) {
+        self.rows = rows
+        self.totalCount = totalCount
+    }
+}
+
 public struct WindowUsageData: Identifiable {
     public let id = UUID()
     public let windowName: String?

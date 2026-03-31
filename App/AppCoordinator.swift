@@ -2823,9 +2823,10 @@ public actor AppCoordinator {
     public func getWindowUsageForApp(
         bundleID: String,
         from startDate: Date,
-        to endDate: Date
-    ) async throws -> [(windowName: String?, isWebsite: Bool, duration: TimeInterval, tabCount: Int?)] {
-        try await services.database.getWindowUsageForApp(bundleID: bundleID, from: startDate, to: endDate)
+        to endDate: Date,
+        limit: Int? = nil
+    ) async throws -> [(windowName: String?, isWebsite: Bool, duration: TimeInterval, tabCount: Int?, totalCount: Int, totalDuration: TimeInterval)] {
+        try await services.database.getWindowUsageForApp(bundleID: bundleID, from: startDate, to: endDate, limit: limit)
     }
 
     /// Get browser tab usage aggregated by windowName (tab title) with full URL

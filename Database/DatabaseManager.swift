@@ -1038,12 +1038,19 @@ public actor DatabaseManager: DatabaseProtocol {
     public func getWindowUsageForApp(
         bundleID: String,
         from startDate: Date,
-        to endDate: Date
-    ) async throws -> [(windowName: String?, isWebsite: Bool, duration: TimeInterval, tabCount: Int?)] {
+        to endDate: Date,
+        limit: Int? = nil
+    ) async throws -> [(windowName: String?, isWebsite: Bool, duration: TimeInterval, tabCount: Int?, totalCount: Int, totalDuration: TimeInterval)] {
         guard let db = db else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
-        return try AppSegmentQueries.getWindowUsageForApp(db: db, bundleID: bundleID, from: startDate, to: endDate)
+        return try AppSegmentQueries.getWindowUsageForApp(
+            db: db,
+            bundleID: bundleID,
+            from: startDate,
+            to: endDate,
+            limit: limit
+        )
     }
 
     public func getBrowserTabUsage(

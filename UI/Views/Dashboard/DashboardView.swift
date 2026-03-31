@@ -1202,8 +1202,8 @@ public struct DashboardView: View {
                     apps: viewModel.weeklyAppUsage,
                     totalTime: viewModel.totalWeeklyTime,
                     layoutSize: layoutSize,
-                    loadWindowUsage: { bundleID in
-                        await viewModel.getWindowUsageForApp(bundleID: bundleID)
+                    loadWindowUsage: { bundleID, visibleCount in
+                        await viewModel.getWindowUsageForApp(bundleID: bundleID, limit: visibleCount)
                     },
                     loadTabsForDomain: { bundleID, domain in
                         await viewModel.getBrowserTabsForDomain(bundleID: bundleID, domain: domain)
