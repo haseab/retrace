@@ -6168,7 +6168,7 @@ struct DebugFrameIDBadge: View {
 
     private var renderedMediaText: String {
         if viewModel.currentFrameStillDisplayMode == .waitingFallback {
-            return "decoded still (fallback)"
+            return viewModel.currentFrameStillUsesFreshCaptureSource ? "live still (fallback)" : "decoded still (fallback)"
         }
 
         if viewModel.isInLiveMode {
@@ -6177,7 +6177,7 @@ struct DebugFrameIDBadge: View {
 
         switch viewModel.currentFrameMediaDisplayMode {
         case .still:
-            return "decoded still"
+            return viewModel.currentFrameStillUsesFreshCaptureSource ? "live still" : "decoded still"
         case .decodedVideo:
             return "decoded video"
         case .noContent:
@@ -6187,7 +6187,7 @@ struct DebugFrameIDBadge: View {
 
     private var renderedMediaColor: Color {
         if viewModel.currentFrameStillDisplayMode == .waitingFallback {
-            return .orange.opacity(0.85)
+            return viewModel.currentFrameStillUsesFreshCaptureSource ? .blue.opacity(0.9) : .orange.opacity(0.85)
         }
 
         if viewModel.isInLiveMode {
@@ -6196,7 +6196,7 @@ struct DebugFrameIDBadge: View {
 
         switch viewModel.currentFrameMediaDisplayMode {
         case .still:
-            return .green.opacity(0.85)
+            return viewModel.currentFrameStillUsesFreshCaptureSource ? .blue.opacity(0.9) : .green.opacity(0.85)
         case .decodedVideo:
             return .cyan.opacity(0.9)
         case .noContent:

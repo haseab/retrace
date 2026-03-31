@@ -1940,6 +1940,26 @@ public class SimpleTimelineViewModel: ObservableObject {
         )
     }
 
+    var currentFrameStillUsesFreshCaptureSource: Bool {
+        switch currentFrameStillDisplayMode {
+        case .currentImage:
+            guard let currentFrameID = currentTimelineFrame?.frame.id,
+                  currentImage != nil,
+                  currentImageFrameID == currentFrameID else {
+                return false
+            }
+            return hasExternalCaptureStillInDiskFrameBuffer(frameID: currentFrameID)
+        case .waitingFallback:
+            guard let fallbackFrameID = waitingFallbackImageFrameID,
+                  waitingFallbackImage != nil else {
+                return false
+            }
+            return hasExternalCaptureStillInDiskFrameBuffer(frameID: fallbackFrameID)
+        case .none:
+            return false
+        }
+    }
+
     static func resolveCurrentFrameStillDisplayMode(
         currentFrameID: FrameID?,
         currentImageFrameID: FrameID?,
