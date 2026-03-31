@@ -12274,6 +12274,8 @@ struct FilterDropdownOverlay: View {
                 selectedApps: viewModel.pendingFilterCriteria.selectedApps,
                 filterMode: viewModel.pendingFilterCriteria.appFilterMode,
                 allowMultiSelect: true,
+                isLoading: viewModel.isLoadingAppsForFilter,
+                isLoadingOtherApps: viewModel.isRefreshingRewindAppsForFilter,
                 onSelectApp: { bundleID in
                     if let bundleID = bundleID {
                         viewModel.toggleAppFilter(bundleID)

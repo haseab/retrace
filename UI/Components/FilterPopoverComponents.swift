@@ -75,6 +75,7 @@ extension View {
 /// Used in apps, tags, and visibility filter popovers
 public struct FilterRow: View {
     let icon: Image?
+    let appIconBundleID: String?
     let iconColorOverride: Color?
     let title: String
     let subtitle: String?
@@ -86,6 +87,7 @@ public struct FilterRow: View {
 
     public init(
         icon: Image? = nil,
+        appIconBundleID: String? = nil,
         iconColorOverride: Color? = nil,
         title: String,
         subtitle: String? = nil,
@@ -94,6 +96,7 @@ public struct FilterRow: View {
         action: @escaping () -> Void
     ) {
         self.icon = icon
+        self.appIconBundleID = appIconBundleID
         self.iconColorOverride = iconColorOverride
         self.title = title
         self.subtitle = subtitle
@@ -113,6 +116,7 @@ public struct FilterRow: View {
         action: @escaping () -> Void
     ) {
         self.icon = Image(systemName: systemIcon)
+        self.appIconBundleID = nil
         self.iconColorOverride = iconColorOverride
         self.title = title
         self.subtitle = subtitle
@@ -136,7 +140,26 @@ public struct FilterRow: View {
         } else {
             self.icon = Image(systemName: "app.fill")
         }
+        self.appIconBundleID = nil
         self.iconColorOverride = iconColorOverride
+        self.title = title
+        self.subtitle = subtitle
+        self.isSelected = isSelected
+        self.isKeyboardHighlighted = isKeyboardHighlighted
+        self.action = action
+    }
+
+    public init(
+        appIconBundleID: String,
+        title: String,
+        subtitle: String? = nil,
+        isSelected: Bool,
+        isKeyboardHighlighted: Bool = false,
+        action: @escaping () -> Void
+    ) {
+        self.icon = nil
+        self.appIconBundleID = appIconBundleID
+        self.iconColorOverride = nil
         self.title = title
         self.subtitle = subtitle
         self.isSelected = isSelected
@@ -152,7 +175,13 @@ public struct FilterRow: View {
         Button(action: action) {
             HStack(spacing: RetraceMenuStyle.iconTextSpacing) {
                 // Icon
-                if let icon = icon {
+                if let appIconBundleID {
+                    AppIconView(bundleID: appIconBundleID, size: RetraceMenuStyle.iconFrameWidth)
+                        .frame(
+                            width: RetraceMenuStyle.iconFrameWidth,
+                            height: RetraceMenuStyle.iconFrameWidth
+                        )
+                } else if let icon = icon {
                     icon
                         .resizable()
                         .aspectRatio(contentMode: .fit)
@@ -298,6 +327,8 @@ public struct AppsFilterPopover: View {
     let filterMode: AppFilterMode
     let allowMultiSelect: Bool
     let showAllOption: Bool
+    let isLoading: Bool
+    let isLoadingOtherApps: Bool
     let onSelectApp: (String?) -> Void
     let onFilterModeChange: ((AppFilterMode) -> Void)?
     var onDismiss: (() -> Void)?
@@ -319,6 +350,8 @@ public struct AppsFilterPopover: View {
         filterMode: AppFilterMode = .include,
         allowMultiSelect: Bool = false,
         showAllOption: Bool = true,
+        isLoading: Bool = false,
+        isLoadingOtherApps: Bool = false,
         onSelectApp: @escaping (String?) -> Void,
         onFilterModeChange: ((AppFilterMode) -> Void)? = nil,
         onDismiss: (() -> Void)? = nil
@@ -329,6 +362,8 @@ public struct AppsFilterPopover: View {
         self.filterMode = filterMode
         self.allowMultiSelect = allowMultiSelect
         self.showAllOption = showAllOption
+        self.isLoading = isLoading
+        self.isLoadingOtherApps = isLoadingOtherApps
         self.onSelectApp = onSelectApp
         self.onFilterModeChange = onFilterModeChange
         self.onDismiss = onDismiss
@@ -378,6 +413,10 @@ public struct AppsFilterPopover: View {
 
     private var isAllAppsSelected: Bool {
         selectedApps == nil || selectedApps!.isEmpty
+    }
+
+    private var prefetchedInstalledAppBundleIDs: [String] {
+        Array(filteredApps.prefix(24)).map(\.bundleID)
     }
 
     private var hasFilterModeSupport: Bool {
@@ -502,8 +541,21 @@ public struct AppsFilterPopover: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(spacing: 0) {
+                        if filteredApps.isEmpty && filteredOtherApps.isEmpty && isLoading {
+                            VStack(spacing: 10) {
+                                ProgressView()
+                                    .controlSize(.small)
+                                Text("Loading apps…")
+                                    .font(.system(size: 11, weight: .medium))
+                                    .foregroundColor(.secondary)
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 24)
+                        }
+
                         // "All Apps" option (only in include mode, when not searching, and when showAllOption is true)
-                        if showAllOption && filterMode == .include && searchText.isEmpty {
+                        if !(filteredApps.isEmpty && filteredOtherApps.isEmpty && isLoading) &&
+                            showAllOption && filterMode == .include && searchText.isEmpty {
                             FilterRow(
                                 systemIcon: "square.grid.2x2.fill",
                                 title: "All Apps",
@@ -532,7 +584,7 @@ public struct AppsFilterPopover: View {
                         // Installed apps
                         ForEach(filteredApps, id: \.bundleID) { app in
                             FilterRow(
-                                nsImage: AppIconProvider.shared.icon(for: app.bundleID),
+                                appIconBundleID: app.bundleID,
                                 title: app.name,
                                 isSelected: selectedApps?.contains(app.bundleID) ?? false,
                                 isKeyboardHighlighted: isAppHighlighted(app.bundleID)
@@ -543,6 +595,22 @@ public struct AppsFilterPopover: View {
                                 }
                             }
                             .id(app.bundleID)
+                        }
+
+                        if isLoadingOtherApps {
+                            Divider()
+                                .padding(.vertical, 8)
+
+                            HStack(spacing: 8) {
+                                ProgressView()
+                                    .controlSize(.small)
+                                Text("Refreshing Rewind history…")
+                                    .font(.system(size: 11, weight: .medium))
+                                    .foregroundColor(.secondary)
+                                Spacer(minLength: 0)
+                            }
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
                         }
 
                         // "Other Apps" section (uninstalled apps from history)
@@ -571,6 +639,12 @@ public struct AppsFilterPopover: View {
                                 }
                                 .id(app.bundleID)
                             }
+                        } else if filteredApps.isEmpty && !isLoading {
+                            Text(searchText.isEmpty ? "No apps found" : "No matching apps")
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundColor(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .center)
+                                .padding(.vertical, 18)
                         }
                     }
                     .padding(.vertical, 4)
@@ -600,6 +674,7 @@ public struct AppsFilterPopover: View {
         .onAppear {
             // Capture initial selection state for stable sorting
             initialSelectedApps = selectedApps ?? []
+            AppMetadataCache.shared.prefetch(bundleIDs: prefetchedInstalledAppBundleIDs)
 
             // Autofocus the search field when popover appears
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
@@ -611,6 +686,9 @@ public struct AppsFilterPopover: View {
         .onChange(of: searchText) { _ in
             // Reset highlight to first item when search changes
             resetHighlightToFirst()
+        }
+        .onChange(of: prefetchedInstalledAppBundleIDs) { bundleIDs in
+            AppMetadataCache.shared.prefetch(bundleIDs: bundleIDs)
         }
         .keyboardNavigation(
             onUpArrow: { moveHighlight(by: -1) },

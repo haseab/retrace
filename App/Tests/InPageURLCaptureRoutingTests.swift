@@ -1337,6 +1337,71 @@ final class DataAdapterRewindBoundaryTests: XCTestCase {
         XCTAssertTrue(bundleIDs.contains("com.rewind.old"))
     }
 
+    func testDistinctAppBundleIDsForNativeSourceExcludeRewindApps() async throws {
+        let cutoffDate = makeCutoffDate()
+        let fixture = try await makeFixture(cutoffDate: cutoffDate)
+        defer {
+            Task {
+                try? await self.close(fixture)
+            }
+        }
+
+        _ = try await seedFrame(
+            in: fixture.retraceDatabase,
+            timestamp: cutoffDate.addingTimeInterval(7200),
+            bundleID: "com.retrace.new",
+            text: "native new",
+            source: .native
+        )
+        _ = try await seedFrame(
+            in: fixture.retraceDatabase,
+            timestamp: cutoffDate.addingTimeInterval(-7200),
+            bundleID: "com.retrace.old",
+            text: "native old",
+            source: .native
+        )
+        _ = try await seedFrame(
+            in: fixture.rewindDatabase,
+            timestamp: cutoffDate.addingTimeInterval(-3600),
+            bundleID: "com.rewind.old",
+            text: "rewind old",
+            source: .rewind
+        )
+
+        let bundleIDs = try await fixture.adapter.getDistinctAppBundleIDs(source: .native)
+
+        XCTAssertEqual(bundleIDs, ["com.retrace.new"])
+    }
+
+    func testDistinctAppBundleIDsForRewindSourceExcludeRetraceApps() async throws {
+        let cutoffDate = makeCutoffDate()
+        let fixture = try await makeFixture(cutoffDate: cutoffDate)
+        defer {
+            Task {
+                try? await self.close(fixture)
+            }
+        }
+
+        _ = try await seedFrame(
+            in: fixture.retraceDatabase,
+            timestamp: cutoffDate.addingTimeInterval(7200),
+            bundleID: "com.retrace.new",
+            text: "native new",
+            source: .native
+        )
+        _ = try await seedFrame(
+            in: fixture.rewindDatabase,
+            timestamp: cutoffDate.addingTimeInterval(-3600),
+            bundleID: "com.rewind.old",
+            text: "rewind old",
+            source: .rewind
+        )
+
+        let bundleIDs = try await fixture.adapter.getDistinctAppBundleIDs(source: .rewind)
+
+        XCTAssertEqual(bundleIDs, ["com.rewind.old"])
+    }
+
     func testDeleteFrameRemovesFTSRowsForNativeSource() async throws {
         let cutoffDate = makeCutoffDate()
         let fixture = try await makeFixture(cutoffDate: cutoffDate)

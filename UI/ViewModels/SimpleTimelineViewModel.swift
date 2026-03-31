@@ -1692,6 +1692,9 @@ public class SimpleTimelineViewModel: ObservableObject {
         filterDropdownAnchorFrame = anchorFrame
         filterAnchorFrames[type] = anchorFrame
         activeFilterDropdown = type
+        if type == .apps {
+            startAvailableAppsForFilterLoadIfNeeded()
+        }
         // `.advanced` is rendered inline in the panel, not as a popover.
         isFilterDropdownOpen = type != .none && type != .advanced
         if type != .dateRange {
@@ -1721,6 +1724,24 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Whether apps for filter are currently being loaded
     @Published public var isLoadingAppsForFilter = false
+
+    /// Whether the timeline app filter is waiting on a live Rewind refresh.
+    @Published public var isRefreshingRewindAppsForFilter = false
+
+    /// Prevent repeated installed-app scans when the loaded result is legitimately empty.
+    private var hasLoadedInstalledAppsForFilter = false
+
+    /// Prevent repeated historical-app scans when the loaded result is legitimately empty.
+    private var hasLoadedHistoricalAppsForFilter = false
+
+    /// Tracks which effective Rewind context produced `otherAppsForFilter`.
+    private var lastHistoricalAppsForFilterContext: RewindAppBundleIDCacheContext?
+
+    /// Coalesced task for loading app-filter data.
+    private var availableAppsForFilterLoadTask: Task<Void, Never>?
+
+    /// Delayed task for loading non-app filter support data after the panel animation.
+    private var filterPanelSupportingDataLoadTask: Task<Void, Never>?
 
     /// Map of segment IDs to their tag IDs (for efficient tag filtering)
     @Published public var segmentTagsMap: [Int64: Set<Int64>] = [:] {
@@ -2177,6 +2198,8 @@ public class SimpleTimelineViewModel: ObservableObject {
         cacheExpansionTask?.cancel()
         appBlockSnapshotBuildTask?.cancel()
         appBlockSnapshotApplyTask?.cancel()
+        availableAppsForFilterLoadTask?.cancel()
+        filterPanelSupportingDataLoadTask?.cancel()
         pendingDeleteCommitTask?.cancel()
         Self.clearTimelineMemoryLedger()
     }
@@ -2429,6 +2452,31 @@ public class SimpleTimelineViewModel: ObservableObject {
     private static let cachedFilterSavedAtKey = "timeline.cachedFilterSavedAt"
     /// How long the cached filter criteria remains valid (2 minutes)
     private static let filterCacheExpirationSeconds: TimeInterval = 120
+    nonisolated private static let rewindAppBundleIDCacheVersion = 1
+
+    struct RewindAppBundleIDCacheContext: Codable, Equatable {
+        let cutoffDate: Date
+        let effectiveRewindDatabasePath: String
+        let useRewindData: Bool
+    }
+
+    private struct RewindAppBundleIDCachePayload: Codable {
+        let version: Int
+        let bundleIDs: [String]
+        let context: RewindAppBundleIDCacheContext
+    }
+
+    private enum RewindAppBundleIDCacheReadResult {
+        case cacheHit([String])
+        case cacheMiss
+        case invalidate(String)
+    }
+
+    /// File path for cached Rewind app bundle IDs used by the timeline filter.
+    nonisolated static var cachedRewindAppBundleIDsPath: URL {
+        let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
+        return cacheDir.appendingPathComponent("timeline_rewind_app_bundle_ids.json")
+    }
 
     // MARK: - Background Refresh Throttling
 
@@ -2522,6 +2570,12 @@ public class SimpleTimelineViewModel: ObservableObject {
             segmentCommentCountsMap: [Int64: Int]
         ))?
     }
+    struct AvailableAppsForFilterTestHooks {
+        var getInstalledApps: (() -> [AppInfo])?
+        var getDistinctAppBundleIDs: ((FrameSource?) async throws -> [String])?
+        var resolveAllBundleIDs: (([String]) -> [AppInfo])?
+        var skipSupportingPanelDataLoad = false
+    }
     var test_refreshProcessingStatusesHooks = RefreshProcessingStatusesTestHooks()
     var test_refreshFrameDataHooks = RefreshFrameDataTestHooks()
     var test_windowFetchHooks = WindowFetchTestHooks()
@@ -2531,6 +2585,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     var test_dragStartStillOCRHooks = DragStartStillOCRTestHooks()
     var test_blockCommentsHooks = BlockCommentsTestHooks()
     var test_tapeIndicatorRefreshHooks = TapeIndicatorRefreshTestHooks()
+    var test_availableAppsForFilterHooks = AvailableAppsForFilterTestHooks()
 #endif
 
     // MARK: - Initialization
@@ -6499,43 +6554,280 @@ public class SimpleTimelineViewModel: ObservableObject {
             return
         }
 
-        // Skip if already loaded
-        guard availableAppsForFilter.isEmpty else {
+        let rewindCacheContext = Self.currentRewindAppBundleIDCacheContext()
+        let needsInstalledApps = !hasLoadedInstalledAppsForFilter
+        let needsHistoricalApps = !hasLoadedHistoricalAppsForFilter || lastHistoricalAppsForFilterContext != rewindCacheContext
+        guard needsInstalledApps || needsHistoricalApps else {
             Log.debug("[Filter] loadAvailableAppsForFilter skipped - already have \(availableAppsForFilter.count) apps", category: .ui)
             return
         }
 
         isLoadingAppsForFilter = true
+        isRefreshingRewindAppsForFilter = false
         let startTime = CFAbsoluteTimeGetCurrent()
+        defer {
+            isLoadingAppsForFilter = false
+            isRefreshingRewindAppsForFilter = false
+        }
 
-        // Phase 1: Instant - get installed apps from /Applications folder
-        let installed = AppNameResolver.shared.getInstalledApps()
+        if needsHistoricalApps, hasLoadedHistoricalAppsForFilter {
+            otherAppsForFilter = []
+        }
+
+        // Phase 1: Load installed apps off-main, then publish immediately.
+        let installed: [AppInfo]
+        if needsInstalledApps {
+            installed = await installedAppsForFilter()
+        } else {
+            installed = availableAppsForFilter.map { AppInfo(bundleID: $0.bundleID, name: $0.name) }
+        }
         let installedBundleIDs = Set(installed.map { $0.bundleID })
         let allApps = installed.map { (bundleID: $0.bundleID, name: $0.name) }
         Log.info("[Filter] Phase 1: Loaded \(allApps.count) installed apps in \(Int((CFAbsoluteTimeGetCurrent() - startTime) * 1000))ms", category: .ui)
 
-        // Update UI immediately with installed apps
-        availableAppsForFilter = allApps.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        guard !Task.isCancelled else { return }
 
-        // Phase 2: Load apps from DB that aren't installed (historical apps)
-        do {
-            let bundleIDs = try await coordinator.getDistinctAppBundleIDs()
-            let dbApps = AppNameResolver.shared.resolveAll(bundleIDs: bundleIDs)
-            let historicalApps = dbApps
-                .filter { !installedBundleIDs.contains($0.bundleID) }
-                .map { (bundleID: $0.bundleID, name: $0.name) }
+        // Update UI immediately with installed apps.
+        if needsInstalledApps {
+            availableAppsForFilter = allApps.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+            hasLoadedInstalledAppsForFilter = true
+        }
 
+        // Phase 2: Load historical apps after installed apps are already visible.
+        if needsHistoricalApps {
+            let historicalApps = await loadHistoricalAppsForFilter(
+                installedBundleIDs: installedBundleIDs,
+                rewindCacheContext: rewindCacheContext
+            )
+            guard !Task.isCancelled else { return }
+            otherAppsForFilter = historicalApps
+            hasLoadedHistoricalAppsForFilter = true
+            lastHistoricalAppsForFilterContext = rewindCacheContext
             if !historicalApps.isEmpty {
-                otherAppsForFilter = historicalApps.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
                 Log.info("[Filter] Phase 2: Added \(historicalApps.count) historical apps to otherAppsForFilter", category: .ui)
             }
-        } catch {
-            Log.error("[Filter] Failed to load apps from DB: \(error)", category: .ui)
         }
 
         let totalTime = CFAbsoluteTimeGetCurrent() - startTime
         Log.info("[Filter] Total: \(availableAppsForFilter.count) installed + \(otherAppsForFilter.count) other apps loaded in \(Int(totalTime * 1000))ms", category: .ui)
-        isLoadingAppsForFilter = false
+    }
+
+    private func loadHistoricalAppsForFilter(
+        installedBundleIDs: Set<String>,
+        rewindCacheContext: RewindAppBundleIDCacheContext
+    ) async -> [(bundleID: String, name: String)] {
+        async let nativeBundleIDsTask = distinctAppBundleIDsForFilter(source: .native)
+
+        var rewindBundleIDs: [String] = []
+        if rewindCacheContext.useRewindData {
+            if let cachedBundleIDs = await Self.loadCachedRewindAppBundleIDs(matching: rewindCacheContext) {
+                rewindBundleIDs = cachedBundleIDs
+                Log.info("[Filter] Loaded \(cachedBundleIDs.count) Rewind app bundle IDs from cache", category: .ui)
+            } else {
+                isRefreshingRewindAppsForFilter = true
+                defer { isRefreshingRewindAppsForFilter = false }
+                do {
+                    rewindBundleIDs = try await distinctAppBundleIDsForFilter(source: .rewind)
+                    await Self.saveCachedRewindAppBundleIDs(rewindBundleIDs, context: rewindCacheContext)
+                    Log.info("[Filter] Cached \(rewindBundleIDs.count) Rewind app bundle IDs", category: .ui)
+                } catch {
+                    Log.error("[Filter] Failed to load Rewind app bundle IDs: \(error)", category: .ui)
+                }
+            }
+        } else {
+            await Self.removeCachedRewindAppBundleIDs()
+        }
+
+        var nativeBundleIDs: [String] = []
+        do {
+            nativeBundleIDs = try await nativeBundleIDsTask
+        } catch {
+            Log.error("[Filter] Failed to load native app bundle IDs: \(error)", category: .ui)
+        }
+
+        let bundleIDs = Array(Set(nativeBundleIDs).union(rewindBundleIDs)).sorted()
+        guard !bundleIDs.isEmpty else {
+            return []
+        }
+
+        let dbApps = await resolveAppsForFilter(bundleIDs: bundleIDs)
+        return dbApps
+            .filter { !installedBundleIDs.contains($0.bundleID) }
+            .map { (bundleID: $0.bundleID, name: $0.name) }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    private func needsAvailableAppsForFilterLoad() -> Bool {
+        let rewindCacheContext = Self.currentRewindAppBundleIDCacheContext()
+        return !hasLoadedInstalledAppsForFilter
+            || !hasLoadedHistoricalAppsForFilter
+            || lastHistoricalAppsForFilterContext != rewindCacheContext
+    }
+
+    private func startAvailableAppsForFilterLoadIfNeeded() {
+        guard needsAvailableAppsForFilterLoad() else { return }
+        guard availableAppsForFilterLoadTask == nil else { return }
+
+        availableAppsForFilterLoadTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.availableAppsForFilterLoadTask = nil }
+            await self.loadAvailableAppsForFilter()
+        }
+    }
+
+    private func scheduleFilterPanelSupportingDataLoad() {
+#if DEBUG
+        if test_availableAppsForFilterHooks.skipSupportingPanelDataLoad {
+            return
+        }
+#endif
+        filterPanelSupportingDataLoadTask?.cancel()
+        filterPanelSupportingDataLoadTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.filterPanelSupportingDataLoadTask = nil }
+            try? await Task.sleep(for: .milliseconds(200), clock: .continuous)
+            guard !Task.isCancelled else { return }
+            await self.loadFilterPanelSupportingDataBatched()
+        }
+    }
+
+    private func installedAppsForFilter() async -> [AppInfo] {
+#if DEBUG
+        if let getInstalledApps = test_availableAppsForFilterHooks.getInstalledApps {
+            return getInstalledApps()
+        }
+#endif
+        return await Task.detached(priority: .utility) {
+            AppNameResolver.shared.getInstalledApps()
+        }.value
+    }
+
+    private func distinctAppBundleIDsForFilter(source: FrameSource?) async throws -> [String] {
+#if DEBUG
+        if let getDistinctAppBundleIDs = test_availableAppsForFilterHooks.getDistinctAppBundleIDs {
+            return try await getDistinctAppBundleIDs(source)
+        }
+#endif
+        return try await coordinator.getDistinctAppBundleIDs(source: source)
+    }
+
+    private func resolveAppsForFilter(bundleIDs: [String]) async -> [AppInfo] {
+#if DEBUG
+        if let resolveAllBundleIDs = test_availableAppsForFilterHooks.resolveAllBundleIDs {
+            return resolveAllBundleIDs(bundleIDs)
+        }
+#endif
+        return await Task.detached(priority: .utility) {
+            AppNameResolver.shared.resolveAll(bundleIDs: bundleIDs)
+        }.value
+    }
+
+    nonisolated private static func currentRewindAppBundleIDCacheContext() -> RewindAppBundleIDCacheContext {
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        return RewindAppBundleIDCacheContext(
+            cutoffDate: ServiceContainer.rewindCutoffDate(in: defaults),
+            effectiveRewindDatabasePath: normalizedFilesystemPath(AppPaths.rewindDBPath),
+            useRewindData: defaults.bool(forKey: "useRewindData")
+        )
+    }
+
+    nonisolated private static func normalizedFilesystemPath(_ path: String) -> String {
+        let expanded = NSString(string: path).expandingTildeInPath
+        let resolved = NSString(string: expanded).resolvingSymlinksInPath
+        return URL(fileURLWithPath: resolved).standardizedFileURL.path
+    }
+
+    nonisolated private static func normalizedRewindAppBundleIDs(_ bundleIDs: [String]) -> [String] {
+        Array(Set(bundleIDs)).sorted()
+    }
+
+    nonisolated static func loadCachedRewindAppBundleIDs(
+        matching context: RewindAppBundleIDCacheContext,
+        from fileURL: URL? = nil
+    ) async -> [String]? {
+        let url = fileURL ?? cachedRewindAppBundleIDsPath
+
+        let readResult = await Task.detached(priority: .utility) { () -> RewindAppBundleIDCacheReadResult in
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                return .cacheMiss
+            }
+
+            do {
+                let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+                let payload = try JSONDecoder().decode(RewindAppBundleIDCachePayload.self, from: data)
+
+                guard payload.version == Self.rewindAppBundleIDCacheVersion else {
+                    return .invalidate("version mismatch")
+                }
+
+                guard payload.context == context else {
+                    var mismatches: [String] = []
+                    if payload.context.cutoffDate != context.cutoffDate {
+                        mismatches.append("cutoffDate")
+                    }
+                    if payload.context.effectiveRewindDatabasePath != context.effectiveRewindDatabasePath {
+                        mismatches.append("effectiveRewindDatabasePath")
+                    }
+                    if payload.context.useRewindData != context.useRewindData {
+                        mismatches.append("useRewindData")
+                    }
+
+                    let mismatchDescription = mismatches.isEmpty ? "context mismatch" : "context mismatch: \(mismatches.joined(separator: ", "))"
+                    return .invalidate(mismatchDescription)
+                }
+
+                return .cacheHit(Self.normalizedRewindAppBundleIDs(payload.bundleIDs))
+            } catch {
+                return .invalidate("decode failed: \(error.localizedDescription)")
+            }
+        }.value
+
+        switch readResult {
+        case .cacheHit(let bundleIDs):
+            return bundleIDs
+        case .cacheMiss:
+            return nil
+        case .invalidate(let reason):
+            Log.info("[Filter] Invalidating Rewind app bundle ID cache (\(reason))", category: .ui)
+            await removeCachedRewindAppBundleIDs(at: url)
+            return nil
+        }
+    }
+
+    nonisolated static func saveCachedRewindAppBundleIDs(
+        _ bundleIDs: [String],
+        context: RewindAppBundleIDCacheContext,
+        to fileURL: URL? = nil
+    ) async {
+        let url = fileURL ?? cachedRewindAppBundleIDsPath
+        let payload = RewindAppBundleIDCachePayload(
+            version: rewindAppBundleIDCacheVersion,
+            bundleIDs: normalizedRewindAppBundleIDs(bundleIDs),
+            context: context
+        )
+
+        do {
+            try await Task.detached(priority: .utility) {
+                let directoryURL = url.deletingLastPathComponent()
+                try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+                let data = try JSONEncoder().encode(payload)
+                try data.write(to: url, options: .atomic)
+            }.value
+        } catch {
+            Log.error("[Filter] Failed to save cached Rewind app bundle IDs: \(error)", category: .ui)
+        }
+    }
+
+    nonisolated static func removeCachedRewindAppBundleIDs(at fileURL: URL? = nil) async {
+        let url = fileURL ?? cachedRewindAppBundleIDsPath
+        do {
+            try await Task.detached(priority: .utility) {
+                guard FileManager.default.fileExists(atPath: url.path) else { return }
+                try FileManager.default.removeItem(at: url)
+            }.value
+        } catch {
+            Log.error("[Filter] Failed to remove cached Rewind app bundle IDs: \(error)", category: .ui)
+        }
     }
 
     /// Load segment-to-tags mapping for efficient tag filtering
@@ -7156,6 +7448,8 @@ public class SimpleTimelineViewModel: ObservableObject {
                 filterCriteria = normalized
             }
             pendingFilterCriteria = normalized
+            filterPanelSupportingDataLoadTask?.cancel()
+            filterPanelSupportingDataLoadTask = nil
             dismissFilterDropdown()
             isFilterPanelVisible = false
         }
@@ -7198,6 +7492,8 @@ public class SimpleTimelineViewModel: ObservableObject {
             filterCriteria = normalized
         }
         pendingFilterCriteria = normalized
+        filterPanelSupportingDataLoadTask?.cancel()
+        filterPanelSupportingDataLoadTask = nil
         dismissFilterDropdown()
         isFilterPanelVisible = false
     }
@@ -7218,55 +7514,29 @@ public class SimpleTimelineViewModel: ObservableObject {
         pendingFilterCriteria = normalized
         // Set visible immediately - animation is handled by the View
         isFilterPanelVisible = true
-        // Load data asynchronously - delay slightly to let animation complete first
-        Task {
-            // Small delay to let the panel animation complete before loading data
-            try? await Task.sleep(for: .nanoseconds(Int64(200_000_000)), clock: .continuous) // 200ms
-            await loadFilterPanelDataBatched()
-        }
+        // Start app loading immediately so the Apps dropdown can populate incrementally.
+        startAvailableAppsForFilterLoadIfNeeded()
+        // Keep the rest of the supporting data delayed so the panel animation stays smooth.
+        scheduleFilterPanelSupportingDataLoad()
     }
 
-    /// Load all filter panel data in a single batch to minimize re-renders
-    private func loadFilterPanelDataBatched() async {
-        // Skip if already loaded
-        let needsApps = availableAppsForFilter.isEmpty
+    /// Load non-app filter panel data in a single batch after the open animation completes.
+    private func loadFilterPanelSupportingDataBatched() async {
         let needsTags = !hasLoadedAvailableTags
         let needsHidden = hiddenSegmentIds.isEmpty
         let needsTagsMap = !hasLoadedSegmentTagsMap
 
-        guard needsApps || needsTags || needsHidden || needsTagsMap else {
+        guard needsTags || needsHidden || needsTagsMap else {
             return
         }
 
         // Collect all data first without updating @Published properties
-        var newApps: [(bundleID: String, name: String)] = []
-        var newOtherApps: [(bundleID: String, name: String)] = []
         var newTags: [Tag] = []
         var newHiddenSegmentIds: Set<SegmentID> = []
         var newSegmentTagsMap: [Int64: Set<Int64>] = [:]
         var loadedTags = false
         var loadedHiddenSegmentIDs = false
         var loadedSegmentTagsMap = false
-
-        // Load apps
-        if needsApps {
-            let installed = AppNameResolver.shared.getInstalledApps()
-            let installedBundleIDs = Set(installed.map { $0.bundleID })
-            newApps = installed.map { (bundleID: $0.bundleID, name: $0.name) }
-                .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
-
-            // Load historical apps from DB
-            do {
-                let bundleIDs = try await coordinator.getDistinctAppBundleIDs()
-                let dbApps = AppNameResolver.shared.resolveAll(bundleIDs: bundleIDs)
-                newOtherApps = dbApps
-                    .filter { !installedBundleIDs.contains($0.bundleID) }
-                    .map { (bundleID: $0.bundleID, name: $0.name) }
-                    .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
-            } catch {
-                Log.error("[Filter] Failed to load apps from DB: \(error)", category: .ui)
-            }
-        }
 
         // Load tags
         if needsTags {
@@ -7299,10 +7569,6 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
 
         // Now update all @Published properties in one batch
-        if needsApps {
-            availableAppsForFilter = newApps
-            otherAppsForFilter = newOtherApps
-        }
         if needsTags && loadedTags {
             availableTags = newTags
         }

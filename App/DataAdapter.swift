@@ -1136,28 +1136,44 @@ public actor DataAdapter {
 
     // MARK: - App Discovery
 
-    /// Get all distinct apps from all data sources
-    /// Get distinct app bundle IDs from the database
-    /// Caller is responsible for resolving names (use AppNameResolver.shared.resolveAll)
-    public func getDistinctAppBundleIDs() async throws -> [String] {
+    /// Get distinct app bundle IDs from the configured data sources.
+    /// When `source` is `nil`, returns the union across all connected sources.
+    /// Caller is responsible for resolving names (use AppNameResolver.shared.resolveAll).
+    public func getDistinctAppBundleIDs(source: FrameSource? = nil) async throws -> [String] {
         guard isInitialized else {
             throw DataAdapterError.notInitialized
         }
 
-        var bundleIDs = Set<String>()
-
-        if hasRewindReadSource {
-            let rewindBundleIDs = try await withRewindRead(operation: "data_adapter.distinct_apps.rewind") { connection, config in
+        switch source {
+        case .native:
+            return try await withNativeRead(operation: "data_adapter.distinct_apps.native") { connection, config in
                 try Self.queryDistinctApps(connection: connection, config: config)
             }
-            bundleIDs.formUnion(rewindBundleIDs)
-        }
+        case .rewind:
+            guard hasRewindReadSource else {
+                return []
+            }
+            return try await withRewindRead(operation: "data_adapter.distinct_apps.rewind") { connection, config in
+                try Self.queryDistinctApps(connection: connection, config: config)
+            }
+        case nil:
+            var bundleIDs = Set<String>()
 
-        let retraceBundleIDs = try await withNativeRead(operation: "data_adapter.distinct_apps.native") { connection, config in
-            try Self.queryDistinctApps(connection: connection, config: config)
+            if hasRewindReadSource {
+                let rewindBundleIDs = try await withRewindRead(operation: "data_adapter.distinct_apps.rewind") { connection, config in
+                    try Self.queryDistinctApps(connection: connection, config: config)
+                }
+                bundleIDs.formUnion(rewindBundleIDs)
+            }
+
+            let retraceBundleIDs = try await withNativeRead(operation: "data_adapter.distinct_apps.native") { connection, config in
+                try Self.queryDistinctApps(connection: connection, config: config)
+            }
+            bundleIDs.formUnion(retraceBundleIDs)
+            return Array(bundleIDs).sorted()
+        case .screenMemory, .timeScroll, .pensieve, .unknown:
+            return []
         }
-        bundleIDs.formUnion(retraceBundleIDs)
-        return Array(bundleIDs).sorted()
     }
 
     // MARK: - URL Bounding Box Detection

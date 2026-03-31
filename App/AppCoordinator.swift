@@ -2517,13 +2517,14 @@ public actor AppCoordinator {
 
     // MARK: - Search Interface
 
-    /// Get all distinct app bundle IDs from the database for filter UI
-    /// Caller should use AppNameResolver.shared.resolveAll() to get display names
-    public nonisolated func getDistinctAppBundleIDs() async throws -> [String] {
+    /// Get distinct app bundle IDs from the database for filter UI.
+    /// When `source` is `nil`, returns the union across all connected sources.
+    /// Caller should use AppNameResolver.shared.resolveAll() to get display names.
+    public nonisolated func getDistinctAppBundleIDs(source: FrameSource? = nil) async throws -> [String] {
         guard let adapter = await services.dataAdapter else {
             return []
         }
-        return try await adapter.getDistinctAppBundleIDs()
+        return try await adapter.getDistinctAppBundleIDs(source: source)
     }
 
     /// Search for text across all captured frames
