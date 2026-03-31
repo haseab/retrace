@@ -8492,6 +8492,12 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
 
         currentIndex = clampedIndex
+        if clampedIndex >= frames.count - 1 && hasMoreNewer {
+            Log.info(
+                "[PLAYHEAD-EDGE] navigateToFrame fromScroll=\(fromScroll) requested=\(index) index=\(previousIndex)->\(clampedIndex) frameCount=\(frames.count) hasMoreNewer=\(hasMoreNewer) isLoadingNewer=\(isLoadingNewer) isActivelyScrolling=\(isActivelyScrolling) subFrameOffset=\(String(format: "%.1f", subFrameOffset))",
+                category: .ui
+            )
+        }
 
         if Self.isFilteredScrubDiagnosticsEnabled,
            filterCriteria.hasActiveFilters,
@@ -15960,11 +15966,18 @@ public class SimpleTimelineViewModel: ObservableObject {
     ) -> BoundaryLoadTrigger {
         let shouldLoadOlder = currentIndex < WindowConfig.loadThreshold && hasMoreOlder && !isLoadingOlder
         let shouldLoadNewer = currentIndex > frames.count - WindowConfig.loadThreshold && hasMoreNewer && !isLoadingNewer
+        let maxIndex = max(frames.count - 1, 0)
 
         if let cmdFTrace {
-            let maxIndex = max(frames.count - 1, 0)
             Log.info(
                 "[CmdFPerf][\(cmdFTrace.id)] Boundary check reason=\(reason) index=\(currentIndex)/\(maxIndex) threshold=\(WindowConfig.loadThreshold) loadOlder=\(shouldLoadOlder) loadNewer=\(shouldLoadNewer)",
+                category: .ui
+            )
+        }
+
+        if shouldLoadOlder || shouldLoadNewer {
+            Log.info(
+                "[BOUNDARY-CHECK] reason=\(reason) index=\(currentIndex)/\(maxIndex) loadOlder=\(shouldLoadOlder) loadNewer=\(shouldLoadNewer) hasMoreOlder=\(hasMoreOlder) hasMoreNewer=\(hasMoreNewer) isLoadingOlder=\(isLoadingOlder) isLoadingNewer=\(isLoadingNewer) isActivelyScrolling=\(isActivelyScrolling) subFrameOffset=\(String(format: "%.1f", subFrameOffset))",
                 category: .ui
             )
         }
@@ -16268,6 +16281,10 @@ public class SimpleTimelineViewModel: ObservableObject {
         isLoadingNewer = true
         defer { newerBoundaryLoadTask = nil }
         Log.debug("[InfiniteScroll] Loading newer frames after \(newestTimestamp)...", category: .ui)
+        Log.info(
+            "[BOUNDARY-NEWER-PLAYHEAD] START reason=\(reason) currentIndex=\(currentIndex) frameCount=\(frames.count) newestLoadedIndex=\(max(frames.count - 1, 0)) hasMoreNewer=\(hasMoreNewer) isActivelyScrolling=\(isActivelyScrolling) subFrameOffset=\(String(format: "%.1f", subFrameOffset))",
+            category: .ui
+        )
         if let cmdFTrace {
             Log.info("[CmdFPerf][\(cmdFTrace.id)] Boundary newer load started reason=\(reason) newest=\(newestTimestamp)", category: .ui)
         }
@@ -16417,6 +16434,11 @@ public class SimpleTimelineViewModel: ObservableObject {
             let shouldPinToNewestAfterAppend = wasAtNewestBeforeAppend && shouldPinToNewestAfterBoundaryAppend(reason: reason)
             let oldLastTimestamp = frames.last?.frame.timestamp
             let previousNewestBlock = newestEdgeBlockSummary(in: frames)
+            let preAppendCurrentIndex = currentIndex
+            Log.info(
+                "[BOUNDARY-NEWER-PLAYHEAD] PRE_APPEND reason=\(reason) currentIndex=\(preAppendCurrentIndex) beforeCount=\(beforeCount) added=\(uniqueTimelineFrames.count) wasAtNewestLoaded=\(wasAtNewestBeforeAppend) shouldPinToNewest=\(shouldPinToNewestAfterAppend) hasMoreNewer=\(hasMoreNewer) isActivelyScrolling=\(isActivelyScrolling) subFrameOffset=\(String(format: "%.1f", subFrameOffset))",
+                category: .ui
+            )
             frames.append(contentsOf: uniqueTimelineFrames)
 
             // Keep playhead pinned to "now" only for flows that should track newest.
@@ -16424,6 +16446,10 @@ public class SimpleTimelineViewModel: ObservableObject {
                 currentIndex = frames.count - 1
                 subFrameOffset = 0
             }
+            Log.info(
+                "[BOUNDARY-NEWER-PLAYHEAD] POST_APPEND reason=\(reason) index=\(preAppendCurrentIndex)->\(currentIndex) beforeCount=\(beforeCount) afterCount=\(frames.count) pinnedToNewest=\(shouldPinToNewestAfterAppend) hasMoreNewer=\(hasMoreNewer) isActivelyScrolling=\(isActivelyScrolling) subFrameOffset=\(String(format: "%.1f", subFrameOffset))",
+                category: .ui
+            )
             logCmdFPlayheadState(
                 "boundary.newer.appended",
                 trace: cmdFTrace,
@@ -16493,18 +16519,14 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
     }
 
-    private func shouldPinToNewestAfterBoundaryAppend(reason: String) -> Bool {
+    private func shouldPinToNewestAfterBoundaryAppend(reason _: String) -> Bool {
         if isInLiveMode {
             return true
         }
 
-        switch reason {
-        case "searchForDate", "searchForFrameID":
-            // Date/frame-ID jumps should stay anchored on the chosen frame.
-            return false
-        default:
-            return true
-        }
+        // Boundary pagination should preserve the user's current frame.
+        // Explicit "snap to newest" behavior lives in launch/reopen/live-mode flows.
+        return false
     }
 
     /// Direction to preserve when trimming

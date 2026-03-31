@@ -7,7 +7,7 @@ import App
 
 @MainActor
 final class TimelineBoundaryNewerFallbackTests: XCTestCase {
-    func testLoadNewerFramesFallsBackToNearestQueryAfterEmptyWindowedProbe() async {
+    func testLoadNewerFramesFallsBackToNearestQueryAfterEmptyWindowedProbeWithoutMovingSelection() async {
         let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
         let baseDate = Date(timeIntervalSince1970: 1_700_500_000)
         var recordedWindowCalls: [(from: Date, to: Date, limit: Int, reason: String)] = []
@@ -72,7 +72,8 @@ final class TimelineBoundaryNewerFallbackTests: XCTestCase {
         XCTAssertEqual(viewModel.frames.count, 4)
         XCTAssertEqual(viewModel.frames[2].frame.id.value, 22)
         XCTAssertEqual(viewModel.frames[3].frame.id.value, 23)
-        XCTAssertEqual(viewModel.currentIndex, 3)
+        XCTAssertEqual(viewModel.currentIndex, 1)
+        XCTAssertEqual(viewModel.currentTimelineFrame?.frame.id.value, 21)
 
         let paginationState = viewModel.test_boundaryPaginationState()
         XCTAssertTrue(paginationState.hasMoreNewer)
