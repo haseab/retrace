@@ -33,6 +33,7 @@ extension SettingsView {
 
     /// Show or hide the Dock icon (and Cmd+Tab presence) for Retrace.
     func setDockIconVisibility(visible: Bool) {
+        let foregroundWindow = currentForegroundAppWindow()
         let targetPolicy: NSApplication.ActivationPolicy = visible ? .regular : .accessory
         let changed = NSApp.setActivationPolicy(targetPolicy)
         let policyName = visible ? "regular" : "accessory"
@@ -42,12 +43,42 @@ extension SettingsView {
             category: .ui
         )
 
+        (NSApp.delegate as? AppDelegate)?.installMainMenuIfNeeded(force: true)
+
         if visible {
-            (NSApp.delegate as? AppDelegate)?.installMainMenuIfNeeded(force: true)
+            NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
             NSApp.activate(ignoringOtherApps: true)
+        } else if let foregroundWindow {
+            keepForegroundWindowVisibleAfterDockRemoval(foregroundWindow)
         }
 
         recordDockIconVisibilityMetric(enabled: visible)
+    }
+
+    private func currentForegroundAppWindow() -> NSWindow? {
+        NSApp.windows.first { candidate in
+            guard candidate.level == .normal else { return false }
+            guard candidate.isVisible, !candidate.isMiniaturized else { return false }
+            guard candidate.alphaValue > 0.01 else { return false }
+
+            return candidate.canBecomeKey
+                || candidate.canBecomeMain
+                || candidate.isKeyWindow
+                || candidate.isMainWindow
+        }
+    }
+
+    private func keepForegroundWindowVisibleAfterDockRemoval(_ window: NSWindow) {
+        NSApp.unhide(nil)
+        NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
+
+        Log.info(
+            "[SettingsView] Restored foreground window after Dock icon removal title=\(window.title)",
+            category: .ui
+        )
     }
 
     /// Show or hide the menu bar icon
