@@ -38,6 +38,8 @@ public class TimelineWindowController: NSObject {
     private var tapeShowAnimationTask: Task<Void, Never>?
     private var liveModeCaptureTask: Task<Void, Never>?
     private var windowFadeInTask: Task<Void, Never>?
+    private var deferredSearchOverlayRestoreTask: Task<Void, Never>?
+    private var shouldRestoreSearchOverlayAfterNextShow = false
     private var windowFadeInGeneration: UInt64 = 0
     private var workspaceActivationObserver: Any?
     private let hideCompletionCoordinator = HideCompletionCoordinator()
@@ -89,6 +91,10 @@ public class TimelineWindowController: NSObject {
     private static let nearLiveReopenExpirationSeconds: TimeInterval = 10
     /// Delay before detaching hosting view after hide to keep rapid reopen seamless.
     private static let hostingViewDetachDelay: Duration = .milliseconds(350)
+    /// Delay preserved spotlight overlay reopen until after live-mode presentation settles.
+    private static let liveSearchOverlayRestoreDelayMs = 180
+    /// Small delay after the historical fade completes so the search pops after the reveal.
+    private static let historicalSearchOverlayRestoreDelayMs = 80
 
     /// Monotonic counter for deeplink search invocations (debug tracing).
     private var deeplinkSearchInvocationCounter = 0
@@ -517,11 +523,12 @@ public class TimelineWindowController: NSObject {
             viewModel.closeDateSearch()
         }
         if viewModel.isSearchOverlayVisible {
-            // Keep the search overlay/search bar state across timeline toggle.
-            // Simulate clicking the recent-entries header "x" on toggle-off, then
-            // suppress recent entries on next overlay presentation.
+            // Preserve overlay state across timeline toggle, but do not keep the
+            // spotlight view mounted during the next timeline-open animation.
             viewModel.searchViewModel.requestDismissRecentEntriesPopoverByUser()
             viewModel.searchViewModel.suppressRecentEntriesForNextOverlayOpen()
+            shouldRestoreSearchOverlayAfterNextShow = true
+            viewModel.isSearchOverlayVisible = false
         }
         if viewModel.isInFrameSearchVisible ||
             !viewModel.inFrameSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -532,6 +539,10 @@ public class TimelineWindowController: NSObject {
     private func prepareForHiddenStateTransition(reason: String) {
         stopObservingApplicationActivation()
         cancelWindowFadeIn(reason: reason)
+        if deferredSearchOverlayRestoreTask != nil {
+            shouldRestoreSearchOverlayAfterNextShow = true
+        }
+        cancelDeferredSearchOverlayRestore()
         liveModeCaptureTask?.cancel()
         liveModeCaptureTask = nil
         recordVisibleSessionMetricsIfNeeded()
@@ -1109,6 +1120,7 @@ public class TimelineWindowController: NSObject {
         reconcileVisibilityState(reason: "show")
         cancelDeferredHostingViewDetach()
         cancelWindowFadeIn(reason: "show")
+        cancelDeferredSearchOverlayRestore()
 
         // If we're in the middle of hiding, cancel the animation and snap back to visible
         if isHiding, let window = window {
@@ -1307,6 +1319,11 @@ public class TimelineWindowController: NSObject {
         if let viewModel = timelineViewModel {
             let currentVideoInfo = viewModel.currentVideoInfo
             Log.info("[TIMELINE-SHOW] 🎬 About to show window - currentIndex=\(viewModel.currentIndex), frames.count=\(viewModel.frames.count), videoPath=\(currentVideoInfo?.videoPath.suffix(30) ?? "nil"), frameIndex=\(currentVideoInfo?.frameIndex ?? -1)", category: .ui)
+            let searchViewModel = viewModel.searchViewModel
+            Log.info(
+                "[TIMELINE-SHOW] 🔎 Search overlay snapshot visible=\(viewModel.isSearchOverlayVisible) queuedRestore=\(shouldRestoreSearchOverlayAfterNextShow) queryLength=\(searchViewModel.searchQuery.count) committedLength=\(searchViewModel.committedSearchQuery.count) totalResults=\(searchViewModel.results?.results.count ?? 0) visibleResults=\(searchViewModel.visibleResults.count) thumbnailsCached=\(searchViewModel.thumbnailCache.count) appIconsCached=\(searchViewModel.appIconCache.count)",
+                category: .ui
+            )
         }
 
         // Force video reload BEFORE showing window to avoid flicker
@@ -1379,6 +1396,13 @@ public class TimelineWindowController: NSObject {
             scheduleHistoricalFadeIn(window: window, viewModel: viewModel)
         }
 
+        if isLive, let viewModel = timelineViewModel {
+            scheduleDeferredSearchOverlayRestoreIfNeeded(
+                viewModel: viewModel,
+                isLiveMode: isLive
+            )
+        }
+
         // Trigger tape slide-up animation (Cmd+H style)
         tapeShowAnimationTask = Task { @MainActor in
             await Task.yield()
@@ -1407,6 +1431,50 @@ public class TimelineWindowController: NSObject {
         // Post notification so menu bar can hide recording indicator
         NotificationCenter.default.post(name: .timelineDidOpen, object: nil)
 
+    }
+
+    private func cancelDeferredSearchOverlayRestore() {
+        deferredSearchOverlayRestoreTask?.cancel()
+        deferredSearchOverlayRestoreTask = nil
+    }
+
+    private static func preservedSearchOverlayRestoreDelayMs(isLiveMode: Bool) -> Int {
+        isLiveMode ? liveSearchOverlayRestoreDelayMs : historicalSearchOverlayRestoreDelayMs
+    }
+
+    private func scheduleDeferredSearchOverlayRestoreIfNeeded(
+        viewModel: SimpleTimelineViewModel,
+        isLiveMode: Bool
+    ) {
+        guard shouldRestoreSearchOverlayAfterNextShow else {
+            return
+        }
+
+        shouldRestoreSearchOverlayAfterNextShow = false
+        cancelDeferredSearchOverlayRestore()
+        let delayMs = Self.preservedSearchOverlayRestoreDelayMs(isLiveMode: isLiveMode)
+        Log.info(
+            "[TimelineSearchOverlay] queued preserved overlay restore delayMs=\(delayMs) isLiveMode=\(isLiveMode)",
+            category: .ui
+        )
+
+        deferredSearchOverlayRestoreTask = Task { @MainActor [weak self, weak viewModel] in
+            try? await Task.sleep(for: .milliseconds(delayMs), clock: .continuous)
+            guard let self, let viewModel else { return }
+            defer { self.deferredSearchOverlayRestoreTask = nil }
+            guard !Task.isCancelled,
+                  self.isVisible,
+                  !self.isHiding,
+                  self.timelineViewModel === viewModel else {
+                return
+            }
+
+            Log.info(
+                "[TimelineSearchOverlay] restoring preserved overlay after timeline reveal delayMs=\(delayMs)",
+                category: .ui
+            )
+            viewModel.isSearchOverlayVisible = true
+        }
     }
 
     /// Hide the timeline overlay
@@ -1716,6 +1784,7 @@ public class TimelineWindowController: NSObject {
     private func destroyMountedPresentation() {
         cancelDeferredHostingViewDetach()
         cancelWindowFadeIn(reason: "destroyMountedPresentation")
+        cancelDeferredSearchOverlayRestore()
         liveModeCaptureTask?.cancel()
         liveModeCaptureTask = nil
         stopObservingApplicationActivation()
@@ -2284,6 +2353,11 @@ public class TimelineWindowController: NSObject {
                 context.timingFunction = CAMediaTimingFunction(name: .easeOut)
                 window.animator().alphaValue = 1
             })
+
+            self.scheduleDeferredSearchOverlayRestoreIfNeeded(
+                viewModel: viewModel,
+                isLiveMode: false
+            )
 
             if self.windowFadeInGeneration == generation {
                 self.windowFadeInTask = nil
