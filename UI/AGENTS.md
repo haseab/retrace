@@ -36,7 +36,9 @@ UI/
 │   │   └── SupportLink.swift            # Twitter/support
 │   ├── Feedback/
 │   │   ├── FeedbackFormView.swift       # Feedback sheet with form, sending, and success states
+│   │   ├── FeedbackDiagnosticsPresentation.swift # Feedback diagnostics section building + readable formatting helpers
 │   │   ├── FeedbackModels.swift         # Feedback launch context, diagnostics, and payload models
+│   │   ├── FeedbackSubmissionExport.swift # Feedback export text/JSON generation + filtered payload builder
 │   │   └── FeedbackService.swift        # Feedback submission and export implementation
 │   └── Settings/
 │       ├── SettingsView.swift           # Thin settings shell hosting navigation, alerts, and top-level wiring
@@ -94,6 +96,7 @@ UI/
 │   ├── ProcessCPUMonitor.swift          # Shared process CPU+memory sampler + 24h aggregation service
 │   ├── ProcessMemoryCardPresentation.swift # Local presentation controller + row builder for memory monitor card
 │   ├── ProcessMonitorModels.swift       # System Monitor snapshot/models + ranking/build helpers
+│   ├── HoverLatchedScrollMonitor.swift  # Shared nested-scroll latch helper for hover-routed inner scroll regions
 │   ├── ProcessCPUSummaryCard.swift      # System Monitor CPU table/card UI
 │   ├── ProcessMemorySummaryCard.swift   # System Monitor memory table/card UI
 │   ├── RetraceAboutPanel.swift          # Custom About window content and factory extracted from the app delegate

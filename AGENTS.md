@@ -170,6 +170,7 @@ retrace/
     ├── LaunchAgents/            # Embedded SMAppService launch-agent plists
     ├── Components/              # Reusable UI components (MenuBarManager, HotkeyManager, etc.)
     │   ├── MasterKeyRedactionFlowCoordinator.swift # Shared missing-master-key prompt/recovery coordinator
+    │   ├── HoverLatchedScrollMonitor.swift # Shared nested-scroll latch helper for hover-routed inner scroll regions
     │   └── ProcessMonitorModels.swift # System Monitor snapshot/models + ranking helpers
     ├── ViewModels/              # View models (Dashboard, Search, Timeline, Feedback, Settings)
     │   └── Settings/            # Settings-specific view models and extracted helper logic
@@ -180,7 +181,7 @@ retrace/
     │   ├── Settings/            # Settings shell, support components, and extracted section/action files
     │   │   └── Sections/        # Concern-split settings sections, verification flows, and shared actions
     │   ├── Onboarding/          # Onboarding flow
-    │   └── Feedback/            # Feedback form & submission
+    │   └── Feedback/            # Feedback form, diagnostics presentation, and submission/export helpers
     └── Tests/
         ├── Dashboard/           # Dashboard-specific XCTestCase files
         ├── MenuBar/             # Menu bar XCTestCase files

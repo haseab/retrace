@@ -38,7 +38,13 @@ public final class FeedbackViewModel: ObservableObject {
 
     // MARK: - Diagnostic Info
 
-    @Published public var diagnostics: DiagnosticInfo?
+    @Published public var diagnostics: DiagnosticInfo? {
+        didSet {
+            diagnosticSections = diagnostics?.sectionSummaries(includeVerboseSections: true) ?? []
+        }
+    }
+    @Published private(set) var diagnosticSections: [DiagnosticInfo.SectionSummary] = []
+    @Published private(set) var includedDiagnosticSections: Set<DiagnosticInfo.SectionID> = Set(DiagnosticInfo.SectionID.allCases)
     @Published public var showDiagnosticsDetail: Bool = false
 
     // MARK: - Submission State
@@ -64,6 +70,7 @@ public final class FeedbackViewModel: ObservableObject {
     private let minimumUploadDisplaySeconds: TimeInterval = 8.0
     private let uploadProgressRampSeconds: TimeInterval = 8.0
     private let recentMetricEventLimit = 100
+    private static let defaultDiagnosticSections = Set(DiagnosticInfo.SectionID.allCases)
 
     // MARK: - Computed Properties
 
@@ -147,6 +154,18 @@ public final class FeedbackViewModel: ObservableObject {
         return "v\(diagnostics.appVersion) • macOS \(diagnostics.macOSVersion) • \(diagnostics.deviceModel)"
     }
 
+    var includedDiagnosticSectionCount: Int {
+        diagnosticSections.filter { includedDiagnosticSections.contains($0.id) }.count
+    }
+
+    var excludedDiagnosticSectionCount: Int {
+        max(0, diagnosticSections.count - includedDiagnosticSectionCount)
+    }
+
+    var hasSelectedDiagnosticSections: Bool {
+        includedDiagnosticSectionCount > 0
+    }
+
     private var fallbackDatabaseStats: DiagnosticInfo.DatabaseStats {
         diagnostics?.databaseStats ?? DiagnosticInfo.DatabaseStats(
             sessionCount: 0,
@@ -194,8 +213,31 @@ public final class FeedbackViewModel: ObservableObject {
         guard feedbackType != type else { return }
         feedbackType = type
         diagnostics = nil
+        resetDiagnosticSectionSelection()
         if showDiagnosticsDetail {
             loadDiagnosticsIfNeeded()
+        }
+    }
+
+    public func isDiagnosticSectionIncluded(_ section: DiagnosticInfo.SectionID) -> Bool {
+        includedDiagnosticSections.contains(section)
+    }
+
+    public func toggleDiagnosticSection(_ section: DiagnosticInfo.SectionID) {
+        setDiagnosticSection(section, isIncluded: !includedDiagnosticSections.contains(section))
+    }
+
+    public func setDiagnosticSection(
+        _ section: DiagnosticInfo.SectionID,
+        isIncluded: Bool
+    ) {
+        let wasIncluded = includedDiagnosticSections.contains(section)
+        guard wasIncluded != isIncluded else { return }
+
+        if isIncluded {
+            includedDiagnosticSections.insert(section)
+        } else {
+            includedDiagnosticSections.remove(section)
         }
     }
 
@@ -206,10 +248,11 @@ public final class FeedbackViewModel: ObservableObject {
         let includeLogs = includesLogsInDiagnostics
         let stats = fallbackDatabaseStats
         Task {
-            diagnostics = await collectFullDiagnosticsInBackground(
+            let collectedDiagnostics = await collectFullDiagnosticsInBackground(
                 includeLogs: includeLogs,
                 stats: includeLogs ? nil : stats
             )
+            diagnostics = collectedDiagnostics
         }
     }
 
@@ -226,10 +269,11 @@ public final class FeedbackViewModel: ObservableObject {
                 segmentCount: 0,
                 databaseSizeMB: 0
             )
-            diagnostics = await collectQuickDiagnosticsInBackground(
+            let collectedDiagnostics = await collectQuickDiagnosticsInBackground(
                 includeLogs: includeLogs,
                 stats: stats
             )
+            diagnostics = collectedDiagnostics
             return
         }
 
@@ -252,10 +296,11 @@ public final class FeedbackViewModel: ObservableObject {
                 databaseSizeMB: dbSizeMB
             )
 
-            self.diagnostics = await collectQuickDiagnosticsInBackground(
+            let collectedDiagnostics = await collectQuickDiagnosticsInBackground(
                 includeLogs: includeLogs,
                 stats: stats
             )
+            self.diagnostics = collectedDiagnostics
         } catch {
             Log.warning("[FeedbackViewModel] Failed to load quick stats: \(error)", category: .ui)
             let stats = DiagnosticInfo.DatabaseStats(
@@ -264,20 +309,22 @@ public final class FeedbackViewModel: ObservableObject {
                 segmentCount: 0,
                 databaseSizeMB: 0
             )
-            diagnostics = await collectQuickDiagnosticsInBackground(
+            let collectedDiagnostics = await collectQuickDiagnosticsInBackground(
                 includeLogs: includeLogs,
                 stats: stats
             )
+            diagnostics = collectedDiagnostics
         }
     }
 
     /// Load full diagnostic information with complete stats.
     private func loadDiagnosticsWithRealStats(includeLogs: Bool) async {
         guard let wrapper = coordinatorWrapper else {
-            diagnostics = await collectFullDiagnosticsInBackground(
+            let collectedDiagnostics = await collectFullDiagnosticsInBackground(
                 includeLogs: includeLogs,
                 stats: includeLogs ? nil : fallbackDatabaseStats
             )
+            diagnostics = collectedDiagnostics
             return
         }
 
@@ -299,16 +346,18 @@ public final class FeedbackViewModel: ObservableObject {
                 databaseSizeMB: dbSizeMB
             )
 
-            self.diagnostics = await collectFullDiagnosticsInBackground(
+            let collectedDiagnostics = await collectFullDiagnosticsInBackground(
                 includeLogs: includeLogs,
                 stats: stats
             )
+            self.diagnostics = collectedDiagnostics
         } catch {
             Log.warning("[FeedbackViewModel] Failed to load real stats: \(error)", category: .ui)
-            diagnostics = await collectFullDiagnosticsInBackground(
+            let collectedDiagnostics = await collectFullDiagnosticsInBackground(
                 includeLogs: includeLogs,
                 stats: includeLogs ? nil : fallbackDatabaseStats
             )
+            diagnostics = collectedDiagnostics
         }
     }
 
@@ -335,6 +384,7 @@ public final class FeedbackViewModel: ObservableObject {
                 email: email.trimmingCharacters(in: .whitespacesAndNewlines),
                 description: description,
                 diagnostics: diagnostics,
+                includedDiagnosticSections: includedDiagnosticSections,
                 includeScreenshot: attachedImageData != nil,
                 screenshotData: attachedImageData
             )
@@ -398,7 +448,10 @@ public final class FeedbackViewModel: ObservableObject {
     public func copyDiagnostics() {
         guard let diagnostics = diagnostics else { return }
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(diagnostics.formattedText(), forType: .string)
+        NSPasteboard.general.setString(
+            diagnostics.formattedText(including: includedDiagnosticSections),
+            forType: .string
+        )
     }
 
     /// Export diagnostics to file
@@ -415,6 +468,7 @@ public final class FeedbackViewModel: ObservableObject {
         description = ""
         attachedImage = nil
         attachedImageData = nil
+        resetDiagnosticSectionSelection()
         isSubmitting = false
         isExporting = false
         isSubmitted = false
@@ -681,6 +735,7 @@ public final class FeedbackViewModel: ObservableObject {
             email: email.trimmingCharacters(in: .whitespacesAndNewlines),
             description: description,
             diagnostics: diagnostics,
+            includedDiagnosticSections: includedDiagnosticSections,
             includeScreenshot: attachedImageData != nil,
             screenshotData: attachedImageData
         )
@@ -733,6 +788,8 @@ public final class FeedbackViewModel: ObservableObject {
             "feedbackType": feedbackType.rawValue,
             "includeLogs": includesLogsInDiagnostics,
             "includeScreenshot": attachedImageData != nil,
+            "includedDiagnosticSections": includedDiagnosticSectionIdentifiers,
+            "excludedDiagnosticSections": excludedDiagnosticSectionIdentifiers,
             "exportedFileCount": exportedFileCount
         ])
 
@@ -769,5 +826,25 @@ public final class FeedbackViewModel: ObservableObject {
             symbolName: "exclamationmark.triangle.fill",
             isNetworkRelated: false
         )
+    }
+
+    private func resetDiagnosticSectionSelection() {
+        includedDiagnosticSections = Self.defaultDiagnosticSections
+    }
+
+    private var orderedDiagnosticSectionIDs: [DiagnosticInfo.SectionID] {
+        diagnosticSections.map(\.id)
+    }
+
+    private var includedDiagnosticSectionIdentifiers: [String] {
+        orderedDiagnosticSectionIDs
+            .filter { includedDiagnosticSections.contains($0) }
+            .map(\.rawValue)
+    }
+
+    private var excludedDiagnosticSectionIdentifiers: [String] {
+        orderedDiagnosticSectionIDs
+            .filter { !includedDiagnosticSections.contains($0) }
+            .map(\.rawValue)
     }
 }

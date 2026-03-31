@@ -7,8 +7,16 @@ import Processing
 public struct SystemMonitorView: View {
     @StateObject private var viewModel: SystemMonitorViewModel
     private let coordinator: AppCoordinator
-    @StateObject private var scrollLatch = SystemMonitorScrollLatchState()
-    @State private var localScrollMonitor: Any?
+    @StateObject private var scrollLatch = HoverLatchedScrollMonitor<ScrollTarget>(
+        hoverPriority: [.cpu, .memory],
+        defaultTarget: .outer
+    )
+
+    private enum ScrollTarget {
+        case outer
+        case cpu
+        case memory
+    }
 
     public init(coordinator: AppCoordinator) {
         self.coordinator = coordinator
@@ -690,7 +698,7 @@ public struct SystemMonitorView: View {
     private var processCPUSummarySection: some View {
         ProcessCPUSummaryCard(
             onRowsHoverChanged: { hovering in
-                scrollLatch.updateHover(cpu: hovering)
+                scrollLatch.updateHoveredTarget(.cpu, isHovering: hovering)
             },
             isRowsScrollEnabled: isCPUScrollEnabled,
             showsOCRBacklogAttribution: viewModel.shouldShowOCRBacklogAttribution
@@ -700,7 +708,7 @@ public struct SystemMonitorView: View {
     private var processMemorySummarySection: some View {
         ProcessMemorySummaryCard(
             onRowsHoverChanged: { hovering in
-                scrollLatch.updateHover(memory: hovering)
+                scrollLatch.updateHoveredTarget(.memory, isHovering: hovering)
             },
             onRetraceRowToggle: { expanded in
                 DashboardViewModel.recordSystemMonitorMemoryLogToggle(
@@ -757,100 +765,13 @@ public struct SystemMonitorView: View {
     }
 
     private func installScrollMonitorIfNeeded() {
-        guard localScrollMonitor == nil else { return }
-
-        localScrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { event in
-            scrollLatch.handleScrollEvent(event)
-            return event
+        scrollLatch.installMonitorIfNeeded { event in
+            event.window?.title == "System Monitor"
         }
     }
 
     private func removeScrollMonitor() {
-        if let localScrollMonitor {
-            NSEvent.removeMonitor(localScrollMonitor)
-            self.localScrollMonitor = nil
-        }
-        scrollLatch.reset()
-    }
-}
-
-@MainActor
-private final class SystemMonitorScrollLatchState: ObservableObject {
-    enum ScrollTarget {
-        case outer
-        case cpu
-        case memory
-    }
-
-    @Published private(set) var latchedTarget: ScrollTarget?
-
-    private var isHoveringCPULogTable = false
-    private var isHoveringMemoryLogTable = false
-    private var lastScrollTimestamp: CFAbsoluteTime = 0
-    private var releaseWorkItem: DispatchWorkItem?
-
-    private let scrollSequenceGap: CFAbsoluteTime = 0.12
-    private let releaseDelay: TimeInterval = 0.16
-    private let systemMonitorWindowTitle = "System Monitor"
-
-    func updateHover(cpu: Bool? = nil, memory: Bool? = nil) {
-        if let cpu {
-            isHoveringCPULogTable = cpu
-        }
-        if let memory {
-            isHoveringMemoryLogTable = memory
-        }
-    }
-
-    func handleScrollEvent(_ event: NSEvent) {
-        guard event.window?.title == systemMonitorWindowTitle else { return }
-
-        let now = CFAbsoluteTimeGetCurrent()
-        let phase = event.phase
-        let momentumPhase = event.momentumPhase
-        let startedByPhase = phase.contains(.began) || phase.contains(.mayBegin)
-        let startedByGap = latchedTarget == nil || (now - lastScrollTimestamp) > scrollSequenceGap
-
-        if startedByPhase || startedByGap {
-            latchedTarget = hoveredTarget
-        }
-        lastScrollTimestamp = now
-
-        releaseWorkItem?.cancel()
-        let hasEnded = phase.contains(.ended) || phase.contains(.cancelled) ||
-            momentumPhase.contains(.ended) || momentumPhase.contains(.cancelled)
-        if hasEnded {
-            latchedTarget = nil
-            return
-        }
-
-        let workItem = DispatchWorkItem { [weak self] in
-            self?.latchedTarget = nil
-        }
-        releaseWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + releaseDelay, execute: workItem)
-    }
-
-    func reset() {
-        releaseWorkItem?.cancel()
-        releaseWorkItem = nil
-        latchedTarget = nil
-        isHoveringCPULogTable = false
-        isHoveringMemoryLogTable = false
-    }
-
-    private var hoveredTarget: ScrollTarget {
-        if isHoveringCPULogTable {
-            return .cpu
-        }
-        if isHoveringMemoryLogTable {
-            return .memory
-        }
-        return .outer
-    }
-
-    deinit {
-        releaseWorkItem?.cancel()
+        scrollLatch.removeMonitor()
     }
 }
 

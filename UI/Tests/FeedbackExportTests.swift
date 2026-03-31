@@ -61,7 +61,213 @@ final class FeedbackExportTests: XCTestCase {
 
     func testExportTextIncludesReadableSectionsAndJSONPayload() throws {
         let generatedAt = Date(timeIntervalSince1970: 1_773_489_600)
-        let diagnostics = DiagnosticInfo(
+        let diagnostics = makeSampleDiagnostics()
+
+        let submission = FeedbackSubmission(
+            type: .bug,
+            email: "user@example.com",
+            description: "Steps to reproduce\n1. Open Help\n2. Block network",
+            diagnostics: diagnostics,
+            includeScreenshot: true,
+            screenshotData: Data([0x89, 0x50])
+        )
+
+        let text = submission.exportText(
+            generatedAt: generatedAt,
+            launchSource: .crashBanner,
+            screenshotFileName: "report-screenshot.png"
+        )
+
+        XCTAssertTrue(text.contains("RETRACE FEEDBACK EXPORT (USER REPORT)"))
+        XCTAssertTrue(text.contains("feedback_type: Bug Report"))
+        XCTAssertTrue(text.contains("launch_source: crashBanner"))
+        XCTAssertTrue(text.contains("screenshot_file: report-screenshot.png"))
+        XCTAssertTrue(text.contains("=== FEEDBACK ==="))
+        XCTAssertTrue(text.contains("Description:\nSteps to reproduce"))
+        XCTAssertTrue(text.contains("=== DIAGNOSTICS ==="))
+        XCTAssertTrue(text.contains("=== RETRACE MEMORY SUMMARY ==="))
+        XCTAssertTrue(text.contains("=== RECENT ACTIONS (2) ==="))
+        XCTAssertTrue(text.contains("Help opened (source=dashboard)"))
+        XCTAssertTrue(text.contains("Filtered search submitted (filterCount=2, queryLength=12)"))
+        XCTAssertTrue(text.contains("\nRetrace memory hierarchy:"))
+        XCTAssertTrue(text.contains("\n  storage.videoEncoding: now 256 MB | avg 240 MB | peak 320 MB"))
+        XCTAssertFalse(text.contains("\n-   storage.videoEncoding"))
+        XCTAssertTrue(text.contains("--- FULL LOGS (last hour) ---"))
+        XCTAssertTrue(text.contains("=== BEGIN SUBMISSION JSON ==="))
+        XCTAssertTrue(text.contains("=== END SUBMISSION JSON ==="))
+
+        let payload = try exportPayload(from: text)
+        let metadata = try XCTUnwrap(payload["metadata"] as? [String: Any])
+        XCTAssertEqual(metadata["launchSource"] as? String, "crashBanner")
+        XCTAssertEqual(metadata["screenshotFileName"] as? String, "report-screenshot.png")
+        XCTAssertEqual(metadata["screenshotByteCount"] as? Int, 2)
+
+        let report = try XCTUnwrap(payload["report"] as? [String: Any])
+        XCTAssertEqual(report["type"] as? String, "Bug Report")
+        XCTAssertEqual(report["email"] as? String, "user@example.com")
+        XCTAssertEqual(report["includeScreenshot"] as? Bool, true)
+
+        let diagnosticsPayload = try XCTUnwrap(report["diagnostics"] as? [String: Any])
+        XCTAssertEqual(
+            diagnosticsPayload["includedSections"] as? [String],
+            [
+                "app_system",
+                "database",
+                "displays",
+                "performance",
+                "retrace_memory_summary",
+                "running_apps",
+                "accessibility",
+                "recent_errors",
+                "settings",
+                "recent_actions",
+                "emergency_crash_reports",
+                "full_logs",
+            ]
+        )
+        XCTAssertEqual((diagnosticsPayload["recentLogs"] as? [String])?.count, 5)
+    }
+
+    func testExportTextOmitsUncheckedDiagnosticSectionsFromTextAndJSONPayload() throws {
+        let diagnostics = makeSampleDiagnostics()
+        let submission = FeedbackSubmission(
+            type: .bug,
+            description: "Need a narrower report",
+            diagnostics: diagnostics,
+            includedDiagnosticSections: [
+                .appSystem,
+                .memorySummary,
+                .recentActions,
+            ]
+        )
+
+        let text = submission.exportText(generatedAt: Date(timeIntervalSince1970: 1_773_489_600))
+
+        XCTAssertTrue(text.contains("=== APP & SYSTEM ==="))
+        XCTAssertTrue(text.contains("=== RETRACE MEMORY SUMMARY ==="))
+        XCTAssertTrue(text.contains("=== RECENT ACTIONS (2) ==="))
+        XCTAssertFalse(text.contains("=== DATABASE ==="))
+        XCTAssertFalse(text.contains("=== SETTINGS ==="))
+        XCTAssertFalse(text.contains("--- FULL LOGS (last hour) ---"))
+
+        let payload = try exportPayload(from: text)
+        let report = try XCTUnwrap(payload["report"] as? [String: Any])
+        let diagnosticsPayload = try XCTUnwrap(report["diagnostics"] as? [String: Any])
+
+        XCTAssertEqual(
+            diagnosticsPayload["includedSections"] as? [String],
+            ["app_system", "retrace_memory_summary", "recent_actions"]
+        )
+        XCTAssertNil(diagnosticsPayload["databaseStats"])
+        XCTAssertNil(diagnosticsPayload["settingsSnapshot"])
+
+        let recentLogs = try XCTUnwrap(diagnosticsPayload["recentLogs"] as? [String])
+        XCTAssertEqual(recentLogs.count, 4)
+        XCTAssertTrue(recentLogs.allSatisfy { $0.contains("[FeedbackMemoryProfile]") })
+        XCTAssertFalse(recentLogs.contains { $0.contains("Sample log line") })
+    }
+
+    func testDiagnosticSectionSummariesUseCompactPreviewsForVerboseSections() throws {
+        let diagnostics = makePreviewDiagnostics()
+        let summaries = diagnostics.sectionSummaries(includeVerboseSections: true)
+
+        let memorySummary = try XCTUnwrap(summaries.first { $0.id == .memorySummary })
+        XCTAssertEqual(
+            memorySummary.previewDisclosure,
+            "Preview truncated. Download .txt below to inspect the full contents."
+        )
+
+        let settingsSummary = try XCTUnwrap(summaries.first { $0.id == .settings })
+        XCTAssertTrue(settingsSummary.preview.contains("more lines"))
+        XCTAssertEqual(
+            settingsSummary.previewDisclosure,
+            "Preview truncated. Download .txt below to inspect the full contents."
+        )
+
+        let recentActionsSummary = try XCTUnwrap(summaries.first { $0.id == .recentActions })
+        XCTAssertTrue(recentActionsSummary.preview.contains("more lines"))
+        XCTAssertEqual(
+            recentActionsSummary.previewDisclosure,
+            "Preview truncated. Download .txt below to inspect the full contents."
+        )
+
+        let fullLogsSummary = try XCTUnwrap(summaries.first { $0.id == .fullLogs })
+        XCTAssertTrue(fullLogsSummary.preview.contains("…"))
+        XCTAssertTrue(fullLogsSummary.preview.contains("downloadable .txt report"))
+        XCTAssertEqual(
+            fullLogsSummary.previewDisclosure,
+            "Preview truncated. Download .txt below to inspect all included log entries."
+        )
+        XCTAssertFalse(fullLogsSummary.preview.contains("Full log entry 6"))
+
+        let crashReportsSummary = try XCTUnwrap(summaries.first { $0.id == .emergencyCrashReports })
+        XCTAssertTrue(crashReportsSummary.preview.contains("plus 1 more report"))
+        XCTAssertEqual(
+            crashReportsSummary.previewDisclosure,
+            "Preview truncated. Download .txt below to inspect the full contents."
+        )
+        XCTAssertFalse(crashReportsSummary.preview.contains("Crash line 12"))
+    }
+
+    func testSuggestedBaseNameSlugifiesFeedbackType() {
+        let baseName = FeedbackSubmission.suggestedBaseName(
+            forType: "Feature Request",
+            timestamp: Date(timeIntervalSince1970: 1_773_489_600)
+        )
+
+        XCTAssertEqual(baseName, "retrace-feedback-feature-request-2026-03-14-120000")
+    }
+
+    func testSuggestedExportURLUsesProvidedDirectory() throws {
+        let directoryURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directoryURL) }
+
+        let exportURL = FeedbackViewModel.suggestedExportURL(
+            defaultFileName: "retrace-feedback-bug-report.txt",
+            directoryURL: directoryURL
+        )
+
+        XCTAssertEqual(exportURL.deletingLastPathComponent(), directoryURL)
+        XCTAssertEqual(exportURL.lastPathComponent, "retrace-feedback-bug-report.txt")
+    }
+
+    func testSuggestedExportURLKeepsProvidedFilenameWhenFileAlreadyExists() throws {
+        let directoryURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directoryURL) }
+
+        let existingURL = directoryURL.appendingPathComponent("retrace-feedback-bug-report.txt")
+        try "existing".write(to: existingURL, atomically: true, encoding: .utf8)
+
+        let exportURL = FeedbackViewModel.suggestedExportURL(
+            defaultFileName: "retrace-feedback-bug-report.txt",
+            directoryURL: directoryURL
+        )
+
+        XCTAssertEqual(exportURL.lastPathComponent, "retrace-feedback-bug-report.txt")
+    }
+
+    private func exportPayload(from text: String) throws -> [String: Any] {
+        let startMarker = "=== BEGIN SUBMISSION JSON ===\n"
+        let endMarker = "\n=== END SUBMISSION JSON ==="
+
+        guard let startRange = text.range(of: startMarker),
+              let endRange = text.range(of: endMarker) else {
+            XCTFail("Expected JSON markers in export text")
+            return [:]
+        }
+
+        let jsonString = String(text[startRange.upperBound..<endRange.lowerBound])
+        let data = try XCTUnwrap(jsonString.data(using: .utf8))
+        let object = try JSONSerialization.jsonObject(with: data, options: [])
+        return try XCTUnwrap(object as? [String: Any])
+    }
+
+    private func makeSampleDiagnostics() -> DiagnosticInfo {
+        DiagnosticInfo(
             appVersion: "1.2.3",
             buildNumber: "45",
             macOSVersion: "14.4",
@@ -149,106 +355,60 @@ final class FeedbackExportTests: XCTestCase {
             emergencyCrashReports: ["Sample emergency report"],
             timestamp: Date(timeIntervalSince1970: 1_773_486_000)
         )
-
-        let submission = FeedbackSubmission(
-            type: .bug,
-            email: "user@example.com",
-            description: "Steps to reproduce\n1. Open Help\n2. Block network",
-            diagnostics: diagnostics,
-            includeScreenshot: true,
-            screenshotData: Data([0x89, 0x50])
-        )
-
-        let text = submission.exportText(
-            generatedAt: generatedAt,
-            launchSource: .crashBanner,
-            screenshotFileName: "report-screenshot.png"
-        )
-
-        XCTAssertTrue(text.contains("RETRACE FEEDBACK EXPORT (USER REPORT)"))
-        XCTAssertTrue(text.contains("feedback_type: Bug Report"))
-        XCTAssertTrue(text.contains("launch_source: crashBanner"))
-        XCTAssertTrue(text.contains("screenshot_file: report-screenshot.png"))
-        XCTAssertTrue(text.contains("=== FEEDBACK ==="))
-        XCTAssertTrue(text.contains("Description:\nSteps to reproduce"))
-        XCTAssertTrue(text.contains("=== DIAGNOSTICS ==="))
-        XCTAssertTrue(text.contains("=== RETRACE MEMORY SUMMARY ==="))
-        XCTAssertTrue(text.contains("=== RECENT ACTIONS (2) ==="))
-        XCTAssertTrue(text.contains("Help opened (source=dashboard)"))
-        XCTAssertTrue(text.contains("Filtered search submitted (filterCount=2, queryLength=12)"))
-        XCTAssertTrue(text.contains("\nRetrace memory hierarchy:"))
-        XCTAssertTrue(text.contains("\n  storage.videoEncoding: now 256 MB | avg 240 MB | peak 320 MB"))
-        XCTAssertFalse(text.contains("\n-   storage.videoEncoding"))
-        XCTAssertTrue(text.contains("--- FULL LOGS (last hour) ---"))
-        XCTAssertTrue(text.contains("=== BEGIN SUBMISSION JSON ==="))
-        XCTAssertTrue(text.contains("=== END SUBMISSION JSON ==="))
-
-        let payload = try exportPayload(from: text)
-        let metadata = try XCTUnwrap(payload["metadata"] as? [String: Any])
-        XCTAssertEqual(metadata["launchSource"] as? String, "crashBanner")
-        XCTAssertEqual(metadata["screenshotFileName"] as? String, "report-screenshot.png")
-        XCTAssertEqual(metadata["screenshotByteCount"] as? Int, 2)
-
-        let report = try XCTUnwrap(payload["report"] as? [String: Any])
-        XCTAssertEqual(report["type"] as? String, "Bug Report")
-        XCTAssertEqual(report["email"] as? String, "user@example.com")
-        XCTAssertEqual(report["includeScreenshot"] as? Bool, true)
     }
 
-    func testSuggestedBaseNameSlugifiesFeedbackType() {
-        let baseName = FeedbackSubmission.suggestedBaseName(
-            forType: "Feature Request",
-            timestamp: Date(timeIntervalSince1970: 1_773_489_600)
-        )
+    private func makePreviewDiagnostics() -> DiagnosticInfo {
+        let base = makeSampleDiagnostics()
 
-        XCTAssertEqual(baseName, "retrace-feedback-feature-request-2026-03-14-120000")
-    }
-
-    func testSuggestedExportURLUsesProvidedDirectory() throws {
-        let directoryURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directoryURL) }
-
-        let exportURL = FeedbackViewModel.suggestedExportURL(
-            defaultFileName: "retrace-feedback-bug-report.txt",
-            directoryURL: directoryURL
-        )
-
-        XCTAssertEqual(exportURL.deletingLastPathComponent(), directoryURL)
-        XCTAssertEqual(exportURL.lastPathComponent, "retrace-feedback-bug-report.txt")
-    }
-
-    func testSuggestedExportURLKeepsProvidedFilenameWhenFileAlreadyExists() throws {
-        let directoryURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directoryURL) }
-
-        let existingURL = directoryURL.appendingPathComponent("retrace-feedback-bug-report.txt")
-        try "existing".write(to: existingURL, atomically: true, encoding: .utf8)
-
-        let exportURL = FeedbackViewModel.suggestedExportURL(
-            defaultFileName: "retrace-feedback-bug-report.txt",
-            directoryURL: directoryURL
-        )
-
-        XCTAssertEqual(exportURL.lastPathComponent, "retrace-feedback-bug-report.txt")
-    }
-
-    private func exportPayload(from text: String) throws -> [String: Any] {
-        let startMarker = "=== BEGIN SUBMISSION JSON ===\n"
-        let endMarker = "\n=== END SUBMISSION JSON ==="
-
-        guard let startRange = text.range(of: startMarker),
-              let endRange = text.range(of: endMarker) else {
-            XCTFail("Expected JSON markers in export text")
-            return [:]
+        let recentLogs = [
+            "2026-03-13T11:57:00Z [FeedbackMemoryProfile] Retrace memory hierarchy:",
+            "2026-03-13T11:58:01Z [FeedbackMemoryProfile] Retrace: now 512 MB | avg 480 MB | peak 600 MB",
+            "2026-03-13T11:58:02Z [FeedbackMemoryProfile]   storage.videoEncoding: now 256 MB | avg 240 MB | peak 320 MB",
+            "2026-03-13T11:58:03Z [FeedbackMemoryProfile]   storage.imageExtraction: now 128 MB | avg 120 MB | peak 160 MB",
+            "2026-03-13T11:58:04Z [FeedbackMemoryProfile]   processing.ocr: now 96 MB | avg 92 MB | peak 104 MB",
+            "2026-03-13T11:58:05Z [FeedbackMemoryProfile]   ui.caches: now 48 MB | avg 45 MB | peak 60 MB",
+        ] + (1...6).map { index in
+            "2026-03-13T11:59:0\(index)Z [INFO] Full log entry \(index)"
         }
 
-        let jsonString = String(text[startRange.upperBound..<endRange.lowerBound])
-        let data = try XCTUnwrap(jsonString.data(using: .utf8))
-        let object = try JSONSerialization.jsonObject(with: data, options: [])
-        return try XCTUnwrap(object as? [String: Any])
+        let primaryCrashReport = (1...12)
+            .map { "Crash line \($0)" }
+            .joined(separator: "\n")
+
+        let settingsSnapshot = Dictionary(uniqueKeysWithValues: (1...25).map { index in
+            ("settingKey\(index)", "value\(index)")
+        })
+
+        let recentMetricEvents = (1...100).map { index in
+            FeedbackRecentMetricEvent(
+                timestamp: Date(timeIntervalSince1970: 1_773_485_700 + TimeInterval(index)),
+                metricType: "search_submitted",
+                summary: "Search submitted",
+                details: ["queryLength": "\(index % 7 + 1)"]
+            )
+        }
+
+        return DiagnosticInfo(
+            appVersion: base.appVersion,
+            buildNumber: base.buildNumber,
+            macOSVersion: base.macOSVersion,
+            deviceModel: base.deviceModel,
+            totalDiskSpace: base.totalDiskSpace,
+            freeDiskSpace: base.freeDiskSpace,
+            databaseStats: base.databaseStats,
+            settingsSnapshot: settingsSnapshot,
+            recentErrors: base.recentErrors,
+            recentLogs: recentLogs,
+            recentMetricEvents: recentMetricEvents,
+            displayInfo: base.displayInfo,
+            processInfo: base.processInfo,
+            accessibilityInfo: base.accessibilityInfo,
+            performanceInfo: base.performanceInfo,
+            emergencyCrashReports: [
+                primaryCrashReport,
+                "Secondary crash report"
+            ],
+            timestamp: base.timestamp
+        )
     }
 }

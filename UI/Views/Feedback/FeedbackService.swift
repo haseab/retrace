@@ -29,6 +29,7 @@ public protocol FeedbackStatsProvider {
 public final class FeedbackService: @unchecked Sendable {
 
     public static let shared = FeedbackService()
+    static let diagnosticsLogLimit = 500
 
     private init() {}
 
@@ -59,9 +60,11 @@ public final class FeedbackService: @unchecked Sendable {
 
     /// Collect current diagnostic information with real database stats from provider
     public func collectDiagnostics(with stats: DiagnosticInfo.DatabaseStats) -> DiagnosticInfo {
-        // Use file-based logs for submission (more complete, includes all logs)
+        // Use the file-based log buffer for submission/export.
         let baseFields = collectBaseDiagnosticsFields()
-        let baseLogs = Self.filteredFeedbackLogEntries(Log.getRecentLogs(maxCount: 500))
+        let baseLogs = Self.filteredFeedbackLogEntries(
+            Log.getRecentLogs(maxCount: Self.diagnosticsLogLimit)
+        )
         let errors = Log.getRecentErrors(maxCount: 50)
         let logs = collectRetraceMemorySummaryLogsOnCurrentThread(
             performanceInfo: baseFields.enhanced.performanceInfo
@@ -79,9 +82,11 @@ public final class FeedbackService: @unchecked Sendable {
     /// Collect diagnostics quickly for preview using in-memory log buffer (instant)
     /// This avoids the slow OSLogStore query entirely
     public func collectDiagnosticsQuick(with stats: DiagnosticInfo.DatabaseStats) -> DiagnosticInfo {
-        // Use the fast file-based log buffer instead of OSLogStore
+        // Use the fast file-based log buffer with the same log cap shown in exports.
         let baseFields = collectBaseDiagnosticsFields()
-        let baseLogs = Self.filteredFeedbackLogEntries(Log.getRecentLogs(maxCount: 100))
+        let baseLogs = Self.filteredFeedbackLogEntries(
+            Log.getRecentLogs(maxCount: Self.diagnosticsLogLimit)
+        )
         let errors = Log.getRecentErrors(maxCount: 20)
         let logs = collectRetraceMemorySummaryLogsOnCurrentThread(
             performanceInfo: baseFields.enhanced.performanceInfo
@@ -118,7 +123,9 @@ public final class FeedbackService: @unchecked Sendable {
     public func collectDiagnosticsAsync(with stats: DiagnosticInfo.DatabaseStats) async -> DiagnosticInfo {
         await Task.detached(priority: .userInitiated) { [self] in
             let baseFields = collectBaseDiagnosticsFields()
-            let baseLogs = Self.filteredFeedbackLogEntries(Log.getRecentLogs(maxCount: 500))
+            let baseLogs = Self.filteredFeedbackLogEntries(
+                Log.getRecentLogs(maxCount: Self.diagnosticsLogLimit)
+            )
             let errors = Log.getRecentErrors(maxCount: 50)
             let logs = await collectRetraceMemorySummaryLogs(
                 performanceInfo: baseFields.enhanced.performanceInfo
@@ -137,7 +144,9 @@ public final class FeedbackService: @unchecked Sendable {
     public func collectDiagnosticsQuickAsync(with stats: DiagnosticInfo.DatabaseStats) async -> DiagnosticInfo {
         await Task.detached(priority: .userInitiated) { [self] in
             let baseFields = collectBaseDiagnosticsFields()
-            let baseLogs = Self.filteredFeedbackLogEntries(Log.getRecentLogs(maxCount: 100))
+            let baseLogs = Self.filteredFeedbackLogEntries(
+                Log.getRecentLogs(maxCount: Self.diagnosticsLogLimit)
+            )
             let errors = Log.getRecentErrors(maxCount: 20)
             let logs = await collectRetraceMemorySummaryLogs(
                 performanceInfo: baseFields.enhanced.performanceInfo

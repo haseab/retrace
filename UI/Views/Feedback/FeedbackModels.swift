@@ -81,8 +81,6 @@ public struct FeedbackLaunchContext {
 /// to decoder debugging. No file paths, no user data. Settings snapshot uses a strict whitelist —
 /// no raw queries, app lists, or browsing data are ever included.
 public struct DiagnosticInfo: Codable {
-    private static let memoryProfileLogMarker = "[FeedbackMemoryProfile]"
-
     public let appVersion: String
     public let buildNumber: String
     public let macOSVersion: String
@@ -258,178 +256,6 @@ public struct DiagnosticInfo: Codable {
         self.timestamp = timestamp
     }
 
-    private var memoryProfileEntries: [String] {
-        recentLogs
-            .filter(Self.isMemoryProfileLog)
-            .map(Self.memoryProfileMessage)
-    }
-
-    private var nonMemoryProfileLogs: [String] {
-        recentLogs.filter { !Self.isMemoryProfileLog($0) }
-    }
-
-    private static func isMemoryProfileLog(_ entry: String) -> Bool {
-        entry.contains(memoryProfileLogMarker)
-    }
-
-    private static func memoryProfileMessage(from entry: String) -> String {
-        guard let markerRange = entry.range(of: memoryProfileLogMarker) else {
-            return entry
-        }
-        let message = String(entry[markerRange.upperBound...]).trimmingCharacters(in: .newlines)
-        if message.hasPrefix(" ") {
-            return String(message.dropFirst())
-        }
-        return message
-    }
-
-    /// Format as readable text for display (summary without full logs).
-    /// Each section explains *why* this data helps diagnose the issue.
-    public func formattedText() -> String {
-        // -- App & System: identifies the exact build so we can check if the bug is already fixed
-        var text = """
-        === APP & SYSTEM ===
-        (Identifies your build — helps us check if the bug is already fixed)
-        App Version: \(appVersion) (\(buildNumber))
-        macOS: \(macOSVersion)
-        Device: \(deviceModel)
-        Disk: \(freeDiskSpace) free of \(totalDiskSpace)
-        """
-
-        // -- Database: helps diagnose data-related issues (corruption, retention, storage pressure)
-        text += "\n\n=== DATABASE ==="
-        text += "\n(Helps diagnose data corruption, retention, and storage pressure issues)"
-        text += "\n- Sessions: \(databaseStats.sessionCount)"
-        text += "\n- Frames: \(databaseStats.frameCount)"
-        text += "\n- Segments: \(databaseStats.segmentCount)"
-        text += "\n- Size: \(String(format: "%.1f", databaseStats.databaseSizeMB)) MB"
-
-        // -- Displays: needed to reproduce scaling, color, and multi-monitor rendering bugs
-        text += "\n\n=== DISPLAYS (\(displayInfo.count)) ==="
-        text += "\n(Needed to reproduce scaling, color space, and multi-monitor rendering bugs)"
-        for display in displayInfo.displays {
-            let mainTag = display.index == displayInfo.mainDisplayIndex ? " <- MAIN" : ""
-            text += "\n  [\(display.index)] \(display.resolution) @\(display.backingScaleFactor)x\(display.isRetina ? " Retina" : "") \(display.refreshRate) \(display.colorSpace) \(display.frame)\(mainTag)"
-        }
-
-        // -- Performance: distinguishes app bugs from system resource pressure
-        text += "\n\n=== PERFORMANCE ==="
-        text += "\n(Distinguishes app bugs from system resource pressure)"
-        text += "\n- CPU: \(String(format: "%.1f", performanceInfo.cpuUsagePercent))%"
-        text += "\n- Memory: \(String(format: "%.1f", performanceInfo.memoryUsedGB)) GB / \(String(format: "%.1f", performanceInfo.memoryTotalGB)) GB (\(performanceInfo.memoryPressure))"
-        text += "\n- Swap: \(String(format: "%.1f", performanceInfo.swapUsedGB)) GB"
-        text += "\n- Thermal: \(performanceInfo.thermalState)"
-        text += "\n- Power: \(performanceInfo.powerSource)"
-        if let battery = performanceInfo.batteryLevel {
-            text += " (\(battery)%)"
-        }
-        text += "\n- Low Power Mode: \(performanceInfo.isLowPowerModeEnabled)"
-        text += "\n- Processors: \(performanceInfo.processorCount)"
-
-        if !memoryProfileEntries.isEmpty {
-            text += "\n\n=== RETRACE MEMORY SUMMARY ==="
-            text += "\n(Hierarchical breakdown from the system monitor sampler included with this report)"
-            for entry in memoryProfileEntries {
-                text += "\n\(entry)"
-            }
-        }
-
-        // -- Running Apps: category counts only (never app names) — detects interference
-        text += "\n\n=== RUNNING APPS (category counts only, never app names) ==="
-        text += "\n(Detects tools that commonly interfere with screen capture and accessibility)"
-        text += "\n- Total: \(processInfo.totalRunning)"
-        if processInfo.eventMonitoringApps > 0 { text += "\n- Event Monitoring: \(processInfo.eventMonitoringApps)" }
-        if processInfo.windowManagementApps > 0 { text += "\n- Window Management: \(processInfo.windowManagementApps)" }
-        if processInfo.securityApps > 0 { text += "\n- Security/MDM: \(processInfo.securityApps)" }
-        if processInfo.hasJamf { text += "\n- Jamf: detected" }
-        if processInfo.hasKandji { text += "\n- Kandji: detected" }
-        if processInfo.axuiServerCPU > 1.0 { text += "\n- AXUIServer CPU: \(String(format: "%.1f", processInfo.axuiServerCPU))%" }
-        if processInfo.windowServerCPU > 5.0 { text += "\n- WindowServer CPU: \(String(format: "%.1f", processInfo.windowServerCPU))%" }
-
-        // -- Accessibility: these OS settings directly affect rendering behavior
-        let axFeatures: [(String, Bool)] = [
-            ("VoiceOver", accessibilityInfo.voiceOverEnabled),
-            ("SwitchControl", accessibilityInfo.switchControlEnabled),
-            ("ReduceMotion", accessibilityInfo.reduceMotionEnabled),
-            ("IncreaseContrast", accessibilityInfo.increaseContrastEnabled),
-            ("ReduceTransparency", accessibilityInfo.reduceTransparencyEnabled),
-            ("DifferentiateWithoutColor", accessibilityInfo.differentiateWithoutColorEnabled),
-            ("InvertColors", accessibilityInfo.displayHasInvertedColors),
-        ]
-        let enabledFeatures = axFeatures.filter(\.1).map(\.0)
-        if !enabledFeatures.isEmpty {
-            text += "\n\n=== ACCESSIBILITY ==="
-            text += "\n(These OS settings directly affect rendering and compositing behavior)"
-            text += "\n\(enabledFeatures.joined(separator: ", "))"
-        }
-
-        text += "\n\nRecent Errors: \(recentErrors.isEmpty ? "None" : "\(recentErrors.count) error(s)")"
-
-        // -- Settings: whitelisted toggles/thresholds only (no paths, no app lists, no user content)
-        if !settingsSnapshot.isEmpty {
-            text += "\n\n=== SETTINGS (whitelisted keys only, no paths or app names) ==="
-            text += "\n(Helps reproduce misconfiguration issues — only behavioral toggles and thresholds)"
-            for key in settingsSnapshot.keys.sorted() {
-                if let value = settingsSnapshot[key] {
-                    text += "\n- \(key): \(value)"
-                }
-            }
-        }
-
-        if !recentMetricEvents.isEmpty {
-            text += "\n\n=== RECENT ACTIONS (\(recentMetricEvents.count)) ==="
-            text += "\n(Relevant recent daily-metrics events with limited metadata, filtered to avoid noisy telemetry)"
-            let formatter = ISO8601DateFormatter()
-            formatter.formatOptions = [.withInternetDateTime]
-
-            for event in recentMetricEvents {
-                let detailsText = event.details.keys.sorted().compactMap { key in
-                    event.details[key].map { "\(key)=\($0)" }
-                }.joined(separator: ", ")
-
-                text += "\n- [\(formatter.string(from: event.timestamp))] \(event.summary)"
-                if !detailsText.isEmpty {
-                    text += " (\(detailsText))"
-                }
-            }
-        }
-
-        if !recentLogs.isEmpty {
-            text += "\nRecent Logs: \(recentLogs.count) entries (recent log tail + Retrace memory summary)"
-        }
-
-        return text
-    }
-
-    /// Full formatted text including all logs
-    public func fullFormattedText() -> String {
-        var text = formattedText()
-
-        // -- Errors: recent error-level log entries that may indicate the root cause
-        if !recentErrors.isEmpty {
-            text += "\n\n--- ERRORS ---\n"
-            text += "(Recent error-level log entries — may indicate root cause)\n"
-            text += recentErrors.joined(separator: "\n")
-        }
-
-        // -- Emergency crash reports: captured automatically when the app freezes
-        // Stored locally only, attached here so we can diagnose hangs after the fact
-        if let crashReports = emergencyCrashReports, !crashReports.isEmpty {
-            text += "\n\n--- EMERGENCY CRASH REPORTS ---\n"
-            text += "(Auto-captured when app was frozen — stored locally, included only with your permission)\n"
-            text += crashReports.joined(separator: "\n---\n")
-        }
-
-        // -- Full logs: complete log output from the last hour for tracing event sequences
-        if !nonMemoryProfileLogs.isEmpty {
-            text += "\n\n--- FULL LOGS (last hour) ---\n"
-            text += "(Complete log output for tracing event sequences leading to the issue)\n"
-            text += nonMemoryProfileLogs.joined(separator: "\n")
-        }
-
-        return text
-    }
-
     public func withRecentMetricEvents(_ events: [FeedbackRecentMetricEvent]) -> DiagnosticInfo {
         DiagnosticInfo(
             appVersion: appVersion,
@@ -456,11 +282,12 @@ public struct DiagnosticInfo: Codable {
 // MARK: - Feedback Submission
 
 /// Complete feedback submission payload
-public struct FeedbackSubmission: Codable {
+public struct FeedbackSubmission {
     public let type: String
     public let email: String?
     public let description: String
     public let diagnostics: DiagnosticInfo
+    public let includedDiagnosticSections: Set<DiagnosticInfo.SectionID>
     public let includeScreenshot: Bool
     public let screenshotData: Data?
 
@@ -469,6 +296,7 @@ public struct FeedbackSubmission: Codable {
         email: String = "",
         description: String,
         diagnostics: DiagnosticInfo,
+        includedDiagnosticSections: Set<DiagnosticInfo.SectionID> = Set(DiagnosticInfo.SectionID.allCases),
         includeScreenshot: Bool = false,
         screenshotData: Data? = nil
     ) {
@@ -476,149 +304,8 @@ public struct FeedbackSubmission: Codable {
         self.email = email.isEmpty ? nil : email
         self.description = description
         self.diagnostics = diagnostics
+        self.includedDiagnosticSections = includedDiagnosticSections
         self.includeScreenshot = includeScreenshot
         self.screenshotData = screenshotData
-    }
-}
-
-extension FeedbackSubmission {
-    fileprivate static let exportTimestampFormatter: ISO8601DateFormatter = {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter
-    }()
-
-    public var exportSuggestedBaseName: String {
-        Self.suggestedBaseName(forType: type, timestamp: diagnostics.timestamp)
-    }
-
-    public static func suggestedBaseName(forType type: String, timestamp: Date = Date()) -> String {
-        let typeSlug = type
-            .lowercased()
-            .replacingOccurrences(of: "[^a-z0-9]+", with: "-", options: .regularExpression)
-            .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
-        let formattedTimestamp = exportFileTimestampFormatter.string(from: timestamp)
-        return "retrace-feedback-\(typeSlug.isEmpty ? "report" : typeSlug)-\(formattedTimestamp)"
-    }
-
-    public func exportText(
-        generatedAt: Date = Date(),
-        launchSource: FeedbackLaunchContext.Source? = nil,
-        screenshotFileName: String? = nil
-    ) -> String {
-        let generatedAtString = Self.exportTimestampFormatter.string(from: generatedAt)
-        let diagnosticsTimestamp = Self.exportTimestampFormatter.string(from: diagnostics.timestamp)
-        let screenshotLabel = includeScreenshot ? (screenshotFileName ?? "(attached separately)") : "(none)"
-        let trimmedDescription = description.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        let structureGuide = [
-            "summary header: export metadata, report type, and attachment state",
-            "structure guide: quick map of the sections that follow",
-            "feedback section: user-entered email and description",
-            "diagnostics section: full environment snapshot included with the report",
-            "attachment section: exported screenshot filename when present",
-            "JSON footer markers: BEGIN/END SUBMISSION JSON delimit the machine-readable payload"
-        ]
-
-        let summaryLines = [
-            "RETRACE FEEDBACK EXPORT (USER REPORT)",
-            "generated_at: \(generatedAtString)",
-            "export_format_version: 1",
-            "submission_endpoint: https://retrace.to/api/feedback",
-            "feedback_type: \(type)",
-            "launch_source: \(launchSource?.rawValue ?? FeedbackLaunchContext.Source.manual.rawValue)",
-            "report_email: \(email ?? "(none)")",
-            "description_length: \(description.count)",
-            "diagnostics_timestamp: \(diagnosticsTimestamp)",
-            "recent_errors_count: \(diagnostics.recentErrors.count)",
-            "recent_logs_count: \(diagnostics.recentLogs.count)",
-            "includes_screenshot: \(includeScreenshot ? "yes" : "no")",
-            "screenshot_file: \(screenshotLabel)",
-            "",
-            "STRUCTURE GUIDE",
-        ] + structureGuide.enumerated().map { index, line in
-            "\(String(format: "%02d", index + 1)). \(line)"
-        }
-
-        let payload = FeedbackExportEnvelope(
-            metadata: FeedbackExportEnvelope.Metadata(
-                description: "LLM-oriented export of the feedback report prepared by Retrace.",
-                exportFormatVersion: 1,
-                generatedAt: generatedAt,
-                submissionEndpoint: "https://retrace.to/api/feedback",
-                launchSource: launchSource?.rawValue ?? FeedbackLaunchContext.Source.manual.rawValue,
-                screenshotFileName: screenshotFileName,
-                screenshotByteCount: screenshotData?.count
-            ),
-            report: FeedbackExportEnvelope.Report(
-                type: type,
-                email: email,
-                description: description,
-                includeScreenshot: includeScreenshot,
-                diagnostics: diagnostics
-            )
-        )
-
-        return [
-            summaryLines.joined(separator: "\n"),
-            "",
-            "=== FEEDBACK ===",
-            "Type: \(type)",
-            "Email: \(email ?? "(none)")",
-            "",
-            "Description:",
-            trimmedDescription.isEmpty ? "(empty)" : trimmedDescription,
-            "",
-            "=== DIAGNOSTICS ===",
-            diagnostics.fullFormattedText(),
-            "",
-            "=== ATTACHMENTS ===",
-            includeScreenshot ? "Screenshot: \(screenshotLabel)" : "Screenshot: none",
-            "",
-            "=== BEGIN SUBMISSION JSON ===",
-            payload.prettyPrintedJSON() ?? "{}",
-            "=== END SUBMISSION JSON ==="
-        ].joined(separator: "\n")
-    }
-
-    private static let exportFileTimestampFormatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = TimeZone(secondsFromGMT: 0)
-        formatter.dateFormat = "yyyy-MM-dd-HHmmss"
-        return formatter
-    }()
-}
-
-private struct FeedbackExportEnvelope: Encodable {
-    struct Metadata: Encodable {
-        let description: String
-        let exportFormatVersion: Int
-        let generatedAt: Date
-        let submissionEndpoint: String
-        let launchSource: String
-        let screenshotFileName: String?
-        let screenshotByteCount: Int?
-    }
-
-    struct Report: Encodable {
-        let type: String
-        let email: String?
-        let description: String
-        let includeScreenshot: Bool
-        let diagnostics: DiagnosticInfo
-    }
-
-    let metadata: Metadata
-    let report: Report
-
-    func prettyPrintedJSON() -> String? {
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        guard let data = try? encoder.encode(self) else {
-            return nil
-        }
-        return String(data: data, encoding: .utf8)
     }
 }

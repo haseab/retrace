@@ -26,18 +26,29 @@ public struct FeedbackFormView: View {
     @State private var successTextOffset: CGFloat = 14
     @State private var measuredFormContentHeight: CGFloat = 0
     @State private var measuredFormFooterHeight: CGFloat = 0
+    @State private var feedbackWindowNumber: Int?
     @State private var keyboardFocusTarget: KeyboardFocusTarget = .description
     @State private var suppressAutomaticFocusScroll = true
+    @StateObject private var scrollLatch = HoverLatchedScrollMonitor<ScrollTarget>(
+        hoverPriority: [.details],
+        defaultTarget: .outer
+    )
 
     private enum FocusedField {
         case email
         case description
     }
 
+    private enum ScrollTarget {
+        case outer
+        case details
+    }
+
     private enum KeyboardFocusTarget: Hashable {
         case email
         case description
         case details
+        case diagnosticSection(DiagnosticInfo.SectionID)
         case attachScreenshot
         case downloadReport
         case submit
@@ -85,6 +96,14 @@ public struct FeedbackFormView: View {
         .frame(width: 480, height: containerHeight)
         .clipped()
         .animation(.spring(response: 0.42, dampingFraction: 0.88), value: presentationState)
+        .background(
+            FeedbackWindowObserver { windowNumber in
+                feedbackWindowNumber = windowNumber
+                if viewModel.showDiagnosticsDetail {
+                    installScrollMonitorIfNeeded()
+                }
+            }
+        )
         .onAppear {
             suppressAutomaticFocusScroll = true
             viewModel.setCoordinator(coordinatorWrapper)
@@ -93,6 +112,7 @@ public struct FeedbackFormView: View {
         }
         .onDisappear {
             removeEscapeKeyHandler()
+            removeScrollMonitor()
             viewModel.teardown()
         }
         .onChange(of: viewModel.isSubmitting) { isSubmitting in
@@ -116,6 +136,14 @@ public struct FeedbackFormView: View {
         }
         .onChange(of: viewModel.feedbackType) { _ in
             ensureKeyboardFocusIsValid()
+        }
+        .onChange(of: viewModel.showDiagnosticsDetail) { isExpanded in
+            ensureKeyboardFocusIsValid()
+            if isExpanded {
+                installScrollMonitorIfNeeded()
+            } else {
+                removeScrollMonitor()
+            }
         }
     }
 
@@ -194,6 +222,32 @@ public struct FeedbackFormView: View {
         }
     }
 
+    private var isOuterScrollDisabled: Bool {
+        viewModel.showDiagnosticsDetail && scrollLatch.latchedTarget == .details
+    }
+
+    private var isDiagnosticsScrollEnabled: Bool {
+        switch scrollLatch.latchedTarget {
+        case .outer:
+            return false
+        case .details, .none:
+            return true
+        }
+    }
+
+    private func installScrollMonitorIfNeeded() {
+        guard viewModel.showDiagnosticsDetail else { return }
+
+        scrollLatch.installMonitorIfNeeded { event in
+            guard let feedbackWindowNumber else { return false }
+            return event.window?.windowNumber == feedbackWindowNumber
+        }
+    }
+
+    private func removeScrollMonitor() {
+        scrollLatch.removeMonitor()
+    }
+
     private func applyInitialFocusIfNeeded() {
         let initialTarget: KeyboardFocusTarget = launchContext?.preferredFocusField == .email ? .email : .description
         DispatchQueue.main.async {
@@ -205,9 +259,15 @@ public struct FeedbackFormView: View {
     }
 
     private var formKeyboardOrder: [KeyboardFocusTarget] {
-        var order: [KeyboardFocusTarget] = [.email, .description]
-        if viewModel.feedbackType == .bug {
-            order.append(.details)
+        var order: [KeyboardFocusTarget] = [
+            .email,
+            .description,
+            .details,
+        ]
+        if viewModel.showDiagnosticsDetail {
+            order.append(contentsOf: viewModel.diagnosticSections.map {
+                .diagnosticSection($0.id)
+            })
         }
         order.append(.attachScreenshot)
         order.append(.downloadReport)
@@ -230,7 +290,7 @@ public struct FeedbackFormView: View {
             focusedField = .email
         case .description:
             focusedField = .description
-        case .details, .attachScreenshot, .downloadReport, .submit:
+        case .details, .diagnosticSection(_), .attachScreenshot, .downloadReport, .submit:
             focusedField = nil
         }
     }
@@ -284,6 +344,9 @@ public struct FeedbackFormView: View {
         case .details:
             toggleDiagnosticsDetail()
             return true
+        case .diagnosticSection(let section):
+            viewModel.toggleDiagnosticSection(section)
+            return true
         case .attachScreenshot:
             viewModel.selectImageFromFinder()
             return true
@@ -319,7 +382,7 @@ public struct FeedbackFormView: View {
 
     private func scrollAnchorTarget(for target: KeyboardFocusTarget) -> KeyboardFocusTarget? {
         switch target {
-        case .email, .description, .details, .attachScreenshot, .downloadReport:
+        case .email, .description, .details, .diagnosticSection(_), .attachScreenshot, .downloadReport:
             return target
         case .submit:
             // Submit is in the fixed footer and already visible.
@@ -424,11 +487,8 @@ public struct FeedbackFormView: View {
                         descriptionSection
                             .id(KeyboardFocusTarget.description)
 
-                        // Diagnostics are only shown for bug reports.
-                        if viewModel.feedbackType == .bug {
-                            diagnosticsSection
-                                .id(KeyboardFocusTarget.details)
-                        }
+                        diagnosticsSection
+                            .id(KeyboardFocusTarget.details)
 
                         // Image Attachment
                         imageAttachmentSection
@@ -454,6 +514,7 @@ public struct FeedbackFormView: View {
                         }
                     )
                 }
+                .scrollDisabled(isOuterScrollDisabled)
                 .onChange(of: keyboardFocusTarget) { newValue in
                     guard presentationState == .form else { return }
                     scrollToFocusedControl(newValue, proxy: proxy)
@@ -729,6 +790,10 @@ public struct FeedbackFormView: View {
                 Text("Bug reports include recent logs plus a hierarchical Retrace memory summary from the system monitor sampler.")
                     .font(.system(size: 10))
                     .foregroundColor(.retraceSecondary.opacity(0.72))
+            } else {
+                Text("Retrace also attaches a local app and system snapshot for support. Expand details to exclude anything you don't want to share.")
+                    .font(.system(size: 10))
+                    .foregroundColor(.retraceSecondary.opacity(0.72))
             }
 
             // Expanded details (lazy loaded)
@@ -736,28 +801,40 @@ public struct FeedbackFormView: View {
                 Divider()
                     .background(Color.white.opacity(0.06))
 
-                if let diagnostics = viewModel.diagnostics {
-                    VStack(spacing: 0) {
-                        ScrollView {
-                            Text(diagnostics.fullFormattedText())
-                                .font(.retraceMonoSmall)
-                                .foregroundColor(.retraceSecondary)
-                                .textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(8)
+                if viewModel.diagnostics != nil {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Uncheck any section you don't want included with this report.")
+                            .font(.system(size: 10))
+                            .foregroundColor(.retraceSecondary.opacity(0.72))
+
+                        if viewModel.excludedDiagnosticSectionCount > 0 {
+                            Text("\(viewModel.excludedDiagnosticSectionCount) section\(viewModel.excludedDiagnosticSectionCount == 1 ? "" : "s") currently excluded")
+                                .font(.retraceCaption2)
+                                .foregroundColor(.retraceSecondary.opacity(0.58))
                         }
+
+                        ScrollView(showsIndicators: true) {
+                            VStack(alignment: .leading, spacing: 10) {
+                                ForEach(viewModel.diagnosticSections) { section in
+                                    diagnosticSectionCard(section)
+                                        .id(KeyboardFocusTarget.diagnosticSection(section.id))
+                                }
+                            }
+                            .padding(8)
+                        }
+                        .scrollDisabled(!isDiagnosticsScrollEnabled)
                         .frame(height: 280)
                         .background(Color.black.opacity(0.2))
                         .cornerRadius(6)
+                        .clipped()
+                        .onHover { hovering in
+                            scrollLatch.updateHoveredTarget(.details, isHovering: hovering)
+                        }
 
-                        if viewModel.includesLogsInDiagnostics {
-                            HStack {
-                                Spacer()
-                                Text("(Last \(diagnostics.recentLogs.count) log entries)")
-                                    .font(.retraceCaption2)
-                                    .foregroundColor(.retraceSecondary.opacity(0.5))
-                            }
-                            .padding(.top, 4)
+                        if !viewModel.hasSelectedDiagnosticSections {
+                            Text("No diagnostics will be attached beyond your written description and any screenshot you add.")
+                                .font(.retraceCaption2)
+                                .foregroundColor(.retraceSecondary.opacity(0.58))
                         }
                     }
                 } else {
@@ -790,6 +867,99 @@ public struct FeedbackFormView: View {
                 .font(.system(size: 10, weight: .medium))
         }
         .foregroundColor(.retraceSecondary)
+    }
+
+    private func diagnosticSectionCard(_ section: DiagnosticInfo.SectionSummary) -> some View {
+        let isIncluded = viewModel.isDiagnosticSectionIncluded(section.id)
+        let isFocused = keyboardFocusTarget == .diagnosticSection(section.id)
+
+        return VStack(alignment: .leading, spacing: 10) {
+            Button(action: {
+                keyboardFocusTarget = .diagnosticSection(section.id)
+                viewModel.toggleDiagnosticSection(section.id)
+            }) {
+                HStack(alignment: .top, spacing: 10) {
+                    Image(systemName: isIncluded ? "checkmark.square.fill" : "square")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundColor(isIncluded ? .retraceAccent : .retraceSecondary.opacity(0.75))
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 8) {
+                            Text(section.title)
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundColor(.retracePrimary)
+
+                            if let countSummary = section.countSummary {
+                                Text(countSummary)
+                                    .font(.system(size: 9, weight: .medium))
+                                    .foregroundColor(.retraceSecondary.opacity(0.82))
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(Color.white.opacity(0.05))
+                                    .cornerRadius(999)
+                            }
+                        }
+
+                        Text(section.reason)
+                            .font(.system(size: 10))
+                            .foregroundColor(.retraceSecondary.opacity(0.74))
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    Spacer(minLength: 8)
+
+                    Text(isIncluded ? "Included" : "Excluded")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(isIncluded ? .retraceAccent : .retraceSecondary.opacity(0.72))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .background(
+                            (isIncluded ? Color.retraceAccent.opacity(0.14) : Color.white.opacity(0.04))
+                        )
+                        .cornerRadius(999)
+                }
+            }
+            .buttonStyle(.plain)
+
+            Text(section.preview)
+                .font(.retraceMonoSmall)
+                .foregroundColor(
+                    isIncluded
+                        ? .retraceSecondary
+                        : .retraceSecondary.opacity(0.58)
+                )
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(10)
+                .background(
+                    isIncluded
+                        ? Color.black.opacity(0.16)
+                        : Color.black.opacity(0.1)
+                )
+                .cornerRadius(6)
+
+            if let previewDisclosure = section.previewDisclosure {
+                Text(previewDisclosure)
+                    .font(.system(size: 9))
+                    .foregroundColor(.retraceSecondary.opacity(0.58))
+            }
+        }
+        .padding(10)
+        .background(
+            isIncluded
+                ? Color.white.opacity(0.035)
+                : Color.white.opacity(0.015)
+        )
+        .cornerRadius(8)
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(
+                    isFocused
+                        ? Color.retraceAccent.opacity(0.64)
+                        : Color.white.opacity(isIncluded ? 0.08 : 0.04),
+                    lineWidth: 1
+                )
+        )
     }
 
     // MARK: - Image Attachment Section
@@ -1272,6 +1442,49 @@ public struct FeedbackFormView: View {
             .padding(.bottom, 20)
         }
         .padding(28)
+    }
+}
+
+private struct FeedbackWindowObserver: NSViewRepresentable {
+    let onWindowNumberChange: (Int?) -> Void
+
+    func makeNSView(context: Context) -> ObserverView {
+        ObserverView(onWindowNumberChange: onWindowNumberChange)
+    }
+
+    func updateNSView(_ nsView: ObserverView, context: Context) {
+        nsView.onWindowNumberChange = onWindowNumberChange
+        nsView.reportWindowNumberIfNeeded()
+    }
+
+    final class ObserverView: NSView {
+        var onWindowNumberChange: (Int?) -> Void
+        private var lastReportedWindowNumber: Int?
+
+        init(onWindowNumberChange: @escaping (Int?) -> Void) {
+            self.onWindowNumberChange = onWindowNumberChange
+            super.init(frame: .zero)
+        }
+
+        @available(*, unavailable)
+        required init?(coder: NSCoder) {
+            fatalError("init(coder:) has not been implemented")
+        }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            reportWindowNumberIfNeeded()
+        }
+
+        func reportWindowNumberIfNeeded() {
+            let windowNumber = window?.windowNumber
+            guard windowNumber != lastReportedWindowNumber else { return }
+            lastReportedWindowNumber = windowNumber
+
+            DispatchQueue.main.async { [windowNumber, onWindowNumberChange] in
+                onWindowNumberChange(windowNumber)
+            }
+        }
     }
 }
 
