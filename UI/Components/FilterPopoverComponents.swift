@@ -1059,6 +1059,7 @@ public struct AdvancedSearchFilterPopover: View {
     @State private var isWindowHovered = false
     @State private var isBrowserHovered = false
     @State private var arrowKeyMonitor: Any?
+    @State private var lastFocusedField: Field?
 
     private enum Field: Hashable {
         case excludeTerms
@@ -1266,6 +1267,25 @@ public struct AdvancedSearchFilterPopover: View {
         default:
             break
         }
+    }
+
+    private func commitPendingInput(for field: Field?) {
+        switch field {
+        case .excludeTerms:
+            addExcludedTermFromInput()
+        case .windowNameInput:
+            addWindowNameTermFromInput()
+        case .browserUrlInput:
+            addBrowserUrlTermFromInput()
+        case .none:
+            break
+        }
+    }
+
+    private func commitAllPendingInputs() {
+        commitPendingInput(for: .excludeTerms)
+        commitPendingInput(for: .windowNameInput)
+        commitPendingInput(for: .browserUrlInput)
     }
 
     private func setupArrowKeyMonitor() {
@@ -1517,12 +1537,21 @@ public struct AdvancedSearchFilterPopover: View {
             setWindowNameExcludeTerms(windowNameExcludeTerms)
             setBrowserUrlIncludeTerms(browserUrlIncludeTerms)
             setBrowserUrlExcludeTerms(browserUrlExcludeTerms)
+            lastFocusedField = focusedField
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
                 focusedField = .excludeTerms
             }
             setupArrowKeyMonitor()
         }
+        .onChange(of: focusedField) { newValue in
+            let previousField = lastFocusedField
+            lastFocusedField = newValue
+            guard previousField != newValue else { return }
+            commitPendingInput(for: previousField)
+        }
         .onDisappear {
+            commitAllPendingInputs()
+            lastFocusedField = nil
             removeArrowKeyMonitor()
         }
     }
