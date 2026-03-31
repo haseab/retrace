@@ -7,59 +7,6 @@ import App
 
 @MainActor
 final class DateJumpRelativeDayAnchoringTests: XCTestCase {
-    func testYearOnlyUsesFirstFrameInResolvedYear() async {
-        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
-        let calendar = Calendar.current
-        let year = makeDate(year: 2024, month: 1, day: 1, hour: 0, minute: 0)
-        guard let yearInterval = calendar.dateInterval(of: .year, for: year) else {
-            XCTFail("Failed to construct expected year interval")
-            return
-        }
-
-        var anchoredTimestamp: Date?
-        var sawYearAnchorFetch = false
-        var sawWindowFetch = false
-
-        viewModel.test_windowFetchHooks.getFramesWithVideoInfo = { start, end, limit, _, reason in
-            switch reason {
-            case "searchForDate.anchor.firstFrameInYear":
-                sawYearAnchorFetch = true
-                XCTAssertEqual(limit, 1)
-                XCTAssertEqual(start.timeIntervalSince(yearInterval.start), 0, accuracy: 0.01)
-                XCTAssertEqual(end.timeIntervalSince(yearInterval.end), -0.001, accuracy: 0.01)
-                let firstFrameInYear = start.addingTimeInterval(123)
-                anchoredTimestamp = firstFrameInYear
-                return [self.makeFrameWithVideoInfo(id: 6899, timestamp: firstFrameInYear, processingStatus: 4)]
-
-            case "searchForDate":
-                sawWindowFetch = true
-                guard let anchoredTimestamp else {
-                    XCTFail("Expected year anchor to resolve before window fetch")
-                    return []
-                }
-                XCTAssertEqual(limit, 1000)
-                XCTAssertEqual(start.timeIntervalSince(anchoredTimestamp), -600, accuracy: 0.01)
-                XCTAssertEqual(end.timeIntervalSince(anchoredTimestamp), 600, accuracy: 0.01)
-                return [self.makeFrameWithVideoInfo(id: 6899, timestamp: anchoredTimestamp, processingStatus: 4)]
-
-            case "loadNewerFrames.reason=searchForDate",
-                 "loadOlderFrames.reason=searchForDate":
-                return []
-
-            default:
-                XCTFail("Unexpected fetch reason: \(reason)")
-                return []
-            }
-        }
-
-        await viewModel.searchForDate("2024")
-
-        XCTAssertTrue(sawYearAnchorFetch)
-        XCTAssertTrue(sawWindowFetch)
-        XCTAssertEqual(viewModel.currentTimelineFrame?.frame.id.value, 6899)
-        XCTAssertEqual(viewModel.currentTimelineFrame?.frame.timestamp, anchoredTimestamp)
-    }
-
     func testMonthAndYearUseFirstFrameInResolvedMonth() async {
         let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
         let calendar = Calendar.current

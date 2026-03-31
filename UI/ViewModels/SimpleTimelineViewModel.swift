@@ -14850,6 +14850,12 @@ public class SimpleTimelineViewModel: ObservableObject {
             return normalizedAnchorDate(normalized, mode: anchorMode, calendar: calendar)
         }
 
+        // Bias bare compact numeric input like "2024" toward 20:24 before
+        // standalone year parsing can claim it.
+        if let timeOnlyDate = parseTimeOnly(normalizedRelativeInput, relativeTo: now) {
+            return finalizeParsedDate(timeOnlyDate)
+        }
+
         if let standaloneMonthDate = parseStandaloneMonthReference(
             normalizedRelativeInput,
             now: now,
@@ -14884,14 +14890,6 @@ public class SimpleTimelineViewModel: ObservableObject {
         // SwiftyChrono handles all relative dates (X days/weeks/months/years ago, yesterday, etc.)
         // We only need fallback for compact time formats and explicit date strings
         let trimmedLower = normalizedRelativeInput
-
-        // === TIME-ONLY INPUT ===
-
-        // Try parsing time-only input (assumes "today" if just time is given)
-        // Handles: "938pm", "9:38pm", "938 pm", "9:38 pm", "938", "9:38", "21:38"
-        if let timeOnlyDate = parseTimeOnly(trimmedLower, relativeTo: now) {
-            return finalizeParsedDate(timeOnlyDate)
-        }
 
         // Normalize compact time formats before passing to NSDataDetector.
         // Examples:
@@ -15303,10 +15301,6 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     private func isStandaloneYearBucketInput(_ normalizedText: String) -> Bool {
-        if normalizedText.range(of: #"^(?:19|20|21)\d{2}$"#, options: .regularExpression) != nil {
-            return true
-        }
-
         return normalizedText.range(
             of: #"^(?:last|this|next)\s+year$"#,
             options: .regularExpression

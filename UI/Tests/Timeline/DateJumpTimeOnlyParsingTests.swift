@@ -143,16 +143,16 @@ final class DateJumpTimeOnlyParsingTests: XCTestCase {
         assertDateComponents(result, year: 2024, month: 2, day: 28, hour: 0, minute: 0)
     }
 
-    func testYearOnlyInputParsesAsStartOfYear() {
+    func testBareFourDigitInputParsesAsCompact24HourTime() {
         let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
-        let now = makeDate(year: 2026, month: 3, day: 1, hour: 9, minute: 0)
+        let now = makeDate(year: 2026, month: 3, day: 1, hour: 21, minute: 0)
 
         guard let result = viewModel.test_parseNaturalLanguageDateForDateSearch("2024", now: now) else {
-            XCTFail("Expected parser to resolve year-only input")
+            XCTFail("Expected parser to resolve bare four-digit input as compact 24-hour time")
             return
         }
 
-        assertDateComponents(result, year: 2024, month: 1, day: 1, hour: 0, minute: 0)
+        assertDateComponents(result, year: 2026, month: 3, day: 1, hour: 20, minute: 24)
     }
 
     func testLastYearInputParsesAsStartOfPreviousYear() {
