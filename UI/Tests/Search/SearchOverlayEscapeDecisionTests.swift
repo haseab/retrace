@@ -63,4 +63,12 @@ final class SearchOverlayEscapeDecisionTests: XCTestCase {
             )
         )
     }
+
+    func testRequestSearchFieldFocusCanRequestSelectAll() {
+        let viewModel = SearchViewModel(coordinator: AppCoordinator())
+
+        viewModel.requestSearchFieldFocus(selectAll: true)
+
+        XCTAssertTrue(viewModel.focusSearchFieldSignal.selectAll)
+    }
 }

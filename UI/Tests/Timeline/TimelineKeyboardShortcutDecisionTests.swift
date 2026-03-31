@@ -71,6 +71,36 @@ final class TimelineKeyboardShortcutDecisionTests: XCTestCase {
         )
     }
 
+    func testSearchOverlayShortcutOpensOverlayWhenHidden() {
+        XCTAssertEqual(
+            TimelineWindowController.searchOverlayShortcutAction(
+                isSearchOverlayVisible: false,
+                shouldRefocusSearchFieldBeforeClose: false
+            ),
+            .open
+        )
+    }
+
+    func testSearchOverlayShortcutFocusesFieldBeforeClosingWhenVisibleResultsOwnFocus() {
+        XCTAssertEqual(
+            TimelineWindowController.searchOverlayShortcutAction(
+                isSearchOverlayVisible: true,
+                shouldRefocusSearchFieldBeforeClose: true
+            ),
+            .focusField
+        )
+    }
+
+    func testSearchOverlayShortcutClosesOverlayWhenVisibleAndFieldAlreadyFocused() {
+        XCTAssertEqual(
+            TimelineWindowController.searchOverlayShortcutAction(
+                isSearchOverlayVisible: true,
+                shouldRefocusSearchFieldBeforeClose: false
+            ),
+            .close
+        )
+    }
+
     func testShouldDismissTimelineWithCommandW() {
         XCTAssertTrue(
             TimelineWindowController.shouldDismissTimelineWithCommandW(

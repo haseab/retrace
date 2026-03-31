@@ -366,7 +366,8 @@ public class SearchViewModel: ObservableObject {
     @Published public var collapseOverlaySignal: UUID = UUID()
 
     // Signal to refocus the spotlight search field from parent-level handlers.
-    @Published public var focusSearchFieldSignal: UUID = UUID()
+    // selectAll=true is used when returning from results so the existing query is easy to replace.
+    @Published public var focusSearchFieldSignal: (selectAll: Bool, id: UUID) = (false, UUID())
 
     // Signal to dismiss the recent-entries popover as if the user clicked the header "x".
     @Published public var dismissRecentEntriesPopoverSignal: UUID = UUID()
@@ -1151,8 +1152,9 @@ public class SearchViewModel: ObservableObject {
     }
 
     /// Ask the overlay view to move focus back to the search field.
-    public func requestSearchFieldFocus() {
-        focusSearchFieldSignal = UUID()
+    /// - Parameter selectAll: Whether the current query should be fully selected after focus is restored.
+    public func requestSearchFieldFocus(selectAll: Bool = false) {
+        focusSearchFieldSignal = (selectAll, UUID())
     }
 
     /// Set a one-shot delay for the next "Recent Entries" popover reveal.

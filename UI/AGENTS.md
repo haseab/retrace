@@ -132,9 +132,6 @@ UI/
     ├── HyperlinkMappingTests.swift       # Stored hyperlink row to OCR-node mapping coverage
     ├── FaviconProviderTests.swift        # Favicon memory-vs-disk cache behavior coverage
     ├── HyperlinkResolutionTests.swift    # Hyperlink parsing/resolution coverage
-    ├── InPageURLSettingsTests.swift      # In-page URL setup instructions and toggle coverage
-    ├── MilestoneCelebrationViewTests.swift # Milestone dialog action layout coverage
-    ├── OnboardingAutomationTargetTests.swift # Onboarding/settings unsupported browser coverage
     ├── AppNameResolverInstalledAppsTests.swift # Installed-app scan deduplication coverage
     ├── SearchViewModelAvailableAppsTests.swift # Search app-list merge/deduplication coverage
     ├── SpotlightSearchOverlayRecentEntryAppMapTests.swift # Recent entry app-name map deduplication coverage
@@ -144,8 +141,7 @@ UI/
     ├── CaptureIntervalSettingsTests.swift # Live capture-interval config update coverage
     ├── ProcessCPUDisplayMetricsTests.swift # CPU sampler display math and live ranking coverage
     ├── SearchHighlightTooltipTests.swift # Search highlight tooltip hover/dismiss coverage
-    ├── Dashboard/                        # Dashboard-specific XCTestCase files (title formatting, storage tooltip breakdown)
-    │   └── StorageTooltipBreakdownTests.swift # Storage chart tooltip breakdown coverage
+    ├── Dashboard/                        # Dashboard-specific XCTestCase files
     ├── MenuBar/                          # Menu bar interaction tests
     ├── Search/                           # Search/deeplink/overlay XCTestCase files
     ├── Settings/                         # Settings-focused XCTestCase files, including shell/view-model coverage

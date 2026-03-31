@@ -208,6 +208,12 @@ public class TimelineWindowController: NSObject {
         case hide
     }
 
+    enum SearchOverlayShortcutAction: Equatable {
+        case open
+        case focusField
+        case close
+    }
+
     private struct VisibilitySnapshot {
         let windowExists: Bool
         let windowVisible: Bool
@@ -264,6 +270,14 @@ public class TimelineWindowController: NSObject {
         isSettledAtAbsoluteTimelineBoundary: Bool = false
     ) -> Bool {
         !isActivelyScrolling || isSettledAtAbsoluteTimelineBoundary
+    }
+
+    nonisolated static func searchOverlayShortcutAction(
+        isSearchOverlayVisible: Bool,
+        shouldRefocusSearchFieldBeforeClose: Bool
+    ) -> SearchOverlayShortcutAction {
+        guard isSearchOverlayVisible else { return .open }
+        return shouldRefocusSearchFieldBeforeClose ? .focusField : .close
     }
 
     nonisolated static func isActuallyVisible(
@@ -2966,7 +2980,7 @@ extension TimelineWindowController {
                         return true
                     }
                     if searchViewModel.shouldRefocusSearchFieldOnEscape {
-                        searchViewModel.requestSearchFieldFocus()
+                        searchViewModel.requestSearchFieldFocus(selectAll: true)
                         return true
                     }
 
@@ -3083,13 +3097,20 @@ extension TimelineWindowController {
                     return true
                 }
                 let wasVisible = viewModel.isSearchOverlayVisible
+                let action = Self.searchOverlayShortcutAction(
+                    isSearchOverlayVisible: wasVisible,
+                    shouldRefocusSearchFieldBeforeClose: viewModel.searchViewModel.shouldRefocusSearchFieldOnEscape
+                )
                 Log.info(
-                    "[TimelineShortcut] Cmd+K wasVisible=\(wasVisible) queryEmpty=\(viewModel.searchViewModel.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)",
+                    "[TimelineShortcut] Cmd+K action=\(String(describing: action)) wasVisible=\(wasVisible) fieldFocused=\(viewModel.searchViewModel.isSearchFieldFocused) queryEmpty=\(viewModel.searchViewModel.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)",
                     category: .ui
                 )
-                if wasVisible {
+                switch action {
+                case .focusField:
+                    viewModel.searchViewModel.requestSearchFieldFocus(selectAll: true)
+                case .close:
                     viewModel.closeSearchOverlay()
-                } else {
+                case .open:
                     _ = Self.presentSearchOverlay(
                         on: viewModel,
                         coordinator: coordinator,
