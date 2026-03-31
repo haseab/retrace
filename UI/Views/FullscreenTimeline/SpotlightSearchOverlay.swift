@@ -306,11 +306,12 @@ public struct SpotlightSearchOverlay: View {
                 if let results = viewModel.results {
                     Log.info("\(searchLog) Results received: \(results.results.count) results, nextPage=\(results.nextCursor != nil), searchTime=\(results.searchTimeMs)ms", category: .ui)
                 }
-                if shouldFocusFirstResultAfterSubmit {
-                    focusFirstResultIfAvailable()
-                }
+                updateSubmittedSearchResultFocus()
             }
             refreshRecentEntriesPopoverVisibility()
+        }
+        .onChange(of: viewModel.results != nil) { _ in
+            updateSubmittedSearchResultFocus()
         }
         .onChange(of: viewModel.visibleResults.count) { _ in
             Log.info(
@@ -320,6 +321,7 @@ public struct SpotlightSearchOverlay: View {
             if !viewModel.visibleResults.isEmpty {
                 reserveExpandedResultsHeight()
             }
+            updateSubmittedSearchResultFocus()
             syncKeyboardSelectionWithCurrentResults()
             scheduleAppIconPrefetch(for: viewModel.visibleResults)
         }
@@ -1887,6 +1889,34 @@ public struct SpotlightSearchOverlay: View {
         isResultKeyboardNavigationActive = true
         keyboardSelectedResultIndex = 0
         resignSearchFieldFocus()
+    }
+
+    private func updateSubmittedSearchResultFocus() {
+        guard shouldFocusFirstResultAfterSubmit else { return }
+
+        let totalResultCount = viewModel.results?.results.count
+        let visibleResultCount = keyboardNavigableResults.count
+        let hasSearchError = viewModel.error != nil
+
+        if visibleResultCount > 0 {
+            focusFirstResultIfAvailable()
+            return
+        }
+
+        if viewModel.isSearching {
+            return
+        }
+
+        if let totalResultCount {
+            if totalResultCount == 0 {
+                clearResultKeyboardNavigation()
+            }
+            return
+        }
+
+        if hasSearchError {
+            clearResultKeyboardNavigation()
+        }
     }
 
     private func syncKeyboardSelectionWithCurrentResults() {

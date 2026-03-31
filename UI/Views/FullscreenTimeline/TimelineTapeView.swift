@@ -2577,8 +2577,8 @@ struct DateSearchField: NSViewRepresentable {
 
 // MARK: - Focusable TextField
 
-/// Custom NSTextField that properly accepts first responder in borderless windows
-/// Also intercepts Cmd+G to close the panel
+/// Custom NSTextField that properly accepts first responder in borderless windows.
+/// Also intercepts command shortcuts that AppKit can miss in borderless panels.
 class FocusableTextField: NSTextField {
     override var acceptsFirstResponder: Bool { true }
 
@@ -2594,13 +2594,29 @@ class FocusableTextField: NSTextField {
     }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        // Check for Cmd+G to close the panel
         let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
-        if event.keyCode == 5 && modifiers == [.command] { // G key with Command
+        guard modifiers == [.command],
+              let key = event.charactersIgnoringModifiers?.lowercased() else {
+            return super.performKeyEquivalent(with: event)
+        }
+
+        switch key {
+        case "g":
             onCancelCallback?()
             return true
+        case "a":
+            if currentEditor() == nil {
+                window?.makeFirstResponder(self)
+            }
+            if let editor = currentEditor() as? NSTextView {
+                editor.selectAll(nil)
+            } else {
+                selectText(nil)
+            }
+            return true
+        default:
+            return super.performKeyEquivalent(with: event)
         }
-        return super.performKeyEquivalent(with: event)
     }
 }
 

@@ -129,70 +129,71 @@ private actor FrameGenerator {
 
 // MARK: - Generator Cache
 
-/// Thread-safe cache for FrameGenerator actors
-/// Uses NSCache for automatic memory management with LRU eviction
-private final class GeneratorCache: NSObject, NSCacheDelegate, @unchecked Sendable {
-    private let cache = NSCache<NSString, AnyObject>()
+/// Thread-safe cache for FrameGenerator actors.
+/// Uses an explicit LRU map so eviction never re-enters the cache while a lock is held.
+private final class GeneratorCache: @unchecked Sendable {
+    private struct Entry {
+        let generator: FrameGenerator
+        let estimate: FrameGeneratorMemoryEstimate
+        var lastAccess: Date
+    }
+
     private let lock = NSLock()
     private let countLimit: Int
-    private var estimatesByKey: [String: FrameGeneratorMemoryEstimate] = [:]
-    private var keyByObjectID: [ObjectIdentifier: String] = [:]
-    private var lastAccessByKey: [String: Date] = [:]
+    private var entries: [String: Entry] = [:]
 
     init(countLimit: Int) {
         self.countLimit = max(1, countLimit)
-        super.init()
-        cache.countLimit = self.countLimit
-        cache.delegate = self
     }
 
     func get(_ key: String) -> FrameGenerator? {
+        let referenceTime = Date()
+        var generator: FrameGenerator?
+        var evictedGenerators: [FrameGenerator] = []
+
         lock.lock()
-        let generator = cache.object(forKey: key as NSString) as? FrameGenerator
-        if generator != nil {
-            noteAccessLocked(for: key, at: Date())
+        if var entry = entries[key] {
+            entry.lastAccess = referenceTime
+            entries[key] = entry
+            generator = entry.generator
         }
+        evictedGenerators = evictEntriesLocked(referenceTime: referenceTime)
         lock.unlock()
-        if generator != nil {
-            trim(referenceTime: Date())
-        }
+
+        withExtendedLifetime(evictedGenerators) {}
         return generator
     }
 
     func set(_ key: String, generator: FrameGenerator, estimate: FrameGeneratorMemoryEstimate) {
-        let object = generator as AnyObject
         let referenceTime = Date()
+        var evictedGenerators: [FrameGenerator] = []
 
         lock.lock()
-        if let existingObject = cache.object(forKey: key as NSString) {
-            keyByObjectID.removeValue(forKey: ObjectIdentifier(existingObject))
-            estimatesByKey.removeValue(forKey: key)
-            lastAccessByKey.removeValue(forKey: key)
+        if let existing = entries.removeValue(forKey: key) {
+            evictedGenerators.append(existing.generator)
         }
-
-        estimatesByKey[key] = estimate
-        keyByObjectID[ObjectIdentifier(object)] = key
-        noteAccessLocked(for: key, at: referenceTime)
+        entries[key] = Entry(
+            generator: generator,
+            estimate: estimate,
+            lastAccess: referenceTime
+        )
+        evictedGenerators.append(contentsOf: evictEntriesLocked(referenceTime: referenceTime))
         lock.unlock()
 
-        cache.setObject(
-            object,
-            forKey: key as NSString,
-            cost: Self.sanitizedCost(estimate.bytes)
-        )
-        trim(referenceTime: referenceTime)
+        withExtendedLifetime(evictedGenerators) {}
     }
 
     func summary() -> GeneratorCacheSummary {
         lock.lock()
         defer { lock.unlock() }
-        let totalBytes = estimatesByKey.values.reduce(into: Int64(0)) { total, estimate in
+        let estimates = entries.values.map(\.estimate)
+        let totalBytes = estimates.reduce(into: Int64(0)) { total, estimate in
             total = Self.clampedAdd(total, estimate.bytes)
         }
-        let maxWidth = estimatesByKey.values.map(\.pixelWidth).max() ?? 0
-        let maxHeight = estimatesByKey.values.map(\.pixelHeight).max() ?? 0
+        let maxWidth = estimates.map(\.pixelWidth).max() ?? 0
+        let maxHeight = estimates.map(\.pixelHeight).max() ?? 0
         return GeneratorCacheSummary(
-            generatorCount: estimatesByKey.count,
+            generatorCount: entries.count,
             bytes: totalBytes,
             maxPixelWidth: maxWidth,
             maxPixelHeight: maxHeight
@@ -200,64 +201,38 @@ private final class GeneratorCache: NSObject, NSCacheDelegate, @unchecked Sendab
     }
 
     func remove(_ key: String) {
-        if let existingObject = cache.object(forKey: key as NSString) {
-            lock.lock()
-            keyByObjectID.removeValue(forKey: ObjectIdentifier(existingObject))
-            estimatesByKey.removeValue(forKey: key)
-            lastAccessByKey.removeValue(forKey: key)
-            lock.unlock()
-        }
+        var removedGenerator: FrameGenerator?
         lock.lock()
-        if estimatesByKey[key] != nil {
-            estimatesByKey.removeValue(forKey: key)
-        }
-        lastAccessByKey.removeValue(forKey: key)
+        removedGenerator = entries.removeValue(forKey: key)?.generator
         lock.unlock()
-        cache.removeObject(forKey: key as NSString)
+        withExtendedLifetime(removedGenerator) {}
     }
 
     func removeAll() {
+        var removedGenerators: [FrameGenerator] = []
         lock.lock()
-        estimatesByKey.removeAll()
-        keyByObjectID.removeAll()
-        lastAccessByKey.removeAll()
+        removedGenerators = entries.values.map(\.generator)
+        entries.removeAll()
         lock.unlock()
-        cache.removeAllObjects()
+        withExtendedLifetime(removedGenerators) {}
     }
 
-    func cache(_ cache: NSCache<AnyObject, AnyObject>, willEvictObject obj: Any) {
-        guard let object = obj as AnyObject? else { return }
-        lock.lock()
-        if let key = keyByObjectID.removeValue(forKey: ObjectIdentifier(object)) {
-            estimatesByKey.removeValue(forKey: key)
-            lastAccessByKey.removeValue(forKey: key)
-        }
-        lock.unlock()
-    }
-
-    private func noteAccessLocked(for key: String, at referenceTime: Date) {
-        lastAccessByKey[key] = referenceTime
-    }
-
-    private func trim(referenceTime: Date) {
-        lock.lock()
+    private func evictEntriesLocked(referenceTime: Date) -> [FrameGenerator] {
         let keysToRemove = GeneratorCachePolicy.keysToEvict(
-            lastAccessByKey: lastAccessByKey,
+            lastAccessByKey: entries.mapValues(\.lastAccess),
             referenceTime: referenceTime,
             countLimit: countLimit
         )
-        lock.unlock()
-
+        guard !keysToRemove.isEmpty else {
+            return []
+        }
+        var removedGenerators: [FrameGenerator] = []
         for key in keysToRemove {
-            remove(key)
+            if let removed = entries.removeValue(forKey: key) {
+                removedGenerators.append(removed.generator)
+            }
         }
-    }
-
-    private static func sanitizedCost(_ bytes: Int64) -> Int {
-        if bytes <= 0 {
-            return 0
-        }
-        return Int(clamping: bytes)
+        return removedGenerators
     }
 
     private static func clampedAdd(_ lhs: Int64, _ rhs: Int64) -> Int64 {
@@ -268,66 +243,69 @@ private final class GeneratorCache: NSObject, NSCacheDelegate, @unchecked Sendab
     }
 }
 
-private final class TrackedDataCache: NSObject, NSCacheDelegate, @unchecked Sendable {
-    private let cache = NSCache<NSString, NSData>()
+private final class TrackedDataCache: @unchecked Sendable {
+    private struct Entry {
+        let data: Data
+        let byteCount: Int64
+        var lastAccess: Date
+    }
+
     private let lock = NSLock()
-    private var bytesByKey: [String: Int64] = [:]
-    private var keyByObjectID: [ObjectIdentifier: String] = [:]
+    private let countLimit: Int
+    private let totalCostLimit: Int64
+    private var entries: [String: Entry] = [:]
+    private var totalBytes: Int64 = 0
 
     init(countLimit: Int, totalCostLimit: Int) {
-        super.init()
-        cache.countLimit = countLimit
-        cache.totalCostLimit = totalCostLimit
-        cache.delegate = self
+        self.countLimit = max(1, countLimit)
+        self.totalCostLimit = max(1, Int64(totalCostLimit))
     }
 
     func get(_ key: String) -> Data? {
         lock.lock()
         defer { lock.unlock() }
-        return cache.object(forKey: key as NSString) as Data?
+        guard var entry = entries[key] else {
+            return nil
+        }
+        entry.lastAccess = Date()
+        entries[key] = entry
+        return entry.data
     }
 
     func set(_ key: String, data: Data) {
-        let nsData = data as NSData
-        if let existingObject = cache.object(forKey: key as NSString) {
-            lock.lock()
-            keyByObjectID.removeValue(forKey: ObjectIdentifier(existingObject))
-            bytesByKey.removeValue(forKey: key)
-            lock.unlock()
-        }
-
+        let referenceTime = Date()
+        let byteCount = Int64(data.count)
         lock.lock()
-        bytesByKey[key] = Int64(data.count)
-        keyByObjectID[ObjectIdentifier(nsData)] = key
+        if let existing = entries[key] {
+            totalBytes -= existing.byteCount
+        }
+        entries[key] = Entry(data: data, byteCount: byteCount, lastAccess: referenceTime)
+        totalBytes = Self.clampedAdd(totalBytes, byteCount)
+        trimLocked()
         lock.unlock()
-
-        cache.setObject(nsData, forKey: key as NSString, cost: data.count)
     }
 
     func summary() -> CacheFootprintSummary {
         lock.lock()
         defer { lock.unlock() }
-        let totalBytes = bytesByKey.values.reduce(into: Int64(0)) { total, bytes in
-            total = Self.clampedAdd(total, bytes)
-        }
-        return CacheFootprintSummary(entryCount: bytesByKey.count, bytes: totalBytes)
+        return CacheFootprintSummary(entryCount: entries.count, bytes: totalBytes)
     }
 
     func removeAll() {
         lock.lock()
-        bytesByKey.removeAll()
-        keyByObjectID.removeAll()
+        entries.removeAll()
+        totalBytes = 0
         lock.unlock()
-        cache.removeAllObjects()
     }
 
-    func cache(_ cache: NSCache<AnyObject, AnyObject>, willEvictObject obj: Any) {
-        guard let object = obj as AnyObject? else { return }
-        lock.lock()
-        if let key = keyByObjectID.removeValue(forKey: ObjectIdentifier(object)) {
-            bytesByKey.removeValue(forKey: key)
+    private func trimLocked() {
+        while entries.count > countLimit || totalBytes > totalCostLimit {
+            guard let lruKey = entries.min(by: { $0.value.lastAccess < $1.value.lastAccess })?.key,
+                  let removed = entries.removeValue(forKey: lruKey) else {
+                break
+            }
+            totalBytes = max(0, totalBytes - removed.byteCount)
         }
-        lock.unlock()
     }
 
     private static func clampedAdd(_ lhs: Int64, _ rhs: Int64) -> Int64 {
@@ -347,6 +325,7 @@ public final class HEVCStorageExtractor: ImageExtractor, FrameExtractionCacheInv
     private static let memoryLedgerImageCacheTag = "storage.frameExtraction.retrace.jpegCache"
     private static let memoryLedgerSummaryIntervalSeconds: TimeInterval = 30
     private static let generatorCacheCountLimit = GeneratorCachePolicy.defaultCountLimit
+    private static let imageCacheTotalCostLimit = 5 * 1024 * 1024
 
     private let storageRoot: String
     private let imageCache: TrackedDataCache
@@ -354,14 +333,14 @@ public final class HEVCStorageExtractor: ImageExtractor, FrameExtractionCacheInv
 
     public init(storageManager: StorageManager) {
         self.storageRoot = AppPaths.expandedStorageRoot
-        imageCache = TrackedDataCache(countLimit: 100, totalCostLimit: 5 * 1024 * 1024)
+        imageCache = TrackedDataCache(countLimit: 100, totalCostLimit: Self.imageCacheTotalCostLimit)
         generatorCache = GeneratorCache(countLimit: Self.generatorCacheCountLimit)
         updateMemoryLedger()
     }
 
     public init(storageRoot: String) {
         self.storageRoot = storageRoot
-        imageCache = TrackedDataCache(countLimit: 100, totalCostLimit: 5 * 1024 * 1024)
+        imageCache = TrackedDataCache(countLimit: 100, totalCostLimit: Self.imageCacheTotalCostLimit)
         generatorCache = GeneratorCache(countLimit: Self.generatorCacheCountLimit)
         updateMemoryLedger()
     }
@@ -563,6 +542,7 @@ public final class AVAssetExtractor: ImageExtractor, FrameExtractionCacheInvalid
     private static let memoryLedgerImageCacheTag = "storage.frameExtraction.rewind.jpegCache"
     private static let memoryLedgerSummaryIntervalSeconds: TimeInterval = 30
     private static let generatorCacheCountLimit = GeneratorCachePolicy.defaultCountLimit
+    private static let imageCacheTotalCostLimit = 5 * 1024 * 1024
 
     private let imageCache: TrackedDataCache
     private let generatorCache: GeneratorCache
@@ -570,7 +550,7 @@ public final class AVAssetExtractor: ImageExtractor, FrameExtractionCacheInvalid
 
     public init(storageRoot: String) {
         self.storageRoot = storageRoot
-        imageCache = TrackedDataCache(countLimit: 100, totalCostLimit: 5 * 1024 * 1024)
+        imageCache = TrackedDataCache(countLimit: 100, totalCostLimit: Self.imageCacheTotalCostLimit)
         generatorCache = GeneratorCache(countLimit: Self.generatorCacheCountLimit)
         updateMemoryLedger()
     }
