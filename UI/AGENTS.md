@@ -105,6 +105,7 @@ UI/
 │   ├── SimpleTimelineViewModel.swift    # Fullscreen timeline state, caching, playback, filters, OCR overlays
 │   ├── SearchViewModel.swift
 │   ├── DashboardViewModel.swift
+│   ├── TimelineMetrics.swift         # Timeline-scoped daily_metrics helpers and shared UI metric recorder glue
 │   ├── CrashRecoveryBannerModel.swift   # Dashboard-facing banner state derived from crash recovery manager status
 │   ├── CommentComposerTargetDisplayInfo.swift # Shared display metadata/title logic for timeline and quick-comment composers
 │   ├── FeedbackViewModel.swift          # Feedback form state, diagnostics, export, submission
@@ -148,6 +149,7 @@ UI/
     ├── Support/                          # Shared XCTest helpers and support-only tests
     ├── SystemMonitor/                    # System monitor XCTestCase files
     ├── Timeline/TimelineCopyFeedbackTests.swift # Timeline copy image/text toast feedback coverage
+    ├── Timeline/TimelinePositionRecoveryHintTests.swift # Timeline reopen Cmd+Z recovery hint behavior and policy coverage
     └── Timeline/                         # Timeline XCTestCase files
 ```
 

@@ -87,6 +87,7 @@ enum FeedbackRecentMetricSupport {
         .scrubDistance,
         .searchDialogOpens,
         .settingsSearchOpened,
+        .timelinePositionRecoveryHintAction,
         .timelineOpens,
         .timelineSessionDuration,
     ]

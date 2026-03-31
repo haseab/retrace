@@ -1003,6 +1003,14 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Whether the frame context menu should guide the user to the Show Controls row.
     @Published public private(set) var highlightShowControlsContextMenuRow: Bool = false
 
+    // MARK: - Timeline Position Recovery Hint State
+
+    /// Whether to show the top-center hint for returning to the pre-cache-bust playhead position.
+    @Published public private(set) var showPositionRecoveryHintBanner: Bool = false
+
+    /// Auto-dismiss task for the position recovery hint banner.
+    private var positionRecoveryHintDismissTask: Task<Void, Never>?
+
     // MARK: - Scroll Orientation Hint Banner State
 
     /// Whether to show the scroll orientation hint banner
@@ -1174,6 +1182,12 @@ public class SimpleTimelineViewModel: ObservableObject {
     @Published public var toastVisible: Bool = false
     private var toastDismissTask: Task<Void, Never>?
 
+    private static var positionRecoveryHintDismissedForSession = false
+#if DEBUG
+    static func resetPositionRecoveryHintDismissalForTesting() {
+        positionRecoveryHintDismissedForSession = false
+    }
+#endif
     /// Show a brief toast notification overlay
     public func showToast(_ message: String, icon: String? = nil) {
         toastDismissTask?.cancel()
@@ -2221,6 +2235,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         availableAppsForFilterLoadTask?.cancel()
         filterPanelSupportingDataLoadTask?.cancel()
         pendingDeleteCommitTask?.cancel()
+        positionRecoveryHintDismissTask?.cancel()
         Self.clearTimelineMemoryLedger()
     }
 
@@ -8344,6 +8359,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         ocrStatus = .unknown
         ocrStatusPollingTask?.cancel()
         ocrStatusPollingTask = nil
+        clearPositionRecoveryHint(animated: false)
 
         if purgeDiskFrameBuffer {
             clearDiskFrameBuffer(reason: "compactPresentationState.\(reason)")
@@ -8488,6 +8504,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         let clampedIndex = max(0, min(frames.count - 1, index))
         guard clampedIndex != currentIndex else { return }
         let previousIndex = currentIndex
+        clearPositionRecoveryHintForSupersedingNavigation()
 
         if !undonePositionHistory.isEmpty {
             undonePositionHistory.removeAll()
@@ -8598,6 +8615,22 @@ public class SimpleTimelineViewModel: ObservableObject {
         return didRecord
     }
 
+    /// Preserve the current playhead as an undo target, then snap to newest immediately.
+    /// Used when hidden-state cache expiry advances reopen to "now".
+    @discardableResult
+    public func applyCacheBustReopenSnapToNewest(newestIndex: Int) -> Bool {
+        guard !frames.isEmpty else { return false }
+
+        let clampedNewestIndex = max(0, min(frames.count - 1, newestIndex))
+        guard clampedNewestIndex != currentIndex else { return false }
+
+        cancelPendingStoppedPositionRecording()
+        _ = recordCurrentPositionImmediatelyForUndo(reason: "timelineReopen.cacheBust.source")
+        currentIndex = clampedNewestIndex
+        _ = recordCurrentPositionImmediatelyForUndo(reason: "timelineReopen.cacheBust.destination")
+        return true
+    }
+
     /// Record a position as a "stopped" position for undo history
     private func recordStoppedPosition(_ index: Int, highlightQueryOverride: String? = nil) {
         // Don't record invalid indices
@@ -8686,6 +8719,13 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         // Undo is an explicit timeline navigation action; clear transient search-result highlight.
         resetSearchHighlightState()
+        clearPositionRecoveryHint()
+
+        // History navigation targets historical frames, so it must leave live mode even
+        // when the destination frame is already loaded in memory.
+        if isInLiveMode {
+            exitLiveMode()
+        }
 
         // Fast path: check if frame exists in current frames array
         if let index = frames.firstIndex(where: { $0.frame.id == previousPosition.frameID }) {
@@ -8722,6 +8762,12 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         // Redo is explicit timeline navigation; clear transient search-result highlight.
         resetSearchHighlightState()
+
+        // Redoing to a previous playhead state should also leave live mode before the
+        // fast in-memory path updates the frame index.
+        if isInLiveMode {
+            exitLiveMode()
+        }
 
         // Keep undo history in sync with the redone position.
         if stoppedPositionHistory.last?.frameID != nextPosition.frameID {
@@ -8850,6 +8896,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                 framesWithVideoInfo,
                 clearDiskBufferReason: "search navigation"
             )
+            clearPositionRecoveryHintForSupersedingNavigation()
 
             // Find and navigate to the target frame by ID
             if let index = frames.firstIndex(where: { $0.frame.id == frameID }) {
@@ -12766,6 +12813,52 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
     }
 
+    public func showPositionRecoveryHint(
+        hiddenElapsedSeconds: TimeInterval,
+        autoDismissAfter: TimeInterval = 10
+    ) {
+        guard !Self.positionRecoveryHintDismissedForSession else {
+            return
+        }
+
+        positionRecoveryHintDismissTask?.cancel()
+        positionRecoveryHintDismissTask = nil
+
+        withAnimation(.spring(response: 0.3, dampingFraction: 0.82)) {
+            showPositionRecoveryHintBanner = true
+        }
+
+        TimelineMetrics.recordPositionRecoveryHintAction(
+            coordinator: coordinator,
+            action: "shown",
+            source: "cache_bust_reopen",
+            seconds: max(0, Int(hiddenElapsedSeconds.rounded(.down)))
+        )
+
+        let dismissDelayNs = Int64(max(0, autoDismissAfter) * 1_000_000_000)
+        positionRecoveryHintDismissTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .nanoseconds(dismissDelayNs), clock: .continuous)
+            guard let self, !Task.isCancelled else { return }
+            self.positionRecoveryHintDismissTask = nil
+            self.clearPositionRecoveryHint(cancelDismissTask: false)
+            TimelineMetrics.recordPositionRecoveryHintAction(
+                coordinator: self.coordinator,
+                action: "auto_dismissed",
+                source: "cache_bust_reopen"
+            )
+        }
+    }
+
+    public func dismissPositionRecoveryHint() {
+        Self.positionRecoveryHintDismissedForSession = true
+        clearPositionRecoveryHint()
+        TimelineMetrics.recordPositionRecoveryHintAction(
+            coordinator: coordinator,
+            action: "dismissed",
+            source: "cache_bust_reopen"
+        )
+    }
+
     private func clearControlsHiddenRestoreGuidance(animated: Bool = true) {
         highlightShowControlsContextMenuRow = false
 
@@ -12775,6 +12868,29 @@ public class SimpleTimelineViewModel: ObservableObject {
             }
         } else {
             showControlsHiddenRestoreHintBanner = false
+        }
+    }
+
+    private func clearPositionRecoveryHintForSupersedingNavigation() {
+        guard showPositionRecoveryHintBanner else { return }
+        clearPositionRecoveryHint()
+    }
+
+    private func clearPositionRecoveryHint(
+        animated: Bool = true,
+        cancelDismissTask: Bool = true
+    ) {
+        if cancelDismissTask {
+            positionRecoveryHintDismissTask?.cancel()
+            positionRecoveryHintDismissTask = nil
+        }
+
+        if animated {
+            withAnimation(.easeOut(duration: 0.2)) {
+                showPositionRecoveryHintBanner = false
+            }
+        } else {
+            showPositionRecoveryHintBanner = false
         }
     }
 
@@ -14439,6 +14555,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                 clearDiskBufferReason: "calendar navigation",
                 memoryLogContext: "calendar navigation"
             )
+            clearPositionRecoveryHintForSupersedingNavigation()
 
             let closestIndex = findClosestFrameIndex(to: targetDate)
             currentIndex = closestIndex
@@ -14577,6 +14694,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                 clearDiskBufferReason: "date search",
                 memoryLogContext: "date search"
             )
+            clearPositionRecoveryHintForSupersedingNavigation()
 
             // Find the frame closest to the target date in our centered set
             let closestIndex = findClosestFrameIndex(to: anchoredTargetDate)
@@ -14680,6 +14798,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                 clearDiskBufferReason: "frame ID search",
                 memoryLogContext: "frame ID search"
             )
+            clearPositionRecoveryHintForSupersedingNavigation()
 
             // Find the exact frame by ID in our loaded frames
             if let exactIndex = frames.firstIndex(where: { $0.frame.id.value == frameID }) {

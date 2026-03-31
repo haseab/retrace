@@ -65,7 +65,6 @@ public struct SimpleTimelineView: View {
             )
             let shouldRenderSearchHighlightControlsHint =
                 shouldShowSearchHighlightControlsHint && !isSearchHighlightControlsHintDismissed
-            let controlsHiddenHintBannerStackOffset: CGFloat = viewModel.showControlsHiddenRestoreHintBanner ? 58 : 0
 
             ZStack {
                 // Full screen frame display
@@ -302,90 +301,7 @@ public struct SimpleTimelineView: View {
                 // OCR debug overlay (dev setting)
                 ocrDebugOverlay(containerSize: geometry.size, actualFrameRect: actualFrameRect)
 
-                // Controls hidden restore affordance (top center)
-                if viewModel.showControlsHiddenRestoreHintBanner {
-                    VStack {
-                        ControlsHiddenRestoreHintBanner(
-                            onDismiss: { viewModel.dismissControlsHiddenRestoreHint() }
-                        )
-                            .fixedSize()
-                            .padding(.top, 60)
-                            .transition(.asymmetric(
-                                insertion: .move(edge: .top).combined(with: .opacity),
-                                removal: .opacity
-                            ))
-                        Spacer()
-                    }
-                    .animation(.spring(response: 0.3, dampingFraction: 0.8), value: viewModel.showControlsHiddenRestoreHintBanner)
-                }
-
-                // Text selection hint toast (top center)
-                if viewModel.showTextSelectionHint {
-                    VStack {
-                        TextSelectionHintBanner(
-                            onDismiss: {
-                                viewModel.dismissTextSelectionHint()
-                            }
-                        )
-                        .fixedSize()
-                        .padding(.top, 60 + controlsHiddenHintBannerStackOffset)
-                        .transition(.asymmetric(
-                            insertion: .move(edge: .top).combined(with: .opacity),
-                            removal: .opacity
-                        ))
-                        Spacer()
-                    }
-                    .animation(.spring(response: 0.3, dampingFraction: 0.8), value: viewModel.showTextSelectionHint)
-                }
-
-                // Search-highlight/timeline-controls hint toast (top center)
-                if shouldRenderSearchHighlightControlsHint {
-                    VStack {
-                        SearchHighlightControlsHintBanner(
-                            onDismiss: {
-                                isSearchHighlightControlsHintDismissed = true
-                            }
-                        )
-                            .fixedSize()
-                            .padding(
-                                .top,
-                                60 +
-                                    controlsHiddenHintBannerStackOffset +
-                                    (viewModel.showTextSelectionHint ? 58 : 0)
-                            )
-                            .transition(.asymmetric(
-                                insertion: .move(edge: .top).combined(with: .opacity),
-                                removal: .opacity
-                            ))
-                        Spacer()
-                    }
-                    .animation(.spring(response: 0.3, dampingFraction: 0.8), value: shouldRenderSearchHighlightControlsHint)
-                }
-
-                // Scroll orientation hint toast (top center)
-                if viewModel.showScrollOrientationHintBanner {
-                    VStack {
-                        ScrollOrientationHintBanner(
-                            currentOrientation: viewModel.scrollOrientationHintCurrentOrientation,
-                            onSwitch: { viewModel.openTimelineScrollOrientationSettings() },
-                            onDismiss: { viewModel.dismissScrollOrientationHint() }
-                        )
-                        .fixedSize()
-                        .padding(
-                            .top,
-                            60 +
-                                controlsHiddenHintBannerStackOffset +
-                                (viewModel.showTextSelectionHint ? 58 : 0) +
-                                (shouldRenderSearchHighlightControlsHint ? 58 : 0)
-                        )
-                        .transition(.asymmetric(
-                            insertion: .move(edge: .top).combined(with: .opacity),
-                            removal: .opacity
-                        ))
-                        Spacer()
-                    }
-                    .animation(.spring(response: 0.3, dampingFraction: 0.8), value: viewModel.showScrollOrientationHintBanner)
-                }
+                topHintOverlay(shouldRenderSearchHighlightControlsHint: shouldRenderSearchHighlightControlsHint)
 
                 // Filter panel (floating, anchored to filter button position)
                 if viewModel.isFilterPanelVisible {
@@ -732,6 +648,71 @@ public struct SimpleTimelineView: View {
             return viewModel.isFrameZoomed ? baseTopPadding + 94 : baseTopPadding + 46
         }
         return viewModel.isFrameZoomed ? baseTopPadding + 48 : baseTopPadding
+    }
+
+    private static let topHintTransition: AnyTransition = .asymmetric(
+        insertion: .move(edge: .top).combined(with: .opacity),
+        removal: .opacity
+    )
+
+    @ViewBuilder
+    private func topHintOverlay(shouldRenderSearchHighlightControlsHint: Bool) -> some View {
+        let hasVisibleHints =
+            viewModel.showControlsHiddenRestoreHintBanner ||
+            viewModel.showPositionRecoveryHintBanner ||
+            viewModel.showTextSelectionHint ||
+            shouldRenderSearchHighlightControlsHint ||
+            viewModel.showScrollOrientationHintBanner
+
+        if hasVisibleHints {
+            TimelineHintOverlayStack {
+                if viewModel.showControlsHiddenRestoreHintBanner {
+                    ControlsHiddenRestoreHintBanner(
+                        onDismiss: { viewModel.dismissControlsHiddenRestoreHint() }
+                    )
+                    .fixedSize()
+                    .transition(Self.topHintTransition)
+                }
+
+                if viewModel.showPositionRecoveryHintBanner {
+                    PositionRecoveryHintBanner(
+                        onDismiss: { viewModel.dismissPositionRecoveryHint() }
+                    )
+                    .fixedSize()
+                    .transition(Self.topHintTransition)
+                }
+
+                if viewModel.showTextSelectionHint {
+                    TextSelectionHintBanner(
+                        onDismiss: { viewModel.dismissTextSelectionHint() }
+                    )
+                    .fixedSize()
+                    .transition(Self.topHintTransition)
+                }
+
+                if shouldRenderSearchHighlightControlsHint {
+                    SearchHighlightControlsHintBanner(
+                        onDismiss: {
+                            withAnimation(.easeOut(duration: 0.2)) {
+                                isSearchHighlightControlsHintDismissed = true
+                            }
+                        }
+                    )
+                    .fixedSize()
+                    .transition(Self.topHintTransition)
+                }
+
+                if viewModel.showScrollOrientationHintBanner {
+                    ScrollOrientationHintBanner(
+                        currentOrientation: viewModel.scrollOrientationHintCurrentOrientation,
+                        onSwitch: { viewModel.openTimelineScrollOrientationSettings() },
+                        onDismiss: { viewModel.dismissScrollOrientationHint() }
+                    )
+                    .fixedSize()
+                    .transition(Self.topHintTransition)
+                }
+            }
+        }
     }
 
     private var frameCanvasBackgroundColor: Color {
@@ -6708,11 +6689,10 @@ struct DeveloperActionsMenu: View {
 /// Guides the user to right-click anywhere on the frame to restore them.
 struct ControlsHiddenRestoreHintBanner: View {
     let onDismiss: () -> Void
-    @State private var isDismissHovering = false
     private var scale: CGFloat { TimelineScaleFactor.current }
 
     var body: some View {
-        HStack(spacing: 12 * scale) {
+        TimelineHintBanner(style: .capsule, scale: scale, onDismiss: onDismiss) {
             Image(systemName: "menubar.arrow.down.rectangle")
                 .font(.system(size: 16 * scale, weight: .medium))
                 .foregroundColor(.white.opacity(0.9))
@@ -6730,38 +6710,40 @@ struct ControlsHiddenRestoreHintBanner: View {
             Text("on screen to bring them back")
                 .font(.system(size: 14 * scale, weight: .medium))
                 .foregroundColor(.white.opacity(0.76))
-
-            Button(action: onDismiss) {
-                Image(systemName: "xmark")
-                    .font(.system(size: 11 * scale, weight: .bold))
-                    .foregroundColor(.white.opacity(isDismissHovering ? 0.88 : 0.66))
-                    .frame(width: 22 * scale, height: 22 * scale)
-                    .background(
-                        Circle()
-                            .fill(Color.white.opacity(isDismissHovering ? 0.16 : 0.1))
-                    )
-            }
-            .buttonStyle(.plain)
-            .onHover { hovering in
-                isDismissHovering = hovering
-                if hovering {
-                    NSCursor.pointingHand.push()
-                } else {
-                    NSCursor.pop()
-                }
-            }
         }
-        .padding(.horizontal, 18 * scale)
-        .padding(.vertical, 10 * scale)
-        .background(
-            Capsule()
-                .fill(Color.black.opacity(0.72))
-                .overlay(
-                    Capsule()
-                        .stroke(Color.white.opacity(0.14), lineWidth: 1)
-                )
-        )
-        .shadow(color: .black.opacity(0.28), radius: 16, y: 6)
+    }
+}
+
+/// Banner displayed after hidden-state cache expiry snaps the timeline to the newest frame.
+/// Reminds the user that Cmd+Z restores the previous playhead position.
+struct PositionRecoveryHintBanner: View {
+    let onDismiss: () -> Void
+    private var scale: CGFloat { TimelineScaleFactor.current }
+
+    var body: some View {
+        TimelineHintBanner(style: .capsule, scale: scale, onDismiss: onDismiss) {
+            Image(systemName: "arrow.uturn.backward.circle.fill")
+                .font(.system(size: 16 * scale, weight: .medium))
+                .foregroundColor(.white.opacity(0.9))
+
+            Text("Lost your place?")
+                .font(.system(size: 15 * scale, weight: .medium))
+                .foregroundColor(.white.opacity(0.92))
+
+            Rectangle()
+                .fill(Color.white.opacity(0.28))
+                .frame(width: 1, height: 16 * scale)
+
+            Text("Press")
+                .font(.system(size: 14 * scale, weight: .medium))
+                .foregroundColor(.white.opacity(0.76))
+
+            KeyboardBadge(symbol: "⌘ Z")
+
+            Text("to return to your previous position")
+                .font(.system(size: 14 * scale, weight: .medium))
+                .foregroundColor(.white.opacity(0.76))
+        }
     }
 }
 
@@ -6773,7 +6755,7 @@ struct TextSelectionHintBanner: View {
     let onDismiss: () -> Void
 
     var body: some View {
-        HStack(spacing: 12) {
+        TimelineHintBanner(style: .card, onDismiss: onDismiss) {
             // Info icon
             Image(systemName: "info.circle.fill")
                 .font(.retraceHeadline)
@@ -6807,29 +6789,7 @@ struct TextSelectionHintBanner: View {
                     .foregroundColor(.white.opacity(0.5))
                 KeyboardBadge(symbol: "⊹ Drag")
             }
-
-            // Dismiss button
-            Button(action: onDismiss) {
-                Image(systemName: "xmark")
-                    .font(.retraceCaption2Bold)
-                    .foregroundColor(.white.opacity(0.6))
-                    .frame(width: 24, height: 24)
-                    .background(Color.white.opacity(0.1))
-                    .clipShape(Circle())
-            }
-            .buttonStyle(.plain)
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
-        .background(
-            RoundedRectangle(cornerRadius: 10)
-                .fill(Color(white: 0.2).opacity(0.95))
-                .shadow(color: .black.opacity(0.3), radius: 10, y: 4)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 10)
-                .stroke(Color.white.opacity(0.15), lineWidth: 1)
-        )
     }
 }
 
@@ -6839,7 +6799,7 @@ struct SearchHighlightControlsHintBanner: View {
     let onDismiss: () -> Void
 
     var body: some View {
-        HStack(spacing: 12) {
+        TimelineHintBanner(style: .card, onDismiss: onDismiss) {
             Image(systemName: "lightbulb.fill")
                 .font(.retraceHeadline)
                 .foregroundColor(.white.opacity(0.9))
@@ -6857,28 +6817,7 @@ struct SearchHighlightControlsHintBanner: View {
             Text("to hide/show controls, or right-click.")
                 .font(.retraceCaption)
                 .foregroundColor(.white.opacity(0.7))
-
-            Button(action: onDismiss) {
-                Image(systemName: "xmark")
-                    .font(.retraceCaption2Bold)
-                    .foregroundColor(.white.opacity(0.6))
-                    .frame(width: 24, height: 24)
-                    .background(Color.white.opacity(0.1))
-                    .clipShape(Circle())
-            }
-            .buttonStyle(.plain)
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
-        .background(
-            RoundedRectangle(cornerRadius: 10)
-                .fill(Color(white: 0.2).opacity(0.95))
-                .shadow(color: .black.opacity(0.3), radius: 10, y: 4)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 10)
-                .stroke(Color.white.opacity(0.15), lineWidth: 1)
-        )
     }
 }
 
@@ -6892,7 +6831,7 @@ struct ScrollOrientationHintBanner: View {
     @State private var isSwitchHovered = false
 
     var body: some View {
-        HStack(spacing: 12) {
+        TimelineHintBanner(style: .card, onDismiss: onDismiss) {
             // Direction icon
             Image(systemName: isHorizontal ? "arrow.up.arrow.down" : "arrow.left.arrow.right")
                 .font(.retraceHeadline)
@@ -6933,28 +6872,119 @@ struct ScrollOrientationHintBanner: View {
                 }
             }
 
-            // Dismiss button
-            Button(action: onDismiss) {
-                Image(systemName: "xmark")
-                    .font(.retraceCaption2Bold)
-                    .foregroundColor(.white.opacity(0.6))
-                    .frame(width: 24, height: 24)
-                    .background(Color.white.opacity(0.1))
-                    .clipShape(Circle())
-            }
-            .buttonStyle(.plain)
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
-        .background(
+    }
+}
+
+private struct TimelineHintOverlayStack<Content: View>: View {
+    @ViewBuilder let content: () -> Content
+    private var scale: CGFloat { TimelineScaleFactor.current }
+
+    var body: some View {
+        VStack(spacing: 10 * scale) {
+            content()
+        }
+        .padding(.top, 60)
+        .padding(.horizontal, .spacingL)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    }
+}
+
+private enum TimelineHintBannerStyle {
+    case capsule
+    case card
+}
+
+private struct TimelineHintBanner<Content: View>: View {
+    let style: TimelineHintBannerStyle
+    var scale: CGFloat = 1
+    let onDismiss: (() -> Void)?
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        HStack(spacing: 12 * scale) {
+            content()
+
+            if let onDismiss {
+                TimelineHintDismissButton(scale: scale, onDismiss: onDismiss)
+            }
+        }
+        .padding(.horizontal, horizontalPadding)
+        .padding(.vertical, verticalPadding)
+        .background(backgroundShape)
+        .overlay(borderShape)
+    }
+
+    private var horizontalPadding: CGFloat {
+        switch style {
+        case .capsule:
+            18 * scale
+        case .card:
+            16
+        }
+    }
+
+    private var verticalPadding: CGFloat {
+        switch style {
+        case .capsule:
+            10 * scale
+        case .card:
+            10
+        }
+    }
+
+    @ViewBuilder
+    private var backgroundShape: some View {
+        switch style {
+        case .capsule:
+            Capsule()
+                .fill(Color.black.opacity(0.72))
+                .shadow(color: .black.opacity(0.28), radius: 16, y: 6)
+        case .card:
             RoundedRectangle(cornerRadius: 10)
                 .fill(Color(white: 0.2).opacity(0.95))
                 .shadow(color: .black.opacity(0.3), radius: 10, y: 4)
-        )
-        .overlay(
+        }
+    }
+
+    @ViewBuilder
+    private var borderShape: some View {
+        switch style {
+        case .capsule:
+            Capsule()
+                .stroke(Color.white.opacity(0.14), lineWidth: 1)
+        case .card:
             RoundedRectangle(cornerRadius: 10)
                 .stroke(Color.white.opacity(0.15), lineWidth: 1)
-        )
+        }
+    }
+}
+
+private struct TimelineHintDismissButton: View {
+    var scale: CGFloat = 1
+    let onDismiss: () -> Void
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: onDismiss) {
+            Image(systemName: "xmark")
+                .font(.system(size: 11 * scale, weight: .bold))
+                .foregroundColor(.white.opacity(isHovering ? 0.88 : 0.66))
+                .frame(width: 24 * scale, height: 24 * scale)
+                .background(
+                    Circle()
+                        .fill(Color.white.opacity(isHovering ? 0.16 : 0.1))
+                )
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            isHovering = hovering
+            if hovering {
+                NSCursor.pointingHand.push()
+            } else {
+                NSCursor.pop()
+            }
+        }
     }
 }
 

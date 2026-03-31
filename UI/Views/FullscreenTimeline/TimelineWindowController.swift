@@ -78,7 +78,9 @@ public class TimelineWindowController: NSObject {
     }
 
     /// Shared hidden-state cache expiry used by timeline and search-state invalidation.
-    static let hiddenStateCacheExpirationSeconds: TimeInterval = 60
+    nonisolated static let hiddenStateCacheExpirationSeconds: TimeInterval = 60
+    /// Show the Cmd+Z recovery hint only for a short window after cache expiry actually snaps away from history.
+    nonisolated static let positionRecoveryHintGracePeriodSeconds: TimeInterval = 60
     /// Reopen policy: when playhead is within this many latest loaded frames, open in live mode immediately.
     /// This only applies when the newest loaded frame is still recent.
     private static let instantLiveReopenFrameThreshold: Int = 3
@@ -270,6 +272,15 @@ public class TimelineWindowController: NSObject {
         isSettledAtAbsoluteTimelineBoundary: Bool = false
     ) -> Bool {
         !isActivelyScrolling || isSettledAtAbsoluteTimelineBoundary
+    }
+
+    nonisolated static func shouldShowPositionRecoveryHintOnReopen(
+        hiddenElapsedSeconds: TimeInterval,
+        didSnapToNewest: Bool
+    ) -> Bool {
+        guard didSnapToNewest, hiddenElapsedSeconds.isFinite else { return false }
+        guard hiddenElapsedSeconds > hiddenStateCacheExpirationSeconds else { return false }
+        return hiddenElapsedSeconds <= hiddenStateCacheExpirationSeconds + positionRecoveryHintGracePeriodSeconds
     }
 
     nonisolated static func searchOverlayShortcutAction(
@@ -1169,6 +1180,8 @@ public class TimelineWindowController: NSObject {
         var shouldRefreshPreparedMetadataOnShow = false
         var navigateToNewestOnShowRefresh = true
         var allowNearLiveAutoAdvanceOnShowRefresh = true
+        var shouldShowPositionRecoveryHintOnShow = false
+        var positionRecoveryHintHiddenElapsedSeconds: TimeInterval?
 
         if let viewModel = timelineViewModel {
             let framesFromNewestBefore = max(0, viewModel.frames.count - 1 - viewModel.currentIndex)
@@ -1220,12 +1233,31 @@ public class TimelineWindowController: NSObject {
             if shouldSnapToNewestOnShow, !viewModel.frames.isEmpty {
                 let newestIndex = max(0, viewModel.frames.count - 1)
                 let oldIndex = viewModel.currentIndex
-                if oldIndex != newestIndex {
-                    viewModel.currentIndex = newestIndex
+                let didSnapToNewest: Bool
+                if cacheExpired {
+                    didSnapToNewest = viewModel.applyCacheBustReopenSnapToNewest(newestIndex: newestIndex)
+                } else {
+                    if oldIndex != newestIndex {
+                        viewModel.currentIndex = newestIndex
+                        didSnapToNewest = true
+                    } else {
+                        didSnapToNewest = false
+                    }
+                }
+
+                if didSnapToNewest {
                     Log.info(
                         "[TIMELINE-REOPEN] snapOnShow oldIndex=\(oldIndex) newIndex=\(newestIndex) reason=\(snapReason)",
                         category: .ui
                     )
+                }
+
+                shouldShowPositionRecoveryHintOnShow = Self.shouldShowPositionRecoveryHintOnReopen(
+                    hiddenElapsedSeconds: hiddenElapsedSeconds,
+                    didSnapToNewest: didSnapToNewest && cacheExpired
+                )
+                if shouldShowPositionRecoveryHintOnShow {
+                    positionRecoveryHintHiddenElapsedSeconds = hiddenElapsedSeconds
                 }
             }
 
@@ -1280,6 +1312,10 @@ public class TimelineWindowController: NSObject {
                 openPath: "prepared_headless",
                 showStartTime: showStartTime
             )
+            if shouldShowPositionRecoveryHintOnShow,
+               let hiddenElapsedSeconds = positionRecoveryHintHiddenElapsedSeconds {
+                viewModel.showPositionRecoveryHint(hiddenElapsedSeconds: hiddenElapsedSeconds)
+            }
             startLiveModeCaptureIfNeeded(shouldUseLiveMode: shouldUseLiveMode, viewModel: viewModel)
             if shouldRefreshPreparedMetadataOnShow {
                 refreshTimelineMetadataOnShow(

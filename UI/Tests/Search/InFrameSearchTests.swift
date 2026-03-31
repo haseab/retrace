@@ -123,6 +123,44 @@ final class InFrameSearchTests: XCTestCase {
         XCTAssertNil(viewModel.searchHighlightQuery)
     }
 
+    func testUndoExitsLiveModeWhenNavigatingToLoadedHistoricalFrame() async {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        viewModel.frames = [
+            makeTimelineFrame(id: 1, frameIndex: 0, bundleID: "com.apple.Safari"),
+            makeTimelineFrame(id: 2, frameIndex: 1, bundleID: "com.apple.Safari"),
+            makeTimelineFrame(id: 3, frameIndex: 2, bundleID: "com.apple.Safari")
+        ]
+        viewModel.currentIndex = 0
+
+        viewModel.navigateToFrame(1)
+        try? await Task.sleep(for: .milliseconds(500), clock: .continuous)
+        viewModel.navigateToFrame(2)
+        try? await Task.sleep(for: .milliseconds(500), clock: .continuous)
+
+        viewModel.isInLiveMode = true
+        viewModel.liveScreenshot = NSImage(size: NSSize(width: 12, height: 12))
+
+        XCTAssertTrue(viewModel.undoToLastStoppedPosition())
+        XCTAssertEqual(viewModel.currentIndex, 1)
+        XCTAssertFalse(viewModel.isInLiveMode)
+        XCTAssertNil(viewModel.liveScreenshot)
+    }
+
+    func testCacheBustReopenSnapImmediatelyCreatesUndoReturnPath() {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        viewModel.frames = [
+            makeTimelineFrame(id: 1, frameIndex: 0, bundleID: "com.apple.Safari"),
+            makeTimelineFrame(id: 2, frameIndex: 1, bundleID: "com.apple.Safari"),
+            makeTimelineFrame(id: 3, frameIndex: 2, bundleID: "com.apple.Safari")
+        ]
+        viewModel.currentIndex = 1
+
+        XCTAssertTrue(viewModel.applyCacheBustReopenSnapToNewest(newestIndex: 2))
+        XCTAssertEqual(viewModel.currentIndex, 2)
+        XCTAssertTrue(viewModel.undoToLastStoppedPosition())
+        XCTAssertEqual(viewModel.currentIndex, 1)
+    }
+
     func testUndoThreeTimesThenRedoThreeTimesReturnsToOriginalPosition() async {
         let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
         viewModel.frames = [

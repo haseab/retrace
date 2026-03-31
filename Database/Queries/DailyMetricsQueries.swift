@@ -78,6 +78,7 @@ public enum DailyMetricsQueries {
         case recordingAutoResumed = "recording_auto_resumed"
         case systemMonitorOpened = "system_monitor_opened"
         case helpOpened = "help_opened"  // metadata: JSON {source}
+        case timelinePositionRecoveryHintAction = "timeline_position_recovery_hint_action"  // metadata: JSON {action, source, seconds?}
         case settingsSearchOpened = "settings_search_opened"
         case dockIconVisibilityToggle = "dock_icon_visibility_toggle"  // metadata: JSON {enabled, source}
         case redactionRulesUpdated = "redaction_rules_updated"
