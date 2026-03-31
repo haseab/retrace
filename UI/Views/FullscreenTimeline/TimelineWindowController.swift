@@ -993,12 +993,10 @@ public class TimelineWindowController: NSObject {
 
     /// Load the current timeline shortcut from UserDefaults
     private func loadTimelineShortcut() -> ShortcutConfig {
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
-        guard let data = defaults.data(forKey: Self.timelineShortcutKey),
-              let config = try? JSONDecoder().decode(ShortcutConfig.self, from: data) else {
-            return .defaultTimeline
-        }
-        return config
+        OnboardingManager.loadShortcutConfig(
+            forKey: Self.timelineShortcutKey,
+            fallback: .defaultTimeline
+        )
     }
 
     // MARK: - Configuration

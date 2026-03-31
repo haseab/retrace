@@ -28,6 +28,19 @@ public actor OnboardingManager {
 
     // MARK: - State
 
+    public static func loadShortcutConfig(
+        forKey key: String,
+        fallback: ShortcutConfig,
+        defaults: UserDefaults? = nil
+    ) -> ShortcutConfig {
+        let defaults = defaults ?? settingsDefaults
+        guard let data = defaults.data(forKey: key),
+              let config = try? JSONDecoder().decode(ShortcutConfig.self, from: data) else {
+            return fallback
+        }
+        return config
+    }
+
     public var hasCompletedOnboarding: Bool {
         let completedVersion = settingsDefaults.integer(forKey: Self.onboardingVersionKey)
         return completedVersion >= Self.currentOnboardingVersion
@@ -43,47 +56,42 @@ public actor OnboardingManager {
 
     /// Timeline shortcut configuration (key + modifiers)
     public var timelineShortcut: ShortcutConfig {
-        guard let data = settingsDefaults.data(forKey: Self.timelineShortcutKey),
-              let config = try? JSONDecoder().decode(ShortcutConfig.self, from: data) else {
-            return .defaultTimeline
-        }
-        return config
+        Self.loadShortcutConfig(
+            forKey: Self.timelineShortcutKey,
+            fallback: .defaultTimeline
+        )
     }
 
     /// Dashboard shortcut configuration (key + modifiers)
     public var dashboardShortcut: ShortcutConfig {
-        guard let data = settingsDefaults.data(forKey: Self.dashboardShortcutKey),
-              let config = try? JSONDecoder().decode(ShortcutConfig.self, from: data) else {
-            return .defaultDashboard
-        }
-        return config
+        Self.loadShortcutConfig(
+            forKey: Self.dashboardShortcutKey,
+            fallback: .defaultDashboard
+        )
     }
 
     /// Recording shortcut configuration (key + modifiers)
     public var recordingShortcut: ShortcutConfig {
-        guard let data = settingsDefaults.data(forKey: Self.recordingShortcutKey),
-              let config = try? JSONDecoder().decode(ShortcutConfig.self, from: data) else {
-            return .defaultRecording
-        }
-        return config
+        Self.loadShortcutConfig(
+            forKey: Self.recordingShortcutKey,
+            fallback: .defaultRecording
+        )
     }
 
     /// System monitor shortcut configuration (key + modifiers)
     public var systemMonitorShortcut: ShortcutConfig {
-        guard let data = settingsDefaults.data(forKey: Self.systemMonitorShortcutKey),
-              let config = try? JSONDecoder().decode(ShortcutConfig.self, from: data) else {
-            return .defaultSystemMonitor
-        }
-        return config
+        Self.loadShortcutConfig(
+            forKey: Self.systemMonitorShortcutKey,
+            fallback: .defaultSystemMonitor
+        )
     }
 
     /// Quick-comment shortcut configuration (key + modifiers)
     public var commentShortcut: ShortcutConfig {
-        guard let data = settingsDefaults.data(forKey: Self.commentShortcutKey),
-              let config = try? JSONDecoder().decode(ShortcutConfig.self, from: data) else {
-            return .defaultCommentCapture
-        }
-        return config
+        Self.loadShortcutConfig(
+            forKey: Self.commentShortcutKey,
+            fallback: .defaultCommentCapture
+        )
     }
 
     public var hasRewindData: Bool? {

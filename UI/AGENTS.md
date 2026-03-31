@@ -88,6 +88,7 @@ UI/
 │   ├── CrashRecoveryManager.swift       # App-side SMAppService/XPC lifecycle manager
 │   ├── SessionTimeline.swift            # App session visualization
 │   ├── DeeplinkHandler.swift            # URL scheme routing
+│   ├── LaunchMenuRouting.swift          # Shared dashboard/timeline/settings routing and frontmost-window checks for app/status menus
 │   ├── AppMetadataCache.swift           # App name/icon lookup caches and app icon view
 │   ├── FaviconProvider.swift            # Favicon memory+disk cache and favicon view
 │   ├── ProcessCPUMonitor.swift          # Shared process CPU+memory sampler + 24h aggregation service
@@ -95,6 +96,7 @@ UI/
 │   ├── ProcessMonitorModels.swift       # System Monitor snapshot/models + ranking/build helpers
 │   ├── ProcessCPUSummaryCard.swift      # System Monitor CPU table/card UI
 │   ├── ProcessMemorySummaryCard.swift   # System Monitor memory table/card UI
+│   ├── RetraceAboutPanel.swift          # Custom About window content and factory extracted from the app delegate
 │   └── UIMemoryEstimators.swift         # Shared UI memory-estimation helpers for telemetry
 ├── ViewModels/
 │   ├── SimpleTimelineViewModel.swift    # Fullscreen timeline state, caching, playback, filters, OCR overlays

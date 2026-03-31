@@ -160,8 +160,6 @@ enum FeedbackRecentMetricSupport {
             return "Capture interval updated"
         case .videoQualityUpdated:
             return "Video quality updated"
-        case .dockMenuAction:
-            return "Dock menu action"
         case .dockIconVisibilityToggle:
             return "Dock icon visibility toggled"
         case .masterKeyFlow:

@@ -134,21 +134,17 @@ public struct OnboardingView: View {
     }
     // Load saved shortcuts or use defaults
     private static func loadTimelineShortcut() -> ShortcutConfig {
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
-        guard let data = defaults.data(forKey: timelineShortcutKey),
-              let config = try? JSONDecoder().decode(ShortcutConfig.self, from: data) else {
-            return .defaultTimeline
-        }
-        return config
+        OnboardingManager.loadShortcutConfig(
+            forKey: timelineShortcutKey,
+            fallback: .defaultTimeline
+        )
     }
 
     private static func loadDashboardShortcut() -> ShortcutConfig {
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
-        guard let data = defaults.data(forKey: dashboardShortcutKey),
-              let config = try? JSONDecoder().decode(ShortcutConfig.self, from: data) else {
-            return .defaultDashboard
-        }
-        return config
+        OnboardingManager.loadShortcutConfig(
+            forKey: dashboardShortcutKey,
+            fallback: .defaultDashboard
+        )
     }
 
     @State private var currentStep: Int = UserDefaults.standard.integer(forKey: OnboardingView.onboardingStepKey).clamped(to: 1...10) == 0 ? 1 : UserDefaults.standard.integer(forKey: OnboardingView.onboardingStepKey).clamped(to: 1...10)

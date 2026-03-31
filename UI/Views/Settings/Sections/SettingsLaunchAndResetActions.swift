@@ -43,6 +43,7 @@ extension SettingsView {
         )
 
         if visible {
+            (NSApp.delegate as? AppDelegate)?.installMainMenuIfNeeded(force: true)
             NSApp.activate(ignoringOtherApps: true)
         }
 

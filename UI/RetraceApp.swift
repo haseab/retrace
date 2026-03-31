@@ -115,96 +115,22 @@ struct RetraceApp: App {
     // MARK: - Body
 
     var body: some Scene {
-        // Windows are managed manually via window controllers; Settings scene exists for app commands.
+        // Windows are managed manually via window controllers.
         Settings {
             EmptyView()
         }
         .commands {
-            appCommands
+            CommandGroup(replacing: .newItem) {
+                // Remove "New Window" because window creation is managed by dedicated controllers.
+            }
         }
     }
-
-    // MARK: - Commands
-
-    @CommandsBuilder
-    private var appCommands: some Commands {
-        CommandGroup(replacing: .newItem) {
-            // Remove "New Window" because window creation is managed by dedicated controllers.
-        }
-
-        // Add Dashboard and Timeline to the app menu (top left, after "About Retrace")
-        CommandGroup(after: .appInfo) {
-            Button("Open Dashboard") {
-                if TimelineWindowController.shared.isVisible {
-                    TimelineWindowController.shared.hideToShowDashboard()
-                }
-                DashboardWindowController.shared.showDashboard()
-            }
-            // Note: Global hotkey is registered via HotkeyManager from saved settings
-            // Don't add a static .keyboardShortcut here as it would conflict
-
-            Button("Open Changelog") {
-                DashboardWindowController.shared.showChangelog()
-            }
-
-            Button("Open Timeline") {
-                TimelineWindowController.shared.toggle()
-            }
-            // Note: Global hotkey is registered via HotkeyManager from saved settings
-            // Don't add a static .keyboardShortcut here as it would conflict
-
-            Divider()
-        }
-
-        CommandMenu("View") {
-            Button("Dashboard") {
-                if TimelineWindowController.shared.isVisible {
-                    TimelineWindowController.shared.hideToShowDashboard()
-                }
-                DashboardWindowController.shared.showDashboard()
-            }
-
-            Button("Changelog") {
-                DashboardWindowController.shared.showChangelog()
-            }
-
-            Button("Timeline") {
-                // Open fullscreen timeline overlay
-                TimelineWindowController.shared.toggle()
-            }
-            // Note: Global hotkey is registered via HotkeyManager from saved settings
-            // Don't add a static .keyboardShortcut here as it would conflict
-
-            Divider()
-
-            Button("Settings") {
-                if TimelineWindowController.shared.isVisible {
-                    TimelineWindowController.shared.hideToShowDashboard()
-                }
-                DashboardWindowController.shared.showSettings()
-            }
-            .keyboardShortcut(",", modifiers: .command)
-        }
-
-        CommandMenu("Recording") {
-            Button("Start/Stop Recording") {
-                Task {
-                    if let appDelegate = NSApplication.shared.delegate as? AppDelegate {
-                        try? await appDelegate.toggleRecording()
-                    }
-                }
-            }
-            // Note: Global hotkey is registered via HotkeyManager from saved settings
-            // Don't add a static .keyboardShortcut here as it would conflict
-        }
-    }
-
 }
 
 // MARK: - App Delegate
 
 @MainActor
-class AppDelegate: NSObject, NSApplicationDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @MainActor static private(set) var isApplicationTerminating = false
 
     enum FreshLaunchAction: Equatable {
@@ -234,11 +160,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var isTerminationDecisionInProgress = false
     private var bypassQuitConfirmationPromptOnce = false
     private var singleInstanceLockFileDescriptor: CInt = -1
+    private var aboutWindowController: NSWindowController?
     private let settingsStore = UserDefaults(suiteName: "io.retrace.app") ?? .standard
     private static let devDeeplinkEnvKey = "RETRACE_DEV_DEEPLINK_URL"
     private static let externalDashboardRevealNotification = Notification.Name("io.retrace.app.externalDashboardReveal")
     private static let quitConfirmationPreferenceKey = "quitConfirmationPreference"
     private static let showDockIconPreferenceKey = "showDockIcon"
+    private static let dashboardShortcutDefaultsKey = "dashboardShortcutConfig"
+    private static let recordingShortcutDefaultsKey = "recordingShortcutConfig"
+    private static let systemMonitorShortcutDefaultsKey = "systemMonitorShortcutConfig"
     private static let canonicalBundleIdentifier = "io.retrace.app"
     private static let singleInstanceLockPath = "/tmp/io.retrace.app.instance.lock"
     private static let launchLockRetryAttempts = 5
@@ -258,6 +188,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Prompt user to move app to Applications folder if not already there.
         // AppMover.moveToApplicationsFolderIfNecessary()
         setupExternalDashboardRevealObserver()
+        installMainMenuIfNeeded(force: true)
         applyDockIconVisibilityPreference()
 
         // Check if another instance is already running. Relaunches still need to
@@ -392,6 +323,314 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             "[LaunchSurface] Applied startup activation policy showDockIcon=\(showDockIcon) policy=\(policyName) changed=\(changed) missingBundleID=\(missingBundleIdentifier)",
             category: .app
         )
+
+        if showDockIcon {
+            installMainMenuIfNeeded(force: true)
+        }
+    }
+
+    func installMainMenuIfNeeded(force: Bool = false) {
+        let appName = Self.applicationMenuTitle()
+        let menu = Self.makeMainMenu(appName: appName, target: self)
+
+        if force || Self.mainMenuNeedsInstallation(existingMenu: NSApp.mainMenu, expectedTopLevelTitles: Self.topLevelMenuTitles(in: menu)) {
+            NSApp.mainMenu = menu
+            NSApp.windowsMenu = menu.item(withTitle: "Window")?.submenu
+            NSApp.helpMenu = menu.item(withTitle: "Help")?.submenu
+        }
+    }
+
+    static func applicationMenuTitle(bundle: Bundle = .main) -> String {
+        if let appName = bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String, !appName.isEmpty {
+            return appName
+        }
+
+        if let appName = bundle.object(forInfoDictionaryKey: kCFBundleNameKey as String) as? String, !appName.isEmpty {
+            return appName
+        }
+
+        return "Retrace"
+    }
+
+    static func topLevelMenuTitles(in menu: NSMenu) -> [String] {
+        menu.items.map(\.title)
+    }
+
+    static func mainMenuNeedsInstallation(existingMenu: NSMenu?, expectedTopLevelTitles: [String]) -> Bool {
+        guard let existingMenu else { return true }
+        return topLevelMenuTitles(in: existingMenu) != expectedTopLevelTitles
+    }
+
+    static func makeMainMenu(appName: String, target: AppDelegate) -> NSMenu {
+        let mainMenu = NSMenu(title: appName)
+
+        func makeTopLevelMenu(_ title: String, submenu: NSMenu) -> NSMenuItem {
+            let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            item.submenu = submenu
+            return item
+        }
+
+        func makeMenuItem(
+            _ title: String,
+            action: Selector,
+            keyEquivalent: String = "",
+            modifiers: NSEvent.ModifierFlags = [],
+            systemImageName: String? = nil,
+            target overrideTarget: AnyObject? = target
+        ) -> NSMenuItem {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: keyEquivalent)
+            item.target = overrideTarget
+            item.keyEquivalentModifierMask = modifiers
+            if let systemImageName,
+               let symbol = NSImage(systemSymbolName: systemImageName, accessibilityDescription: nil) {
+                symbol.isTemplate = true
+                item.image = symbol
+            }
+            return item
+        }
+
+        let appMenu = NSMenu(title: appName)
+        appMenu.delegate = target
+        target.populateMainAppMenu(appMenu, appName: appName)
+        mainMenu.addItem(makeTopLevelMenu(appName, submenu: appMenu))
+
+        let recordingMenu = NSMenu(title: "Recording")
+        recordingMenu.delegate = target
+        target.populateMainMenuRecording(recordingMenu)
+        mainMenu.addItem(makeTopLevelMenu("Recording", submenu: recordingMenu))
+
+        let windowMenu = NSMenu(title: "Window")
+        windowMenu.addItem(
+            makeMenuItem(
+                "Minimize",
+                action: #selector(NSWindow.performMiniaturize(_:)),
+                keyEquivalent: "m",
+                modifiers: [.command],
+                target: nil
+            )
+        )
+        windowMenu.addItem(
+            makeMenuItem(
+                "Zoom",
+                action: #selector(NSWindow.performZoom(_:)),
+                target: nil
+            )
+        )
+        windowMenu.addItem(.separator())
+        windowMenu.addItem(
+            makeMenuItem(
+                "Bring All to Front",
+                action: #selector(NSApplication.arrangeInFront(_:)),
+                target: nil
+            )
+        )
+        mainMenu.addItem(makeTopLevelMenu("Window", submenu: windowMenu))
+
+        let helpMenu = NSMenu(title: "Help")
+        helpMenu.addItem(
+            makeMenuItem(
+                "Get Help...",
+                action: #selector(AppDelegate.handleMainMenuOpenFeedback),
+                keyEquivalent: "h",
+                modifiers: [.command, .shift],
+                systemImageName: "exclamationmark.bubble"
+            )
+        )
+        helpMenu.addItem(
+            makeMenuItem(
+                "Changelog",
+                action: #selector(AppDelegate.handleMainMenuOpenChangelog),
+                systemImageName: "text.book.closed"
+            )
+        )
+        mainMenu.addItem(makeTopLevelMenu("Help", submenu: helpMenu))
+
+        return mainMenu
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        switch menu.title {
+        case Self.applicationMenuTitle():
+            populateMainAppMenu(menu, appName: Self.applicationMenuTitle())
+        case "Recording":
+            populateMainMenuRecording(menu)
+        default:
+            break
+        }
+    }
+
+    private func populateMainAppMenu(_ menu: NSMenu, appName: String) {
+        menu.removeAllItems()
+        let dashboardShortcut = OnboardingManager.loadShortcutConfig(
+            forKey: Self.dashboardShortcutDefaultsKey,
+            fallback: .defaultDashboard
+        )
+        let systemMonitorShortcut = OnboardingManager.loadShortcutConfig(
+            forKey: Self.systemMonitorShortcutDefaultsKey,
+            fallback: .defaultSystemMonitor
+        )
+
+        menu.addItem(
+            makeMainMenuItem(
+                "About \(appName)",
+                action: #selector(handleMainMenuOpenAbout),
+                systemImageName: "info.circle"
+            )
+        )
+        menu.addItem(.separator())
+        menu.addItem(
+            makeMainMenuItem(
+                "Settings...",
+                action: #selector(handleMainMenuOpenSettings),
+                keyEquivalent: ",",
+                modifiers: [.command],
+                systemImageName: "gearshape"
+            )
+        )
+        let checkForUpdatesItem = makeMainMenuItem(
+            UpdaterManager.shared.isCheckingForUpdates ? "Checking for Updates..." : "Check for Updates...",
+            action: #selector(handleMainMenuCheckForUpdates),
+            systemImageName: "arrow.down.circle"
+        )
+        checkForUpdatesItem.isEnabled = !UpdaterManager.shared.isCheckingForUpdates && UpdaterManager.shared.canCheckForUpdates
+        menu.addItem(checkForUpdatesItem)
+        menu.addItem(.separator())
+        menu.addItem(
+            makeMainMenuItem(
+                TimelineWindowController.shared.isVisible ? "Hide Timeline" : "Show Timeline",
+                action: #selector(handleMainMenuToggleTimeline),
+                systemImageName: "clock.arrow.circlepath"
+            )
+        )
+        menu.addItem(
+            makeMainMenuItem(
+                "Search Screen History",
+                action: #selector(handleMainMenuOpenSearch),
+                systemImageName: "magnifyingglass"
+            )
+        )
+        menu.addItem(.separator())
+        menu.addItem(
+            makeMainMenuItem(
+                LaunchMenuRouting.dashboardIsFrontAndCenter() ? "Hide Dashboard" : "Show Dashboard",
+                action: #selector(handleMainMenuToggleDashboard),
+                shortcut: dashboardShortcut,
+                systemImageName: "rectangle.3.group"
+            )
+        )
+        menu.addItem(
+            makeMainMenuItem(
+                LaunchMenuRouting.systemMonitorIsFrontAndCenter() ? "Hide System Monitor" : "Show System Monitor",
+                action: #selector(handleMainMenuToggleSystemMonitor),
+                shortcut: systemMonitorShortcut,
+                systemImageName: "waveform.path.ecg"
+            )
+        )
+        menu.addItem(.separator())
+        menu.addItem(
+            makeMainMenuItem(
+                "Quit \(appName)",
+                action: #selector(handleMainMenuQuit),
+                keyEquivalent: "q",
+                modifiers: [.command],
+                systemImageName: "xmark.square"
+            )
+        )
+    }
+
+    private func populateMainMenuRecording(_ menu: NSMenu) {
+        menu.removeAllItems()
+        let recordingShortcut = OnboardingManager.loadShortcutConfig(
+            forKey: Self.recordingShortcutDefaultsKey,
+            fallback: .defaultRecording
+        )
+
+        if recordingIsRunning {
+            menu.addItem(
+                makeMainMenuItem(
+                    "Pause for 5 Minutes",
+                    action: #selector(handleMainMenuPauseRecordingFor5Minutes),
+                    systemImageName: "timer"
+                )
+            )
+            menu.addItem(
+                makeMainMenuItem(
+                    "Pause for 30 Minutes",
+                    action: #selector(handleMainMenuPauseRecordingFor30Minutes),
+                    systemImageName: "timer"
+                )
+            )
+            menu.addItem(
+                makeMainMenuItem(
+                    "Pause for 60 Minutes",
+                    action: #selector(handleMainMenuPauseRecordingFor60Minutes),
+                    systemImageName: "timer"
+                )
+            )
+            menu.addItem(.separator())
+            menu.addItem(
+                makeMainMenuItem(
+                    "Stop Recording",
+                    action: #selector(handleMainMenuStopRecording),
+                    shortcut: recordingShortcut,
+                    systemImageName: "stop.circle"
+                )
+            )
+            return
+        }
+
+        if timedPauseIsActive, let subtitle = timedPauseSubtitle() {
+            let subtitleItem = NSMenuItem(title: subtitle, action: nil, keyEquivalent: "")
+            subtitleItem.isEnabled = false
+            subtitleItem.image = NSImage(systemSymbolName: "timer", accessibilityDescription: nil)
+            menu.addItem(subtitleItem)
+            menu.addItem(
+                makeMainMenuItem(
+                    "Resume Recording Now",
+                    action: #selector(handleMainMenuResumeRecordingNow),
+                    shortcut: recordingShortcut,
+                    systemImageName: "play.circle"
+                )
+            )
+            menu.addItem(
+                makeMainMenuItem(
+                    "Turn Off Recording",
+                    action: #selector(handleMainMenuStopRecording),
+                    systemImageName: "stop.circle"
+                )
+            )
+            return
+        }
+
+        menu.addItem(
+            makeMainMenuItem(
+                "Start Recording",
+                action: #selector(handleMainMenuResumeRecordingNow),
+                shortcut: recordingShortcut,
+                systemImageName: "record.circle"
+            )
+        )
+    }
+
+    private func makeMainMenuItem(
+        _ title: String,
+        action: Selector,
+        keyEquivalent: String = "",
+        modifiers: NSEvent.ModifierFlags = [],
+        shortcut: ShortcutConfig? = nil,
+        systemImageName: String? = nil
+    ) -> NSMenuItem {
+        let resolvedKeyEquivalent = shortcut?.menuKeyEquivalent ?? keyEquivalent
+        let resolvedModifiers = shortcut?.modifiers.nsModifiers ?? modifiers
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: resolvedKeyEquivalent)
+        item.target = self
+        item.keyEquivalentModifierMask = resolvedModifiers
+        if let systemImageName,
+           let symbol = NSImage(systemSymbolName: systemImageName, accessibilityDescription: nil) {
+            symbol.isTemplate = true
+            item.image = symbol
+        }
+        return item
     }
 
     @MainActor
@@ -545,8 +784,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
         let menu = NSMenu(title: "Retrace")
-        let isDashboardFrontAndCenter = dockDashboardIsFrontAndCenter()
-        let isSettingsFrontAndCenter = dockSettingsIsFrontAndCenter()
+        let isDashboardFrontAndCenter = LaunchMenuRouting.dashboardIsFrontAndCenter()
+        let isSettingsFrontAndCenter = LaunchMenuRouting.settingsIsFrontAndCenter()
 
         menu.addItem(
             makeDockMenuItem(
@@ -598,6 +837,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidBecomeActive(_ notification: Notification) {
         Task { @MainActor in
+            self.installMainMenuIfNeeded()
             CrashRecoveryManager.shared.refreshUserFacingStatus()
             let shouldReveal = shouldRevealDashboardForActivation()
             Log.info("[LaunchSurface] applicationDidBecomeActive shouldReveal=\(shouldReveal) state=\(launchSurfaceStateSnapshot())", category: .app)
@@ -1479,45 +1719,30 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func handleDockToggleDashboard() {
-        if dockDashboardIsFrontAndCenter() {
-            recordDockMenuActionMetric("hide_dashboard")
+        if LaunchMenuRouting.dashboardIsFrontAndCenter() {
             DashboardWindowController.shared.hide()
             return
         }
 
-        recordDockMenuActionMetric("open_dashboard")
-        if TimelineWindowController.shared.isVisible {
-            TimelineWindowController.shared.hideToShowDashboard()
-        }
-        DashboardWindowController.shared.showDashboard()
+        LaunchMenuRouting.showDashboard()
     }
 
     @objc private func handleDockOpenTimeline() {
-        recordDockMenuActionMetric("open_timeline")
-        TimelineWindowController.shared.show()
+        LaunchMenuRouting.showTimeline()
     }
 
     @objc private func handleDockOpenSettings() {
-        if dockSettingsIsFrontAndCenter() {
-            recordDockMenuActionMetric("hide_settings")
+        if LaunchMenuRouting.settingsIsFrontAndCenter() {
             DashboardWindowController.shared.hide()
             return
         }
 
-        recordDockMenuActionMetric("open_settings")
-
-        if TimelineWindowController.shared.isVisible {
-            TimelineWindowController.shared.hideToShowDashboard()
-        }
-        DashboardWindowController.shared.showSettings()
+        LaunchMenuRouting.showSettings()
     }
 
     @objc private func handleDockToggleRecording() {
         Task { @MainActor [weak self] in
             guard let self else { return }
-            let currentlyCapturing = await self.coordinatorWrapper?.coordinator.isCapturing() ?? false
-            self.recordDockMenuActionMetric(currentlyCapturing ? "stop_recording" : "start_recording")
-
             do {
                 try await self.toggleRecording()
             } catch {
@@ -1527,13 +1752,163 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func handleDockOpenFeedback() {
-        recordDockMenuActionMetric("open_help")
+        openHelpFromMenu(source: "dock_menu")
+    }
+
+    @objc private func handleMainMenuOpenAbout() {
+        presentAboutWindow()
+    }
+
+    @objc private func handleMainMenuOpenChangelog() {
+        LaunchMenuRouting.showChangelog()
+    }
+
+    @objc private func handleMainMenuOpenSettings() {
+        LaunchMenuRouting.showSettings()
+    }
+
+    @objc private func handleMainMenuCheckForUpdates() {
+        UpdaterManager.shared.checkForUpdates()
+        installMainMenuIfNeeded(force: true)
+    }
+
+    @objc private func handleMainMenuToggleTimeline() {
+        if TimelineWindowController.shared.isVisible {
+            LaunchMenuRouting.hideTimeline()
+        } else {
+            LaunchMenuRouting.showTimeline()
+        }
+    }
+
+    @objc private func handleMainMenuOpenSearch() {
+        LaunchMenuRouting.showSearch(source: "main_menu")
+    }
+
+    @objc private func handleMainMenuToggleDashboard() {
+        if LaunchMenuRouting.dashboardIsFrontAndCenter() {
+            DashboardWindowController.shared.hide()
+        } else {
+            LaunchMenuRouting.showDashboard()
+        }
+    }
+
+    @objc private func handleMainMenuToggleSystemMonitor() {
+        if LaunchMenuRouting.systemMonitorIsFrontAndCenter() {
+            LaunchMenuRouting.toggleSystemMonitor()
+        } else {
+            LaunchMenuRouting.showSystemMonitor()
+        }
+    }
+
+    @objc private func handleMainMenuPauseRecordingFor5Minutes() {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.pauseRecordingFromMainMenu(duration: 5 * 60)
+        }
+    }
+
+    @objc private func handleMainMenuPauseRecordingFor30Minutes() {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.pauseRecordingFromMainMenu(duration: 30 * 60)
+        }
+    }
+
+    @objc private func handleMainMenuPauseRecordingFor60Minutes() {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.pauseRecordingFromMainMenu(duration: 60 * 60)
+        }
+    }
+
+    @objc private func handleMainMenuResumeRecordingNow() {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.startRecordingFromMainMenu()
+        }
+    }
+
+    @objc private func handleMainMenuStopRecording() {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.pauseRecordingFromMainMenu(duration: nil)
+        }
+    }
+
+    @objc private func handleMainMenuOpenFeedback() {
+        openHelpFromMenu(source: "main_menu")
+    }
+
+    @objc private func handleMainMenuQuit() {
+        NSApplication.shared.terminate(nil)
+    }
+
+    private func openHelpFromMenu(source: String) {
         if let coordinator = coordinatorWrapper?.coordinator {
             Task { @MainActor in
-                DashboardViewModel.recordHelpOpened(coordinator: coordinator, source: "dock_menu")
+                DashboardViewModel.recordHelpOpened(coordinator: coordinator, source: source)
             }
         }
         NotificationCenter.default.post(name: .openFeedback, object: nil)
+    }
+
+    private func startRecordingFromMainMenu() async {
+        if let menuBarManager {
+            await menuBarManager.startRecordingNow(source: "main_menu")
+            installMainMenuIfNeeded(force: true)
+            return
+        }
+
+        guard let wrapper = coordinatorWrapper else { return }
+
+        do {
+            try await wrapper.coordinator.startPipeline()
+            DashboardViewModel.recordRecordingStartedFromMenu(
+                coordinator: wrapper.coordinator,
+                source: "main_menu"
+            )
+        } catch {
+            Log.error("[MainMenu] Failed to start recording: \(error)", category: .ui)
+        }
+
+        installMainMenuIfNeeded(force: true)
+    }
+
+    private func pauseRecordingFromMainMenu(duration: TimeInterval?) async {
+        if let menuBarManager {
+            await menuBarManager.pauseRecording(for: duration, source: "main_menu")
+            installMainMenuIfNeeded(force: true)
+            return
+        }
+
+        guard let wrapper = coordinatorWrapper else { return }
+        let wasRecording = await wrapper.coordinator.isCapturing()
+        let isTimedPause = (duration ?? 0) > 0
+
+        guard wasRecording else {
+            installMainMenuIfNeeded(force: true)
+            return
+        }
+
+        do {
+            try await wrapper.coordinator.stopPipeline(persistState: !isTimedPause)
+            if isTimedPause, let duration {
+                DashboardViewModel.recordRecordingPauseSelected(
+                    coordinator: wrapper.coordinator,
+                    source: "main_menu",
+                    durationSeconds: Int(duration)
+                )
+            } else {
+                DashboardViewModel.recordRecordingTurnedOff(
+                    coordinator: wrapper.coordinator,
+                    source: "main_menu"
+                )
+            }
+        } catch {
+            Log.error("[MainMenu] Failed to stop recording: \(error)", category: .ui)
+        }
+
+        installMainMenuIfNeeded(force: true)
     }
 
     private func makeDockMenuItem(
@@ -1558,19 +1933,29 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return "Start Recording"
     }
 
-    private func dockDashboardIsFrontAndCenter() -> Bool {
-        guard NSApp.isActive else { return false }
-        let titles = [NSApp.keyWindow?.title, NSApp.mainWindow?.title]
-        return titles.contains("Dashboard")
+    private var recordingIsRunning: Bool {
+        if let menuBarManager {
+            return menuBarManager.isRecording
+        }
+        return coordinatorWrapper?.coordinator.statusHolder.status.isRunning ?? false
     }
 
-    private func dockSettingsIsFrontAndCenter() -> Bool {
-        guard NSApp.isActive else { return false }
-        let titles = [NSApp.keyWindow?.title, NSApp.mainWindow?.title]
-        return titles.contains { title in
-            guard let title else { return false }
-            return title.hasPrefix("Settings")
+    private var timedPauseIsActive: Bool {
+        guard let menuBarManager else { return false }
+        return menuBarManager.isPausedState
+    }
+
+    private func timedPauseSubtitle() -> String? {
+        guard let remainingSeconds = menuBarManager?.timedPauseRemainingSeconds else { return nil }
+        let hours = remainingSeconds / 3600
+        let minutes = (remainingSeconds % 3600) / 60
+        let seconds = remainingSeconds % 60
+
+        if hours > 0 {
+            return String(format: "Resumes in %d:%02d:%02d", hours, minutes, seconds)
         }
+
+        return String(format: "Resumes in %02d:%02d", minutes, seconds)
     }
 
     private func dockRecordingMenuSymbolName() -> String {
@@ -1580,30 +1965,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return "record.circle"
     }
 
-    private func recordDockMenuActionMetric(_ action: String) {
-        guard let coordinator = coordinatorWrapper?.coordinator else { return }
+    private func presentAboutWindow() {
+        let appName = Self.applicationMenuTitle()
+        let controller: NSWindowController
 
-        let metadata = Self.metricMetadata([
-            "action": action,
-            "source": "dock_menu"
-        ])
-
-        Task {
-            try? await coordinator.recordMetricEvent(
-                metricType: .dockMenuAction,
-                metadata: metadata
-            )
-        }
-    }
-
-    private static func metricMetadata(_ payload: [String: Any]) -> String? {
-        guard JSONSerialization.isValidJSONObject(payload),
-              let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
-              let json = String(data: data, encoding: .utf8) else {
-            return nil
+        if let aboutWindowController {
+            controller = aboutWindowController
+        } else {
+            let window = RetraceAboutPanel.makeWindow(appName: appName)
+            let newController = NSWindowController(window: window)
+            aboutWindowController = newController
+            controller = newController
         }
 
-        return json
+        controller.showWindow(nil)
+        controller.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     // MARK: - Single Instance Check

@@ -80,7 +80,6 @@ public enum DailyMetricsQueries {
         case helpOpened = "help_opened"  // metadata: JSON {source}
         case settingsSearchOpened = "settings_search_opened"
         case dockIconVisibilityToggle = "dock_icon_visibility_toggle"  // metadata: JSON {enabled, source}
-        case dockMenuAction = "dock_menu_action"  // metadata: JSON {action, source}
         case redactionRulesUpdated = "redaction_rules_updated"
         case masterKeyFlow = "master_key_flow"  // metadata: JSON {action, source, ...}
         case phraseLevelRedactionRulesUpdated = "phrase_level_redaction_rules_updated"

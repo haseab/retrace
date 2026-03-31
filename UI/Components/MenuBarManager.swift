@@ -707,7 +707,7 @@ public class MenuBarManager: ObservableObject {
         iconAnimationTimer = timer
     }
 
-    public func pauseRecording(for duration: TimeInterval?) async {
+    public func pauseRecording(for duration: TimeInterval?, source: String = "pause_menu") async {
         clearScheduledResume()
         let wasRecording = coordinator.statusHolder.status.isRunning
         let isTimedPause = (duration ?? 0) > 0
@@ -726,7 +726,7 @@ public class MenuBarManager: ObservableObject {
                     await MainActor.run {
                         DashboardViewModel.recordRecordingPauseSelected(
                             coordinator: coordinator,
-                            source: "pause_menu",
+                            source: source,
                             durationSeconds: Int(duration)
                         )
                     }
@@ -734,7 +734,7 @@ public class MenuBarManager: ObservableObject {
                     await MainActor.run {
                         DashboardViewModel.recordRecordingTurnedOff(
                             coordinator: coordinator,
-                            source: "pause_menu"
+                            source: source
                         )
                     }
                 }
@@ -751,7 +751,7 @@ public class MenuBarManager: ObservableObject {
         updateIconForCurrentState()
     }
 
-    private func startRecordingNow() async {
+    public func startRecordingNow(source: String = "status_menu_start") async {
         clearScheduledResume()
         isPausedByUser = false
         do {
@@ -759,7 +759,7 @@ public class MenuBarManager: ObservableObject {
             await MainActor.run {
                 DashboardViewModel.recordRecordingStartedFromMenu(
                     coordinator: coordinator,
-                    source: "status_menu_start"
+                    source: source
                 )
             }
         } catch {
@@ -908,7 +908,7 @@ public class MenuBarManager: ObservableObject {
 
     private func setupMenu() {
         let menu = NSMenu()
-        let visibleDashboardContent = visibleDashboardContentInFront()
+        let visibleDashboardContent = LaunchMenuRouting.visibleDashboardContent()
         let primaryActions = Self.primaryActions(
             isDashboardFrontAndCenter: visibleDashboardContent == .dashboard,
             isSystemMonitorFrontAndCenter: visibleDashboardContent == .monitor
@@ -1220,16 +1220,13 @@ public class MenuBarManager: ObservableObject {
     @objc private func openSearch() {
         // Open the timeline search overlay without resetting existing search state.
         Task { @MainActor in
-            TimelineWindowController.shared.showSearchOverlay(source: "menu_bar_menu")
+            LaunchMenuRouting.showSearch(source: "menu_bar_menu")
         }
     }
 
     @objc private func openDashboard() {
         Task { @MainActor in
-            if TimelineWindowController.shared.isVisible {
-                TimelineWindowController.shared.hideToShowDashboard()
-            }
-            DashboardWindowController.shared.showDashboard()
+            LaunchMenuRouting.showDashboard()
         }
     }
 
@@ -1241,16 +1238,20 @@ public class MenuBarManager: ObservableObject {
 
     @objc private func openChangelog() {
         Task { @MainActor in
-            DashboardWindowController.shared.showChangelog()
+            LaunchMenuRouting.showChangelog()
         }
     }
 
     @objc private func openSystemMonitor() {
-        NotificationCenter.default.post(name: .openSystemMonitor, object: nil)
+        Task { @MainActor in
+            LaunchMenuRouting.showSystemMonitor()
+        }
     }
 
     @objc private func hideSystemMonitorFromMenu() {
-        NotificationCenter.default.post(name: .toggleSystemMonitor, object: nil)
+        Task { @MainActor in
+            LaunchMenuRouting.toggleSystemMonitor()
+        }
     }
 
     @objc private func startRecordingFromMenu() {
@@ -1281,10 +1282,10 @@ public class MenuBarManager: ObservableObject {
             if TimelineWindowController.shared.isVisible {
                 TimelineWindowController.shared.hideToShowDashboard()
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                    NotificationCenter.default.post(name: .toggleSystemMonitor, object: nil)
+                    LaunchMenuRouting.toggleSystemMonitor()
                 }
             } else {
-                NotificationCenter.default.post(name: .toggleSystemMonitor, object: nil)
+                LaunchMenuRouting.toggleSystemMonitor()
             }
         }
     }
@@ -1338,12 +1339,6 @@ public class MenuBarManager: ObservableObject {
         }
     }
 
-    private enum VisibleDashboardContent {
-        case dashboard
-        case monitor
-        case other
-    }
-
     static func primaryActions(
         isDashboardFrontAndCenter: Bool,
         isSystemMonitorFrontAndCenter: Bool
@@ -1365,19 +1360,6 @@ public class MenuBarManager: ObservableObject {
                 imageSystemName: "waveform.path.ecg"
             )
         )
-    }
-
-    private func visibleDashboardContentInFront() -> VisibleDashboardContent {
-        guard NSApp.isActive else { return .other }
-
-        let titles = [NSApp.keyWindow?.title, NSApp.mainWindow?.title]
-        if titles.contains("Dashboard") {
-            return .dashboard
-        }
-        if titles.contains("System Monitor") {
-            return .monitor
-        }
-        return .other
     }
 
     // MARK: - Update
