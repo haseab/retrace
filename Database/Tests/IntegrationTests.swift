@@ -59,7 +59,6 @@ final class IntegrationTests: XCTestCase {
             segmentID: frame.segmentID,
             videoID: frame.videoID,
             frameIndexInSegment: frame.frameIndexInSegment,
-            encodingStatus: frame.encodingStatus,
             metadata: frame.metadata,
             source: frame.source
         )
@@ -107,7 +106,6 @@ final class IntegrationTests: XCTestCase {
             segmentID: AppSegmentID(value: appSegmentID),
             videoID: storedVideoID,
             frameIndexInSegment: 0,
-            encodingStatus: .success,
             metadata: FrameMetadata(
                 appBundleID: "com.apple.Safari",
                 appName: "Safari",
@@ -176,7 +174,6 @@ final class IntegrationTests: XCTestCase {
             segmentID: AppSegmentID(value: appSegmentID),
             videoID: storedVideoID,
             frameIndexInSegment: 0,
-            encodingStatus: .success,
             metadata: .empty
         ))
 
@@ -195,7 +192,6 @@ final class IntegrationTests: XCTestCase {
             segmentID: AppSegmentID(value: appSegmentID),
             videoID: storedVideoID,
             frameIndexInSegment: 1,
-            encodingStatus: .success,
             metadata: .empty
         ))
 
@@ -279,7 +275,6 @@ final class IntegrationTests: XCTestCase {
             segmentID: AppSegmentID(value: safariSegmentID),
             videoID: storedVideoID,
             frameIndexInSegment: 0,
-            encodingStatus: .success,
             metadata: FrameMetadata(
                 appBundleID: "com.apple.Safari",
                 appName: "Safari",
@@ -301,7 +296,6 @@ final class IntegrationTests: XCTestCase {
             segmentID: AppSegmentID(value: xcodeSegmentID),
             videoID: storedVideoID,
             frameIndexInSegment: 1,
-            encodingStatus: .success,
             metadata: FrameMetadata(
                 appBundleID: "com.apple.dt.Xcode",
                 appName: "Xcode",
@@ -323,7 +317,6 @@ final class IntegrationTests: XCTestCase {
             segmentID: AppSegmentID(value: terminalSegmentID),
             videoID: storedVideoID,
             frameIndexInSegment: 2,
-            encodingStatus: .success,
             metadata: FrameMetadata(
                 appBundleID: "com.apple.Terminal",
                 appName: "Terminal",
@@ -388,7 +381,6 @@ final class IntegrationTests: XCTestCase {
             segmentID: AppSegmentID(value: appSegmentID),
             videoID: storedVideoID,
             frameIndexInSegment: 0,
-            encodingStatus: .success,
             metadata: .empty
         ))
 
@@ -456,7 +448,6 @@ final class IntegrationTests: XCTestCase {
             segmentID: AppSegmentID(value: appSegmentID),
             videoID: storedVideoID,
             frameIndexInSegment: 0,
-            encodingStatus: .success,
             metadata: .empty
         ))
         _ = try await database.insertDocument(IndexedDocument(
@@ -473,7 +464,6 @@ final class IntegrationTests: XCTestCase {
             segmentID: AppSegmentID(value: appSegmentID),
             videoID: storedVideoID,
             frameIndexInSegment: 1,
-            encodingStatus: .success,
             metadata: .empty
         ))
         _ = try await database.insertDocument(IndexedDocument(

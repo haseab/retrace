@@ -387,11 +387,11 @@ final class DatabaseManagerTests: XCTestCase {
                 """
                 INSERT INTO frame (
                     id, createdAt, imageFileName, segmentId, videoId, videoFrameIndex,
-                    isStarred, encodingStatus, processingStatus
+                    isStarred, processingStatus
                 )
                 VALUES (
                     \(frameID), \(timestampMs), 'legacy-frame.jpg', \(segmentID), \(videoID), 0,
-                    0, 'success', 2
+                    0, 2
                 );
                 """,
                 db: legacyDB
@@ -842,6 +842,93 @@ final class DatabaseManagerTests: XCTestCase {
         XCTAssertEqual(counts.rewriteProcessing, 1)
     }
 
+    func testMarkFrameReadableStoresEncodedAt() async throws {
+        let frameID = try await insertTestFrame(browserURL: nil)
+
+        let beforeEncodedAtCount = try await fetchInt64(
+            """
+            SELECT COUNT(*)
+            FROM frame
+            WHERE id = ?
+              AND encodedAt IS NOT NULL;
+            """,
+            bind: { statement in
+                sqlite3_bind_int64(statement, 1, frameID.value)
+            }
+        )
+        XCTAssertEqual(beforeEncodedAtCount, 0)
+
+        try await database.markFrameReadable(frameID: frameID.value)
+
+        let readableCount = try await fetchInt64(
+            """
+            SELECT COUNT(*)
+            FROM frame
+            WHERE id = ?
+              AND processingStatus = 0
+              AND encodedAt IS NOT NULL;
+            """,
+            bind: { statement in
+                sqlite3_bind_int64(statement, 1, frameID.value)
+            }
+        )
+        XCTAssertEqual(readableCount, 1)
+    }
+
+    func testGetUnreadableFrameCountWithinLastMinutesIgnoresOlderFrames() async throws {
+        _ = try await insertTestFrame(
+            browserURL: nil,
+            timestamp: Date()
+        )
+        _ = try await insertTestFrame(
+            browserURL: nil,
+            timestamp: Date().addingTimeInterval(-10 * 60)
+        )
+        let readableFrameID = try await insertTestFrame(
+            browserURL: nil,
+            timestamp: Date().addingTimeInterval(-60)
+        )
+
+        try await database.markFrameReadable(frameID: readableFrameID.value)
+
+        let recentUnreadableCount = try await database.getUnreadableFrameCount(withinLastMinutes: 5)
+        let totalUnreadableCount = try await database.getUnreadableFrameCount()
+
+        XCTAssertEqual(recentUnreadableCount, 1)
+        XCTAssertEqual(totalUnreadableCount, 2)
+    }
+
+    func testGetFramesEncodedPerMinuteBucketsByEncodedAt() async throws {
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        let currentMinuteMs = (nowMs / 60_000) * 60_000
+
+        let currentMinuteFrameID = try await insertTestFrame(browserURL: nil)
+        let previousMinuteFrameID = try await insertTestFrame(browserURL: nil)
+        let oldFrameID = try await insertTestFrame(browserURL: nil)
+
+        try await database.markFrameReadable(frameID: currentMinuteFrameID.value)
+        try await database.markFrameReadable(frameID: previousMinuteFrameID.value)
+        try await database.markFrameReadable(frameID: oldFrameID.value)
+
+        try await executeRawSQL(
+            """
+            UPDATE frame
+            SET encodedAt = CASE id
+                WHEN \(currentMinuteFrameID.value) THEN \(currentMinuteMs + 5_000)
+                WHEN \(previousMinuteFrameID.value) THEN \(currentMinuteMs - 60_000 + 5_000)
+                WHEN \(oldFrameID.value) THEN \(currentMinuteMs - 31 * 60_000)
+            END
+            WHERE id IN (\(currentMinuteFrameID.value), \(previousMinuteFrameID.value), \(oldFrameID.value));
+            """
+        )
+
+        let buckets = try await database.getFramesEncodedPerMinute(lastMinutes: 30)
+
+        XCTAssertEqual(buckets[0], 1)
+        XCTAssertEqual(buckets[1], 1)
+        XCTAssertNil(buckets[29])
+    }
+
     func testGetFramesRewrittenPerMinuteBucketsByRewrittenAt() async throws {
         let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
         let currentMinuteMs = (nowMs / 60_000) * 60_000
@@ -1193,7 +1280,6 @@ final class DatabaseManagerTests: XCTestCase {
             segmentID: AppSegmentID(value: appSegmentID),
             videoID: VideoSegmentID(value: insertedSegmentID),
             frameIndexInSegment: 0,
-            encodingStatus: .success,
             metadata: .empty,
             source: .native
         )
@@ -1347,7 +1433,6 @@ final class DatabaseManagerTests: XCTestCase {
             segmentID: AppSegmentID(value: appSegmentID),
             videoID: VideoSegmentID(value: insertedVideoID),
             frameIndexInSegment: 0,
-            encodingStatus: .success,
             metadata: FrameMetadata(
                 appBundleID: "com.apple.Safari",
                 appName: "Safari",
@@ -1370,6 +1455,116 @@ final class DatabaseManagerTests: XCTestCase {
         XCTAssertEqual(retrieved?.metadata.appBundleID, "com.apple.Safari")
         XCTAssertEqual(retrieved?.metadata.windowName, "Retrace - GitHub")
         XCTAssertEqual(retrieved?.metadata.captureTrigger, .mouse)
+    }
+
+    func testInsertFrameLeavesEncodedAtNull() async throws {
+        let timestamp = Date()
+        let videoSegment = VideoSegment(
+            id: VideoSegmentID(value: 0),
+            startTime: timestamp,
+            endTime: timestamp.addingTimeInterval(120),
+            frameCount: 1,
+            fileSizeBytes: 1024,
+            relativePath: "segments/null-encoding-status.mp4",
+            width: 1920,
+            height: 1080,
+            source: .native
+        )
+        let insertedVideoID = try await database.insertVideoSegment(videoSegment)
+
+        let appSegmentID = try await database.insertSegment(
+            bundleID: "com.apple.Safari",
+            startDate: timestamp,
+            endDate: timestamp.addingTimeInterval(120),
+            windowName: "NULL Encoding Status",
+            browserUrl: nil,
+            type: 0
+        )
+
+        let frame = FrameReference(
+            id: FrameID(value: 0),
+            timestamp: timestamp,
+            segmentID: AppSegmentID(value: appSegmentID),
+            videoID: VideoSegmentID(value: insertedVideoID),
+            frameIndexInSegment: 0,
+            metadata: .empty,
+            source: .native
+        )
+
+        let insertedFrameID = try await database.insertFrame(frame)
+        let storedEncodedAt = try await fetchText(
+            "SELECT encodedAt FROM frame WHERE id = ?;",
+            bind: { statement in
+                sqlite3_bind_int64(statement, 1, insertedFrameID)
+            }
+        )
+
+        XCTAssertNil(storedEncodedAt)
+    }
+
+    func testUpdateFrameVideoLinkLeavesEncodedAtNull() async throws {
+        let timestamp = Date()
+        let appSegmentID = try await database.insertSegment(
+            bundleID: "com.apple.Safari",
+            startDate: timestamp,
+            endDate: timestamp.addingTimeInterval(120),
+            windowName: "Video Link Update",
+            browserUrl: nil,
+            type: 0
+        )
+
+        let frame = FrameReference(
+            id: FrameID(value: 0),
+            timestamp: timestamp,
+            segmentID: AppSegmentID(value: appSegmentID),
+            videoID: VideoSegmentID(value: 0),
+            frameIndexInSegment: 0,
+            metadata: .empty,
+            source: .native
+        )
+        let insertedFrameID = try await database.insertFrame(frame)
+
+        let videoSegment = VideoSegment(
+            id: VideoSegmentID(value: 0),
+            startTime: timestamp,
+            endTime: timestamp.addingTimeInterval(120),
+            frameCount: 1,
+            fileSizeBytes: 1024,
+            relativePath: "segments/video-link-update.mp4",
+            width: 1920,
+            height: 1080,
+            source: .native
+        )
+        let insertedVideoID = try await database.insertVideoSegment(videoSegment)
+
+        try await database.updateFrameVideoLink(
+            frameID: FrameID(value: insertedFrameID),
+            videoID: VideoSegmentID(value: insertedVideoID),
+            frameIndex: 7
+        )
+
+        let storedEncodedAt = try await fetchText(
+            "SELECT encodedAt FROM frame WHERE id = ?;",
+            bind: { statement in
+                sqlite3_bind_int64(statement, 1, insertedFrameID)
+            }
+        )
+        let storedVideoID = try await fetchInt64(
+            "SELECT videoId FROM frame WHERE id = ?;",
+            bind: { statement in
+                sqlite3_bind_int64(statement, 1, insertedFrameID)
+            }
+        )
+        let storedFrameIndex = try await fetchInt64(
+            "SELECT videoFrameIndex FROM frame WHERE id = ?;",
+            bind: { statement in
+                sqlite3_bind_int64(statement, 1, insertedFrameID)
+            }
+        )
+
+        XCTAssertNil(storedEncodedAt)
+        XCTAssertEqual(storedVideoID, insertedVideoID)
+        XCTAssertEqual(storedFrameIndex, 7)
     }
 
     func testUpdateAndGetFrameMetadata() async throws {
@@ -1402,7 +1597,6 @@ final class DatabaseManagerTests: XCTestCase {
             segmentID: AppSegmentID(value: appSegmentID),
             videoID: VideoSegmentID(value: insertedVideoID),
             frameIndexInSegment: 0,
-            encodingStatus: .success,
             metadata: .empty,
             source: .native
         )
@@ -1447,7 +1641,6 @@ final class DatabaseManagerTests: XCTestCase {
             segmentID: AppSegmentID(value: appSegmentID),
             videoID: VideoSegmentID(value: insertedVideoID),
             frameIndexInSegment: 0,
-            encodingStatus: .success,
             metadata: .empty,
             source: .native
         )
@@ -2003,6 +2196,62 @@ final class DatabaseManagerTests: XCTestCase {
         XCTAssertTrue(postMigrationColumns.contains("capture_trigger"))
     }
 
+    func testMigrationRunner_V19AddsEncodedAtWithoutBackfillingExistingFrames() async throws {
+        let dbPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RetraceV19Migration-\(UUID().uuidString).sqlite")
+            .path
+        let db = try openRawDatabase(at: dbPath)
+
+        defer {
+            sqlite3_close(db)
+            try? FileManager.default.removeItem(atPath: dbPath)
+            try? FileManager.default.removeItem(atPath: dbPath + "-wal")
+            try? FileManager.default.removeItem(atPath: dbPath + "-shm")
+        }
+
+        let createdAtMs: Int64 = 1_700_000_000_000
+        try await runLegacyMigrations(throughVersion: 18, db: db)
+
+        let preMigrationColumns = try tableColumnNames("frame", db: db)
+        let preMigrationLegacyIndexCount = try fetchInt64(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'index_frame_on_encodingstatus_createdat';",
+            db: db
+        )
+
+        XCTAssertFalse(preMigrationColumns.contains("encodedAt"))
+        XCTAssertEqual(preMigrationLegacyIndexCount, 1)
+
+        try executeRawSQL(
+            """
+            INSERT INTO frame (id, createdAt, imageFileName, processingStatus)
+            VALUES (1, \(createdAtMs), 'legacy-frame.jpg', 0);
+            """,
+            db: db
+        )
+
+        let runner = MigrationRunner(db: db)
+        try await runner.runMigrations()
+
+        let currentVersion = try fetchInt64("SELECT MAX(version) FROM schema_migrations;", db: db)
+        let encodedAtNullCount = try fetchInt64(
+            "SELECT COUNT(*) FROM frame WHERE id = 1 AND encodedAt IS NULL;",
+            db: db
+        )
+        let encodedAtIndexCount = try fetchInt64(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_frame_encoded_at';",
+            db: db
+        )
+        let legacyIndexCount = try fetchInt64(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'index_frame_on_encodingstatus_createdat';",
+            db: db
+        )
+
+        XCTAssertGreaterThanOrEqual(currentVersion, 19)
+        XCTAssertEqual(encodedAtNullCount, 1)
+        XCTAssertEqual(encodedAtIndexCount, 1)
+        XCTAssertEqual(legacyIndexCount, 0)
+    }
+
     func testGetPendingFrameIDsNotInQueueReturnsOnlyNewestOrphanedFrames() async throws {
         let oldestFrame = try await insertTestFrame(
             browserURL: "https://example.com/oldest",
@@ -2062,7 +2311,6 @@ final class DatabaseManagerTests: XCTestCase {
             segmentID: AppSegmentID(value: appSegmentID),
             videoID: videoSegment.id,
             frameIndexInSegment: 0,
-            encodingStatus: .success,
             metadata: .empty,
             source: .native
         )
@@ -2073,7 +2321,6 @@ final class DatabaseManagerTests: XCTestCase {
             segmentID: AppSegmentID(value: appSegmentID),
             videoID: videoSegment.id,
             frameIndexInSegment: 1,
-            encodingStatus: .success,
             metadata: .empty,
             source: .native
         )
@@ -2084,7 +2331,6 @@ final class DatabaseManagerTests: XCTestCase {
             segmentID: AppSegmentID(value: appSegmentID),
             videoID: videoSegment.id,
             frameIndexInSegment: 2,
-            encodingStatus: .success,
             metadata: .empty,
             source: .native
         )
@@ -2144,7 +2390,6 @@ final class DatabaseManagerTests: XCTestCase {
             segmentID: AppSegmentID(value: safariSegmentID),
             videoID: segment.id,
             frameIndexInSegment: 0,
-            encodingStatus: .success,
             metadata: FrameMetadata(appBundleID: "com.apple.Safari"),
             source: .native
         )
@@ -2155,7 +2400,6 @@ final class DatabaseManagerTests: XCTestCase {
             segmentID: AppSegmentID(value: xcodeSegmentID),
             videoID: segment.id,
             frameIndexInSegment: 1,
-            encodingStatus: .success,
             metadata: FrameMetadata(appBundleID: "com.apple.Xcode"),
             source: .native
         )
@@ -2215,7 +2459,6 @@ final class DatabaseManagerTests: XCTestCase {
             segmentID: AppSegmentID(value: oldAppSegmentID),
             videoID: segment.id,
             frameIndexInSegment: 0,
-            encodingStatus: .success,
             metadata: .empty,
             source: .native
         )
@@ -2226,7 +2469,6 @@ final class DatabaseManagerTests: XCTestCase {
             segmentID: AppSegmentID(value: recentAppSegmentID),
             videoID: segment.id,
             frameIndexInSegment: 1,
-            encodingStatus: .success,
             metadata: .empty,
             source: .native
         )
@@ -2280,7 +2522,6 @@ final class DatabaseManagerTests: XCTestCase {
             segmentID: AppSegmentID(value: appSegmentID),
             videoID: segment.id,
             frameIndexInSegment: 0,
-            encodingStatus: .success,
             metadata: .empty,
             source: .native
         )
@@ -2291,7 +2532,6 @@ final class DatabaseManagerTests: XCTestCase {
             segmentID: AppSegmentID(value: appSegmentID),
             videoID: segment.id,
             frameIndexInSegment: 1,
-            encodingStatus: .success,
             metadata: .empty,
             source: .native
         )
@@ -2342,7 +2582,6 @@ final class DatabaseManagerTests: XCTestCase {
             segmentID: AppSegmentID(value: appSegmentID),
             videoID: VideoSegmentID(value: insertedVideoID),
             frameIndexInSegment: 0,
-            encodingStatus: .success,
             metadata: .empty,
             source: .native
         )
@@ -2422,7 +2661,6 @@ final class DatabaseManagerTests: XCTestCase {
                 segmentID: AppSegmentID(value: segmentID),
                 videoID: VideoSegmentID(value: videoID),
                 frameIndexInSegment: 0,
-                encodingStatus: .success,
                 metadata: .empty,
                 source: .native
             )
@@ -2483,7 +2721,6 @@ final class DatabaseManagerTests: XCTestCase {
                 segmentID: AppSegmentID(value: segmentAID),
                 videoID: VideoSegmentID(value: videoID),
                 frameIndexInSegment: 0,
-                encodingStatus: .success,
                 metadata: .empty,
                 source: .native
             )
@@ -2495,7 +2732,6 @@ final class DatabaseManagerTests: XCTestCase {
                 segmentID: AppSegmentID(value: segmentAID),
                 videoID: VideoSegmentID(value: videoID),
                 frameIndexInSegment: 1,
-                encodingStatus: .success,
                 metadata: .empty,
                 source: .native
             )
@@ -2507,7 +2743,6 @@ final class DatabaseManagerTests: XCTestCase {
                 segmentID: AppSegmentID(value: segmentBID),
                 videoID: VideoSegmentID(value: videoID),
                 frameIndexInSegment: 0,
-                encodingStatus: .success,
                 metadata: .empty,
                 source: .native
             )
@@ -2780,7 +3015,6 @@ final class DatabaseManagerTests: XCTestCase {
                     segmentID: AppSegmentID(value: segmentID),
                     videoID: VideoSegmentID(value: videoID),
                     frameIndexInSegment: 0,
-                    encodingStatus: .success,
                     metadata: .empty,
                     source: .native
                 )
@@ -2988,7 +3222,6 @@ final class DatabaseManagerTests: XCTestCase {
             segmentID: AppSegmentID(value: appSegmentID),
             videoID: VideoSegmentID(value: insertedVideoID),
             frameIndexInSegment: 0,
-            encodingStatus: .success,
             metadata: .empty,
             source: .native
         )
@@ -3100,6 +3333,10 @@ final class DatabaseManagerTests: XCTestCase {
 
     private func tableColumnNames(_ table: String) async throws -> [String] {
         let db = try await databaseConnection()
+        return try tableColumnNames(table, db: db)
+    }
+
+    private func tableColumnNames(_ table: String, db: OpaquePointer) throws -> [String] {
         let sql = "PRAGMA table_info(\(table));"
         var statement: OpaquePointer?
         defer { sqlite3_finalize(statement) }
@@ -3157,7 +3394,8 @@ final class DatabaseManagerTests: XCTestCase {
             V14_DBStorageSnapshot(),
             V15_NodeRedactionFlag(),
             V16_ProcessingQueueFrameIDIndex(),
-            V17_FrameCaptureTrigger()
+            V17_FrameCaptureTrigger(),
+            V18_DailyMetricsRecencyIndex()
         ]
 
         for migration in migrations where migration.version <= version {

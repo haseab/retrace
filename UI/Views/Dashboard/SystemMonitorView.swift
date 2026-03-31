@@ -42,16 +42,14 @@ public struct SystemMonitorView: View {
                         .frame(maxWidth: monitorMaxWidth)
                         .frame(maxWidth: .infinity)
                         .padding(.horizontal, 32)
-                        .padding(.top, 28)
-                        .padding(.bottom, 24)
+                        .padding(.top, 16)
+                        .padding(.bottom, 12)
 
                     // Main content
                     ScrollView(showsIndicators: false) {
-                        VStack(alignment: .leading, spacing: 16) {
-                            // OCR Processing Section
-                            ocrProcessingSection
-                            videoRewritingSection
-                                .padding(.bottom, 40)
+                        VStack(alignment: .leading, spacing: 20) {
+                            processingPipelinesSection(isCompactLayout: isCompactLayout)
+
                             processResourceSummarySection(isCompactLayout: isCompactLayout)
 
                             // Future sections placeholder
@@ -454,10 +452,19 @@ public struct SystemMonitorView: View {
         }
     }
 
+    private var frameEncodingSection: some View {
+        activityMonitorCard(
+            model: encodingCardModel,
+            hoveredIndex: $viewModel.hoveredEncodingBarIndex
+        ) {
+            EmptyView()
+        }
+    }
+
     private var ocrMonitorCardModel: ActivityMonitorCardModel {
         ActivityMonitorCardModel(
             icon: "text.viewfinder",
-            title: "OCR Processing",
+            title: "OCR Processing (Extracting Screenshot Text)",
             statusText: viewModel.ocrStatusBadgeText,
             statusColor: viewModel.ocrStatusColor,
             metricTitle: "Frames processed",
@@ -471,14 +478,39 @@ public struct SystemMonitorView: View {
             queueDepth: viewModel.ocrQueueDepth,
             etaText: viewModel.ocrEtaText,
             etaSuffixText: viewModel.ocrEtaSuffixText,
-            backlogAxisLabel: "backlog"
+            backlogAxisLabel: "backlog",
+            historyWindowMinutes: viewModel.ocrHistoryWindowMinutes,
+            maxVisibleBacklogBars: 10
+        )
+    }
+
+    private var encodingCardModel: ActivityMonitorCardModel {
+        ActivityMonitorCardModel(
+            icon: "video",
+            title: "Frame Encoding (Compression)",
+            statusText: viewModel.encodingBufferStatusBadgeText,
+            statusColor: viewModel.encodingBufferStatusColor,
+            metricTitle: "Frames encoded",
+            history: viewModel.encodingHistory,
+            completedLast30Minutes: viewModel.encodedLast30Min,
+            completedLabel: "encoded",
+            activeCount: nil,
+            activeLabel: nil,
+            pendingCount: viewModel.encodedPendingCount,
+            pendingLabel: "buffered",
+            queueDepth: viewModel.encodedQueueDepth,
+            etaText: viewModel.encodingEtaText,
+            etaSuffixText: viewModel.encodingEtaSuffixText,
+            backlogAxisLabel: "buffer",
+            historyWindowMinutes: viewModel.encodingHistoryWindowMinutes,
+            maxVisibleBacklogBars: 3
         )
     }
 
     private var videoRewritingCardModel: ActivityMonitorCardModel {
         ActivityMonitorCardModel(
             icon: "film.stack",
-            title: "Video Rewriting",
+            title: "Video Rewriting (Redaction)",
             statusText: viewModel.rewriteStatusBadgeText,
             statusColor: viewModel.rewriteStatusColor,
             metricTitle: "Frames rewritten",
@@ -492,7 +524,9 @@ public struct SystemMonitorView: View {
             queueDepth: viewModel.rewriteQueueDepth,
             etaText: viewModel.rewriteEtaText,
             etaSuffixText: viewModel.rewriteEtaSuffixText,
-            backlogAxisLabel: "queue"
+            backlogAxisLabel: "queue",
+            historyWindowMinutes: viewModel.rewriteHistoryWindowMinutes,
+            maxVisibleBacklogBars: 3
         )
     }
 
@@ -514,12 +548,12 @@ public struct SystemMonitorView: View {
                 statusBadge(text: model.statusText, color: model.statusColor)
             }
             .padding(.horizontal, 20)
-            .padding(.vertical, 14)
+                .padding(.vertical, 8)
 
             Divider()
                 .background(Color.white.opacity(0.06))
 
-            VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 6) {
                     Text(model.metricTitle)
                         .font(.retraceCaption)
@@ -527,7 +561,7 @@ public struct SystemMonitorView: View {
                     Text("·")
                         .font(.retraceCaption2)
                         .foregroundColor(.retraceSecondary.opacity(0.5))
-                    Text("Last 30 min")
+                    Text("Last \(model.historyWindowMinutes) min")
                         .font(.retraceCaption2)
                         .foregroundColor(.retraceSecondary.opacity(0.7))
                     Spacer()
@@ -536,28 +570,29 @@ public struct SystemMonitorView: View {
                 ActivityBarChart(
                     dataPoints: model.history,
                     pendingCount: model.pendingCount,
-                    processingCount: model.activeCount,
+                    processingCount: model.activeCount ?? 0,
                     completedTint: model.completedTint,
                     activeTint: model.activeTint,
                     pendingTint: model.pendingTint,
                     backlogLabel: model.backlogAxisLabel,
+                    maxVisibleBacklogBars: model.maxVisibleBacklogBars,
                     hoveredIndex: hoveredIndex
                 )
-                .frame(height: 140)
+                .frame(height: 88)
             }
-            .padding(.vertical, 16)
+            .padding(.vertical, 8)
             .padding(.horizontal, 20)
 
             Divider()
                 .background(Color.white.opacity(0.06))
 
-            HStack(spacing: 16) {
+            HStack(spacing: 10) {
                 HStack(spacing: 4) {
                     Text("\(model.completedLast30Minutes)")
                         .font(.system(size: 14, weight: .semibold, design: .rounded))
                         .foregroundColor(model.completedTint)
                     if model.isIdle {
-                        Text("\(model.completedLabel) in the last 30 minutes")
+                        Text("\(model.completedLabel) in the last \(model.historyWindowMinutes) minutes")
                             .font(.retraceCaption2)
                             .foregroundColor(.retraceSecondary.opacity(0.7))
                     } else {
@@ -567,23 +602,25 @@ public struct SystemMonitorView: View {
                     }
                 }
 
-                if model.activeCount > 0 {
+                if let activeCount = model.activeCount,
+                   activeCount > 0,
+                   let activeLabel = model.activeLabel {
                     Circle()
                         .fill(Color.retraceSecondary.opacity(0.3))
                         .frame(width: 3, height: 3)
 
                     HStack(spacing: 4) {
-                        Text("\(model.activeCount)")
+                        Text("\(activeCount)")
                             .font(.system(size: 14, weight: .semibold, design: .rounded))
                             .foregroundColor(model.activeTint)
-                        Text(model.activeLabel)
+                        Text(activeLabel)
                             .font(.retraceCaption2)
                             .foregroundColor(.retraceSecondary.opacity(0.7))
                     }
                 }
 
                 if model.pendingCount > 0 {
-                    HStack(spacing: 16) {
+                    HStack(spacing: 10) {
                         Circle()
                             .fill(Color.retraceSecondary.opacity(0.3))
                             .frame(width: 3, height: 3)
@@ -619,7 +656,7 @@ public struct SystemMonitorView: View {
                     .transition(.opacity.combined(with: .move(edge: .trailing)))
                 }
             }
-            .padding(.vertical, 12)
+            .padding(.vertical, 8)
             .padding(.horizontal, 16)
             .animation(.spring(response: 0.28, dampingFraction: 0.84), value: model.pendingCount > 0)
             .animation(.spring(response: 0.28, dampingFraction: 0.84), value: model.queueDepth > 0)
@@ -640,11 +677,11 @@ public struct SystemMonitorView: View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 10) {
                 Image(systemName: "gauge.with.needle")
-                    .font(.retraceCallout)
+                    .font(.retraceHeadline)
                     .foregroundColor(.retraceSecondary)
 
                 Text("Process Resource Logs (last 12h)")
-                    .font(.retraceCalloutBold)
+                    .font(.retraceHeadline)
                     .foregroundColor(.retracePrimary)
 
                 Spacer()
@@ -686,6 +723,51 @@ public struct SystemMonitorView: View {
                 }
             }
             .padding(12)
+        }
+        .background(Color.white.opacity(0.02))
+        .cornerRadius(12)
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.white.opacity(0.06), lineWidth: 1)
+        )
+    }
+
+    private func processingPipelinesSection(isCompactLayout: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 10) {
+                Image(systemName: "arrow.triangle.branch")
+                    .font(.retraceHeadline)
+                    .foregroundColor(.retraceSecondary)
+
+                Text("Processing Pipelines")
+                    .font(.retraceHeadline)
+                    .foregroundColor(.retracePrimary)
+
+                Spacer()
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 14)
+            .padding(.bottom, 12)
+
+            Divider()
+                .background(Color.white.opacity(0.06))
+
+            VStack(alignment: .leading, spacing: 20) {
+                if isCompactLayout {
+                    frameEncodingSection
+                    videoRewritingSection
+                } else {
+                    HStack(alignment: .top, spacing: 18) {
+                        frameEncodingSection
+                            .frame(maxWidth: .infinity, alignment: .top)
+                        videoRewritingSection
+                            .frame(maxWidth: .infinity, alignment: .top)
+                    }
+                }
+
+                ocrProcessingSection
+            }
+            .padding(16)
         }
         .background(Color.white.opacity(0.02))
         .cornerRadius(12)
@@ -784,8 +866,8 @@ private struct ActivityMonitorCardModel {
     let history: [ProcessingDataPoint]
     let completedLast30Minutes: Int
     let completedLabel: String
-    let activeCount: Int
-    let activeLabel: String
+    let activeCount: Int?
+    let activeLabel: String?
     let pendingCount: Int
     let pendingLabel: String
     let queueDepth: Int
@@ -795,6 +877,8 @@ private struct ActivityMonitorCardModel {
     let activeTint: Color = .green
     let pendingTint: Color = .orange
     let backlogAxisLabel: String
+    let historyWindowMinutes: Int
+    let maxVisibleBacklogBars: Int
 
     var isIdle: Bool {
         queueDepth == 0
@@ -821,6 +905,7 @@ struct ActivityBarChart: View {
     let activeTint: Color
     let pendingTint: Color
     let backlogLabel: String
+    let maxVisibleBacklogBars: Int
     @Binding var hoveredIndex: Int?
 
     // Backlog hover state
@@ -828,7 +913,6 @@ struct ActivityBarChart: View {
 
     // Cap for each backlog bar and maximum number of visible backlog bars.
     private let backlogBarCap = 100
-    private let maxVisibleBacklogBars = 10
     private let standardTooltipEstimatedHeight: CGFloat = 56
     private let liveTooltipEstimatedHeight: CGFloat = 76
     private let tooltipGapAboveBar: CGFloat = 8
@@ -874,9 +958,14 @@ struct ActivityBarChart: View {
             let liveProcessedCount = dataPoints.last?.count ?? 0
             let liveTotalForScaling = liveProcessedCount + processingCount
 
-            // Scale based on max of historical data, live total, or backlog cap
+            // Scale based on the observed chart data, then round up to a "nice" axis value.
             let historicalMax = dataPoints.map(\.count).max() ?? 1
-            let maxValue = max(historicalMax, liveTotalForScaling, backlogBarCap, 1)
+            let maxValue = Self.yAxisUpperBound(
+                historicalMax: historicalMax,
+                liveTotal: liveTotalForScaling,
+                pendingCount: pendingCount,
+                backlogBarCap: backlogBarCap
+            )
 
             VStack(spacing: 0) {
                 HStack(alignment: .bottom, spacing: 0) {
@@ -1011,7 +1100,7 @@ struct ActivityBarChart: View {
                 HStack(spacing: 0) {
                     // Main chart labels
                     HStack {
-                        Text("-30m")
+                        Text("-\(max(dataPoints.count, 1))m")
                         Spacer()
                         Text("now")
                     }
@@ -1394,6 +1483,37 @@ struct ActivityBarChart: View {
         )
     }
 
+    static func yAxisUpperBound(
+        historicalMax: Int,
+        liveTotal: Int,
+        pendingCount: Int,
+        backlogBarCap: Int
+    ) -> Int {
+        let visibleBacklogMax = min(max(pendingCount, 0), max(backlogBarCap, 1))
+        let rawMax = max(historicalMax, liveTotal, visibleBacklogMax, 1)
+
+        guard rawMax > 1 else { return 1 }
+
+        let magnitude = pow(10.0, floor(log10(Double(rawMax))))
+        let normalized = Double(rawMax) / magnitude
+        let niceMultiplier: Double
+
+        switch normalized {
+        case ...1:
+            niceMultiplier = 1
+        case ...2:
+            niceMultiplier = 2
+        case ...3:
+            niceMultiplier = 3
+        case ...5:
+            niceMultiplier = 5
+        default:
+            niceMultiplier = 10
+        }
+
+        return Int(niceMultiplier * magnitude)
+    }
+
     static func clampedTooltipCenterX(
         anchorX: CGFloat,
         containerWidth: CGFloat,
@@ -1443,12 +1563,87 @@ struct ProcessingDataPoint: Identifiable {
     }
 }
 
+/// Shared rolling history state for a pipeline card.
+/// Supports both delayed historical bucket snapshots and live cumulative-total deltas.
+private struct ActivityPipelineHistory {
+    let windowMinutes: Int
+    var history: [ProcessingDataPoint]
+
+    private var minuteCounts: [Int: Int] = [:]
+    private var previousTotal = 0
+
+    init(windowMinutes: Int, now: Date = Date()) {
+        self.windowMinutes = windowMinutes
+
+        let nowKey = Self.minuteKey(for: now)
+        self.history = (0..<windowMinutes).reversed().map { minutesAgo in
+            let key = nowKey - minutesAgo
+            return ProcessingDataPoint(minute: Self.date(fromMinuteKey: key), count: 0)
+        }
+    }
+
+    var completedInWindow: Int {
+        history.reduce(0) { $0 + $1.count }
+    }
+
+    mutating func mergeHistoricalCounts(_ counts: [Int: Int], now: Date = Date()) {
+        let nowKey = Self.minuteKey(for: now)
+        for (minuteOffset, count) in counts where minuteOffset >= 0 && minuteOffset < windowMinutes {
+            let minuteKey = nowKey - minuteOffset
+            if minuteOffset == 0 {
+                // Historical fetches can arrive after live observations have already recorded
+                // current-minute progress. Keep the higher count so the bar never moves backward.
+                minuteCounts[minuteKey] = max(minuteCounts[minuteKey] ?? 0, count)
+            } else {
+                minuteCounts[minuteKey] = count
+            }
+        }
+        rebuildHistory(nowKey: nowKey)
+    }
+
+    mutating func recordObservedTotal(_ total: Int, now: Date = Date()) {
+        let newlyCompleted = total - previousTotal
+        if previousTotal > 0 && newlyCompleted > 0 {
+            let currentKey = Self.minuteKey(for: now)
+            minuteCounts[currentKey, default: 0] += newlyCompleted
+        }
+        previousTotal = total
+        rebuildHistory(nowKey: Self.minuteKey(for: now))
+    }
+
+    private mutating func rebuildHistory(nowKey: Int) {
+        history = (0..<windowMinutes).reversed().map { minutesAgo in
+            let key = nowKey - minutesAgo
+            return ProcessingDataPoint(
+                minute: Self.date(fromMinuteKey: key),
+                count: minuteCounts[key] ?? 0
+            )
+        }
+
+        let cutoffKey = nowKey - (windowMinutes + 1)
+        minuteCounts = minuteCounts.filter { $0.key > cutoffKey }
+    }
+
+    private static func minuteKey(for date: Date) -> Int {
+        Int(date.timeIntervalSince1970 / 60)
+    }
+
+    private static func date(fromMinuteKey key: Int) -> Date {
+        Date(timeIntervalSince1970: Double(key) * 60)
+    }
+}
+
 // MARK: - ViewModel
 
 protocol SystemMonitorDataProviding: AnyObject {
     func getQueueStatistics() async -> QueueStatistics?
     func getFramesProcessedPerMinute(lastMinutes: Int) async throws -> [Int: Int]
+    func getFramesEncodedPerMinute(lastMinutes: Int) async throws -> [Int: Int]
     func getFramesRewrittenPerMinute(lastMinutes: Int) async throws -> [Int: Int]
+    func getEncodingStatistics() async -> (
+        queueDepth: Int,
+        pendingCount: Int
+    )?
     func getCurrentPowerState() -> (source: PowerStateMonitor.PowerSource, isPaused: Bool)
     var isSystemMonitorRecordingActive: Bool { get }
 }
@@ -1473,6 +1668,8 @@ class SystemMonitorViewModel: ObservableObject {
     @Published var ocrQueueDepth: Int = 0
     @Published var ocrPendingCount: Int = 0
     @Published var ocrProcessingCount: Int = 0
+    @Published var encodedQueueDepth: Int = 0
+    @Published var encodedPendingCount: Int = 0
     @Published var rewriteQueueDepth: Int = 0
     @Published var rewritePendingCount: Int = 0
     @Published var rewriteProcessingCount: Int = 0
@@ -1487,9 +1684,11 @@ class SystemMonitorViewModel: ObservableObject {
     @Published var isRecordingActive: Bool = false
 
     // Chart data
-    @Published var ocrProcessingHistory: [ProcessingDataPoint] = []
-    @Published var rewriteHistory: [ProcessingDataPoint] = []
+    @Published private var ocrHistoryState = ActivityPipelineHistory(windowMinutes: 30)
+    @Published private var encodingHistoryState = ActivityPipelineHistory(windowMinutes: 15)
+    @Published private var rewriteHistoryState = ActivityPipelineHistory(windowMinutes: 15)
     @Published var hoveredOCRBarIndex: Int? = nil
+    @Published var hoveredEncodingBarIndex: Int? = nil
     @Published var hoveredRewriteBarIndex: Int? = nil
 
     // Animation
@@ -1500,15 +1699,8 @@ class SystemMonitorViewModel: ObservableObject {
     private var monitoringTask: Task<Void, Never>?
     private var historicalLoadTask: Task<Void, Never>?
     private var pulseAnimationTask: Task<Void, Never>?
-    private let historyWindowMinutes = 30
 
-    // Track frames processed per minute using minute key (minutes since epoch)
-    // Using Int key instead of Date to avoid timezone/rounding issues at minute boundaries
-    private var ocrMinuteProcessingCounts: [Int: Int] = [:]
-    private var rewriteMinuteCounts: [Int: Int] = [:]
     private var ocrQueueDepthSamples: [(timestamp: Date, depth: Int)] = []
-    private var previousTotalProcessed: Int = 0
-    private var previousTotalRewritten: Int = 0
     private let backlogNudgeThreshold = 100
     private let queueDepthSampleWindowSeconds: TimeInterval = 45
     private let minimumQueueTrendWindowSeconds: TimeInterval = 12
@@ -1520,37 +1712,27 @@ class SystemMonitorViewModel: ObservableObject {
 
     init(dataProvider: any SystemMonitorDataProviding) {
         self.dataProvider = dataProvider
-        initializeHistories()
     }
 
-    /// Convert a Date to a minute key (minutes since epoch)
-    private func minuteKey(for date: Date) -> Int {
-        Int(date.timeIntervalSince1970 / 60)
-    }
+    var ocrHistoryWindowMinutes: Int { ocrHistoryState.windowMinutes }
+    var encodingHistoryWindowMinutes: Int { encodingHistoryState.windowMinutes }
+    var rewriteHistoryWindowMinutes: Int { rewriteHistoryState.windowMinutes }
 
-    /// Convert a minute key back to a Date (start of that minute)
-    private func date(fromMinuteKey key: Int) -> Date {
-        Date(timeIntervalSince1970: Double(key) * 60)
-    }
+    var ocrProcessingHistory: [ProcessingDataPoint] { ocrHistoryState.history }
+    var encodingHistory: [ProcessingDataPoint] { encodingHistoryState.history }
+    var rewriteHistory: [ProcessingDataPoint] { rewriteHistoryState.history }
 
-    private func initializeHistories() {
-        // Create empty data points (one per minute in the visible window).
-        let nowKey = minuteKey(for: Date())
-        let emptyHistory = (0..<historyWindowMinutes).reversed().map { minutesAgo in
-            let key = nowKey - minutesAgo
-            return ProcessingDataPoint(minute: date(fromMinuteKey: key), count: 0)
-        }
-        ocrProcessingHistory = emptyHistory
-        rewriteHistory = emptyHistory
-    }
-
-    /// Total frames processed in the last 30 minutes (sum of history)
+    /// Total frames processed in the current OCR history window (sum of history)
     var ocrProcessedLast30Min: Int {
-        ocrProcessingHistory.reduce(0) { $0 + $1.count }
+        ocrHistoryState.completedInWindow
     }
 
     var rewrittenLast30Min: Int {
-        rewriteHistory.reduce(0) { $0 + $1.count }
+        rewriteHistoryState.completedInWindow
+    }
+
+    var encodedLast30Min: Int {
+        encodingHistoryState.completedInWindow
     }
 
     var ocrStatusColor: Color {
@@ -1578,11 +1760,19 @@ class SystemMonitorViewModel: ObservableObject {
     }
 
     var rewriteStatusColor: Color {
-        rewriteQueueDepth > 0 ? .green : .gray
+        rewriteProcessingCount > 0 ? .green : .gray
     }
 
     var rewriteStatusBadgeText: String {
-        rewriteQueueDepth > 0 ? "Rewriting" : "Idle"
+        rewriteProcessingCount > 0 ? "Rewriting" : "Idle"
+    }
+
+    var encodingBufferStatusColor: Color {
+        encodedQueueDepth > 0 ? .retraceAccent : .gray
+    }
+
+    var encodingBufferStatusBadgeText: String {
+        encodedQueueDepth > 0 ? "Encoding" : "Idle"
     }
 
     private func recentCompletionRateFramesPerMinute(for history: [ProcessingDataPoint]) -> Double? {
@@ -1646,6 +1836,13 @@ class SystemMonitorViewModel: ObservableObject {
         etaText(queueDepth: ocrQueueDepth, drainRate: effectiveOCRDrainRateFramesPerMinute)
     }
 
+    var encodingEtaText: String {
+        etaText(
+            queueDepth: encodedQueueDepth,
+            drainRate: recentCompletionRateFramesPerMinute(for: encodingHistory)
+        )
+    }
+
     var ocrEtaSuffixText: String {
         if isPausedForBattery || !ocrEnabled {
             return "processing time"
@@ -1654,6 +1851,10 @@ class SystemMonitorViewModel: ObservableObject {
             return "backlog growing"
         }
         return "remaining"
+    }
+
+    var encodingEtaSuffixText: String {
+        "remaining"
     }
 
     var rewriteEtaText: String {
@@ -1725,27 +1926,16 @@ class SystemMonitorViewModel: ObservableObject {
     }
 
     private func loadHistoricalData() async {
-        let nowKey = minuteKey(for: Date())
-
         if let historicalCounts = try? await dataProvider.getFramesProcessedPerMinute(
-            lastMinutes: historyWindowMinutes
+            lastMinutes: ocrHistoryWindowMinutes
         ), !Task.isCancelled {
-            mergeHistoricalCounts(historicalCounts, into: &ocrMinuteProcessingCounts, nowKey: nowKey)
-            updateOCRProcessingHistory()
+            ocrHistoryState.mergeHistoricalCounts(historicalCounts)
         }
 
         if let rewriteCounts = try? await dataProvider.getFramesRewrittenPerMinute(
-            lastMinutes: historyWindowMinutes
+            lastMinutes: rewriteHistoryWindowMinutes
         ), !Task.isCancelled {
-            mergeHistoricalCounts(rewriteCounts, into: &rewriteMinuteCounts, nowKey: nowKey)
-            updateRewriteHistory()
-        }
-    }
-
-    private func mergeHistoricalCounts(_ counts: [Int: Int], into target: inout [Int: Int], nowKey: Int) {
-        for (minuteOffset, count) in counts where minuteOffset >= 0 && minuteOffset < historyWindowMinutes {
-            let key = nowKey - minuteOffset
-            target[key] = count
+            rewriteHistoryState.mergeHistoricalCounts(rewriteCounts)
         }
     }
 
@@ -1761,25 +1951,22 @@ class SystemMonitorViewModel: ObservableObject {
             rewritePendingCount = stats.rewritePendingCount
             rewriteProcessingCount = stats.rewriteProcessingCount
 
-            // Calculate frames processed since last update
-            let newlyProcessed = stats.totalProcessed - previousTotalProcessed
-            if previousTotalProcessed > 0 && newlyProcessed > 0 {
-                let currentKey = minuteKey(for: Date())
-                ocrMinuteProcessingCounts[currentKey, default: 0] += newlyProcessed
-            }
-            previousTotalProcessed = stats.totalProcessed
             ocrTotalProcessed = stats.totalProcessed
-
-            let newlyRewritten = stats.totalRewritten - previousTotalRewritten
-            if previousTotalRewritten > 0 && newlyRewritten > 0 {
-                let currentKey = minuteKey(for: Date())
-                rewriteMinuteCounts[currentKey, default: 0] += newlyRewritten
-            }
-            previousTotalRewritten = stats.totalRewritten
             totalRewritten = stats.totalRewritten
 
-            updateOCRProcessingHistory()
-            updateRewriteHistory()
+            ocrHistoryState.recordObservedTotal(stats.totalProcessed)
+            rewriteHistoryState.recordObservedTotal(stats.totalRewritten)
+        }
+
+        if let encodingStats = await dataProvider.getEncodingStatistics() {
+            encodedQueueDepth = encodingStats.queueDepth
+            encodedPendingCount = encodingStats.pendingCount
+        }
+
+        if let encodedCounts = try? await dataProvider.getFramesEncodedPerMinute(
+            lastMinutes: encodingHistoryWindowMinutes
+        ), !Task.isCancelled {
+            encodingHistoryState.mergeHistoricalCounts(encodedCounts)
         }
 
         #if DEBUG
@@ -1823,40 +2010,6 @@ class SystemMonitorViewModel: ObservableObject {
         }
     }
     #endif
-
-    private func updateOCRProcessingHistory() {
-        let nowKey = minuteKey(for: Date())
-
-        var newHistory: [ProcessingDataPoint] = []
-
-        for minutesAgo in (0..<historyWindowMinutes).reversed() {
-            let key = nowKey - minutesAgo
-            let count = ocrMinuteProcessingCounts[key] ?? 0
-            newHistory.append(ProcessingDataPoint(minute: date(fromMinuteKey: key), count: count))
-        }
-
-        ocrProcessingHistory = newHistory
-
-        let cutoffKey = nowKey - (historyWindowMinutes + 1)
-        ocrMinuteProcessingCounts = ocrMinuteProcessingCounts.filter { $0.key > cutoffKey }
-    }
-
-    private func updateRewriteHistory() {
-        let nowKey = minuteKey(for: Date())
-
-        var newHistory: [ProcessingDataPoint] = []
-
-        for minutesAgo in (0..<historyWindowMinutes).reversed() {
-            let key = nowKey - minutesAgo
-            let count = rewriteMinuteCounts[key] ?? 0
-            newHistory.append(ProcessingDataPoint(minute: date(fromMinuteKey: key), count: count))
-        }
-
-        rewriteHistory = newHistory
-
-        let cutoffKey = nowKey - (historyWindowMinutes + 1)
-        rewriteMinuteCounts = rewriteMinuteCounts.filter { $0.key > cutoffKey }
-    }
 
     private func recordQueueDepthSample(_ depth: Int, at timestamp: Date = Date()) {
         ocrQueueDepthSamples.append((timestamp: timestamp, depth: max(depth, 0)))

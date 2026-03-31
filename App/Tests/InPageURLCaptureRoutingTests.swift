@@ -303,7 +303,6 @@ final class DBStorageSnapshotEstimateTests: XCTestCase {
                 segmentID: AppSegmentID(value: segmentID),
                 videoID: VideoSegmentID(value: videoID),
                 frameIndexInSegment: 0,
-                encodingStatus: .success,
                 metadata: .empty,
                 source: .native
             )
@@ -543,7 +542,6 @@ final class DataAdapterRewindBoundaryTests: XCTestCase {
                 segmentID: AppSegmentID(value: segmentID),
                 videoID: VideoSegmentID(value: videoID),
                 frameIndexInSegment: 0,
-                encodingStatus: .success,
                 metadata: FrameMetadata(
                     appBundleID: bundleID,
                     appName: bundleID,
@@ -2125,7 +2123,6 @@ final class CrashRecoveryStartupTests: XCTestCase {
                     segmentID: AppSegmentID(value: segmentID),
                     videoID: VideoSegmentID(value: insertedVideoID),
                     frameIndexInSegment: 0,
-                    encodingStatus: .success,
                     metadata: .empty,
                     source: .native
                 )

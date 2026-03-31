@@ -3589,6 +3589,17 @@ public actor DatabaseManager: DatabaseProtocol {
         )
     }
 
+    /// Get count of frames encoded/readable per minute for the last N minutes.
+    /// Returns dictionary of [minuteOffset: count] where offset 0 = current minute.
+    public func getFramesEncodedPerMinute(lastMinutes: Int) async throws -> [Int: Int] {
+        try await getFrameCountsPerMinute(
+            lastMinutes: lastMinutes,
+            timestampColumn: "encodedAt",
+            extraWhereClause: "",
+            logLabel: "encoded"
+        )
+    }
+
     /// Get count of frames rewritten per minute for the last N minutes.
     /// Returns dictionary of [minuteOffset: count] where offset 0 = current minute.
     public func getFramesRewrittenPerMinute(lastMinutes: Int) async throws -> [Int: Int] {
@@ -3780,8 +3791,9 @@ public actor DatabaseManager: DatabaseProtocol {
     /// Called when frame is confirmed to be written to video file
     public func markFrameReadable(frameID: Int64) async throws {
         try withTracedDatabaseOperation("mark_frame_readable") { db in
+            let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
             // Only update if status is 4 (not yet readable)
-            let sql = "UPDATE frame SET processingStatus = 0 WHERE id = ? AND processingStatus = 4;"
+            let sql = "UPDATE frame SET processingStatus = 0, encodedAt = \(nowMs) WHERE id = ? AND processingStatus = 4;"
             var stmt: OpaquePointer?
             defer { sqlite3_finalize(stmt) }
 
@@ -3795,6 +3807,71 @@ public actor DatabaseManager: DatabaseProtocol {
                 throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
             }
         }
+    }
+
+    /// Count frames that are still waiting to become readable from the active video writer.
+    public func getUnreadableFrameCount() async throws -> Int {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let sql = "SELECT COUNT(*) FROM frame WHERE processingStatus = 4;"
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return 0 }
+        return Int(sqlite3_column_int64(stmt, 0))
+    }
+
+    /// Count recently created frames that are still waiting to become readable from disk.
+    /// This is used as a short-lived encoding buffer backlog signal, not a durable queue length.
+    public func getUnreadableFrameCount(withinLastMinutes windowMinutes: Int) async throws -> Int {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let clampedWindowMinutes = max(windowMinutes, 1)
+        let cutoffMs = Int64(Date().timeIntervalSince1970 * 1000) - Int64(clampedWindowMinutes * 60 * 1000)
+        let sql = """
+            SELECT COUNT(*)
+            FROM frame
+            WHERE processingStatus = 4
+              AND createdAt >= ?;
+            """
+
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+
+        sqlite3_bind_int64(stmt, 1, cutoffMs)
+
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return 0 }
+        return Int(sqlite3_column_int64(stmt, 0))
+    }
+
+    /// Count frames that have already been confirmed readable from the video file.
+    public func getEncodedFrameCount() async throws -> Int {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let sql = "SELECT COUNT(*) FROM frame WHERE encodedAt IS NOT NULL;"
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return 0 }
+        return Int(sqlite3_column_int64(stmt, 0))
     }
 
     /// Get processing status for multiple frames in a single query

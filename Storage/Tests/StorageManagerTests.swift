@@ -3574,7 +3574,6 @@ private actor RecoveryTestDatabase: DatabaseProtocol {
             segmentID: frame.segmentID,
             videoID: frame.videoID,
             frameIndexInSegment: frame.frameIndexInSegment,
-            encodingStatus: frame.encodingStatus,
             metadata: frame.metadata,
             source: frame.source
         )
@@ -3676,7 +3675,6 @@ private actor RecoveryTestDatabase: DatabaseProtocol {
             segmentID: existing.segmentID,
             videoID: videoID,
             frameIndexInSegment: frameIndex,
-            encodingStatus: existing.encodingStatus,
             metadata: existing.metadata,
             source: existing.source
         )
@@ -3763,7 +3761,6 @@ private actor RecoveryTestDatabase: DatabaseProtocol {
                 segmentID: frame.segmentID,
                 videoID: VideoSegmentID(value: 0),
                 frameIndexInSegment: frame.frameIndexInSegment,
-                encodingStatus: frame.encodingStatus,
                 metadata: frame.metadata,
                 source: frame.source
             )

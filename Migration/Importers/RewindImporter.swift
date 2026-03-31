@@ -415,7 +415,6 @@ public actor RewindImporter: MigrationProtocol {
                     segmentID: appSegmentID,  // Link to app session (segment table)
                     videoID: videoSegmentID,  // Link to video chunk (video table)
                     frameIndexInSegment: frameIndex,
-                    encodingStatus: .success,
                     metadata: extractedText.metadata,
                     source: .rewind
                 )

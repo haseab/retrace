@@ -218,7 +218,7 @@ extension Schema {
     ///   - INTEGER videoId (FK video.id ON DELETE SET NULL)
     ///   - INTEGER videoFrameIndex
     ///   - INTEGER isStarred NOT NULL DEFAULT 0
-    ///   - TEXT encodingStatus
+    ///   - INTEGER encodedAt (ms, nullable)
     ///
     /// node: OCR text bounding boxes
     ///   - INTEGER id (PK, auto-increment)
@@ -314,11 +314,12 @@ extension Schema {
     ///   - TEXT path NOT NULL
     ///   - TEXT fileType NOT NULL
     ///
-    /// INDEXES (21 total, Rewind-compatible naming):
+    /// INDEXES (selected, Rewind-compatible naming):
     /// - segment: index_segment_on_appid, index_segment_on_endtime, index_segment_on_starttime,
     ///            index_segment_on_windowname (partial), index_segment_on_browserurl (partial)
-    /// - frame: index_frame_on_createdat, index_frame_on_encodingstatus_createdat,
-    ///          index_frame_on_isstarred_createdat, index_frame_on_segmentid_createdat, index_frame_on_videoid
+    /// - frame: index_frame_on_createdat,
+    ///          index_frame_on_isstarred_createdat, index_frame_on_segmentid_createdat, index_frame_on_videoid,
+    ///          idx_frame_encoded_at
     /// - node: index_node_on_frameid, index_node_on_windowindex (partial)
     /// - transcript_word: index_transcript_word_on_segmentid_fulltextoffset
     /// - event: index_event_on_calendarseriesid, index_event_on_status

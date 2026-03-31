@@ -371,7 +371,6 @@ final class InPageURLMetadataResolutionTests: XCTestCase {
                 segmentID: AppSegmentID(value: segmentID),
                 videoID: VideoSegmentID(value: insertedVideoID),
                 frameIndexInSegment: 0,
-                encodingStatus: .success,
                 metadata: FrameMetadata(
                     appBundleID: "com.apple.Safari",
                     appName: "Safari",
@@ -403,7 +402,6 @@ final class InPageURLMetadataResolutionTests: XCTestCase {
                 segmentID: AppSegmentID(value: segmentID),
                 videoID: videoID,
                 frameIndexInSegment: frameIndex,
-                encodingStatus: .success,
                 metadata: FrameMetadata(
                     appBundleID: "com.apple.Safari",
                     appName: "Safari",

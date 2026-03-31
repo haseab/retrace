@@ -2509,10 +2509,42 @@ public actor AppCoordinator {
         try await services.database.getFramesProcessedPerMinute(lastMinutes: lastMinutes)
     }
 
+    /// Get frames encoded/readable per minute for the last N minutes.
+    /// Returns dictionary of [minuteOffset: count] where minuteOffset 0 = current minute.
+    public func getFramesEncodedPerMinute(lastMinutes: Int) async throws -> [Int: Int] {
+        try await services.database.getFramesEncodedPerMinute(lastMinutes: lastMinutes)
+    }
+
     /// Get frames rewritten per minute for the last N minutes.
     /// Returns dictionary of [minuteOffset: count] where minuteOffset 0 = current minute.
     public func getFramesRewrittenPerMinute(lastMinutes: Int) async throws -> [Int: Int] {
         try await services.database.getFramesRewrittenPerMinute(lastMinutes: lastMinutes)
+    }
+
+    /// Get current frame-encoding buffer backlog.
+    /// The backlog is derived from frames that were created recently but are still not readable
+    /// from the encoded video file, so the counts describe short-lived buffer lag rather than a
+    /// durable worker queue.
+    public func getEncodingStatistics() async -> (
+        queueDepth: Int,
+        pendingCount: Int
+    )? {
+        // Intentionally use a short recency window here. `processingStatus = 4` currently
+        // conflates "buffered but still flushing to disk" with "older frame that may be stuck
+        // or otherwise never became readable." For the System Monitor card we want a signal for
+        // recent encoder buffer pressure, not a durable count that can stay pinned forever because
+        // of one stale unreadable frame. Once buffering/stalled states are modeled separately,
+        // this heuristic window should be replaced with explicit state-based accounting.
+        let backlogWindowMinutes = 5
+
+        guard let queueDepth = try? await services.database.getUnreadableFrameCount(withinLastMinutes: backlogWindowMinutes) else {
+            return nil
+        }
+
+        return (
+            queueDepth: queueDepth,
+            pendingCount: queueDepth
+        )
     }
 
     // MARK: - Search Interface

@@ -1514,6 +1514,67 @@ public actor DataAdapter {
 
     // MARK: - Private SQL Query Methods
 
+    private struct FrameWithVideoProjection {
+        let encodedAtColumn: String
+        let processingStatusColumn: String
+        let redactionReasonColumn: String
+        let captureTriggerColumn: String
+        let mousePositionColumn: String
+        let scrollPositionColumn: String
+        let videoCurrentTimeColumn: String
+    }
+
+    private static func frameWithVideoProjection(
+        source: FrameSource,
+        tableAlias: String
+    ) -> FrameWithVideoProjection {
+        if source == .rewind {
+            return FrameWithVideoProjection(
+                encodedAtColumn: "NULL as encodedAt",
+                processingStatusColumn: "-1 as processingStatus",
+                redactionReasonColumn: "NULL as redactionReason",
+                captureTriggerColumn: "NULL as captureTrigger",
+                mousePositionColumn: "NULL",
+                scrollPositionColumn: "NULL",
+                videoCurrentTimeColumn: "NULL"
+            )
+        }
+
+        return FrameWithVideoProjection(
+            encodedAtColumn: "\(tableAlias).encodedAt",
+            processingStatusColumn: "\(tableAlias).processingStatus",
+            redactionReasonColumn: "\(tableAlias).redactionReason",
+            captureTriggerColumn: "\(tableAlias).capture_trigger",
+            mousePositionColumn: "\(tableAlias).mousePosition",
+            scrollPositionColumn: "\(tableAlias).scrollPosition",
+            videoCurrentTimeColumn: "\(tableAlias).videoCurrentTime"
+        )
+    }
+
+    private static func frameWithVideoSubqueryProjection(source: FrameSource) -> FrameWithVideoProjection {
+        if source == .rewind {
+            return FrameWithVideoProjection(
+                encodedAtColumn: "NULL as encodedAt",
+                processingStatusColumn: "-1 as processingStatus",
+                redactionReasonColumn: "NULL as redactionReason",
+                captureTriggerColumn: "NULL as captureTrigger",
+                mousePositionColumn: "NULL as mousePosition",
+                scrollPositionColumn: "NULL as scrollPosition",
+                videoCurrentTimeColumn: "NULL as videoCurrentTime"
+            )
+        }
+
+        return FrameWithVideoProjection(
+            encodedAtColumn: "encodedAt",
+            processingStatusColumn: "processingStatus",
+            redactionReasonColumn: "redactionReason",
+            captureTriggerColumn: "capture_trigger",
+            mousePositionColumn: "mousePosition",
+            scrollPositionColumn: "scrollPosition",
+            videoCurrentTimeColumn: "videoCurrentTime"
+        )
+    }
+
     private static func queryFramesWithVideoInfo(
         from startDate: Date,
         to endDate: Date,
@@ -1549,9 +1610,7 @@ public actor DataAdapter {
 
         let whereClause = whereClauses.joined(separator: " AND ")
 
-        // Rewind database doesn't have processingStatus column
-        let processingStatusColumn = config.source == .rewind ? "-1 as processingStatus" : "f.processingStatus"
-        let redactionReasonColumn = config.source == .rewind ? "NULL as redactionReason" : "f.redactionReason"
+        let projection = Self.frameWithVideoProjection(source: config.source, tableAlias: "f")
 
         let sql = """
             SELECT
@@ -1560,16 +1619,16 @@ public actor DataAdapter {
                 f.segmentId,
                 f.videoId,
                 f.videoFrameIndex,
-                f.encodingStatus,
-                \(processingStatusColumn),
-                \(redactionReasonColumn),
-                \(config.source == .rewind ? "NULL as captureTrigger" : "f.capture_trigger"),
+                \(projection.encodedAtColumn),
+                \(projection.processingStatusColumn),
+                \(projection.redactionReasonColumn),
+                \(projection.captureTriggerColumn),
                 s.bundleID,
                 s.windowName,
                 s.browserUrl,
-                \(config.source == .rewind ? "NULL" : "f.mousePosition"),
-                \(config.source == .rewind ? "NULL" : "f.scrollPosition"),
-                \(config.source == .rewind ? "NULL" : "f.videoCurrentTime"),
+                \(projection.mousePositionColumn),
+                \(projection.scrollPositionColumn),
+                \(projection.videoCurrentTimeColumn),
                 v.path,
                 v.frameRate,
                 v.width,
@@ -1628,22 +1687,18 @@ public actor DataAdapter {
             return []
         }
 
-        // Rewind database doesn't have processingStatus column
-        let processingStatusColumn = config.source == .rewind ? "-1 as processingStatus" : "f.processingStatus"
-        let redactionReasonColumn = config.source == .rewind ? "NULL as redactionReason" : "f.redactionReason"
-        let subqueryProcessingStatus = config.source == .rewind ? "-1 as processingStatus" : "processingStatus"
-        let subqueryRedactionReason = config.source == .rewind ? "NULL as redactionReason" : "redactionReason"
-        let subqueryVideoCurrentTime = config.source == .rewind ? "NULL as videoCurrentTime" : "videoCurrentTime"
+        let projection = Self.frameWithVideoProjection(source: config.source, tableAlias: "f")
+        let subqueryProjection = Self.frameWithVideoSubqueryProjection(source: config.source)
         let boundaryFilter = Self.buildSourceBoundaryClause(config: config, columnName: "createdAt")
         let boundaryWhereClause = boundaryFilter.clause.map { "WHERE \($0)" } ?? ""
 
         let sql = """
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
-                   \(config.source == .rewind ? "NULL as captureTrigger" : "f.capture_trigger"),
-                   s.bundleID, s.windowName, s.browserUrl, \(config.source == .rewind ? "NULL" : "f.mousePosition"), \(config.source == .rewind ? "NULL" : "f.scrollPosition"), \(config.source == .rewind ? "NULL" : "f.videoCurrentTime"),
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, \(projection.encodedAtColumn), \(projection.processingStatusColumn), \(projection.redactionReasonColumn),
+                   \(projection.captureTriggerColumn),
+                   s.bundleID, s.windowName, s.browserUrl, \(projection.mousePositionColumn), \(projection.scrollPositionColumn), \(projection.videoCurrentTimeColumn),
                    v.path, v.frameRate, v.width, v.height
             FROM (
-                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, \(subqueryProcessingStatus), \(subqueryRedactionReason), \(config.source == .rewind ? "NULL as captureTrigger" : "capture_trigger"), \(config.source == .rewind ? "NULL as mousePosition" : "mousePosition"), \(config.source == .rewind ? "NULL as scrollPosition" : "scrollPosition"), \(subqueryVideoCurrentTime)
+                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, \(subqueryProjection.encodedAtColumn), \(subqueryProjection.processingStatusColumn), \(subqueryProjection.redactionReasonColumn), \(subqueryProjection.captureTriggerColumn), \(subqueryProjection.mousePositionColumn), \(subqueryProjection.scrollPositionColumn), \(subqueryProjection.videoCurrentTimeColumn)
                 FROM frame
                 \(boundaryWhereClause)
                 ORDER BY createdAt DESC
@@ -1715,16 +1770,15 @@ public actor DataAdapter {
             ? ""
             : "WHERE " + filterComponents.whereClauses.joined(separator: " AND ")
 
-        // Rewind database doesn't have processingStatus column
-        let processingStatusColumn = config.source == .rewind ? "-1 as processingStatus" : "f.processingStatus"
-        let redactionReasonColumn = config.source == .rewind ? "NULL as redactionReason" : "f.redactionReason"
+        // Normalize native-only frame columns across Retrace and Rewind.
+        let projection = Self.frameWithVideoProjection(source: config.source, tableAlias: "f")
 
         // CTE filters tags first (small set), then joins with frames using segmentId index
         let sql = """
             \(filterComponents.combinedCTE)
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
-                   \(config.source == .rewind ? "NULL as captureTrigger" : "f.capture_trigger"),
-                   s.bundleID, s.windowName, s.browserUrl, \(config.source == .rewind ? "NULL" : "f.mousePosition"), \(config.source == .rewind ? "NULL" : "f.scrollPosition"), \(config.source == .rewind ? "NULL" : "f.videoCurrentTime"),
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, \(projection.encodedAtColumn), \(projection.processingStatusColumn), \(projection.redactionReasonColumn),
+                   \(projection.captureTriggerColumn),
+                   s.bundleID, s.windowName, s.browserUrl, \(projection.mousePositionColumn), \(projection.scrollPositionColumn), \(projection.videoCurrentTimeColumn),
                    v.path, v.frameRate, v.width, v.height
             FROM frame f
             INNER JOIN segment s ON f.segmentId = s.id
@@ -1904,13 +1958,12 @@ public actor DataAdapter {
 
         let whereClause = whereClauses.joined(separator: " AND ")
 
-        let processingStatusColumn = config.source == .rewind ? "-1 as processingStatus" : "f.processingStatus"
-        let redactionReasonColumn = config.source == .rewind ? "NULL as redactionReason" : "f.redactionReason"
+        let projection = Self.frameWithVideoProjection(source: config.source, tableAlias: "f")
 
         let sql = """
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
-                   \(config.source == .rewind ? "NULL as captureTrigger" : "f.capture_trigger"),
-                   s.bundleID, s.windowName, s.browserUrl, \(config.source == .rewind ? "NULL" : "f.mousePosition"), \(config.source == .rewind ? "NULL" : "f.scrollPosition"), \(config.source == .rewind ? "NULL" : "f.videoCurrentTime"),
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, \(projection.encodedAtColumn), \(projection.processingStatusColumn), \(projection.redactionReasonColumn),
+                   \(projection.captureTriggerColumn),
+                   s.bundleID, s.windowName, s.browserUrl, \(projection.mousePositionColumn), \(projection.scrollPositionColumn), \(projection.videoCurrentTimeColumn),
                    v.path, v.frameRate, v.width, v.height
             FROM frame f
             INNER JOIN segment s ON f.segmentId = s.id
@@ -1985,16 +2038,15 @@ public actor DataAdapter {
         whereClauses.append(contentsOf: filterComponents.whereClauses)
         let whereClause = whereClauses.joined(separator: " AND ")
 
-        // Rewind database doesn't have processingStatus column
-        let processingStatusColumn = config.source == .rewind ? "-1 as processingStatus" : "f.processingStatus"
-        let redactionReasonColumn = config.source == .rewind ? "NULL as redactionReason" : "f.redactionReason"
+        // Normalize native-only frame columns across Retrace and Rewind.
+        let projection = Self.frameWithVideoProjection(source: config.source, tableAlias: "f")
 
         // CTE filters tags first (small set), then joins with frames using segmentId index
         let sql = """
             \(filterComponents.combinedCTE)
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
-                   \(config.source == .rewind ? "NULL as captureTrigger" : "f.capture_trigger"),
-                   s.bundleID, s.windowName, s.browserUrl, \(config.source == .rewind ? "NULL" : "f.mousePosition"), \(config.source == .rewind ? "NULL" : "f.scrollPosition"), \(config.source == .rewind ? "NULL" : "f.videoCurrentTime"),
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, \(projection.encodedAtColumn), \(projection.processingStatusColumn), \(projection.redactionReasonColumn),
+                   \(projection.captureTriggerColumn),
+                   s.bundleID, s.windowName, s.browserUrl, \(projection.mousePositionColumn), \(projection.scrollPositionColumn), \(projection.videoCurrentTimeColumn),
                    v.path, v.frameRate, v.width, v.height
             FROM frame f
             INNER JOIN segment s ON f.segmentId = s.id
@@ -2059,16 +2111,15 @@ public actor DataAdapter {
         whereClauses.append(contentsOf: filterComponents.whereClauses)
         let whereClause = whereClauses.joined(separator: " AND ")
 
-        // Rewind database doesn't have processingStatus column
-        let processingStatusColumn = config.source == .rewind ? "-1 as processingStatus" : "f.processingStatus"
-        let redactionReasonColumn = config.source == .rewind ? "NULL as redactionReason" : "f.redactionReason"
+        // Normalize native-only frame columns across Retrace and Rewind.
+        let projection = Self.frameWithVideoProjection(source: config.source, tableAlias: "f")
 
         // CTE filters tags first (small set), then joins with frames using segmentId index
         let sql = """
             \(filterComponents.combinedCTE)
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
-                   \(config.source == .rewind ? "NULL as captureTrigger" : "f.capture_trigger"),
-                   s.bundleID, s.windowName, s.browserUrl, \(config.source == .rewind ? "NULL" : "f.mousePosition"), \(config.source == .rewind ? "NULL" : "f.scrollPosition"), \(config.source == .rewind ? "NULL" : "f.videoCurrentTime"),
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, \(projection.encodedAtColumn), \(projection.processingStatusColumn), \(projection.redactionReasonColumn),
+                   \(projection.captureTriggerColumn),
+                   s.bundleID, s.windowName, s.browserUrl, \(projection.mousePositionColumn), \(projection.scrollPositionColumn), \(projection.videoCurrentTimeColumn),
                    v.path, v.frameRate, v.width, v.height
             FROM frame f
             INNER JOIN segment s ON f.segmentId = s.id
@@ -2139,16 +2190,15 @@ public actor DataAdapter {
         whereClauses.append(contentsOf: filterComponents.whereClauses)
         let whereClause = whereClauses.joined(separator: " AND ")
 
-        // Rewind database doesn't have processingStatus column
-        let processingStatusColumn = config.source == .rewind ? "-1 as processingStatus" : "f.processingStatus"
-        let redactionReasonColumn = config.source == .rewind ? "NULL as redactionReason" : "f.redactionReason"
+        // Normalize native-only frame columns across Retrace and Rewind.
+        let projection = Self.frameWithVideoProjection(source: config.source, tableAlias: "f")
 
         // CTE filters tags first (small set), then joins with frames using segmentId index
         let sql = """
             \(filterComponents.combinedCTE)
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
-                   \(config.source == .rewind ? "NULL as captureTrigger" : "f.capture_trigger"),
-                   s.bundleID, s.windowName, s.browserUrl, \(config.source == .rewind ? "NULL" : "f.mousePosition"), \(config.source == .rewind ? "NULL" : "f.scrollPosition"), \(config.source == .rewind ? "NULL" : "f.videoCurrentTime"),
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, \(projection.encodedAtColumn), \(projection.processingStatusColumn), \(projection.redactionReasonColumn),
+                   \(projection.captureTriggerColumn),
+                   s.bundleID, s.windowName, s.browserUrl, \(projection.mousePositionColumn), \(projection.scrollPositionColumn), \(projection.videoCurrentTimeColumn),
                    v.path, v.frameRate, v.width, v.height
             FROM frame f
             INNER JOIN segment s ON f.segmentId = s.id
@@ -2234,20 +2284,17 @@ public actor DataAdapter {
 
         let whereClause = whereClauses.joined(separator: " AND ")
 
-        // Rewind database doesn't have processingStatus column
-        let processingStatusColumn = config.source == .rewind ? "-1 as processingStatus" : "f.processingStatus"
-        let redactionReasonColumn = config.source == .rewind ? "NULL as redactionReason" : "f.redactionReason"
-        let subqueryProcessingStatus = config.source == .rewind ? "-1 as processingStatus" : "processingStatus"
-        let subqueryRedactionReason = config.source == .rewind ? "NULL as redactionReason" : "redactionReason"
-        let subqueryVideoCurrentTime = config.source == .rewind ? "NULL as videoCurrentTime" : "videoCurrentTime"
+        // Normalize native-only frame columns across Retrace and Rewind.
+        let projection = Self.frameWithVideoProjection(source: config.source, tableAlias: "f")
+        let subqueryProjection = Self.frameWithVideoSubqueryProjection(source: config.source)
 
         let sql = """
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
-                   \(config.source == .rewind ? "NULL as captureTrigger" : "f.capture_trigger"),
-                   s.bundleID, s.windowName, s.browserUrl, \(config.source == .rewind ? "NULL" : "f.mousePosition"), \(config.source == .rewind ? "NULL" : "f.scrollPosition"), \(config.source == .rewind ? "NULL" : "f.videoCurrentTime"),
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, \(projection.encodedAtColumn), \(projection.processingStatusColumn), \(projection.redactionReasonColumn),
+                   \(projection.captureTriggerColumn),
+                   s.bundleID, s.windowName, s.browserUrl, \(projection.mousePositionColumn), \(projection.scrollPositionColumn), \(projection.videoCurrentTimeColumn),
                    v.path, v.frameRate, v.width, v.height
             FROM (
-                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, \(subqueryProcessingStatus), \(subqueryRedactionReason), \(config.source == .rewind ? "NULL as captureTrigger" : "capture_trigger"), \(config.source == .rewind ? "NULL as mousePosition" : "mousePosition"), \(config.source == .rewind ? "NULL as scrollPosition" : "scrollPosition"), \(subqueryVideoCurrentTime)
+                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, \(subqueryProjection.encodedAtColumn), \(subqueryProjection.processingStatusColumn), \(subqueryProjection.redactionReasonColumn), \(subqueryProjection.captureTriggerColumn), \(subqueryProjection.mousePositionColumn), \(subqueryProjection.scrollPositionColumn), \(subqueryProjection.videoCurrentTimeColumn)
                 FROM frame
                 WHERE \(whereClause)
                 ORDER BY createdAt DESC
@@ -2335,20 +2382,17 @@ public actor DataAdapter {
 
         let whereClause = whereClauses.joined(separator: " AND ")
 
-        // Rewind database doesn't have processingStatus column
-        let processingStatusColumn = config.source == .rewind ? "-1 as processingStatus" : "f.processingStatus"
-        let redactionReasonColumn = config.source == .rewind ? "NULL as redactionReason" : "f.redactionReason"
-        let subqueryProcessingStatus = config.source == .rewind ? "-1 as processingStatus" : "processingStatus"
-        let subqueryRedactionReason = config.source == .rewind ? "NULL as redactionReason" : "redactionReason"
-        let subqueryVideoCurrentTime = config.source == .rewind ? "NULL as videoCurrentTime" : "videoCurrentTime"
+        // Normalize native-only frame columns across Retrace and Rewind.
+        let projection = Self.frameWithVideoProjection(source: config.source, tableAlias: "f")
+        let subqueryProjection = Self.frameWithVideoSubqueryProjection(source: config.source)
 
         let sql = """
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
-                   \(config.source == .rewind ? "NULL as captureTrigger" : "f.capture_trigger"),
-                   s.bundleID, s.windowName, s.browserUrl, \(config.source == .rewind ? "NULL" : "f.mousePosition"), \(config.source == .rewind ? "NULL" : "f.scrollPosition"), \(config.source == .rewind ? "NULL" : "f.videoCurrentTime"),
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, \(projection.encodedAtColumn), \(projection.processingStatusColumn), \(projection.redactionReasonColumn),
+                   \(projection.captureTriggerColumn),
+                   s.bundleID, s.windowName, s.browserUrl, \(projection.mousePositionColumn), \(projection.scrollPositionColumn), \(projection.videoCurrentTimeColumn),
                    v.path, v.frameRate, v.width, v.height
             FROM (
-                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, \(subqueryProcessingStatus), \(subqueryRedactionReason), \(config.source == .rewind ? "NULL as captureTrigger" : "capture_trigger"), \(config.source == .rewind ? "NULL as mousePosition" : "mousePosition"), \(config.source == .rewind ? "NULL as scrollPosition" : "scrollPosition"), \(subqueryVideoCurrentTime)
+                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, \(subqueryProjection.encodedAtColumn), \(subqueryProjection.processingStatusColumn), \(subqueryProjection.redactionReasonColumn), \(subqueryProjection.captureTriggerColumn), \(subqueryProjection.mousePositionColumn), \(subqueryProjection.scrollPositionColumn), \(subqueryProjection.videoCurrentTimeColumn)
                 FROM frame
                 WHERE \(whereClause)
                 ORDER BY createdAt ASC
@@ -2405,17 +2449,16 @@ public actor DataAdapter {
         connection: DatabaseConnection,
         config: DatabaseConfig
     ) throws -> FrameWithVideoInfo? {
-        // Rewind database doesn't have processingStatus column
-        let processingStatusColumn = config.source == .rewind ? "-1 as processingStatus" : "f.processingStatus"
-        let redactionReasonColumn = config.source == .rewind ? "NULL as redactionReason" : "f.redactionReason"
+        // Normalize native-only frame columns across Retrace and Rewind.
+        let projection = Self.frameWithVideoProjection(source: config.source, tableAlias: "f")
 
         let sourceBoundaryFilter = Self.buildSourceBoundaryClause(config: config, columnName: "f.createdAt")
         let boundaryClause = sourceBoundaryFilter.clause.map { " AND \($0)" } ?? ""
 
         let sql = """
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
-                   \(config.source == .rewind ? "NULL as captureTrigger" : "f.capture_trigger"),
-                   s.bundleID, s.windowName, s.browserUrl, \(config.source == .rewind ? "NULL" : "f.mousePosition"), \(config.source == .rewind ? "NULL" : "f.scrollPosition"), \(config.source == .rewind ? "NULL" : "f.videoCurrentTime"),
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, \(projection.encodedAtColumn), \(projection.processingStatusColumn), \(projection.redactionReasonColumn),
+                   \(projection.captureTriggerColumn),
+                   s.bundleID, s.windowName, s.browserUrl, \(projection.mousePositionColumn), \(projection.scrollPositionColumn), \(projection.videoCurrentTimeColumn),
                    v.path, v.frameRate, v.width, v.height
             FROM frame f
             LEFT JOIN segment s ON f.segmentId = s.id
@@ -4757,9 +4800,7 @@ public actor DataAdapter {
         let videoID = VideoSegmentID(value: sqlite3_column_int64(statement, 3))
         let videoFrameIndex = Int(sqlite3_column_int(statement, 4))
 
-        let encodingStatusText = sqlite3_column_text(statement, 5)
-        let encodingStatusString = encodingStatusText != nil ? String(cString: encodingStatusText!) : "pending"
-        let encodingStatus = EncodingStatus(rawValue: encodingStatusString) ?? .pending
+        let encodedAt = config.parseDate(from: statement, column: 5)
         let processingStatus = Int(sqlite3_column_int(statement, 6))
 
         let redactionReason = Self.getTextOrNil(statement, 7)
@@ -4793,7 +4834,7 @@ public actor DataAdapter {
             segmentID: segmentID,
             videoID: videoID,
             frameIndexInSegment: videoFrameIndex,
-            encodingStatus: encodingStatus,
+            encodedAt: encodedAt,
             metadata: metadata,
             source: config.source
         )

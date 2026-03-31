@@ -183,7 +183,7 @@ enum Schema {
     static let createFramesAppIndex         = "CREATE INDEX idx_frames_app ON frames(app_bundle_id);"
     static let createFramesSourceIndex      = "CREATE INDEX idx_frames_source ON frames(source);"
     static let createFramesSessionIndex     = "CREATE INDEX idx_frames_session ON frames(session_id);"
-    static let createFramesEncodingStatusIndex = "CREATE INDEX idx_frames_encoding_status ON frames(encoding_status);"
+    static let createFramesEncodedAtIndex    = "CREATE INDEX idx_frames_encoded_at ON frames(encoded_at);"
 
     // ┌─────────────────────────────────────────────────────────────────────────┐
     // │ APP_SESSIONS                                                            │

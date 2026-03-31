@@ -149,7 +149,8 @@ public struct FrameReference: Codable, Sendable, Equatable, Identifiable {
     /// Position of this frame within the video (0-149 for 150-frame chunks)
     public let frameIndexInSegment: Int
 
-    public let encodingStatus: EncodingStatus
+    /// When this frame became readable from the encoded video file, if known.
+    public let encodedAt: Date?
     public let metadata: FrameMetadata
     public let source: FrameSource
 
@@ -159,7 +160,7 @@ public struct FrameReference: Codable, Sendable, Equatable, Identifiable {
         segmentID: AppSegmentID,
         videoID: VideoSegmentID = VideoSegmentID(value: 0),
         frameIndexInSegment: Int,
-        encodingStatus: EncodingStatus = .success,
+        encodedAt: Date? = nil,
         metadata: FrameMetadata,
         source: FrameSource = .native
     ) {
@@ -168,7 +169,7 @@ public struct FrameReference: Codable, Sendable, Equatable, Identifiable {
         self.segmentID = segmentID
         self.videoID = videoID
         self.frameIndexInSegment = frameIndexInSegment
-        self.encodingStatus = encodingStatus
+        self.encodedAt = encodedAt
         self.metadata = metadata
         self.source = source
     }
@@ -176,6 +177,11 @@ public struct FrameReference: Codable, Sendable, Equatable, Identifiable {
     /// Whether this frame has been encoded to a video chunk
     public var isEncodedToVideo: Bool {
         videoID.value > 0
+    }
+
+    /// Whether this frame is confirmed readable from the encoded video file.
+    public var isReadableFromVideo: Bool {
+        encodedAt != nil
     }
 }
 
