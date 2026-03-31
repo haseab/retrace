@@ -3662,10 +3662,15 @@ public actor AppCoordinator {
         limit: Int
     ) async throws -> [FeedbackRecentMetricEvent] {
         let rawEvents = try await services.database.getRecentMetricEvents(
-            limit: limit,
+            limit: FeedbackRecentMetricSupport.rawEventFetchLimit(
+                forDisplayedLimit: limit
+            ),
             excluding: FeedbackRecentMetricSupport.excludedMetricTypes
         )
-        return FeedbackRecentMetricSupport.sanitize(rawEvents)
+        return FeedbackRecentMetricSupport.sanitize(
+            rawEvents,
+            limit: limit
+        )
     }
 
     /// Get daily screen time totals (for 7-day graphs)

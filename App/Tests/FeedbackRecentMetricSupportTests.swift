@@ -115,6 +115,104 @@ final class FeedbackRecentMetricSupportTests: XCTestCase {
         )
     }
 
+    func testSanitizeRecentMetricEventsExcludesAdditionalNoiseAndRedactsPlainSearches() {
+        let events: [DailyMetricsQueries.RecentEvent] = [
+            .init(
+                metricType: .helpOpened,
+                timestamp: Date(timeIntervalSince1970: 1_774_800_050),
+                metadata: #"{"source":"feedback"}"#
+            ),
+            .init(
+                metricType: .searches,
+                timestamp: Date(timeIntervalSince1970: 1_774_800_060),
+                metadata: "  sensitive query  "
+            ),
+            .init(
+                metricType: .timelineOpens,
+                timestamp: Date(timeIntervalSince1970: 1_774_800_070),
+                metadata: nil
+            ),
+            .init(
+                metricType: .inPageURLHover,
+                timestamp: Date(timeIntervalSince1970: 1_774_800_080),
+                metadata: #"{"url":"https://example.com"}"#
+            ),
+        ]
+
+        let sanitized = FeedbackRecentMetricSupport.sanitize(events)
+
+        XCTAssertEqual(sanitized.count, 1)
+        XCTAssertEqual(sanitized[0].metricType, "searches")
+        XCTAssertEqual(sanitized[0].summary, "Search submitted")
+        XCTAssertEqual(sanitized[0].details, ["queryLength": "15"])
+    }
+
+    func testSanitizeRecentMetricEventsCollapsesDuplicateTimelineFilterBurstsWithinTenSeconds() throws {
+        let repeatedMetadata = try XCTUnwrap(
+            encodedJSON(
+                TimelineFilterMetricMetadata(
+                    hasAppFilter: true,
+                    hasWindowFilter: false,
+                    hasURLFilter: true,
+                    hasStartDate: false,
+                    hasEndDate: false
+                )
+            )
+        )
+        let changedMetadata = try XCTUnwrap(
+            encodedJSON(
+                TimelineFilterMetricMetadata(
+                    hasAppFilter: true,
+                    hasWindowFilter: true,
+                    hasURLFilter: true,
+                    hasStartDate: false,
+                    hasEndDate: false
+                )
+            )
+        )
+
+        let sanitized = FeedbackRecentMetricSupport.sanitize([
+            .init(
+                metricType: .timelineFilterQuery,
+                timestamp: Date(timeIntervalSince1970: 1_774_800_100),
+                metadata: repeatedMetadata
+            ),
+            .init(
+                metricType: .timelineFilterQuery,
+                timestamp: Date(timeIntervalSince1970: 1_774_800_108),
+                metadata: repeatedMetadata
+            ),
+            .init(
+                metricType: .timelineFilterQuery,
+                timestamp: Date(timeIntervalSince1970: 1_774_800_119),
+                metadata: repeatedMetadata
+            ),
+            .init(
+                metricType: .timelineFilterQuery,
+                timestamp: Date(timeIntervalSince1970: 1_774_800_125),
+                metadata: changedMetadata
+            ),
+        ])
+
+        XCTAssertEqual(sanitized.count, 3)
+        XCTAssertEqual(
+            sanitized.map(\.timestamp),
+            [
+                Date(timeIntervalSince1970: 1_774_800_108),
+                Date(timeIntervalSince1970: 1_774_800_119),
+                Date(timeIntervalSince1970: 1_774_800_125),
+            ]
+        )
+        XCTAssertEqual(
+            sanitized.last?.details,
+            [
+                "hasAppFilter": "true",
+                "hasWindowFilter": "true",
+                "hasURLFilter": "true",
+            ]
+        )
+    }
+
     private func encodedJSON<T: Encodable>(_ value: T) -> String? {
         let encoder = JSONEncoder()
         guard let data = try? encoder.encode(value) else {

@@ -76,18 +76,26 @@ public struct TimelineFilterMetricMetadata: Codable, Sendable, Equatable {
 
 enum FeedbackRecentMetricSupport {
     static let excludedMetricTypes: Set<DailyMetricsQueries.MetricType> = [
+        .appLaunches,
+        .feedbackReportExport,
+        .helpOpened,
+        .inPageURLHover,
         .mouseClickCapture,
         .phraseLevelRedactionQueuedHover,
-        .timelineSessionDuration,
-        .scrubDistance,
         .arrowKeyNavigation,
         .keyboardShortcut,
+        .scrubDistance,
+        .searchDialogOpens,
+        .settingsSearchOpened,
+        .timelineOpens,
+        .timelineSessionDuration,
     ]
 
     static func sanitize(
-        _ events: [DailyMetricsQueries.RecentEvent]
+        _ events: [DailyMetricsQueries.RecentEvent],
+        limit displayLimit: Int? = nil
     ) -> [FeedbackRecentMetricEvent] {
-        events.map { event in
+        let sanitizedEvents = noiseReducedEvents(from: events).map { event in
             FeedbackRecentMetricEvent(
                 timestamp: event.timestamp,
                 metricType: event.metricType.rawValue,
@@ -98,12 +106,34 @@ enum FeedbackRecentMetricSupport {
                 )
             )
         }
+
+        guard let displayLimit else {
+            return sanitizedEvents
+        }
+
+        let boundedLimit = max(0, displayLimit)
+        guard boundedLimit > 0 else {
+            return []
+        }
+
+        return Array(sanitizedEvents.suffix(boundedLimit))
+    }
+
+    static func rawEventFetchLimit(forDisplayedLimit displayLimit: Int) -> Int {
+        let boundedLimit = max(0, displayLimit)
+        guard boundedLimit > 0 else {
+            return 0
+        }
+
+        return min(max(boundedLimit * 4, boundedLimit + 100), 1_000)
     }
 
     private static func summary(
         for metricType: DailyMetricsQueries.MetricType
     ) -> String {
         switch metricType {
+        case .searches:
+            return "Search submitted"
         case .helpOpened:
             return "Help opened"
         case .settingsSearchOpened:
@@ -150,6 +180,8 @@ enum FeedbackRecentMetricSupport {
         guard let metadata, !metadata.isEmpty else { return [:] }
 
         switch metricType {
+        case .searches:
+            return searchDetails(from: metadata)
         case .timelineSessionDuration:
             return scalarDetails(label: "durationMs", value: metadata)
         case .scrubDistance:
@@ -253,11 +285,23 @@ enum FeedbackRecentMetricSupport {
             details["queryLength"] = "\(query.count)"
         }
 
-        if let filters = payload["filters"] as? [String: Any] {
+        if let filters = payload["filters"] as? [String: Any],
+           !filters.isEmpty {
             details["filterCount"] = "\(filters.count)"
         }
 
         return details
+    }
+
+    private static func searchDetails(
+        from metadata: String
+    ) -> [String: String] {
+        let trimmedQuery = metadata.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedQuery.isEmpty else {
+            return [:]
+        }
+
+        return ["queryLength": "\(trimmedQuery.count)"]
     }
 
     private static func timelineFilterDetails(
@@ -359,6 +403,66 @@ enum FeedbackRecentMetricSupport {
         default:
             return nil
         }
+    }
+
+    private static func noiseReducedEvents(
+        from events: [DailyMetricsQueries.RecentEvent]
+    ) -> [DailyMetricsQueries.RecentEvent] {
+        let filteredEvents = events.filter { !excludedMetricTypes.contains($0.metricType) }
+        guard !filteredEvents.isEmpty else {
+            return []
+        }
+
+        var collapsedEvents: [DailyMetricsQueries.RecentEvent] = []
+        for event in filteredEvents {
+            guard let lastEvent = collapsedEvents.last else {
+                collapsedEvents.append(event)
+                continue
+            }
+
+            if shouldCollapse(event, into: lastEvent) {
+                collapsedEvents[collapsedEvents.count - 1] = event
+                continue
+            }
+
+            collapsedEvents.append(event)
+        }
+
+        return collapsedEvents
+    }
+
+    private static func shouldCollapse(
+        _ event: DailyMetricsQueries.RecentEvent,
+        into previousEvent: DailyMetricsQueries.RecentEvent
+    ) -> Bool {
+        guard event.metricType == previousEvent.metricType else {
+            return false
+        }
+
+        switch event.metricType {
+        case .timelineFilterQuery:
+            return event.timestamp.timeIntervalSince(previousEvent.timestamp) <= 10 &&
+                comparisonSignature(for: event) == comparisonSignature(for: previousEvent)
+        default:
+            return false
+        }
+    }
+
+    private static func comparisonSignature(
+        for event: DailyMetricsQueries.RecentEvent
+    ) -> String {
+        let details = sanitizedDetails(
+            for: event.metricType,
+            metadata: event.metadata
+        )
+
+        return details.keys.sorted().compactMap { key in
+            guard let value = details[key] else {
+                return nil
+            }
+            return "\(key)=\(value)"
+        }
+        .joined(separator: "|")
     }
 
     private static func hasNonEmptyString(_ value: Any?) -> Bool {
