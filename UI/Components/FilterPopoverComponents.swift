@@ -306,12 +306,16 @@ public struct FilterSearchField: View {
 
     @ViewBuilder
     private var textField: some View {
-        if let isFocused = isFocused {
-            TextField(placeholder, text: $text)
-                .focused(isFocused)
-        } else {
-            TextField(placeholder, text: $text)
-        }
+        FocusableTextInput(
+            text: $text,
+            placeholder: placeholder,
+            isFocused: isFocused.map { binding in
+                { binding.wrappedValue }
+            },
+            setFocused: isFocused.map { binding in
+                { binding.wrappedValue = $0 }
+            }
+        )
     }
 }
 
@@ -1358,11 +1362,19 @@ public struct AdvancedSearchFilterPopover: View {
                         .font(.system(size: 12, weight: .medium))
                         .foregroundColor(.white.opacity(0.65))
 
-                    TextField("Type a word or phrase, then press Return", text: $excludedInputText)
-                        .focused($focusedField, equals: .excludeTerms)
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 13))
-                        .foregroundColor(.white)
+                    FocusableTextInput(
+                        text: $excludedInputText,
+                        placeholder: "Type a word or phrase, then press Return",
+                        onSubmit: addExcludedTermFromInput,
+                        isFocused: { focusedField == .excludeTerms },
+                        setFocused: { isFocused in
+                            if isFocused {
+                                focusedField = .excludeTerms
+                            } else if focusedField == .excludeTerms {
+                                focusedField = nil
+                            }
+                        }
+                    )
                         .padding(.horizontal, 11)
                         .padding(.vertical, 9)
                         .background(
@@ -1387,9 +1399,6 @@ public struct AdvancedSearchFilterPopover: View {
                         .onTapGesture {
                             focusedField = .excludeTerms
                         }
-                        .onSubmit {
-                            addExcludedTermFromInput()
-                        }
 
                     if !normalizedExcludedTerms.isEmpty {
                         ScrollView(.horizontal, showsIndicators: false) {
@@ -1411,14 +1420,19 @@ public struct AdvancedSearchFilterPopover: View {
                         .foregroundColor(.white.opacity(0.65))
 
                     HStack(spacing: 10) {
-                        TextField("Search titles...", text: $windowInputText)
-                            .focused($focusedField, equals: .windowNameInput)
-                            .textFieldStyle(.plain)
-                            .font(.system(size: 13))
-                            .foregroundColor(.white)
-                            .onSubmit {
-                                addWindowNameTermFromInput()
+                        FocusableTextInput(
+                            text: $windowInputText,
+                            placeholder: "Search titles...",
+                            onSubmit: addWindowNameTermFromInput,
+                            isFocused: { focusedField == .windowNameInput },
+                            setFocused: { isFocused in
+                                if isFocused {
+                                    focusedField = .windowNameInput
+                                } else if focusedField == .windowNameInput {
+                                    focusedField = nil
+                                }
                             }
+                        )
 
                         IncludeExcludeModeToggle(mode: $windowNameFilterMode)
                             .frame(width: 138)
@@ -1472,14 +1486,19 @@ public struct AdvancedSearchFilterPopover: View {
                         .foregroundColor(.white.opacity(0.65))
 
                     HStack(spacing: 10) {
-                        TextField("Search URLs...", text: $browserInputText)
-                            .focused($focusedField, equals: .browserUrlInput)
-                            .textFieldStyle(.plain)
-                            .font(.system(size: 13))
-                            .foregroundColor(.white)
-                            .onSubmit {
-                                addBrowserUrlTermFromInput()
+                        FocusableTextInput(
+                            text: $browserInputText,
+                            placeholder: "Search URLs...",
+                            onSubmit: addBrowserUrlTermFromInput,
+                            isFocused: { focusedField == .browserUrlInput },
+                            setFocused: { isFocused in
+                                if isFocused {
+                                    focusedField = .browserUrlInput
+                                } else if focusedField == .browserUrlInput {
+                                    focusedField = nil
+                                }
                             }
+                        )
 
                         IncludeExcludeModeToggle(mode: $browserUrlFilterMode)
                             .frame(width: 138)
@@ -2268,29 +2287,32 @@ public struct DateRangeFilterPopover: View {
                         .font(.system(size: 11, weight: .medium))
                         .foregroundColor(.white.opacity(0.45))
 
-                    TextField("e.g. Dec 5, 2025 to Dec 8, 2025 | last week to now", text: $rangeInputText)
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 12, weight: .regular))
-                        .foregroundColor(.white)
-                        .focused($isRangeInputFocused)
-                        .modifier(FocusEffectDisabledModifier())
-                        .onChange(of: isRangeInputFocused) { isFocused in
-                            if isFocused {
-                                focusedItem = -1  // Clear keyboard navigation highlight when text field is focused
-                                lastFocusedCalendarTarget = .primary
-                                if isCalendarVisible {
-                                    synchronizeCalendarStateFromTarget(.primary)
-                                }
-                            } else {
-                                canonicalizeInputTextIfPossible()
+                    FocusableTextInput(
+                        text: $rangeInputText,
+                        placeholder: "e.g. Dec 5, 2025 to Dec 8, 2025 | last week to now",
+                        font: .systemFont(ofSize: 12, weight: .regular),
+                        onSubmit: {
+                            applyCurrentSelection(moveToNextDropdown: false)
+                        },
+                        isFocused: { isRangeInputFocused },
+                        setFocused: { isFocused in
+                            isRangeInputFocused = isFocused
+                        },
+                        onBlur: canonicalizeInputTextIfPossible
+                    )
+                    .modifier(FocusEffectDisabledModifier())
+                    .onChange(of: isRangeInputFocused) { isFocused in
+                        if isFocused {
+                            focusedItem = -1  // Clear keyboard navigation highlight when text field is focused
+                            lastFocusedCalendarTarget = .primary
+                            if isCalendarVisible {
+                                synchronizeCalendarStateFromTarget(.primary)
                             }
                         }
-                        .onSubmit {
-                            applyCurrentSelection(moveToNextDropdown: false)
-                        }
-                        .onChange(of: rangeInputText) { _ in
-                            parseError = nil
-                        }
+                    }
+                    .onChange(of: rangeInputText) { _ in
+                        parseError = nil
+                    }
 
                     if !rangeInputText.isEmpty {
                         Button(action: {
@@ -2336,18 +2358,23 @@ public struct DateRangeFilterPopover: View {
                                 .font(.system(size: 11, weight: .medium))
                                 .foregroundColor(.white.opacity(0.3))
 
-                            TextField(
-                                additionalRangePlaceholder(for: rangeID),
-                                text: additionalRangeBinding(for: rangeID)
+                            FocusableTextInput(
+                                text: additionalRangeBinding(for: rangeID),
+                                placeholder: additionalRangePlaceholder(for: rangeID),
+                                font: .systemFont(ofSize: 12, weight: .regular),
+                                onSubmit: {
+                                    applyAdditionalRangeInput(for: rangeID)
+                                },
+                                isFocused: { focusedAdditionalRangeID == rangeID },
+                                setFocused: { isFocused in
+                                    if isFocused {
+                                        focusedAdditionalRangeID = rangeID
+                                    } else if focusedAdditionalRangeID == rangeID {
+                                        focusedAdditionalRangeID = nil
+                                    }
+                                }
                             )
-                            .textFieldStyle(.plain)
-                            .font(.system(size: 12, weight: .regular))
-                            .foregroundColor(.white)
-                            .focused($focusedAdditionalRangeID, equals: rangeID)
                             .modifier(FocusEffectDisabledModifier())
-                            .onSubmit {
-                                applyAdditionalRangeInput(for: rangeID)
-                            }
 
                             Button(action: {
                                 removeAdditionalRange(id: rangeID)

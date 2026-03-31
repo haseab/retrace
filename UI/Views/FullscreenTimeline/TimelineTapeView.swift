@@ -2575,52 +2575,6 @@ struct DateSearchField: NSViewRepresentable {
     }
 }
 
-// MARK: - Focusable TextField
-
-/// Custom NSTextField that properly accepts first responder in borderless windows.
-/// Also intercepts command shortcuts that AppKit can miss in borderless panels.
-class FocusableTextField: NSTextField {
-    override var acceptsFirstResponder: Bool { true }
-
-    /// Callback to cancel/close the panel
-    var onCancelCallback: (() -> Void)?
-
-    /// Callback when the text field is clicked
-    var onClickCallback: (() -> Void)?
-
-    override func mouseDown(with event: NSEvent) {
-        onClickCallback?()
-        super.mouseDown(with: event)
-    }
-
-    override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
-        guard modifiers == [.command],
-              let key = event.charactersIgnoringModifiers?.lowercased() else {
-            return super.performKeyEquivalent(with: event)
-        }
-
-        switch key {
-        case "g":
-            onCancelCallback?()
-            return true
-        case "a":
-            if currentEditor() == nil {
-                window?.makeFirstResponder(self)
-            }
-            if let editor = currentEditor() as? NSTextView {
-                editor.selectAll(nil)
-            } else {
-                selectText(nil)
-            }
-            return true
-        default:
-            return super.performKeyEquivalent(with: event)
-        }
-    }
-}
-
-
 // MARK: - Timeline Tape Right Click Handler
 
 /// Per-frame right-click handler - knows its exact frame index

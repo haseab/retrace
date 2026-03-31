@@ -7202,6 +7202,10 @@ struct RightClickOverlay: ViewModifier {
         eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .rightMouseDown) { event in
             guard let window = event.window else { return event }
 
+            if FocusableTextInputSupport.shouldDeferRightClickToTextInput(window: window, event: event) {
+                return event
+            }
+
             // Get click location in window coordinates (origin at bottom-left of window)
             let windowLocation = event.locationInWindow
 
@@ -11619,14 +11623,21 @@ struct AdvancedFiltersSection: View {
                             .foregroundColor(.white.opacity(0.6))
 
                         HStack(spacing: 10) {
-                            TextField("Search titles...", text: $draftState.windowInputText)
-                                .focused($focusedField, equals: .windowName)
-                                .textFieldStyle(.plain)
-                                .font(.system(size: 13))
-                                .foregroundColor(.white)
-                                .onSubmit {
+                            FocusableTextInput(
+                                text: $draftState.windowInputText,
+                                placeholder: "Search titles...",
+                                onSubmit: {
                                     draftState.commitWindowNameDraft()
+                                },
+                                isFocused: { focusedField == .windowName },
+                                setFocused: { isFocused in
+                                    if isFocused {
+                                        focusedField = .windowName
+                                    } else if focusedField == .windowName {
+                                        focusedField = nil
+                                    }
                                 }
+                            )
 
                             IncludeExcludeModeToggle(mode: $draftState.windowNameFilterMode)
                                 .frame(width: 138)
@@ -11677,14 +11688,21 @@ struct AdvancedFiltersSection: View {
                             .foregroundColor(.white.opacity(0.6))
 
                         HStack(spacing: 10) {
-                            TextField("Search URLs...", text: $draftState.browserInputText)
-                                .focused($focusedField, equals: .browserUrl)
-                                .textFieldStyle(.plain)
-                                .font(.system(size: 13))
-                                .foregroundColor(.white)
-                                .onSubmit {
+                            FocusableTextInput(
+                                text: $draftState.browserInputText,
+                                placeholder: "Search URLs...",
+                                onSubmit: {
                                     draftState.commitBrowserUrlDraft()
+                                },
+                                isFocused: { focusedField == .browserUrl },
+                                setFocused: { isFocused in
+                                    if isFocused {
+                                        focusedField = .browserUrl
+                                    } else if focusedField == .browserUrl {
+                                        focusedField = nil
+                                    }
                                 }
+                            )
 
                             IncludeExcludeModeToggle(mode: $draftState.browserUrlFilterMode)
                                 .frame(width: 138)

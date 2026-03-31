@@ -6,6 +6,7 @@ import Database
 import SQLCipher
 import Darwin
 import IOKit.ps
+import ObjectiveC.runtime
 import UniformTypeIdentifiers
 
 enum SingleInstanceLock {
@@ -104,6 +105,119 @@ enum SingleInstanceLockRetrier {
         return .failedHeldByAnotherProcess(attempts: attempts)
     }
 }
+
+enum TextInputContextMenuAutofillFilter {
+    private static var isInstalled = false
+    private static let allowedActions: Set<Selector> = [
+        #selector(NSText.cut(_:)),
+        #selector(NSText.copy(_:)),
+        #selector(NSText.paste(_:))
+    ]
+
+    static func install() {
+        guard !isInstalled else { return }
+        isInstalled = true
+
+        swizzleMenuMethod(on: NSTextField.self, with: #selector(NSTextField.retrace_filteredContextMenu(for:)))
+        swizzleMenuMethod(on: NSTextView.self, with: #selector(NSTextView.retrace_filteredContextMenu(for:)))
+    }
+
+    static func filteredMenu(from menu: NSMenu?) -> NSMenu? {
+        guard let menu else { return nil }
+        filterAllowedItems(from: menu)
+        return menu
+    }
+
+    private static func swizzleMenuMethod(on cls: AnyClass, with swizzledSelector: Selector) {
+        let originalSelector = #selector(NSView.menu(for:))
+        guard let originalMethod = class_getInstanceMethod(cls, originalSelector),
+              let swizzledMethod = class_getInstanceMethod(cls, swizzledSelector) else {
+            return
+        }
+
+        let didAddMethod = class_addMethod(
+            cls,
+            originalSelector,
+            method_getImplementation(swizzledMethod),
+            method_getTypeEncoding(swizzledMethod)
+        )
+
+        if didAddMethod {
+            class_replaceMethod(
+                cls,
+                swizzledSelector,
+                method_getImplementation(originalMethod),
+                method_getTypeEncoding(originalMethod)
+            )
+        } else {
+            method_exchangeImplementations(originalMethod, swizzledMethod)
+        }
+    }
+
+    static func filterAllowedItems(from menu: NSMenu) {
+        for item in menu.items {
+            if let submenu = item.submenu {
+                filterAllowedItems(from: submenu)
+            }
+        }
+
+        for index in menu.items.indices.reversed() where shouldRemove(menu.items[index]) {
+            menu.removeItem(at: index)
+        }
+
+        collapseRedundantSeparators(in: menu)
+    }
+
+    private static func shouldRemove(_ item: NSMenuItem) -> Bool {
+        guard !item.isSeparatorItem else {
+            return false
+        }
+
+        guard let action = item.action else {
+            return true
+        }
+
+        return !allowedActions.contains(action)
+    }
+
+    private static func collapseRedundantSeparators(in menu: NSMenu) {
+        var previousWasSeparator = true
+        var indexesToRemove: [Int] = []
+
+        for (index, item) in menu.items.enumerated() {
+            if item.isSeparatorItem {
+                if previousWasSeparator {
+                    indexesToRemove.append(index)
+                }
+                previousWasSeparator = true
+            } else {
+                previousWasSeparator = false
+            }
+        }
+
+        if let lastIndex = menu.items.indices.last,
+           menu.items[lastIndex].isSeparatorItem {
+            indexesToRemove.append(lastIndex)
+        }
+
+        for index in Set(indexesToRemove).sorted(by: >) {
+            menu.removeItem(at: index)
+        }
+    }
+}
+
+private extension NSTextField {
+    @objc func retrace_filteredContextMenu(for event: NSEvent) -> NSMenu? {
+        TextInputContextMenuAutofillFilter.filteredMenu(from: retrace_filteredContextMenu(for: event))
+    }
+}
+
+private extension NSTextView {
+    @objc func retrace_filteredContextMenu(for event: NSEvent) -> NSMenu? {
+        TextInputContextMenuAutofillFilter.filteredMenu(from: retrace_filteredContextMenu(for: event))
+    }
+}
+
 /// Main app entry point
 @main
 struct RetraceApp: App {
@@ -187,6 +301,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Temporarily disabled while investigating App Management permission prompts.
         // Prompt user to move app to Applications folder if not already there.
         // AppMover.moveToApplicationsFolderIfNecessary()
+        TextInputContextMenuAutofillFilter.install()
         setupExternalDashboardRevealObserver()
         installMainMenuIfNeeded(force: true)
         applyDockIconVisibilityPreference()
