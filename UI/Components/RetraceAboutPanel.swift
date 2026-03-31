@@ -1,96 +1,172 @@
 import AppKit
 import SwiftUI
 
-@MainActor
 enum RetraceAboutPanel {
-    static func makeWindow(appName: String) -> NSWindow {
-        let hostingController = NSHostingController(rootView: RetraceAboutView(appName: appName))
-        let window = NSWindow(contentViewController: hostingController)
+    struct Content {
+        static let defaultWindowSize = NSSize(width: 480, height: 560)
+        static let defaultDescriptionText =
+            "Retrace is an open source, local-first screen memory for macOS. It continuously captures what you see, extracts text with on-device OCR, and makes your screen history searchable without sending it to the cloud."
+        static let repositoryURL = URL(string: "https://github.com/haseab/retrace")!
+        static let creatorURL = URL(string: "https://dub.sh/haseab-twitter")!
 
+        let appName: String
+        let versionText: String
+        let branchText: String?
+        let descriptionText: String
+        let repositoryURL: URL
+        let creatorURL: URL
+        let windowSize: NSSize
+    }
+
+    static func makeContent(appName: String) -> Content {
+        Content(
+            appName: appName,
+            versionText: BuildInfo.displayVersion,
+            branchText: BuildInfo.displayBranch,
+            descriptionText: Content.defaultDescriptionText,
+            repositoryURL: Content.repositoryURL,
+            creatorURL: Content.creatorURL,
+            windowSize: Content.defaultWindowSize
+        )
+    }
+
+    @MainActor
+    static func makeWindow(appName: String) -> NSWindow {
+        let content = makeContent(appName: appName)
+        let hostingController = NSHostingController(rootView: RetraceAboutPanelView(content: content))
+        let window = NSWindow(
+            contentRect: NSRect(origin: .zero, size: content.windowSize),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+
+        window.contentViewController = hostingController
         window.title = "About \(appName)"
-        window.styleMask = [.titled, .closable, .miniaturizable, .fullSizeContentView]
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
+        window.isMovableByWindowBackground = true
         window.isReleasedWhenClosed = false
-        window.setContentSize(NSSize(width: 420, height: 320))
-        window.minSize = NSSize(width: 420, height: 320)
-        window.maxSize = NSSize(width: 420, height: 320)
+        window.isExcludedFromWindowsMenu = true
+        window.tabbingMode = .disallowed
+        window.collectionBehavior = [.moveToActiveSpace]
+        window.setContentSize(content.windowSize)
         window.center()
-        window.backgroundColor = NSColor(named: "retraceBackground") ?? NSColor.windowBackgroundColor
-        window.appearance = NSAppearance(named: .darkAqua)
-
-        window.standardWindowButton(.zoomButton)?.isHidden = true
-        window.standardWindowButton(.miniaturizeButton)?.isHidden = true
 
         return window
     }
 }
 
-private struct RetraceAboutView: View {
-    let appName: String
-
-    private var commitLabel: String? {
-        let commit = BuildInfo.gitCommit.trimmingCharacters(in: .whitespacesAndNewlines)
-        return commit == "unknown" || commit.isEmpty ? nil : commit
-    }
+private struct RetraceAboutPanelView: View {
+    let content: RetraceAboutPanel.Content
 
     var body: some View {
-        VStack(spacing: 18) {
-            Image(nsImage: NSApp.applicationIconImage)
-                .resizable()
-                .frame(width: 80, height: 80)
-                .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-                .shadow(color: .black.opacity(0.18), radius: 12, y: 6)
-
-            VStack(spacing: 6) {
-                Text(appName)
-                    .font(.system(size: 26, weight: .semibold))
-
-                Text(BuildInfo.fullVersion)
-                    .font(.system(size: 14, weight: .medium))
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-
-                if BuildInfo.buildDate != "unknown" {
-                    Text("Built \(BuildInfo.buildDate)")
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
-                }
-            }
-
-            VStack(spacing: 8) {
-                if let commitLabel, let commitURL = BuildInfo.commitURL {
-                    Link(destination: commitURL) {
-                        Label("Commit \(commitLabel)", systemImage: "arrow.up.right.square")
-                            .font(.system(size: 13, weight: .medium))
-                    }
-                    .buttonStyle(.plain)
-                }
-
-                if let branch = BuildInfo.displayBranch {
-                    Text(branch)
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
-                }
-            }
-
-            Spacer(minLength: 0)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding(.horizontal, 32)
-        .padding(.top, 32)
-        .padding(.bottom, 24)
-        .background(
+        ZStack {
             LinearGradient(
                 colors: [
                     Color(nsColor: .windowBackgroundColor),
-                    Color(nsColor: .windowBackgroundColor).opacity(0.92)
+                    Color(nsColor: .underPageBackgroundColor)
                 ],
                 startPoint: .top,
                 endPoint: .bottom
             )
-        )
+            .ignoresSafeArea()
+
+            VStack(spacing: 0) {
+                Spacer(minLength: 28)
+
+                VStack(spacing: 18) {
+                    Image(nsImage: NSApp.applicationIconImage)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 104, height: 104)
+                        .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+                        .shadow(color: .black.opacity(0.22), radius: 14, y: 8)
+
+                    VStack(spacing: 8) {
+                        Text(content.appName)
+                            .font(.system(size: 30, weight: .semibold))
+
+                        Text("Local-first screen memory for macOS")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundStyle(.secondary)
+
+                        Text(content.versionText)
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(.secondary)
+
+                        if let branchText = content.branchText {
+                            Text(branchText)
+                                .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 5)
+                                .background(
+                                    Capsule(style: .continuous)
+                                        .fill(Color.white.opacity(0.08))
+                                )
+                        }
+                    }
+                    .multilineTextAlignment(.center)
+                }
+
+                Divider()
+                    .padding(.top, 28)
+
+                VStack(spacing: 22) {
+                    Text(content.descriptionText)
+                        .font(.system(size: 15))
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .lineSpacing(4)
+                        .frame(maxWidth: 390)
+
+                    HStack(spacing: 12) {
+                        aboutLink(
+                            title: "Open Source Repo",
+                            systemImage: "arrow.up.right.square",
+                            url: content.repositoryURL
+                        )
+                        aboutLink(
+                            title: "@haseab on X",
+                            systemImage: "person.crop.circle",
+                            url: content.creatorURL
+                        )
+                    }
+                    .frame(maxWidth: 390)
+                }
+                .padding(.top, 28)
+
+                Spacer(minLength: 28)
+            }
+            .padding(.horizontal, 28)
+            .padding(.bottom, 28)
+        }
+        .frame(width: content.windowSize.width, height: content.windowSize.height)
+    }
+
+    private func aboutLink(title: String, systemImage: String, url: URL) -> some View {
+        Link(destination: url) {
+            HStack(spacing: 8) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 13, weight: .semibold))
+                Text(title)
+                    .font(.system(size: 13, weight: .semibold))
+                    .lineLimit(1)
+            }
+            .foregroundStyle(.primary)
+            .frame(maxWidth: .infinity)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 11)
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(Color.white.opacity(0.08))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(Color.white.opacity(0.06), lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
     }
 }
