@@ -14085,6 +14085,18 @@ public class SimpleTimelineViewModel: ObservableObject {
         return isNearMostRecentFrame(within: 1)
     }
 
+    /// Whether the playhead is centered on a hard timeline edge with no more frames beyond it.
+    /// This is narrower than `isAtMostRecentFrame`: it only becomes true once scrolling has
+    /// fully settled on the absolute start/end, with no residual sub-frame offset.
+    var isSettledAtAbsoluteTimelineBoundary: Bool {
+        guard !frames.isEmpty else { return false }
+        guard abs(subFrameOffset) < 0.001 else { return false }
+
+        let atAbsoluteStart = currentIndex <= 0 && !hasMoreOlder
+        let atAbsoluteEnd = currentIndex >= frames.count - 1 && !hasMoreNewer
+        return atAbsoluteStart || atAbsoluteEnd
+    }
+
     /// Whether the timeline is within N frames of the most recent
     /// - Parameter within: Number of frames from the end to consider "near" (1 = last frame only, 2 = last 2 frames, etc.)
     public func isNearMostRecentFrame(within count: Int) -> Bool {

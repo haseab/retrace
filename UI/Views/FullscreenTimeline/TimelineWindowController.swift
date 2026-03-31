@@ -259,8 +259,11 @@ public class TimelineWindowController: NSObject {
         return activatedProcessID != currentProcessID
     }
 
-    nonisolated static func shouldToggleSearchOverlayFromShortcut(isActivelyScrolling: Bool) -> Bool {
-        !isActivelyScrolling
+    nonisolated static func shouldToggleSearchOverlayFromShortcut(
+        isActivelyScrolling: Bool,
+        isSettledAtAbsoluteTimelineBoundary: Bool = false
+    ) -> Bool {
+        !isActivelyScrolling || isSettledAtAbsoluteTimelineBoundary
     }
 
     nonisolated static func isActuallyVisible(
@@ -3074,7 +3077,10 @@ extension TimelineWindowController {
         if event.keyCode == 40 && modifiers == [.command] { // K key with Command
             recordShortcut("cmd+k")
             if let viewModel = timelineViewModel {
-                guard Self.shouldToggleSearchOverlayFromShortcut(isActivelyScrolling: viewModel.isActivelyScrolling) else {
+                guard Self.shouldToggleSearchOverlayFromShortcut(
+                    isActivelyScrolling: viewModel.isActivelyScrolling,
+                    isSettledAtAbsoluteTimelineBoundary: viewModel.isSettledAtAbsoluteTimelineBoundary
+                ) else {
                     Log.info("[TimelineShortcut] Cmd+K ignored while scroll is active", category: .ui)
                     return true
                 }
