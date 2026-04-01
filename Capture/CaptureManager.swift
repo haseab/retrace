@@ -45,8 +45,8 @@ struct CaptureSchedulingConfiguration: Sendable {
 
     static let production = CaptureSchedulingConfiguration(
         minimumInterCaptureInterval: 0.3,
-        mouseClickSettleDelay: 0.06,
-        windowChangeSettleDelay: 0.1,
+        mouseClickSettleDelay: 0.15,
+        windowChangeSettleDelay: 0.15,
         startWithImmediateIntervalCapture: true
     )
 }
