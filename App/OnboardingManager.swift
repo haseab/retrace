@@ -133,6 +133,13 @@ public actor OnboardingManager {
         Log.info("Onboarding skipped by user", category: .app)
     }
 
+    public func resetCompletionStateForDebug() {
+        settingsDefaults.removeObject(forKey: Self.hasCompletedOnboardingKey)
+        settingsDefaults.removeObject(forKey: Self.onboardingSkippedKey)
+        settingsDefaults.removeObject(forKey: Self.onboardingVersionKey)
+        Log.info("Onboarding completion state reset for debug relaunch", category: .app)
+    }
+
     // MARK: - Shortcuts
 
     /// Set timeline shortcut (full config with key + modifiers)

@@ -208,6 +208,11 @@ public struct OnboardingView: View {
 
     private let totalSteps = 10
 
+    static func resetPersistedProgressForDebug(defaults: UserDefaults = .standard) {
+        defaults.removeObject(forKey: Self.onboardingStepKey)
+        defaults.removeObject(forKey: Self.automationPreflightStatusesKey)
+    }
+
     // MARK: - Body
 
     public var body: some View {
@@ -2495,23 +2500,13 @@ public struct OnboardingView: View {
         }
     }
 
-    /// Rewind-style double arrow icon (⏪) matching the app's color scheme
+    /// Rewind logo rendered from the original SVG path with onboarding-specific styling.
     private var rewindIcon: some View {
         GeometryReader { geometry in
             let size = min(geometry.size.width, geometry.size.height)
-            let centerX = size / 2
-            let centerY = size / 2
-            let arrowHeight = size * 0.45
-            let arrowWidth = size * 0.28
-            let gap = size * 0.02  // Small gap between arrows
-            let leftOffset = size * 0.08  // Shift arrows to the left
-
-            // Total width of both arrows + gap, centered around centerX, then shifted left
-            let totalWidth = arrowWidth * 2 + gap
-            let startX = centerX - totalWidth / 2 - leftOffset
+            let logoOffsetX = -size * 0.045
 
             ZStack {
-                // Background circle with gradient
                 Circle()
                     .fill(
                         LinearGradient(
@@ -2520,28 +2515,15 @@ public struct OnboardingView: View {
                             endPoint: .bottomTrailing
                         )
                     )
+                    .overlay(
+                        Circle()
+                            .strokeBorder(Color.white.opacity(0.08), lineWidth: 1)
+                    )
 
-                // Left arrow (first rewind arrow)
-                Path { path in
-                    let tipX = startX
-                    let baseX = tipX + arrowWidth
-                    path.move(to: CGPoint(x: tipX, y: centerY))
-                    path.addLine(to: CGPoint(x: baseX, y: centerY - arrowHeight / 2))
-                    path.addLine(to: CGPoint(x: baseX, y: centerY + arrowHeight / 2))
-                    path.closeSubpath()
-                }
-                .fill(Color.retraceAccent)
-
-                // Right arrow (second rewind arrow)
-                Path { path in
-                    let tipX = startX + arrowWidth + gap
-                    let baseX = tipX + arrowWidth
-                    path.move(to: CGPoint(x: tipX, y: centerY))
-                    path.addLine(to: CGPoint(x: baseX, y: centerY - arrowHeight / 2))
-                    path.addLine(to: CGPoint(x: baseX, y: centerY + arrowHeight / 2))
-                    path.closeSubpath()
-                }
-                .fill(Color.retraceAccent)
+                RewindLogoIcon(color: .white)
+                    .frame(width: size * 0.72, height: size * 0.44)
+                    .offset(x: logoOffsetX)
+                    .shadow(color: Color.white.opacity(0.14), radius: 10, y: 1)
             }
         }
     }
@@ -2550,19 +2532,9 @@ public struct OnboardingView: View {
     private var rewindIconMuted: some View {
         GeometryReader { geometry in
             let size = min(geometry.size.width, geometry.size.height)
-            let centerX = size / 2
-            let centerY = size / 2
-            let arrowHeight = size * 0.45
-            let arrowWidth = size * 0.28
-            let gap = size * 0.02  // Small gap between arrows
-            let leftOffset = size * 0.08  // Shift arrows to the left
-
-            // Total width of both arrows + gap, centered around centerX, then shifted left
-            let totalWidth = arrowWidth * 2 + gap
-            let startX = centerX - totalWidth / 2 - leftOffset
+            let logoOffsetX = -size * 0.045
 
             ZStack {
-                // Background circle with muted gradient
                 Circle()
                     .fill(
                         LinearGradient(
@@ -2571,28 +2543,14 @@ public struct OnboardingView: View {
                             endPoint: .bottomTrailing
                         )
                     )
+                    .overlay(
+                        Circle()
+                            .strokeBorder(Color.white.opacity(0.06), lineWidth: 1)
+                    )
 
-                // Left arrow (first rewind arrow) - muted
-                Path { path in
-                    let tipX = startX
-                    let baseX = tipX + arrowWidth
-                    path.move(to: CGPoint(x: tipX, y: centerY))
-                    path.addLine(to: CGPoint(x: baseX, y: centerY - arrowHeight / 2))
-                    path.addLine(to: CGPoint(x: baseX, y: centerY + arrowHeight / 2))
-                    path.closeSubpath()
-                }
-                .fill(Color.retraceSecondary)
-
-                // Right arrow (second rewind arrow) - muted
-                Path { path in
-                    let tipX = startX + arrowWidth + gap
-                    let baseX = tipX + arrowWidth
-                    path.move(to: CGPoint(x: tipX, y: centerY))
-                    path.addLine(to: CGPoint(x: baseX, y: centerY - arrowHeight / 2))
-                    path.addLine(to: CGPoint(x: baseX, y: centerY + arrowHeight / 2))
-                    path.closeSubpath()
-                }
-                .fill(Color.retraceSecondary)
+                RewindLogoIcon(color: .white.opacity(0.4))
+                    .frame(width: size * 0.72, height: size * 0.44)
+                    .offset(x: logoOffsetX)
             }
         }
     }

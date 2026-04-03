@@ -64,6 +64,7 @@ public struct DashboardView: View {
     @StateObject private var crashRecoveryBannerModel: CrashRecoveryBannerModel
     @ObservedObject var launchOnLoginReminderManager: LaunchOnLoginReminderManager
     @ObservedObject var milestoneCelebrationManager: MilestoneCelebrationManager
+    let debugLaunchOnboarding: (() -> Void)?
     @ObservedObject private var updaterManager = UpdaterManager.shared
     @State private var isPulsing = false
     @State private var showFeedbackSheet = false
@@ -155,6 +156,7 @@ public struct DashboardView: View {
         coordinator: AppCoordinator,
         launchOnLoginReminderManager: LaunchOnLoginReminderManager,
         milestoneCelebrationManager: MilestoneCelebrationManager,
+        debugLaunchOnboarding: (() -> Void)? = nil,
         hasLoadedInitialData: Binding<Bool> = .constant(false)
     ) {
         self.viewModel = viewModel
@@ -164,6 +166,7 @@ public struct DashboardView: View {
         )
         self.launchOnLoginReminderManager = launchOnLoginReminderManager
         self.milestoneCelebrationManager = milestoneCelebrationManager
+        self.debugLaunchOnboarding = debugLaunchOnboarding
         self._hasLoadedInitialData = hasLoadedInitialData
     }
 
@@ -1729,6 +1732,12 @@ public struct DashboardView: View {
                         )
                     }
                     Divider()
+                    if let debugLaunchOnboarding {
+                        Button("Relaunch Onboarding") {
+                            debugLaunchOnboarding()
+                        }
+                        Divider()
+                    }
                     Menu("Set Color Theme") {
                         Button("Blue") {
                             MilestoneCelebrationManager.setDebugThemeOverride(.blue)

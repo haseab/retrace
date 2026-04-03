@@ -112,6 +112,7 @@ public enum DailyMetricsQueries {
         case crashRecoveryApprovalBannerAction = "crash_recovery_approval_banner_action"  // metadata: JSON {action, status}
         case debugWatchdogHangTriggered = "debug_watchdog_hang_triggered"
         case debugForcedTerminationTriggered = "debug_forced_termination_triggered"
+        case debugOnboardingRelaunchTriggered = "debug_onboarding_relaunch_triggered"
         case developerSettingToggle = "developer_setting_toggle"  // metadata: JSON {source, settingKey, isEnabled}
         case debugCrashTriggered = "debug_crash_triggered"
         case crashAutoRestart = "crash_auto_restart"  // metadata: JSON {source}

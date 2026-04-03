@@ -2124,6 +2124,11 @@ public class DashboardViewModel: ObservableObject {
         recordMetric(coordinator: coordinator, type: .debugForcedTerminationTriggered)
     }
 
+    /// Record a debug-only onboarding relaunch from the dashboard.
+    public static func recordDebugOnboardingRelaunchTriggered(coordinator: AppCoordinator) {
+        recordMetric(coordinator: coordinator, type: .debugOnboardingRelaunchTriggered)
+    }
+
     public static func recordDeveloperSettingToggle(
         coordinator: AppCoordinator,
         source: String,

@@ -505,6 +505,7 @@ struct DashboardContentView: View {
                 coordinator: coordinator,
                 launchOnLoginReminderManager: launchOnLoginReminderManager,
                 milestoneCelebrationManager: milestoneCelebrationManager,
+                debugLaunchOnboarding: triggerDebugOnboardingRelaunch,
                 hasLoadedInitialData: $hasLoadedDashboard
             )
 
@@ -534,6 +535,21 @@ struct DashboardContentView: View {
         let shouldShow = await coordinator.onboardingManager.shouldShowOnboarding()
         await MainActor.run {
             showOnboarding = shouldShow
+        }
+    }
+
+    private func triggerDebugOnboardingRelaunch() {
+        DashboardViewModel.recordDebugOnboardingRelaunchTriggered(coordinator: coordinator)
+
+        Task {
+            await coordinator.onboardingManager.resetCompletionStateForDebug()
+
+            await MainActor.run {
+                OnboardingView.resetPersistedProgressForDebug()
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    showOnboarding = true
+                }
+            }
         }
     }
 
