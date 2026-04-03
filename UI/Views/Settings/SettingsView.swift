@@ -314,20 +314,7 @@ public struct SettingsView: View {
         qos: .utility,
         attributes: .concurrent
     )
-    nonisolated static let inPageURLKnownBrowserBundleIDs: [String] = [
-        "com.apple.Safari",
-        "com.google.Chrome",
-        "com.google.Chrome.canary",
-        "org.chromium.Chromium",
-        "com.microsoft.edgemac",
-        "com.brave.Browser",
-        "com.vivaldi.Vivaldi",
-        "com.operasoftware.Opera",
-        "company.thebrowser.Browser",
-        "ai.perplexity.comet",
-        "company.thebrowser.dia",
-        "com.nicklockwood.Thorium",
-    ]
+    nonisolated static let inPageURLKnownBrowserBundleIDs: [String] = AppInfo.supportedBrowserBundleIDOrder
     nonisolated static let inPageURLUnsupportedBundleIDs: [String] = [
         "org.mozilla.firefox",
         "org.mozilla.firefoxbeta",
@@ -337,19 +324,7 @@ public struct SettingsView: View {
         "com.sigmaos.sigmaos.macos",
         "com.openai.atlas",
     ]
-    nonisolated static let inPageURLChromiumHostBundleIDPrefixes: [String] = [
-        "com.google.Chrome",
-        "com.google.Chrome.canary",
-        "org.chromium.Chromium",
-        "com.microsoft.edgemac",
-        "com.brave.Browser",
-        "com.vivaldi.Vivaldi",
-        "com.operasoftware.Opera",
-        "company.thebrowser.Browser",
-        "ai.perplexity.comet",
-        "company.thebrowser.dia",
-        "com.nicklockwood.Thorium",
-    ]
+    nonisolated static let inPageURLChromiumHostBundleIDPrefixes: [String] = AppInfo.chromiumHostBrowserBundleIDPrefixes
     static let inPageURLTestURLString = "https://en.wikipedia.org/wiki/Cat"
     static let inPageURLNoMatchingWindowToken = "__NO_MATCHING_WINDOW__"
     nonisolated static let privateModeAutomationFallbackBundleIDs: [String] = [

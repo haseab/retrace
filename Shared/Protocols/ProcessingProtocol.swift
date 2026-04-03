@@ -141,18 +141,40 @@ public struct AppInfo: Identifiable, Hashable, Sendable {
         self.browserURL = browserURL
     }
 
-    /// Known browser bundle IDs (used for URL extraction and dashboard display)
-    /// Firefox excluded as it doesn't support URL extraction via accessibility APIs
-    public static let browserBundleIDs: Set<String> = [
+    /// Supported browsers exposed in product UI for browser-specific features.
+    /// This drives dashboard website breakdowns and user-facing browser support lists.
+    public static let supportedBrowserBundleIDOrder: [String] = [
         "com.apple.Safari",
         "com.google.Chrome",
+        "com.google.Chrome.canary",
+        "org.chromium.Chromium",
         "com.microsoft.edgemac",
         "com.brave.Browser",
-        "com.operasoftware.Opera",
         "com.vivaldi.Vivaldi",
+        "com.operasoftware.Opera",
         "company.thebrowser.Browser", // Arc
-        "company.thebrowser.dia"      // Dia
+        "ai.perplexity.comet",        // Comet
+        "company.thebrowser.dia",     // Dia
+        "com.nicklockwood.Thorium",   // Thorium
     ]
+
+    /// Chromium-family browser host bundle IDs used for host-browser matching.
+    public static let chromiumHostBrowserBundleIDPrefixes: [String] = [
+        "com.google.Chrome",
+        "com.google.Chrome.canary",
+        "org.chromium.Chromium",
+        "com.microsoft.edgemac",
+        "com.brave.Browser",
+        "com.vivaldi.Vivaldi",
+        "com.operasoftware.Opera",
+        "company.thebrowser.Browser",
+        "ai.perplexity.comet",
+        "company.thebrowser.dia",
+        "com.nicklockwood.Thorium",
+    ]
+
+    /// Known browser bundle IDs used by dashboard/browser breakdown paths.
+    public static let browserBundleIDs: Set<String> = Set(supportedBrowserBundleIDOrder)
 
     public var isBrowser: Bool {
         Self.browserBundleIDs.contains(bundleID)
