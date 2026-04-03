@@ -66,8 +66,8 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.retrace.app
         INFOPLIST_FILE: UI/Info.plist
-        MARKETING_VERSION: "0.8.5"
-        CURRENT_PROJECT_VERSION: "10"
+        MARKETING_VERSION: "0.8.7"
+        CURRENT_PROJECT_VERSION: "11"
         CODE_SIGN_ENTITLEMENTS: UI/Retrace.entitlements
         CODE_SIGN_STYLE: Manual
         CODE_SIGN_IDENTITY: "Developer ID Application"

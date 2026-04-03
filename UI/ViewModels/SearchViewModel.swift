@@ -432,8 +432,8 @@ public class SearchViewModel: ObservableObject {
     nonisolated private static let memoryLedgerAppIconTag = "ui.search.appIconCache"
     nonisolated private static let memoryLedgerResultSetTag = "ui.search.resultSet"
     nonisolated private static let memoryLedgerRecentSearchesTag = "ui.search.recentEntries"
-    private static let thumbnailDiskCacheMaxBytes: Int64 = 512 * 1024 * 1024
-    private static let thumbnailDiskCacheMaxAge: TimeInterval = 7 * 24 * 60 * 60
+    private nonisolated static let thumbnailDiskCacheMaxBytes: Int64 = 512 * 1024 * 1024
+    private nonisolated static let thumbnailDiskCacheMaxAge: TimeInterval = 7 * 24 * 60 * 60
     private static let maxRecentSearchEntryCount = 80
     private static let recentSearchEntriesKey = "search.recentEntries.v1"
     private static let encodedMetadataFilterPrefix = "__retrace_meta_filter_v1__"
