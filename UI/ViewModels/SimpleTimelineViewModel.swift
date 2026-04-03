@@ -14574,6 +14574,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     public func searchForDate(_ searchText: String, source: String = "timeline_date_search") async {
         let trimmedSearchText = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedSearchText.isEmpty else { return }
+        let normalizedPlayheadDaySearchText = normalizedPlayheadDayReferenceInput(trimmedSearchText)
         let numericFrameID = Int64(trimmedSearchText)
         let qualifiesForFrameIDSearch = numericFrameID.map { $0 >= Self.minimumFrameIDSearchValue } ?? false
         var frameIDLookupAttempted = false
@@ -14625,10 +14626,12 @@ public class SimpleTimelineViewModel: ObservableObject {
             // Parse natural language date.
             // "X minutes/hours earlier|later" is interpreted relative to the current playhead timestamp.
             let targetDate: Date
-            if let playheadRelativeDate = parsePlayheadRelativeDateIfNeeded(searchText) {
+            if let playheadRelativeDate = parsePlayheadRelativeDateIfNeeded(normalizedPlayheadDaySearchText) {
                 targetDate = playheadRelativeDate
+            } else if let playheadDayReferenceDate = parsePlayheadDayReferenceIfNeeded(trimmedSearchText) {
+                targetDate = playheadDayReferenceDate
             } else {
-                guard let parsedDate = parseNaturalLanguageDate(trimmedSearchText) else {
+                guard let parsedDate = parseNaturalLanguageDate(normalizedPlayheadDaySearchText) else {
                     let parseFailedReason: String
                     let outcome: String
                     if frameIDLookupAttempted, let frameID = numericFrameID {
@@ -14656,7 +14659,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
             let anchoredTargetDate = try await resolveDateSearchAnchorDate(
                 parsedDate: targetDate,
-                input: trimmedSearchText
+                input: normalizedPlayheadDaySearchText
             )
 
             // Load frames around the target date (±10 minutes window)
@@ -14894,6 +14897,47 @@ public class SimpleTimelineViewModel: ObservableObject {
             directionSign: directionSign,
             to: baseTimestamp
         )
+    }
+
+    private func parsePlayheadDayReferenceIfNeeded(_ text: String) -> Date? {
+        guard hasPlayheadDayReference(text) else {
+            return nil
+        }
+
+        let normalizedInput = normalizedPlayheadDayReferenceInput(text)
+        let baseTimestamp: Date
+        if let currentTimestamp {
+            baseTimestamp = currentTimestamp
+        } else {
+            baseTimestamp = Date()
+            Log.warning("[DateSearch] Same-day reference '\(normalizedInput)' had no playhead timestamp; falling back to now", category: .ui)
+        }
+
+        let calendar = Calendar.current
+        if normalizedInput == "today" ||
+            normalizedInput.range(of: #"^start of (?:the )?today$"#, options: .regularExpression) != nil {
+            return calendar.startOfDay(for: baseTimestamp)
+        }
+
+        let strippedTodayInput = normalizedInput
+            .replacingOccurrences(of: #"\btoday\b"#, with: " ", options: .regularExpression)
+            .replacingOccurrences(of: #"\b(?:at|on)\b"#, with: " ", options: .regularExpression)
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if strippedTodayInput.isEmpty {
+            return calendar.startOfDay(for: baseTimestamp)
+        }
+
+        if let timeOnlyDate = parseTimeOnly(strippedTodayInput, relativeTo: baseTimestamp) {
+            return timeOnlyDate
+        }
+
+        if let parsedStrippedInput = parseNaturalLanguageDate(strippedTodayInput, now: baseTimestamp) {
+            return parsedStrippedInput
+        }
+
+        return parseNaturalLanguageDate(normalizedInput, now: baseTimestamp)
     }
 
     private func parsePlayheadRelativeOffset(_ normalizedText: String) -> PlayheadRelativeOffset? {
@@ -15651,6 +15695,33 @@ public class SimpleTimelineViewModel: ObservableObject {
             of: #"^(?:\d{1,2}(?::\d{2})?\s*(?:am|pm|a|p)?|\d{3,4}\s*(?:am|pm|a|p)?|noon|midnight)$"#,
             options: [.regularExpression, .caseInsensitive]
         ) != nil
+    }
+
+    private func hasPlayheadDayReference(_ text: String) -> Bool {
+        text.range(
+            of: #"\b(?:same|that)[-\s]+day\b"#,
+            options: [.regularExpression, .caseInsensitive]
+        ) != nil
+    }
+
+    private func normalizedPlayheadDayReferenceInput(_ text: String) -> String {
+        let collapsedInput = text
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+
+        guard hasPlayheadDayReference(collapsedInput) else {
+            return collapsedInput
+        }
+
+        return collapsedInput
+            .replacingOccurrences(
+                of: #"\b(?:same|that)[-\s]+day\b"#,
+                with: "today",
+                options: [.regularExpression, .caseInsensitive]
+            )
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func normalizeRelativeDateShorthand(_ text: String) -> String {
