@@ -24,7 +24,9 @@ extension SettingsView {
 
     @ViewBuilder
     var rewindDataCard: some View {
-        ModernSettingsCard(title: "Rewind Data", icon: "arrow.counterclockwise") {
+        ModernSettingsCard(title: "Rewind Data") {
+            RewindSettingsLogoIcon()
+        } content: {
             VStack(alignment: .leading, spacing: 16) {
                 ModernToggleRow(
                     title: "Use Rewind data",
@@ -567,4 +569,55 @@ extension SettingsView {
     }
 
     // MARK: - Export & Data Settings
+}
+
+private struct RewindSettingsLogoIcon: View {
+    var body: some View {
+        RewindSettingsLogoShape()
+            .fill(Color.white)
+            .frame(width: 18, height: 12)
+            .accessibilityHidden(true)
+    }
+}
+
+private struct RewindSettingsLogoShape: Shape {
+    private static let bounds = CGRect(x: -0.25, y: -0.75, width: 65.75, height: 41.5)
+
+    func path(in rect: CGRect) -> Path {
+        let scale = min(rect.width / Self.bounds.width, rect.height / Self.bounds.height)
+        let scaledWidth = Self.bounds.width * scale
+        let scaledHeight = Self.bounds.height * scale
+        let offsetX = rect.midX - (scaledWidth / 2)
+        let offsetY = rect.midY - (scaledHeight / 2)
+
+        func point(_ x: CGFloat, _ y: CGFloat) -> CGPoint {
+            CGPoint(
+                x: offsetX + ((x - Self.bounds.minX) * scale),
+                y: offsetY + ((y - Self.bounds.minY) * scale)
+            )
+        }
+
+        var path = Path()
+        path.move(to: point(32.1, 17.7))
+        path.addLine(to: point(60.8, 0.6))
+        path.addCurve(to: point(64.8, 3.5), control1: point(62.8, -0.6), control2: point(65.3, 1.2))
+        path.addLine(to: point(63.8, 7.5))
+        path.addCurve(to: point(63.8, 32.4), control1: point(61.8, 15.7), control2: point(61.8, 24.2))
+        path.addLine(to: point(64.8, 36.4))
+        path.addCurve(to: point(60.8, 39.3), control1: point(65.4, 38.7), control2: point(62.9, 40.5))
+        path.addLine(to: point(32.1, 22.3))
+        path.addCurve(to: point(31.6, 22.0), control1: point(31.9, 22.2), control2: point(31.8, 22.1))
+        path.addCurve(to: point(33.0, 32.5), control1: point(31.7, 25.5), control2: point(32.2, 29.0))
+        path.addLine(to: point(34.0, 36.5))
+        path.addCurve(to: point(30.0, 39.4), control1: point(34.6, 38.8), control2: point(32.1, 40.6))
+        path.addLine(to: point(1.5, 22.3))
+        path.addCurve(to: point(1.5, 17.7), control1: point(-0.2, 21.3), control2: point(-0.2, 18.7))
+        path.addLine(to: point(30.1, 0.6))
+        path.addCurve(to: point(34.1, 3.5), control1: point(32.1, -0.6), control2: point(34.6, 1.2))
+        path.addLine(to: point(33.1, 7.5))
+        path.addCurve(to: point(31.7, 18.0), control1: point(32.3, 10.9), control2: point(31.8, 14.5))
+        path.addCurve(to: point(32.1, 17.7), control1: point(31.8, 17.9), control2: point(32.0, 17.8))
+        path.closeSubpath()
+        return path
+    }
 }

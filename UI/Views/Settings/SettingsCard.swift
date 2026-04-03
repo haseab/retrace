@@ -4,19 +4,65 @@ import Shared
 
 struct ModernSettingsCard<Content: View>: View {
     let title: String
-    let icon: String
+    let icon: String?
+    let customIcon: AnyView?
     var dangerous: Bool = false
     var trailingAction: (() -> Void)? = nil
     var trailingActionIcon: String? = nil
     var trailingActionTooltip: String? = nil
     @ViewBuilder let content: () -> Content
 
+    init(
+        title: String,
+        icon: String,
+        dangerous: Bool = false,
+        trailingAction: (() -> Void)? = nil,
+        trailingActionIcon: String? = nil,
+        trailingActionTooltip: String? = nil,
+        @ViewBuilder content: @escaping () -> Content
+    ) {
+        self.title = title
+        self.icon = icon
+        self.customIcon = nil
+        self.dangerous = dangerous
+        self.trailingAction = trailingAction
+        self.trailingActionIcon = trailingActionIcon
+        self.trailingActionTooltip = trailingActionTooltip
+        self.content = content
+    }
+
+    init<Icon: View>(
+        title: String,
+        dangerous: Bool = false,
+        trailingAction: (() -> Void)? = nil,
+        trailingActionIcon: String? = nil,
+        trailingActionTooltip: String? = nil,
+        @ViewBuilder iconView: () -> Icon,
+        @ViewBuilder content: @escaping () -> Content
+    ) {
+        self.title = title
+        self.icon = nil
+        self.customIcon = AnyView(iconView())
+        self.dangerous = dangerous
+        self.trailingAction = trailingAction
+        self.trailingActionIcon = trailingActionIcon
+        self.trailingActionTooltip = trailingActionTooltip
+        self.content = content
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack(spacing: 10) {
-                Image(systemName: icon)
-                    .font(.retraceCalloutMedium)
-                    .foregroundColor(dangerous ? .retraceDanger : .retraceSecondary)
+                Group {
+                    if let customIcon {
+                        customIcon
+                    } else if let icon {
+                        Image(systemName: icon)
+                            .font(.retraceCalloutMedium)
+                            .foregroundColor(dangerous ? .retraceDanger : .retraceSecondary)
+                    }
+                }
+                .frame(width: 18, height: 16, alignment: .center)
 
                 Text(title)
                     .font(.retraceBodyBold)

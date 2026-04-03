@@ -3,9 +3,59 @@ import Shared
 @testable import Retrace
 
 final class CaptureIntervalSettingsTests: XCTestCase {
+    private func makeTestDefaults() -> UserDefaults {
+        let suiteName = "io.retrace.tests.pause-reminder.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
+        return defaults
+    }
+
     func testMouseClickCaptureDefaultsToDisabledUntilPermissionGranted() {
         XCTAssertFalse(SettingsDefaults.captureOnMouseClick)
         XCTAssertFalse(CaptureConfig().captureOnMouseClick)
+    }
+
+    func testPauseReminderDelayUsesDefaultWhenUnset() {
+        let defaults = makeTestDefaults()
+
+        XCTAssertEqual(PauseReminderManager.remindLaterDelay(for: defaults), 30 * 60)
+    }
+
+    func testPauseReminderDelayUsesStoredMinutesWhenConfigured() {
+        let defaults = makeTestDefaults()
+        defaults.set(15.0, forKey: "pauseReminderDelayMinutes")
+
+        XCTAssertEqual(PauseReminderManager.remindLaterDelay(for: defaults), 15 * 60)
+    }
+
+    func testRemainingPauseReminderDelayUsesUpdatedIntervalFromOriginalSnoozeTime() {
+        let remindLaterRequestedAt = Date(timeIntervalSince1970: 1_000)
+        let now = remindLaterRequestedAt.addingTimeInterval(10 * 60)
+
+        XCTAssertEqual(
+            PauseReminderManager.remainingRemindLaterDelay(
+                since: remindLaterRequestedAt,
+                configuredDelay: 30 * 60,
+                now: now
+            ),
+            20 * 60,
+            accuracy: 0.001
+        )
+    }
+
+    func testRemainingPauseReminderDelayDropsToZeroWhenUpdatedIntervalAlreadyElapsed() {
+        let remindLaterRequestedAt = Date(timeIntervalSince1970: 1_000)
+        let now = remindLaterRequestedAt.addingTimeInterval(20 * 60)
+
+        XCTAssertEqual(
+            PauseReminderManager.remainingRemindLaterDelay(
+                since: remindLaterRequestedAt,
+                configuredDelay: 15 * 60,
+                now: now
+            ),
+            0,
+            accuracy: 0.001
+        )
     }
 
     func testAutomaticCaptureConfigurationRequiresAtLeastOneTrigger() {

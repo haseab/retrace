@@ -268,6 +268,12 @@ extension SettingsView {
                 }
 
                 PauseReminderDelayPicker(selectedMinutes: $pauseReminderDelayMinutes)
+                    .onChange(of: pauseReminderDelayMinutes) { newValue in
+                        NotificationCenter.default.post(
+                            name: PauseReminderSettingsNotification.didChange,
+                            object: PauseReminderSettingsSnapshot(delayMinutes: newValue)
+                        )
+                    }
 
                 HStack {
                     Text("How long to wait before reminding you again when recording is stopped")
