@@ -264,9 +264,9 @@ public struct FilterPopoverContainer<Content: View>: View {
 public struct FilterSearchField: View {
     @Binding var text: String
     let placeholder: String
-    var isFocused: FocusState<Bool>.Binding?
+    var isFocused: Binding<Bool>?
 
-    public init(text: Binding<String>, placeholder: String = "Search...", isFocused: FocusState<Bool>.Binding? = nil) {
+    public init(text: Binding<String>, placeholder: String = "Search...", isFocused: Binding<Bool>? = nil) {
         self._text = text
         self.placeholder = placeholder
         self.isFocused = isFocused
@@ -342,7 +342,7 @@ public struct AppsFilterPopover: View {
     @State private var highlightedItemID: String? = nil
     /// Special flag to indicate "All Apps" is highlighted (since nil bundleID is ambiguous)
     @State private var isAllAppsHighlighted: Bool = true
-    @FocusState private var isSearchFocused: Bool
+    @State private var isSearchFieldFocused = false
 
     /// Cached initial selection state - used for sorting so list doesn't re-order while open
     @State private var initialSelectedApps: Set<String> = []
@@ -510,7 +510,7 @@ public struct AppsFilterPopover: View {
     public var body: some View {
         FilterPopoverContainer(width: 220) {
             // Search field
-            FilterSearchField(text: $searchText, placeholder: "Search apps...", isFocused: $isSearchFocused)
+            FilterSearchField(text: $searchText, placeholder: "Search apps...", isFocused: $isSearchFieldFocused)
                 .padding(.top, 8)
                 .padding(.bottom, 4)
 
@@ -680,12 +680,17 @@ public struct AppsFilterPopover: View {
             initialSelectedApps = selectedApps ?? []
             AppMetadataCache.shared.prefetch(bundleIDs: prefetchedInstalledAppBundleIDs)
 
-            // Autofocus the search field when popover appears
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                isSearchFocused = true
+            // Clear the previous responder first so the main overlay search field
+            // does not immediately reclaim keyboard focus from the dropdown field.
+            DispatchQueue.main.async {
+                NSApp.keyWindow?.makeFirstResponder(nil)
+                isSearchFieldFocused = true
             }
             // Initialize highlight to first item
             resetHighlightToFirst()
+        }
+        .onDisappear {
+            isSearchFieldFocused = false
         }
         .onChange(of: searchText) { _ in
             // Reset highlight to first item when search changes
@@ -756,7 +761,7 @@ public struct TagsFilterPopover: View {
     @State private var highlightedTagID: Int64? = nil
     /// Special flag to indicate "All Tags" is highlighted
     @State private var isAllTagsHighlighted: Bool = true
-    @FocusState private var isSearchFocused: Bool
+    @State private var isSearchFieldFocused = false
 
     /// Cached initial selection state - used for sorting so list doesn't re-order while open
     @State private var initialSelectedTags: Set<Int64> = []
@@ -894,7 +899,7 @@ public struct TagsFilterPopover: View {
     public var body: some View {
         FilterPopoverContainer(width: 220) {
             // Search field
-            FilterSearchField(text: $searchText, placeholder: "Search tags...", isFocused: $isSearchFocused)
+            FilterSearchField(text: $searchText, placeholder: "Search tags...", isFocused: $isSearchFieldFocused)
                 .padding(.top, 8)
                 .padding(.bottom, 4)
 
@@ -1024,12 +1029,17 @@ public struct TagsFilterPopover: View {
             // Capture initial selection state for stable sorting
             initialSelectedTags = selectedTags ?? []
 
-            // Autofocus the search field when popover appears
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                isSearchFocused = true
+            // Clear the previous responder first so the main overlay search field
+            // does not immediately reclaim keyboard focus from the dropdown field.
+            DispatchQueue.main.async {
+                NSApp.keyWindow?.makeFirstResponder(nil)
+                isSearchFieldFocused = true
             }
             // Initialize highlight to first item
             resetHighlightToFirst()
+        }
+        .onDisappear {
+            isSearchFieldFocused = false
         }
         .onChange(of: searchText) { _ in
             // Reset highlight to first item when search changes
