@@ -1874,6 +1874,93 @@ public actor AppCoordinator {
             .appendingPathExtension("jpg")
     }
 
+    private func removeTimelineDiskCacheStills(frameIDs: [Int64]) {
+        for frameID in Set(frameIDs) {
+            let url = Self.timelineDiskFrameBufferURL(for: frameID)
+            try? FileManager.default.removeItem(at: url)
+        }
+    }
+
+    private func finalizeNativeFrameDeletionIntent(_ result: NativeFrameDeletionResult) async -> FrameDeletionResult {
+        guard result.affectedFrameCount > 0 else { return .empty }
+
+        removeTimelineDiskCacheStills(frameIDs: result.affectedFrameIDs)
+
+        let scheduledFrameIDs = Set(result.scheduledJobs.map(\.frameID))
+        var queuedScheduledFrameIDs = Set<Int64>()
+        let touchedVideoIDs = Array(Set(result.scheduledJobs.map(\.videoID))).sorted()
+
+        if let processingQueue = await services.processingQueue {
+            for videoID in touchedVideoIDs {
+                do {
+                    let dispatchOutcome = try await processingQueue.processPendingRewrites(for: videoID)
+                    if case .deferred(let reason) = dispatchOutcome {
+                        Log.info(
+                            "[AppCoordinator] Queued native frame deletion rewrite for video \(videoID): \(reason.rawValue)",
+                            category: .app
+                        )
+                    }
+                } catch {
+                    Log.error(
+                        "[AppCoordinator] Native frame deletion rewrite failed for video \(videoID); leaving deletion queued: \(error.localizedDescription)",
+                        category: .app
+                    )
+                }
+
+                do {
+                    let pendingJobs = try await services.database.getPendingFrameDeletionJobs(
+                        videoID: videoID,
+                        includeInProgressJobs: true,
+                        includeRetryableFailures: true
+                    )
+                    queuedScheduledFrameIDs.formUnion(pendingJobs.map(\.frameID))
+                } catch {
+                    queuedScheduledFrameIDs.formUnion(
+                        result.scheduledJobs
+                            .filter { $0.videoID == videoID }
+                            .map(\.frameID)
+                    )
+                    Log.error(
+                        "[AppCoordinator] Failed to verify native frame deletion completion for video \(videoID); treating scheduled frames as queued: \(error.localizedDescription)",
+                        category: .app
+                    )
+                }
+            }
+        } else if !scheduledFrameIDs.isEmpty {
+            queuedScheduledFrameIDs = scheduledFrameIDs
+            Log.warning(
+                "[AppCoordinator] processingQueue unavailable while deleting native frames; marking \(queuedScheduledFrameIDs.count) frame(s) queued",
+                category: .app
+            )
+        }
+
+        let relevantQueuedFrameIDs = queuedScheduledFrameIDs.intersection(scheduledFrameIDs)
+        return FrameDeletionResult(
+            completedFrames: result.immediatelyDeletedFrameIDs.count + scheduledFrameIDs.count - relevantQueuedFrameIDs.count,
+            queuedFrames: relevantQueuedFrameIDs.count
+        )
+    }
+
+    private func persistNativeFrameDeletionIntent(frameIDs: [Int64]) async throws -> FrameDeletionResult {
+        let result = try await services.database.deleteOrScheduleNativeFramesForDeletion(frameIDs: frameIDs)
+        return await finalizeNativeFrameDeletionIntent(result)
+    }
+
+    private func persistNativeFrameDeletionIntent(newerThan date: Date) async throws -> FrameDeletionResult {
+        let result = try await services.database.deleteOrScheduleNativeFramesForDeletion(newerThan: date)
+        return await finalizeNativeFrameDeletionIntent(result)
+    }
+
+    private func recordDeleteMetric(
+        metricType: DailyMetricsQueries.MetricType,
+        payload: [String: Any]
+    ) async {
+        try? await recordMetricEvent(
+            metricType: metricType,
+            metadata: Self.metricMetadata(payload)
+        )
+    }
+
     private func writeCapturedFrameStillToTimelineDiskCache(
         frameID: Int64,
         frame: CapturedFrame
@@ -2198,13 +2285,13 @@ public actor AppCoordinator {
             }
 
             // Trigger segment-level video rewrites for any p=5 frames now that the file is finalized.
-            try? await processingQueue.processPendingRedactions(for: writerState.videoDBID)
+            _ = try? await processingQueue.processPendingRewrites(for: writerState.videoDBID)
         }
     }
 
     public func recoverPendingPhraseRedactionRewritesIfPossible() async {
         if let processingQueue = await services.processingQueue {
-            await processingQueue.recoverPendingRedactionsIfPossible()
+            await processingQueue.recoverPendingRewritesIfPossible()
         }
     }
 
@@ -3270,43 +3357,88 @@ public actor AppCoordinator {
 
     /// Delete a single frame from the database
     /// Note: For Rewind data, this only removes the database entry. Video files remain on disk.
-    public func deleteFrame(frameID: FrameID, timestamp: Date, source: FrameSource) async throws {
-        guard let adapter = await services.dataAdapter else {
-            // Fallback to direct database deletion for native frames
-            if source == .native {
-                try await services.database.deleteFrame(id: frameID)
-                Log.info("[AppCoordinator] Deleted native frame \(frameID.stringValue)", category: .app)
-                return
-            }
-            throw AppError.notInitialized
-        }
-
-        // For Rewind frames, use timestamp-based deletion (more reliable than synthetic UUIDs)
+    public func deleteFrame(
+        frameID: FrameID,
+        timestamp: Date,
+        source: FrameSource,
+        metricSource: String? = nil
+    ) async throws -> FrameDeletionResult {
+        let result: FrameDeletionResult
         if source == .rewind {
+            guard let adapter = await services.dataAdapter else {
+                throw AppError.notInitialized
+            }
             try await adapter.deleteFrameByTimestamp(timestamp, source: source)
+            result = FrameDeletionResult(completedFrames: 1, queuedFrames: 0)
         } else {
-            try await adapter.deleteFrame(frameID: frameID, source: source)
+            result = try await persistNativeFrameDeletionIntent(frameIDs: [frameID.value])
         }
 
-        Log.info("[AppCoordinator] Deleted frame from \(source.displayName)", category: .app)
+        Log.info(
+            "[AppCoordinator] Deleted frame from \(source.displayName); completed=\(result.completedFrames), queued=\(result.queuedFrames)",
+            category: .app
+        )
+
+        await recordDeleteMetric(
+            metricType: .frameDeleted,
+            payload: [
+                "source": metricSource ?? "frame_delete",
+                "dataSource": source.rawValue,
+                "frameID": frameID.value,
+                "completedFrames": result.completedFrames,
+                "queuedFrames": result.queuedFrames
+            ]
+        )
+        return result
     }
 
     /// Delete multiple frames from the database
     /// Groups by source and uses appropriate deletion method for each
-    public func deleteFrames(_ frames: [FrameReference]) async throws {
-        guard !frames.isEmpty else { return }
+    public func deleteFrames(
+        _ frames: [FrameReference],
+        metricSource: String? = nil
+    ) async throws -> FrameDeletionResult {
+        guard !frames.isEmpty else { return .empty }
 
-        // For Rewind frames, delete by timestamp (more reliable)
-        // For native frames, delete by ID
-        for frame in frames {
-            try await deleteFrame(
-                frameID: frame.id,
-                timestamp: frame.timestamp,
-                source: frame.source
+        var result = FrameDeletionResult.empty
+
+        let nativeFrameIDs = frames
+            .filter { $0.source == .native }
+            .map { $0.id.value }
+        if !nativeFrameIDs.isEmpty {
+            result = result.merging(try await persistNativeFrameDeletionIntent(frameIDs: nativeFrameIDs))
+        }
+
+        let rewindFrames = frames.filter { $0.source == .rewind }
+        if !rewindFrames.isEmpty {
+            guard let adapter = await services.dataAdapter else {
+                throw AppError.notInitialized
+            }
+            for frame in rewindFrames {
+                try await adapter.deleteFrameByTimestamp(frame.timestamp, source: .rewind)
+            }
+            result = result.merging(
+                FrameDeletionResult(completedFrames: rewindFrames.count, queuedFrames: 0)
             )
         }
 
-        Log.info("[AppCoordinator] Deleted \(frames.count) frames", category: .app)
+        Log.info(
+            "[AppCoordinator] Deleted \(frames.count) frames; completed=\(result.completedFrames), queued=\(result.queuedFrames)",
+            category: .app
+        )
+
+        await recordDeleteMetric(
+            metricType: .segmentDeleted,
+            payload: [
+                "source": metricSource ?? "frame_batch_delete",
+                "frameCount": frames.count,
+                "segmentCount": Set(frames.map { $0.segmentID.value }).count,
+                "completedFrames": result.completedFrames,
+                "queuedFrames": result.queuedFrames,
+                "dataSources": Array(Set(frames.map { $0.source.rawValue })).sorted()
+            ]
+        )
+        return result
     }
 
     // MARK: - URL Bounding Box Detection
@@ -3638,7 +3770,7 @@ public actor AppCoordinator {
         outcome: MouseClickCaptureOutcome,
         timestamp: Date
     ) async {
-        let metadata = Self.captureTriggerMetricMetadata([
+        let metadata = Self.metricMetadata([
             "trigger": "mouse_click",
             "outcome": outcome.rawValue,
             "button": "left"
@@ -3656,7 +3788,7 @@ public actor AppCoordinator {
         source: String,
         isRunning: Bool
     ) async {
-        let metadata = Self.captureTriggerMetricMetadata([
+        let metadata = Self.metricMetadata([
             "quality": quality,
             "source": source,
             "isRunning": isRunning
@@ -3668,7 +3800,7 @@ public actor AppCoordinator {
         )
     }
 
-    private static func captureTriggerMetricMetadata(_ payload: [String: Any]) -> String? {
+    private static func metricMetadata(_ payload: [String: Any]) -> String? {
         guard JSONSerialization.isValidJSONObject(payload),
               let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
               let json = String(data: data, encoding: .utf8) else {
@@ -3852,25 +3984,30 @@ public actor AppCoordinator {
 
     /// Delete recent data (newer than specified date) - used for quick delete feature
     /// This deletes all frames captured after the cutoff date
-    public func deleteRecentData(newerThan date: Date) async throws -> CleanupResult {
+    public func deleteRecentData(
+        newerThan date: Date,
+        metricSource: String? = "quick_delete"
+    ) async throws -> FrameDeletionResult {
         Log.info("Starting quick delete for data newer than \(date)", category: .app)
 
-        // Delete recent frames from database
-        let deletedFrameCount = try await services.database.deleteFrames(newerThan: date)
+        let result = try await persistNativeFrameDeletionIntent(newerThan: date)
 
-        // Note: Video segments are not deleted here because they may contain older frames too
-        // The storage cleanup based on retention policy will handle orphaned segments
-
-        // Vacuum database to reclaim space
-        try await services.database.vacuum()
-
-        Log.info("Quick delete complete. Deleted \(deletedFrameCount) frames", category: .app)
-
-        return CleanupResult(
-            deletedFrames: deletedFrameCount,
-            deletedSegments: 0, // Segments are not deleted in quick delete
-            reclaimedBytes: 0
+        Log.info(
+            "Quick delete complete. completed=\(result.completedFrames), queued=\(result.queuedFrames)",
+            category: .app
         )
+
+        await recordDeleteMetric(
+            metricType: .segmentDeleted,
+            payload: [
+                "source": metricSource ?? "quick_delete",
+                "frameCount": result.affectedFrames,
+                "completedFrames": result.completedFrames,
+                "queuedFrames": result.queuedFrames,
+                "cutoffTimestampMs": Int64(date.timeIntervalSince1970 * 1000)
+            ]
+        )
+        return result
     }
 
     /// Rebuild the search index
@@ -4729,6 +4866,33 @@ public struct CleanupResult: Sendable {
     public let deletedFrames: Int
     public let deletedSegments: Int
     public let reclaimedBytes: Int64
+}
+
+public struct FrameDeletionResult: Sendable, Equatable {
+    public static let empty = FrameDeletionResult(completedFrames: 0, queuedFrames: 0)
+
+    public let completedFrames: Int
+    public let queuedFrames: Int
+
+    public init(completedFrames: Int, queuedFrames: Int) {
+        self.completedFrames = completedFrames
+        self.queuedFrames = queuedFrames
+    }
+
+    public var affectedFrames: Int {
+        completedFrames + queuedFrames
+    }
+
+    public var hasQueuedFrames: Bool {
+        queuedFrames > 0
+    }
+
+    public func merging(_ other: FrameDeletionResult) -> FrameDeletionResult {
+        FrameDeletionResult(
+            completedFrames: completedFrames + other.completedFrames,
+            queuedFrames: queuedFrames + other.queuedFrames
+        )
+    }
 }
 
 /// OCR processing status for a frame

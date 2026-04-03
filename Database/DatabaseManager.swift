@@ -132,6 +132,126 @@ public struct PendingNodeRedactionJob: Sendable, Equatable {
     }
 }
 
+public struct PendingFrameDeletionJob: Sendable, Equatable {
+    public let frameID: Int64
+    public let videoID: Int64
+    public let frameIndex: Int
+
+    public init(frameID: Int64, videoID: Int64, frameIndex: Int) {
+        self.frameID = frameID
+        self.videoID = videoID
+        self.frameIndex = frameIndex
+    }
+}
+
+public struct NativeFrameDeletionResult: Sendable, Equatable {
+    public let immediatelyDeletedFrameIDs: [Int64]
+    public let scheduledJobs: [PendingFrameDeletionJob]
+
+    public init(
+        immediatelyDeletedFrameIDs: [Int64],
+        scheduledJobs: [PendingFrameDeletionJob]
+    ) {
+        self.immediatelyDeletedFrameIDs = immediatelyDeletedFrameIDs
+        self.scheduledJobs = scheduledJobs
+    }
+
+    public var affectedFrameIDs: [Int64] {
+        immediatelyDeletedFrameIDs + scheduledJobs.map(\.frameID)
+    }
+
+    public var affectedFrameCount: Int {
+        affectedFrameIDs.count
+    }
+}
+
+public struct VideoFrameDeletion: Sendable, Equatable {
+    public let frameID: Int64
+    public let frameIndex: Int
+
+    public init(frameID: Int64, frameIndex: Int) {
+        self.frameID = frameID
+        self.frameIndex = frameIndex
+    }
+}
+
+public struct VideoFrameRedaction: Sendable, Equatable {
+    public let frameID: Int64
+    public let frameIndex: Int
+    public let targets: [SegmentRedactionTarget]
+
+    public init(frameID: Int64, frameIndex: Int, targets: [SegmentRedactionTarget]) {
+        self.frameID = frameID
+        self.frameIndex = frameIndex
+        self.targets = targets
+    }
+}
+
+public struct VideoRewritePlan: Sendable, Equatable {
+    public let videoID: Int64
+    public let operation: SegmentRewriteOperation
+    public let deletions: [VideoFrameDeletion]
+    public let redactions: [VideoFrameRedaction]
+
+    public init(
+        videoID: Int64,
+        operation: SegmentRewriteOperation = .partialRewrite,
+        deletions: [VideoFrameDeletion] = [],
+        redactions: [VideoFrameRedaction] = []
+    ) {
+        self.videoID = videoID
+        self.operation = operation
+        self.deletions = deletions
+        self.redactions = redactions
+    }
+
+    public var hasDeletionTargets: Bool {
+        !deletions.isEmpty
+    }
+
+    public var hasRedactionTargets: Bool {
+        !redactions.isEmpty
+    }
+
+    public var deletesWholeVideo: Bool {
+        operation == .wholeVideoDelete
+    }
+
+    public var hasAnyRewrite: Bool {
+        deletesWholeVideo || hasDeletionTargets || hasRedactionTargets
+    }
+
+    public var deletionFrameIDs: [Int64] {
+        deletions.map(\.frameID)
+    }
+
+    public var redactionFrameIDs: [Int64] {
+        redactions.map(\.frameID)
+    }
+
+    public var blackFrameIndexes: Set<Int> {
+        Set(deletions.map(\.frameIndex))
+    }
+
+    public var segmentRewritePlan: SegmentRewritePlan {
+        SegmentRewritePlan(
+            operation: operation,
+            blackFrameIndexes: blackFrameIndexes,
+            redactions: redactions.map {
+                SegmentFrameRedaction(
+                    frameID: $0.frameID,
+                    frameIndex: $0.frameIndex,
+                    targets: $0.targets
+                )
+            }
+        )
+    }
+
+    public func droppingRedactions() -> Self {
+        Self(videoID: videoID, operation: operation, deletions: deletions, redactions: [])
+    }
+}
+
 public struct LinkedSegmentComment: Sendable, Equatable {
     public let comment: SegmentComment
     public let preferredSegmentID: SegmentID
@@ -2325,6 +2445,484 @@ public actor DatabaseManager: DatabaseProtocol {
         try FTSQueries.deleteForFrame(db: db, frameId: frameId)
     }
 
+    public func getPendingFrameDeletionJobs(
+        videoID: Int64,
+        includeInProgressJobs: Bool = false,
+        includeRetryableFailures: Bool = false
+    ) async throws -> [PendingFrameDeletionJob] {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let pendingStatuses = includeInProgressJobs ? [5, 6] : [5]
+        let includedStatuses = includeRetryableFailures
+            ? Array(Set(pendingStatuses + [8])).sorted()
+            : pendingStatuses
+        let statusFilter = includedStatuses.count == 1
+            ? "processingStatus = \(includedStatuses[0])"
+            : "processingStatus IN (\(includedStatuses.map(String.init).joined(separator: ", ")))"
+        let sql = """
+            SELECT id, videoId, videoFrameIndex
+            FROM frame
+            WHERE videoId = ?
+              AND \(statusFilter)
+              AND rewritePurpose = 'deletion'
+            ORDER BY videoFrameIndex ASC, id ASC;
+            """
+
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        sqlite3_bind_int64(statement, 1, videoID)
+
+        var jobs: [PendingFrameDeletionJob] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            jobs.append(
+                PendingFrameDeletionJob(
+                    frameID: sqlite3_column_int64(statement, 0),
+                    videoID: sqlite3_column_int64(statement, 1),
+                    frameIndex: Int(sqlite3_column_int(statement, 2))
+                )
+            )
+        }
+
+        return jobs
+    }
+
+    public func getVideoIDsWithPendingRewrites(
+        includeRetryableFailures: Bool = false
+    ) async throws -> [Int64] {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let statuses = includeRetryableFailures ? [5, 6, 8] : [5, 6]
+        let sql = """
+            SELECT DISTINCT videoId
+            FROM frame
+            WHERE videoId IS NOT NULL
+              AND processingStatus IN (\(statuses.map(String.init).joined(separator: ", ")))
+              AND rewritePurpose IN ('redaction', 'deletion')
+            ORDER BY videoId ASC;
+            """
+
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        var videoIDs: [Int64] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            videoIDs.append(sqlite3_column_int64(statement, 0))
+        }
+
+        return videoIDs
+    }
+
+    public func buildVideoRewritePlan(
+        videoID: Int64,
+        includeInProgressJobs: Bool = false,
+        includeRetryableFailures: Bool = false
+    ) async throws -> VideoRewritePlan? {
+        let deletionJobs = try await getPendingFrameDeletionJobs(
+            videoID: videoID,
+            includeInProgressJobs: includeInProgressJobs,
+            includeRetryableFailures: includeRetryableFailures
+        )
+        let deletions = deletionJobs.map {
+            VideoFrameDeletion(frameID: $0.frameID, frameIndex: $0.frameIndex)
+        }
+        let deletionFrameIDs = Set(deletions.map(\.frameID))
+
+        let redactionJobs = try await getPendingNodeRedactionJobs(
+            videoID: videoID,
+            includeInProgressJobs: includeInProgressJobs,
+            includeRetryableFailures: includeRetryableFailures
+        )
+
+        var redactionTargetsByFrameID: [Int64: (frameIndex: Int, targets: [SegmentRedactionTarget])] = [:]
+        var seenTargets: Set<String> = []
+
+        for job in redactionJobs {
+            guard !deletionFrameIDs.contains(job.frameID) else { continue }
+            let targetKey = "\(job.frameID)|\(job.nodeID)"
+            guard seenTargets.insert(targetKey).inserted else { continue }
+            redactionTargetsByFrameID[job.frameID, default: (job.frameIndex, [])].targets.append(
+                SegmentRedactionTarget(
+                    frameID: job.frameID,
+                    nodeID: job.nodeID,
+                    normalizedRect: job.normalizedRect
+                )
+            )
+        }
+
+        let redactions = redactionTargetsByFrameID
+            .map { frameID, value in
+                VideoFrameRedaction(
+                    frameID: frameID,
+                    frameIndex: value.frameIndex,
+                    targets: value.targets
+                )
+            }
+            .sorted {
+                if $0.frameIndex == $1.frameIndex {
+                    return $0.frameID < $1.frameID
+                }
+                return $0.frameIndex < $1.frameIndex
+            }
+
+        guard !deletions.isEmpty || !redactions.isEmpty else {
+            return nil
+        }
+
+        let visibleFrameCount = try withTracedDatabaseOperation("get_visible_frame_count_for_video_rewrite") { db in
+            let sql = """
+                SELECT COUNT(*)
+                FROM frame
+                WHERE videoId = ?
+                  AND (rewritePurpose IS NULL OR rewritePurpose != 'deletion');
+                """
+            var statement: OpaquePointer?
+            defer { sqlite3_finalize(statement) }
+
+            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+                throw DatabaseError.queryFailed(
+                    query: sql,
+                    underlying: String(cString: sqlite3_errmsg(db))
+                )
+            }
+
+            sqlite3_bind_int64(statement, 1, videoID)
+            guard sqlite3_step(statement) == SQLITE_ROW else { return 0 }
+            return Int(sqlite3_column_int(statement, 0))
+        }
+
+        return VideoRewritePlan(
+            videoID: videoID,
+            operation: !deletions.isEmpty && visibleFrameCount == 0 ? .wholeVideoDelete : .partialRewrite,
+            deletions: deletions,
+            redactions: redactions
+        )
+    }
+
+    public func deleteOrScheduleNativeFramesForDeletion(
+        frameIDs: [Int64]
+    ) async throws -> NativeFrameDeletionResult {
+        let uniqueFrameIDs = Array(Set(frameIDs)).sorted()
+        guard !uniqueFrameIDs.isEmpty else {
+            return NativeFrameDeletionResult(
+                immediatelyDeletedFrameIDs: [],
+                scheduledJobs: []
+            )
+        }
+
+        return try withTracedDatabaseOperation("delete_or_schedule_native_frames_for_deletion_by_id") { db in
+            let placeholders = uniqueFrameIDs.map { _ in "?" }.joined(separator: ", ")
+            let selectSQL = """
+                SELECT id, videoId, videoFrameIndex
+                FROM frame
+                WHERE id IN (\(placeholders))
+                ORDER BY COALESCE(videoId, 0) ASC, videoFrameIndex ASC, id ASC;
+                """
+
+            return try executeNativeFrameDeletion(
+                db: db,
+                selectSQL: selectSQL
+            ) { statement in
+                for (index, frameID) in uniqueFrameIDs.enumerated() {
+                    sqlite3_bind_int64(statement, Int32(index + 1), frameID)
+                }
+            }
+        }
+    }
+
+    public func deleteOrScheduleNativeFramesForDeletion(
+        newerThan date: Date
+    ) async throws -> NativeFrameDeletionResult {
+        return try withTracedDatabaseOperation("delete_or_schedule_native_frames_for_deletion_by_date") { db in
+            let selectSQL = """
+                SELECT id, videoId, videoFrameIndex
+                FROM frame
+                WHERE createdAt > ?
+                  AND (rewritePurpose IS NULL OR rewritePurpose != 'deletion')
+                ORDER BY COALESCE(videoId, 0) ASC, createdAt ASC, videoFrameIndex ASC, id ASC;
+                """
+
+            return try executeNativeFrameDeletion(
+                db: db,
+                selectSQL: selectSQL
+            ) { statement in
+                sqlite3_bind_int64(statement, 1, Schema.dateToTimestamp(date))
+            }
+        }
+    }
+
+    private func executeNativeFrameDeletion(
+        db: OpaquePointer,
+        selectSQL: String,
+        bindSelection: (OpaquePointer) -> Void
+    ) throws -> NativeFrameDeletionResult {
+        var transactionOpen = false
+        do {
+            try executeImmediateSQL("BEGIN IMMEDIATE TRANSACTION;", db: db)
+            transactionOpen = true
+
+            var selectStatement: OpaquePointer?
+            defer { sqlite3_finalize(selectStatement) }
+            guard sqlite3_prepare_v2(db, selectSQL, -1, &selectStatement, nil) == SQLITE_OK else {
+                throw DatabaseError.queryFailed(query: selectSQL, underlying: String(cString: sqlite3_errmsg(db)))
+            }
+
+            bindSelection(selectStatement!)
+
+            var immediatelyDeletedFrameIDs: [Int64] = []
+            var scheduledJobs: [PendingFrameDeletionJob] = []
+            while sqlite3_step(selectStatement) == SQLITE_ROW {
+                let frameID = sqlite3_column_int64(selectStatement, 0)
+                if sqlite3_column_type(selectStatement, 1) == SQLITE_NULL {
+                    immediatelyDeletedFrameIDs.append(frameID)
+                    continue
+                }
+
+                scheduledJobs.append(
+                    PendingFrameDeletionJob(
+                        frameID: frameID,
+                        videoID: sqlite3_column_int64(selectStatement, 1),
+                        frameIndex: Int(sqlite3_column_int(selectStatement, 2))
+                    )
+                )
+            }
+
+            if !immediatelyDeletedFrameIDs.isEmpty {
+                _ = try FrameQueries.delete(
+                    db: db,
+                    frameIDs: immediatelyDeletedFrameIDs.map { FrameID(value: $0) }
+                )
+            }
+
+            try markFramesPendingDeletion(
+                db: db,
+                frameIDs: scheduledJobs.map(\.frameID)
+            )
+
+            try executeImmediateSQL("COMMIT;", db: db)
+            transactionOpen = false
+            return NativeFrameDeletionResult(
+                immediatelyDeletedFrameIDs: immediatelyDeletedFrameIDs,
+                scheduledJobs: scheduledJobs
+            )
+        } catch {
+            if transactionOpen {
+                try? executeImmediateSQL("ROLLBACK;", db: db)
+            }
+            throw error
+        }
+    }
+
+    private func markFramesPendingDeletion(
+        db: OpaquePointer,
+        frameIDs: [Int64]
+    ) throws {
+        guard !frameIDs.isEmpty else { return }
+
+        let placeholders = frameIDs.map { _ in "?" }.joined(separator: ", ")
+        let deleteQueueSQL = "DELETE FROM processing_queue WHERE frameId IN (\(placeholders));"
+        let updateSQL = """
+            UPDATE frame
+            SET processingStatus = 5,
+                rewritePurpose = 'deletion'
+            WHERE id IN (\(placeholders));
+            """
+
+        var deleteQueueStatement: OpaquePointer?
+        defer { sqlite3_finalize(deleteQueueStatement) }
+        guard sqlite3_prepare_v2(db, deleteQueueSQL, -1, &deleteQueueStatement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: deleteQueueSQL, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+        for (index, frameID) in frameIDs.enumerated() {
+            sqlite3_bind_int64(deleteQueueStatement, Int32(index + 1), frameID)
+        }
+        guard sqlite3_step(deleteQueueStatement) == SQLITE_DONE else {
+            throw DatabaseError.queryFailed(query: deleteQueueSQL, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+
+        var updateStatement: OpaquePointer?
+        defer { sqlite3_finalize(updateStatement) }
+        guard sqlite3_prepare_v2(db, updateSQL, -1, &updateStatement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: updateSQL, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+        for (index, frameID) in frameIDs.enumerated() {
+            sqlite3_bind_int64(updateStatement, Int32(index + 1), frameID)
+        }
+        guard sqlite3_step(updateStatement) == SQLITE_DONE else {
+            throw DatabaseError.queryFailed(query: updateSQL, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+    }
+
+    public func getVisibleNativeFrameIDsNewerThan(_ date: Date) async throws -> [Int64] {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let sql = """
+            SELECT id
+            FROM frame
+            WHERE createdAt > ?
+              AND (rewritePurpose IS NULL OR rewritePurpose != 'deletion')
+            ORDER BY createdAt ASC, id ASC;
+            """
+
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        sqlite3_bind_int64(statement, 1, Schema.dateToTimestamp(date))
+
+        var frameIDs: [Int64] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            frameIDs.append(sqlite3_column_int64(statement, 0))
+        }
+
+        return frameIDs
+    }
+
+    public func finalizeVideoRewrite(_ plan: VideoRewritePlan) async throws {
+        try withTracedDatabaseOperation("finalize_video_mutation") { db in
+            var transactionOpen = false
+            do {
+                try executeImmediateSQL("BEGIN IMMEDIATE TRANSACTION;", db: db)
+                transactionOpen = true
+
+                let deletionFrameIDs: [Int64]
+                if plan.deletesWholeVideo {
+                    let sql = """
+                        SELECT id
+                        FROM frame
+                        WHERE videoId = ?
+                          AND rewritePurpose = 'deletion'
+                        ORDER BY id ASC;
+                        """
+                    var statement: OpaquePointer?
+                    defer { sqlite3_finalize(statement) }
+
+                    guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+                        throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+                    }
+                    sqlite3_bind_int64(statement, 1, plan.videoID)
+
+                    var collectedIDs: [Int64] = []
+                    while sqlite3_step(statement) == SQLITE_ROW {
+                        collectedIDs.append(sqlite3_column_int64(statement, 0))
+                    }
+                    deletionFrameIDs = collectedIDs
+                } else {
+                    deletionFrameIDs = plan.deletionFrameIDs
+                }
+
+                if !deletionFrameIDs.isEmpty {
+                    _ = try FrameQueries.delete(
+                        db: db,
+                        frameIDs: deletionFrameIDs.map { FrameID(value: $0) }
+                    )
+                }
+
+                if !plan.redactionFrameIDs.isEmpty {
+                    let placeholders = plan.redactionFrameIDs.map { _ in "?" }.joined(separator: ", ")
+                    let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+                    let sql = """
+                        UPDATE frame
+                        SET processingStatus = 7,
+                            rewrittenAt = \(nowMs),
+                            rewritePurpose = 'redaction'
+                        WHERE id IN (\(placeholders))
+                          AND COALESCE(rewritePurpose, 'redaction') = 'redaction';
+                        """
+                    var statement: OpaquePointer?
+                    defer { sqlite3_finalize(statement) }
+                    guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+                        throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+                    }
+                    for (index, frameID) in plan.redactionFrameIDs.enumerated() {
+                        sqlite3_bind_int64(statement, Int32(index + 1), frameID)
+                    }
+                    guard sqlite3_step(statement) == SQLITE_DONE else {
+                        throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+                    }
+                }
+
+                if plan.deletesWholeVideo {
+                    let sql = "DELETE FROM video WHERE id = ?;"
+                    var statement: OpaquePointer?
+                    defer { sqlite3_finalize(statement) }
+                    guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+                        throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+                    }
+                    sqlite3_bind_int64(statement, 1, plan.videoID)
+                    guard sqlite3_step(statement) == SQLITE_DONE else {
+                        throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+                    }
+                }
+
+                try executeImmediateSQL("COMMIT;", db: db)
+                transactionOpen = false
+            } catch {
+                if transactionOpen {
+                    try? executeImmediateSQL("ROLLBACK;", db: db)
+                }
+                throw error
+            }
+        }
+    }
+
+    public func resetVideoRewritePlanToPending(_ plan: VideoRewritePlan) async throws {
+        try withTracedDatabaseOperation("reset_video_mutation_plan_to_pending") { db in
+            func update(_ frameIDs: [Int64], purpose: String) throws {
+                guard !frameIDs.isEmpty else { return }
+                let placeholders = frameIDs.map { _ in "?" }.joined(separator: ", ")
+                let sql = """
+                    UPDATE frame
+                    SET processingStatus = 5,
+                        rewritePurpose = ?
+                    WHERE id IN (\(placeholders));
+                    """
+                var statement: OpaquePointer?
+                defer { sqlite3_finalize(statement) }
+                guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+                    throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+                }
+                let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+                sqlite3_bind_text(statement, 1, purpose, -1, transient)
+                for (index, frameID) in frameIDs.enumerated() {
+                    sqlite3_bind_int64(statement, Int32(index + 2), frameID)
+                }
+                guard sqlite3_step(statement) == SQLITE_DONE else {
+                    throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+                }
+            }
+
+            try update(plan.deletionFrameIDs, purpose: "deletion")
+            try update(plan.redactionFrameIDs, purpose: "redaction")
+        }
+    }
+
     public func getPendingNodeRedactionJobs(
         videoID: Int64,
         includeInProgressJobs: Bool = false,
@@ -2533,6 +3131,33 @@ public actor DatabaseManager: DatabaseProtocol {
 
         sqlite3_bind_int64(statement, 1, videoID)
         return sqlite3_step(statement) == SQLITE_ROW
+    }
+
+    public func isVideoFinalized(videoID: Int64) async throws -> Bool {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let sql = """
+            SELECT processingState
+            FROM video
+            WHERE id = ?
+            LIMIT 1;
+            """
+
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        sqlite3_bind_int64(statement, 1, videoID)
+        guard sqlite3_step(statement) == SQLITE_ROW else { return false }
+        return sqlite3_column_int(statement, 0) == 0
     }
 
     // MARK: - Daily Metrics Operations
@@ -3718,9 +4343,15 @@ public actor DatabaseManager: DatabaseProtocol {
             if status == 2 {
                 let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
                 if shouldBindRewritePurpose {
-                    sql = "UPDATE frame SET processingStatus = ?, processedAt = \(nowMs), rewritePurpose = ? WHERE id = ?;"
+                    sql = "UPDATE frame SET processingStatus = ?, processedAt = \(nowMs), rewritePurpose = ? WHERE id = ? AND (rewritePurpose IS NULL OR rewritePurpose != 'deletion');"
                 } else {
-                    sql = "UPDATE frame SET processingStatus = ?, processedAt = \(nowMs) WHERE id = ?;"
+                    sql = "UPDATE frame SET processingStatus = ?, processedAt = \(nowMs) WHERE id = ? AND (rewritePurpose IS NULL OR rewritePurpose != 'deletion');"
+                }
+            } else if !isRewriteStatus {
+                if shouldBindRewritePurpose {
+                    sql = "UPDATE frame SET processingStatus = ?, rewritePurpose = ? WHERE id = ? AND (rewritePurpose IS NULL OR rewritePurpose != 'deletion');"
+                } else {
+                    sql = "UPDATE frame SET processingStatus = ? WHERE id = ? AND (rewritePurpose IS NULL OR rewritePurpose != 'deletion');"
                 }
             } else if status == 7 {
                 let nowMs = Int64(Date().timeIntervalSince1970 * 1000)

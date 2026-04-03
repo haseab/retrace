@@ -1015,6 +1015,528 @@ final class DatabaseManagerTests: XCTestCase {
         XCTAssertEqual(retryableJobs.map(\.frameID), [frameID.value])
     }
 
+    func testDeleteOrScheduleNativeFramesForDeletionDeletesLiveFramesImmediatelyAndSchedulesVideoFrames() async throws {
+        let timestamp = Date(timeIntervalSince1970: 1_775_000_000)
+        let appSegmentID = try await insertTestAppSegment(bundleID: "com.apple.Safari")
+
+        let liveFrame = FrameReference(
+            id: FrameID(value: 0),
+            timestamp: timestamp,
+            segmentID: AppSegmentID(value: appSegmentID.value),
+            frameIndexInSegment: 0,
+            metadata: .empty,
+            source: .native
+        )
+        let liveFrameID = FrameID(value: try await database.insertFrame(liveFrame))
+
+        let videoBackedFrameID = try await insertTestFrame(
+            browserURL: nil,
+            timestamp: timestamp.addingTimeInterval(2)
+        )
+
+        try await database.updateFrameProcessingStatus(frameID: liveFrameID.value, status: 0)
+        try await database.updateFrameProcessingStatus(frameID: videoBackedFrameID.value, status: 0)
+        try await database.enqueueFrameForProcessing(frameID: liveFrameID.value)
+        try await database.enqueueFrameForProcessing(frameID: videoBackedFrameID.value)
+
+        let result = try await database.deleteOrScheduleNativeFramesForDeletion(
+            frameIDs: [liveFrameID.value, videoBackedFrameID.value]
+        )
+
+        XCTAssertEqual(result.immediatelyDeletedFrameIDs, [liveFrameID.value])
+        XCTAssertEqual(result.scheduledJobs.map(\.frameID), [videoBackedFrameID.value])
+
+        let liveFrameCount = try await fetchInt64(
+            "SELECT COUNT(*) FROM frame WHERE id = ?;",
+            bind: { sqlite3_bind_int64($0, 1, liveFrameID.value) }
+        )
+        let liveQueueCount = try await fetchInt64(
+            "SELECT COUNT(*) FROM processing_queue WHERE frameId = ?;",
+            bind: { sqlite3_bind_int64($0, 1, liveFrameID.value) }
+        )
+        let scheduledQueueCount = try await fetchInt64(
+            "SELECT COUNT(*) FROM processing_queue WHERE frameId = ?;",
+            bind: { sqlite3_bind_int64($0, 1, videoBackedFrameID.value) }
+        )
+        let scheduledDeletionCount = try await fetchInt64(
+            """
+            SELECT COUNT(*)
+            FROM frame
+            WHERE id = ?
+              AND processingStatus = 5
+              AND rewritePurpose = 'deletion';
+            """,
+            bind: { sqlite3_bind_int64($0, 1, videoBackedFrameID.value) }
+        )
+
+        XCTAssertEqual(liveFrameCount, 0)
+        XCTAssertEqual(liveQueueCount, 0)
+        XCTAssertEqual(scheduledQueueCount, 0)
+        XCTAssertEqual(scheduledDeletionCount, 1)
+    }
+
+    func testDeleteOrScheduleNativeFramesForDeletionByDateUsesSetBasedSelection() async throws {
+        let cutoff = Date(timeIntervalSince1970: 1_775_000_000)
+        let appSegmentID = try await insertTestAppSegment(bundleID: "com.apple.Safari")
+
+        let olderLiveFrame = FrameReference(
+            id: FrameID(value: 0),
+            timestamp: cutoff.addingTimeInterval(-10),
+            segmentID: AppSegmentID(value: appSegmentID.value),
+            frameIndexInSegment: 0,
+            metadata: .empty,
+            source: .native
+        )
+        let olderLiveFrameID = FrameID(value: try await database.insertFrame(olderLiveFrame))
+
+        let recentLiveFrame = FrameReference(
+            id: FrameID(value: 0),
+            timestamp: cutoff.addingTimeInterval(10),
+            segmentID: AppSegmentID(value: appSegmentID.value),
+            frameIndexInSegment: 1,
+            metadata: .empty,
+            source: .native
+        )
+        let recentLiveFrameID = FrameID(value: try await database.insertFrame(recentLiveFrame))
+
+        let recentVideoFrameID = try await insertTestFrame(
+            browserURL: nil,
+            timestamp: cutoff.addingTimeInterval(20)
+        )
+
+        let result = try await database.deleteOrScheduleNativeFramesForDeletion(newerThan: cutoff)
+
+        XCTAssertEqual(result.immediatelyDeletedFrameIDs, [recentLiveFrameID.value])
+        XCTAssertEqual(result.scheduledJobs.map(\.frameID), [recentVideoFrameID.value])
+
+        let olderLiveFrameCount = try await fetchInt64(
+            "SELECT COUNT(*) FROM frame WHERE id = ?;",
+            bind: { sqlite3_bind_int64($0, 1, olderLiveFrameID.value) }
+        )
+        let recentLiveFrameCount = try await fetchInt64(
+            "SELECT COUNT(*) FROM frame WHERE id = ?;",
+            bind: { sqlite3_bind_int64($0, 1, recentLiveFrameID.value) }
+        )
+        let scheduledDeletionCount = try await fetchInt64(
+            """
+            SELECT COUNT(*)
+            FROM frame
+            WHERE id = ?
+              AND processingStatus = 5
+              AND rewritePurpose = 'deletion';
+            """,
+            bind: { sqlite3_bind_int64($0, 1, recentVideoFrameID.value) }
+        )
+
+        XCTAssertEqual(olderLiveFrameCount, 1)
+        XCTAssertEqual(recentLiveFrameCount, 0)
+        XCTAssertEqual(scheduledDeletionCount, 1)
+    }
+
+    func testBuildVideoRewritePlanDetectsWholeVideoDeleteFromRemainingVisibleFrames() async throws {
+        let timestamp = Date(timeIntervalSince1970: 1_775_000_000)
+        let videoID = try await database.insertVideoSegment(
+            VideoSegment(
+                id: VideoSegmentID(value: 0),
+                startTime: timestamp,
+                endTime: timestamp.addingTimeInterval(30),
+                frameCount: 3,
+                fileSizeBytes: 1_024,
+                relativePath: "segments/rewrite-whole-delete-\(UUID().uuidString).mp4",
+                width: 1_920,
+                height: 1_080,
+                source: .native
+            )
+        )
+        let appSegmentID = try await database.insertSegment(
+            bundleID: "com.apple.Safari",
+            startDate: timestamp,
+            endDate: timestamp.addingTimeInterval(30),
+            windowName: "Rewrite Whole Delete",
+            browserUrl: nil,
+            type: 0
+        )
+
+        let alreadyHiddenFrameID = try await insertTestFrame(
+            videoID: videoID,
+            segmentID: appSegmentID,
+            frameIndex: 0,
+            timestamp: timestamp
+        )
+        let remainingVisibleFrameID = try await insertTestFrame(
+            videoID: videoID,
+            segmentID: appSegmentID,
+            frameIndex: 2,
+            timestamp: timestamp.addingTimeInterval(2)
+        )
+
+        try await database.updateFrameProcessingStatus(
+            frameID: alreadyHiddenFrameID.value,
+            status: 5,
+            rewritePurpose: "deletion"
+        )
+        _ = try await database.deleteOrScheduleNativeFramesForDeletion(frameIDs: [remainingVisibleFrameID.value])
+
+        let maybePlan = try await database.buildVideoRewritePlan(videoID: videoID)
+        let plan = try XCTUnwrap(maybePlan)
+
+        XCTAssertEqual(Set(plan.deletionFrameIDs), Set([alreadyHiddenFrameID.value, remainingVisibleFrameID.value]))
+        XCTAssertEqual(plan.blackFrameIndexes, Set([0, 2]))
+        XCTAssertTrue(plan.deletesWholeVideo)
+    }
+
+    func testBuildVideoRewritePlanDropsRedactionTargetsOnlyForDeletedFrameIDs() async throws {
+        let timestamp = Date(timeIntervalSince1970: 1_775_100_000)
+        let videoID = try await database.insertVideoSegment(
+            VideoSegment(
+                id: VideoSegmentID(value: 0),
+                startTime: timestamp,
+                endTime: timestamp.addingTimeInterval(30),
+                frameCount: 2,
+                fileSizeBytes: 1_024,
+                relativePath: "segments/rewrite-mixed-\(UUID().uuidString).mp4",
+                width: 1_920,
+                height: 1_080,
+                source: .native
+            )
+        )
+        let appSegmentID = try await database.insertSegment(
+            bundleID: "com.apple.Safari",
+            startDate: timestamp,
+            endDate: timestamp.addingTimeInterval(30),
+            windowName: "Rewrite Mixed",
+            browserUrl: nil,
+            type: 0
+        )
+
+        let deletedFrameID = try await insertTestFrame(
+            videoID: videoID,
+            segmentID: appSegmentID,
+            frameIndex: 0,
+            timestamp: timestamp
+        )
+        let redactedFrameID = try await insertTestFrame(
+            videoID: videoID,
+            segmentID: appSegmentID,
+            frameIndex: 1,
+            timestamp: timestamp.addingTimeInterval(2)
+        )
+
+        try await database.insertNodes(
+            frameID: deletedFrameID,
+            nodes: [(
+                textOffset: 0,
+                textLength: 6,
+                bounds: CGRect(x: 10, y: 10, width: 120, height: 24),
+                windowIndex: nil
+            )],
+            encryptedTexts: [0: "cipher-delete"],
+            frameWidth: 1_000,
+            frameHeight: 1_000
+        )
+        try await database.insertNodes(
+            frameID: redactedFrameID,
+            nodes: [(
+                textOffset: 0,
+                textLength: 6,
+                bounds: CGRect(x: 10, y: 40, width: 120, height: 24),
+                windowIndex: nil
+            )],
+            encryptedTexts: [0: "cipher-redact"],
+            frameWidth: 1_000,
+            frameHeight: 1_000
+        )
+
+        try await database.updateFrameProcessingStatus(
+            frameID: deletedFrameID.value,
+            status: 5,
+            rewritePurpose: "redaction"
+        )
+        try await database.updateFrameProcessingStatus(
+            frameID: redactedFrameID.value,
+            status: 5,
+            rewritePurpose: "redaction"
+        )
+
+        _ = try await database.deleteOrScheduleNativeFramesForDeletion(frameIDs: [deletedFrameID.value])
+
+        let maybePlan = try await database.buildVideoRewritePlan(videoID: videoID)
+        let plan = try XCTUnwrap(maybePlan)
+
+        XCTAssertEqual(plan.deletionFrameIDs, [deletedFrameID.value])
+        XCTAssertEqual(plan.blackFrameIndexes, Set([0]))
+        XCTAssertEqual(plan.redactionFrameIDs, [redactedFrameID.value])
+        XCTAssertEqual(plan.redactions.map(\.frameID), [redactedFrameID.value])
+        XCTAssertEqual(plan.redactions.map(\.frameIndex), [1])
+        XCTAssertEqual(plan.segmentRewritePlan.redactionFrameIDs, [redactedFrameID.value])
+        XCTAssertFalse(plan.deletesWholeVideo)
+    }
+
+    func testBuildVideoRewritePlanPreservesDuplicateFrameIndexRedactionsByFrameID() async throws {
+        let timestamp = Date(timeIntervalSince1970: 1_775_150_000)
+        let videoID = try await database.insertVideoSegment(
+            VideoSegment(
+                id: VideoSegmentID(value: 0),
+                startTime: timestamp,
+                endTime: timestamp.addingTimeInterval(30),
+                frameCount: 2,
+                fileSizeBytes: 1_024,
+                relativePath: "segments/rewrite-duplicate-redactions-\(UUID().uuidString).mp4",
+                width: 1_920,
+                height: 1_080,
+                source: .native
+            )
+        )
+        let appSegmentID = try await database.insertSegment(
+            bundleID: "com.apple.Safari",
+            startDate: timestamp,
+            endDate: timestamp.addingTimeInterval(30),
+            windowName: "Rewrite Duplicate Redactions",
+            browserUrl: nil,
+            type: 0
+        )
+
+        let firstFrameID = try await insertTestFrame(
+            videoID: videoID,
+            segmentID: appSegmentID,
+            frameIndex: 0,
+            timestamp: timestamp
+        )
+        let secondFrameID = try await insertTestFrame(
+            videoID: videoID,
+            segmentID: appSegmentID,
+            frameIndex: 0,
+            timestamp: timestamp.addingTimeInterval(2)
+        )
+
+        try await database.insertNodes(
+            frameID: firstFrameID,
+            nodes: [(
+                textOffset: 0,
+                textLength: 5,
+                bounds: CGRect(x: 10, y: 10, width: 120, height: 24),
+                windowIndex: nil
+            )],
+            encryptedTexts: [0: "cipher-first"],
+            frameWidth: 1_000,
+            frameHeight: 1_000
+        )
+        try await database.insertNodes(
+            frameID: secondFrameID,
+            nodes: [(
+                textOffset: 0,
+                textLength: 6,
+                bounds: CGRect(x: 10, y: 50, width: 120, height: 24),
+                windowIndex: nil
+            )],
+            encryptedTexts: [0: "cipher-second"],
+            frameWidth: 1_000,
+            frameHeight: 1_000
+        )
+
+        try await database.updateFrameProcessingStatus(
+            frameID: firstFrameID.value,
+            status: 5,
+            rewritePurpose: "redaction"
+        )
+        try await database.updateFrameProcessingStatus(
+            frameID: secondFrameID.value,
+            status: 5,
+            rewritePurpose: "redaction"
+        )
+
+        let maybePlan = try await database.buildVideoRewritePlan(videoID: videoID)
+        let plan = try XCTUnwrap(maybePlan)
+
+        XCTAssertEqual(Set(plan.redactionFrameIDs), Set([firstFrameID.value, secondFrameID.value]))
+        XCTAssertEqual(plan.redactions.count, 2)
+        XCTAssertEqual(Set(plan.redactions.map(\.frameIndex)), Set([0]))
+        XCTAssertEqual(Set(plan.segmentRewritePlan.redactionFrameIDs), Set([firstFrameID.value, secondFrameID.value]))
+    }
+
+    func testBuildVideoRewritePlanKeepsDuplicateFrameIndexRedactionWhenSiblingFrameIsDeleted() async throws {
+        let timestamp = Date(timeIntervalSince1970: 1_775_160_000)
+        let videoID = try await database.insertVideoSegment(
+            VideoSegment(
+                id: VideoSegmentID(value: 0),
+                startTime: timestamp,
+                endTime: timestamp.addingTimeInterval(30),
+                frameCount: 2,
+                fileSizeBytes: 1_024,
+                relativePath: "segments/rewrite-duplicate-delete-redact-\(UUID().uuidString).mp4",
+                width: 1_920,
+                height: 1_080,
+                source: .native
+            )
+        )
+        let appSegmentID = try await database.insertSegment(
+            bundleID: "com.apple.Safari",
+            startDate: timestamp,
+            endDate: timestamp.addingTimeInterval(30),
+            windowName: "Rewrite Duplicate Delete Redact",
+            browserUrl: nil,
+            type: 0
+        )
+
+        let deletedFrameID = try await insertTestFrame(
+            videoID: videoID,
+            segmentID: appSegmentID,
+            frameIndex: 0,
+            timestamp: timestamp
+        )
+        let redactedFrameID = try await insertTestFrame(
+            videoID: videoID,
+            segmentID: appSegmentID,
+            frameIndex: 0,
+            timestamp: timestamp.addingTimeInterval(2)
+        )
+
+        try await database.insertNodes(
+            frameID: redactedFrameID,
+            nodes: [(
+                textOffset: 0,
+                textLength: 6,
+                bounds: CGRect(x: 10, y: 50, width: 120, height: 24),
+                windowIndex: nil
+            )],
+            encryptedTexts: [0: "cipher-duplicate-redact"],
+            frameWidth: 1_000,
+            frameHeight: 1_000
+        )
+
+        try await database.updateFrameProcessingStatus(
+            frameID: deletedFrameID.value,
+            status: 5,
+            rewritePurpose: "redaction"
+        )
+        try await database.updateFrameProcessingStatus(
+            frameID: redactedFrameID.value,
+            status: 5,
+            rewritePurpose: "redaction"
+        )
+
+        _ = try await database.deleteOrScheduleNativeFramesForDeletion(frameIDs: [deletedFrameID.value])
+
+        let maybePlan = try await database.buildVideoRewritePlan(videoID: videoID)
+        let plan = try XCTUnwrap(maybePlan)
+
+        XCTAssertEqual(plan.deletionFrameIDs, [deletedFrameID.value])
+        XCTAssertEqual(plan.blackFrameIndexes, Set([0]))
+        XCTAssertEqual(plan.redactionFrameIDs, [redactedFrameID.value])
+        XCTAssertEqual(plan.redactions.map(\.frameIndex), [0])
+        XCTAssertEqual(plan.segmentRewritePlan.redactionFrameIDs, [redactedFrameID.value])
+    }
+
+    func testFinalizeVideoRewriteDeletesDeletionFramesAndMarksRedactionsCompleted() async throws {
+        let timestamp = Date(timeIntervalSince1970: 1_775_200_000)
+        let videoID = try await database.insertVideoSegment(
+            VideoSegment(
+                id: VideoSegmentID(value: 0),
+                startTime: timestamp,
+                endTime: timestamp.addingTimeInterval(30),
+                frameCount: 2,
+                fileSizeBytes: 1_024,
+                relativePath: "segments/rewrite-finalize-\(UUID().uuidString).mp4",
+                width: 1_920,
+                height: 1_080,
+                source: .native
+            )
+        )
+        let appSegmentID = try await database.insertSegment(
+            bundleID: "com.apple.Safari",
+            startDate: timestamp,
+            endDate: timestamp.addingTimeInterval(30),
+            windowName: "Rewrite Finalize",
+            browserUrl: nil,
+            type: 0
+        )
+
+        let deletedFrameID = try await insertTestFrame(
+            videoID: videoID,
+            segmentID: appSegmentID,
+            frameIndex: 0,
+            timestamp: timestamp
+        )
+        let redactedFrameID = try await insertTestFrame(
+            videoID: videoID,
+            segmentID: appSegmentID,
+            frameIndex: 1,
+            timestamp: timestamp.addingTimeInterval(2)
+        )
+
+        let deletedDocID = try await database.indexFrameText(
+            mainText: "delete me",
+            chromeText: nil,
+            windowTitle: nil,
+            segmentId: appSegmentID,
+            frameId: deletedFrameID.value
+        )
+        _ = try await database.indexFrameText(
+            mainText: "redact me",
+            chromeText: nil,
+            windowTitle: nil,
+            segmentId: appSegmentID,
+            frameId: redactedFrameID.value
+        )
+
+        try await database.insertNodes(
+            frameID: redactedFrameID,
+            nodes: [(
+                textOffset: 0,
+                textLength: 6,
+                bounds: CGRect(x: 10, y: 40, width: 120, height: 24),
+                windowIndex: nil
+            )],
+            encryptedTexts: [0: "cipher-redact"],
+            frameWidth: 1_000,
+            frameHeight: 1_000
+        )
+        try await database.updateFrameProcessingStatus(
+            frameID: redactedFrameID.value,
+            status: 5,
+            rewritePurpose: "redaction"
+        )
+        _ = try await database.deleteOrScheduleNativeFramesForDeletion(frameIDs: [deletedFrameID.value])
+
+        let maybePlan = try await database.buildVideoRewritePlan(videoID: videoID)
+        let plan = try XCTUnwrap(maybePlan)
+        try await database.finalizeVideoRewrite(plan)
+
+        let deletedFrameCount = try await fetchInt64(
+            "SELECT COUNT(*) FROM frame WHERE id = ?;",
+            bind: { sqlite3_bind_int64($0, 1, deletedFrameID.value) }
+        )
+        let deletedDocSegmentCount = try await fetchInt64(
+            "SELECT COUNT(*) FROM doc_segment WHERE frameId = ?;",
+            bind: { sqlite3_bind_int64($0, 1, deletedFrameID.value) }
+        )
+        let deletedSearchRowCount = try await fetchInt64(
+            "SELECT COUNT(*) FROM searchRanking WHERE rowid = ?;",
+            bind: { sqlite3_bind_int64($0, 1, deletedDocID) }
+        )
+        let redactedFrameCompletedCount = try await fetchInt64(
+            """
+            SELECT COUNT(*)
+            FROM frame
+            WHERE id = ?
+              AND processingStatus = 7
+              AND rewritePurpose = 'redaction'
+              AND rewrittenAt IS NOT NULL;
+            """,
+            bind: { sqlite3_bind_int64($0, 1, redactedFrameID.value) }
+        )
+        let videoCount = try await fetchInt64(
+            "SELECT COUNT(*) FROM video WHERE id = ?;",
+            bind: { sqlite3_bind_int64($0, 1, videoID) }
+        )
+
+        XCTAssertEqual(deletedFrameCount, 0)
+        XCTAssertEqual(deletedDocSegmentCount, 0)
+        XCTAssertEqual(deletedSearchRowCount, 0)
+        XCTAssertEqual(redactedFrameCompletedCount, 1)
+        XCTAssertEqual(videoCount, 1)
+    }
+
     func testHasProtectedPhraseRedactionDataReturnsTrueWhenEncryptedNodesExist() async throws {
         let frameID = try await insertTestFrame(browserURL: nil)
         let hasProtectedDataBeforeInsert = try await database.hasProtectedPhraseRedactionData()
@@ -3223,6 +3745,32 @@ final class DatabaseManagerTests: XCTestCase {
             videoID: VideoSegmentID(value: insertedVideoID),
             frameIndexInSegment: 0,
             metadata: .empty,
+            source: .native
+        )
+
+        return FrameID(value: try await database.insertFrame(frame))
+    }
+
+    private func insertTestFrame(
+        videoID: Int64,
+        segmentID: Int64,
+        frameIndex: Int,
+        timestamp: Date,
+        bundleID: String = "com.apple.Safari",
+        browserURL: String? = nil
+    ) async throws -> FrameID {
+        let frame = FrameReference(
+            id: FrameID(value: 0),
+            timestamp: timestamp,
+            segmentID: AppSegmentID(value: segmentID),
+            videoID: VideoSegmentID(value: videoID),
+            frameIndexInSegment: frameIndex,
+            metadata: FrameMetadata(
+                appBundleID: bundleID,
+                appName: "Test",
+                windowName: "Test Window",
+                browserURL: browserURL
+            ),
             source: .native
         )
 

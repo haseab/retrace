@@ -1473,7 +1473,10 @@ public actor DataAdapter {
             : (retraceConnection, retraceConfig)
 
         // Find frame by timestamp
-        let sql = "SELECT id FROM frame WHERE createdAt = ? LIMIT 1;"
+        let visibilityClause = frameSource == .rewind
+            ? ""
+            : " AND (rewritePurpose IS NULL OR rewritePurpose != 'deletion')"
+        let sql = "SELECT id FROM frame WHERE createdAt = ?\(visibilityClause) LIMIT 1;"
         guard let statement = try? connection.prepare(sql: sql) else {
             throw DataAdapterError.frameNotFound
         }
@@ -1589,6 +1592,12 @@ public actor DataAdapter {
 
         // Build WHERE clause based on filters
         var whereClauses = ["f.createdAt >= ?", "f.createdAt <= ?"]
+        if let visibilityClause = Self.nativeVisibleFrameClause(
+            frameAlias: "f",
+            isRewindDatabase: config.source == .rewind
+        ) {
+            whereClauses.append(visibilityClause)
+        }
         var bindIndex = 3 // 1 and 2 are for timestamps
 
         // App filter (include or exclude mode)
@@ -1690,7 +1699,19 @@ public actor DataAdapter {
         let projection = Self.frameWithVideoProjection(source: config.source, tableAlias: "f")
         let subqueryProjection = Self.frameWithVideoSubqueryProjection(source: config.source)
         let boundaryFilter = Self.buildSourceBoundaryClause(config: config, columnName: "createdAt")
-        let boundaryWhereClause = boundaryFilter.clause.map { "WHERE \($0)" } ?? ""
+        var subqueryWhereClauses: [String] = []
+        if let visibilityClause = Self.nativeVisibleFrameClause(
+            frameAlias: nil,
+            isRewindDatabase: config.source == .rewind
+        ) {
+            subqueryWhereClauses.append(visibilityClause)
+        }
+        if let boundaryClause = boundaryFilter.clause {
+            subqueryWhereClauses.append(boundaryClause)
+        }
+        let boundaryWhereClause = subqueryWhereClauses.isEmpty
+            ? ""
+            : "WHERE " + subqueryWhereClauses.joined(separator: " AND ")
 
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, \(projection.encodedAtColumn), \(projection.processingStatusColumn), \(projection.redactionReasonColumn),
@@ -1898,6 +1919,13 @@ public actor DataAdapter {
         var segmentWhereClauses: [String] = []
         var whereClauses: [String] = []
         var segmentMetadataBindValues: [String] = []
+
+        if let visibilityClause = Self.nativeVisibleFrameClause(
+            frameAlias: "f",
+            isRewindDatabase: isRewindDatabase
+        ) {
+            whereClauses.append(visibilityClause)
+        }
 
         if let apps = filters.selectedApps, !apps.isEmpty {
             segmentWhereClauses.append(Self.buildAppFilterClause(apps: apps, mode: filters.appFilterMode, tableAlias: "s2"))
@@ -2259,6 +2287,12 @@ public actor DataAdapter {
 
         // Build WHERE clause based on filters
         var whereClauses = ["createdAt < ?"]
+        if let visibilityClause = Self.nativeVisibleFrameClause(
+            frameAlias: nil,
+            isRewindDatabase: config.source == .rewind
+        ) {
+            whereClauses.append(visibilityClause)
+        }
         var bindIndex = 2 // 1 is for timestamp
 
         // App filter (include or exclude mode)
@@ -2357,6 +2391,12 @@ public actor DataAdapter {
 
         // Build WHERE clause based on filters
         var whereClauses = ["createdAt > ?"]
+        if let visibilityClause = Self.nativeVisibleFrameClause(
+            frameAlias: nil,
+            isRewindDatabase: config.source == .rewind
+        ) {
+            whereClauses.append(visibilityClause)
+        }
         var bindIndex = 2 // 1 is for timestamp
 
         // App filter (include or exclude mode)
@@ -2454,6 +2494,10 @@ public actor DataAdapter {
 
         let sourceBoundaryFilter = Self.buildSourceBoundaryClause(config: config, columnName: "f.createdAt")
         let boundaryClause = sourceBoundaryFilter.clause.map { " AND \($0)" } ?? ""
+        let visibilityClause = Self.nativeVisibleFrameClause(
+            frameAlias: "f",
+            isRewindDatabase: config.source == .rewind
+        ).map { " AND \($0)" } ?? ""
 
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, \(projection.encodedAtColumn), \(projection.processingStatusColumn), \(projection.redactionReasonColumn),
@@ -2463,7 +2507,7 @@ public actor DataAdapter {
             FROM frame f
             LEFT JOIN segment s ON f.segmentId = s.id
             LEFT JOIN video v ON f.videoId = v.id
-            WHERE f.id = ?\(boundaryClause)
+            WHERE f.id = ?\(visibilityClause)\(boundaryClause)
             """
 
         guard let statement = try? connection.prepare(sql: sql) else { return nil }
@@ -2489,11 +2533,17 @@ public actor DataAdapter {
     ) throws -> FrameVideoInfo? {
         guard config.contains(timestamp) else { return nil }
 
+        let visibilityClause = Self.nativeVisibleFrameClause(
+            frameAlias: "f",
+            isRewindDatabase: config.source == .rewind
+        ).map { " AND \($0)" } ?? ""
+
         let sql = """
             SELECT v.id, v.path, v.width, v.height, v.frameRate, f.videoFrameIndex
             FROM frame f
             LEFT JOIN video v ON f.videoId = v.id
             WHERE f.createdAt = ?
+            \(visibilityClause)
             LIMIT 1;
             """
 
@@ -2555,7 +2605,11 @@ public actor DataAdapter {
         guard config.contains(timestamp) else { return [] }
 
         // First find the frame ID
-        let frameSql = "SELECT id FROM frame WHERE createdAt = ? LIMIT 1;"
+        let visibilityClause = Self.nativeVisibleFrameClause(
+            frameAlias: nil,
+            isRewindDatabase: config.source == .rewind
+        ).map { " AND \($0)" } ?? ""
+        let frameSql = "SELECT id FROM frame WHERE createdAt = ?\(visibilityClause) LIMIT 1;"
         guard let frameStatement = try? connection.prepare(sql: frameSql) else { return [] }
         defer { connection.finalize(frameStatement) }
 
@@ -2585,6 +2639,10 @@ public actor DataAdapter {
                 """
             encryptedTextColumn = "n.encryptedText as encryptedText"
         }
+        let visibilityClause = Self.nativeVisibleFrameClause(
+            frameAlias: "f",
+            isRewindDatabase: config.source == .rewind
+        ).map { " AND \($0)" } ?? ""
         let sql = """
             SELECT
                 n.id,
@@ -2600,9 +2658,11 @@ public actor DataAdapter {
                 \(encryptedTextColumn),
                 n.frameId
             FROM node n
+            JOIN frame f ON f.id = n.frameId
             LEFT JOIN doc_segment ds ON n.frameId = ds.frameId
             LEFT JOIN searchRanking_content sc ON ds.docid = sc.id
             WHERE n.frameId = ?
+            \(visibilityClause)
             ORDER BY n.nodeOrder ASC;
             """
 
@@ -2657,11 +2717,16 @@ public actor DataAdapter {
         guard config.contains(timestamp) else { return nil }
 
         // Get frameId and browserUrl
+        let visibilityClause = Self.nativeVisibleFrameClause(
+            frameAlias: "f",
+            isRewindDatabase: config.source == .rewind
+        ).map { " AND \($0)" } ?? ""
         let frameSQL = """
             SELECT f.id, s.browserUrl
             FROM frame f
             LEFT JOIN segment s ON f.segmentId = s.id
             WHERE f.createdAt = ?
+            \(visibilityClause)
             LIMIT 1;
             """
 
@@ -2917,6 +2982,12 @@ public actor DataAdapter {
         if let sourceBoundaryClause = sourceBoundaryFilter.clause {
             outerWhereConditions.append(sourceBoundaryClause)
             outerBindValues.append(contentsOf: sourceBoundaryFilter.bindValues.map(config.formatDate))
+        }
+        if let visibilityClause = Self.nativeVisibleFrameClause(
+            frameAlias: "f",
+            isRewindDatabase: source == .rewind
+        ) {
+            outerWhereConditions.append(visibilityClause)
         }
 
         // App include filter
@@ -3414,6 +3485,12 @@ public actor DataAdapter {
         if let sourceBoundaryClause = sourceBoundaryFilter.clause {
             whereConditions.append(sourceBoundaryClause)
             bindValues.append(contentsOf: sourceBoundaryFilter.bindValues.map(config.formatDate))
+        }
+        if let visibilityClause = Self.nativeVisibleFrameClause(
+            frameAlias: "f",
+            isRewindDatabase: source == .rewind
+        ) {
+            whereConditions.append(visibilityClause)
         }
 
         // App include filter
@@ -4524,6 +4601,15 @@ public actor DataAdapter {
         return "\(tableAlias).bundleID \(operator_) (\(placeholders))"
     }
 
+    private static func nativeVisibleFrameClause(
+        frameAlias: String? = "f",
+        isRewindDatabase: Bool
+    ) -> String? {
+        guard !isRewindDatabase else { return nil }
+        let prefix = frameAlias.map { "\($0)." } ?? ""
+        return "(\(prefix)rewritePurpose IS NULL OR \(prefix)rewritePurpose != 'deletion')"
+    }
+
     private struct FrameFilterQueryComponents {
         let combinedCTE: String
         let tagJoin: String
@@ -4582,6 +4668,13 @@ public actor DataAdapter {
 
         var whereClauses: [String] = []
         var metadataBindValues: [String] = []
+
+        if let visibilityClause = Self.nativeVisibleFrameClause(
+            frameAlias: "f",
+            isRewindDatabase: isRewindDatabase
+        ) {
+            whereClauses.append(visibilityClause)
+        }
 
         if !appBundleIDs.isEmpty {
             whereClauses.append(Self.buildAppFilterClause(apps: Set(appBundleIDs), mode: filters.appFilterMode))
@@ -5004,7 +5097,17 @@ public actor DataAdapter {
     /// Query distinct dates from a specific connection
     private static func queryDistinctDates(connection: DatabaseConnection, config: DatabaseConfig) throws -> [Date] {
         let sourceBoundaryFilter = Self.buildSourceBoundaryClause(config: config, columnName: "createdAt")
-        let whereClause = sourceBoundaryFilter.clause.map { "WHERE \($0)" } ?? ""
+        var whereClauses: [String] = []
+        if let visibilityClause = Self.nativeVisibleFrameClause(
+            frameAlias: nil,
+            isRewindDatabase: config.source == .rewind
+        ) {
+            whereClauses.append(visibilityClause)
+        }
+        if let boundaryClause = sourceBoundaryFilter.clause {
+            whereClauses.append(boundaryClause)
+        }
+        let whereClause = whereClauses.isEmpty ? "" : "WHERE " + whereClauses.joined(separator: " AND ")
 
         let sql: String
         if config.dateFormatter == nil {
@@ -5223,11 +5326,15 @@ public actor DataAdapter {
 
         let startMs = Int64(effectiveStartOfDay.timeIntervalSince1970 * 1000)
         let endMs = Int64(effectiveEndOfDay.timeIntervalSince1970 * 1000)
+        let visibilityClause = Self.nativeVisibleFrameClause(
+            frameAlias: nil,
+            isRewindDatabase: false
+        ) ?? "1 = 1"
 
         let sql = """
             SELECT MIN(createdAt) as hourTimestamp
             FROM frame
-            WHERE createdAt >= ? AND createdAt < ?
+            WHERE createdAt >= ? AND createdAt < ? AND \(visibilityClause)
             GROUP BY strftime('%H', createdAt / 1000, 'unixepoch', 'localtime')
             ORDER BY hourTimestamp ASC
             """

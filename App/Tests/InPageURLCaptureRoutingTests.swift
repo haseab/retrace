@@ -626,6 +626,12 @@ final class DataAdapterRewindBoundaryTests: XCTestCase {
         return sqlite3_column_int64(statement, 0)
     }
 
+    private func decodeMetricMetadata(_ metadata: String?) throws -> [String: Any] {
+        let json = try XCTUnwrap(metadata)
+        let data = try XCTUnwrap(json.data(using: .utf8))
+        return try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+    }
+
     @discardableResult
     private func executeUpdate(
         db: OpaquePointer,
@@ -755,6 +761,59 @@ final class DataAdapterRewindBoundaryTests: XCTestCase {
         XCTAssertFalse(resultKeys.contains("native:\(preCutoffNativeFrame.value)"))
         XCTAssertTrue(resultKeys.contains("native:\(postCutoffNativeFrame.value)"))
         XCTAssertTrue(resultKeys.contains("rewind:\(preCutoffRewindFrame.value)"))
+    }
+
+    func testDeletionHiddenNativeFramesAreExcludedFromTimelineAndDirectLookups() async throws {
+        let cutoffDate = makeCutoffDate()
+        let fixture = try await makeFixture(cutoffDate: cutoffDate)
+        defer {
+            Task {
+                try? await self.close(fixture)
+            }
+        }
+
+        let timestamp = cutoffDate.addingTimeInterval(3_600)
+        let seeded = try await seedFrameRecord(
+            in: fixture.retraceDatabase,
+            timestamp: timestamp,
+            bundleID: "com.retrace.hidden",
+            text: "hidden native frame",
+            source: .native,
+            browserURL: "https://example.com/hidden"
+        )
+        try await fixture.retraceDatabase.insertNodes(
+            frameID: seeded.frameID,
+            nodes: [(
+                textOffset: 0,
+                textLength: 6,
+                bounds: CGRect(x: 10, y: 10, width: 120, height: 24),
+                windowIndex: nil
+            )],
+            encryptedTexts: [:],
+            frameWidth: 1_000,
+            frameHeight: 1_000
+        )
+        try await fixture.retraceDatabase.updateFrameProcessingStatus(
+            frameID: seeded.frameID.value,
+            status: 5,
+            rewritePurpose: "deletion"
+        )
+
+        let recentFrames = try await fixture.adapter.getMostRecentFrames(limit: 10)
+        let frameLookup = try await fixture.adapter.getFrameWithVideoInfoByID(id: seeded.frameID)
+        let nodesByTimestamp = try await fixture.adapter.getAllOCRNodes(
+            timestamp: timestamp,
+            source: .native
+        )
+        let nodesByID = try await fixture.adapter.getAllOCRNodes(
+            frameID: seeded.frameID,
+            source: .native
+        )
+
+        XCTAssertFalse(recentFrames.contains { $0.id == seeded.frameID && $0.source == .native })
+        XCTAssertNil(frameLookup)
+        XCTAssertTrue(nodesByTimestamp.isEmpty)
+        XCTAssertTrue(nodesByID.isEmpty)
     }
 
     func testMostRecentFramesTreatInactiveFiltersSameAsNilFilters() async throws {
@@ -2272,6 +2331,293 @@ final class OCRReprocessSafetyTests: XCTestCase {
         } catch {
             try? await services.shutdown()
             try? FileManager.default.removeItem(at: storageRoot)
+            throw error
+        }
+    }
+}
+
+final class FrameDeletionSemanticsTests: XCTestCase {
+    private func makeServices(storageRoot: URL) -> ServiceContainer {
+        let crashReportDirectory = storageRoot.appendingPathComponent("crash_reports", isDirectory: true).path
+        return ServiceContainer(
+            databasePath: storageRoot.appendingPathComponent("retrace.db").path,
+            storageConfig: StorageConfig(
+                storageRootPath: storageRoot.path,
+                retentionDays: nil,
+                maxStorageGB: nil,
+                segmentDurationSeconds: 300
+            ),
+            storageCrashReportDirectory: crashReportDirectory
+        )
+    }
+
+    private func makeCapturedFrame(timestamp: Date) -> CapturedFrame {
+        CapturedFrame(
+            timestamp: timestamp,
+            imageData: Data(repeating: 0xAB, count: 32 * 8),
+            width: 8,
+            height: 8,
+            bytesPerRow: 32,
+            metadata: FrameMetadata(
+                appBundleID: "com.apple.Safari",
+                appName: "Safari",
+                windowName: "Window",
+                browserURL: "https://example.com",
+                displayID: 1
+            )
+        )
+    }
+
+    private func seedVideoBackedFrame(
+        services: ServiceContainer,
+        timestamp: Date
+    ) async throws -> (frameID: FrameID, videoID: Int64, segmentPath: String) {
+        let storage = await services.storage
+        let database = await services.database
+        let capturedFrame = makeCapturedFrame(timestamp: timestamp)
+
+        let writer = try await storage.createSegmentWriter()
+        try await writer.appendFrame(capturedFrame)
+        let segment = try await writer.finalize()
+
+        let databaseVideoID = try await database.insertVideoSegment(
+            VideoSegment(
+                id: segment.id,
+                startTime: segment.startTime,
+                endTime: segment.endTime,
+                frameCount: segment.frameCount,
+                fileSizeBytes: segment.fileSizeBytes,
+                relativePath: segment.relativePath,
+                width: segment.width,
+                height: segment.height,
+                source: .native
+            )
+        )
+        try await database.markVideoFinalized(
+            id: databaseVideoID,
+            frameCount: segment.frameCount,
+            fileSize: segment.fileSizeBytes
+        )
+
+        let appSegmentID = try await database.insertSegment(
+            bundleID: "com.apple.Safari",
+            startDate: timestamp,
+            endDate: timestamp,
+            windowName: "Delete Test",
+            browserUrl: "https://example.com",
+            type: 0
+        )
+        let frameIDValue = try await database.insertFrame(
+            FrameReference(
+                id: FrameID(value: 0),
+                timestamp: timestamp,
+                segmentID: AppSegmentID(value: appSegmentID),
+                videoID: VideoSegmentID(value: databaseVideoID),
+                frameIndexInSegment: 0,
+                metadata: capturedFrame.metadata,
+                source: .native
+            )
+        )
+        try await database.updateFrameProcessingStatus(frameID: frameIDValue, status: 2)
+
+        let storageDirectory = await storage.getStorageDirectory()
+
+        return (
+            frameID: FrameID(value: frameIDValue),
+            videoID: databaseVideoID,
+            segmentPath: storageDirectory.appendingPathComponent(segment.relativePath).path
+        )
+    }
+
+    private func withConnection<T>(
+        _ database: DatabaseManager,
+        _ body: (OpaquePointer) throws -> T
+    ) async throws -> T {
+        let connection = await database.getConnection()
+        let db = try XCTUnwrap(connection)
+        return try body(db)
+    }
+
+    private func fetchInt64(
+        db: OpaquePointer,
+        sql: String,
+        bind: ((OpaquePointer) -> Void)? = nil
+    ) throws -> Int64 {
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            XCTFail("Failed to prepare SQL: \(sql)")
+            return 0
+        }
+
+        if let bind {
+            bind(statement!)
+        }
+
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            XCTFail("Failed to step SQL: \(sql)")
+            return 0
+        }
+
+        return sqlite3_column_int64(statement, 0)
+    }
+
+    private func decodeMetricMetadata(_ metadata: String?) throws -> [String: Any] {
+        let json = try XCTUnwrap(metadata)
+        let data = try XCTUnwrap(json.data(using: .utf8))
+        return try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+    }
+
+    func testDeleteFrameReturnsQueuedResultWhileTimelineVisible() async throws {
+        let storageRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("FrameDeletionQueued_\(UUID().uuidString)", isDirectory: true)
+        let services = makeServices(storageRoot: storageRoot)
+        let coordinator = AppCoordinator(services: services)
+        let timestamp = Date(timeIntervalSince1970: 1_775_300_000)
+
+        try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: storageRoot) }
+
+        do {
+            try await services.initialize()
+            let seeded = try await seedVideoBackedFrame(services: services, timestamp: timestamp)
+            let database = await services.database
+
+            await coordinator.setTimelineVisible(true)
+            let result = try await coordinator.deleteFrame(
+                frameID: seeded.frameID,
+                timestamp: timestamp,
+                source: .native,
+                metricSource: "frame_delete_test"
+            )
+
+            XCTAssertEqual(result, FrameDeletionResult(completedFrames: 0, queuedFrames: 1))
+
+            let visibleFrameIDs = try await database.getVisibleNativeFrameIDsNewerThan(
+                timestamp.addingTimeInterval(-1)
+            )
+            XCTAssertFalse(visibleFrameIDs.contains(seeded.frameID.value))
+
+            let pendingJobs = try await database.getPendingFrameDeletionJobs(
+                videoID: seeded.videoID,
+                includeInProgressJobs: true,
+                includeRetryableFailures: true
+            )
+            XCTAssertEqual(pendingJobs.map(\.frameID), [seeded.frameID.value])
+
+            let frameCount = try await withConnection(database) { db in
+                try fetchInt64(
+                    db: db,
+                    sql: "SELECT COUNT(*) FROM frame WHERE id = ?;",
+                    bind: { sqlite3_bind_int64($0, 1, seeded.frameID.value) }
+                )
+            }
+            XCTAssertEqual(frameCount, 1)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: seeded.segmentPath))
+
+            try await services.shutdown()
+        } catch {
+            try? await services.shutdown()
+            throw error
+        }
+    }
+
+    func testDeleteFrameReturnsCompletedResultAfterWholeVideoRewrite() async throws {
+        let storageRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("FrameDeletionCompleted_\(UUID().uuidString)", isDirectory: true)
+        let services = makeServices(storageRoot: storageRoot)
+        let coordinator = AppCoordinator(services: services)
+        let timestamp = Date(timeIntervalSince1970: 1_775_300_100)
+
+        try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: storageRoot) }
+
+        do {
+            try await services.initialize()
+            let seeded = try await seedVideoBackedFrame(services: services, timestamp: timestamp)
+            let database = await services.database
+
+            let result = try await coordinator.deleteFrame(
+                frameID: seeded.frameID,
+                timestamp: timestamp,
+                source: .native
+            )
+
+            XCTAssertEqual(result, FrameDeletionResult(completedFrames: 1, queuedFrames: 0))
+
+            let pendingJobs = try await database.getPendingFrameDeletionJobs(
+                videoID: seeded.videoID,
+                includeInProgressJobs: true,
+                includeRetryableFailures: true
+            )
+            XCTAssertTrue(pendingJobs.isEmpty)
+
+            let frameCount = try await withConnection(database) { db in
+                try fetchInt64(
+                    db: db,
+                    sql: "SELECT COUNT(*) FROM frame WHERE id = ?;",
+                    bind: { sqlite3_bind_int64($0, 1, seeded.frameID.value) }
+                )
+            }
+            XCTAssertEqual(frameCount, 0)
+            let deletedVideo = try await database.getVideoSegment(id: VideoSegmentID(value: seeded.videoID))
+            XCTAssertNil(deletedVideo)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: seeded.segmentPath))
+
+            let recentMetricEvents = try await database.getRecentMetricEvents(limit: 5)
+            let metricEvent = try XCTUnwrap(
+                recentMetricEvents.first { $0.metricType == .frameDeleted }
+            )
+            let metricMetadata = try decodeMetricMetadata(metricEvent.metadata)
+            XCTAssertEqual(metricMetadata["source"] as? String, "frame_delete")
+            XCTAssertEqual(metricMetadata["dataSource"] as? String, "native")
+            XCTAssertEqual((metricMetadata["frameID"] as? NSNumber)?.int64Value, seeded.frameID.value)
+            XCTAssertEqual((metricMetadata["completedFrames"] as? NSNumber)?.intValue, 1)
+            XCTAssertEqual((metricMetadata["queuedFrames"] as? NSNumber)?.intValue, 0)
+
+            try await services.shutdown()
+        } catch {
+            try? await services.shutdown()
+            throw error
+        }
+    }
+
+    func testDeleteRecentDataRecordsSegmentDeletedMetric() async throws {
+        let storageRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("FrameDeletionQuickDelete_\(UUID().uuidString)", isDirectory: true)
+        let services = makeServices(storageRoot: storageRoot)
+        let coordinator = AppCoordinator(services: services)
+        let timestamp = Date(timeIntervalSince1970: 1_775_300_200)
+
+        try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: storageRoot) }
+
+        do {
+            try await services.initialize()
+            _ = try await seedVideoBackedFrame(services: services, timestamp: timestamp)
+            let database = await services.database
+
+            let result = try await coordinator.deleteRecentData(
+                newerThan: timestamp.addingTimeInterval(-1),
+                metricSource: "quick_delete_test"
+            )
+
+            XCTAssertEqual(result, FrameDeletionResult(completedFrames: 1, queuedFrames: 0))
+
+            let recentMetricEvents = try await database.getRecentMetricEvents(limit: 5)
+            let metricEvent = try XCTUnwrap(
+                recentMetricEvents.first { $0.metricType == .segmentDeleted }
+            )
+            let metricMetadata = try decodeMetricMetadata(metricEvent.metadata)
+            XCTAssertEqual(metricMetadata["source"] as? String, "quick_delete_test")
+            XCTAssertEqual((metricMetadata["frameCount"] as? NSNumber)?.intValue, 1)
+            XCTAssertEqual((metricMetadata["completedFrames"] as? NSNumber)?.intValue, 1)
+            XCTAssertEqual((metricMetadata["queuedFrames"] as? NSNumber)?.intValue, 0)
+
+            try await services.shutdown()
+        } catch {
+            try? await services.shutdown()
             throw error
         }
     }

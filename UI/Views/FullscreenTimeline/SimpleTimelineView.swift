@@ -5508,11 +5508,6 @@ struct DeleteConfirmationDialog: View {
                     Text("Choose to delete this frame or the entire segment.")
                         .font(.retraceCallout)
                         .foregroundColor(.white.opacity(0.6))
-
-                    Text("Note: Removes from database only. Video files remain on disk.")
-                        .font(.retraceCaption2)
-                        .foregroundColor(.white.opacity(0.4))
-                        .italic()
                 }
                 .multilineTextAlignment(.center)
 

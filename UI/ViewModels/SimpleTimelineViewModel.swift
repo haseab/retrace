@@ -4151,12 +4151,6 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         Log.debug("[Delete] Frame \(frameID) removed from UI (optimistic deletion)", category: .ui)
 
-        DashboardViewModel.recordFrameDeleted(
-            coordinator: coordinator,
-            source: "timeline_delete",
-            frameID: frameID.value
-        )
-
         stagePendingDelete(
             PendingDeleteOperation(
                 id: UUID(),
@@ -4235,19 +4229,27 @@ public class SimpleTimelineViewModel: ObservableObject {
         restoreOnFailure: Bool
     ) async {
         do {
+            let result: FrameDeletionResult
             switch operation.payload {
             case .frame(let frameRef):
-                try await coordinator.deleteFrame(
+                result = try await coordinator.deleteFrame(
                     frameID: frameRef.id,
                     timestamp: frameRef.timestamp,
-                    source: frameRef.source
+                    source: frameRef.source,
+                    metricSource: "timeline_delete"
                 )
                 Log.debug("[Delete] Committed frame deletion frameID=\(frameRef.id.value) reason=\(reason)", category: .ui)
             case .frames(let frameRefs):
-                try await coordinator.deleteFrames(frameRefs)
+                result = try await coordinator.deleteFrames(
+                    frameRefs,
+                    metricSource: "timeline_delete"
+                )
                 Log.debug("[Delete] Committed segment deletion frames=\(frameRefs.count) reason=\(reason)", category: .ui)
             }
             clearPendingDeletedFrameIDs(operation.removedFrameIDs, reason: "commit-success.\(reason)")
+            if result.hasQueuedFrames {
+                showToast(queuedDeletionToastMessage(for: result), icon: "clock.badge.exclamationmark.fill")
+            }
         } catch {
             Log.error("[Delete] Failed to persist deletion reason=\(reason): \(error)", category: .ui)
             if restoreOnFailure {
@@ -4258,6 +4260,13 @@ public class SimpleTimelineViewModel: ObservableObject {
                 showToast("Delete may not have persisted", icon: "exclamationmark.triangle.fill")
             }
         }
+    }
+
+    private func queuedDeletionToastMessage(for result: FrameDeletionResult) -> String {
+        if result.completedFrames > 0 {
+            return "Deleted \(result.completedFrames) frame\(result.completedFrames == 1 ? "" : "s"); queued \(result.queuedFrames) for disk rewrite"
+        }
+        return "Deletion queued for \(result.queuedFrames) frame\(result.queuedFrames == 1 ? "" : "s")"
     }
 
     private func clearPendingDeletedFrameIDs(_ frameIDs: [FrameID], reason: String) {
@@ -4482,14 +4491,6 @@ public class SimpleTimelineViewModel: ObservableObject {
         )
 
         Log.debug("[Delete] Segment with \(deleteCount) frames removed from UI (optimistic deletion)", category: .ui)
-
-        let uniqueSegmentCount = Set(framesToDelete.map { $0.segmentID.value }).count
-        DashboardViewModel.recordSegmentDeleted(
-            coordinator: coordinator,
-            source: "timeline_delete",
-            segmentCount: uniqueSegmentCount,
-            frameCount: deleteCount
-        )
 
         stagePendingDelete(
             PendingDeleteOperation(

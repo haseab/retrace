@@ -120,6 +120,7 @@ public enum DailyMetricsQueries {
         // Delete actions
         case frameDeleted = "frame_deleted"
         case segmentDeleted = "segment_deleted"
+        case videoRewriteOutcome = "video_rewrite_outcome"
     }
 
     // MARK: - Insert

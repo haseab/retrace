@@ -16,35 +16,53 @@ public struct WALAvailabilityIssue: Sendable, Equatable {
 fileprivate struct SegmentRewriteArtifacts: Sendable {
     let segmentID: VideoSegmentID
     let segmentURL: URL
-    var tempURL: URL?
+    var workingURL: URL?
     var backupURL: URL?
+    var cleanupURLs: [URL]
+    var operation: SegmentRewriteOperation
+}
+
+fileprivate struct SegmentRewriteArtifactPiece: Sendable {
+    let segmentID: VideoSegmentID
+    let segmentURL: URL
+    let operation: SegmentRewriteOperation
+    let workingURL: URL?
+    let backupURL: URL?
+    let cleanupURL: URL?
 }
 
 fileprivate struct SegmentRewriteRequest: Sendable {
     let segmentID: VideoSegmentID
     let segmentURL: URL
-    let tempURL: URL
+    let workingURL: URL
     let backupURL: URL
-    let targetsByFrameIndex: [Int: [SegmentRedactionTarget]]
-    let secret: String
+    let plan: SegmentRewritePlan
+    let secret: String?
 }
 
 fileprivate func ensureNoConflictingSegmentRewriteArtifactsOnDisk(
     segmentID: VideoSegmentID,
     segmentURL: URL,
-    tempURL: URL,
-    backupURL: URL
+    workingURL: URL?,
+    backupURL: URL,
+    cleanupURLs: [URL] = []
 ) throws {
-    if FileManager.default.fileExists(atPath: tempURL.path) {
-        removeItemIfExistsOnDisk(at: tempURL)
+    if let workingURL, FileManager.default.fileExists(atPath: workingURL.path) {
+        removeItemIfExistsOnDisk(at: workingURL)
     }
 
     if FileManager.default.fileExists(atPath: backupURL.path) {
         Log.warning(
-            "[StorageManager] Removing stale rewrite backup before starting new rewrite for segment \(segmentID.value): \(backupURL.lastPathComponent)",
+            "[StorageManager] Removing stale segment mutation backup before starting new mutation for segment \(segmentID.value): \(backupURL.lastPathComponent)",
             category: .storage
         )
         removeItemIfExistsOnDisk(at: backupURL)
+    }
+
+    for cleanupURL in cleanupURLs {
+        if FileManager.default.fileExists(atPath: cleanupURL.path) {
+            removeItemIfExistsOnDisk(at: cleanupURL)
+        }
     }
 
     guard FileManager.default.fileExists(atPath: segmentURL.path) else {
@@ -52,16 +70,16 @@ fileprivate func ensureNoConflictingSegmentRewriteArtifactsOnDisk(
     }
 }
 
-fileprivate func swapRewrittenSegmentIntoPlaceOnDisk(
+fileprivate func swapMutatedSegmentIntoPlaceOnDisk(
     segmentURL: URL,
-    tempURL: URL,
+    workingURL: URL,
     backupURL: URL
 ) throws {
     let fileManager = FileManager.default
 
     try fileManager.moveItem(at: segmentURL, to: backupURL)
     do {
-        try fileManager.moveItem(at: tempURL, to: segmentURL)
+        try fileManager.moveItem(at: workingURL, to: segmentURL)
     } catch {
         if fileManager.fileExists(atPath: backupURL.path),
            !fileManager.fileExists(atPath: segmentURL.path) {
@@ -71,22 +89,32 @@ fileprivate func swapRewrittenSegmentIntoPlaceOnDisk(
     }
 }
 
-fileprivate func inferSegmentRewriteRecoveryModeFromDisk(
+fileprivate func commitWholeVideoDeleteOnDisk(
     segmentURL: URL,
-    tempURL: URL?,
+    backupURL: URL
+) throws {
+    try FileManager.default.moveItem(at: segmentURL, to: backupURL)
+}
+
+fileprivate func inferSegmentRewriteRecoveryModeFromDisk(
+    operation: SegmentRewriteOperation,
+    segmentURL: URL,
+    workingURL: URL?,
     backupURL: URL?
-) -> SegmentRedactionRecoveryAction.Mode {
+) -> SegmentRewriteRecoveryAction.Mode {
     let fileManager = FileManager.default
     let segmentExists = fileManager.fileExists(atPath: segmentURL.path)
-    let tempExists = tempURL.map { fileManager.fileExists(atPath: $0.path) } ?? false
     let backupExists = backupURL.map { fileManager.fileExists(atPath: $0.path) } ?? false
 
-    if segmentExists && backupExists {
-        return .markCompleted
-    }
-
-    if backupExists || tempExists {
-        return .rollbackToPending
+    switch operation {
+    case .partialRewrite:
+        if segmentExists && backupExists {
+            return .finalizeCommitted
+        }
+    case .wholeVideoDelete:
+        if !segmentExists && backupExists {
+            return .finalizeCommitted
+        }
     }
 
     return .rollbackToPending
@@ -94,7 +122,7 @@ fileprivate func inferSegmentRewriteRecoveryModeFromDisk(
 
 fileprivate func rollbackInterruptedSegmentRewriteIfNeededOnDisk(
     segmentURL: URL,
-    tempURL: URL?,
+    workingURL: URL?,
     backupURL: URL?
 ) {
     let fileManager = FileManager.default
@@ -113,14 +141,14 @@ fileprivate func rollbackInterruptedSegmentRewriteIfNeededOnDisk(
             }
         } catch {
             Log.error(
-                "[StorageManager] Failed to roll back interrupted segment rewrite at \(segmentURL.lastPathComponent): \(error.localizedDescription)",
+                "[StorageManager] Failed to roll back interrupted segment mutation at \(segmentURL.lastPathComponent): \(error.localizedDescription)",
                 category: .storage
             )
         }
     }
 
-    if let tempURL {
-        removeItemIfExistsOnDisk(at: tempURL)
+    if let workingURL {
+        removeItemIfExistsOnDisk(at: workingURL)
     }
 }
 
@@ -142,11 +170,29 @@ fileprivate actor SegmentRewriteExecutor {
     }
 
     func rewrite(_ request: SegmentRewriteRequest) async throws {
+        guard request.plan.operation == .partialRewrite else {
+            throw StorageError.fileWriteFailed(
+                path: request.segmentURL.path,
+                underlying: "Whole-video deletes must not use the rewrite executor"
+            )
+        }
+
+        if request.plan.hasRedactionTargets, request.secret == nil {
+            throw StorageError.fileWriteFailed(
+                path: request.segmentURL.path,
+                underlying: "Missing rewrite secret for redaction targets"
+            )
+        }
+
         let decodedFrames = try await decodeAllFrames(
             from: request.segmentURL,
             segmentID: request.segmentID.value
         )
         guard !decodedFrames.isEmpty else { return }
+        let redactionTargetsByFrameIndex = Dictionary(grouping: request.plan.redactions, by: \.frameIndex)
+            .mapValues { redactions in
+                redactions.flatMap(\.targets)
+            }
 
         let width = decodedFrames[0].image.width
         let height = decodedFrames[0].image.height
@@ -157,8 +203,9 @@ fileprivate actor SegmentRewriteExecutor {
             try ensureNoConflictingSegmentRewriteArtifactsOnDisk(
                 segmentID: request.segmentID,
                 segmentURL: request.segmentURL,
-                tempURL: request.tempURL,
-                backupURL: request.backupURL
+                workingURL: request.workingURL,
+                backupURL: request.backupURL,
+                cleanupURLs: [StorageManager.legacySegmentRewriteStateURL(for: request.segmentURL, segmentID: request.segmentID)]
             )
 
             let newEncoder = HEVCEncoder()
@@ -167,14 +214,16 @@ fileprivate actor SegmentRewriteExecutor {
                 width: width,
                 height: height,
                 config: encoderConfig,
-                outputURL: request.tempURL,
+                outputURL: request.workingURL,
                 segmentStartTime: Date()
             )
 
             var loggedTargets = 0
             for (frameIndex, decodedFrame) in decodedFrames.enumerated() {
                 var bgra = try StorageManager.makeBGRAData(from: decodedFrame.image)
-                if let targets = request.targetsByFrameIndex[frameIndex], !targets.isEmpty {
+                if request.plan.blackFrameIndexes.contains(frameIndex) {
+                    bgra = Data(repeating: 0, count: bgra.count)
+                } else if let targets = redactionTargetsByFrameIndex[frameIndex], !targets.isEmpty {
                     for target in targets {
                         let pixelRect = BGRAImageUtilities.pixelRect(
                             from: target.normalizedRect,
@@ -203,7 +252,7 @@ fileprivate actor SegmentRewriteExecutor {
                             bytesPerRow: patch.bytesPerRow,
                             frameID: target.frameID,
                             nodeID: target.nodeID,
-                            secret: request.secret
+                            secret: request.secret ?? ""
                         )
                         BGRAImageUtilities.writePatch(
                             patch,
@@ -227,16 +276,16 @@ fileprivate actor SegmentRewriteExecutor {
             }
 
             try await newEncoder.finalize()
-            try swapRewrittenSegmentIntoPlaceOnDisk(
+            try swapMutatedSegmentIntoPlaceOnDisk(
                 segmentURL: request.segmentURL,
-                tempURL: request.tempURL,
+                workingURL: request.workingURL,
                 backupURL: request.backupURL
             )
         } catch {
             await encoder?.reset()
             rollbackInterruptedSegmentRewriteIfNeededOnDisk(
                 segmentURL: request.segmentURL,
-                tempURL: request.tempURL,
+                workingURL: request.workingURL,
                 backupURL: request.backupURL
             )
             throw error
@@ -780,69 +829,110 @@ public actor StorageManager: StorageProtocol {
         )
     }
 
-    /// Rewrite a finalized segment by encoding a new file to a temp path, then swapping it into
-    /// the original segment location once complete.
-    public func rewriteSegmentForRedaction(
+    /// Apply a generic post-capture rewrite/delete mutation to a finalized segment.
+    public func applySegmentRewrite(
         segmentID: VideoSegmentID,
-        frameIDs: [Int64],
-        targetsByFrameIndex: [Int: [SegmentRedactionTarget]],
-        secret: String
+        plan: SegmentRewritePlan,
+        secret: String?
     ) async throws {
-        guard !targetsByFrameIndex.isEmpty else { return }
-        guard !frameIDs.isEmpty else { return }
+        guard plan.hasAnyRewrite else { return }
 
         let segmentURL = try await getSegmentPath(id: segmentID)
-        let tempURL = segmentRewriteTempURL(for: segmentURL, segmentID: segmentID)
+        let legacyStateURL = Self.legacySegmentRewriteStateURL(for: segmentURL, segmentID: segmentID)
+
+        if plan.deletesWholeVideo {
+            let backupURL = segmentDeleteBackupURL(for: segmentURL, segmentID: segmentID)
+            try ensureNoConflictingSegmentRewriteArtifactsOnDisk(
+                segmentID: segmentID,
+                segmentURL: segmentURL,
+                workingURL: nil,
+                backupURL: backupURL,
+                cleanupURLs: [legacyStateURL]
+            )
+
+            do {
+                try commitWholeVideoDeleteOnDisk(
+                    segmentURL: segmentURL,
+                    backupURL: backupURL
+                )
+            } catch {
+                rollbackInterruptedSegmentRewriteIfNeededOnDisk(
+                    segmentURL: segmentURL,
+                    workingURL: nil,
+                    backupURL: backupURL
+                )
+                throw error
+            }
+
+            clearFrameCache(for: segmentID)
+            if let entry = generatorCache.removeValue(forKey: segmentURL.path) {
+                releaseGeneratorEntry(entry)
+            }
+            publishVideoDecodingMemory(reason: "storage.video_decoding.cache")
+            Log.info(
+                "[StorageManager] Committed whole-video delete for segment \(segmentID.value)",
+                category: .storage
+            )
+            return
+        }
+
+        let workingURL = segmentRewriteWorkingURL(for: segmentURL, segmentID: segmentID)
         let backupURL = segmentRewriteBackupURL(for: segmentURL, segmentID: segmentID)
         let request = SegmentRewriteRequest(
             segmentID: segmentID,
             segmentURL: segmentURL,
-            tempURL: tempURL,
+            workingURL: workingURL,
             backupURL: backupURL,
-            targetsByFrameIndex: targetsByFrameIndex,
+            plan: plan,
             secret: secret
         )
 
-        try await Task.detached(priority: .utility) { [segmentRewriteExecutor] in
-            try await segmentRewriteExecutor.rewrite(request)
-        }.value
+        try await segmentRewriteExecutor.rewrite(request)
 
         clearFrameCache(for: segmentID)
-        generatorCache.removeValue(forKey: segmentURL.path)
+        if let entry = generatorCache.removeValue(forKey: segmentURL.path) {
+            releaseGeneratorEntry(entry)
+        }
+        publishVideoDecodingMemory(reason: "storage.video_decoding.cache")
 
         Log.info(
-            "[StorageManager] Rewrote segment \(segmentID.value) with reversible OCR scrambling (\(targetsByFrameIndex.count) frame(s))",
+            "[StorageManager] Applied segment rewrite to \(segmentID.value) (blackFrames=\(plan.blackFrameIndexes.count), redactionFrames=\(plan.redactions.count), operation=\(plan.operation.rawValue))",
             category: .storage
         )
     }
 
-    public func recoverInterruptedSegmentRedactions() async throws -> [SegmentRedactionRecoveryAction] {
+    public func recoverInterruptedSegmentRewrites() async throws -> [SegmentRewriteRecoveryAction] {
         let artifacts = try findInterruptedSegmentRewriteArtifacts()
-        var actions: [SegmentRedactionRecoveryAction] = []
+        var actions: [SegmentRewriteRecoveryAction] = []
         for artifact in artifacts {
-            let tempURL = artifact.tempURL
+            let workingURL = artifact.workingURL
             let backupURL = artifact.backupURL
             let recoveryMode = inferSegmentRewriteRecoveryMode(
+                operation: artifact.operation,
                 segmentURL: artifact.segmentURL,
-                tempURL: tempURL,
+                workingURL: workingURL,
                 backupURL: backupURL
             )
 
             if recoveryMode == .rollbackToPending {
                 rollbackInterruptedSegmentRewriteIfNeeded(
                     segmentURL: artifact.segmentURL,
-                    tempURL: tempURL,
+                    workingURL: workingURL,
                     backupURL: backupURL
                 )
-            } else if let tempURL {
-                removeItemIfExists(at: tempURL)
+            } else if let workingURL {
+                removeItemIfExists(at: workingURL)
             }
 
             clearFrameCache(for: artifact.segmentID)
-            generatorCache.removeValue(forKey: artifact.segmentURL.path)
+            if let entry = generatorCache.removeValue(forKey: artifact.segmentURL.path) {
+                releaseGeneratorEntry(entry)
+            }
+            publishVideoDecodingMemory(reason: "storage.video_decoding.cache")
             actions.append(
-                SegmentRedactionRecoveryAction(
+                SegmentRewriteRecoveryAction(
                     mode: recoveryMode,
+                    operation: artifact.operation,
                     segmentID: artifact.segmentID
                 )
             )
@@ -851,16 +941,19 @@ public actor StorageManager: StorageProtocol {
         return actions
     }
 
-    public func finishInterruptedSegmentRedactionRecovery(segmentID: VideoSegmentID) async throws {
+    public func finishInterruptedSegmentRewriteRecovery(segmentID: VideoSegmentID) async throws {
         guard let artifact = try findInterruptedSegmentRewriteArtifacts(segmentID: segmentID).first else {
             return
         }
 
-        if let tempURL = artifact.tempURL {
-            removeItemIfExists(at: tempURL)
+        if let workingURL = artifact.workingURL {
+            removeItemIfExists(at: workingURL)
         }
         if let backupURL = artifact.backupURL {
             removeItemIfExists(at: backupURL)
+        }
+        for cleanupURL in artifact.cleanupURLs {
+            removeItemIfExists(at: cleanupURL)
         }
     }
 
@@ -871,14 +964,14 @@ public actor StorageManager: StorageProtocol {
         }
 
         let segmentURL = artifact.segmentURL
-        let tempURL = artifact.tempURL ?? segmentRewriteTempURL(for: segmentURL, segmentID: segmentID)
+        let workingURL = artifact.workingURL ?? segmentRewriteWorkingURL(for: segmentURL, segmentID: segmentID)
         let fileManager = FileManager.default
 
         if fileManager.fileExists(atPath: segmentURL.path) {
-            if fileManager.fileExists(atPath: tempURL.path) {
-                removeItemIfExists(at: tempURL)
+            if fileManager.fileExists(atPath: workingURL.path) {
+                removeItemIfExists(at: workingURL)
             }
-            try fileManager.moveItem(at: segmentURL, to: tempURL)
+            try fileManager.moveItem(at: segmentURL, to: workingURL)
         }
     }
 
@@ -1678,20 +1771,45 @@ public actor StorageManager: StorageProtocol {
         )
     }
 
-    private func segmentRewriteTempURL(for segmentURL: URL, segmentID: VideoSegmentID) -> URL {
-        segmentURL
-            .deletingLastPathComponent()
-            .appendingPathComponent(".\(segmentURL.lastPathComponent).redaction-working-\(segmentID.value).mp4")
+    private enum SegmentRewriteArtifactRole {
+        case working
+        case backup
     }
 
-    private func segmentRewriteBackupName(for segmentURL: URL, segmentID: VideoSegmentID) -> String {
-        ".\(segmentURL.lastPathComponent).redaction-backup-\(segmentID.value)"
+    private func segmentRewriteWorkingURL(for segmentURL: URL, segmentID: VideoSegmentID) -> URL {
+        hiddenSegmentRewriteURL(
+            for: segmentURL,
+            suffix: ".rewrite-working-\(segmentID.value).mp4"
+        )
     }
 
     private func segmentRewriteBackupURL(for segmentURL: URL, segmentID: VideoSegmentID) -> URL {
+        hiddenSegmentRewriteURL(
+            for: segmentURL,
+            suffix: ".rewrite-backup-\(segmentID.value)"
+        )
+    }
+
+    private func segmentDeleteBackupURL(for segmentURL: URL, segmentID: VideoSegmentID) -> URL {
+        hiddenSegmentRewriteURL(
+            for: segmentURL,
+            suffix: ".delete-backup-\(segmentID.value)"
+        )
+    }
+
+    private func hiddenSegmentRewriteURL(for segmentURL: URL, suffix: String) -> URL {
         segmentURL
             .deletingLastPathComponent()
-            .appendingPathComponent(segmentRewriteBackupName(for: segmentURL, segmentID: segmentID))
+            .appendingPathComponent(".\(segmentURL.lastPathComponent)\(suffix)")
+    }
+
+    fileprivate static func legacySegmentRewriteStateURL(
+        for segmentURL: URL,
+        segmentID: VideoSegmentID
+    ) -> URL {
+        segmentURL
+            .deletingLastPathComponent()
+            .appendingPathComponent(".\(segmentURL.lastPathComponent).rewrite-state-\(segmentID.value).json")
     }
 
     private func findInterruptedSegmentRewriteArtifacts(
@@ -1713,7 +1831,8 @@ public actor StorageManager: StorageProtocol {
             guard (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else {
                 continue
             }
-            guard let artifact = parseSegmentRewriteArtifact(at: url) else {
+            guard let artifact = parseSegmentRewriteArtifact(at: url) ??
+                parseLegacySegmentRewriteArtifact(at: url) else {
                 continue
             }
             if let targetSegmentID, artifact.segmentID != targetSegmentID {
@@ -1723,88 +1842,188 @@ public actor StorageManager: StorageProtocol {
             var merged = artifactsByPath[artifact.segmentURL.path] ?? SegmentRewriteArtifacts(
                 segmentID: artifact.segmentID,
                 segmentURL: artifact.segmentURL,
-                tempURL: nil,
-                backupURL: nil
+                workingURL: nil,
+                backupURL: nil,
+                cleanupURLs: [],
+                operation: artifact.operation
             )
-            if let tempURL = artifact.tempURL {
-                merged.tempURL = tempURL
+            if let workingURL = artifact.workingURL {
+                merged.workingURL = workingURL
             }
             if let backupURL = artifact.backupURL {
                 merged.backupURL = backupURL
             }
+            if let cleanupURL = artifact.cleanupURL,
+               !merged.cleanupURLs.contains(where: { $0.path == cleanupURL.path }) {
+                merged.cleanupURLs.append(cleanupURL)
+            }
+            if artifact.operation == .wholeVideoDelete {
+                merged.operation = .wholeVideoDelete
+            }
             artifactsByPath[artifact.segmentURL.path] = merged
         }
 
-        return artifactsByPath.values.sorted { lhs, rhs in
-            if lhs.segmentID.value == rhs.segmentID.value {
-                return lhs.segmentURL.path < rhs.segmentURL.path
+        return artifactsByPath.values
+            .map { artifact in
+                var artifact = artifact
+                artifact.cleanupURLs.sort { $0.path < $1.path }
+                return artifact
             }
-            return lhs.segmentID.value < rhs.segmentID.value
-        }
+            .sorted { lhs, rhs in
+                if lhs.segmentID.value == rhs.segmentID.value {
+                    return lhs.segmentURL.path < rhs.segmentURL.path
+                }
+                return lhs.segmentID.value < rhs.segmentID.value
+            }
     }
 
-    private func parseSegmentRewriteArtifact(at url: URL) -> SegmentRewriteArtifacts? {
+    private func parseSegmentRewriteArtifact(at url: URL) -> SegmentRewriteArtifactPiece? {
+        parseHiddenSegmentRewriteArtifact(
+            at: url,
+            marker: ".rewrite-working-",
+            suffix: ".mp4",
+            operation: .partialRewrite,
+            role: .working
+        ) ??
+            parseHiddenSegmentRewriteArtifact(
+                at: url,
+                marker: ".rewrite-backup-",
+                operation: .partialRewrite,
+                role: .backup
+            ) ??
+            parseHiddenSegmentRewriteArtifact(
+                at: url,
+                marker: ".delete-backup-",
+                operation: .wholeVideoDelete,
+                role: .backup
+            )
+    }
+
+    private func parseLegacySegmentRewriteArtifact(at url: URL) -> SegmentRewriteArtifactPiece? {
+        if let artifact = parseHiddenSegmentRewriteArtifact(
+            at: url,
+            marker: ".redaction-working-",
+            suffix: ".mp4",
+            operation: .partialRewrite,
+            role: .working
+        ) {
+            return artifact
+        }
+
+        if let artifact = parseHiddenSegmentRewriteArtifact(
+            at: url,
+            marker: ".redaction-backup-",
+            operation: .partialRewrite,
+            role: .backup
+        ) {
+            return artifact
+        }
+
         let name = url.lastPathComponent
-        guard name.hasPrefix(".") else { return nil }
+        guard name.hasPrefix("."),
+              let markerRange = name.range(of: ".rewrite-state-", options: .backwards),
+              name.hasSuffix(".json") else {
+            return nil
+        }
 
         let hiddenStart = name.index(after: name.startIndex)
-
-        if let markerRange = name.range(of: ".redaction-working-", options: .backwards),
-           name.hasSuffix(".mp4") {
-            let originalName = String(name[hiddenStart..<markerRange.lowerBound])
-            let idEnd = name.index(name.endIndex, offsetBy: -4)
-            guard !originalName.isEmpty,
-                  markerRange.upperBound < idEnd,
-                  let rawID = Int64(name[markerRange.upperBound..<idEnd]) else {
-                return nil
-            }
-            let segmentURL = url.deletingLastPathComponent().appendingPathComponent(originalName)
-            return SegmentRewriteArtifacts(
-                segmentID: VideoSegmentID(value: rawID),
-                segmentURL: segmentURL,
-                tempURL: url,
-                backupURL: nil
-            )
+        let idEnd = name.index(name.endIndex, offsetBy: -".json".count)
+        let originalName = String(name[hiddenStart..<markerRange.lowerBound])
+        guard !originalName.isEmpty,
+              markerRange.upperBound < idEnd,
+              let rawID = Int64(name[markerRange.upperBound..<idEnd]) else {
+            return nil
         }
 
-        if let markerRange = name.range(of: ".redaction-backup-", options: .backwards) {
-            let originalName = String(name[hiddenStart..<markerRange.lowerBound])
-            guard !originalName.isEmpty,
-                  let rawID = Int64(name[markerRange.upperBound...]) else {
-                return nil
-            }
-            let segmentURL = url.deletingLastPathComponent().appendingPathComponent(originalName)
-            return SegmentRewriteArtifacts(
-                segmentID: VideoSegmentID(value: rawID),
-                segmentURL: segmentURL,
-                tempURL: nil,
-                backupURL: url
-            )
+        return SegmentRewriteArtifactPiece(
+            segmentID: VideoSegmentID(value: rawID),
+            segmentURL: url.deletingLastPathComponent().appendingPathComponent(originalName),
+            operation: loadLegacySegmentRewriteOperationFromManifest(at: url) ?? .partialRewrite,
+            workingURL: nil,
+            backupURL: nil,
+            cleanupURL: url
+        )
+    }
+
+    private func parseHiddenSegmentRewriteArtifact(
+        at url: URL,
+        marker: String,
+        suffix: String? = nil,
+        operation: SegmentRewriteOperation,
+        role: SegmentRewriteArtifactRole
+    ) -> SegmentRewriteArtifactPiece? {
+        let name = url.lastPathComponent
+        guard name.hasPrefix("."),
+              let markerRange = name.range(of: marker, options: .backwards) else {
+            return nil
         }
 
-        return nil
+        if let suffix, !name.hasSuffix(suffix) {
+            return nil
+        }
+
+        let hiddenStart = name.index(after: name.startIndex)
+        let idEnd = suffix.map { name.index(name.endIndex, offsetBy: -$0.count) } ?? name.endIndex
+        let originalName = String(name[hiddenStart..<markerRange.lowerBound])
+        guard !originalName.isEmpty,
+              markerRange.upperBound < idEnd,
+              let rawID = Int64(name[markerRange.upperBound..<idEnd]) else {
+            return nil
+        }
+
+        let segmentURL = url.deletingLastPathComponent().appendingPathComponent(originalName)
+        return SegmentRewriteArtifactPiece(
+            segmentID: VideoSegmentID(value: rawID),
+            segmentURL: segmentURL,
+            operation: operation,
+            workingURL: role == .working ? url : nil,
+            backupURL: role == .backup ? url : nil,
+            cleanupURL: nil
+        )
+    }
+
+    private struct LegacySegmentRewriteManifest: Decodable {
+        let operation: String
+    }
+
+    private func loadLegacySegmentRewriteOperationFromManifest(at url: URL) -> SegmentRewriteOperation? {
+        guard let data = try? Data(contentsOf: url),
+              let manifest = try? JSONDecoder().decode(LegacySegmentRewriteManifest.self, from: data) else {
+            return nil
+        }
+
+        switch manifest.operation {
+        case "wholeVideoDelete":
+            return .wholeVideoDelete
+        case "partialRewrite":
+            return .partialRewrite
+        default:
+            return nil
+        }
     }
 
     private func inferSegmentRewriteRecoveryMode(
+        operation: SegmentRewriteOperation,
         segmentURL: URL,
-        tempURL: URL?,
+        workingURL: URL?,
         backupURL: URL?
-    ) -> SegmentRedactionRecoveryAction.Mode {
+    ) -> SegmentRewriteRecoveryAction.Mode {
         inferSegmentRewriteRecoveryModeFromDisk(
+            operation: operation,
             segmentURL: segmentURL,
-            tempURL: tempURL,
+            workingURL: workingURL,
             backupURL: backupURL
         )
     }
 
     private func rollbackInterruptedSegmentRewriteIfNeeded(
         segmentURL: URL,
-        tempURL: URL?,
+        workingURL: URL?,
         backupURL: URL?
     ) {
         rollbackInterruptedSegmentRewriteIfNeededOnDisk(
             segmentURL: segmentURL,
-            tempURL: tempURL,
+            workingURL: workingURL,
             backupURL: backupURL
         )
     }

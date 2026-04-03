@@ -34,8 +34,10 @@ Processing/
 │   └── TextMerger.swift            # Combine OCR + AX results
 └── Tests/
     ├── ExtractRequestInstrumentationTests.swift # Region tail aggregation and coordinator helper coverage
-    ├── InPageURLMetadataResolutionTests.swift # In-page URL metadata retry/resolve coverage
+    ├── InPageURLMetadataResolutionTests.swift # In-page URL metadata retry and rewrite scheduling regression coverage
+    ├── OCRMemoryBackpressurePolicyTests.swift # OCR memory backpressure threshold/default coverage
     ├── PhraseLevelRedactionTests.swift        # Manual + automatic OCR phrase-level redaction coverage
+    ├── RewriteRetryPolicyTests.swift          # Bounded automatic rewrite retry coverage
     ├── TestLogger.swift                       # Shared processing test logging helpers
     └── _future/
         ├── AccessibilityTests.swift

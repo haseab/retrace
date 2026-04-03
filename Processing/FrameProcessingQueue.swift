@@ -5,6 +5,21 @@ import Database
 import Search
 import ImageIO
 
+public enum PendingRewriteDeferralReason: String, Sendable, Equatable {
+    case timelineInteraction
+    case rewriteAlreadyInProgress
+    case videoNotFinalized
+    case videoRecordUnavailable
+    case pendingOCR
+    case missingMasterKey
+}
+
+public enum PendingRewriteDispatchOutcome: Sendable, Equatable {
+    case noPendingWork
+    case deferred(PendingRewriteDeferralReason)
+    case completed
+}
+
 enum OCRStageMemoryLedger {
     private static let tracker = Tracker()
     private static let phaseResidualHoldSeconds: TimeInterval = 0.8
@@ -496,16 +511,20 @@ public actor FrameProcessingQueue {
     private static let memoryLedgerQueueTag = "processing.ocr.queueDepth"
     private static let memoryLedgerWorkersTag = "processing.ocr.workers"
     private static let rewriteResumeDebounceNs: UInt64 = 300_000_000
+    private static let defaultRetryableRewriteRetryDelayNs: UInt64 = 5_000_000_000
     private static let phraseRedactionPhrasesDefaultsKey = "phraseLevelRedactionPhrases"
     private static let phraseRedactionEnabledDefaultsKey = "phraseLevelRedactionEnabled"
     private static let phraseRedactionExtraTokenSlack = 2
     private static let phraseRedactionMaxNodeSpan = 8
     private var isPausedForMemoryPressure = false
     private var activeRewriteVideoIDs: Set<Int64> = []
+    private var rewriteVideosNeedingRedrain: Set<Int64> = []
     private var isRewriteTimelineVisible = false
     private var isRewriteTimelineScrubbing = false
     private var rewriteResumeTask: Task<Void, Never>?
+    private var retryableRewriteRetryTask: Task<Void, Never>?
     private var startupRewriteRecoveryPending = false
+    private var exhaustedAutomaticRewriteRetryVideoIDs: Set<Int64> = []
 
     // MARK: - Power-Aware Processing Control
 
@@ -728,7 +747,7 @@ public actor FrameProcessingQueue {
             return
         }
 
-        await drainPendingRedactionsIfPossible(
+        await drainPendingRewritesIfPossible(
             includeInProgressJobs: false,
             includeRetryableFailures: false,
             trigger: "interactive-idle:\(trigger)"
@@ -749,43 +768,35 @@ public actor FrameProcessingQueue {
         startupRewriteRecoveryPending = false
 
         do {
-            await reconcileInterruptedSegmentRedactionsOnStartup()
+            await reconcileInterruptedSegmentRewritesOnStartup()
 
-            let pendingVideoIDs = try await databaseManager.getVideoIDsWithPendingNodeRedactions(
+            let pendingVideoIDs = try await databaseManager.getVideoIDsWithPendingRewrites(
                 includeRetryableFailures: true
             )
             guard !pendingVideoIDs.isEmpty else { return true }
 
-            guard ReversibleOCRScrambler.currentAppWideSecret() != nil else {
-                Log.warning(
-                    "[Queue-Rewrite] Deferring startup rewrite recovery for \(pendingVideoIDs.count) video(s) because no master key exists, purpose=redaction",
-                    category: .processing
-                )
-                return true
-            }
-
             Log.info(
-                "[Queue-Rewrite] Startup recovery found \(pendingVideoIDs.count) video(s) with pending rewrites, purpose=redaction (\(trigger))",
+                "[Queue-Rewrite] Startup recovery found \(pendingVideoIDs.count) video(s) with pending rewrites (\(trigger))",
                 category: .processing
             )
 
             for videoID in pendingVideoIDs {
                 do {
-                    try await processPendingRedactions(
+                    _ = try await processPendingRewrites(
                         for: videoID,
                         includeInProgressJobs: true,
                         includeRetryableFailures: true
                     )
                 } catch {
                     Log.error(
-                        "[Queue-Rewrite] Startup recovery failed for video \(videoID): \(error.localizedDescription), purpose=redaction",
+                        "[Queue-Rewrite] Startup recovery failed for video \(videoID): \(error.localizedDescription)",
                         category: .processing
                     )
                 }
             }
         } catch {
             Log.error(
-                "[Queue-Rewrite] Failed to scan pending rewrites on startup: \(error.localizedDescription), purpose=redaction",
+                "[Queue-Rewrite] Failed to scan pending rewrites on startup: \(error.localizedDescription)",
                 category: .processing
             )
         }
@@ -793,7 +804,7 @@ public actor FrameProcessingQueue {
         return true
     }
 
-    private func drainPendingRedactionsIfPossible(
+    private func drainPendingRewritesIfPossible(
         includeInProgressJobs: Bool,
         includeRetryableFailures: Bool,
         trigger: String
@@ -807,18 +818,10 @@ public actor FrameProcessingQueue {
         }
 
         do {
-            let pendingVideoIDs = try await databaseManager.getVideoIDsWithPendingNodeRedactions(
+            let pendingVideoIDs = try await databaseManager.getVideoIDsWithPendingRewrites(
                 includeRetryableFailures: includeRetryableFailures
             )
             guard !pendingVideoIDs.isEmpty else { return }
-
-            guard ReversibleOCRScrambler.currentAppWideSecret() != nil else {
-                Log.warning(
-                    "[Queue-Rewrite] Deferring pending rewrite drain for \(pendingVideoIDs.count) video(s) because no master key exists, purpose=redaction (\(trigger))",
-                    category: .processing
-                )
-                return
-            }
 
             Log.info(
                 "[Queue-Rewrite] Draining \(pendingVideoIDs.count) pending rewrite video(s), includeRetryableFailures=\(includeRetryableFailures), trigger=\(trigger)",
@@ -827,23 +830,149 @@ public actor FrameProcessingQueue {
 
             for videoID in pendingVideoIDs {
                 do {
-                    try await processPendingRedactions(
+                    _ = try await processPendingRewrites(
                         for: videoID,
                         includeInProgressJobs: includeInProgressJobs,
                         includeRetryableFailures: includeRetryableFailures
                     )
                 } catch {
                     Log.error(
-                        "[Queue-Rewrite] Pending rewrite drain failed for video \(videoID): \(error.localizedDescription), purpose=redaction, trigger=\(trigger)",
+                        "[Queue-Rewrite] Pending rewrite drain failed for video \(videoID): \(error.localizedDescription), trigger=\(trigger)",
                         category: .processing
                     )
                 }
             }
         } catch {
             Log.error(
-                "[Queue-Rewrite] Failed to scan pending rewrites for drain: \(error.localizedDescription), purpose=redaction, trigger=\(trigger)",
+                "[Queue-Rewrite] Failed to scan pending rewrites for drain: \(error.localizedDescription), trigger=\(trigger)",
                 category: .processing
             )
+        }
+    }
+
+    private func schedulePendingRewriteRedrainIfNeeded(for videoID: Int64) {
+        guard rewriteVideosNeedingRedrain.remove(videoID) != nil else { return }
+
+        Log.debug(
+            "[Queue-Rewrite] Scheduling follow-up rewrite drain after active rewrite finished for video \(videoID)",
+            category: .processing
+        )
+
+        Task {
+            await self.drainPendingRewritesIfPossible(
+                includeInProgressJobs: false,
+                includeRetryableFailures: false,
+                trigger: "post-active-rewrite:\(videoID)"
+            )
+        }
+    }
+
+    private func scheduleRetryableRewriteRetry(
+        trigger: String,
+        delayNs: UInt64? = nil
+    ) {
+        retryableRewriteRetryTask?.cancel()
+        let effectiveDelayNs = delayNs ?? config.retryableRewriteRetryDelayNs
+
+        retryableRewriteRetryTask = Task { [effectiveDelayNs] in
+            if effectiveDelayNs > 0 {
+                try? await Task.sleep(for: .nanoseconds(Int64(effectiveDelayNs)), clock: .continuous)
+            }
+            guard !Task.isCancelled else { return }
+            await self.drainRetryableFailedRewritesIfPossible(trigger: trigger)
+        }
+    }
+
+    private func drainRetryableFailedRewritesIfPossible(trigger: String) async {
+        guard !isRewriteSchedulingSuspended else {
+            Log.debug(
+                "[Queue-Rewrite] Deferring retryable failed rewrite drain while timeline interaction is active (\(trigger))",
+                category: .processing
+            )
+            scheduleRetryableRewriteRetry(trigger: "\(trigger)-timeline-active")
+            return
+        }
+
+        guard !startupRewriteRecoveryPending else {
+            Log.debug(
+                "[Queue-Rewrite] Skipping retryable failed rewrite drain because startup recovery is still pending (\(trigger))",
+                category: .processing
+            )
+            return
+        }
+
+        do {
+            let standardPendingVideoIDs = try await databaseManager.getVideoIDsWithPendingRewrites(
+                includeRetryableFailures: false
+            )
+            guard standardPendingVideoIDs.isEmpty else {
+                Log.debug(
+                    "[Queue-Rewrite] Delaying retryable failed rewrite drain until \(standardPendingVideoIDs.count) standard rewrite video(s) clear (\(trigger))",
+                    category: .processing
+                )
+                scheduleRetryableRewriteRetry(trigger: "\(trigger)-standard-pending")
+                return
+            }
+
+            let retryableFailedVideoIDs = try await databaseManager.getVideoIDsWithPendingRewrites(
+                includeRetryableFailures: true
+            )
+            let eligibleRetryableFailedVideoIDs = retryableFailedVideoIDs.filter {
+                !exhaustedAutomaticRewriteRetryVideoIDs.contains($0)
+            }
+            guard !eligibleRetryableFailedVideoIDs.isEmpty else {
+                Log.debug(
+                    "[Queue-Rewrite] No eligible retryable failed rewrites remain after one automatic retry (\(trigger))",
+                    category: .processing
+                )
+                return
+            }
+
+            Log.info(
+                "[Queue-Rewrite] Retrying \(eligibleRetryableFailedVideoIDs.count) retryable failed rewrite video(s) (\(trigger))",
+                category: .processing
+            )
+
+            for videoID in eligibleRetryableFailedVideoIDs {
+                do {
+                    let outcome = try await processPendingRewrites(
+                        for: videoID,
+                        includeRetryableFailures: true,
+                        isAutomaticRetryOfFailedRewrite: true
+                    )
+                    if case .deferred(let reason) = outcome {
+                        Log.debug(
+                            "[Queue-Rewrite] Retryable failed rewrite for video \(videoID) deferred during retry drain: \(reason.rawValue)",
+                            category: .processing
+                        )
+                    }
+                } catch {
+                    Log.error(
+                        "[Queue-Rewrite] Retryable failed rewrite retry failed for video \(videoID): \(error.localizedDescription), trigger=\(trigger)",
+                        category: .processing
+                    )
+                }
+            }
+
+            let remainingStandardVideoIDs = try await databaseManager.getVideoIDsWithPendingRewrites(
+                includeRetryableFailures: false
+            )
+            let remainingRetryableVideoIDs = try await databaseManager.getVideoIDsWithPendingRewrites(
+                includeRetryableFailures: true
+            )
+            let remainingStandardSet = Set(remainingStandardVideoIDs)
+            if remainingRetryableVideoIDs.contains(where: {
+                !remainingStandardSet.contains($0) &&
+                    !exhaustedAutomaticRewriteRetryVideoIDs.contains($0)
+            }) {
+                scheduleRetryableRewriteRetry(trigger: "\(trigger)-remaining")
+            }
+        } catch {
+            Log.error(
+                "[Queue-Rewrite] Failed to drain retryable failed rewrites: \(error.localizedDescription), trigger=\(trigger)",
+                category: .processing
+            )
+            scheduleRetryableRewriteRetry(trigger: "\(trigger)-scan-failed")
         }
     }
 
@@ -937,6 +1066,9 @@ public actor FrameProcessingQueue {
         memoryReportTask = nil
         rewriteResumeTask?.cancel()
         rewriteResumeTask = nil
+        retryableRewriteRetryTask?.cancel()
+        retryableRewriteRetryTask = nil
+        exhaustedAutomaticRewriteRetryVideoIDs.removeAll()
 
         MemoryLedger.set(
             tag: Self.memoryLedgerWorkersTag,
@@ -1198,7 +1330,7 @@ public actor FrameProcessingQueue {
         // Video rewrites run only on finalized segments. Defer the actual rewrite
         // until OCR has quiesced for the whole video so we only re-encode once.
         if frameWithInfo.videoInfo?.isVideoFinalized ?? true {
-            try? await processPendingRedactions(for: frameRef.videoID.value)
+            _ = try? await processPendingRewrites(for: frameRef.videoID.value)
         }
 
         let tDone = CFAbsoluteTimeGetCurrent()
@@ -2586,161 +2718,173 @@ public actor FrameProcessingQueue {
         return String(repeating: " ", count: text.count)
     }
 
-    public func processPendingRedactions(
+    public func processPendingRewrites(
         for videoDatabaseID: Int64,
         includeInProgressJobs: Bool = false,
-        includeRetryableFailures: Bool = false
-    ) async throws {
+        includeRetryableFailures: Bool = false,
+        isAutomaticRetryOfFailedRewrite: Bool = false
+    ) async throws -> PendingRewriteDispatchOutcome {
         if isRewriteSchedulingSuspended {
             Log.debug(
-                "[Queue-Rewrite] Deferring segment rewrite for video \(videoDatabaseID) while timeline interaction is active, purpose=redaction",
+                "[Queue-Rewrite] Deferring segment rewrite for video \(videoDatabaseID) while timeline interaction is active",
                 category: .processing
             )
-            return
+            return .deferred(.timelineInteraction)
         }
 
-        let jobs = try await databaseManager.getPendingNodeRedactionJobs(
+        guard let plan = try await databaseManager.buildVideoRewritePlan(
             videoID: videoDatabaseID,
             includeInProgressJobs: includeInProgressJobs,
             includeRetryableFailures: includeRetryableFailures
-        )
-        guard !jobs.isEmpty else { return }
-
-        if try await databaseManager.videoHasFramesAwaitingOCR(videoID: videoDatabaseID) {
-            let pendingFrameCount = Set(jobs.map(\.frameID)).count
-            Log.debug(
-                "[Queue-Rewrite] Deferring segment rewrite for video \(videoDatabaseID) until OCR quiesces; pendingRewriteFrames=\(pendingFrameCount), purpose=redaction",
-                category: .processing
-            )
-            return
+        ), plan.hasAnyRewrite else {
+            return .noPendingWork
         }
 
-        guard !activeRewriteVideoIDs.contains(videoDatabaseID) else { return }
+        if try await databaseManager.videoHasFramesAwaitingOCR(videoID: videoDatabaseID) {
+            let pendingFrameCount = plan.deletions.count + plan.redactions.count
+            Log.debug(
+                "[Queue-Rewrite] Deferring rewrite for video \(videoDatabaseID) until OCR quiesces; pendingRewriteFrames=\(pendingFrameCount), purpose=\(rewritePurposeSummary(for: plan))",
+                category: .processing
+            )
+            return .deferred(.pendingOCR)
+        }
+
+        guard !activeRewriteVideoIDs.contains(videoDatabaseID) else {
+            rewriteVideosNeedingRedrain.insert(videoDatabaseID)
+            Log.debug(
+                "[Queue-Rewrite] Deferring rewrite for video \(videoDatabaseID) because another rewrite is active; scheduling a follow-up drain",
+                category: .processing
+            )
+            return .deferred(.rewriteAlreadyInProgress)
+        }
         activeRewriteVideoIDs.insert(videoDatabaseID)
-        defer { activeRewriteVideoIDs.remove(videoDatabaseID) }
+        defer {
+            activeRewriteVideoIDs.remove(videoDatabaseID)
+            schedulePendingRewriteRedrainIfNeeded(for: videoDatabaseID)
+        }
+
+        guard try await databaseManager.isVideoFinalized(videoID: videoDatabaseID) else {
+            Log.debug(
+                "[Queue-Rewrite] Deferring rewrite for video \(videoDatabaseID) until finalization completes",
+                category: .processing
+            )
+            return .deferred(.videoNotFinalized)
+        }
 
         guard let videoSegment = try await databaseManager.getVideoSegment(
             id: VideoSegmentID(value: videoDatabaseID)
         ) else {
-            return
+            return .deferred(.videoRecordUnavailable)
         }
 
         let actualSegmentID = try parseActualSegmentID(from: videoSegment.relativePath)
-        var targetsByFrameIndex: [Int: [SegmentRedactionTarget]] = [:]
-        var frameIDs: Set<Int64> = []
-        var seenTargets: Set<String> = []
+        let secret = ReversibleOCRScrambler.currentAppWideSecret()
+        let executablePlan: VideoRewritePlan
 
-        for job in jobs {
-            let targetKey = "\(job.frameID)|\(job.nodeID)"
-            guard seenTargets.insert(targetKey).inserted else { continue }
-            frameIDs.insert(job.frameID)
-            targetsByFrameIndex[job.frameIndex, default: []].append(
-                SegmentRedactionTarget(
-                    frameID: job.frameID,
-                    nodeID: job.nodeID,
-                    normalizedRect: job.normalizedRect
+        if plan.hasRedactionTargets && secret == nil {
+            if plan.hasDeletionTargets {
+                executablePlan = plan.droppingRedactions()
+                Log.warning(
+                    "[Queue-Rewrite] Running deletion-only rewrite for video \(videoDatabaseID) because no master key exists for pending redactions",
+                    category: .processing
                 )
-            )
-        }
-
-        guard let secret = ReversibleOCRScrambler.currentAppWideSecret() else {
-            for frameID in frameIDs {
-                try? await updateFrameProcessingStatus(
-                    frameID,
-                    status: .rewritePending,
-                    rewritePurpose: "redaction"
+            } else {
+                try await databaseManager.resetVideoRewritePlanToPending(plan)
+                Log.warning(
+                    "[Queue-Rewrite] Deferring rewrite for video \(videoDatabaseID) because no master key exists for redaction work",
+                    category: .processing
                 )
+                return .deferred(.missingMasterKey)
             }
-            Log.warning(
-                "[Queue-Rewrite] Deferring segment rewrite for video \(videoDatabaseID) because no master key exists, purpose=redaction",
-                category: .processing
-            )
-            return
+        } else {
+            executablePlan = plan
         }
 
-        let sortedFrameIDs = Array(frameIDs).sorted()
+        if isAutomaticRetryOfFailedRewrite {
+            exhaustedAutomaticRewriteRetryVideoIDs.insert(videoDatabaseID)
+        }
+
         var rewriteCommitted = false
-
         do {
-            for frameID in frameIDs {
-                try await updateFrameProcessingStatus(
-                    frameID,
-                    status: .rewriteProcessing,
-                    rewritePurpose: "redaction"
-                )
-            }
-            try await storage.rewriteSegmentForRedaction(
+            try await markVideoRewritePlanStatus(
+                executablePlan,
+                status: .rewriteProcessing
+            )
+
+            try await storage.applySegmentRewrite(
                 segmentID: actualSegmentID,
-                frameIDs: sortedFrameIDs,
-                targetsByFrameIndex: targetsByFrameIndex,
+                plan: executablePlan.segmentRewritePlan,
                 secret: secret
             )
             rewriteCommitted = true
-            for frameID in frameIDs {
-                try await updateFrameProcessingStatus(
-                    frameID,
-                    status: .rewriteCompleted,
-                    rewritePurpose: "redaction"
-                )
-            }
-            totalRewritten += frameIDs.count
+            try await databaseManager.finalizeVideoRewrite(executablePlan)
+            totalRewritten += executablePlan.deletions.count + executablePlan.redactions.count
+
             do {
-                try await storage.finishInterruptedSegmentRedactionRecovery(segmentID: actualSegmentID)
+                try await storage.finishInterruptedSegmentRewriteRecovery(segmentID: actualSegmentID)
             } catch {
                 Log.warning(
                     "[Queue-Rewrite] Completed rewrite for video \(videoDatabaseID) but failed to remove rewrite artifacts for segment \(actualSegmentID.value): \(error.localizedDescription)",
                     category: .processing
                 )
             }
+
+            await recordRewriteOutcomeBestEffort(plan: executablePlan, outcome: "success")
+            exhaustedAutomaticRewriteRetryVideoIDs.remove(videoDatabaseID)
             Log.info(
-                "[Queue-Rewrite] Completed segment rewrite for video \(videoDatabaseID), frames=\(frameIDs.count), purpose=redaction",
+                "[Queue-Rewrite] Completed segment rewrite for video \(videoDatabaseID), purpose=\(rewritePurposeSummary(for: executablePlan)), frames=\(executablePlan.deletions.count + executablePlan.redactions.count)",
                 category: .processing
             )
+            return .completed
         } catch {
             if rewriteCommitted {
+                await recordRewriteOutcomeBestEffort(plan: executablePlan, outcome: "db_finalize_failed")
                 Log.error(
-                    "[Queue-Rewrite] Segment rewrite for video \(videoDatabaseID) committed to disk but DB completion failed; leaving rewrite artifacts for startup reconciliation: \(error.localizedDescription), purpose=redaction",
+                    "[Queue-Rewrite] Segment rewrite for video \(videoDatabaseID) committed to disk but DB completion failed; leaving rewrite artifacts for startup reconciliation: \(error.localizedDescription)",
                     category: .processing
                 )
             } else {
-                for frameID in frameIDs {
-                    try? await updateFrameProcessingStatus(
-                        frameID,
-                        status: .rewriteFailed,
-                        rewritePurpose: "redaction"
-                    )
+                try? await markVideoRewritePlanStatus(
+                    executablePlan,
+                    status: .rewriteFailed
+                )
+                await recordRewriteOutcomeBestEffort(plan: executablePlan, outcome: "file_mutation_failed")
+                if !exhaustedAutomaticRewriteRetryVideoIDs.contains(videoDatabaseID) {
+                    scheduleRetryableRewriteRetry(trigger: "rewrite-failed:\(videoDatabaseID)")
                 }
             }
             let failureSummary = rewriteCommitted
                 ? "segment bytes are committed; rewrite artifacts retained for startup reconciliation"
-                : "marked jobs retryable-failed"
+                : exhaustedAutomaticRewriteRetryVideoIDs.contains(videoDatabaseID)
+                    ? "marked jobs failed after exhausting the one automatic retry"
+                    : "marked jobs retryable-failed"
             Log.error(
-                "[Queue-Rewrite] Failed segment rewrite for video \(videoDatabaseID); \(failureSummary): \(error.localizedDescription), purpose=redaction",
+                "[Queue-Rewrite] Failed segment rewrite for video \(videoDatabaseID); \(failureSummary): \(error.localizedDescription), purpose=\(rewritePurposeSummary(for: executablePlan))",
                 category: .processing
             )
             throw error
         }
     }
 
-    private func recoverPendingRedactionsOnStartup() async {
+    private func recoverPendingRewritesOnStartup() async {
         _ = await performStartupRewriteRecoveryIfPending(trigger: "startup-manual")
     }
 
-    public func recoverPendingRedactionsIfPossible() async {
+    public func recoverPendingRewritesIfPossible() async {
         if await performStartupRewriteRecoveryIfPending(trigger: "manual-request") {
             return
         }
 
-        await drainPendingRedactionsIfPossible(
+        await drainPendingRewritesIfPossible(
             includeInProgressJobs: true,
             includeRetryableFailures: true,
             trigger: "manual-request"
         )
     }
 
-    private func reconcileInterruptedSegmentRedactionsOnStartup() async {
+    private func reconcileInterruptedSegmentRewritesOnStartup() async {
         do {
-            let actions = try await storage.recoverInterruptedSegmentRedactions()
+            let actions = try await storage.recoverInterruptedSegmentRewrites()
             guard !actions.isEmpty else { return }
 
             Log.warning(
@@ -2748,7 +2892,7 @@ public actor FrameProcessingQueue {
                 category: .processing
             )
 
-            let pendingVideoIDs = try await databaseManager.getVideoIDsWithPendingNodeRedactions(
+            let pendingVideoIDs = try await databaseManager.getVideoIDsWithPendingRewrites(
                 includeRetryableFailures: true
             )
             var videoIDBySegmentID: [Int64: Int64] = [:]
@@ -2765,21 +2909,14 @@ public actor FrameProcessingQueue {
             }
 
             for action in actions {
-                let frameIDs: [Int64]
-                if let videoID = videoIDBySegmentID[action.segmentID.value] {
-                    let jobs = try await databaseManager.getPendingNodeRedactionJobs(
+                guard let videoID = videoIDBySegmentID[action.segmentID.value],
+                      let plan = try await databaseManager.buildVideoRewritePlan(
                         videoID: videoID,
                         includeInProgressJobs: true,
-                        includeRetryableFailures: false
-                    )
-                    frameIDs = Array(Set(jobs.map(\.frameID))).sorted()
-                } else {
-                    frameIDs = []
-                }
-
-                guard !frameIDs.isEmpty else {
+                        includeRetryableFailures: true
+                      ) else {
                     do {
-                        try await storage.finishInterruptedSegmentRedactionRecovery(segmentID: action.segmentID)
+                        try await storage.finishInterruptedSegmentRewriteRecovery(segmentID: action.segmentID)
                     } catch {
                         Log.error(
                             "[Queue-Rewrite] Failed to clean stale interrupted rewrite artifacts for segment \(action.segmentID.value): \(error.localizedDescription)",
@@ -2789,36 +2926,23 @@ public actor FrameProcessingQueue {
                     continue
                 }
 
-                var didPersistAllStatuses = true
-                let targetStatus: FrameProcessingStatus = {
+                do {
                     switch action.mode {
                     case .rollbackToPending:
-                        return .rewritePending
-                    case .markCompleted:
-                        return .rewriteCompleted
+                        try await databaseManager.resetVideoRewritePlanToPending(plan)
+                    case .finalizeCommitted:
+                        try await databaseManager.finalizeVideoRewrite(plan)
                     }
-                }()
-
-                for frameID in frameIDs {
-                    do {
-                        try await updateFrameProcessingStatus(
-                            frameID,
-                            status: targetStatus,
-                            rewritePurpose: "redaction"
-                        )
-                    } catch {
-                        didPersistAllStatuses = false
-                        Log.error(
-                            "[Queue-Rewrite] Failed to persist startup rewrite reconciliation for segment \(action.segmentID.value), frame \(frameID): \(error.localizedDescription)",
-                            category: .processing
-                        )
-                    }
+                } catch {
+                    Log.error(
+                        "[Queue-Rewrite] Failed to persist startup rewrite reconciliation for segment \(action.segmentID.value): \(error.localizedDescription)",
+                        category: .processing
+                    )
+                    continue
                 }
 
-                guard didPersistAllStatuses else { continue }
-
                 do {
-                    try await storage.finishInterruptedSegmentRedactionRecovery(segmentID: action.segmentID)
+                    try await storage.finishInterruptedSegmentRewriteRecovery(segmentID: action.segmentID)
                 } catch {
                     Log.error(
                         "[Queue-Rewrite] Failed to clean interrupted rewrite artifacts for segment \(action.segmentID.value): \(error.localizedDescription)",
@@ -2829,6 +2953,58 @@ public actor FrameProcessingQueue {
         } catch {
             Log.error(
                 "[Queue-Rewrite] Failed to reconcile interrupted rewrite artifacts on startup: \(error.localizedDescription)",
+                category: .processing
+            )
+        }
+    }
+
+    private func markVideoRewritePlanStatus(
+        _ plan: VideoRewritePlan,
+        status: FrameProcessingStatus
+    ) async throws {
+        for deletion in plan.deletions {
+            try await updateFrameProcessingStatus(
+                deletion.frameID,
+                status: status,
+                rewritePurpose: "deletion"
+            )
+        }
+
+        for redaction in plan.redactions {
+            try await updateFrameProcessingStatus(
+                redaction.frameID,
+                status: status,
+                rewritePurpose: "redaction"
+            )
+        }
+    }
+
+    private func rewritePurposeSummary(for plan: VideoRewritePlan) -> String {
+        if plan.hasDeletionTargets && plan.hasRedactionTargets {
+            return "mixed"
+        }
+        if plan.hasDeletionTargets {
+            return "deletion"
+        }
+        return "redaction"
+    }
+
+    private func recordRewriteOutcomeBestEffort(
+        plan: VideoRewritePlan,
+        outcome: String
+    ) async {
+        let frameCount = plan.deletions.count + plan.redactions.count
+        let metadata = """
+            {"purpose":"\(rewritePurposeSummary(for: plan))","outcome":"\(outcome)","frameCount":\(frameCount),"videoCount":1}
+            """
+        do {
+            try await databaseManager.recordMetricEvent(
+                metricType: .videoRewriteOutcome,
+                metadata: metadata
+            )
+        } catch {
+            Log.warning(
+                "[Queue-Rewrite] Failed to record rewrite metric for video \(plan.videoID): \(error.localizedDescription)",
                 category: .processing
             )
         }
@@ -3398,11 +3574,18 @@ public struct ProcessingQueueConfig: Sendable {
     public let workerCount: Int
     public let maxRetryAttempts: Int
     public let maxQueueSize: Int
+    public let retryableRewriteRetryDelayNs: UInt64
 
-    public init(workerCount: Int = 1, maxRetryAttempts: Int = 3, maxQueueSize: Int = 1000) {
+    public init(
+        workerCount: Int = 1,
+        maxRetryAttempts: Int = 3,
+        maxQueueSize: Int = 1000,
+        retryableRewriteRetryDelayNs: UInt64 = 5_000_000_000
+    ) {
         self.workerCount = workerCount
         self.maxRetryAttempts = maxRetryAttempts
         self.maxQueueSize = maxQueueSize
+        self.retryableRewriteRetryDelayNs = retryableRewriteRetryDelayNs
     }
 
     public static let `default` = ProcessingQueueConfig()

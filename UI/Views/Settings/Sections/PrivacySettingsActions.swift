@@ -20,13 +20,16 @@ extension SettingsView {
         Task {
             do {
                 // Use deleteRecentData to delete frames NEWER than the cutoff date
-                let result = try await coordinatorWrapper.coordinator.deleteRecentData(newerThan: option.cutoffDate)
+                let result = try await coordinatorWrapper.coordinator.deleteRecentData(
+                    newerThan: option.cutoffDate,
+                    metricSource: "quick_delete"
+                )
 
                 await MainActor.run {
                     isDeleting = false
                     deletingOption = nil
-                    if result.deletedFrames > 0 {
-                        showSettingsToast("Deleted \(result.deletedFrames) frames from the \(option.displayName)")
+                    if result.affectedFrames > 0 {
+                        showSettingsToast(quickDeleteToastMessage(for: result, option: option))
                         // Notify timeline to reload so deleted frames don't appear
                         NotificationCenter.default.post(name: .dataSourceDidChange, object: nil)
                     } else {
@@ -41,6 +44,16 @@ extension SettingsView {
                 }
             }
         }
+    }
+
+    private func quickDeleteToastMessage(for result: FrameDeletionResult, option: QuickDeleteOption) -> String {
+        if result.queuedFrames == 0 {
+            return "Deleted \(result.completedFrames) frames from the \(option.displayName)"
+        }
+        if result.completedFrames == 0 {
+            return "Queued deletion for \(result.queuedFrames) frames from the \(option.displayName)."
+        }
+        return "Deleted \(result.completedFrames) frames and queued \(result.queuedFrames) more from the \(option.displayName)"
     }
 }
 
