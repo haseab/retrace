@@ -281,9 +281,10 @@ public actor HEVCEncoder {
         let effectiveBitsPerPixelPerFrame = Double(averageBitRate) / (pixelCount * Double(expectedSourceFrameRate))
         let effectiveDensityBoost = max(effectiveBitsPerPixelPerFrame / baseBitsPerPixelPerFrame, 1.0)
 
-        // Keep a modest burst cap so bitrate can flex without running away.
+        // Keep a bounded burst cap so reference frames can spend materially more
+        // than the segment average without changing the long-GOP structure.
         let burstDataRateLimit = max(
-            Int((Double(averageBitRate) * 1.18 / 8.0).rounded()),
+            Int((Double(averageBitRate) * 6.0 / 8.0).rounded()),
             128 * 1_024
         )
 
@@ -379,11 +380,14 @@ public actor HEVCEncoder {
                 compressionTuning.dataRateLimitBytesPerSecond,
                 1,
             ],
+            // Storage guardrail: keep the configured long GOP. Shortening this increases reference
+            // frame frequency and noticeably increases disk usage for continuous capture.
             kVTCompressionPropertyKey_MaxKeyFrameInterval as String: config.keyframeInterval,
             kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration as String:
                 Double(config.keyframeInterval) / Double(Self.expectedSourceFrameRate),
             kVTCompressionPropertyKey_AllowTemporalCompression as String: true,
-            // Enable frame reordering (B-frames) for better compression efficiency.
+            // Storage guardrail: keep frame reordering enabled. B-frames are a major part of the
+            // current storage-efficiency strategy and should not be disabled casually.
             kVTCompressionPropertyKey_AllowFrameReordering as String: true,
             kVTCompressionPropertyKey_ExpectedFrameRate as String: Self.expectedSourceFrameRate
         ]

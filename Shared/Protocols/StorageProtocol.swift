@@ -229,7 +229,9 @@ public struct VideoEncoderConfig: Sendable {
     /// Target bitrate in bits per second (nil = auto)
     public let targetBitrate: Int?
 
-    /// Keyframe interval in frames
+    /// Keyframe interval in frames.
+    /// Storage guardrail: do not shorten this casually. A longer GOP is intentional here because
+    /// it materially improves storage efficiency for continuous screen capture.
     public let keyframeInterval: Int
 
     /// Whether to use hardware encoding
@@ -241,7 +243,7 @@ public struct VideoEncoderConfig: Sendable {
     public init(
         codec: VideoCodec = .hevc,
         targetBitrate: Int? = nil,
-        keyframeInterval: Int = 30,  // Keyframe every 30 frames, enables P/B-frame compression
+        keyframeInterval: Int = 30,  // Storage guardrail: keep this long for compression efficiency unless storage cost is intentionally being traded away.
         useHardwareEncoder: Bool = true,
         quality: Float = 0.5
     ) {
