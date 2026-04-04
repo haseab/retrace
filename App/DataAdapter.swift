@@ -3,6 +3,7 @@ import CoreGraphics
 import Shared
 import Database
 import Storage
+import Search
 import SQLCipher
 
 /// Unified data adapter that owns connections directly and runs SQL
@@ -30,6 +31,7 @@ public actor DataAdapter {
     private static let searchDedupeSameTextMinWidthRatio: Double = 0.92
     private static let searchDedupeSameTextMinHeightRatio: Double = 0.8
     private static let searchAllRawBatchSize = 150
+    private static let queryTokenizer = QueryTokenizer()
 
     // MARK: - Connections
 
@@ -4088,103 +4090,28 @@ public actor DataAdapter {
     }
 
     private static func parseFTSQueryComponents(_ text: String) -> FTSQueryComponents {
-        let tokens = tokenizeSearchQuery(text)
         var includeParts: [String] = []
         var excludeTerms: [String] = []
 
-        for token in tokens {
-            if token == "-" {
+        for token in Self.queryTokenizer.tokenize(text) {
+            let sanitized = token.sanitizedText
+            guard !sanitized.isEmpty else {
                 continue
             }
 
-            if token.hasPrefix("-") && token.count > 1 {
-                let rawExcluded = String(token.dropFirst())
-                if rawExcluded.hasPrefix("\""), rawExcluded.hasSuffix("\""), rawExcluded.count > 1 {
-                    let phrase = sanitizeFTSTerm(String(rawExcluded.dropFirst().dropLast()))
-                    if !phrase.isEmpty {
-                        excludeTerms.append("\"\(phrase)\"")
-                    }
-                } else {
-                    let term = sanitizeFTSTerm(rawExcluded)
-                    if !term.isEmpty {
-                        excludeTerms.append("\"\(term)\"")
-                    }
-                }
+            switch token.kind {
+            case .ignoredShellOption:
                 continue
-            }
-
-            if token.hasPrefix("\""), token.hasSuffix("\""), token.count > 1 {
-                let phrase = sanitizeFTSTerm(String(token.dropFirst().dropLast()))
-                if !phrase.isEmpty {
-                    includeParts.append("\"\(phrase)\"")
-                }
-            } else {
-                let term = sanitizeFTSTerm(token)
-                if !term.isEmpty {
-                    includeParts.append(formatUnquotedTerm(term))
-                }
+            case .excludedTerm, .excludedPhrase:
+                excludeTerms.append("\"\(sanitized)\"")
+            case .phrase:
+                includeParts.append("\"\(sanitized)\"")
+            case .term:
+                includeParts.append(formatUnquotedTerm(sanitized))
             }
         }
 
         return FTSQueryComponents(includeParts: includeParts, excludeTerms: excludeTerms)
-    }
-
-    private static func buildFTSQuery(_ text: String) -> String {
-        buildFTSQuery(parseFTSQueryComponents(text))
-    }
-
-    private static func buildFTSQuery(_ components: FTSQueryComponents) -> String {
-        // Exclusion-only queries are invalid in FTS syntax (`NOT x` cannot stand alone).
-        // Keep this path deterministic and return no rows.
-        guard !components.includeParts.isEmpty else {
-            return "\"__retrace_no_match__\""
-        }
-
-        let excludeParts = components.excludeTerms.map { "NOT \($0)" }
-        return (components.includeParts + excludeParts).joined(separator: " ")
-    }
-
-    /// Tokenize query while preserving quoted phrases and handling `-"phrase"` as one token.
-    private static func tokenizeSearchQuery(_ query: String) -> [String] {
-        var tokens: [String] = []
-        var current = ""
-        var inQuotes = false
-
-        for char in query {
-            if char == "\"" {
-                if inQuotes {
-                    current.append(char)
-                    tokens.append(current)
-                    current = ""
-                    inQuotes = false
-                } else {
-                    if current == "-" {
-                        current.append(char)
-                        inQuotes = true
-                        continue
-                    }
-                    if !current.isEmpty {
-                        tokens.append(current)
-                        current = ""
-                    }
-                    current.append(char)
-                    inQuotes = true
-                }
-            } else if char.isWhitespace && !inQuotes {
-                if !current.isEmpty {
-                    tokens.append(current)
-                    current = ""
-                }
-            } else {
-                current.append(char)
-            }
-        }
-
-        if !current.isEmpty {
-            tokens.append(current)
-        }
-
-        return tokens
     }
 
     /// Restrict FTS MATCH to content columns only (exclude window title metadata).
@@ -4371,15 +4298,6 @@ public actor DataAdapter {
         return collapsed.isEmpty ? nil : collapsed
     }
 
-    /// Remove characters that have special meaning in FTS query syntax.
-    private static func sanitizeFTSTerm(_ text: String) -> String {
-        text
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .replacingOccurrences(of: "\"", with: "")
-            .replacingOccurrences(of: "*", with: "")
-            .replacingOccurrences(of: ":", with: "")
-    }
-
     /// For unquoted terms, avoid prefix expansion on stopwords and very short tokens.
     /// This keeps terms like "a" as exact-token matches instead of broad "a*" prefix matches.
     private static func formatUnquotedTerm(_ term: String) -> String {
@@ -4444,40 +4362,31 @@ public actor DataAdapter {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalizedQuery.isEmpty else { return [] }
 
-        var tokens: [SearchDedupeToken] = []
+        var dedupeTokens: [SearchDedupeToken] = []
         var seenKeys = Set<String>()
 
         func appendToken(_ token: SearchDedupeToken) {
             if seenKeys.insert(token.dedupeKey).inserted {
-                tokens.append(token)
+                dedupeTokens.append(token)
             }
         }
 
-        for token in tokenizeSearchQuery(normalizedQuery) {
-            if token == "-" {
-                continue
-            }
+        for token in Self.queryTokenizer.tokenize(normalizedQuery) {
+            let sanitized = token.sanitizedText
+            guard !sanitized.isEmpty else { continue }
 
-            if token.hasPrefix("-"), token.count > 1 {
-                // Excluded query terms should not drive highlight matching / dedupe anchors.
+            switch token.kind {
+            case .excludedTerm, .excludedPhrase, .ignoredShellOption:
                 continue
+            case .phrase:
+                appendToken(.phrase(sanitized))
+            case .term:
+                let mode: SearchDedupeTermMatchMode = shouldUseExactMatch(sanitized) ? .exactWord : .wordPrefix
+                appendToken(.term(sanitized, mode: mode))
             }
-
-            if token.hasPrefix("\""), token.hasSuffix("\""), token.count > 1 {
-                let phrase = sanitizeFTSTerm(String(token.dropFirst().dropLast()))
-                if !phrase.isEmpty {
-                    appendToken(.phrase(phrase))
-                }
-                continue
-            }
-
-            let term = sanitizeFTSTerm(token)
-            guard !term.isEmpty else { continue }
-            let mode: SearchDedupeTermMatchMode = shouldUseExactMatch(term) ? .exactWord : .wordPrefix
-            appendToken(.term(term, mode: mode))
         }
 
-        return tokens
+        return dedupeTokens
     }
 
     private struct SearchDedupeMatchBox: Hashable {

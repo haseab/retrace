@@ -117,6 +117,27 @@ final class SearchHighlightQueryParsingTests: XCTestCase {
         XCTAssertEqual(String(matches[0].node.text[matches[0].ranges[0]]), "error occurred")
     }
 
+    func testSearchResultModeTreatsCommandLikeQueryAsIndividualTerms() {
+        let nodes = [
+            makeNode(id: 1, text: "osascript"),
+            makeNode(id: 2, text: "tell application"),
+            makeNode(id: 3, text: "\"Codex\" to hide"),
+            makeNode(id: 4, text: "delay 1"),
+            makeNode(id: 5, text: "go to search settings"),
+            makeNode(id: 6, text: "window 1"),
+            makeNode(id: 7, text: "completely unrelated")
+        ]
+
+        let matches = SimpleTimelineViewModel.searchHighlightMatches(
+            in: nodes,
+            query: #"osascript -e 'tell application "Codex" to hide' -e 'delay 1'"#,
+            mode: .matchedNodes
+        )
+
+        XCTAssertEqual(matches.map(\.node.id), [1, 2, 3, 4])
+        XCTAssertTrue(matches.allSatisfy { $0.ranges.isEmpty })
+    }
+
     private func makeNode(id: Int, text: String, x: CGFloat = 0.1, y: CGFloat = 0.1) -> OCRNodeWithText {
         OCRNodeWithText(
             id: id,

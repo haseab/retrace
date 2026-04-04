@@ -958,6 +958,60 @@ final class DataAdapterRewindBoundaryTests: XCTestCase {
         XCTAssertEqual(results.results.first?.source, .rewind)
     }
 
+    func testSearchIgnoresShellFlagsInCommandLikeQuery() async throws {
+        let cutoffDate = makeCutoffDate()
+        let fixture = try await makeFixture(cutoffDate: cutoffDate)
+        defer {
+            Task {
+                try? await self.close(fixture)
+            }
+        }
+
+        let command = #"osascript -e 'tell application "Codex" to hide' -e 'tell application "Retrace" to activate' -e 'delay 1'"#
+        let frameID = try await seedFrame(
+            in: fixture.retraceDatabase,
+            timestamp: cutoffDate.addingTimeInterval(3600),
+            bundleID: "com.apple.Terminal",
+            text: command,
+            source: .native
+        )
+
+        let results = try await fixture.adapter.search(query: SearchQuery(text: command))
+
+        XCTAssertTrue(results.results.contains(where: { $0.id.value == frameID.value && $0.source == .native }))
+    }
+
+    func testSearchStillTreatsPlainDashTermsAsExclusions() async throws {
+        let cutoffDate = makeCutoffDate()
+        let fixture = try await makeFixture(cutoffDate: cutoffDate)
+        defer {
+            Task {
+                try? await self.close(fixture)
+            }
+        }
+
+        let excludedFrameID = try await seedFrame(
+            in: fixture.retraceDatabase,
+            timestamp: cutoffDate.addingTimeInterval(3600),
+            bundleID: "com.apple.Terminal",
+            text: "swift java",
+            source: .native
+        )
+        let includedFrameID = try await seedFrame(
+            in: fixture.retraceDatabase,
+            timestamp: cutoffDate.addingTimeInterval(7200),
+            bundleID: "com.apple.Terminal",
+            text: "swift objc",
+            source: .native
+        )
+
+        let results = try await fixture.adapter.search(query: SearchQuery(text: "swift -java"))
+        let resultIDs = Set(results.results.map(\.id.value))
+
+        XCTAssertFalse(resultIDs.contains(excludedFrameID.value))
+        XCTAssertTrue(resultIDs.contains(includedFrameID.value))
+    }
+
     func testSearchThrowsWhenNativeSourceFailsUnexpectedlyAndRewindHasNoMatches() async throws {
         let cutoffDate = makeCutoffDate()
         let brokenRetracePool = SQLiteReadConnectionPool(

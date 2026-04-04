@@ -9110,15 +9110,26 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     private enum SearchHighlightToken {
+        case term(String)
         case phrase(String)
     }
+
+    private static let searchResultHighlightStopwords: Set<String> = [
+        "a", "an", "and", "as", "at",
+        "be", "but", "by",
+        "for", "from",
+        "if", "in", "into", "is", "it",
+        "of", "on", "or",
+        "the", "to",
+        "with"
+    ]
 
     static func searchHighlightMatches(
         in nodes: [OCRNodeWithText],
         query: String,
         mode: SearchHighlightMode
     ) -> [(node: OCRNodeWithText, ranges: [Range<String.Index>])] {
-        let queryTokens = tokenizeSearchHighlightQuery(query)
+        let queryTokens = tokenizeSearchHighlightQuery(query, mode: mode)
         guard !queryTokens.isEmpty else { return [] }
 
         var matchingNodes: [(node: OCRNodeWithText, ranges: [Range<String.Index>])] = []
@@ -9141,11 +9152,54 @@ public class SimpleTimelineViewModel: ObservableObject {
         return matchingNodes
     }
 
-    private static func tokenizeSearchHighlightQuery(_ query: String) -> [SearchHighlightToken] {
+    private static func tokenizeSearchHighlightQuery(
+        _ query: String,
+        mode: SearchHighlightMode
+    ) -> [SearchHighlightToken] {
         let normalizedQuery = query
             .lowercased()
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalizedQuery.isEmpty else { return [] }
+
+        if mode == .matchedNodes {
+            var tokens: [SearchHighlightToken] = []
+            var seen = Set<String>()
+
+            func appendToken(_ token: SearchHighlightToken, key: String) {
+                if seen.insert(key).inserted {
+                    tokens.append(token)
+                }
+            }
+
+            if normalizedQuery.hasPrefix("\""),
+               normalizedQuery.hasSuffix("\""),
+               normalizedQuery.count > 2 {
+                let phrase = String(normalizedQuery.dropFirst().dropLast()).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !phrase.isEmpty {
+                    appendToken(.phrase(phrase), key: "p:\(phrase)")
+                }
+                return tokens
+            }
+
+            for rawTerm in normalizedQuery.split(whereSeparator: \.isWhitespace) {
+                let rawValue = String(rawTerm)
+                if isIgnoredSearchResultShellToken(rawValue) || rawValue.hasPrefix("-") {
+                    continue
+                }
+
+                let cleaned = rawValue
+                    .trimmingCharacters(in: CharacterSet(charactersIn: "\"'`"))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !cleaned.isEmpty else { continue }
+                if shouldIgnoreSearchResultTerm(cleaned) {
+                    continue
+                }
+
+                appendToken(.term(cleaned), key: "t:\(cleaned)")
+            }
+
+            return tokens
+        }
 
         return normalizedQuery
             .split(separator: ",", omittingEmptySubsequences: false)
@@ -9163,9 +9217,65 @@ public class SimpleTimelineViewModel: ObservableObject {
         in text: String
     ) -> [Range<String.Index>] {
         switch token {
+        case .term(let term):
+            let exactWordRanges = allWholeWordRanges(of: term, in: text)
+            if !exactWordRanges.isEmpty {
+                return exactWordRanges
+            }
+            return allRanges(of: term, in: text)
         case .phrase(let phrase):
             return allRanges(of: phrase, in: text)
         }
+    }
+
+    private static func allWholeWordRanges(
+        of needle: String,
+        in haystack: String
+    ) -> [Range<String.Index>] {
+        guard !needle.isEmpty else { return [] }
+        let pattern = #"\b\#(NSRegularExpression.escapedPattern(for: needle))\b"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else {
+            return []
+        }
+
+        let fullRange = NSRange(haystack.startIndex..<haystack.endIndex, in: haystack)
+        return regex.matches(in: haystack, options: [.withTransparentBounds], range: fullRange)
+            .compactMap { Range($0.range, in: haystack) }
+    }
+
+    private static func isIgnoredSearchResultShellToken(_ token: String) -> Bool {
+        guard token.hasPrefix("-"), token.count > 1 else { return false }
+        if token.hasPrefix("-\"") || token.hasPrefix("-'") {
+            return false
+        }
+
+        if token == "--" {
+            return true
+        }
+
+        let optionBody = token.hasPrefix("--") ? String(token.dropFirst(2)) : String(token.dropFirst())
+        let optionName = optionBody
+            .split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            .first
+            .map(String.init) ?? optionBody
+        guard !optionName.isEmpty else { return false }
+
+        if token.hasPrefix("--") {
+            return optionName.allSatisfy { $0.isLetter || $0.isNumber || $0 == "-" }
+        }
+
+        return optionName.count <= 3 && optionName.allSatisfy { $0.isLetter || $0.isNumber || $0 == "-" }
+    }
+
+    private static func shouldIgnoreSearchResultTerm(_ term: String) -> Bool {
+        let normalized = term.lowercased()
+        if normalized.count == 1 {
+            return true
+        }
+        if normalized.allSatisfy(\.isNumber) {
+            return true
+        }
+        return Self.searchResultHighlightStopwords.contains(normalized)
     }
 
     private static func allRanges(of needle: String, in haystack: String) -> [Range<String.Index>] {
