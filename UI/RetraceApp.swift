@@ -66,11 +66,6 @@ enum SingleInstanceLockRetryResult: Equatable {
     case failedError(code: Int32, attempts: Int)
 }
 
-enum SingleInstanceLockErrorAction: Equatable {
-    case continueLaunch
-    case activateExistingInstance
-}
-
 enum SingleInstanceLockRetrier {
     static func acquire(
         maxAttempts: Int,
@@ -247,10 +242,15 @@ struct RetraceApp: App {
 class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @MainActor static private(set) var isApplicationTerminating = false
 
-    enum FreshLaunchAction: Equatable {
+    enum LaunchMode: Equatable {
+        case fresh
+        case relaunch
+    }
+
+    enum LaunchGateAction: Equatable {
         case continueLaunch
         case continueLaunchIgnoringStaleRunningApp
-        case activateExistingInstance
+        case activateExistingInstanceAndExitDuplicate
     }
 
     var menuBarManager: MenuBarManager?
@@ -285,7 +285,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private static let systemMonitorShortcutDefaultsKey = "systemMonitorShortcutConfig"
     private static let canonicalBundleIdentifier = "io.retrace.app"
     private static let singleInstanceLockPath = "/tmp/io.retrace.app.instance.lock"
-    private static let launchLockRetryAttempts = 5
     private static let relaunchLockRetryAttempts = 30
     private static let singleInstanceLockRetryDelay: Duration = .milliseconds(100)
     nonisolated private static let watchdogSleepSuspensionSeconds: TimeInterval = 12 * 60 * 60
@@ -298,6 +297,42 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Check if another instance is already running. Relaunches still need to
+        // reacquire the lock during handoff, but fresh launches should decide immediately.
+        let isRelaunch = UserDefaults.standard.bool(forKey: "isRelaunching")
+        if isRelaunch {
+            Log.info("[AppDelegate] App relaunched successfully", category: .app)
+            UserDefaults.standard.removeObject(forKey: "isRelaunching")
+            Task { @MainActor in
+                let singleInstanceLockResult = await self.acquireSingleInstanceLock(
+                    maxAttempts: Self.relaunchLockRetryAttempts,
+                    reason: "relaunch handoff"
+                )
+
+                guard self.handleSingleInstanceLaunchDecision(
+                    mode: .relaunch,
+                    lockResult: singleInstanceLockResult
+                ) else {
+                    return
+                }
+
+                self.beginPostSingleInstanceLaunchSetup()
+            }
+            return
+        }
+
+        let singleInstanceLockResult = acquireSingleInstanceLockForFreshLaunch()
+        guard handleSingleInstanceLaunchDecision(
+            mode: .fresh,
+            lockResult: singleInstanceLockResult
+        ) else {
+            return
+        }
+
+        beginPostSingleInstanceLaunchSetup()
+    }
+
+    private func beginPostSingleInstanceLaunchSetup() {
         // Temporarily disabled while investigating App Management permission prompts.
         // Prompt user to move app to Applications folder if not already there.
         // AppMover.moveToApplicationsFolderIfNecessary()
@@ -305,95 +340,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setupExternalDashboardRevealObserver()
         installMainMenuIfNeeded(force: true)
         applyDockIconVisibilityPreference()
-
-        // Check if another instance is already running. Relaunches still need to
-        // reacquire the lock, but can skip the duplicate-process scan during handoff.
-        let isRelaunch = UserDefaults.standard.bool(forKey: "isRelaunching")
-        if isRelaunch {
-            Log.info("[AppDelegate] App relaunched successfully", category: .app)
-            UserDefaults.standard.removeObject(forKey: "isRelaunching")
-        }
-
-        Task { @MainActor in
-            let retryAttempts = isRelaunch ? Self.relaunchLockRetryAttempts : Self.launchLockRetryAttempts
-            let singleInstanceLockResult = await self.acquireSingleInstanceLock(
-                maxAttempts: retryAttempts,
-                reason: isRelaunch ? "relaunch handoff" : "launch"
-            )
-
-            switch singleInstanceLockResult {
-            case .acquired:
-                break
-
-            case .failedHeldByAnotherProcess:
-                if isRelaunch {
-                    Log.warning(
-                        "[AppDelegate] Relaunch could not reacquire the single-instance lock after handoff window; activating existing instance and terminating duplicate.",
-                        category: .app
-                    )
-                } else {
-                    Log.info(
-                        "[AppDelegate] Could not acquire the single-instance lock for launch; activating existing instance if available and terminating duplicate.",
-                        category: .app
-                    )
-                }
-                self.activateExistingInstance()
-                self.requestImmediateTermination(skipQuitConfirmation: true)
-                return
-
-            case .failedError:
-                let matchingRunningAppDetected = isRelaunch ? false : self.isAnotherInstanceRunning()
-
-                switch Self.launchActionAfterLockError(
-                    isRelaunch: isRelaunch,
-                    matchingRunningAppDetected: matchingRunningAppDetected
-                ) {
-                case .continueLaunch:
-                    if isRelaunch {
-                        Log.warning(
-                            "[AppDelegate] Continuing relaunch after single-instance lock error because relaunch handoff is authoritative.",
-                            category: .app
-                        )
-                    } else {
-                        Log.warning(
-                            "[AppDelegate] Continuing launch after single-instance lock error because no matching running instance was detected.",
-                            category: .app
-                        )
-                    }
-
-                case .activateExistingInstance:
-                    Log.warning(
-                        "[AppDelegate] Single-instance lock failed during launch and a matching running instance was detected; activating existing instance and terminating duplicate.",
-                        category: .app
-                    )
-                    self.activateExistingInstance()
-                    self.requestImmediateTermination(skipQuitConfirmation: true)
-                    return
-                }
-            }
-
-            if !isRelaunch, case .acquired = singleInstanceLockResult {
-                switch Self.freshLaunchAction(
-                    hasSingleInstanceLock: true,
-                    matchingRunningAppDetected: self.isAnotherInstanceRunning()
-                ) {
-                case .continueLaunch:
-                    break
-                case .continueLaunchIgnoringStaleRunningApp:
-                    Log.warning(
-                        "[AppDelegate] Matching running application detected after acquiring the single-instance lock; continuing launch because the lock is authoritative and the other instance is likely terminating.",
-                        category: .app
-                    )
-                case .activateExistingInstance:
-                    Log.info("[AppDelegate] Another instance already running, activating it", category: .app)
-                    self.activateExistingInstance()
-                    self.requestImmediateTermination(skipQuitConfirmation: true)
-                    return
-                }
-            }
-
-            self.finishApplicationLaunch()
-        }
+        finishApplicationLaunch()
     }
 
     private func finishApplicationLaunch() {
@@ -996,6 +943,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             bypassQuitConfirmationPromptOnce = true
         }
         NSApp.terminate(nil)
+    }
+
+    private func exitDuplicatePrelaunchProcess() -> Never {
+        // Duplicate-prelaunch exits should not wait on normal AppKit termination flushes.
+        Darwin.exit(EXIT_SUCCESS)
     }
 
     private func terminationPreferenceForCurrentRequest() -> QuitTerminationPreference {
@@ -2132,6 +2084,30 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             )
         }
 
+        return finalizeSingleInstanceLockAcquisition(result, reason: reason)
+    }
+
+    private func acquireSingleInstanceLockForFreshLaunch() -> SingleInstanceLockRetryResult {
+        let result: SingleInstanceLockRetryResult
+        switch SingleInstanceLock.acquire(
+            atPath: Self.singleInstanceLockPath,
+            existingDescriptor: singleInstanceLockFileDescriptor
+        ) {
+        case .alreadyHeld(let descriptor), .acquired(let descriptor):
+            result = .acquired(descriptor: descriptor, attempts: 1)
+        case .heldByAnotherProcess:
+            result = .failedHeldByAnotherProcess(attempts: 1)
+        case .error(let code):
+            result = .failedError(code: code, attempts: 1)
+        }
+
+        return finalizeSingleInstanceLockAcquisition(result, reason: "launch")
+    }
+
+    private func finalizeSingleInstanceLockAcquisition(
+        _ result: SingleInstanceLockRetryResult,
+        reason: String
+    ) -> SingleInstanceLockRetryResult {
         switch result {
         case .acquired(let descriptor, let attempts):
             singleInstanceLockFileDescriptor = descriptor
@@ -2166,30 +2142,96 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         SingleInstanceLock.release(descriptor: &singleInstanceLockFileDescriptor)
     }
 
-    static func freshLaunchAction(
-        hasSingleInstanceLock: Bool,
+    static func launchGateAction(
+        mode: LaunchMode,
+        lockResult: SingleInstanceLockRetryResult,
         matchingRunningAppDetected: Bool
-    ) -> FreshLaunchAction {
-        guard hasSingleInstanceLock else {
-            return .activateExistingInstance
-        }
+    ) -> LaunchGateAction {
+        switch lockResult {
+        case .acquired:
+            if mode == .fresh, matchingRunningAppDetected {
+                return .continueLaunchIgnoringStaleRunningApp
+            }
+            return .continueLaunch
 
-        if matchingRunningAppDetected {
-            return .continueLaunchIgnoringStaleRunningApp
-        }
+        case .failedHeldByAnotherProcess:
+            return .activateExistingInstanceAndExitDuplicate
 
-        return .continueLaunch
+        case .failedError:
+            if mode == .relaunch {
+                return .continueLaunch
+            }
+            return matchingRunningAppDetected ? .activateExistingInstanceAndExitDuplicate : .continueLaunch
+        }
     }
 
-    static func launchActionAfterLockError(
-        isRelaunch: Bool,
-        matchingRunningAppDetected: Bool
-    ) -> SingleInstanceLockErrorAction {
-        if isRelaunch {
-            return .continueLaunch
+    private func handleSingleInstanceLaunchDecision(
+        mode: LaunchMode,
+        lockResult: SingleInstanceLockRetryResult
+    ) -> Bool {
+        let matchingRunningAppDetected: Bool
+        switch lockResult {
+        case .acquired, .failedError:
+            matchingRunningAppDetected = mode == .fresh ? isAnotherInstanceRunning() : false
+        case .failedHeldByAnotherProcess:
+            matchingRunningAppDetected = false
         }
 
-        return matchingRunningAppDetected ? .activateExistingInstance : .continueLaunch
+        let action = Self.launchGateAction(
+            mode: mode,
+            lockResult: lockResult,
+            matchingRunningAppDetected: matchingRunningAppDetected
+        )
+
+        switch action {
+        case .continueLaunch:
+            if mode == .relaunch, case .failedError = lockResult {
+                Log.warning(
+                    "[AppDelegate] Continuing relaunch after single-instance lock error because relaunch handoff is authoritative.",
+                    category: .app
+                )
+            } else if mode == .fresh, case .failedError = lockResult {
+                Log.warning(
+                    "[AppDelegate] Continuing launch after single-instance lock error because no matching running instance was detected.",
+                    category: .app
+                )
+            }
+            return true
+
+        case .continueLaunchIgnoringStaleRunningApp:
+            Log.warning(
+                "[AppDelegate] Matching running application detected after acquiring the single-instance lock; continuing launch because the lock is authoritative and the other instance is likely terminating.",
+                category: .app
+            )
+            return true
+
+        case .activateExistingInstanceAndExitDuplicate:
+            switch (mode, lockResult) {
+            case (.relaunch, .failedHeldByAnotherProcess):
+                Log.warning(
+                    "[AppDelegate] Relaunch could not reacquire the single-instance lock after handoff window; activating existing instance and exiting duplicate prelaunch.",
+                    category: .app
+                )
+
+            case (.fresh, .failedHeldByAnotherProcess):
+                Log.info(
+                    "[AppDelegate] Could not acquire the single-instance lock for launch; activating existing instance if available and exiting duplicate prelaunch.",
+                    category: .app
+                )
+
+            case (.fresh, .failedError):
+                Log.warning(
+                    "[AppDelegate] Single-instance lock failed during launch and a matching running instance was detected; activating existing instance and exiting duplicate prelaunch.",
+                    category: .app
+                )
+
+            default:
+                break
+            }
+
+            activateExistingInstance()
+            exitDuplicatePrelaunchProcess()
+        }
     }
 
     private func lockFileInstancePID() -> pid_t? {

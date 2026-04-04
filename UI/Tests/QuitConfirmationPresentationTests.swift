@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import XCTest
 @testable import Retrace
 
@@ -57,48 +58,64 @@ final class QuitConfirmationPresentationTests: XCTestCase {
 
     func testFreshLaunchContinuesWhenCurrentProcessOwnsLockEvenIfMatchingRunningAppStillExists() {
         XCTAssertEqual(
-            AppDelegate.freshLaunchAction(
-                hasSingleInstanceLock: true,
+            AppDelegate.launchGateAction(
+                mode: .fresh,
+                lockResult: .acquired(descriptor: 42, attempts: 1),
                 matchingRunningAppDetected: true
             ),
             .continueLaunchIgnoringStaleRunningApp
         )
     }
 
-    func testFreshLaunchActivatesExistingInstanceWhenLockCannotBeAcquired() {
+    func testFreshLaunchActivatesExistingInstanceWhenLockIsHeldByAnotherProcess() {
         XCTAssertEqual(
-            AppDelegate.freshLaunchAction(
-                hasSingleInstanceLock: false,
-                matchingRunningAppDetected: true
+            AppDelegate.launchGateAction(
+                mode: .fresh,
+                lockResult: .failedHeldByAnotherProcess(attempts: 1),
+                matchingRunningAppDetected: false
             ),
-            .activateExistingInstance
+            .activateExistingInstanceAndExitDuplicate
         )
     }
 
-    func testLaunchAfterLockErrorContinuesForRelaunch() {
+    func testRelaunchContinuesAfterLockError() {
         XCTAssertEqual(
-            AppDelegate.launchActionAfterLockError(
-                isRelaunch: true,
+            AppDelegate.launchGateAction(
+                mode: .relaunch,
+                lockResult: .failedError(code: EIO, attempts: 30),
                 matchingRunningAppDetected: true
             ),
             .continueLaunch
         )
     }
 
-    func testLaunchAfterLockErrorActivatesExistingInstanceForFreshLaunchWhenMatchExists() {
+    func testRelaunchActivatesExistingInstanceWhenLockIsHeldByAnotherProcess() {
         XCTAssertEqual(
-            AppDelegate.launchActionAfterLockError(
-                isRelaunch: false,
-                matchingRunningAppDetected: true
+            AppDelegate.launchGateAction(
+                mode: .relaunch,
+                lockResult: .failedHeldByAnotherProcess(attempts: 30),
+                matchingRunningAppDetected: false
             ),
-            .activateExistingInstance
+            .activateExistingInstanceAndExitDuplicate
         )
     }
 
-    func testLaunchAfterLockErrorContinuesFreshLaunchWhenNoMatchExists() {
+    func testFreshLaunchActivatesExistingInstanceWhenLockErrorOccursAndMatchExists() {
         XCTAssertEqual(
-            AppDelegate.launchActionAfterLockError(
-                isRelaunch: false,
+            AppDelegate.launchGateAction(
+                mode: .fresh,
+                lockResult: .failedError(code: EIO, attempts: 1),
+                matchingRunningAppDetected: true
+            ),
+            .activateExistingInstanceAndExitDuplicate
+        )
+    }
+
+    func testFreshLaunchContinuesWhenLockErrorOccursWithoutMatch() {
+        XCTAssertEqual(
+            AppDelegate.launchGateAction(
+                mode: .fresh,
+                lockResult: .failedError(code: EIO, attempts: 1),
                 matchingRunningAppDetected: false
             ),
             .continueLaunch
