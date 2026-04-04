@@ -1,5 +1,7 @@
 import AVFoundation
+import CoreGraphics
 import CoreMedia
+import CoreVideo
 import Foundation
 import VideoToolbox
 import Shared
@@ -408,6 +410,7 @@ public actor HEVCEncoder {
             AVVideoCodecKey: codecType,
             AVVideoWidthKey: width,
             AVVideoHeightKey: height,
+            AVVideoColorPropertiesKey: Self.screenCaptureOutputColorProperties(),
             AVVideoCompressionPropertiesKey: compressionProperties
         ]
 
@@ -516,6 +519,8 @@ public actor HEVCEncoder {
             }
             try await Task.sleep(for: .nanoseconds(Int64(1_000_000)), clock: .continuous) // 1ms
         }
+
+        Self.applyScreenCaptureColorMetadata(to: pixelBuffer)
 
         guard adaptor.append(pixelBuffer, withPresentationTime: timestamp) else {
             Log.error("[HEVCEncoder] adaptor.append() failed at frameCount=\(frameCount), timestamp=\(timestamp.seconds)s, writerStatus=\(assetWriter?.status.rawValue ?? -1), outputURL=\(outputURL?.lastPathComponent ?? "nil")", category: .storage)
@@ -672,6 +677,50 @@ public actor HEVCEncoder {
 }
 
 private extension HEVCEncoder {
+    static func screenCaptureOutputColorProperties() -> [String: String] {
+        let transferFunction: String
+        if #available(macOS 15.0, *) {
+            transferFunction = AVVideoTransferFunction_IEC_sRGB
+        } else {
+            transferFunction = AVVideoTransferFunction_ITU_R_709_2
+        }
+
+        return [
+            AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+            AVVideoTransferFunctionKey: transferFunction,
+            AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2,
+        ]
+    }
+
+    static func applyScreenCaptureColorMetadata(to pixelBuffer: CVPixelBuffer) {
+        CVBufferSetAttachment(
+            pixelBuffer,
+            kCVImageBufferColorPrimariesKey,
+            kCVImageBufferColorPrimaries_ITU_R_709_2,
+            .shouldPropagate
+        )
+        CVBufferSetAttachment(
+            pixelBuffer,
+            kCVImageBufferTransferFunctionKey,
+            kCVImageBufferTransferFunction_sRGB,
+            .shouldPropagate
+        )
+        CVBufferSetAttachment(
+            pixelBuffer,
+            kCVImageBufferYCbCrMatrixKey,
+            kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+            .shouldPropagate
+        )
+        if let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) {
+            CVBufferSetAttachment(
+                pixelBuffer,
+                kCVImageBufferCGColorSpaceKey,
+                colorSpace,
+                .shouldPropagate
+            )
+        }
+    }
+
     static func baseScreenContentBitsPerPixelPerFrame(quality: Double) -> Double {
         interpolate(
             clampedQuality: quality,
