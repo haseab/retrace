@@ -23,7 +23,7 @@ public struct SimpleTimelineView: View {
     @State private var commentSubmenuVisibility: Double = 0
     @State private var isSearchHighlightControlsHintDismissed = false
     @State private var browserURLDebugWindowPosition = CGSize(width: 320, height: 16)
-    @FocusState private var isInFrameSearchFieldFocused: Bool
+    @State private var isInFrameSearchFieldFocused = false
     @AppStorage("showFrameIDs", store: timelineSettingsStore) private var showFrameIDs = SettingsDefaults.showFrameIDs
 
     let coordinator: AppCoordinator
@@ -1066,24 +1066,29 @@ public struct SimpleTimelineView: View {
                 .font(.system(size: 13 * scale, weight: .semibold))
                 .foregroundColor(.white.opacity(0.72))
 
-            TextField("Search this frame", text: inFrameSearchBinding)
-                .textFieldStyle(.plain)
-                .font(.system(size: 14 * scale, weight: .medium))
-                .foregroundColor(.white)
-                .focused($isInFrameSearchFieldFocused)
-                .submitLabel(.search)
-
-            if !viewModel.inFrameSearchQuery.isEmpty {
-                Button {
-                    viewModel.setInFrameSearchQuery("")
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 12 * scale, weight: .medium))
-                        .foregroundColor(.white.opacity(0.6))
+            FocusableTextInput(
+                text: inFrameSearchBinding,
+                placeholder: "Search this frame",
+                font: .systemFont(ofSize: 14 * scale, weight: .medium),
+                isFocused: { isInFrameSearchFieldFocused },
+                setFocused: { isFocused in
+                    isInFrameSearchFieldFocused = isFocused
                 }
-                .buttonStyle(.plain)
-                .help("Clear search")
+            )
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Button {
+                viewModel.setInFrameSearchQuery("")
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 12 * scale, weight: .medium))
+                    .foregroundColor(.white.opacity(0.6))
             }
+            .buttonStyle(.plain)
+            .disabled(viewModel.inFrameSearchQuery.isEmpty)
+            .opacity(viewModel.inFrameSearchQuery.isEmpty ? 0 : 1)
+            .allowsHitTesting(!viewModel.inFrameSearchQuery.isEmpty)
+            .help("Clear search")
 
             Button {
                 viewModel.closeInFrameSearch(clearQuery: true)
@@ -10361,7 +10366,7 @@ struct CommentMarkdownEditor: NSViewRepresentable {
     }
 }
 
-final class CommentMarkdownTextView: NSTextView {
+class CommentMarkdownTextView: NSTextView {
     var commandHandler: ((CommentEditorCommand) -> Void)?
     var submitHandler: (() -> Void)?
     var requestLinkHandler: (() -> Void)?
@@ -10387,6 +10392,18 @@ final class CommentMarkdownTextView: NSTextView {
         }
 
         switch key {
+        case "a":
+            selectAll(nil)
+            return true
+        case "c":
+            copy(nil)
+            return true
+        case "x":
+            cut(nil)
+            return true
+        case "v":
+            paste(nil)
+            return true
         case "b":
             commandHandler?(.bold)
             return true

@@ -396,6 +396,20 @@ public class TimelineWindowController: NSObject {
         return keyCode == 13 || key == "w"
     }
 
+    nonisolated static func shouldDeferCommandAToTextInput(
+        isTextFieldActive: Bool,
+        isSearchOverlayVisible: Bool,
+        isFilterPanelVisible: Bool,
+        isDateSearchActive: Bool,
+        isCommentSubmenuVisible: Bool
+    ) -> Bool {
+        isTextFieldActive ||
+            isSearchOverlayVisible ||
+            isFilterPanelVisible ||
+            isDateSearchActive ||
+            isCommentSubmenuVisible
+    }
+
     nonisolated static func shouldNavigateTimelineBackward(
         keyCode: UInt16,
         charactersIgnoringModifiers: String?,
@@ -2772,13 +2786,16 @@ extension TimelineWindowController {
                 }
 
                 // Cmd+A to select all (handle before system can intercept)
-                // But let it pass through when a dialog with text input is active
+                // But let active text inputs and input-owning overlays keep standard select-all behavior.
                 if event.keyCode == 0 && modifiers == [.command] {
-                    if let viewModel = self?.timelineViewModel,
-                       (viewModel.isSearchOverlayVisible ||
-                        viewModel.isFilterPanelVisible ||
-                        viewModel.isDateSearchActive ||
-                        viewModel.showCommentSubmenu) {
+                    let shouldDeferToTextInput = Self.shouldDeferCommandAToTextInput(
+                        isTextFieldActive: isTextFieldActive,
+                        isSearchOverlayVisible: self?.timelineViewModel?.isSearchOverlayVisible ?? false,
+                        isFilterPanelVisible: self?.timelineViewModel?.isFilterPanelVisible ?? false,
+                        isDateSearchActive: self?.timelineViewModel?.isDateSearchActive ?? false,
+                        isCommentSubmenuVisible: self?.timelineViewModel?.showCommentSubmenu ?? false
+                    )
+                    if shouldDeferToTextInput {
                         return event // Let the text field handle Cmd+A
                     }
                     _ = self?.handleKeyEvent(event)
@@ -3224,16 +3241,27 @@ extension TimelineWindowController {
         }
 
         // Cmd+A to select all text on the frame
-        // Skip when a dialog with text input is active - let the text field handle it
+        // Skip when text editing owns the shortcut.
         if event.keyCode == 0 && modifiers == [.command] { // A key with Command
-            if let viewModel = timelineViewModel {
-                // Don't intercept when dialogs with text inputs are open
-                if viewModel.isSearchOverlayVisible ||
-                    viewModel.isFilterPanelVisible ||
-                    viewModel.isDateSearchActive ||
-                    viewModel.showCommentSubmenu {
-                    return false // Let the text field handle Cmd+A
+            let isTextFieldActive: Bool = {
+                guard let window,
+                      let firstResponder = window.firstResponder else {
+                    return false
                 }
+                return firstResponder is NSTextView || firstResponder is NSTextField
+            }()
+
+            if Self.shouldDeferCommandAToTextInput(
+                isTextFieldActive: isTextFieldActive,
+                isSearchOverlayVisible: timelineViewModel?.isSearchOverlayVisible ?? false,
+                isFilterPanelVisible: timelineViewModel?.isFilterPanelVisible ?? false,
+                isDateSearchActive: timelineViewModel?.isDateSearchActive ?? false,
+                isCommentSubmenuVisible: timelineViewModel?.showCommentSubmenu ?? false
+            ) {
+                return false // Let the text field handle Cmd+A
+            }
+
+            if let viewModel = timelineViewModel {
                 recordShortcut("cmd+a")
                 viewModel.selectAllText()
                 return true

@@ -6,10 +6,16 @@ final class FocusableTextField: NSTextField {
 
     var onCancelCallback: (() -> Void)?
     var onClickCallback: (() -> Void)?
+    var onWindowAttachedCallback: (() -> Void)?
 
     override func mouseDown(with event: NSEvent) {
         onClickCallback?()
         super.mouseDown(with: event)
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        onWindowAttachedCallback?()
     }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
@@ -133,6 +139,12 @@ struct FocusableTextInput: NSViewRepresentable {
         textField.onClickCallback = {
             setFocused?(true)
             onClick?()
+        }
+        textField.onWindowAttachedCallback = { [weak textField] in
+            guard let textField else { return }
+            DispatchQueue.main.async {
+                syncFocusIfNeeded(for: textField)
+            }
         }
     }
 
