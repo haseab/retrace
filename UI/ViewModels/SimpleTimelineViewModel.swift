@@ -841,13 +841,16 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Temporary in-memory overlays for revealed redacted OCR nodes (keyed by node ID).
     @Published public var revealedRedactedNodePatches: [Int: NSImage] = [:]
+    @Published public var hidingRedactedNodePatches: [Int: NSImage] = [:]
     private var revealedRedactedFrameID: FrameID?
     @Published public var activeRedactionTooltipNodeID: Int?
+    private var pendingRedactedNodeHideRemovalTasks: [Int: Task<Void, Never>] = [:]
+    private static let phraseLevelRedactionHideAnimationDuration: Duration = .milliseconds(520)
 
     enum PhraseLevelRedactionTooltipState: Equatable {
         case queued
         case reveal
-        case copyText
+        case hide
 
         var title: String {
             switch self {
@@ -855,8 +858,8 @@ public class SimpleTimelineViewModel: ObservableObject {
                 return "Queued..."
             case .reveal:
                 return "Reveal"
-            case .copyText:
-                return "Copy text"
+            case .hide:
+                return "Hide"
             }
         }
 
@@ -866,8 +869,8 @@ public class SimpleTimelineViewModel: ObservableObject {
                 return "Queued..."
             case .reveal:
                 return "Reveal"
-            case .copyText:
-                return "Copy text"
+            case .hide:
+                return "Hide"
             }
         }
 
@@ -875,7 +878,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             switch self {
             case .queued:
                 return false
-            case .reveal, .copyText:
+            case .reveal, .hide:
                 return true
             }
         }
@@ -10218,7 +10221,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         case 5, 6:
             return .queued
         case 2, 7:
-            return isRevealed ? .copyText : .reveal
+            return isRevealed ? .hide : .reveal
         default:
             return nil
         }
@@ -12400,6 +12403,11 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     public func clearTemporaryRedactionReveals() {
+        for task in pendingRedactedNodeHideRemovalTasks.values {
+            task.cancel()
+        }
+        pendingRedactedNodeHideRemovalTasks.removeAll()
+
         let revealedNodeIDs = Set(revealedRedactedNodePatches.keys)
         if !revealedNodeIDs.isEmpty {
             var updatedNodes = ocrNodes
@@ -12418,6 +12426,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
 
         revealedRedactedNodePatches.removeAll()
+        hidingRedactedNodePatches.removeAll()
         revealedRedactedFrameID = nil
         dismissRedactionTooltip()
     }
@@ -12485,31 +12494,26 @@ public class SimpleTimelineViewModel: ObservableObject {
         String(repeating: " ", count: node.text.count)
     }
 
-    func copyablePhraseLevelRedactionText(for node: OCRNodeWithText) -> String? {
-        let currentNode = ocrNodes.first(where: { $0.id == node.id }) ?? node
-        let visibleText = currentNode.text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !visibleText.isEmpty, visibleText != currentNode.encryptedText {
-            return visibleText
-        }
-
-        guard let secret = ReversibleOCRScrambler.currentAppWideSecret() else {
-            return nil
-        }
-
-        return decryptedOCRText(for: currentNode, secret: secret)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+    private func cancelPendingRedactedNodeHideRemoval(for nodeID: Int) {
+        pendingRedactedNodeHideRemovalTasks.removeValue(forKey: nodeID)?.cancel()
     }
 
-    public func copyPhraseLevelRedactionText(for node: OCRNodeWithText) {
-        guard let text = copyablePhraseLevelRedactionText(for: node), !text.isEmpty else {
-            showToast("Text unavailable", icon: "exclamationmark.circle.fill")
-            return
-        }
+    private func scheduleRedactedNodeHideRemoval(for nodeID: Int) {
+        cancelPendingRedactedNodeHideRemoval(for: nodeID)
+        pendingRedactedNodeHideRemovalTasks[nodeID] = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(
+                    for: Self.phraseLevelRedactionHideAnimationDuration,
+                    clock: .continuous
+                )
+            } catch {
+                return
+            }
 
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(text, forType: .string)
-        showToast("Text copied", icon: "doc.on.doc.fill")
-        DashboardViewModel.recordTextCopy(coordinator: coordinator, text: text)
+            guard let self else { return }
+            self.hidingRedactedNodePatches.removeValue(forKey: nodeID)
+            self.pendingRedactedNodeHideRemovalTasks.removeValue(forKey: nodeID)
+        }
     }
 
     public func togglePhraseLevelRedactionReveal(for node: OCRNodeWithText) {
@@ -12530,8 +12534,9 @@ public class SimpleTimelineViewModel: ObservableObject {
             return
         }
 
-        if revealedRedactedNodePatches[node.id] != nil {
-            revealedRedactedNodePatches.removeValue(forKey: node.id)
+        if let revealedPatch = revealedRedactedNodePatches.removeValue(forKey: node.id) {
+            hidingRedactedNodePatches[node.id] = revealedPatch
+            scheduleRedactedNodeHideRemoval(for: node.id)
             if node.encryptedText != nil {
                 updateOCRNode(nodeID: node.id) { currentNode in
                     currentNode.replacingText(maskedOCRText(for: currentNode))
@@ -12558,6 +12563,8 @@ public class SimpleTimelineViewModel: ObservableObject {
 
                 await MainActor.run {
                     guard self.currentTimelineFrame?.frame.id == frame.id else { return }
+                    self.cancelPendingRedactedNodeHideRemoval(for: node.id)
+                    self.hidingRedactedNodePatches.removeValue(forKey: node.id)
                     self.revealedRedactedFrameID = frame.id
                     self.revealedRedactedNodePatches[node.id] = patch
                     if let revealedText {

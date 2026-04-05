@@ -2369,11 +2369,8 @@ struct FrameWithURLOverlay<Content: View>: View {
                         viewModel: viewModel,
                         entries: redactionContextMenuEntries,
                         containerSize: geometry.size,
-                        onReveal: { node in
+                        onToggleReveal: { node in
                             viewModel.togglePhraseLevelRedactionReveal(for: node)
-                        },
-                        onCopyText: { node in
-                            viewModel.copyPhraseLevelRedactionText(for: node)
                         }
                     )
                 }
@@ -2848,8 +2845,11 @@ struct FrameZoomIndicator: View {
 private struct DemystifiedRevealPatchView: View {
     let patch: NSImage
     let size: CGSize
+    let isVisible: Bool
 
     @State private var revealProgress: CGFloat = 0
+
+    private static let revealAnimation = Animation.spring(response: 0.46, dampingFraction: 0.84)
 
     var body: some View {
         ZStack {
@@ -2880,9 +2880,14 @@ private struct DemystifiedRevealPatchView: View {
         .compositingGroup()
         .clipShape(RoundedRectangle(cornerRadius: 4))
         .onAppear {
-            revealProgress = 0
-            withAnimation(.spring(response: 0.46, dampingFraction: 0.84)) {
-                revealProgress = 1
+            revealProgress = isVisible ? 0 : 1
+            withAnimation(Self.revealAnimation) {
+                revealProgress = isVisible ? 1 : 0
+            }
+        }
+        .onChange(of: isVisible) { visible in
+            withAnimation(Self.revealAnimation) {
+                revealProgress = visible ? 1 : 0
             }
         }
     }
@@ -2907,11 +2912,14 @@ struct RedactedNodeRevealOverlay: View {
                         for: processingStatus,
                         isTooltipActive: isTooltipActive
                     )
+                    let patch = viewModel.revealedRedactedNodePatches[node.id]
+                        ?? viewModel.hidingRedactedNodePatches[node.id]
                     ZStack {
-                        if let patch = viewModel.revealedRedactedNodePatches[node.id] {
+                        if let patch {
                             DemystifiedRevealPatchView(
                                 patch: patch,
-                                size: CGSize(width: rect.width, height: rect.height)
+                                size: CGSize(width: rect.width, height: rect.height),
+                                isVisible: viewModel.revealedRedactedNodePatches[node.id] != nil
                             )
                                 .frame(width: rect.width, height: rect.height)
                         }
@@ -2975,12 +2983,15 @@ struct ZoomedRedactedNodeRevealOverlay: View {
                         for: processingStatus,
                         isTooltipActive: isTooltipActive
                     )
+                    let patch = viewModel.revealedRedactedNodePatches[node.id]
+                        ?? viewModel.hidingRedactedNodePatches[node.id]
 
                     ZStack {
-                        if let patch = viewModel.revealedRedactedNodePatches[node.id] {
+                        if let patch {
                             DemystifiedRevealPatchView(
                                 patch: patch,
-                                size: CGSize(width: rect.width, height: rect.height)
+                                size: CGSize(width: rect.width, height: rect.height),
+                                isVisible: viewModel.revealedRedactedNodePatches[node.id] != nil
                             )
                                 .frame(width: rect.width, height: rect.height)
                         }
@@ -3052,8 +3063,7 @@ struct RedactionTooltipOverlay: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel
     let entries: [RedactedNodeContextMenuEntry]
     let containerSize: CGSize
-    let onReveal: (OCRNodeWithText) -> Void
-    let onCopyText: (OCRNodeWithText) -> Void
+    let onToggleReveal: (OCRNodeWithText) -> Void
     @State private var escapeMonitor: Any?
     @State private var hoveredNodeID: Int?
 
@@ -3149,10 +3159,8 @@ struct RedactionTooltipOverlay: View {
         switch state {
         case .queued:
             break
-        case .reveal:
-            onReveal(node)
-        case .copyText:
-            onCopyText(node)
+        case .reveal, .hide:
+            onToggleReveal(node)
         }
     }
 
