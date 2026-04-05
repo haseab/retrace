@@ -161,6 +161,12 @@ enum FeedbackRecentMetricSupport {
             return "Capture interval updated"
         case .videoQualityUpdated:
             return "Video quality updated"
+        case .unexpectedRecordingStopAction:
+            return "Unexpected recording stop"
+        case .debugCaptureInterruptionTriggered:
+            return "Debug capture interruption"
+        case .debugEncodingInterruptionTriggered:
+            return "Debug encoding interruption"
         case .dockIconVisibilityToggle:
             return "Dock icon visibility toggled"
         case .masterKeyFlow:
@@ -225,6 +231,22 @@ enum FeedbackRecentMetricSupport {
             return allowlistedDetails(
                 from: payload,
                 keys: ["action", "reportAgeSeconds"]
+            )
+        case .unexpectedRecordingStopAction:
+            return allowlistedDetails(
+                from: payload,
+                keys: [
+                    "action",
+                    "reason",
+                    "captureFramesObserved",
+                    "deduplicatedFrames",
+                    "acceptedFrameCount",
+                    "readableFrameCount",
+                    "pendingUnreadableFrameCount",
+                    "activeWriterCount",
+                    "stalledWriterPendingAgeSeconds",
+                    "stopAgeSeconds"
+                ]
             )
         case .phraseLevelRedactionQueuedHover:
             return allowlistedDetails(

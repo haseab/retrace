@@ -121,6 +121,7 @@ public class DashboardViewModel: ObservableObject {
     @Published var storageHealthBanner: StorageHealthBannerState?
     @Published var recentCrashReport: DashboardCrashReportSummary?
     @Published var recentWALFailureCrash: WALFailureCrashReportSummary?
+    @Published var unexpectedRecordingStop: UnexpectedRecordingStopState?
 
     // Track user dismissals — re-nag after 30 minutes
     private var accessibilityDismissedUntil: Date?
@@ -155,6 +156,7 @@ public class DashboardViewModel: ObservableObject {
     private var lastTrackedCrashBannerIdentifier: String?
     private var lastTrackedWALFailureBannerFileName: String?
     private var lastTrackedStorageHealthBannerSignature: String?
+    private var lastTrackedUnexpectedRecordingStopSignature: String?
     private var isAutoRefreshInFlight = false
     private static let defaultAppUsageRangeDays = 7
     public nonisolated static let maxAppUsageRangeDays = 31
@@ -175,6 +177,7 @@ public class DashboardViewModel: ObservableObject {
         setupAutoRefresh()
         setupDataSourceObserver()
         setupStorageHealthObserver()
+        setupUnexpectedRecordingStopObserver()
         // Check permissions immediately on init
         checkPermissions()
     }
@@ -208,6 +211,21 @@ public class DashboardViewModel: ObservableObject {
             .sink { [weak self] notification in
                 Task { @MainActor [weak self] in
                     self?.handleStorageHealthNotification(notification, severity: .critical)
+                }
+            }
+            .store(in: &cancellables)
+    }
+
+    private func setupUnexpectedRecordingStopObserver() {
+        NotificationCenter.default.publisher(for: RecordingUnexpectedStopNotification.didStop)
+            .sink { [weak self] notification in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    if let state = notification.object as? UnexpectedRecordingStopState {
+                        self.presentUnexpectedRecordingStop(state)
+                    } else {
+                        await self.refreshUnexpectedRecordingStopState()
+                    }
                 }
             }
             .store(in: &cancellables)
@@ -413,6 +431,20 @@ public class DashboardViewModel: ObservableObject {
     public func recordRecentWALFailureCrashDetailsOpened() {
         guard let report = recentWALFailureCrash else { return }
         recordWALFailureBannerAction("details_opened", report: report)
+    }
+
+    public func dismissUnexpectedRecordingStop() {
+        guard let state = unexpectedRecordingStop else { return }
+        recordUnexpectedRecordingStopAction("dismissed", state: state)
+        unexpectedRecordingStop = nil
+        Task {
+            await coordinator.clearUnexpectedRecordingStopState()
+        }
+    }
+
+    public func recordUnexpectedRecordingStopFeedbackOpened() {
+        guard let state = unexpectedRecordingStop else { return }
+        recordUnexpectedRecordingStopAction("submit_bug_report_clicked", state: state)
     }
 
     private func handleStorageHealthNotification(
@@ -713,6 +745,39 @@ public class DashboardViewModel: ObservableObject {
         """
     }
 
+    nonisolated static func makeUnexpectedRecordingStopFeedbackDescription(
+        for state: UnexpectedRecordingStopState,
+        now _: Date = Date()
+    ) -> String {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+
+        return """
+        Retrace Recording Stopped Unexpectedly
+
+        Recording stopped at \(formatter.string(from: state.stoppedAt)).
+        Reason: \(state.reason.description)
+        Summary: \(state.summary)
+
+        Enter any other relevant context here:
+        """
+    }
+
+    private func presentUnexpectedRecordingStop(
+        _ state: UnexpectedRecordingStopState?,
+        now: Date = Date()
+    ) {
+        unexpectedRecordingStop = state
+
+        guard let state, state.signature != lastTrackedUnexpectedRecordingStopSignature else {
+            return
+        }
+
+        lastTrackedUnexpectedRecordingStopSignature = state.signature
+        recordUnexpectedRecordingStopAction("banner_shown", state: state, now: now)
+    }
+
     nonisolated private static func parseWatchdogCrashTimestamp(from fileName: String) -> Date? {
         let prefix = "retrace-emergency-watchdog_auto_quit-"
         let suffix = ".txt"
@@ -771,6 +836,11 @@ public class DashboardViewModel: ObservableObject {
 
         return acknowledgedIdentifiers.contains(report.acknowledgmentIdentifier)
             || acknowledgedIdentifiers.contains(report.fileName)
+    }
+
+    private func refreshUnexpectedRecordingStopState(now: Date = Date()) async {
+        let state = await coordinator.getUnexpectedRecordingStopState()
+        presentUnexpectedRecordingStop(state, now: now)
     }
 
     private func refreshRecentCrashReportState(now: Date = Date()) async {
@@ -1002,6 +1072,25 @@ public class DashboardViewModel: ObservableObject {
         Self.recordMetric(
             coordinator: coordinator,
             type: .walFailureBannerAction,
+            metadata: metadata
+        )
+    }
+
+    private func recordUnexpectedRecordingStopAction(
+        _ action: String,
+        state: UnexpectedRecordingStopState,
+        now: Date = Date()
+    ) {
+        let metadata = Self.jsonMetadata([
+            "action": action,
+            "reason": state.reason.rawValue,
+            "stopAgeSeconds": max(0, Int(now.timeIntervalSince(state.stoppedAt))),
+            "pendingUnreadableFrameCount": state.pendingUnreadableFrameCount,
+            "activeWriterCount": state.activeWriterCount
+        ])
+        Self.recordMetric(
+            coordinator: coordinator,
+            type: .unexpectedRecordingStopAction,
             metadata: metadata
         )
     }
@@ -1398,6 +1487,7 @@ public class DashboardViewModel: ObservableObject {
         // Update recording status
         updateRecordingStatus()
         updatePauseStatus()
+        await refreshUnexpectedRecordingStopState()
         await refreshRecentCrashReportState()
         await refreshRecentWALFailureCrashState()
 
@@ -2117,6 +2207,16 @@ public class DashboardViewModel: ObservableObject {
     /// Record a debug-only watchdog hang trigger from the dashboard.
     public static func recordDebugWatchdogHangTriggered(coordinator: AppCoordinator) {
         recordMetric(coordinator: coordinator, type: .debugWatchdogHangTriggered)
+    }
+
+    /// Record a debug-only capture interruption trigger from the dashboard.
+    public static func recordDebugCaptureInterruptionTriggered(coordinator: AppCoordinator) {
+        recordMetric(coordinator: coordinator, type: .debugCaptureInterruptionTriggered)
+    }
+
+    /// Record a debug-only encoding interruption trigger from the dashboard.
+    public static func recordDebugEncodingInterruptionTriggered(coordinator: AppCoordinator) {
+        recordMetric(coordinator: coordinator, type: .debugEncodingInterruptionTriggered)
     }
 
     /// Record a debug-only forced termination trigger from the dashboard.

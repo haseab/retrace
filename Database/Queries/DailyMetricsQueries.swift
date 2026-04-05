@@ -108,9 +108,12 @@ public enum DailyMetricsQueries {
         case feedbackReportExport = "feedback_report_export"  // metadata: JSON {outcome, source, feedbackType, includeLogs, includeScreenshot, exportedFileCount}
         case watchdogCrashBannerAction = "watchdog_crash_banner_action"  // metadata: JSON {action, fileName, reportAgeSeconds}
         case walFailureBannerAction = "wal_failure_banner_action"  // metadata: JSON {action, fileName, reportAgeSeconds}
+        case unexpectedRecordingStopAction = "unexpected_recording_stop_action"  // metadata: JSON {action, reason, ...}
         case storageHealthBannerAction = "storage_health_banner_action"  // metadata: JSON {action, severity, availableGB, shouldStop}
         case crashRecoveryApprovalBannerAction = "crash_recovery_approval_banner_action"  // metadata: JSON {action, status}
         case debugWatchdogHangTriggered = "debug_watchdog_hang_triggered"
+        case debugCaptureInterruptionTriggered = "debug_capture_interruption_triggered"
+        case debugEncodingInterruptionTriggered = "debug_encoding_interruption_triggered"
         case debugForcedTerminationTriggered = "debug_forced_termination_triggered"
         case debugOnboardingRelaunchTriggered = "debug_onboarding_relaunch_triggered"
         case developerSettingToggle = "developer_setting_toggle"  // metadata: JSON {source, settingKey, isEnabled}

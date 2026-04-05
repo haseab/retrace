@@ -15,6 +15,77 @@ public enum OCRPowerSettingsNotification {
     public static let didChange = Notification.Name("PowerSettingsDidChange")
 }
 
+public enum RecordingUnexpectedStopNotification {
+    public static let didStop = Notification.Name("RecordingUnexpectedStop")
+}
+
+public enum UnexpectedRecordingStopReason: String, Codable, Sendable {
+    case captureStopped = "capture_stopped"
+    case encoderMismatch = "encoder_mismatch"
+    case fileWriteFailed = "file_write_failed"
+    case unreadableWriterStalled = "unreadable_writer_stalled"
+
+    public var description: String {
+        switch self {
+        case .captureStopped:
+            return "Screen capture stopped unexpectedly."
+        case .encoderMismatch:
+            return "The video encoder stopped accepting frames."
+        case .fileWriteFailed:
+            return "Retrace failed to write a recording chunk to disk."
+        case .unreadableWriterStalled:
+            return "A new recording writer never became readable."
+        }
+    }
+}
+
+public struct UnexpectedRecordingStopState: Codable, Equatable, Sendable {
+    public let stoppedAt: Date
+    public let reason: UnexpectedRecordingStopReason
+    public let summary: String
+    public let captureFramesObserved: Int
+    public let deduplicatedFrames: Int
+    public let acceptedFrameCount: Int
+    public let readableFrameCount: Int
+    public let pendingUnreadableFrameCount: Int
+    public let activeWriterCount: Int
+    public let stalledWriterResolution: String?
+    public let stalledWriterVideoID: Int64?
+    public let stalledWriterPendingAgeSeconds: Int?
+
+    public init(
+        stoppedAt: Date,
+        reason: UnexpectedRecordingStopReason,
+        summary: String,
+        captureFramesObserved: Int,
+        deduplicatedFrames: Int,
+        acceptedFrameCount: Int,
+        readableFrameCount: Int,
+        pendingUnreadableFrameCount: Int,
+        activeWriterCount: Int,
+        stalledWriterResolution: String?,
+        stalledWriterVideoID: Int64?,
+        stalledWriterPendingAgeSeconds: Int?
+    ) {
+        self.stoppedAt = stoppedAt
+        self.reason = reason
+        self.summary = summary
+        self.captureFramesObserved = captureFramesObserved
+        self.deduplicatedFrames = deduplicatedFrames
+        self.acceptedFrameCount = acceptedFrameCount
+        self.readableFrameCount = readableFrameCount
+        self.pendingUnreadableFrameCount = pendingUnreadableFrameCount
+        self.activeWriterCount = activeWriterCount
+        self.stalledWriterResolution = stalledWriterResolution
+        self.stalledWriterVideoID = stalledWriterVideoID
+        self.stalledWriterPendingAgeSeconds = stalledWriterPendingAgeSeconds
+    }
+
+    public var signature: String {
+        "\(reason.rawValue)|\(Int64(stoppedAt.timeIntervalSince1970))|\(stalledWriterVideoID ?? -1)"
+    }
+}
+
 /// Snapshot of OCR power settings, used to apply settings immediately without
 /// relying on asynchronous UserDefaults propagation.
 public struct OCRPowerSettingsSnapshot: Sendable {
@@ -378,6 +449,29 @@ public actor AppCoordinator {
         let walDeltaBytes: Int64?
     }
 
+    struct UnexpectedRecordingStopWriterSnapshot: Equatable, Sendable {
+        let resolutionKey: String
+        let videoDBID: Int64
+        let frameCount: Int
+        let persistedReadableFrameCount: Int
+        let pendingUnreadableFrameCount: Int
+        let oldestPendingUnreadableAt: Date?
+    }
+
+    struct UnexpectedRecordingStopCounters: Equatable, Sendable {
+        var acceptedFrameCount: Int = 0
+        var readableFrameCount: Int = 0
+        var lastAcceptedFrameAt: Date?
+        var lastReadableFrameAt: Date?
+    }
+
+    struct PendingUnexpectedRecordingStop: Sendable {
+        let reason: UnexpectedRecordingStopReason
+        let summary: String
+        let counters: UnexpectedRecordingStopCounters
+        let writerSnapshots: [UnexpectedRecordingStopWriterSnapshot]
+    }
+
     // MARK: - Properties
 
     private nonisolated let services: ServiceContainer
@@ -443,6 +537,14 @@ public actor AppCoordinator {
     private static let timelineStillWriterBufferLimit = 4
 
     private let timelineStillDiskWriter: TimelineStillDiskWriter
+    private var unexpectedRecordingStopState: UnexpectedRecordingStopState?
+    private var hasLoadedUnexpectedRecordingStopState = false
+    private var unexpectedRecordingStopCounters = UnexpectedRecordingStopCounters()
+    #if DEBUG
+    private var debugInterruptEncodingOnNextAppend = false
+    #endif
+    private static let unexpectedRecordingStopUnreadableWriterThreshold: TimeInterval = 45
+    private static let unexpectedRecordingStopUnreadableWriterMinimumPendingFrames = 2
 
     // MARK: - Initialization
 
@@ -860,6 +962,7 @@ public actor AppCoordinator {
     // MARK: - Recording State Persistence
 
     private static let recordingStateKey = "shouldAutoStartRecording"
+    private static let unexpectedRecordingStopStateStorageKey = "unexpectedRecordingStopState"
     private static let phraseLevelRedactionEnabledKey = "phraseLevelRedactionEnabled"
     private static let abandonedMissingMasterKeyRewritePurpose = "redaction_missing_master_key_abandoned"
     /// Use a fixed suite name so it works regardless of how the app is launched (swift build vs .app bundle)
@@ -872,6 +975,113 @@ public actor AppCoordinator {
         Log.debug("[AppCoordinator] saveRecordingState(\(isRecording)) - saved to UserDefaults", category: .app)
     }
 
+    private func loadUnexpectedRecordingStopStateIfNeeded() {
+        guard !hasLoadedUnexpectedRecordingStopState else { return }
+        hasLoadedUnexpectedRecordingStopState = true
+
+        guard let data = Self.userDefaultsSuite.data(
+            forKey: Self.unexpectedRecordingStopStateStorageKey
+        ) else {
+            unexpectedRecordingStopState = nil
+            return
+        }
+
+        do {
+            unexpectedRecordingStopState = try JSONDecoder().decode(
+                UnexpectedRecordingStopState.self,
+                from: data
+            )
+        } catch {
+            unexpectedRecordingStopState = nil
+            Self.userDefaultsSuite.removeObject(
+                forKey: Self.unexpectedRecordingStopStateStorageKey
+            )
+            Self.userDefaultsSuite.synchronize()
+            Log.warning(
+                "[RECORDING-STOP] Failed to decode persisted unexpected-stop state: \(error.localizedDescription)",
+                category: .app
+            )
+        }
+    }
+
+    private func persistUnexpectedRecordingStopState(_ state: UnexpectedRecordingStopState?) {
+        hasLoadedUnexpectedRecordingStopState = true
+        unexpectedRecordingStopState = state
+
+        if let state {
+            do {
+                let data = try JSONEncoder().encode(state)
+                Self.userDefaultsSuite.set(
+                    data,
+                    forKey: Self.unexpectedRecordingStopStateStorageKey
+                )
+            } catch {
+                Log.warning(
+                    "[RECORDING-STOP] Failed to persist unexpected-stop state: \(error.localizedDescription)",
+                    category: .app
+                )
+            }
+        } else {
+            Self.userDefaultsSuite.removeObject(
+                forKey: Self.unexpectedRecordingStopStateStorageKey
+            )
+        }
+
+        Self.userDefaultsSuite.synchronize()
+    }
+
+    public func getUnexpectedRecordingStopState() -> UnexpectedRecordingStopState? {
+        loadUnexpectedRecordingStopStateIfNeeded()
+        return unexpectedRecordingStopState
+    }
+
+    public func clearUnexpectedRecordingStopState() {
+        persistUnexpectedRecordingStopState(nil)
+    }
+
+    #if DEBUG
+    public func debugInterruptCapturePipeline() async {
+        guard isRunning else {
+            Log.warning(
+                "[RECORDING-STOP][DEBUG] Ignored capture interruption request because recording is already off",
+                category: .app
+            )
+            return
+        }
+
+        Log.warning(
+            "[RECORDING-STOP][DEBUG] Interrupting capture underneath the coordinator to exercise unexpected-stop detection",
+            category: .app
+        )
+
+        do {
+            try await services.capture.stopCapture()
+        } catch {
+            Log.error(
+                "[RECORDING-STOP][DEBUG] Failed to interrupt capture for testing",
+                category: .app,
+                error: error
+            )
+        }
+    }
+
+    public func debugInterruptEncodingPipeline() {
+        guard isRunning else {
+            Log.warning(
+                "[RECORDING-STOP][DEBUG] Ignored encoder interruption request because recording is already off",
+                category: .app
+            )
+            return
+        }
+
+        debugInterruptEncodingOnNextAppend = true
+        Log.warning(
+            "[RECORDING-STOP][DEBUG] Armed encoder interruption for the next frame append to exercise writer failure handling",
+            category: .app
+        )
+    }
+    #endif
+
     /// Check if recording should auto-start based on previous state
     public nonisolated static func shouldAutoStartRecording() -> Bool {
         let value = userDefaultsSuite.bool(forKey: recordingStateKey)
@@ -881,6 +1091,12 @@ public actor AppCoordinator {
 
     /// Start the capture pipeline
     public func startPipeline() async throws {
+        if !isRunning, let existingCaptureTask = captureTask {
+            Log.info("[RECORDING-STOP] Waiting for previous pipeline cleanup before starting capture again", category: .app)
+            await existingCaptureTask.value
+            captureTask = nil
+        }
+
         guard !isRunning else {
             Log.warning("Pipeline already running", category: .app)
             return
@@ -898,11 +1114,7 @@ public actor AppCoordinator {
             throw AppError.permissionDenied(permission: "screen recording")
         }
 
-        // Set up callback for when capture stops unexpectedly (e.g., user clicks "Stop sharing")
-        services.capture.onCaptureStopped = { [weak self] in
-            guard let self = self else { return }
-            await self.handleCaptureStopped()
-        }
+        services.capture.onCaptureStopped = nil
         services.capture.onMouseClickCaptureOutcome = { [weak self] outcome, timestamp in
             guard let self else { return }
             await self.recordMouseClickCaptureMetricIfNeeded(
@@ -927,6 +1139,10 @@ public actor AppCoordinator {
         isRunning = true
         pipelineStartTime = Date()
         statusHolder.update(isRunning: true, startTime: pipelineStartTime)
+        resetUnexpectedRecordingProgressTracking()
+        #if DEBUG
+        debugInterruptEncodingOnNextAppend = false
+        #endif
         captureTask = Task {
             await runPipeline()
         }
@@ -962,12 +1178,7 @@ public actor AppCoordinator {
 
         Log.info("Stopping capture pipeline...", category: .app)
 
-        // Stop permission monitoring
-        await stopPermissionMonitoring()
-
-        // Stop storage health monitoring
-        StorageHealthMonitor.shared.stopMonitoring()
-        stopStorageHealthNotifications()
+        await suspendPipelineInfrastructure()
 
         // Stop screen capture
         try await services.capture.stopCapture()
@@ -976,23 +1187,40 @@ public actor AppCoordinator {
         // // Stop audio capture
         // try await services.audioCapture.stopCapture()
 
-        // Cancel pipeline tasks
+        finalizePipelineStopped(persistState: persistState, clearCaptureTask: true)
+
+        Log.info("Capture pipeline stopped successfully", category: .app)
+    }
+
+    private func suspendPipelineInfrastructure() async {
+        await stopPermissionMonitoring()
+        StorageHealthMonitor.shared.stopMonitoring()
+        stopStorageHealthNotifications()
+    }
+
+    private func finalizePipelineStopped(
+        persistState: Bool,
+        clearCaptureTask: Bool
+    ) {
         captureTask?.cancel()
-        captureTask = nil
+        if clearCaptureTask {
+            captureTask = nil
+        }
         // ⚠️ RELEASE 2 ONLY
         // audioTask?.cancel()
         // audioTask = nil
+        #if DEBUG
+        debugInterruptEncodingOnNextAppend = false
+        #endif
 
         isRunning = false
         statusHolder.update(isRunning: false)
 
-        // Only save recording state as stopped if explicitly requested (user clicked stop)
-        // During shutdown, we want to preserve the "recording" state so it auto-starts next launch
         if persistState {
             saveRecordingState(false)
         }
 
-        Log.info("Capture pipeline stopped successfully", category: .app)
+        resetUnexpectedRecordingProgressTracking()
     }
 
     // MARK: - Storage Health Notifications
@@ -1159,21 +1387,6 @@ public actor AppCoordinator {
             "[AppCoordinator] Applied power settings: ocrEnabled=\(ocrEnabled), level=\(processingLevel), workers=\(workerCount), priority=\(taskPriority), maxFPS=\(maxFPS), preferBgProcessing=\(preferBackground), pauseOnBattery=\(pauseOnBattery), pauseOnLowPowerMode=\(pauseOnLowPowerMode), isLowPowerModeEnabled=\(isLowPowerModeEnabled), power=\(powerSource)",
             category: .app
         )
-    }
-
-    /// Handle capture stopped unexpectedly (e.g., user clicked "Stop sharing" in macOS)
-    private func handleCaptureStopped() async {
-        guard isRunning else { return }
-
-        Log.info("Capture stopped unexpectedly, cleaning up pipeline...", category: .app)
-
-        // Cancel pipeline tasks
-        captureTask?.cancel()
-        captureTask = nil
-
-        isRunning = false
-        statusHolder.update(isRunning: false)
-        Log.info("Pipeline cleanup complete after unexpected stop", category: .app)
     }
 
     // MARK: - Storage Health (delegated to StorageHealthMonitor)
@@ -1406,6 +1619,7 @@ public actor AppCoordinator {
         let frameID: Int64
         /// The frame's index in the video segment (0-based)
         let frameIndexInSegment: Int
+        let acceptedAt: Date
     }
 
     /// State for tracking a video writer by resolution
@@ -1428,6 +1642,7 @@ public actor AppCoordinator {
 
         let frameStream = await services.capture.frameStream
         var writersByResolution: [String: VideoWriterState] = [:]
+        var pendingUnexpectedStop: PendingUnexpectedRecordingStop?
         var lastPipelineMemoryLogAt = Date.distantPast
         let maxFramesPerSegment = 150
         let videoUpdateInterval = 5
@@ -1437,6 +1652,21 @@ public actor AppCoordinator {
             guard now.timeIntervalSince(lastPipelineMemoryLogAt) >= Self.pipelineMemoryLogInterval else { return }
             lastPipelineMemoryLogAt = now
             logPipelineMemorySnapshot(writersByResolution: writersByResolution, reason: reason)
+        }
+
+        func requestUnexpectedStop(
+            reason: UnexpectedRecordingStopReason,
+            summary: String
+        ) {
+            guard pendingUnexpectedStop == nil else { return }
+            pendingUnexpectedStop = PendingUnexpectedRecordingStop(
+                reason: reason,
+                summary: summary,
+                counters: unexpectedRecordingStopCounters,
+                writerSnapshots: Self.unexpectedRecordingStopWriterSnapshots(
+                    from: writersByResolution
+                )
+            )
         }
 
         for await frame in frameStream {
@@ -1502,16 +1732,34 @@ public actor AppCoordinator {
                     writersByResolution[resolutionKey] = writerState
                 }
 
+                #if DEBUG
+                if debugInterruptEncodingOnNextAppend {
+                    debugInterruptEncodingOnNextAppend = false
+                    Log.warning(
+                        "[RECORDING-STOP][DEBUG] Interrupting active writer before append videoDBID=\(writerState.videoDBID) resolution=\(resolutionKey)",
+                        category: .app
+                    )
+                    await cancelBrokenWriterPreservingRecoveryData(writerState.writer)
+                }
+                #endif
+
                 try await writerState.writer.appendFrame(frame)
 
                 // Verify encoder actually wrote the frame by checking its frame count
                 // This detects if the encoder silently failed or auto-finalized
                 let actualEncoderFrameCount = await writerState.writer.frameCount
                 if actualEncoderFrameCount != writerState.frameCount + 1 {
-                    Log.error("[ENCODER-MISMATCH] Encoder frame count (\(actualEncoderFrameCount)) != expected (\(writerState.frameCount + 1)) - encoder may have failed/finalized. Removing broken writer for videoDBID=\(writerState.videoDBID), resolution=\(resolutionKey)", category: .app)
+                    let summary =
+                        "Encoder frame count \(actualEncoderFrameCount) did not match expected \(writerState.frameCount + 1) " +
+                        "for videoDBID=\(writerState.videoDBID) at \(resolutionKey)."
+                    Log.error("[ENCODER-MISMATCH] \(summary)", category: .app)
+                    requestUnexpectedStop(
+                        reason: .encoderMismatch,
+                        summary: summary
+                    )
                     await cancelBrokenWriterPreservingRecoveryData(writerState.writer)
                     writersByResolution.removeValue(forKey: resolutionKey)
-                    continue
+                    break
                 }
 
                 writerState.frameCount += 1
@@ -1540,6 +1788,8 @@ public actor AppCoordinator {
                     source: .native
                 )
                 let frameID = try await services.database.insertFrame(frameRef)
+                let acceptedAt = Date()
+                recordAcceptedFrameProgress(at: acceptedAt)
                 await persistGlobalMousePositionIfNeeded(
                     frameID: frameID,
                     capturedFrame: frame
@@ -1601,7 +1851,11 @@ public actor AppCoordinator {
                 }
 
                 // Track frame in pending buffer until it's confirmed flushed/readable.
-                let bufferedFrame = BufferedFrame(frameID: frameID, frameIndexInSegment: frameIndexInSegment)
+                let bufferedFrame = BufferedFrame(
+                    frameID: frameID,
+                    frameIndexInSegment: frameIndexInSegment,
+                    acceptedAt: acceptedAt
+                )
 
                 // Add frame to the pending buffer
                 writerState.pendingFrames.append(bufferedFrame)
@@ -1624,6 +1878,7 @@ public actor AppCoordinator {
                     let frameToEnqueue = writerState.pendingFrames.removeFirst()
                     // Mark frame as readable now that it's confirmed flushed to video file
                     try await services.database.markFrameReadable(frameID: frameToEnqueue.frameID)
+                    recordReadableFrameProgress(at: Date())
                     try await processingQueue.enqueue(frameID: frameToEnqueue.frameID)
                 }
 
@@ -1654,6 +1909,21 @@ public actor AppCoordinator {
                 }
 
                 writersByResolution[resolutionKey] = writerState
+                if let stalledWriter = Self.stalledUnreadableWriter(
+                    in: Self.unexpectedRecordingStopWriterSnapshots(from: writersByResolution),
+                    now: Date()
+                ) {
+                    let pendingAgeSeconds = stalledWriter.oldestPendingUnreadableAt.map {
+                        max(0, Int(Date().timeIntervalSince($0)))
+                    } ?? 0
+                    requestUnexpectedStop(
+                        reason: .unreadableWriterStalled,
+                        summary:
+                            "Writer \(stalledWriter.videoDBID) at \(stalledWriter.resolutionKey) remained unreadable for \(pendingAgeSeconds)s " +
+                            "with \(stalledWriter.pendingUnreadableFrameCount) pending frame(s) while another writer continued."
+                    )
+                    break
+                }
                 maybeLogPipelineMemory(reason: "steady-state")
                 totalFramesProcessed += 1
                 statusHolder.incrementFrames()
@@ -1680,13 +1950,22 @@ public actor AppCoordinator {
                     continue
                 }
 
-                // If it's a file write failure, the writer is broken - remove it so a fresh one is created
+                // File write failures mean the active writer is no longer trustworthy.
+                // Stop recording instead of pretending capture is still healthy.
                 if case .fileWriteFailed = error {
                     let resolutionKey = "\(frame.width)x\(frame.height)"
                     if let brokenWriter = writersByResolution[resolutionKey] {
-                        Log.warning("Removing broken writer for \(resolutionKey) due to write failure - will create fresh writer", category: .app)
+                        let summary =
+                            "File write failed for videoDBID=\(brokenWriter.videoDBID) at \(resolutionKey). " +
+                            "Recording was turned off to avoid claiming capture is healthy."
+                        Log.error("[RECORDING-STOP] \(summary)", category: .app)
+                        requestUnexpectedStop(
+                            reason: .fileWriteFailed,
+                            summary: summary
+                        )
                         await cancelBrokenWriterPreservingRecoveryData(brokenWriter.writer)
                         writersByResolution.removeValue(forKey: resolutionKey)
+                        break
                     }
                 }
                 continue
@@ -1695,6 +1974,39 @@ public actor AppCoordinator {
                 statusHolder.incrementErrors()
                 Log.error("[Pipeline] Error processing frame", category: .app, error: error)
                 continue
+            }
+        }
+
+        if pendingUnexpectedStop == nil {
+            let captureIsActiveAfterPipeline = await services.capture.isCapturing
+            if Self.shouldTreatCaptureTerminationAsUnexpected(
+                isRunning: isRunning,
+                taskWasCancelled: Task.isCancelled,
+                isCaptureActive: captureIsActiveAfterPipeline
+            ) {
+                requestUnexpectedStop(
+                    reason: .captureStopped,
+                    summary: captureInactiveUnexpectedStopSummary(
+                        source: "frame_stream_ended",
+                        writerSnapshots: Self.unexpectedRecordingStopWriterSnapshots(
+                            from: writersByResolution
+                        )
+                    )
+                )
+            }
+        }
+
+        if pendingUnexpectedStop != nil {
+            await suspendPipelineInfrastructure()
+            if await services.capture.isCapturing {
+                do {
+                    try await services.capture.stopCapture()
+                } catch {
+                    Log.warning(
+                        "[RECORDING-STOP] Capture stop during unexpected-stop cleanup failed: \(error.localizedDescription)",
+                        category: .app
+                    )
+                }
             }
         }
 
@@ -1721,7 +2033,19 @@ public actor AppCoordinator {
             currentSegmentID = nil
         }
 
+        if let pendingUnexpectedStop {
+            let state = await recordUnexpectedRecordingStop(pendingUnexpectedStop)
+            finalizePipelineStopped(persistState: true, clearCaptureTask: false)
+            await MainActor.run {
+                NotificationCenter.default.post(
+                    name: RecordingUnexpectedStopNotification.didStop,
+                    object: state
+                )
+            }
+        }
+
         Log.info("Pipeline processing completed. Total frames: \(totalFramesProcessed), Errors: \(totalErrors)", category: .app)
+        captureTask = nil
     }
 
     private func rotateActiveVideoWritersIfNeeded(
@@ -2279,6 +2603,7 @@ public actor AppCoordinator {
                 Log.debug("Enqueueing \(writerState.pendingFrames.count) pending frames after finalization", category: .app)
                 for bufferedFrame in writerState.pendingFrames {
                     try await services.database.markFrameReadable(frameID: bufferedFrame.frameID)
+                    recordReadableFrameProgress(at: Date())
                     try await processingQueue.enqueue(frameID: bufferedFrame.frameID)
                 }
                 writerState.pendingFrames = []
@@ -2287,6 +2612,148 @@ public actor AppCoordinator {
             // Trigger segment-level video rewrites for any p=5 frames now that the file is finalized.
             _ = try? await processingQueue.processPendingRewrites(for: writerState.videoDBID)
         }
+    }
+
+    private func resetUnexpectedRecordingProgressTracking() {
+        unexpectedRecordingStopCounters = UnexpectedRecordingStopCounters()
+    }
+
+    private func recordAcceptedFrameProgress(at date: Date) {
+        unexpectedRecordingStopCounters.acceptedFrameCount += 1
+        unexpectedRecordingStopCounters.lastAcceptedFrameAt = date
+    }
+
+    private func recordReadableFrameProgress(at date: Date) {
+        unexpectedRecordingStopCounters.readableFrameCount += 1
+        unexpectedRecordingStopCounters.lastReadableFrameAt = date
+    }
+
+    private static func unexpectedRecordingStopWriterSnapshots(
+        from writersByResolution: [String: VideoWriterState]
+    ) -> [UnexpectedRecordingStopWriterSnapshot] {
+        writersByResolution.map { resolutionKey, writerState in
+            UnexpectedRecordingStopWriterSnapshot(
+                resolutionKey: resolutionKey,
+                videoDBID: writerState.videoDBID,
+                frameCount: writerState.frameCount,
+                persistedReadableFrameCount: writerState.persistedReadableFrameCount,
+                pendingUnreadableFrameCount: writerState.pendingFrames.count,
+                oldestPendingUnreadableAt: writerState.pendingFrames.first?.acceptedAt
+            )
+        }
+    }
+
+    private static func unexpectedRecordingStopPendingUnreadableFrameCount(
+        in writerSnapshots: [UnexpectedRecordingStopWriterSnapshot]
+    ) -> Int {
+        writerSnapshots.reduce(0) { partialResult, writer in
+            partialResult + writer.pendingUnreadableFrameCount
+        }
+    }
+
+    static func stalledUnreadableWriter<C: Collection>(
+        in writers: C,
+        now: Date,
+        threshold: TimeInterval = AppCoordinator.unexpectedRecordingStopUnreadableWriterThreshold,
+        minimumPendingFrames: Int = AppCoordinator.unexpectedRecordingStopUnreadableWriterMinimumPendingFrames
+    ) -> UnexpectedRecordingStopWriterSnapshot? where C.Element == UnexpectedRecordingStopWriterSnapshot {
+        writers.first { writer in
+            guard writer.frameCount > 0,
+                  writer.persistedReadableFrameCount == 0,
+                  writer.pendingUnreadableFrameCount >= minimumPendingFrames,
+                  let oldestPendingUnreadableAt = writer.oldestPendingUnreadableAt else {
+                return false
+            }
+
+            let hasAnotherWriterWithFrames = writers.contains { otherWriter in
+                otherWriter.videoDBID != writer.videoDBID && otherWriter.frameCount > 0
+            }
+            guard hasAnotherWriterWithFrames else {
+                return false
+            }
+
+            return now.timeIntervalSince(oldestPendingUnreadableAt) >= threshold
+        }
+    }
+
+    static func shouldTreatCaptureTerminationAsUnexpected(
+        isRunning: Bool,
+        taskWasCancelled: Bool,
+        isCaptureActive: Bool
+    ) -> Bool {
+        isRunning && !taskWasCancelled && !isCaptureActive
+    }
+
+    private func captureInactiveUnexpectedStopSummary(
+        source: String,
+        writerSnapshots: [UnexpectedRecordingStopWriterSnapshot]
+    ) -> String {
+        let now = Date()
+        let statusIsRunning = statusHolder.status.isRunning
+        let pendingUnreadableFrameCount = Self.unexpectedRecordingStopPendingUnreadableFrameCount(
+            in: writerSnapshots
+        )
+        let lastAcceptedAgeSeconds = unexpectedRecordingStopCounters.lastAcceptedFrameAt.map {
+            max(0, Int(now.timeIntervalSince($0)))
+        }
+        let lastReadableAgeSeconds = unexpectedRecordingStopCounters.lastReadableFrameAt.map {
+            max(0, Int(now.timeIntervalSince($0)))
+        }
+
+        return
+            "Capture became inactive (\(source)) while recording remained marked on. " +
+            "coordinatorIsRunning=\(isRunning) statusHolderIsRunning=\(statusIsRunning) " +
+            "acceptedFrames=\(unexpectedRecordingStopCounters.acceptedFrameCount) " +
+            "readableFrames=\(unexpectedRecordingStopCounters.readableFrameCount) " +
+            "pendingUnreadableFrames=\(pendingUnreadableFrameCount) " +
+            "activeWriters=\(writerSnapshots.count) " +
+            "lastAcceptedAgeSeconds=\(lastAcceptedAgeSeconds.map(String.init) ?? "none") " +
+            "lastReadableAgeSeconds=\(lastReadableAgeSeconds.map(String.init) ?? "none")"
+    }
+
+    private func recordUnexpectedRecordingStop(
+        _ pendingStop: PendingUnexpectedRecordingStop
+    ) async -> UnexpectedRecordingStopState {
+        let now = Date()
+        let captureStats = await services.capture.getStatistics()
+        let pendingUnreadableFrameCount = Self.unexpectedRecordingStopPendingUnreadableFrameCount(
+            in: pendingStop.writerSnapshots
+        )
+        let stalledWriter = Self.stalledUnreadableWriter(
+            in: pendingStop.writerSnapshots,
+            now: now,
+            threshold: 0,
+            minimumPendingFrames: 1
+        )
+        let state = UnexpectedRecordingStopState(
+            stoppedAt: now,
+            reason: pendingStop.reason,
+            summary: pendingStop.summary,
+            captureFramesObserved: captureStats.totalFramesCaptured,
+            deduplicatedFrames: captureStats.framesDeduped,
+            acceptedFrameCount: pendingStop.counters.acceptedFrameCount,
+            readableFrameCount: pendingStop.counters.readableFrameCount,
+            pendingUnreadableFrameCount: pendingUnreadableFrameCount,
+            activeWriterCount: pendingStop.writerSnapshots.count,
+            stalledWriterResolution: stalledWriter?.resolutionKey,
+            stalledWriterVideoID: stalledWriter?.videoDBID,
+            stalledWriterPendingAgeSeconds: stalledWriter?.oldestPendingUnreadableAt.map {
+                max(0, Int(now.timeIntervalSince($0)))
+            }
+        )
+        persistUnexpectedRecordingStopState(state)
+        recordUnexpectedRecordingStopMetric(action: "auto_stopped", state: state)
+
+        Log.error(
+            "[RECORDING-STOP] reason=\(pendingStop.reason.rawValue) summary=\"\(pendingStop.summary)\" captureFramesObserved=\(state.captureFramesObserved) " +
+            "deduplicatedFrames=\(state.deduplicatedFrames) acceptedFrames=\(state.acceptedFrameCount) " +
+            "readableFrames=\(state.readableFrameCount) pendingUnreadableFrames=\(state.pendingUnreadableFrameCount) " +
+            "activeWriters=\(state.activeWriterCount) stalledWriterResolution=\(state.stalledWriterResolution ?? "none") " +
+            "stalledWriterVideoID=\(state.stalledWriterVideoID.map(String.init) ?? "none") " +
+            "stalledWriterPendingAgeSeconds=\(state.stalledWriterPendingAgeSeconds.map(String.init) ?? "none")",
+            category: .app
+        )
+        return state
     }
 
     public func recoverPendingPhraseRedactionRewritesIfPossible() async {
@@ -3798,6 +4265,33 @@ public actor AppCoordinator {
             metricType: .videoQualityUpdated,
             metadata: metadata
         )
+    }
+
+    private func recordUnexpectedRecordingStopMetric(
+        action: String,
+        state: UnexpectedRecordingStopState
+    ) {
+        let metadata = Self.metricMetadata([
+            "action": action,
+            "reason": state.reason.rawValue,
+            "captureFramesObserved": state.captureFramesObserved,
+            "deduplicatedFrames": state.deduplicatedFrames,
+            "acceptedFrameCount": state.acceptedFrameCount,
+            "readableFrameCount": state.readableFrameCount,
+            "pendingUnreadableFrameCount": state.pendingUnreadableFrameCount,
+            "activeWriterCount": state.activeWriterCount,
+            "stalledWriterResolution": state.stalledWriterResolution as Any,
+            "stalledWriterVideoID": state.stalledWriterVideoID as Any,
+            "stalledWriterPendingAgeSeconds": state.stalledWriterPendingAgeSeconds as Any
+        ])
+
+        Task {
+            try? await recordMetricEvent(
+                metricType: .unexpectedRecordingStopAction,
+                timestamp: state.stoppedAt,
+                metadata: metadata
+            )
+        }
     }
 
     private static func metricMetadata(_ payload: [String: Any]) -> String? {

@@ -24,11 +24,38 @@ struct PauseReminderSettingsSnapshot: Sendable {
 /// Similar to Rewind AI's "Rewind is paused" notification
 @MainActor
 public class PauseReminderManager: ObservableObject {
+    public enum ReminderMode: Equatable {
+        case paused
+        case unexpectedStop
+
+        var title: String {
+            switch self {
+            case .paused:
+                return "Retrace is paused."
+            case .unexpectedStop:
+                return "Recording turned off."
+            }
+        }
+    }
+
+    private enum SuppressionState: Equatable {
+        case none
+        case onboarding
+        case paused
+    }
 
     // MARK: - Published State
 
     /// Whether the reminder prompt should be shown
     @Published public var shouldShowReminder = false
+
+    /// Current reminder mode.
+    @Published public private(set) var reminderMode: ReminderMode = .paused
+
+    /// Title shown in the reminder window.
+    public var reminderTitle: String {
+        reminderMode.title
+    }
 
     /// Whether the user has dismissed the reminder for this pause session
     @Published public var isDismissedForSession = false
@@ -71,8 +98,7 @@ public class PauseReminderManager: ObservableObject {
     private var remindLaterRequestedAt: Date?
     private var wasCapturing = false
     private var hasCheckedInitialState = false
-    private var wasSuppressedForPausedState = false
-    private var wasSuppressedForOnboarding = false
+    private var suppressionState: SuppressionState = .none
     private var cancellables = Set<AnyCancellable>()
 
     // MARK: - Initialization
@@ -97,6 +123,13 @@ public class PauseReminderManager: ObservableObject {
         }
         timer.resume()
         statusCheckTimer = timer
+
+        NotificationCenter.default.publisher(for: RecordingUnexpectedStopNotification.didStop)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.showUnexpectedStopReminder()
+            }
+            .store(in: &cancellables)
     }
 
     private func observeSettingsChanges() {
@@ -137,14 +170,13 @@ public class PauseReminderManager: ObservableObject {
             // once onboarding has actually completed.
             hasCheckedInitialState = false
             wasCapturing = isCapturing
-            wasSuppressedForPausedState = false
-            wasSuppressedForOnboarding = true
+            suppressionState = .onboarding
             return
         }
 
-        if wasSuppressedForOnboarding {
+        if suppressionState == .onboarding {
             hasCheckedInitialState = false
-            wasSuppressedForOnboarding = false
+            suppressionState = .none
         }
 
         // "Paused" (timed pause) should not show the off reminder.
@@ -155,7 +187,7 @@ public class PauseReminderManager: ObservableObject {
             }
             hasCheckedInitialState = true
             wasCapturing = isCapturing
-            wasSuppressedForPausedState = true
+            suppressionState = .paused
             return
         }
 
@@ -171,10 +203,15 @@ public class PauseReminderManager: ObservableObject {
         }
 
         // Transitioned from paused state -> off (still not capturing): start off reminder timer now.
-        if wasSuppressedForPausedState && !isCapturing {
+        if suppressionState == .paused && !isCapturing {
             onCapturePaused()
         }
-        wasSuppressedForPausedState = false
+        suppressionState = .none
+
+        if reminderMode == .unexpectedStop && shouldShowReminder && !isCapturing {
+            wasCapturing = isCapturing
+            return
+        }
 
         if wasCapturing && !isCapturing {
             // Capture just stopped - start the reminder timer
@@ -192,6 +229,7 @@ public class PauseReminderManager: ObservableObject {
         pauseStartTime = Date()
         isDismissedForSession = false
         remindLaterRequestedAt = nil
+        reminderMode = .paused
 
         // Cancel any existing timers
         reminderTimer?.invalidate()
@@ -218,8 +256,21 @@ public class PauseReminderManager: ObservableObject {
         remindLaterRequestedAt = nil
         shouldShowReminder = false
         isDismissedForSession = false
+        reminderMode = .paused
 
         Log.debug("[PauseReminderManager] Capture resumed, reminder cancelled", category: .ui)
+    }
+
+    private func showUnexpectedStopReminder() {
+        pauseStartTime = Date()
+        reminderTimer?.invalidate()
+        reminderTimer = nil
+        remindLaterTimer?.invalidate()
+        remindLaterTimer = nil
+        isDismissedForSession = false
+        reminderMode = .unexpectedStop
+        shouldShowReminder = true
+        Log.warning("[PauseReminderManager] Showing immediate reminder after unexpected recording stop", category: .ui)
     }
 
     /// Show the reminder if the user hasn't dismissed it

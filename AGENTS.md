@@ -159,7 +159,8 @@ retrace/
 │       ├── InPageURLCaptureRoutingTests.swift
 │       ├── MasterKeyManagerTests.swift
 │       ├── TestLogger.swift
-│       └── TimelineStillDiskWriterTests.swift
+│       ├── TimelineStillDiskWriterTests.swift
+│       └── UnexpectedRecordingStopHeuristicTests.swift # Unexpected-stop watchdog heuristic coverage
 │
 └── UI/                          # SwiftUI interface
     ├── AGENTS.md
@@ -484,4 +485,4 @@ Then check which path actually executes and fix the right code.
 
 ---
 
-_This file follows the AGENTS.md standard for AI agent guidance. Last updated: 2026-03-30_
+_This file follows the AGENTS.md standard for AI agent guidance. Last updated: 2026-04-04_

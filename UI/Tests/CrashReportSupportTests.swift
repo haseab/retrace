@@ -1,4 +1,5 @@
 import XCTest
+import App
 @testable import Retrace
 
 final class CrashReportSupportTests: XCTestCase {
@@ -242,6 +243,38 @@ final class CrashReportSupportTests: XCTestCase {
 
         XCTAssertEqual(context.source, .crashBanner)
         XCTAssertTrue(context.prefilledDescription?.contains("Retrace macOS Crash Report") == true)
+    }
+
+    func testUnexpectedRecordingStopLaunchContextPrefillsBugReportAndEmailFocus() {
+        let state = UnexpectedRecordingStopState(
+            stoppedAt: Date(timeIntervalSince1970: 1_775_000_000),
+            reason: .unreadableWriterStalled,
+            summary: "Writer 1000060 never became readable.",
+            captureFramesObserved: 42,
+            deduplicatedFrames: 30,
+            acceptedFrameCount: 12,
+            readableFrameCount: 9,
+            pendingUnreadableFrameCount: 3,
+            activeWriterCount: 2,
+            stalledWriterResolution: "3024x1964",
+            stalledWriterVideoID: 1000060,
+            stalledWriterPendingAgeSeconds: 90
+        )
+
+        let context = FeedbackLaunchContext(
+            feedbackType: .bug,
+            prefilledDescription: DashboardViewModel.makeUnexpectedRecordingStopFeedbackDescription(
+                for: state
+            ),
+            preferredFocusField: .email
+        )
+
+        XCTAssertEqual(context.source, FeedbackLaunchContext.Source.manual)
+        XCTAssertEqual(context.feedbackType, FeedbackType.bug)
+        XCTAssertEqual(context.preferredFocusField, FeedbackLaunchContext.PreferredFocusField.email)
+        XCTAssertTrue(context.prefilledDescription?.contains("Retrace Recording Stopped Unexpectedly") == true)
+        XCTAssertTrue(context.prefilledDescription?.contains("Writer 1000060 never became readable.") == true)
+        XCTAssertTrue(context.prefilledDescription?.contains("Enter any other relevant context here:") == true)
     }
 
     func testLoadRecentWALFailureCrashReturnsNewestReport() throws {

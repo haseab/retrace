@@ -67,6 +67,7 @@ public class PauseReminderWindowController: NSObject, ObservableObject {
 
         // Create the SwiftUI content
         let contentView = PauseReminderView(
+            title: pauseReminderManager?.reminderTitle ?? "Retrace is paused.",
             onResumeCapturing: { [weak self] in
                 Task { @MainActor in
                     await self?.pauseReminderManager?.resumeCapturing()
