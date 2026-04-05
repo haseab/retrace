@@ -11,6 +11,10 @@ import Darwin
 import Carbon
 import UniformTypeIdentifiers
 
+private struct InPageURLIconBox: @unchecked Sendable {
+    let image: NSImage?
+}
+
 extension SettingsView {
     @MainActor
     func refreshInPageURLTargets(force: Bool = false) async {
@@ -80,18 +84,24 @@ extension SettingsView {
         guard inPageURLIconLoadTasksByBundleID[bundleID] == nil else { return }
         guard let iconPath = appURL?.path else { return }
 
-        inPageURLIconLoadTasksByBundleID[bundleID] = Task(priority: .utility) { [bundleID, iconPath] in
+        inPageURLIconLoadTasksByBundleID[bundleID] = Task.detached(priority: .utility) { [bundleID, iconPath] in
             guard !Task.isCancelled else { return }
+            let icon = InPageURLIconBox(image: Self.loadInPageURLIconSync(forPath: iconPath))
             await MainActor.run {
                 defer { inPageURLIconLoadTasksByBundleID[bundleID] = nil }
                 guard !Task.isCancelled else { return }
                 guard inPageURLIconByBundleID[bundleID] == nil else { return }
-
-                let icon = NSWorkspace.shared.icon(forFile: iconPath)
-                icon.size = NSSize(width: 20, height: 20)
+                guard let icon = icon.image else { return }
                 inPageURLIconByBundleID[bundleID] = icon
             }
         }
+    }
+
+    nonisolated private static func loadInPageURLIconSync(forPath iconPath: String) -> NSImage? {
+        guard FileManager.default.fileExists(atPath: iconPath) else { return nil }
+        let icon = NSWorkspace.shared.icon(forFile: iconPath)
+        icon.size = NSSize(width: 20, height: 20)
+        return icon
     }
 
     struct InPageURLInstalledApplication: Sendable {

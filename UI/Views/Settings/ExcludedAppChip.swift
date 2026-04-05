@@ -5,13 +5,13 @@ struct ExcludedAppChip: View {
     let app: ExcludedAppInfo
     let onRemove: () -> Void
 
+    @StateObject private var metadata = AppMetadataCache.shared
     @State private var isHovered = false
-    @State private var resolvedIcon: NSImage?
 
     var body: some View {
         HStack(spacing: 8) {
-            if let resolvedIcon {
-                Image(nsImage: resolvedIcon)
+            if let icon = resolvedIcon {
+                Image(nsImage: icon)
                     .resizable()
                     .frame(width: 20, height: 20)
                     .clipShape(RoundedRectangle(cornerRadius: 5))
@@ -55,20 +55,20 @@ struct ExcludedAppChip: View {
                 isHovered = hovering
             }
         }
-        .task(id: app.iconPath) {
-            resolvedIcon = nil
-            guard let iconPath = app.iconPath else { return }
-            guard !Task.isCancelled else { return }
-            resolvedIcon = Self.resolveIconOnMainActor(forPath: iconPath)
+        .task(id: "\(app.bundleID)|\(app.iconPath ?? "")") {
+            if let iconPath = app.iconPath {
+                metadata.requestIcon(forAppPath: iconPath)
+            }
+            metadata.requestMetadata(for: app.bundleID)
         }
     }
 
-    @MainActor
-    private static func resolveIconOnMainActor(forPath iconPath: String) -> NSImage? {
-        guard FileManager.default.fileExists(atPath: iconPath) else { return nil }
-        let icon = NSWorkspace.shared.icon(forFile: iconPath)
-        icon.size = NSSize(width: 20, height: 20)
-        return icon
+    private var resolvedIcon: NSImage? {
+        if let iconPath = app.iconPath,
+           let icon = metadata.icon(forAppPath: iconPath) {
+            return icon
+        }
+        return metadata.icon(for: app.bundleID)
     }
 }
 

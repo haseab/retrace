@@ -140,52 +140,48 @@ extension SettingsView {
         return json
     }
 
-    @ViewBuilder
-    func inPageURLInstructionImage(_ image: NSImage) -> some View {
-        Image(nsImage: image)
-            .resizable()
-            .aspectRatio(contentMode: .fit)
-            .frame(maxWidth: 760)
-            .clipShape(RoundedRectangle(cornerRadius: 14))
-            .overlay(
-                RoundedRectangle(cornerRadius: 14)
-                    .stroke(Color.white.opacity(0.08), lineWidth: 1)
+}
+
+private struct InPageURLInstructionImageBox: @unchecked Sendable {
+    let image: NSImage?
+}
+
+private enum InPageURLInstructionAssetLoadState {
+    case idle
+    case loading
+    case loaded(NSImage)
+    case failed
+}
+
+private actor InPageURLInstructionImageLoader {
+    static let shared = InPageURLInstructionImageLoader()
+
+    private var cache: [String: InPageURLInstructionImageBox] = [:]
+
+    func load(
+        assetName: String,
+        fileName: String,
+        logName: String
+    ) -> InPageURLInstructionImageBox {
+        let cacheKey = "\(assetName)|\(fileName)"
+        if let cached = cache[cacheKey] {
+            return cached
+        }
+
+        let loaded = InPageURLInstructionImageBox(
+            image: Self.resolveInstructionImageSync(
+                assetName: assetName,
+                fileName: fileName,
+                logName: logName
             )
-    }
-
-    func resolveChromiumInPageURLInstructionsImage() -> NSImage? {
-        resolveInPageURLInstructionImage(
-            assetName: "InPageURLInstructions",
-            fileName: "safari_instructions.png",
-            logName: "chromium in-page URL instructions"
         )
+        if loaded.image != nil {
+            cache[cacheKey] = loaded
+        }
+        return loaded
     }
 
-    func resolveSafariInPageURLMenuImage() -> NSImage? {
-        resolveInPageURLInstructionImage(
-            assetName: "SafariInPageURLMenu",
-            fileName: "safari_instructions_1.png",
-            logName: "safari in-page URL menu instructions"
-        )
-    }
-
-    func resolveSafariInPageURLToggleImage() -> NSImage? {
-        resolveInPageURLInstructionImage(
-            assetName: "SafariInPageURLToggle",
-            fileName: "safari_instructions_2.png",
-            logName: "safari in-page URL toggle instructions"
-        )
-    }
-
-    func resolveSafariInPageURLAllowImage() -> NSImage? {
-        resolveInPageURLInstructionImage(
-            assetName: "SafariInPageURLAllow",
-            fileName: "safari_instructions_3.png",
-            logName: "safari in-page URL allow instructions"
-        )
-    }
-
-    func resolveInPageURLInstructionImage(
+    nonisolated private static func resolveInstructionImageSync(
         assetName: String,
         fileName: String,
         logName: String
@@ -258,5 +254,66 @@ extension SettingsView {
         )
 
         return nil
+    }
+}
+
+struct InPageURLInstructionAssetView: View {
+    let assetName: String
+    let fileName: String
+    let logName: String
+
+    @State private var loadState: InPageURLInstructionAssetLoadState = .idle
+
+    var body: some View {
+        Group {
+            switch loadState {
+            case .loaded(let image):
+                Image(nsImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(maxWidth: 760)
+                    .clipShape(RoundedRectangle(cornerRadius: 14))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 14)
+                            .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                    )
+            case .idle, .loading:
+                ProgressView()
+                    .controlSize(.small)
+                    .frame(maxWidth: 760, alignment: .leading)
+            case .failed:
+                EmptyView()
+            }
+        }
+        .task(id: "\(assetName)|\(fileName)") {
+            let shouldLoad = await MainActor.run {
+                guard case .idle = loadState else { return false }
+                loadState = .loading
+                return true
+            }
+            guard shouldLoad else {
+                return
+            }
+
+            let loaded = await InPageURLInstructionImageLoader.shared.load(
+                assetName: assetName,
+                fileName: fileName,
+                logName: logName
+            )
+            guard !Task.isCancelled else {
+                await MainActor.run {
+                    loadState = .idle
+                }
+                return
+            }
+
+            await MainActor.run {
+                if let image = loaded.image {
+                    loadState = .loaded(image)
+                } else {
+                    loadState = .failed
+                }
+            }
+        }
     }
 }
