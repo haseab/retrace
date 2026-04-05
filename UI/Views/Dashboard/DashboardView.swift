@@ -80,6 +80,10 @@ public struct DashboardView: View {
     @State private var showDiscordFollowup = false
     @State private var currentTheme: MilestoneCelebrationManager.ColorTheme = MilestoneCelebrationManager.getCurrentTheme()
     @Binding var hasLoadedInitialData: Bool
+    @AppStorage("timelineShortcutConfig", store: dashboardSettingsStore)
+    private var timelineShortcutData = Data()
+    @AppStorage("systemMonitorShortcutConfig", store: dashboardSettingsStore)
+    private var systemMonitorShortcutData = Data()
 
     enum AppUsageViewMode: String {
         case list = "list"
@@ -695,6 +699,24 @@ public struct DashboardView: View {
     @State private var isHoveringSettings = false
     @State private var settingsRotation: Double = 0
 
+    private var timelineTooltipText: String {
+        tooltipText(
+            title: "Open Timeline",
+            shortcut: decodedShortcut(from: timelineShortcutData, fallback: .defaultTimeline)
+        )
+    }
+
+    private var systemMonitorTooltipText: String {
+        tooltipText(
+            title: "Open System Monitor",
+            shortcut: decodedShortcut(from: systemMonitorShortcutData, fallback: .defaultSystemMonitor)
+        )
+    }
+
+    private var settingsTooltipText: String {
+        tooltipText(title: "Open Settings", shortcutText: "⌘,")
+    }
+
     // MARK: - Footer Hover States
 
     @State private var isHoveringHaseab = false
@@ -722,7 +744,7 @@ public struct DashboardView: View {
         .contentShape(Rectangle())
         .scaleEffect(isHoveringTimeline ? 1.03 : 1.0)
         .animation(.easeOut(duration: 0.12), value: isHoveringTimeline)
-        .compactTopTooltip("Open Timeline", isVisible: $isHoveringTimeline)
+        .compactTopTooltip(timelineTooltipText, isVisible: $isHoveringTimeline)
         .onHover { hovering in
             isHoveringTimeline = hovering
             if hovering {
@@ -736,7 +758,10 @@ public struct DashboardView: View {
     // MARK: - Monitor Button
 
     private var monitorButton: some View {
-        MonitorButton(isProcessing: viewModel.ocrQueueDepth > 0)
+        MonitorButton(
+            isProcessing: viewModel.ocrQueueDepth > 0,
+            tooltipText: systemMonitorTooltipText
+        )
     }
 
     // MARK: - Changelog Button
@@ -778,7 +803,7 @@ public struct DashboardView: View {
         .contentShape(Rectangle())
         .scaleEffect(isHoveringSettings ? 1.03 : 1.0)
         .animation(.easeOut(duration: 0.12), value: isHoveringSettings)
-        .compactTopTooltip("Open Settings", isVisible: $isHoveringSettings)
+        .compactTopTooltip(settingsTooltipText, isVisible: $isHoveringSettings)
         .onHover { hovering in
             isHoveringSettings = hovering
             if hovering {
@@ -787,6 +812,27 @@ public struct DashboardView: View {
                 NSCursor.pop()
             }
         }
+    }
+
+    private func decodedShortcut(from data: Data, fallback: ShortcutConfig) -> ShortcutConfig {
+        guard !data.isEmpty,
+              let shortcut = try? JSONDecoder().decode(ShortcutConfig.self, from: data) else {
+            return fallback
+        }
+        return shortcut
+    }
+
+    private func tooltipText(title: String, shortcut: ShortcutConfig) -> String {
+        guard !shortcut.key.isEmpty else { return title }
+        return tooltipText(title: title, shortcutText: formattedShortcut(shortcut))
+    }
+
+    private func tooltipText(title: String, shortcutText: String) -> String {
+        "\(title)\n(\(shortcutText))"
+    }
+
+    private func formattedShortcut(_ shortcut: ShortcutConfig) -> String {
+        shortcut.modifiers.displaySymbols.joined() + shortcut.key
     }
 
     // MARK: - Recording Indicator
@@ -2264,6 +2310,7 @@ private struct LogoTriangle: Shape {
 /// Extracted to its own view so animation state changes don't cause DashboardView to re-render
 private struct MonitorButton: View {
     let isProcessing: Bool
+    let tooltipText: String
 
     @State private var heartbeatScale: CGFloat = 1.0
     @State private var isHovering = false
@@ -2290,7 +2337,7 @@ private struct MonitorButton: View {
         .contentShape(Rectangle())
         .scaleEffect(isHovering ? 1.03 : 1.0)
         .animation(.easeOut(duration: 0.12), value: isHovering)
-        .compactTopTooltip("Open System Monitor", isVisible: $isHovering)
+        .compactTopTooltip(tooltipText, isVisible: $isHovering)
         .onHover { hovering in
             isHovering = hovering
             if hovering {
@@ -2341,6 +2388,14 @@ private struct CompactTopTooltip: ViewModifier {
     let text: String
     @Binding var isVisible: Bool
 
+    private var isMultiline: Bool {
+        text.contains("\n")
+    }
+
+    private var verticalOffset: CGFloat {
+        isMultiline ? -34 : -26
+    }
+
     func body(content: Content) -> some View {
         content
             .overlay(alignment: .top) {
@@ -2348,15 +2403,16 @@ private struct CompactTopTooltip: ViewModifier {
                     Text(text)
                         .font(.system(size: 10, weight: .semibold))
                         .foregroundColor(.white.opacity(0.95))
-                        .lineLimit(1)
-                        .fixedSize()
-                        .padding(.horizontal, 7)
-                        .padding(.vertical, 3)
+                        .lineLimit(isMultiline ? 2 : 1)
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: true, vertical: true)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, isMultiline ? 5 : 3)
                         .background(
-                            Capsule()
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
                                 .fill(Color.black.opacity(0.82))
                         )
-                        .offset(y: -26)
+                        .offset(y: verticalOffset)
                         .transition(.opacity.combined(with: .offset(y: 3)))
                         .allowsHitTesting(false)
                 }
