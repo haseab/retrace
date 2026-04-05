@@ -22,6 +22,31 @@ enum TimelineMetrics {
             metadata: UIMetricsRecorder.jsonMetadata(payload)
         )
     }
+
+    static func recordSearchResultNavigation(
+        coordinator: AppCoordinator,
+        direction: String,
+        trigger: String,
+        position: Int,
+        loadedCount: Int,
+        didMove: Bool,
+        didRequestMore: Bool
+    ) {
+        let payload: [String: Any] = [
+            "scope": "search_result_highlight",
+            "direction": direction,
+            "trigger": trigger,
+            "position": position,
+            "loaded_count": loadedCount,
+            "did_move": didMove,
+            "did_request_more": didRequestMore
+        ]
+        UIMetricsRecorder.record(
+            coordinator: coordinator,
+            type: .arrowKeyNavigation,
+            metadata: UIMetricsRecorder.jsonMetadata(payload)
+        )
+    }
 }
 
 private enum UIMetricsRecorder {

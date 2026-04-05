@@ -657,7 +657,9 @@ public struct SimpleTimelineView: View {
 
     @ViewBuilder
     private func topHintOverlay(shouldRenderSearchHighlightControlsHint: Bool) -> some View {
+        let searchResultNavigationState = viewModel.searchResultHighlightNavigationState
         let hasVisibleHints =
+            searchResultNavigationState != nil ||
             viewModel.showControlsHiddenRestoreHintBanner ||
             viewModel.showPositionRecoveryHintBanner ||
             viewModel.showTextSelectionHint ||
@@ -666,6 +668,30 @@ public struct SimpleTimelineView: View {
 
         if hasVisibleHints {
             TimelineHintOverlayStack {
+                if let searchResultNavigationState {
+                    SearchResultNavigationBanner(
+                        state: searchResultNavigationState,
+                        onNavigatePrevious: {
+                            Task {
+                                await viewModel.navigateToAdjacentSearchResult(
+                                    offset: -1,
+                                    trigger: .button
+                                )
+                            }
+                        },
+                        onNavigateNext: {
+                            Task {
+                                await viewModel.navigateToAdjacentSearchResult(
+                                    offset: 1,
+                                    trigger: .button
+                                )
+                            }
+                        }
+                    )
+                    .fixedSize()
+                    .transition(Self.topHintTransition)
+                }
+
                 if viewModel.showControlsHiddenRestoreHintBanner {
                     ControlsHiddenRestoreHintBanner(
                         onDismiss: { viewModel.dismissControlsHiddenRestoreHint() }
@@ -727,7 +753,7 @@ public struct SimpleTimelineView: View {
         guard !viewModel.areControlsHidden else { return false }
         guard !viewModel.isInFrameSearchVisible else { return false }
 
-        let highlightCutoffY = containerSize.height * 0.75
+        let highlightCutoffY = containerSize.height * 0.88
         var seenNodeIDs = Set<Int>()
         for match in viewModel.searchHighlightNodes {
             guard seenNodeIDs.insert(match.node.id).inserted else { continue }
@@ -5671,7 +5697,12 @@ struct SearchHighlightOverlay: View {
     private var highlightLayer: some View {
         Group {
             if highlightedRects.isEmpty {
-                Color.clear
+                if viewModel.isSearchResultNavigationModeActive,
+                   viewModel.searchHighlightMode == .matchedNodes {
+                    Color.black.opacity(0.25)
+                } else {
+                    Color.clear
+                }
             } else {
                 ZStack {
                     // Dark overlay
@@ -6790,6 +6821,106 @@ struct TextSelectionHintBanner: View {
                 KeyboardBadge(symbol: "⊹ Drag")
             }
         }
+    }
+}
+
+private struct SearchResultNavigationBanner: View {
+    let state: SearchViewModel.ResultNavigationState
+    let onNavigatePrevious: () -> Void
+    let onNavigateNext: () -> Void
+
+    var body: some View {
+        TimelineHintBanner(style: .card, onDismiss: nil) {
+            Image(systemName: "text.magnifyingglass")
+                .font(.retraceHeadline)
+                .foregroundColor(.white.opacity(0.92))
+
+            Text("Search result")
+                .font(.retraceCaptionMedium)
+                .foregroundColor(.white.opacity(0.9))
+
+            SearchResultNavigationButton(
+                systemImage: "chevron.left",
+                isDisabled: !state.canNavigatePrevious,
+                action: onNavigatePrevious
+            )
+
+            Text("\(state.currentPosition) of \(state.loadedCount)\(state.canLoadMore || state.isLoadingMore ? "+" : "")")
+                .font(.retraceCaptionMedium)
+                .foregroundColor(.white.opacity(0.9))
+                .monospacedDigit()
+                .frame(minWidth: 72, alignment: .center)
+
+            SearchResultNavigationButton(
+                systemImage: "chevron.right",
+                isDisabled: !state.canNavigateNext && !state.canLoadMore,
+                action: onNavigateNext
+            )
+
+            Rectangle()
+                .fill(Color.white.opacity(0.14))
+                .frame(width: 1, height: 18)
+
+            if state.isLoadingMore {
+                HStack(spacing: 6) {
+                    SpinnerView(size: 12, lineWidth: 1.8, color: .white.opacity(0.85))
+                    Text("Loading more")
+                        .font(.retraceCaption)
+                        .foregroundColor(.white.opacity(0.72))
+                }
+            } else {
+                Text("Use")
+                    .font(.retraceCaption)
+                    .foregroundColor(.white.opacity(0.72))
+
+                KeyboardBadge(symbol: "⌘ ⇧ ← / →")
+            }
+        }
+    }
+}
+
+private struct SearchResultNavigationButton: View {
+    let systemImage: String
+    let isDisabled: Bool
+    let action: () -> Void
+
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(.white.opacity(isDisabled ? 0.38 : 0.88))
+                .frame(width: 28, height: 28)
+                .background(
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(buttonBackgroundColor)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(Color.white.opacity(isDisabled ? 0.08 : 0.16), lineWidth: 1)
+                )
+        }
+        .buttonStyle(.plain)
+        .disabled(isDisabled)
+        .onHover { hovering in
+            isHovering = !isDisabled && hovering
+        }
+        .onChange(of: isDisabled) { disabled in
+            if disabled {
+                isHovering = false
+            }
+        }
+        .onDisappear {
+            isHovering = false
+        }
+    }
+
+    private var buttonBackgroundColor: Color {
+        if isDisabled {
+            return Color.white.opacity(0.04)
+        }
+        return Color.white.opacity(isHovering ? 0.18 : 0.1)
     }
 }
 

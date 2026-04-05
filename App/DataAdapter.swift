@@ -24,12 +24,7 @@ public actor DataAdapter {
     ]
 
     private static let searchDedupeLookbackWindow = 3
-    private static let searchDedupeSameTextMaxXDelta: Double = 0.10
-    private static let searchDedupeDifferentTextMaxXDelta: Double = 0.01
-    private static let searchDedupeScrollShiftMinWidthRatio: Double = 0.99
-    private static let searchDedupeScrollShiftMinHeightRatio: Double = 0.8
-    private static let searchDedupeSameTextMinWidthRatio: Double = 0.92
-    private static let searchDedupeSameTextMinHeightRatio: Double = 0.8
+    private static let searchDedupeDifferentPositionMinAxisDelta: Double = 0.25
     private static let searchAllRawBatchSize = 150
     private static let queryTokenizer = QueryTokenizer()
 
@@ -3198,14 +3193,14 @@ public actor DataAdapter {
                     ) AS node_text_signature,
                     ROW_NUMBER() OVER (
                         PARTITION BY b.frame_id, b.docid
-                        ORDER BY n.nodeOrder ASC
+                        ORDER BY n.nodeOrder DESC
                     ) AS rn
                 FROM batch b
                 JOIN node n ON n.frameId = b.frame_id
                 JOIN searchRanking_content sc ON sc.id = b.docid
                 WHERE \(highlightMatchClause)
             ),
-            first_node AS MATERIALIZED (
+            selected_node AS MATERIALIZED (
                 SELECT
                     frame_id,
                     docid,
@@ -3242,7 +3237,7 @@ public actor DataAdapter {
                 fn.node_height,
                 fn.node_text_signature
             FROM batch b
-            LEFT JOIN first_node fn ON fn.frame_id = b.frame_id AND fn.docid = b.docid
+            LEFT JOIN selected_node fn ON fn.frame_id = b.frame_id AND fn.docid = b.docid
             ORDER BY b.rank ASC, b.frame_id ASC
             """
 
@@ -3354,45 +3349,23 @@ public actor DataAdapter {
 
         let sourceRowsFetched = batch.count
         var dedupedRows: [RelevantSearchRow] = []
-        var recentAnchors: [SearchDedupeMatchBox] = []
-        var recentWindowNameSignatures: [String] = []
+        var recentAcceptedCandidates: [SearchDedupeCandidate] = []
 
         for row in batch {
-            let currentWindowNameSignature = normalizedWindowNameSignature(row.windowName)
-            if let highlightNode = row.highlightNode {
-                let currentAnchor = SearchDedupeMatchBox(
-                    label: "highlight",
-                    textSignature: normalizedSearchDedupeTextSignature(row.highlightTextSignature) ?? "",
-                    nodeOrder: highlightNode.nodeOrder,
-                    xBin: quantizedNodeBin(highlightNode.x),
-                    yBin: quantizedNodeBin(highlightNode.y),
-                    wBin: max(1, quantizedNodeBin(highlightNode.width)),
-                    hBin: max(1, quantizedNodeBin(highlightNode.height))
-                )
-                if recentAnchors.contains(where: { areConsecutiveDedupeBoxesSimilar($0, currentAnchor) }) {
-                    continue
-                }
-                recentAnchors.append(currentAnchor)
-                if recentAnchors.count > Self.searchDedupeLookbackWindow {
-                    recentAnchors.removeFirst(recentAnchors.count - Self.searchDedupeLookbackWindow)
-                }
-            } else {
-                recentAnchors.removeAll(keepingCapacity: true)
-            }
-
-            if let currentWindowNameSignature,
-               recentWindowNameSignatures.contains(where: { areConsecutiveWindowNamesSimilar($0, currentWindowNameSignature) }) {
+            let currentCandidate = makeSearchDedupeCandidate(
+                highlightTextSignature: row.highlightTextSignature,
+                highlightNode: row.highlightNode
+            )
+            if shouldDeduplicateSearchResult(currentCandidate, recentAccepted: recentAcceptedCandidates) {
                 continue
             }
 
             dedupedRows.append(row)
-            if let currentWindowNameSignature {
-                recentWindowNameSignatures.append(currentWindowNameSignature)
-                if recentWindowNameSignatures.count > Self.searchDedupeLookbackWindow {
-                    recentWindowNameSignatures.removeFirst(recentWindowNameSignatures.count - Self.searchDedupeLookbackWindow)
-                }
-            } else {
-                recentWindowNameSignatures.removeAll(keepingCapacity: true)
+            recentAcceptedCandidates.append(currentCandidate)
+            if recentAcceptedCandidates.count > Self.searchDedupeLookbackWindow {
+                recentAcceptedCandidates.removeFirst(
+                    recentAcceptedCandidates.count - Self.searchDedupeLookbackWindow
+                )
             }
         }
 
@@ -3839,14 +3812,14 @@ public actor DataAdapter {
                         ) AS node_text_signature,
                         ROW_NUMBER() OVER (
                             PARTITION BY b.frame_id, b.docid
-                            ORDER BY n.nodeOrder ASC
+                            ORDER BY n.nodeOrder DESC
                         ) AS rn
                     FROM batch b
                     JOIN node n ON n.frameId = b.frame_id
                     JOIN searchRanking_content sc ON sc.id = b.docid
                     WHERE \(highlightMatchClause)
                 ),
-                first_node AS MATERIALIZED (
+                selected_node AS MATERIALIZED (
                     SELECT
                         frame_id,
                         docid,
@@ -3882,7 +3855,7 @@ public actor DataAdapter {
                     fn.node_height,
                     fn.node_text_signature
                 FROM batch b
-                LEFT JOIN first_node fn ON fn.frame_id = b.frame_id AND fn.docid = b.docid
+                LEFT JOIN selected_node fn ON fn.frame_id = b.frame_id AND fn.docid = b.docid
                 ORDER BY b.timestamp \(sortOrderClause), b.frame_id \(sortOrderClause)
                 """
 
@@ -3982,46 +3955,23 @@ public actor DataAdapter {
         let batch = try fetchFrameBatch(limit: batchFetchLimit, offset: batchOffset, cursor: frameCursor)
         let sourceRowsFetched = batch.count
         var dedupedRows: [FrameSearchRow] = []
-        var recentAnchors: [SearchDedupeMatchBox] = []
-        var recentWindowNameSignatures: [String] = []
+        var recentAcceptedCandidates: [SearchDedupeCandidate] = []
 
         for row in batch {
-            let currentWindowNameSignature = normalizedWindowNameSignature(row.windowName)
-            if let highlightNode = row.highlightNode {
-                let currentAnchor = SearchDedupeMatchBox(
-                    label: "highlight",
-                    textSignature: normalizedSearchDedupeTextSignature(row.highlightTextSignature) ?? "",
-                    nodeOrder: highlightNode.nodeOrder,
-                    xBin: quantizedNodeBin(highlightNode.x),
-                    yBin: quantizedNodeBin(highlightNode.y),
-                    wBin: max(1, quantizedNodeBin(highlightNode.width)),
-                    hBin: max(1, quantizedNodeBin(highlightNode.height))
-                )
-                if recentAnchors.contains(where: { areConsecutiveDedupeBoxesSimilar($0, currentAnchor) }) {
-                    continue
-                }
-                recentAnchors.append(currentAnchor)
-                if recentAnchors.count > Self.searchDedupeLookbackWindow {
-                    recentAnchors.removeFirst(recentAnchors.count - Self.searchDedupeLookbackWindow)
-                }
-            } else {
-                // No highlight node available; keep row and reset positional streak.
-                recentAnchors.removeAll(keepingCapacity: true)
-            }
-
-            if let currentWindowNameSignature,
-               recentWindowNameSignatures.contains(where: { areConsecutiveWindowNamesSimilar($0, currentWindowNameSignature) }) {
+            let currentCandidate = makeSearchDedupeCandidate(
+                highlightTextSignature: row.highlightTextSignature,
+                highlightNode: row.highlightNode
+            )
+            if shouldDeduplicateSearchResult(currentCandidate, recentAccepted: recentAcceptedCandidates) {
                 continue
             }
 
             dedupedRows.append(row)
-            if let currentWindowNameSignature {
-                recentWindowNameSignatures.append(currentWindowNameSignature)
-                if recentWindowNameSignatures.count > Self.searchDedupeLookbackWindow {
-                    recentWindowNameSignatures.removeFirst(recentWindowNameSignatures.count - Self.searchDedupeLookbackWindow)
-                }
-            } else {
-                recentWindowNameSignatures.removeAll(keepingCapacity: true)
+            recentAcceptedCandidates.append(currentCandidate)
+            if recentAcceptedCandidates.count > Self.searchDedupeLookbackWindow {
+                recentAcceptedCandidates.removeFirst(
+                    recentAcceptedCandidates.count - Self.searchDedupeLookbackWindow
+                )
             }
         }
         let frameResults = dedupedRows
@@ -4389,54 +4339,48 @@ public actor DataAdapter {
         return dedupeTokens
     }
 
-    private struct SearchDedupeMatchBox: Hashable {
-        let label: String
-        let textSignature: String
-        let nodeOrder: Int
-        let xBin: Int
-        let yBin: Int
-        let wBin: Int
-        let hBin: Int
-
-        var minX: Double { Double(xBin) / 1000.0 }
-        var minY: Double { Double(yBin) / 1000.0 }
-        var width: Double { max(0.0, Double(wBin) / 1000.0) }
-        var height: Double { max(0.0, Double(hBin) / 1000.0) }
-        var maxX: Double { minX + width }
-        var maxY: Double { minY + height }
-        var centerX: Double { minX + (width / 2.0) }
-        var centerY: Double { minY + (height / 2.0) }
+    private struct SearchDedupeCandidate: Equatable {
+        let highlightTextSignature: String?
+        let highlightPosition: CGPoint?
     }
 
-    private static func areConsecutiveDedupeBoxesSimilar(
-        _ lhs: SearchDedupeMatchBox,
-        _ rhs: SearchDedupeMatchBox
+    private static func makeSearchDedupeCandidate(
+        highlightTextSignature: String?,
+        highlightNode: SearchResult.HighlightNode?
+    ) -> SearchDedupeCandidate {
+        SearchDedupeCandidate(
+            highlightTextSignature: normalizedSearchDedupeTextSignature(highlightTextSignature),
+            highlightPosition: highlightNode.map { CGPoint(x: $0.x, y: $0.y) }
+        )
+    }
+
+    private static func shouldDeduplicateSearchResult(
+        _ current: SearchDedupeCandidate,
+        recentAccepted: [SearchDedupeCandidate]
     ) -> Bool {
-        guard lhs.label == rhs.label else {
+        guard let currentHighlightTextSignature = current.highlightTextSignature,
+              let currentHighlightPosition = current.highlightPosition else {
             return false
         }
 
-        let widthRatio = ratioSimilarity(lhs.width, rhs.width)
-        let heightRatio = ratioSimilarity(lhs.height, rhs.height)
-        let sameText = !lhs.textSignature.isEmpty && lhs.textSignature == rhs.textSignature
-        let minWidthRatio = sameText ? Self.searchDedupeSameTextMinWidthRatio : Self.searchDedupeScrollShiftMinWidthRatio
-        let minHeightRatio = sameText ? Self.searchDedupeSameTextMinHeightRatio : Self.searchDedupeScrollShiftMinHeightRatio
-        let maxXDelta = sameText ? Self.searchDedupeSameTextMaxXDelta : Self.searchDedupeDifferentTextMaxXDelta
+        for previous in recentAccepted.suffix(Self.searchDedupeLookbackWindow) {
+            guard previous.highlightTextSignature == currentHighlightTextSignature,
+                  let previousHighlightPosition = previous.highlightPosition else {
+                continue
+            }
 
-        let xCenterDelta = abs(lhs.centerX - rhs.centerX)
-        if xCenterDelta <= maxXDelta &&
-            widthRatio >= minWidthRatio &&
-            heightRatio >= minHeightRatio {
-            return true
+            let xDelta = abs(previousHighlightPosition.x - currentHighlightPosition.x)
+            let yDelta = abs(previousHighlightPosition.y - currentHighlightPosition.y)
+            let isMeaningfullyDifferentPosition =
+                xDelta >= Self.searchDedupeDifferentPositionMinAxisDelta &&
+                yDelta >= Self.searchDedupeDifferentPositionMinAxisDelta
+
+            if !isMeaningfullyDifferentPosition {
+                return true
+            }
         }
 
         return false
-    }
-
-    private static func ratioSimilarity(_ lhs: Double, _ rhs: Double) -> Double {
-        let maxValue = max(lhs, rhs)
-        guard maxValue > 0.0 else { return 0.0 }
-        return min(lhs, rhs) / maxValue
     }
 
     private static func normalizedSearchDedupeTextSignature(_ text: String?) -> String? {
@@ -4447,44 +4391,13 @@ public actor DataAdapter {
             return nil
         }
 
+        let boundaryTrimSet = CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters)
         let normalized = raw
             .split(whereSeparator: { $0.isWhitespace })
             .joined(separator: " ")
+            .trimmingCharacters(in: boundaryTrimSet)
 
         return normalized.isEmpty ? nil : normalized
-    }
-
-    private static func normalizedWindowNameSignature(_ windowName: String?) -> String? {
-        guard let raw = windowName?
-            .lowercased()
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-              !raw.isEmpty else {
-            return nil
-        }
-
-        var normalized = ""
-        normalized.reserveCapacity(raw.count)
-
-        for scalar in raw.unicodeScalars {
-            if CharacterSet.letters.contains(scalar) {
-                normalized.unicodeScalars.append(scalar)
-            }
-        }
-
-        return normalized.isEmpty ? nil : normalized
-    }
-
-    private static func areConsecutiveWindowNamesSimilar(
-        _ lhs: String?,
-        _ rhs: String?
-    ) -> Bool {
-        guard let lhs, let rhs else { return false }
-        guard !lhs.isEmpty, !rhs.isEmpty else { return false }
-        return lhs == rhs
-    }
-
-    private static func quantizedNodeBin(_ value: Double) -> Int {
-        Int((value * 1000.0).rounded())
     }
 
     /// Relevant-mode cursor encoding.

@@ -87,4 +87,57 @@ final class TimelineNavigationShortcutDecisionTests: XCTestCase {
             )
         )
     }
+
+    func testSearchResultNavigationShortcutSupportsCommandShiftArrowInHighlightMode() {
+        XCTAssertEqual(
+            TimelineWindowController.searchResultNavigationDirection(
+                keyCode: 123,
+                modifiers: [.command, .shift],
+                isSearchResultHighlightVisible: true
+            ),
+            .previous
+        )
+        XCTAssertEqual(
+            TimelineWindowController.searchResultNavigationDirection(
+                keyCode: 124,
+                modifiers: [.command, .shift],
+                isSearchResultHighlightVisible: true
+            ),
+            .next
+        )
+    }
+
+    func testSearchResultNavigationShortcutRejectsPlainCommandArrowInHighlightMode() {
+        XCTAssertNil(
+            TimelineWindowController.searchResultNavigationDirection(
+                keyCode: 123,
+                modifiers: [.command],
+                isSearchResultHighlightVisible: true
+            )
+        )
+        XCTAssertNil(
+            TimelineWindowController.searchResultNavigationDirection(
+                keyCode: 124,
+                modifiers: [.command],
+                isSearchResultHighlightVisible: true
+            )
+        )
+    }
+
+    func testSearchResultNavigationShortcutStaysDisabledOutsideHighlightMode() {
+        XCTAssertNil(
+            TimelineWindowController.searchResultNavigationDirection(
+                keyCode: 123,
+                modifiers: [.command],
+                isSearchResultHighlightVisible: false
+            )
+        )
+        XCTAssertNil(
+            TimelineWindowController.searchResultNavigationDirection(
+                keyCode: 124,
+                modifiers: [.command, .shift],
+                isSearchResultHighlightVisible: false
+            )
+        )
+    }
 }

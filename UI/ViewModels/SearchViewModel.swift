@@ -226,6 +226,20 @@ public class SearchViewModel: ObservableObject {
         }
     }
 
+    struct ResultNavigationState: Equatable {
+        let currentIndex: Int
+        let loadedCount: Int
+        let canNavigatePrevious: Bool
+        let canNavigateNext: Bool
+        let canLoadMore: Bool
+        let isLoadingMore: Bool
+
+        var currentPosition: Int { currentIndex + 1 }
+        var requestsMoreResultsOnNextAdvance: Bool {
+            canLoadMore && currentIndex >= max(0, loadedCount - 2)
+        }
+    }
+
     // MARK: - Published State
 
     @Published public var searchQuery: String = "" {
@@ -1318,6 +1332,8 @@ public class SearchViewModel: ObservableObject {
         guard !query.isEmpty else {
             results = nil
             committedSearchQuery = ""
+            selectedResult = nil
+            showingFrameViewer = false
             clearInMemoryThumbnailCache()
             didReachPaginationEnd = false
             nextPageCursor = nil
@@ -1332,6 +1348,8 @@ public class SearchViewModel: ObservableObject {
 
         results = nil  // Clear old results immediately to prevent stale thumbnail loads
         savedScrollPosition = 0  // Reset scroll position for new search
+        selectedResult = nil
+        showingFrameViewer = false
         clearInMemoryThumbnailCache()  // Clear in-memory thumbnail cache for new search
         searchGeneration += 1  // Increment generation to invalidate in-flight thumbnail loads
         committedSearchQuery = query  // Set committed query for thumbnail cache keys
@@ -1669,6 +1687,10 @@ public class SearchViewModel: ObservableObject {
     public func selectResult(_ result: SearchResult) {
         selectedResult = result
         showingFrameViewer = true
+        updateSavedScrollPosition(for: result)
+        if let selectedIndex = selectedResultIndex(in: results?.results, selectedResult: result) {
+            prefetchMoreResultsIfNeeded(selectedIndex: selectedIndex)
+        }
     }
 
     public func closeFrameViewer() {
@@ -2058,26 +2080,88 @@ public class SearchViewModel: ObservableObject {
 
     // MARK: - Navigation
 
-    public func nextResult() {
-        guard let results = results,
-              let current = selectedResult,
-              let index = results.results.firstIndex(where: { $0.frameID == current.frameID }),
-              index + 1 < results.results.count else {
-            return
+    var selectedResultNavigationState: ResultNavigationState? {
+        guard let loadedResults = results?.results,
+              let currentIndex = selectedResultIndex(in: loadedResults) else {
+            return nil
         }
 
-        selectResult(results.results[index + 1])
+        return ResultNavigationState(
+            currentIndex: currentIndex,
+            loadedCount: loadedResults.count,
+            canNavigatePrevious: currentIndex > 0,
+            canNavigateNext: currentIndex + 1 < loadedResults.count,
+            canLoadMore: canLoadMore,
+            isLoadingMore: isLoadingMore
+        )
     }
 
-    public func previousResult() {
-        guard let results = results,
-              let current = selectedResult,
-              let index = results.results.firstIndex(where: { $0.frameID == current.frameID }),
-              index > 0 else {
-            return
+    @discardableResult
+    public func nextResult() -> SearchResult? {
+        selectAdjacentResult(offset: 1)
+    }
+
+    @discardableResult
+    public func previousResult() -> SearchResult? {
+        selectAdjacentResult(offset: -1)
+    }
+
+    @discardableResult
+    func selectAdjacentResult(offset: Int) -> SearchResult? {
+        guard offset != 0,
+              let loadedResults = results?.results,
+              let currentIndex = selectedResultIndex(in: loadedResults) else {
+            return nil
         }
 
-        selectResult(results.results[index - 1])
+        prefetchMoreResultsIfNeeded(selectedIndex: currentIndex)
+
+        let targetIndex = currentIndex + offset
+        guard loadedResults.indices.contains(targetIndex) else {
+            return nil
+        }
+
+        let targetResult = loadedResults[targetIndex]
+        selectResult(targetResult)
+        return targetResult
+    }
+
+    private func selectedResultIndex(in loadedResults: [SearchResult]?, selectedResult: SearchResult? = nil) -> Int? {
+        guard let loadedResults else { return nil }
+        let targetResult = selectedResult ?? self.selectedResult
+        guard let targetResult else { return nil }
+        return loadedResults.firstIndex(where: { $0.id == targetResult.id })
+    }
+
+    private func updateSavedScrollPosition(for result: SearchResult) {
+        guard let selectedIndex = selectedResultIndex(in: results?.results, selectedResult: result) else {
+            return
+        }
+        savedScrollPosition = CGFloat(selectedIndex)
+    }
+
+    private func prefetchMoreResultsIfNeeded(selectedIndex: Int, threshold: Int = 1) {
+        guard let loadedResults = results?.results,
+              shouldPrefetchMoreResults(
+                  selectedIndex: selectedIndex,
+                  loadedCount: loadedResults.count,
+                  canLoadMore: canLoadMore,
+                  threshold: threshold
+              ) else {
+            return
+        }
+        loadMore()
+    }
+
+    private func shouldPrefetchMoreResults(
+        selectedIndex: Int,
+        loadedCount: Int,
+        canLoadMore: Bool,
+        threshold: Int
+    ) -> Bool {
+        guard loadedCount > 0, canLoadMore else { return false }
+        let prefetchBoundaryIndex = max(0, loadedCount - 1 - threshold)
+        return selectedIndex >= prefetchBoundaryIndex
     }
 
     // MARK: - Sharing

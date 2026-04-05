@@ -1403,11 +1403,44 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Whether search highlight is currently being displayed
     @Published public var isShowingSearchHighlight: Bool = false
 
-    /// Timer to auto-dismiss search highlight
-    private var searchHighlightTimer: Timer?
+    public var isSearchResultNavigationModeActive: Bool {
+        searchHighlightMode == .matchedNodes &&
+        normalizedRestorableSearchHighlightQuery(searchHighlightQuery) != nil
+    }
+
+    private var pendingSearchHighlightRevealTask: Task<Void, Never>?
+    private var pendingSearchHighlightResetTask: Task<Void, Never>?
+    private var searchResultNavigationGeneration: UInt64 = 0
+
+    enum SearchResultNavigationTrigger {
+        case button
+        case keyboard
+
+        var metricTrigger: String {
+            switch self {
+            case .button:
+                return "button"
+            case .keyboard:
+                return "keyboard"
+            }
+        }
+    }
+
+    var searchResultHighlightNavigationState: SearchViewModel.ResultNavigationState? {
+        guard isSearchResultNavigationModeActive,
+              !hasActiveInFrameSearchQuery else {
+            return nil
+        }
+        return searchViewModel.selectedResultNavigationState
+    }
 
     private var hasActiveInFrameSearchQuery: Bool {
         !inFrameSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private enum FrameNavigationContext: Equatable {
+        case manual
+        case searchResult
     }
 
     /// Timer for periodic processing status refresh while timeline is open
@@ -6959,6 +6992,24 @@ public class SimpleTimelineViewModel: ObservableObject {
         DashboardViewModel.recordKeyboardShortcut(coordinator: coordinator, shortcut: shortcut)
     }
 
+    private func recordSearchResultNavigation(
+        direction: String,
+        trigger: SearchResultNavigationTrigger,
+        state: SearchViewModel.ResultNavigationState,
+        didMove: Bool,
+        didRequestMore: Bool
+    ) {
+        TimelineMetrics.recordSearchResultNavigation(
+            coordinator: coordinator,
+            direction: direction,
+            trigger: trigger.metricTrigger,
+            position: state.currentPosition,
+            loadedCount: state.loadedCount,
+            didMove: didMove,
+            didRequestMore: didRequestMore
+        )
+    }
+
     /// Starts a latency trace for app quick-filter execution.
     /// The trace is consumed by the next filter reload path.
     public func beginCmdFQuickFilterLatencyTrace(
@@ -7716,8 +7767,8 @@ public class SimpleTimelineViewModel: ObservableObject {
             return
         }
 
-        searchHighlightTimer?.invalidate()
-        searchHighlightTimer = nil
+        invalidateSearchResultNavigation()
+        cancelPendingSearchHighlightTasks()
         searchHighlightMode = .matchedTextRanges
         searchHighlightQuery = normalizedQuery
         isShowingSearchHighlight = true
@@ -8491,6 +8542,18 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Navigate to a specific index in the frames array
     public func navigateToFrame(_ index: Int, fromScroll: Bool = false) {
+        performFrameNavigation(index, fromScroll: fromScroll, context: .manual)
+    }
+
+    private func navigateToFrameForSearchResult(_ index: Int) {
+        performFrameNavigation(index, fromScroll: false, context: .searchResult)
+    }
+
+    private func performFrameNavigation(
+        _ index: Int,
+        fromScroll: Bool,
+        context: FrameNavigationContext
+    ) {
         // Exit live mode on explicit navigation
         if isInLiveMode {
             exitLiveMode()
@@ -8512,8 +8575,12 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
 
         // Clear transient search-result highlight when manually navigating.
-        if isShowingSearchHighlight && !hasActiveInFrameSearchQuery {
-            clearSearchHighlight()
+        if context == .manual && !hasActiveInFrameSearchQuery {
+            if isShowingSearchHighlight {
+                clearSearchHighlight()
+            } else if isSearchResultNavigationModeActive {
+                clearSearchHighlightImmediately()
+            }
         }
         // Only dismiss search overlay if there's no active search query
         if isSearchOverlayVisible && searchViewModel.searchQuery.isEmpty {
@@ -8831,9 +8898,87 @@ public class SimpleTimelineViewModel: ObservableObject {
         Log.info("[PlayheadUndo] Navigation complete, now at index \(currentIndex)", category: .ui)
     }
 
+    private func beginSearchResultNavigation() -> UInt64 {
+        searchResultNavigationGeneration &+= 1
+        return searchResultNavigationGeneration
+    }
+
+    private func isCurrentSearchResultNavigation(_ generation: UInt64) -> Bool {
+        generation == searchResultNavigationGeneration
+    }
+
+    private func invalidateSearchResultNavigation() {
+        searchResultNavigationGeneration &+= 1
+    }
+
+    private func cancelPendingSearchHighlightTasks() {
+        pendingSearchHighlightRevealTask?.cancel()
+        pendingSearchHighlightRevealTask = nil
+        pendingSearchHighlightResetTask?.cancel()
+        pendingSearchHighlightResetTask = nil
+    }
+
+    private var activeSearchResultHighlightQuery: String? {
+        let candidates: [String?] = [
+            searchViewModel.committedSearchQuery,
+            searchViewModel.searchQuery,
+            searchHighlightQuery
+        ]
+
+        return candidates
+            .map { $0?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "" }
+            .first(where: { !$0.isEmpty })
+    }
+
+    func navigateToAdjacentSearchResult(
+        offset: Int,
+        trigger: SearchResultNavigationTrigger
+    ) async {
+        guard offset != 0,
+              let navigationState = searchResultHighlightNavigationState else {
+            return
+        }
+
+        let direction = offset > 0 ? "next" : "previous"
+        let didRequestMore = offset > 0 && navigationState.requestsMoreResultsOnNextAdvance
+
+        guard let targetResult = searchViewModel.selectAdjacentResult(offset: offset) else {
+            recordSearchResultNavigation(
+                direction: direction,
+                trigger: trigger,
+                state: navigationState,
+                didMove: false,
+                didRequestMore: didRequestMore
+            )
+            return
+        }
+
+        recordSearchResultNavigation(
+            direction: direction,
+            trigger: trigger,
+            state: navigationState,
+            didMove: true,
+            didRequestMore: didRequestMore
+        )
+
+        let highlightQuery = activeSearchResultHighlightQuery ?? targetResult.matchedText
+        await navigateToSearchResult(
+            frameID: targetResult.id,
+            timestamp: targetResult.timestamp,
+            highlightQuery: highlightQuery,
+            highlightImmediately: true
+        )
+    }
+
     /// Navigate to a specific frame by ID and highlight the search query
     /// Used when selecting a search result
-    public func navigateToSearchResult(frameID: FrameID, timestamp: Date, highlightQuery: String) async {
+    public func navigateToSearchResult(
+        frameID: FrameID,
+        timestamp: Date,
+        highlightQuery: String,
+        highlightImmediately: Bool = false
+    ) async {
+        let navigationGeneration = beginSearchResultNavigation()
         cancelPendingStoppedPositionRecording()
         _ = recordCurrentPositionImmediatelyForUndo(reason: "navigateToSearchResult.source")
 
@@ -8856,12 +9001,32 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         // First, try to find a frame with this ID in our current data
         if let index = frames.firstIndex(where: { $0.frame.id == frameID }) {
-            navigateToFrame(index)
+            guard isCurrentSearchResultNavigation(navigationGeneration) else {
+                setLoadingState(false, reason: "navigateToSearchResult.supersededBeforeFrameWindow")
+                return
+            }
+            navigateToFrameForSearchResult(index)
             _ = recordCurrentPositionImmediatelyForUndo(
                 reason: "navigateToSearchResult.destination",
                 highlightQueryOverride: highlightQuery
             )
-            showSearchHighlight(query: highlightQuery, mode: .matchedNodes)
+            if highlightImmediately {
+                showSearchHighlight(
+                    query: highlightQuery,
+                    mode: .matchedNodes,
+                    delay: 0,
+                    preserveExistingPresentation: true
+                )
+                await loadOCRNodesAsync()
+                guard isCurrentSearchResultNavigation(navigationGeneration) else { return }
+            } else {
+                showSearchHighlight(
+                    query: highlightQuery,
+                    mode: .matchedNodes,
+                    delay: 0.5
+                )
+            }
+            setLoadingState(false, reason: "navigateToSearchResult.localFrame")
             return
         }
 
@@ -8886,6 +9051,11 @@ public class SimpleTimelineViewModel: ObservableObject {
                 filters: filterCriteria,
                 reason: "navigateToSearchResult"
             )
+
+            guard isCurrentSearchResultNavigation(navigationGeneration) else {
+                setLoadingState(false, reason: "navigateToSearchResult.supersededBeforeHighlight")
+                return
+            }
 
             guard !framesWithVideoInfo.isEmpty else {
                 Log.warning("[SearchNavigation] No frames found in time range", category: .ui)
@@ -8924,10 +9094,29 @@ public class SimpleTimelineViewModel: ObservableObject {
             // Check if we need to pre-load more frames (near edge of loaded window)
             checkAndLoadMoreFrames()
 
+            if highlightImmediately {
+                showSearchHighlight(
+                    query: highlightQuery,
+                    mode: .matchedNodes,
+                    delay: 0,
+                    preserveExistingPresentation: true
+                )
+            }
+
             // Wait for OCR nodes to load before showing highlight
             // (loadImageIfNeeded calls loadOCRNodes but doesn't await it)
             await loadOCRNodesAsync()
-            showSearchHighlight(query: highlightQuery, mode: .matchedNodes)
+            guard isCurrentSearchResultNavigation(navigationGeneration) else {
+                setLoadingState(false, reason: "navigateToSearchResult.supersededAfterOCRLoad")
+                return
+            }
+            if !highlightImmediately {
+                showSearchHighlight(
+                    query: highlightQuery,
+                    mode: .matchedNodes,
+                    delay: 0.5
+                )
+            }
             setLoadingState(false, reason: "navigateToSearchResult.success")
             Log.info("[SearchNavigation] Navigation complete, now at index \(currentIndex)", category: .ui)
 
@@ -8939,48 +9128,62 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Show search highlight for the given query after a 0.5-second delay
     public func showSearchHighlight(query: String) {
-        showSearchHighlight(query: query, mode: .matchedTextRanges)
+        showSearchHighlight(query: query, mode: .matchedTextRanges, delay: 0.5)
     }
 
     func showSearchHighlight(
         query: String,
-        mode: SearchHighlightMode
+        mode: SearchHighlightMode,
+        delay: TimeInterval = 0.5,
+        preserveExistingPresentation: Bool = false
     ) {
-
-        // Clear any existing highlight first (so the view is removed and onAppear will fire again)
-        isShowingSearchHighlight = false
+        let shouldPreserveVisibleState = preserveExistingPresentation && isShowingSearchHighlight
+        cancelPendingSearchHighlightTasks()
+        // Clear any existing highlight first when we want the overlay to re-enter.
+        if !shouldPreserveVisibleState {
+            isShowingSearchHighlight = false
+        }
         searchHighlightQuery = query
         searchHighlightMode = mode
 
-        // Show highlight after 0.5 second delay
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-            guard let self = self else { return }
-            // Only show if the query and highlight mode haven't changed
-            if self.searchHighlightQuery == query && self.searchHighlightMode == mode {
-                self.isShowingSearchHighlight = true
-            }
+        guard delay > 0 else {
+            isShowingSearchHighlight = true
+            return
+        }
+
+        pendingSearchHighlightRevealTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(delay), clock: .continuous)
+            guard !Task.isCancelled, let self else { return }
+            guard self.searchHighlightQuery == query, self.searchHighlightMode == mode else { return }
+            self.isShowingSearchHighlight = true
+            self.pendingSearchHighlightRevealTask = nil
         }
     }
 
     /// Clear the search highlight
     public func clearSearchHighlight() {
-        searchHighlightTimer?.invalidate()
-        searchHighlightTimer = nil
+        invalidateSearchResultNavigation()
+        cancelPendingSearchHighlightTasks()
 
         let previousQuery = searchHighlightQuery
-        let previousMode = searchHighlightMode
         withAnimation(.easeOut(duration: 0.3)) {
             isShowingSearchHighlight = false
         }
+        searchHighlightMode = .matchedTextRanges
 
-        // Clear the query after animation
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-            guard let self else { return }
+        guard previousQuery != nil else {
+            searchHighlightQuery = nil
+            return
+        }
+
+        pendingSearchHighlightResetTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(300), clock: .continuous)
+            guard !Task.isCancelled, let self else { return }
             guard !self.isShowingSearchHighlight else { return }
             guard self.searchHighlightQuery == previousQuery else { return }
-            guard self.searchHighlightMode == previousMode else { return }
+            guard self.searchHighlightMode == .matchedTextRanges else { return }
             self.searchHighlightQuery = nil
-            self.searchHighlightMode = .matchedTextRanges
+            self.pendingSearchHighlightResetTask = nil
         }
     }
 
@@ -8990,8 +9193,8 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     private func clearSearchHighlightImmediately() {
-        searchHighlightTimer?.invalidate()
-        searchHighlightTimer = nil
+        invalidateSearchResultNavigation()
+        cancelPendingSearchHighlightTasks()
         isShowingSearchHighlight = false
         searchHighlightQuery = nil
         searchHighlightMode = .matchedTextRanges

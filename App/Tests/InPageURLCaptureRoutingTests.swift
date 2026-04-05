@@ -1012,6 +1012,142 @@ final class DataAdapterRewindBoundaryTests: XCTestCase {
         XCTAssertTrue(resultIDs.contains(includedFrameID.value))
     }
 
+    func testSearchUsesLastMatchingNodeForThumbnailPreviewAcrossModes() async throws {
+        let cutoffDate = makeCutoffDate()
+        let fixture = try await makeFixture(cutoffDate: cutoffDate)
+        defer {
+            Task {
+                try? await self.close(fixture)
+            }
+        }
+
+        let timestamp = cutoffDate.addingTimeInterval(3600)
+        let seeded = try await seedFrameRecord(
+            in: fixture.retraceDatabase,
+            timestamp: timestamp,
+            bundleID: "com.retrace.search",
+            text: "alpha beta alpha",
+            source: .native
+        )
+        try await fixture.retraceDatabase.insertNodes(
+            frameID: seeded.frameID,
+            nodes: [
+                (textOffset: 0, textLength: 5, bounds: CGRect(x: 10, y: 10, width: 120, height: 24), windowIndex: nil),
+                (textOffset: 6, textLength: 4, bounds: CGRect(x: 160, y: 10, width: 120, height: 24), windowIndex: nil),
+                (textOffset: 11, textLength: 5, bounds: CGRect(x: 310, y: 10, width: 120, height: 24), windowIndex: nil)
+            ],
+            frameWidth: 1_000,
+            frameHeight: 1_000
+        )
+
+        let allResults = try await fixture.adapter.search(query: SearchQuery(text: "alpha", mode: .all))
+        let relevantResults = try await fixture.adapter.search(query: SearchQuery(text: "alpha", mode: .relevant))
+
+        let allResult = try XCTUnwrap(allResults.results.first)
+        let relevantResult = try XCTUnwrap(relevantResults.results.first)
+
+        XCTAssertEqual(allResults.results.count, 1)
+        XCTAssertEqual(relevantResults.results.count, 1)
+        XCTAssertEqual(allResult.highlightNode?.nodeOrder, 2)
+        XCTAssertEqual(relevantResult.highlightNode?.nodeOrder, 2)
+    }
+
+    func testSearchDeduplicatesSameTextWhenOnlyOneAxisMovesFarEnough() async throws {
+        let cutoffDate = makeCutoffDate()
+        let fixture = try await makeFixture(cutoffDate: cutoffDate)
+        defer {
+            Task {
+                try? await self.close(fixture)
+            }
+        }
+
+        let first = try await seedFrameRecord(
+            in: fixture.retraceDatabase,
+            timestamp: cutoffDate.addingTimeInterval(3600),
+            bundleID: "com.retrace.search",
+            text: "alpha",
+            source: .native
+        )
+        let second = try await seedFrameRecord(
+            in: fixture.retraceDatabase,
+            timestamp: cutoffDate.addingTimeInterval(3660),
+            bundleID: "com.retrace.search",
+            text: "alpha",
+            source: .native
+        )
+
+        try await fixture.retraceDatabase.insertNodes(
+            frameID: first.frameID,
+            nodes: [
+                (textOffset: 0, textLength: 5, bounds: CGRect(x: 10, y: 10, width: 120, height: 24), windowIndex: nil)
+            ],
+            frameWidth: 1_000,
+            frameHeight: 1_000
+        )
+        try await fixture.retraceDatabase.insertNodes(
+            frameID: second.frameID,
+            nodes: [
+                (textOffset: 0, textLength: 5, bounds: CGRect(x: 10, y: 340, width: 120, height: 24), windowIndex: nil)
+            ],
+            frameWidth: 1_000,
+            frameHeight: 1_000
+        )
+
+        let results = try await fixture.adapter.search(
+            query: SearchQuery(text: "alpha", mode: .all, sortOrder: .oldestFirst)
+        )
+
+        XCTAssertEqual(results.results.map(\.id.value), [first.frameID.value])
+    }
+
+    func testSearchKeepsSameTextWhenBothAxesMoveFarEnough() async throws {
+        let cutoffDate = makeCutoffDate()
+        let fixture = try await makeFixture(cutoffDate: cutoffDate)
+        defer {
+            Task {
+                try? await self.close(fixture)
+            }
+        }
+
+        let first = try await seedFrameRecord(
+            in: fixture.retraceDatabase,
+            timestamp: cutoffDate.addingTimeInterval(3600),
+            bundleID: "com.retrace.search",
+            text: "alpha",
+            source: .native
+        )
+        let second = try await seedFrameRecord(
+            in: fixture.retraceDatabase,
+            timestamp: cutoffDate.addingTimeInterval(3660),
+            bundleID: "com.retrace.search",
+            text: "alpha",
+            source: .native
+        )
+
+        try await fixture.retraceDatabase.insertNodes(
+            frameID: first.frameID,
+            nodes: [
+                (textOffset: 0, textLength: 5, bounds: CGRect(x: 10, y: 10, width: 120, height: 24), windowIndex: nil)
+            ],
+            frameWidth: 1_000,
+            frameHeight: 1_000
+        )
+        try await fixture.retraceDatabase.insertNodes(
+            frameID: second.frameID,
+            nodes: [
+                (textOffset: 0, textLength: 5, bounds: CGRect(x: 340, y: 340, width: 120, height: 24), windowIndex: nil)
+            ],
+            frameWidth: 1_000,
+            frameHeight: 1_000
+        )
+
+        let results = try await fixture.adapter.search(
+            query: SearchQuery(text: "alpha", mode: .all, sortOrder: .oldestFirst)
+        )
+
+        XCTAssertEqual(results.results.map(\.id.value), [first.frameID.value, second.frameID.value])
+    }
+
     func testSearchThrowsWhenNativeSourceFailsUnexpectedlyAndRewindHasNoMatches() async throws {
         let cutoffDate = makeCutoffDate()
         let brokenRetracePool = SQLiteReadConnectionPool(

@@ -140,6 +140,43 @@ final class FocusableTextInputSupportTests: XCTestCase {
         XCTAssertTrue(window.spyFieldEditor.didPaste)
     }
 
+    func testFocusableTextFieldCommandReturnInvokesCommandReturnCallback() throws {
+        let window = KeyableWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 320, height: 120),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        let contentView = NSView(frame: window.contentRect(forFrameRect: window.frame))
+        window.contentView = contentView
+
+        let textField = FocusableTextField(frame: NSRect(x: 20, y: 40, width: 240, height: 24))
+        contentView.addSubview(textField)
+
+        var didInvokeCommandReturn = false
+        textField.onCommandReturnCallback = {
+            didInvokeCommandReturn = true
+        }
+
+        let commandReturn = try XCTUnwrap(
+            NSEvent.keyEvent(
+                with: .keyDown,
+                location: .zero,
+                modifierFlags: [.command],
+                timestamp: 0,
+                windowNumber: window.windowNumber,
+                context: nil,
+                characters: "\r",
+                charactersIgnoringModifiers: "\r",
+                isARepeat: false,
+                keyCode: 36
+            )
+        )
+
+        XCTAssertTrue(textField.performKeyEquivalent(with: commandReturn))
+        XCTAssertTrue(didInvokeCommandReturn)
+    }
+
     func testShouldDeferRightClickToTextInputWhenHitEditableTextField() throws {
         let window = KeyableWindow(
             contentRect: NSRect(x: 0, y: 0, width: 320, height: 120),

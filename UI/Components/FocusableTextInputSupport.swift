@@ -7,6 +7,7 @@ final class FocusableTextField: NSTextField {
     var onCancelCallback: (() -> Void)?
     var onClickCallback: (() -> Void)?
     var onWindowAttachedCallback: (() -> Void)?
+    var onCommandReturnCallback: (() -> Void)?
 
     override func mouseDown(with event: NSEvent) {
         onClickCallback?()
@@ -20,6 +21,13 @@ final class FocusableTextField: NSTextField {
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
+        if modifiers == [.command],
+           (event.keyCode == 36 || event.keyCode == 76),
+           let onCommandReturnCallback {
+            onCommandReturnCallback()
+            return true
+        }
+
         guard modifiers == [.command],
               let key = event.charactersIgnoringModifiers?.lowercased() else {
             return super.performKeyEquivalent(with: event)

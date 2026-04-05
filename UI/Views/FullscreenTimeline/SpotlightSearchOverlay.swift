@@ -400,19 +400,7 @@ public struct SpotlightSearchOverlay: View {
 
                 SpotlightSearchField(
                     text: $viewModel.searchQuery,
-                    onSubmit: {
-                        if isRecentEntriesPopoverVisible {
-                            selectHighlightedRecentEntry()
-                            return
-                        }
-                        if !viewModel.searchQuery.isEmpty {
-                            withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                                isExpanded = true
-                            }
-                            prepareResultKeyboardNavigationAfterSubmit()
-                            viewModel.submitSearch()
-                        }
-                    },
+                    onSubmit: handleSearchFieldSubmit,
                     onEscape: {
                         handleSearchEscape()
                     },
@@ -555,6 +543,33 @@ public struct SpotlightSearchOverlay: View {
             y: 0
         )
         .animation(.easeOut(duration: 0.18), value: isSpotlightSearchGlowActive)
+    }
+
+    static func shouldSelectHighlightedRecentEntry(
+        isRecentEntriesPopoverVisible: Bool,
+        forceRawQuerySubmit: Bool
+    ) -> Bool {
+        isRecentEntriesPopoverVisible && !forceRawQuerySubmit
+    }
+
+    private func handleSearchFieldSubmit(forceRawQuerySubmit: Bool) {
+        if Self.shouldSelectHighlightedRecentEntry(
+            isRecentEntriesPopoverVisible: isRecentEntriesPopoverVisible,
+            forceRawQuerySubmit: forceRawQuerySubmit
+        ) {
+            selectHighlightedRecentEntry()
+            return
+        }
+
+        guard !viewModel.searchQuery.isEmpty else { return }
+        if forceRawQuerySubmit {
+            DashboardViewModel.recordKeyboardShortcut(coordinator: coordinator, shortcut: "cmd+enter")
+        }
+        withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+            isExpanded = true
+        }
+        prepareResultKeyboardNavigationAfterSubmit()
+        viewModel.submitSearch(trigger: forceRawQuerySubmit ? "command-submit" : "submit")
     }
 
     // MARK: - Recent Entries
@@ -1328,8 +1343,6 @@ public struct SpotlightSearchOverlay: View {
 
     private func loadThumbnail(for result: SearchResult) {
         let key = thumbnailKey(for: result)
-        // Use committedSearchQuery for highlighting (the query that was actually searched)
-        let searchQuery = viewModel.committedSearchQuery
         let currentGeneration = viewModel.searchGeneration
 
         if viewModel.thumbnailCache[key] != nil {
@@ -1394,31 +1407,7 @@ public struct SpotlightSearchOverlay: View {
                         size: thumbnailSize
                     )
                 } else {
-                    // 2. Get OCR nodes for this frame (use frameID for exact match)
-                    let ocrNodes = try await coordinator.getAllOCRNodes(
-                        frameID: result.frameID,
-                        source: result.source
-                    )
-
-                    // Check if search generation changed again
-                    guard viewModel.searchGeneration == currentGeneration else {
-                        viewModel.failThumbnailLoad(with: nil, for: key, generation: currentGeneration)
-                        return
-                    }
-
-                    // 3. Find the matching OCR node for the search query
-                    let matchingNode = findMatchingOCRNode(query: searchQuery, nodes: ocrNodes)
-
-                    // 4. Create the highlighted thumbnail
-                    if let matchNode = matchingNode {
-                        thumbnail = createHighlightedThumbnail(
-                            from: fullImage,
-                            matchingNode: matchNode,
-                            size: thumbnailSize
-                        )
-                    } else {
-                        thumbnail = createThumbnail(from: fullImage, size: thumbnailSize)
-                    }
+                    thumbnail = createThumbnail(from: fullImage, size: thumbnailSize)
                 }
 
                 viewModel.finishThumbnailLoad(
@@ -1476,75 +1465,6 @@ public struct SpotlightSearchOverlay: View {
 
         thumbnail.unlockFocus()
         return thumbnail
-    }
-
-    /// Find the OCR node that best matches the search query
-    /// Handles both exact phrase matching (quoted queries) and individual term matching
-    private func findMatchingOCRNode(query: String, nodes: [OCRNodeWithText]) -> OCRNodeWithText? {
-        let trimmedQuery = query.trimmingCharacters(in: .whitespaces)
-
-        // Check if this is an exact phrase search (wrapped in quotes)
-        let isExactPhraseSearch = trimmedQuery.hasPrefix("\"") && trimmedQuery.hasSuffix("\"") && trimmedQuery.count > 2
-
-        if isExactPhraseSearch {
-            // Extract phrase without quotes and search for exact consecutive match
-            let phrase = String(trimmedQuery.dropFirst().dropLast()).lowercased()
-
-            // Only match if the exact phrase appears in the node
-            for node in nodes {
-                if node.text.lowercased().contains(phrase) {
-                    return node
-                }
-            }
-
-            // No fallback for exact phrase search - return nil if not found
-            return nil
-        }
-
-        // Non-quoted search: split into terms and search for any term
-        let queryTerms = trimmedQuery.lowercased()
-            .components(separatedBy: .whitespaces)
-            .filter { !$0.isEmpty }
-
-        // First pass: find node containing any query term as exact word
-        for node in nodes {
-            let nodeText = node.text.lowercased()
-            for term in queryTerms {
-                let pattern = "\\b\(NSRegularExpression.escapedPattern(for: term))\\b"
-                if let regex = try? NSRegularExpression(pattern: pattern, options: []),
-                   regex.firstMatch(in: nodeText, options: [], range: NSRange(nodeText.startIndex..., in: nodeText)) != nil {
-                    return node
-                }
-            }
-        }
-
-        // Second pass: find any substring match as fallback
-        for node in nodes {
-            let nodeText = node.text.lowercased()
-            for term in queryTerms {
-                if nodeText.contains(term) {
-                    return node
-                }
-            }
-        }
-
-        return nil
-    }
-
-    /// Create a thumbnail cropped around the matching OCR node with a yellow highlight
-    private func createHighlightedThumbnail(
-        from image: NSImage,
-        matchingNode: OCRNodeWithText,
-        size: CGSize
-    ) -> NSImage {
-        createHighlightedThumbnail(
-            from: image,
-            matchX: matchingNode.x,
-            matchY: matchingNode.y,
-            matchWidth: matchingNode.width,
-            matchHeight: matchingNode.height,
-            size: size
-        )
     }
 
     private func createHighlightedThumbnail(
@@ -1729,7 +1649,8 @@ public struct SpotlightSearchOverlay: View {
     // MARK: - Actions
 
     private func selectResult(_ result: SearchResult) {
-        let query = viewModel.searchQuery
+        viewModel.selectResult(result)
+        let query = viewModel.committedSearchQuery.isEmpty ? viewModel.searchQuery : viewModel.committedSearchQuery
         let df = DateFormatter()
         df.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
         df.timeZone = .current
@@ -2178,7 +2099,7 @@ private struct ResultsAreaHeightPreferenceKey: PreferenceKey {
 /// Uses manual makeFirstResponder for reliable focus in borderless windows
 struct SpotlightSearchField: NSViewRepresentable {
     @Binding var text: String
-    let onSubmit: () -> Void
+    let onSubmit: (Bool) -> Void
     let onEscape: () -> Void
     var onTab: (() -> Void)? = nil
     var onBackTab: (() -> Void)? = nil
@@ -2213,9 +2134,20 @@ struct SpotlightSearchField: NSViewRepresentable {
         textField.isEditable = true
         textField.isSelectable = true
 
+        context.coordinator.onSubmit = onSubmit
+        context.coordinator.onEscape = onEscape
+        context.coordinator.onTab = onTab
+        context.coordinator.onBackTab = onBackTab
+        context.coordinator.onFocus = onFocus
+        context.coordinator.onBlur = onBlur
+        context.coordinator.onArrowDown = onArrowDown
+        context.coordinator.onArrowUp = onArrowUp
         textField.onCancelCallback = onEscape
         textField.onClickCallback = {
             self.onFocus?()
+        }
+        textField.onCommandReturnCallback = {
+            self.onSubmit(true)
         }
 
         // Focus the text field with retry logic for external monitors
@@ -2229,9 +2161,20 @@ struct SpotlightSearchField: NSViewRepresentable {
         if textField.stringValue != text {
             textField.stringValue = text
         }
-        // Update the click callback in case onFocus changed
+        context.coordinator.onSubmit = onSubmit
+        context.coordinator.onEscape = onEscape
+        context.coordinator.onTab = onTab
+        context.coordinator.onBackTab = onBackTab
+        context.coordinator.onFocus = onFocus
+        context.coordinator.onBlur = onBlur
+        context.coordinator.onArrowDown = onArrowDown
+        context.coordinator.onArrowUp = onArrowUp
+        textField.onCancelCallback = onEscape
         textField.onClickCallback = {
             self.onFocus?()
+        }
+        textField.onCommandReturnCallback = {
+            self.onSubmit(true)
         }
         // Check if refocus was triggered
         if context.coordinator.lastRefocusRequest != refocusRequest {
@@ -2355,19 +2298,19 @@ struct SpotlightSearchField: NSViewRepresentable {
 
     class Coordinator: NSObject, NSTextFieldDelegate {
         @Binding var text: String
-        let onSubmit: () -> Void
-        let onEscape: () -> Void
-        let onTab: (() -> Void)?
-        let onBackTab: (() -> Void)?
-        let onFocus: (() -> Void)?
-        let onBlur: (() -> Void)?
-        let onArrowDown: (() -> Bool)?
-        let onArrowUp: (() -> Bool)?
+        var onSubmit: (Bool) -> Void
+        var onEscape: () -> Void
+        var onTab: (() -> Void)?
+        var onBackTab: (() -> Void)?
+        var onFocus: (() -> Void)?
+        var onBlur: (() -> Void)?
+        var onArrowDown: (() -> Bool)?
+        var onArrowUp: (() -> Bool)?
         fileprivate var lastRefocusRequest: SearchFieldRefocusRequest = .initial
 
         init(
             text: Binding<String>,
-            onSubmit: @escaping () -> Void,
+            onSubmit: @escaping (Bool) -> Void,
             onEscape: @escaping () -> Void,
             onTab: (() -> Void)?,
             onBackTab: (() -> Void)?,
@@ -2402,8 +2345,9 @@ struct SpotlightSearchField: NSViewRepresentable {
         }
 
         func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
-            if commandSelector == #selector(NSResponder.insertNewline(_:)) {
-                onSubmit()
+            if commandSelector == #selector(NSResponder.insertNewline(_:)) ||
+                commandSelector == #selector(NSResponder.insertNewlineIgnoringFieldEditor(_:)) {
+                onSubmit(false)
                 return true
             } else if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
                 onEscape()

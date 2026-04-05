@@ -509,6 +509,60 @@ final class InFrameSearchTests: XCTestCase {
         XCTAssertTrue(viewModel.isShowingSearchHighlight)
     }
 
+    func testNavigateToSearchResultKeepsSameQueryHighlightVisibleAcrossAdjacentFrames() async {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        viewModel.frames = [
+            makeTimelineFrame(id: 1, frameIndex: 0, bundleID: "com.apple.Safari"),
+            makeTimelineFrame(id: 2, frameIndex: 1, bundleID: "com.apple.Safari"),
+            makeTimelineFrame(id: 3, frameIndex: 2, bundleID: "com.apple.Safari")
+        ]
+        viewModel.currentIndex = 0
+        viewModel.setPresentationWorkEnabled(true, reason: "InFrameSearchTests")
+        viewModel.test_frameOverlayLoadHooks.getOCRStatus = { _ in .completed }
+        viewModel.test_frameOverlayLoadHooks.getAllOCRNodes = { frameID, _ in
+            if frameID.value == 3 {
+                try? await Task.sleep(for: .milliseconds(80), clock: .continuous)
+            }
+
+            return [
+                self.makeNode(
+                    id: Int(frameID.value),
+                    frameID: frameID.value,
+                    text: "alpha result \(frameID.value)"
+                )
+            ]
+        }
+
+        await viewModel.navigateToSearchResult(
+            frameID: FrameID(value: 2),
+            timestamp: viewModel.frames[1].frame.timestamp,
+            highlightQuery: "alpha"
+        )
+        XCTAssertFalse(viewModel.isShowingSearchHighlight)
+        try? await Task.sleep(for: .milliseconds(650), clock: .continuous)
+        XCTAssertTrue(viewModel.isShowingSearchHighlight)
+        XCTAssertEqual(viewModel.searchHighlightQuery, "alpha")
+
+        let navigationTask = Task {
+            await viewModel.navigateToSearchResult(
+                frameID: FrameID(value: 3),
+                timestamp: viewModel.frames[2].frame.timestamp,
+                highlightQuery: "alpha",
+                highlightImmediately: true
+            )
+        }
+
+        await Task.yield()
+
+        XCTAssertEqual(viewModel.currentIndex, 2)
+        XCTAssertEqual(viewModel.searchHighlightQuery, "alpha")
+        XCTAssertTrue(viewModel.isShowingSearchHighlight)
+        XCTAssertTrue(viewModel.ocrNodes.isEmpty)
+
+        await navigationTask.value
+        XCTAssertEqual(viewModel.searchHighlightNodes.map(\.node.id), [3])
+    }
+
     private func makeTimelineFrame(id: Int64, frameIndex: Int, bundleID: String) -> TimelineFrame {
         let baseDate = Date(timeIntervalSince1970: 1_700_000_000)
         let frame = FrameReference(
@@ -547,10 +601,16 @@ final class InFrameSearchTests: XCTestCase {
         return FrameWithVideoInfo(frame: frame, videoInfo: nil, processingStatus: 2)
     }
 
-    private func makeNode(id: Int, text: String, x: CGFloat = 0.1, y: CGFloat = 0.1) -> OCRNodeWithText {
+    private func makeNode(
+        id: Int,
+        frameID: Int64 = 1,
+        text: String,
+        x: CGFloat = 0.1,
+        y: CGFloat = 0.1
+    ) -> OCRNodeWithText {
         OCRNodeWithText(
             id: id,
-            frameId: 1,
+            frameId: frameID,
             x: x,
             y: y,
             width: 0.3,

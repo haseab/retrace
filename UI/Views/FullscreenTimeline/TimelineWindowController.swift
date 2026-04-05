@@ -216,6 +216,11 @@ public class TimelineWindowController: NSObject {
         case close
     }
 
+    enum SearchResultNavigationDirection: Equatable {
+        case previous
+        case next
+    }
+
     private struct VisibilitySnapshot {
         let windowExists: Bool
         let windowVisible: Bool
@@ -436,6 +441,28 @@ public class TimelineWindowController: NSObject {
 
         let key = charactersIgnoringModifiers?.lowercased()
         return keyCode == 124 || key == "k" || key == ";"
+    }
+
+    nonisolated static func searchResultNavigationDirection(
+        keyCode: UInt16,
+        modifiers: NSEvent.ModifierFlags,
+        isSearchResultHighlightVisible: Bool
+    ) -> SearchResultNavigationDirection? {
+        guard isSearchResultHighlightVisible else { return nil }
+
+        let normalizedModifiers = modifiers.intersection([.command, .shift, .option, .control])
+        guard normalizedModifiers == [.command, .shift] else {
+            return nil
+        }
+
+        switch keyCode {
+        case 123:
+            return .previous
+        case 124:
+            return .next
+        default:
+            return nil
+        }
     }
 
     private func shouldHandleTimelineKeyboardShortcuts() -> Bool {
@@ -3456,6 +3483,28 @@ extension TimelineWindowController {
         // Skip when a search filter dropdown is open (e.g., DateFilterPopover uses arrow keys for calendar navigation)
         if let viewModel = timelineViewModel, viewModel.searchViewModel.isDropdownOpen, (event.keyCode == 123 || event.keyCode == 124 || event.keyCode == 125 || event.keyCode == 126) {
             return false
+        }
+        if let viewModel = timelineViewModel,
+           let direction = Self.searchResultNavigationDirection(
+               keyCode: event.keyCode,
+               modifiers: modifiers,
+               isSearchResultHighlightVisible: viewModel.searchResultHighlightNavigationState != nil
+           ) {
+            let shortcut: String
+            switch direction {
+            case .previous:
+                shortcut = "cmd+shift+left"
+            case .next:
+                shortcut = "cmd+shift+right"
+            }
+            recordShortcut(shortcut)
+            Task { @MainActor in
+                await viewModel.navigateToAdjacentSearchResult(
+                    offset: direction == .previous ? -1 : 1,
+                    trigger: .keyboard
+                )
+            }
+            return true
         }
         // Cmd+Left: jump to the start of the previous consecutive timeline block
         if event.keyCode == 123 && modifiers == [.command] {
