@@ -662,6 +662,7 @@ public struct SimpleTimelineView: View {
             viewModel.showPositionRecoveryHintBanner ||
             viewModel.showTextSelectionHint ||
             shouldRenderSearchHighlightControlsHint ||
+            viewModel.showTimelineTapeRightClickHintBanner ||
             viewModel.showScrollOrientationHintBanner
 
         if hasVisibleHints {
@@ -697,6 +698,14 @@ public struct SimpleTimelineView: View {
                                 isSearchHighlightControlsHintDismissed = true
                             }
                         }
+                    )
+                    .fixedSize()
+                    .transition(Self.topHintTransition)
+                }
+
+                if viewModel.showTimelineTapeRightClickHintBanner {
+                    TimelineTapeRightClickHintBanner(
+                        onDismiss: { viewModel.dismissTimelineTapeRightClickHint() }
                     )
                     .fixedSize()
                     .transition(Self.topHintTransition)
@@ -6957,6 +6966,26 @@ struct SearchHighlightControlsHintBanner: View {
             KeyboardBadge(symbol: "⌘ H")
 
             Text("to hide/show controls, or right-click.")
+                .font(.retraceCaption)
+                .foregroundColor(.white.opacity(0.7))
+        }
+    }
+}
+
+struct TimelineTapeRightClickHintBanner: View {
+    let onDismiss: () -> Void
+
+    var body: some View {
+        TimelineHintBanner(style: .card, onDismiss: onDismiss) {
+            Image(systemName: "lightbulb.fill")
+                .font(.retraceHeadline)
+                .foregroundColor(.white.opacity(0.9))
+
+            Text("Hint: You can also right-click the timeline tape to open the same tape menu!")
+                .font(.retraceCaptionMedium)
+                .foregroundColor(.white.opacity(0.9))
+
+            // Text("That works even if the hover bubble disappears while you scroll.")
                 .font(.retraceCaption)
                 .foregroundColor(.white.opacity(0.7))
         }

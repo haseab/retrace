@@ -576,6 +576,7 @@ public class TimelineWindowController: NSObject {
         // Ensure right-click menus don't persist across timeline sessions.
         viewModel.dismissContextMenu()
         viewModel.dismissTimelineContextMenu()
+        viewModel.clearTimelineTapeRightClickHint(animated: false)
 
         // Dismiss any open overlays (filter panel, date search, etc.)
         if viewModel.isFilterPanelVisible {
@@ -2574,7 +2575,7 @@ extension TimelineWindowController {
                                     if !viewModel.isActivelyScrolling {
                                         viewModel.isActivelyScrolling = true
                                         viewModel.dismissContextMenu()
-                                        viewModel.dismissTimelineContextMenu()
+                                        viewModel.dismissTimelineContextMenu(reason: .scroll)
                                     }
                                 }
                             }

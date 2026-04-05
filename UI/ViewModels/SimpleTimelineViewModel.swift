@@ -1473,6 +1473,16 @@ public class SimpleTimelineViewModel: ObservableObject {
         isMoreOptionsMenuVisible = false
     }
 
+    enum TimelineContextMenuPresentationSource {
+        case secondaryClick
+        case actionBubble
+    }
+
+    enum TimelineContextMenuDismissReason {
+        case standard
+        case scroll
+    }
+
     // MARK: - Timeline Context Menu State (for right-click on timeline tape)
 
     /// Whether the timeline context menu is visible
@@ -1483,6 +1493,9 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// The segment index that was right-clicked on the timeline
     @Published public var timelineContextMenuSegmentIndex: Int? = nil
+
+    /// Whether to show the top hint teaching that the tape also supports right-click.
+    @Published public private(set) var showTimelineTapeRightClickHintBanner: Bool = false
 
     /// Whether the tag submenu is visible
     @Published public var showTagSubmenu: Bool = false
@@ -1601,9 +1614,23 @@ public class SimpleTimelineViewModel: ObservableObject {
     @Published public var hidingSegmentBlockRange: ClosedRange<Int>? = nil
 
     private static let timelineMenuDismissAnimationDuration: TimeInterval = 0.15
+    private var timelineContextMenuPresentationSource: TimelineContextMenuPresentationSource?
+    private var timelineTapeRightClickHintDismissTask: Task<Void, Never>?
 
     /// Dismiss the timeline context menu
     public func dismissTimelineContextMenu() {
+        dismissTimelineContextMenu(reason: .standard)
+    }
+
+    func dismissTimelineContextMenu(reason: TimelineContextMenuDismissReason) {
+        let shouldShowRightClickHint =
+            reason == .scroll &&
+            timelineContextMenuPresentationSource == .actionBubble &&
+            showTimelineContextMenu &&
+            !showTagSubmenu &&
+            !showCommentSubmenu &&
+            !showNewTagInput
+
         let resetMenuState = {
             self.cancelSelectedBlockCommentsLoad()
             self.showTimelineContextMenu = false
@@ -1625,6 +1652,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             self.isAllCommentsBrowserActive = false
             self.returnToThreadCommentsSignal = 0
             self.selectedSegmentTags = []
+            self.timelineContextMenuPresentationSource = nil
             self.resetCommentTimelineState()
             self.resetCommentSearchState()
         }
@@ -1636,6 +1664,10 @@ public class SimpleTimelineViewModel: ObservableObject {
             }
         } else {
             resetMenuState()
+        }
+
+        if shouldShowRightClickHint {
+            showTimelineTapeRightClickHint()
         }
     }
 
@@ -1669,6 +1701,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             self.isAddingComment = false
             self.isAllCommentsBrowserActive = false
             self.returnToThreadCommentsSignal = 0
+            self.timelineContextMenuPresentationSource = nil
             self.resetCommentTimelineState()
             self.resetCommentSearchState()
             self.currentCommentMetricsSource = "timeline_comment_submenu"
@@ -4548,6 +4581,69 @@ public class SimpleTimelineViewModel: ObservableObject {
         _ = await (tagsTask, commentsTask)
     }
 
+    @discardableResult
+    func presentTimelineContextMenu(
+        at anchorIndex: Int,
+        menuLocation: CGPoint? = nil,
+        source: TimelineContextMenuPresentationSource
+    ) -> Bool {
+        guard anchorIndex >= 0, anchorIndex < frames.count else { return false }
+
+        clearTimelineTapeRightClickHint()
+        cancelSelectedBlockCommentsLoad()
+        timelineContextMenuSegmentIndex = anchorIndex
+        selectedFrameIndex = anchorIndex
+        showTagSubmenu = false
+        showCommentSubmenu = false
+        isHoveringAddTagButton = false
+        isHoveringAddCommentButton = false
+        selectedSegmentTags = []
+        showNewTagInput = false
+        newTagName = ""
+        newCommentText = ""
+        newCommentAttachmentDrafts = []
+        selectedBlockComments = []
+        selectedBlockCommentPreferredSegmentByID = [:]
+        blockCommentsLoadError = nil
+        isLoadingBlockComments = false
+        timelineContextMenuPresentationSource = source
+        resetCommentTimelineState()
+
+        if let resolvedLocation = menuLocation ?? currentMouseLocationInContentCoordinates() {
+            timelineContextMenuLocation = resolvedLocation
+        }
+
+        showTimelineContextMenu = true
+        return true
+    }
+
+    /// Opens the timeline action menu for a specific frame selection.
+    public func openTimelineContextMenu(at anchorIndex: Int, menuLocation: CGPoint? = nil) {
+        guard presentTimelineContextMenu(
+            at: anchorIndex,
+            menuLocation: menuLocation,
+            source: .secondaryClick
+        ) else { return }
+        Task { await loadTimelineContextMenuData() }
+    }
+
+    /// Opens the timeline action menu for a block using the best in-block anchor.
+    public func openTimelineContextMenuForTimelineBlock(_ block: AppBlock) {
+        guard block.frameCount > 0 else { return }
+
+        let anchorIndex = Self.resolvePreferredCommentTargetIndex(
+            in: block,
+            currentIndex: currentIndex,
+            selectedFrameIndex: selectedFrameIndex,
+            timelineContextMenuSegmentIndex: timelineContextMenuSegmentIndex
+        )
+        guard presentTimelineContextMenu(
+            at: anchorIndex,
+            source: .actionBubble
+        ) else { return }
+        Task { await loadTimelineContextMenuData() }
+    }
+
     public func recordTagSubmenuOpen(source: String, block: AppBlock? = nil) {
         let resolvedBlock: AppBlock?
         if let block {
@@ -4623,11 +4719,13 @@ public class SimpleTimelineViewModel: ObservableObject {
             return
         }
 
+        clearTimelineTapeRightClickHint()
         withAnimation(.easeOut(duration: Self.timelineMenuDismissAnimationDuration)) {
             showTimelineContextMenu = false
             showCommentSubmenu = true
             showTagSubmenu = true
         }
+        timelineContextMenuPresentationSource = nil
         recordTagSubmenuOpen(source: source, block: block)
 
         Task { await loadTags() }
@@ -4643,6 +4741,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             selectedFrameIndex: selectedFrameIndex,
             timelineContextMenuSegmentIndex: timelineContextMenuSegmentIndex
         )
+        clearTimelineTapeRightClickHint()
         timelineContextMenuSegmentIndex = anchorIndex
         selectedFrameIndex = anchorIndex
         newCommentText = ""
@@ -4656,6 +4755,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         currentCommentMetricsSource = source
         isHoveringAddTagButton = false
         isHoveringAddCommentButton = false
+        timelineContextMenuPresentationSource = nil
 
         if let pointerLocation = currentMouseLocationInContentCoordinates() {
             timelineContextMenuLocation = pointerLocation
@@ -4727,6 +4827,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     ) {
         guard anchorIndex >= 0, anchorIndex < frames.count else { return }
 
+        clearTimelineTapeRightClickHint()
         timelineContextMenuSegmentIndex = anchorIndex
         selectedFrameIndex = anchorIndex
         newCommentText = ""
@@ -4741,6 +4842,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         showCommentSubmenu = false
         isHoveringAddTagButton = true
         isHoveringAddCommentButton = false
+        timelineContextMenuPresentationSource = nil
 
         if let pointerLocation = currentMouseLocationInContentCoordinates() {
             timelineContextMenuLocation = pointerLocation
@@ -4878,7 +4980,8 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     private func currentMouseLocationInContentCoordinates() -> CGPoint? {
-        guard let window = NSApp.keyWindow,
+        let application = NSApplication.shared
+        guard let window = application.keyWindow ?? application.mainWindow,
               let contentView = window.contentView else {
             return nil
         }
@@ -13060,6 +13163,63 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
     }
 
+    // MARK: - Timeline Tape Right-Click Hint Methods
+
+    func showTimelineTapeRightClickHint(autoDismissAfter: TimeInterval = 5) {
+        timelineTapeRightClickHintDismissTask?.cancel()
+        timelineTapeRightClickHintDismissTask = nil
+
+        withAnimation(.spring(response: 0.3, dampingFraction: 0.82)) {
+            showTimelineTapeRightClickHintBanner = true
+        }
+
+        TimelineMetrics.recordTimelineTapeRightClickHintAction(
+            coordinator: coordinator,
+            action: "shown",
+            trigger: "bubble_scroll_dismiss"
+        )
+
+        let dismissDelayNs = Int64(max(0, autoDismissAfter) * 1_000_000_000)
+        timelineTapeRightClickHintDismissTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .nanoseconds(dismissDelayNs), clock: .continuous)
+            guard let self, !Task.isCancelled else { return }
+            self.timelineTapeRightClickHintDismissTask = nil
+            self.clearTimelineTapeRightClickHint(cancelDismissTask: false)
+            TimelineMetrics.recordTimelineTapeRightClickHintAction(
+                coordinator: self.coordinator,
+                action: "auto_dismissed",
+                trigger: "bubble_scroll_dismiss"
+            )
+        }
+    }
+
+    public func dismissTimelineTapeRightClickHint() {
+        clearTimelineTapeRightClickHint()
+        TimelineMetrics.recordTimelineTapeRightClickHintAction(
+            coordinator: coordinator,
+            action: "dismissed",
+            trigger: "bubble_scroll_dismiss"
+        )
+    }
+
+    func clearTimelineTapeRightClickHint(
+        animated: Bool = true,
+        cancelDismissTask: Bool = true
+    ) {
+        if cancelDismissTask {
+            timelineTapeRightClickHintDismissTask?.cancel()
+            timelineTapeRightClickHintDismissTask = nil
+        }
+
+        if animated {
+            withAnimation(.easeOut(duration: 0.2)) {
+                showTimelineTapeRightClickHintBanner = false
+            }
+        } else {
+            showTimelineTapeRightClickHintBanner = false
+        }
+    }
+
     // MARK: - Scroll Orientation Hint Methods
 
     /// Show the scroll orientation hint banner with auto-dismiss after 8 seconds
@@ -14378,7 +14538,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         if !isActivelyScrolling {
             isActivelyScrolling = true
             dismissContextMenu()
-            dismissTimelineContextMenu()
+            dismissTimelineContextMenu(reason: .scroll)
         }
 
         // Cancel previous debounce task

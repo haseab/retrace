@@ -5,6 +5,26 @@ import App
 import UniformTypeIdentifiers
 import AVFoundation
 
+struct TimelineBlockIndicatorPresentation: Equatable {
+    let showsTagIndicator: Bool
+    let showsCommentIndicator: Bool
+    let showsActionMenuAffordance: Bool
+
+    var shouldRender: Bool {
+        showsTagIndicator || showsCommentIndicator || showsActionMenuAffordance
+    }
+
+    static func make(for block: AppBlock, revealsAffordances: Bool) -> Self {
+        let showsTagIndicator = !block.tagIDs.isEmpty
+        let showsCommentIndicator = block.hasComments
+        return Self(
+            showsTagIndicator: showsTagIndicator,
+            showsCommentIndicator: showsCommentIndicator,
+            showsActionMenuAffordance: revealsAffordances
+        )
+    }
+}
+
 /// Timeline tape view that scrolls horizontally with a fixed center playhead
 /// Groups consecutive frames by app and displays app icons
 public struct TimelineTapeView: View {
@@ -35,6 +55,7 @@ public struct TimelineTapeView: View {
     @AppStorage("scrubbingAnimationDuration", store: TimelineTapeView.settingsStore)
     private var scrubbingAnimationDuration: Double = 0.10
     @StateObject private var tapeLayoutCache = TapeLayoutCache()
+    @State private var hoveredBlockID: String?
 
     // MARK: - Body
 
@@ -221,9 +242,15 @@ public struct TimelineTapeView: View {
         cullingRightX: CGFloat,
         tagsByID: [Int64: Tag]
     ) -> some View {
+        let hoverExtension: CGFloat = 36
         let block = item.block
         let isCurrentBlock = viewModel.currentIndex >= block.startIndex && viewModel.currentIndex <= block.endIndex
         let isSelectedBlock = viewModel.selectedFrameIndex.map { $0 >= block.startIndex && $0 <= block.endIndex } ?? false
+        let revealsAffordances = hoveredBlockID == block.id
+        let indicatorPresentation = TimelineBlockIndicatorPresentation.make(
+            for: block,
+            revealsAffordances: revealsAffordances
+        )
         let color = blockColor(for: block)
         let collapseFactor = item.collapseFactor
         let isHidingBlock = collapseFactor < 0.999
@@ -285,16 +312,24 @@ public struct TimelineTapeView: View {
                     .allowsHitTesting(false) // Allow clicks to pass through to frame segments
             }
 
-            // Top-edge indicators (tags + comment thread shortcut).
-            if !isHidingBlock, blockWidth > 22, (!block.tagIDs.isEmpty || block.hasComments) {
+            // Top-edge indicators (tags/comments plus an action-menu hint when actions are otherwise hidden).
+            if !isHidingBlock, blockWidth > 22, indicatorPresentation.shouldRender {
                 BlockIndicatorsOverlay(
                     block: block,
                     blockWidth: blockWidth,
-                    emphasized: isCurrentBlock || isSelectedBlock,
+                    emphasized: isCurrentBlock || isSelectedBlock || revealsAffordances,
+                    presentation: indicatorPresentation,
                     tagsByID: tagsByID,
                     tagCatalogRevision: viewModel.tagCatalogRevision,
-                    onOpenTags: { viewModel.openTagSubmenuForTimelineBlock(block, source: "tape_indicator") },
-                    onOpenComments: { viewModel.openCommentSubmenuForTimelineBlock(block, source: "tape_indicator") }
+                    onOpenTags: { source in
+                        viewModel.openTagSubmenuForTimelineBlock(block, source: source)
+                    },
+                    onOpenComments: { source in
+                        viewModel.openCommentSubmenuForTimelineBlock(block, source: source)
+                    },
+                    onOpenTimelineMenu: {
+                        viewModel.openTimelineContextMenuForTimelineBlock(block)
+                    }
                 )
                 .equatable()
             }
@@ -309,6 +344,14 @@ public struct TimelineTapeView: View {
             y: isHidingBlock ? 0.82 : 1.0,
             anchor: .center
         )
+        .frame(width: blockWidth, height: tapeHeight + hoverExtension, alignment: .bottom)
+        .offset(y: -hoverExtension / 2)
+        .contentShape(Rectangle())
+        .onHover { hovering in
+            withAnimation(.easeOut(duration: 0.12)) {
+                hoveredBlockID = hovering ? block.id : (hoveredBlockID == block.id ? nil : hoveredBlockID)
+            }
+        }
         .opacity(isHidingBlock ? 0.12 : 1.0)
         .animation(.easeInOut(duration: 0.16), value: collapseFactor)
     }
@@ -503,63 +546,95 @@ public struct TimelineTapeView: View {
         let block: AppBlock
         let blockWidth: CGFloat
         let emphasized: Bool
+        let presentation: TimelineBlockIndicatorPresentation
         let tagsByID: [Int64: Tag]
         let tagCatalogRevision: UInt64
-        let onOpenTags: () -> Void
-        let onOpenComments: () -> Void
+        let onOpenTags: (String) -> Void
+        let onOpenComments: (String) -> Void
+        let onOpenTimelineMenu: () -> Void
+
+        @State private var isTagGroupHovering = false
+        @State private var isCommentIconHovering = false
 
         static func == (lhs: BlockIndicatorsOverlay, rhs: BlockIndicatorsOverlay) -> Bool {
             lhs.block.id == rhs.block.id &&
                 lhs.block.tagIDs == rhs.block.tagIDs &&
                 lhs.block.hasComments == rhs.block.hasComments &&
                 lhs.emphasized == rhs.emphasized &&
+                lhs.presentation == rhs.presentation &&
                 lhs.tagCatalogRevision == rhs.tagCatalogRevision &&
                 abs(lhs.blockWidth - rhs.blockWidth) < 0.001
         }
 
         var body: some View {
-            let topLift: CGFloat = emphasized ? 17 : 16
+            let indicatorRowHeight: CGFloat = 18
+            let bubbleReferenceHeight: CGFloat = 16
+            let tagButtonHeight: CGFloat = indicatorRowHeight + 4
+            let commentButtonHeight: CGFloat = indicatorRowHeight
+            let visibleControlHeight: CGFloat = max(
+                presentation.showsTagIndicator ? tagButtonHeight : 0,
+                presentation.showsCommentIndicator ? commentButtonHeight : 0,
+                presentation.showsActionMenuAffordance ? bubbleReferenceHeight : 0
+            )
+            let topLift: CGFloat = 22 + max(0, (visibleControlHeight - bubbleReferenceHeight) / 2)
 
             return HStack(spacing: 6) {
-                if !block.tagIDs.isEmpty {
-                    Button(action: onOpenTags) {
-                        tagIndicatorDots
+                if presentation.showsTagIndicator {
+                    Button(action: { onOpenTags("tape_indicator") }) {
+                        tagIndicatorDots(rowHeight: indicatorRowHeight)
+                            .padding(.horizontal, 3)
+                            .padding(.vertical, 2)
+                            .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                     .help("Open tags")
+                    .scaleEffect(isTagGroupHovering ? 1.12 : 1.0)
+                    .animation(.spring(response: 0.18, dampingFraction: 0.72), value: isTagGroupHovering)
                     .onHover { hovering in
+                        isTagGroupHovering = hovering
                         if hovering { NSCursor.pointingHand.push() }
                         else { NSCursor.pop() }
                     }
                 }
 
-                if block.hasComments {
-                    Button(action: onOpenComments) {
+                if presentation.showsCommentIndicator {
+                    Button(action: { onOpenComments("tape_indicator") }) {
                         Image(systemName: "text.bubble")
-                            .font(.system(size: emphasized ? 10 : 9, weight: .semibold))
+                            .font(.system(size: 10, weight: .semibold))
                             .foregroundColor(.white.opacity(emphasized ? 0.9 : 0.8))
+                            .frame(width: indicatorRowHeight, height: indicatorRowHeight)
                             .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                     .help("Open comments")
+                    .scaleEffect(isCommentIconHovering ? 1.18 : 1.0)
+                    .animation(.spring(response: 0.18, dampingFraction: 0.72), value: isCommentIconHovering)
                     .onHover { hovering in
+                        isCommentIconHovering = hovering
                         if hovering { NSCursor.pointingHand.push() }
                         else { NSCursor.pop() }
+                    }
+                }
+
+                if presentation.showsActionMenuAffordance {
+                    actionMenuIndicatorButton {
+                        onOpenTimelineMenu()
                     }
                 }
             }
             .padding(.leading, 6)
             .offset(y: -topLift)
             .frame(width: blockWidth, height: TimelineScaleFactor.tapeHeight, alignment: .topLeading)
+            .animation(.easeOut(duration: 0.12), value: presentation)
         }
 
-        private var tagIndicatorDots: some View {
+        private func tagIndicatorDots(rowHeight: CGFloat) -> some View {
             let visibleTagIDs = Array(block.tagIDs.prefix(3))
             let hasOverflow = block.tagIDs.count > visibleTagIDs.count
             let dotOpacity = emphasized ? 0.96 : 0.82
             let dotStrokeOpacity = emphasized ? 0.58 : 0.42
             let dotGlowOpacity = emphasized ? 0.40 : 0.26
-            let dotSize: CGFloat = emphasized ? 9 : 8
+            let dotSize: CGFloat = 9
             let visibleCount = CGFloat(visibleTagIDs.count + (hasOverflow ? 1 : 0))
             let intrinsicRowWidth = visibleCount * dotSize + max(0, visibleCount - 1) * 3
             let rowWidth = max(10, intrinsicRowWidth)
@@ -583,7 +658,8 @@ public struct TimelineTapeView: View {
                         .frame(width: dotSize - 1, height: dotSize - 1)
                 }
             }
-            .frame(width: rowWidth, alignment: .center)
+            .frame(width: rowWidth, height: rowHeight, alignment: .center)
+            .contentShape(Rectangle())
         }
 
         private func tagColor(forTagIDValue tagIDValue: Int64) -> Color {
@@ -591,6 +667,44 @@ public struct TimelineTapeView: View {
                 return TagColorStore.color(for: tag)
             }
             return TagColorStore.color(forTagID: TagID(value: tagIDValue))
+        }
+
+        private func actionMenuIndicatorButton(action: @escaping () -> Void) -> some View {
+            ActionMenuIndicatorButton(emphasized: emphasized, action: action)
+        }
+
+        private struct ActionMenuIndicatorButton: View {
+            let emphasized: Bool
+            let action: () -> Void
+
+            @State private var isHovering = false
+
+            var body: some View {
+                Button(action: action) {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: emphasized ? 10 : 9, weight: .bold))
+                        .foregroundColor(.white.opacity(emphasized || isHovering ? 0.84 : 0.7))
+                        .frame(width: emphasized ? 16 : 14, height: emphasized ? 16 : 14)
+                        .background(
+                            Circle()
+                                .fill(Color.white.opacity(emphasized || isHovering ? 0.16 : 0.09))
+                        )
+                        .overlay(
+                            Circle()
+                                .stroke(Color.white.opacity(emphasized || isHovering ? 0.24 : 0.16), lineWidth: 0.8)
+                        )
+                        .scaleEffect(isHovering ? 1.12 : 1.0)
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .help("Open actions")
+                .animation(.spring(response: 0.18, dampingFraction: 0.72), value: isHovering)
+                .onHover { hovering in
+                    isHovering = hovering
+                    if hovering { NSCursor.pointingHand.push() }
+                    else { NSCursor.pop() }
+                }
+            }
         }
     }
 
@@ -2648,24 +2762,7 @@ class FrameRightClickNSView: NSView {
 
         // Use the frame index this handler was created with - no offset calculation needed!
         DispatchQueue.main.async {
-            // Reset submenu state when opening a new context menu
-            viewModel.showTagSubmenu = false
-            viewModel.showCommentSubmenu = false
-            viewModel.isHoveringAddTagButton = false
-            viewModel.isHoveringAddCommentButton = false
-            viewModel.selectedSegmentTags = []
-            viewModel.newCommentText = ""
-            viewModel.newCommentAttachmentDrafts = []
-            viewModel.selectedBlockComments = []
-            viewModel.blockCommentsLoadError = nil
-            viewModel.isLoadingBlockComments = false
-
-            // Update to new location/frame
-            viewModel.timelineContextMenuSegmentIndex = self.frameIndex
-            viewModel.timelineContextMenuLocation = menuLocation
-            viewModel.selectedFrameIndex = self.frameIndex  // Highlight the right-clicked block
-            viewModel.showTimelineContextMenu = true
-            Task { await viewModel.loadTimelineContextMenuData() }
+            viewModel.openTimelineContextMenu(at: self.frameIndex, menuLocation: menuLocation)
         }
     }
 }

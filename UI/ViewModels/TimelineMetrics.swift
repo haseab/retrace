@@ -23,6 +23,23 @@ enum TimelineMetrics {
         )
     }
 
+    static func recordTimelineTapeRightClickHintAction(
+        coordinator: AppCoordinator,
+        action: String,
+        trigger: String
+    ) {
+        let payload: [String: Any] = [
+            "action": action,
+            "source": "timeline_tape_right_click_hint",
+            "trigger": trigger
+        ]
+        UIMetricsRecorder.record(
+            coordinator: coordinator,
+            type: .timelinePositionRecoveryHintAction,
+            metadata: UIMetricsRecorder.jsonMetadata(payload)
+        )
+    }
+
     static func recordSearchResultNavigation(
         coordinator: AppCoordinator,
         direction: String,
