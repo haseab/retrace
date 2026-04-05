@@ -122,11 +122,7 @@ public struct SimpleTimelineView: View {
                         .ignoresSafeArea()
                         .onTapGesture {
                             withAnimation(.spring(response: 0.25, dampingFraction: 0.9)) {
-                                viewModel.isCalendarPickerVisible = false
-                                viewModel.hoursWithFrames = []
-                                viewModel.selectedCalendarDate = nil
-                                viewModel.calendarKeyboardFocus = .dateGrid
-                                viewModel.selectedCalendarHour = nil
+                                viewModel.closeCalendarPicker()
                             }
                         }
                 }

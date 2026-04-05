@@ -583,11 +583,7 @@ public class TimelineWindowController: NSObject {
             viewModel.dismissFilterPanel()
         }
         if viewModel.isCalendarPickerVisible {
-            viewModel.isCalendarPickerVisible = false
-            viewModel.hoursWithFrames = []
-            viewModel.selectedCalendarDate = nil
-            viewModel.calendarKeyboardFocus = .dateGrid
-            viewModel.selectedCalendarHour = nil
+            viewModel.closeCalendarPicker()
         }
         if viewModel.isDateSearchActive {
             viewModel.closeDateSearch()
@@ -3014,11 +3010,7 @@ extension TimelineWindowController {
                 // If calendar picker is showing, close it first with animation
                 if viewModel.isCalendarPickerVisible {
                     withAnimation(.spring(response: 0.25, dampingFraction: 0.9)) {
-                        viewModel.isCalendarPickerVisible = false
-                        viewModel.hoursWithFrames = []
-                        viewModel.selectedCalendarDate = nil
-                        viewModel.calendarKeyboardFocus = .dateGrid
-                        viewModel.selectedCalendarHour = nil
+                        viewModel.closeCalendarPicker()
                     }
                     return true
                 }

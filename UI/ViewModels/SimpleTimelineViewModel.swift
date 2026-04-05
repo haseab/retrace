@@ -7787,6 +7787,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     public func closeDateSearch() {
         withAnimation(.easeOut(duration: 0.15)) {
             isDateSearchActive = false
+            closeCalendarPicker()
         }
         dateSearchText = ""
         // Clear any date search errors when closing
@@ -14784,6 +14785,15 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     // MARK: - Calendar Picker
+
+    /// Collapse the calendar picker and clear its selection state.
+    public func closeCalendarPicker() {
+        isCalendarPickerVisible = false
+        hoursWithFrames = []
+        selectedCalendarDate = nil
+        calendarKeyboardFocus = .dateGrid
+        selectedCalendarHour = nil
+    }
 
     /// Set keyboard navigation focus to the date grid.
     public func focusCalendarDateGrid() {
