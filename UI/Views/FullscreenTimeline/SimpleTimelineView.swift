@@ -657,9 +657,7 @@ public struct SimpleTimelineView: View {
 
     @ViewBuilder
     private func topHintOverlay(shouldRenderSearchHighlightControlsHint: Bool) -> some View {
-        let searchResultNavigationState = viewModel.searchResultHighlightNavigationState
         let hasVisibleHints =
-            searchResultNavigationState != nil ||
             viewModel.showControlsHiddenRestoreHintBanner ||
             viewModel.showPositionRecoveryHintBanner ||
             viewModel.showTextSelectionHint ||
@@ -668,30 +666,6 @@ public struct SimpleTimelineView: View {
 
         if hasVisibleHints {
             TimelineHintOverlayStack {
-                if let searchResultNavigationState {
-                    SearchResultNavigationBanner(
-                        state: searchResultNavigationState,
-                        onNavigatePrevious: {
-                            Task {
-                                await viewModel.navigateToAdjacentSearchResult(
-                                    offset: -1,
-                                    trigger: .button
-                                )
-                            }
-                        },
-                        onNavigateNext: {
-                            Task {
-                                await viewModel.navigateToAdjacentSearchResult(
-                                    offset: 1,
-                                    trigger: .button
-                                )
-                            }
-                        }
-                    )
-                    .fixedSize()
-                    .transition(Self.topHintTransition)
-                }
-
                 if viewModel.showControlsHiddenRestoreHintBanner {
                     ControlsHiddenRestoreHintBanner(
                         onDismiss: { viewModel.dismissControlsHiddenRestoreHint() }
@@ -1061,15 +1035,44 @@ public struct SimpleTimelineView: View {
 
     private var topRightControls: some View {
         let scale = TimelineScaleFactor.current
-        return HStack(spacing: 10 * scale) {
-            if viewModel.isInFrameSearchVisible {
-                inFrameSearchBar
-                    .transition(.move(edge: .trailing).combined(with: .opacity))
+        let searchResultNavigationState = viewModel.searchResultHighlightNavigationState
+
+        return VStack(alignment: .trailing, spacing: 10 * scale) {
+            HStack(spacing: 10 * scale) {
+                if viewModel.isInFrameSearchVisible {
+                    inFrameSearchBar
+                        .transition(.move(edge: .trailing).combined(with: .opacity))
+                }
+                // helpButton
+                closeButton
             }
-            // helpButton
-            closeButton
+
+            if let searchResultNavigationState {
+                SearchResultNavigationToast(
+                    state: searchResultNavigationState,
+                    onNavigatePrevious: {
+                        Task {
+                            await viewModel.navigateToAdjacentSearchResult(
+                                offset: -1,
+                                trigger: .button
+                            )
+                        }
+                    },
+                    onNavigateNext: {
+                        Task {
+                            await viewModel.navigateToAdjacentSearchResult(
+                                offset: 1,
+                                trigger: .button
+                            )
+                        }
+                    }
+                )
+                .fixedSize()
+                .transition(.move(edge: .trailing).combined(with: .opacity))
+            }
         }
         .animation(.easeOut(duration: 0.15), value: viewModel.isInFrameSearchVisible)
+        .animation(.spring(response: 0.24, dampingFraction: 0.84), value: searchResultNavigationState)
     }
 
     private var inFrameSearchBinding: Binding<String> {
@@ -6824,64 +6827,71 @@ struct TextSelectionHintBanner: View {
     }
 }
 
-private struct SearchResultNavigationBanner: View {
+private struct SearchResultNavigationToast: View {
     let state: SearchViewModel.ResultNavigationState
     let onNavigatePrevious: () -> Void
     let onNavigateNext: () -> Void
+    private var scale: CGFloat { TimelineScaleFactor.current }
 
     var body: some View {
-        TimelineHintBanner(style: .card, onDismiss: nil) {
-            Image(systemName: "text.magnifyingglass")
-                .font(.retraceHeadline)
-                .foregroundColor(.white.opacity(0.92))
+        VStack(alignment: .center, spacing: 10 * scale) {
+            HStack(spacing: 10 * scale) {
+                Image(systemName: "text.magnifyingglass")
+                    .font(.system(size: 16 * scale, weight: .medium))
+                    .foregroundColor(.white.opacity(0.9))
 
-            Text("Search result")
-                .font(.retraceCaptionMedium)
-                .foregroundColor(.white.opacity(0.9))
+                Text("\(state.currentPosition) of \(state.loadedCount)\(state.canLoadMore || state.isLoadingMore ? "+" : "")")
+                    .font(.system(size: 15 * scale, weight: .medium))
+                    .foregroundColor(.white.opacity(0.88))
+                    .monospacedDigit()
+            }
 
-            SearchResultNavigationButton(
-                systemImage: "chevron.left",
-                isDisabled: !state.canNavigatePrevious,
-                action: onNavigatePrevious
-            )
+            HStack(spacing: 10 * scale) {
+                SearchResultNavigationButton(
+                    systemImage: "chevron.left",
+                    isDisabled: !state.canNavigatePrevious,
+                    tooltipText: "⌘ ⇧ ←",
+                    scale: scale,
+                    action: onNavigatePrevious
+                )
 
-            Text("\(state.currentPosition) of \(state.loadedCount)\(state.canLoadMore || state.isLoadingMore ? "+" : "")")
-                .font(.retraceCaptionMedium)
-                .foregroundColor(.white.opacity(0.9))
-                .monospacedDigit()
-                .frame(minWidth: 72, alignment: .center)
-
-            SearchResultNavigationButton(
-                systemImage: "chevron.right",
-                isDisabled: !state.canNavigateNext && !state.canLoadMore,
-                action: onNavigateNext
-            )
-
-            Rectangle()
-                .fill(Color.white.opacity(0.14))
-                .frame(width: 1, height: 18)
+                SearchResultNavigationButton(
+                    systemImage: "chevron.right",
+                    isDisabled: !state.canNavigateNext && !state.canLoadMore,
+                    tooltipText: "⌘ ⇧ →",
+                    scale: scale,
+                    action: onNavigateNext
+                )
+            }
 
             if state.isLoadingMore {
-                HStack(spacing: 6) {
-                    SpinnerView(size: 12, lineWidth: 1.8, color: .white.opacity(0.85))
+                HStack(spacing: 6 * scale) {
+                    SpinnerView(size: 12 * scale, lineWidth: 1.8, color: .white.opacity(0.85))
                     Text("Loading more")
-                        .font(.retraceCaption)
-                        .foregroundColor(.white.opacity(0.72))
+                        .font(.system(size: 14 * scale, weight: .medium))
+                        .foregroundColor(.white.opacity(0.76))
                 }
-            } else {
-                Text("Use")
-                    .font(.retraceCaption)
-                    .foregroundColor(.white.opacity(0.72))
-
-                KeyboardBadge(symbol: "⌘ ⇧ ← / →")
             }
         }
+        .padding(.horizontal, 16 * scale)
+        .padding(.vertical, 12 * scale)
+        .background(
+            RoundedRectangle(cornerRadius: 18 * scale)
+                .fill(Color.black.opacity(0.72))
+                .shadow(color: .black.opacity(0.28), radius: 16, y: 6)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 18 * scale)
+                .stroke(Color.white.opacity(0.14), lineWidth: 1)
+        )
     }
 }
 
 private struct SearchResultNavigationButton: View {
     let systemImage: String
     let isDisabled: Bool
+    let tooltipText: String
+    var scale: CGFloat = 1
     let action: () -> Void
 
     @State private var isHovering = false
@@ -6889,20 +6899,21 @@ private struct SearchResultNavigationButton: View {
     var body: some View {
         Button(action: action) {
             Image(systemName: systemImage)
-                .font(.system(size: 11, weight: .semibold))
+                .font(.system(size: 12 * scale, weight: .semibold))
                 .foregroundColor(.white.opacity(isDisabled ? 0.38 : 0.88))
-                .frame(width: 28, height: 28)
+                .frame(width: 34 * scale, height: 34 * scale)
                 .background(
-                    RoundedRectangle(cornerRadius: 8)
+                    RoundedRectangle(cornerRadius: 10 * scale)
                         .fill(buttonBackgroundColor)
                 )
                 .overlay(
-                    RoundedRectangle(cornerRadius: 8)
+                    RoundedRectangle(cornerRadius: 10 * scale)
                         .stroke(Color.white.opacity(isDisabled ? 0.08 : 0.16), lineWidth: 1)
                 )
         }
         .buttonStyle(.plain)
         .disabled(isDisabled)
+        .instantTooltip(tooltipText, isVisible: $isHovering)
         .onHover { hovering in
             isHovering = !isDisabled && hovering
         }
