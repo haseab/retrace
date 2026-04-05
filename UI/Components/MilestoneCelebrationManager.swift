@@ -351,11 +351,11 @@ public class MilestoneCelebrationManager: ObservableObject {
         let urlString: String
         switch milestone {
         case .tenHours:
-            urlString = "https://dub.sh/support-retrace-10h"
+            urlString = "https://retrace.to/l/support-retrace-10h"
         case .hundredHours:
-            urlString = "https://dub.sh/support-retrace-100h"
+            urlString = "https://retrace.to/l/support-retrace-100h"
         case .thousandHours:
-            urlString = "https://dub.sh/support-retrace-1000h"
+            urlString = "https://retrace.to/l/support-retrace-1000h"
         case .tenThousandHours:
             // No support link for 10k - they're the GOAT, we don't ask them for money
             return
@@ -367,7 +367,7 @@ public class MilestoneCelebrationManager: ObservableObject {
 
     /// Open the Discord community invite link
     public func openDiscordLink() {
-        guard let url = URL(string: "https://dub.sh/retrace-discord") else { return }
+        guard let url = URL(string: "https://retrace.to/l/retrace-discord") else { return }
         NSWorkspace.shared.open(url)
     }
 

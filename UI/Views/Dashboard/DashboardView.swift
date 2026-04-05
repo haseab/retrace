@@ -1620,7 +1620,7 @@ public struct DashboardView: View {
             Spacer()
 
             HStack(spacing: 16) {
-                Link(destination: URL(string: "https://dub.sh/haseab-twitter")!) {
+                Link(destination: URL(string: "https://retrace.to/l/haseab-twitter")!) {
                     HStack(spacing: 4) {
                         Text("Made with")
                             .foregroundColor(.retraceSecondary)
@@ -1648,7 +1648,7 @@ public struct DashboardView: View {
                     .fill(Color.retraceSecondary.opacity(0.5))
                     .frame(width: 3, height: 3)
 
-                Link(destination: URL(string: "https://dub.sh/support-haseab")!) {
+                Link(destination: URL(string: "https://retrace.to/l/support-haseab")!) {
                     HStack(spacing: 6) {
                         Image(systemName: "cup.and.saucer.fill")
                             .font(.retraceCaption2)

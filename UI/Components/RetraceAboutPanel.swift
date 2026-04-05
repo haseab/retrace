@@ -7,7 +7,7 @@ enum RetraceAboutPanel {
         static let defaultDescriptionText =
             "Retrace is an open source, local-first screen memory for macOS. It continuously captures what you see, extracts text with on-device OCR, and makes your screen history searchable without sending it to the cloud."
         static let repositoryURL = URL(string: "https://github.com/haseab/retrace")!
-        static let creatorURL = URL(string: "https://dub.sh/haseab-twitter")!
+        static let creatorURL = URL(string: "https://retrace.to/l/haseab-twitter")!
 
         let appName: String
         let versionText: String
