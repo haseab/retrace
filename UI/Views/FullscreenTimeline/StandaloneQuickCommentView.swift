@@ -139,7 +139,9 @@ struct StandaloneQuickCommentView: View {
     private var loadingTargetSection: some View {
         CommentContextPreviewLoadingCard(
             title: "Resolving current moment...",
-            detail: "Finding the latest captured frame and segment before this quick-comment window."
+            detail: "Finding the latest captured frame and segment before this quick-comment window.",
+            isCollapsed: isContextPreviewCollapsed,
+            onToggleCollapsed: toggleContextPreviewCollapsed
         )
     }
 
