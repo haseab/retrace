@@ -429,15 +429,25 @@ extension SettingsView {
     ) async -> InPageURLPermissionState {
         if status == OSStatus(procNotFound) {
             if let settingsState = await inPageURLPermissionStateFromSystemSettingsAsync(for: bundleID) {
-                return settingsState
+                switch settingsState {
+                case .granted, .denied:
+                    return settingsState
+                case .needsConsent, .unavailable:
+                    break
+                }
             }
-            if let previousState, isStableInPageURLPermissionState(previousState) {
+
+            if previousState == .granted || previousState == .denied,
+               let previousState {
                 return previousState
             }
-            if let cachedState, isStableInPageURLPermissionState(cachedState) {
+
+            if cachedState == .granted || cachedState == .denied,
+               let cachedState {
                 return cachedState
             }
-            return .needsConsent
+
+            return .unavailable(status)
         }
 
         return inPageURLPermissionState(from: status)
@@ -562,6 +572,8 @@ extension SettingsView {
             return "Denied"
         case .needsConsent:
             return "Needs Allow"
+        case .unavailable(let status) where status == OSStatus(procNotFound):
+            return "Launch to Verify"
         case .unavailable(let status):
             return "Unavailable (\(status))"
         }
