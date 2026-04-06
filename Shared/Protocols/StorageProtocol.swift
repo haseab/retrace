@@ -256,7 +256,7 @@ public struct VideoEncoderConfig: Sendable {
 
     public static var `default`: VideoEncoderConfig {
         let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
-        let quality = defaults.object(forKey: "videoQuality") as? Double ?? 0.5
+        let quality = defaults.object(forKey: "videoQuality") as? Double ?? 0.7
         return VideoEncoderConfig(quality: Float(quality))
     }
 }

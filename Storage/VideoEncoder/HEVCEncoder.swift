@@ -254,9 +254,10 @@ public actor HEVCEncoder {
         height: Int,
         config: VideoEncoderConfig
     ) -> CompressionTuning {
-        let clampedQuality = min(max(Double(config.quality), 0.0), 1.0)
+        let requestedQuality = min(max(Double(config.quality), 0.0), 1.0)
+        let encoderQuality = effectiveEncoderQuality(for: requestedQuality)
         let pixelCount = max(Double(width) * Double(height), 1.0)
-        let baseBitsPerPixelPerFrame = baseScreenContentBitsPerPixelPerFrame(quality: clampedQuality)
+        let baseBitsPerPixelPerFrame = baseScreenContentBitsPerPixelPerFrame(quality: encoderQuality)
         let defaultDensityBoost = screenContentDensityBoost(
             width: width,
             height: height,
@@ -275,7 +276,7 @@ public actor HEVCEncoder {
                 width: width,
                 height: height,
                 pixelCount: pixelCount,
-                quality: clampedQuality
+                quality: encoderQuality
             )
             averageBitRate = max(derivedAverageBitRate, displayClassBitRateFloor ?? 0, 750_000)
         }
@@ -293,7 +294,7 @@ public actor HEVCEncoder {
         return CompressionTuning(
             averageBitRate: averageBitRate,
             dataRateLimitBytesPerSecond: burstDataRateLimit,
-            quality: Float(clampedQuality),
+            quality: Float(encoderQuality),
             bitsPerPixelPerFrame: effectiveBitsPerPixelPerFrame,
             densityBoost: effectiveDensityBoost
         )
@@ -363,9 +364,11 @@ public actor HEVCEncoder {
         // We verify availability above but cannot force it through compressionProperties
 
         let compressionTuning = Self.compressionTuning(width: width, height: height, config: config)
+        let requestedQuality = min(max(Double(config.quality), 0.0), 1.0)
         Log.info(
             """
-            Video encoder configured for \(width)x\(height): quality=\(String(format: "%.2f", compressionTuning.quality)) \
+            Video encoder configured for \(width)x\(height): requestedQuality=\(String(format: "%.2f", requestedQuality)) \
+            encoderQuality=\(String(format: "%.2f", compressionTuning.quality)) \
             avgBitrate=\(compressionTuning.averageBitRate) \
             dataRateLimitBytesPerSecond=\(compressionTuning.dataRateLimitBytesPerSecond) \
             bpppf=\(String(format: "%.4f", compressionTuning.bitsPerPixelPerFrame)) \
@@ -719,6 +722,18 @@ private extension HEVCEncoder {
                 .shouldPropagate
             )
         }
+    }
+
+    static func effectiveEncoderQuality(for requestedQuality: Double) -> Double {
+        interpolate(
+            clampedQuality: requestedQuality,
+            points: [
+                (quality: 0.00, bpppf: 0.00),
+                (quality: 0.40, bpppf: 0.3469026324777675),
+                (quality: 0.70, bpppf: 0.55),
+                (quality: 1.00, bpppf: 1.00),
+            ]
+        )
     }
 
     static func baseScreenContentBitsPerPixelPerFrame(quality: Double) -> Double {

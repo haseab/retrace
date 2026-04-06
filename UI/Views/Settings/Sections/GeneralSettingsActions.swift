@@ -195,9 +195,22 @@ extension SettingsView {
         min(max(videoQuality, 0.0), 1.0)
     }
 
-    private static func baseScreenContentBitsPerPixelPerFrame(for videoQuality: Double) -> Double {
+    private static func effectiveEncoderVideoQuality(for videoQuality: Double) -> Double {
         interpolateVideoQuality(
             normalizedVideoQuality(videoQuality),
+            points: [
+                (quality: 0.00, bpppf: 0.00),
+                (quality: 0.40, bpppf: 0.3469026324777675),
+                (quality: 0.70, bpppf: 0.55),
+                (quality: 1.00, bpppf: 1.00),
+            ]
+        )
+    }
+
+    private static func baseScreenContentBitsPerPixelPerFrame(for videoQuality: Double) -> Double {
+        let encoderQuality = effectiveEncoderVideoQuality(for: videoQuality)
+        return interpolateVideoQuality(
+            encoderQuality,
             points: [
                 (quality: 0.00, bpppf: 0.018),
                 (quality: 0.25, bpppf: 0.032),
@@ -208,11 +221,19 @@ extension SettingsView {
         )
     }
 
-    /// Estimate storage impact using the same quality curve the encoder uses.
+    /// Estimate storage impact using observed monthly storage normalization.
+    /// 40% maps to the legacy ~7.29 Mbps tier, and 70% maps to the current
+    /// observed ~11.14 Mbps tier that users experience in practice.
     private static func videoQualityMultiplier(for videoQuality: Double) -> Double {
-        let baselineBitsPerPixelPerFrame = baseScreenContentBitsPerPixelPerFrame(for: SettingsDefaults.videoQuality)
-        guard baselineBitsPerPixelPerFrame > 0 else { return 1.0 }
-        return baseScreenContentBitsPerPixelPerFrame(for: videoQuality) / baselineBitsPerPixelPerFrame
+        interpolateVideoQuality(
+            normalizedVideoQuality(videoQuality),
+            points: [
+                (quality: 0.00, bpppf: 3.207 / 11.14),
+                (quality: 0.40, bpppf: 7.29 / 11.14),
+                (quality: 0.70, bpppf: 1.00),
+                (quality: 1.00, bpppf: 15.145 / 11.14),
+            ]
+        )
     }
 
     private static func interpolateVideoQuality(
@@ -291,19 +312,20 @@ extension SettingsView {
     ) -> String {
         let qualityMultiplier = Self.videoQualityMultiplier(for: normalizedVideoQuality(videoQuality))
         let intervalMultiplier = Self.captureIntervalMultiplier(for: captureIntervalSeconds)
-        let combinedMultiplier = qualityMultiplier * intervalMultiplier
         let eventDrivenHeuristic = Self.eventDrivenCaptureStorageHeuristicGB(
             captureOnWindowChange: captureOnWindowChange,
             captureOnMouseClick: captureOnMouseClick
         )
 
-        let lowGB = (6.0 * combinedMultiplier) + eventDrivenHeuristic.lowGB
-        let highGB = (14.0 * combinedMultiplier) + eventDrivenHeuristic.highGB
+        let baselineLowGB = (6.0 * intervalMultiplier) + eventDrivenHeuristic.lowGB
+        let baselineHighGB = (14.0 * intervalMultiplier) + eventDrivenHeuristic.highGB
+        let lowGB = baselineLowGB * qualityMultiplier
+        let highGB = baselineHighGB * qualityMultiplier
         return Self.formatStorageEstimate(lowGB: lowGB, highGB: highGB)
     }
 
     /// Estimated storage per month based on video quality and capture interval settings
-    /// Reference: 50% quality at 2s interval ≈ 6-14 GB/month
+    /// Reference: 70% quality at 2s interval ≈ 6-14 GB/month
     var videoQualityEstimateText: String {
         Self.captureStorageEstimateText(
             videoQuality: videoQuality,

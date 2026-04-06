@@ -158,7 +158,7 @@ final class CaptureIntervalSettingsTests: XCTestCase {
     func testCaptureStorageEstimateIncludesEventDrivenHeuristicsWhenIntervalIsOff() {
         XCTAssertEqual(
             SettingsView.captureStorageEstimateText(
-                videoQuality: 0.5,
+                videoQuality: 0.7,
                 captureIntervalSeconds: 0,
                 captureOnWindowChange: true,
                 captureOnMouseClick: true
@@ -170,12 +170,24 @@ final class CaptureIntervalSettingsTests: XCTestCase {
     func testCaptureStorageEstimateAddsEventDrivenHeuristicsOnTopOfTimerEstimate() {
         XCTAssertEqual(
             SettingsView.captureStorageEstimateText(
-                videoQuality: 0.5,
+                videoQuality: 0.7,
                 captureIntervalSeconds: 2,
                 captureOnWindowChange: true,
                 captureOnMouseClick: true
             ),
             "Estimated: ~6.8-17.0 GB per month"
+        )
+    }
+
+    func testCaptureStorageEstimateTreatsFortyPercentAsLegacyLowerBitrateTier() {
+        XCTAssertEqual(
+            SettingsView.captureStorageEstimateText(
+                videoQuality: 0.4,
+                captureIntervalSeconds: 2,
+                captureOnWindowChange: true,
+                captureOnMouseClick: true
+            ),
+            "Estimated: ~4.4-11.1 GB per month"
         )
     }
 

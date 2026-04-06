@@ -359,7 +359,7 @@ public final class FeedbackService: @unchecked Sendable {
         let retentionDays = defaults.object(forKey: "retentionDays") as? Int ?? 0
         settings["retentionDays"] = String(retentionDays)
         settings["maxStorageGB"] = String(format: "%.1f", defaults.object(forKey: "maxStorageGB") as? Double ?? 500.0)
-        settings["videoQuality"] = String(format: "%.2f", defaults.object(forKey: "videoQuality") as? Double ?? 0.5)
+        settings["videoQuality"] = String(format: "%.2f", defaults.object(forKey: "videoQuality") as? Double ?? 0.7)
 
         // Integration + startup flags
         settings["useRewindData"] = boolString(defaults.bool(forKey: "useRewindData"))

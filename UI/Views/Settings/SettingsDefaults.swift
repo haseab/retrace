@@ -65,7 +65,7 @@ enum SettingsDefaults {
     static let captureActiveDisplayOnly = false
     static let excludeCursor = false
     static let captureMousePosition = true
-    static let videoQuality: Double = 0.5
+    static let videoQuality: Double = 0.7
     static let deleteDuplicateFrames = true
     static let deduplicationThreshold: Double = CaptureConfig.defaultDeduplicationThreshold
     static let keepFramesOnMouseMovement = true
