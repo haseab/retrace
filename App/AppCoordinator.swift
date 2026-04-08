@@ -540,6 +540,7 @@ public actor AppCoordinator {
     private var unexpectedRecordingStopState: UnexpectedRecordingStopState?
     private var hasLoadedUnexpectedRecordingStopState = false
     private var unexpectedRecordingStopCounters = UnexpectedRecordingStopCounters()
+    private var stalledUnreadableWriterWarningVideoIDs: Set<Int64> = []
     #if DEBUG
     private var debugInterruptEncodingOnNextAppend = false
     #endif
@@ -1644,6 +1645,7 @@ public actor AppCoordinator {
         var writersByResolution: [String: VideoWriterState] = [:]
         var pendingUnexpectedStop: PendingUnexpectedRecordingStop?
         var lastPipelineMemoryLogAt = Date.distantPast
+        stalledUnreadableWriterWarningVideoIDs.removeAll()
         let maxFramesPerSegment = 150
         let videoUpdateInterval = 5
 
@@ -1913,16 +1915,20 @@ public actor AppCoordinator {
                     in: Self.unexpectedRecordingStopWriterSnapshots(from: writersByResolution),
                     now: Date()
                 ) {
-                    let pendingAgeSeconds = stalledWriter.oldestPendingUnreadableAt.map {
-                        max(0, Int(Date().timeIntervalSince($0)))
-                    } ?? 0
-                    requestUnexpectedStop(
-                        reason: .unreadableWriterStalled,
-                        summary:
-                            "Writer \(stalledWriter.videoDBID) at \(stalledWriter.resolutionKey) remained unreadable for \(pendingAgeSeconds)s " +
-                            "with \(stalledWriter.pendingUnreadableFrameCount) pending frame(s) while another writer continued."
-                    )
-                    break
+                    let activeVideoIDs = Set(writersByResolution.values.map(\.videoDBID))
+                    stalledUnreadableWriterWarningVideoIDs.formIntersection(activeVideoIDs)
+                    if !stalledUnreadableWriterWarningVideoIDs.contains(stalledWriter.videoDBID) {
+                        let pendingAgeSeconds = stalledWriter.oldestPendingUnreadableAt.map {
+                            max(0, Int(Date().timeIntervalSince($0)))
+                        } ?? 0
+                        Log.warning(
+                            "[Pipeline] Writer remains unreadable videoDBID=\(stalledWriter.videoDBID) resolution=\(stalledWriter.resolutionKey) " +
+                                "pendingAgeSeconds=\(pendingAgeSeconds) pendingUnreadableFrames=\(stalledWriter.pendingUnreadableFrameCount); " +
+                                "keeping writer active because at least one other writer is readable.",
+                            category: .app
+                        )
+                        stalledUnreadableWriterWarningVideoIDs.insert(stalledWriter.videoDBID)
+                    }
                 }
                 maybeLogPipelineMemory(reason: "steady-state")
                 totalFramesProcessed += 1
@@ -2665,10 +2671,11 @@ public actor AppCoordinator {
                 return false
             }
 
-            let hasAnotherWriterWithFrames = writers.contains { otherWriter in
-                otherWriter.videoDBID != writer.videoDBID && otherWriter.frameCount > 0
+            let hasAnotherReadableWriter = writers.contains { otherWriter in
+                otherWriter.videoDBID != writer.videoDBID &&
+                    otherWriter.persistedReadableFrameCount > 0
             }
-            guard hasAnotherWriterWithFrames else {
+            guard hasAnotherReadableWriter else {
                 return false
             }
 

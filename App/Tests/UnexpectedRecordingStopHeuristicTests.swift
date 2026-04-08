@@ -89,4 +89,35 @@ final class UnexpectedRecordingStopHeuristicTests: XCTestCase {
 
         XCTAssertNil(stalledWriter)
     }
+
+    func testStalledUnreadableWriterIgnoresWhenOtherWriterHasNoReadableFramesYet() {
+        let now = Date(timeIntervalSince1970: 1_775_100_000)
+        let writers = [
+            AppCoordinator.UnexpectedRecordingStopWriterSnapshot(
+                resolutionKey: "3024x1964",
+                videoDBID: 1000059,
+                frameCount: 3,
+                persistedReadableFrameCount: 0,
+                pendingUnreadableFrameCount: 3,
+                oldestPendingUnreadableAt: now.addingTimeInterval(-90)
+            ),
+            AppCoordinator.UnexpectedRecordingStopWriterSnapshot(
+                resolutionKey: "1920x1200",
+                videoDBID: 1000060,
+                frameCount: 6,
+                persistedReadableFrameCount: 0,
+                pendingUnreadableFrameCount: 2,
+                oldestPendingUnreadableAt: now.addingTimeInterval(-30)
+            )
+        ]
+
+        let stalledWriter = AppCoordinator.stalledUnreadableWriter(
+            in: writers,
+            now: now,
+            threshold: 45,
+            minimumPendingFrames: 2
+        )
+
+        XCTAssertNil(stalledWriter)
+    }
 }
