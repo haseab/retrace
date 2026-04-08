@@ -1462,7 +1462,10 @@ public enum FrameQueries {
                 v.frameRate,
                 v.width,
                 v.height,
-                v.processingState
+                v.processingState,
+                v.fileSize,
+                v.frameCount,
+                (SELECT MAX(fr.rewrittenAt) FROM frame fr WHERE fr.videoId = f.videoId) AS videoReencodedAt
             FROM frame f
             LEFT JOIN segment s ON f.segmentId = s.id
             LEFT JOIN video v ON f.videoId = v.id
@@ -1511,7 +1514,8 @@ public enum FrameQueries {
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodedAt, f.processingStatus, f.redactionReason,
                    f.capture_trigger, s.bundleID, s.windowName, s.browserUrl, f.mousePosition,
-                   v.path, v.frameRate, v.width, v.height, v.processingState
+                   v.path, v.frameRate, v.width, v.height, v.processingState, v.fileSize, v.frameCount,
+                   (SELECT MAX(fr.rewrittenAt) FROM frame fr WHERE fr.videoId = f.videoId) AS videoReencodedAt
             FROM (
                 SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodedAt, processingStatus, redactionReason, capture_trigger, mousePosition
                 FROM frame
@@ -1559,7 +1563,8 @@ public enum FrameQueries {
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodedAt, f.processingStatus, f.redactionReason,
                    f.capture_trigger, s.bundleID, s.windowName, s.browserUrl, f.mousePosition,
-                   v.path, v.frameRate, v.width, v.height, v.processingState
+                   v.path, v.frameRate, v.width, v.height, v.processingState, v.fileSize, v.frameCount,
+                   (SELECT MAX(fr.rewrittenAt) FROM frame fr WHERE fr.videoId = f.videoId) AS videoReencodedAt
             FROM (
                 SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodedAt, processingStatus, redactionReason, capture_trigger, mousePosition
                 FROM frame
@@ -1607,7 +1612,8 @@ public enum FrameQueries {
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodedAt, f.processingStatus, f.redactionReason,
                    f.capture_trigger, s.bundleID, s.windowName, s.browserUrl, f.mousePosition,
-                   v.path, v.frameRate, v.width, v.height, v.processingState
+                   v.path, v.frameRate, v.width, v.height, v.processingState, v.fileSize, v.frameCount,
+                   (SELECT MAX(fr.rewrittenAt) FROM frame fr WHERE fr.videoId = f.videoId) AS videoReencodedAt
             FROM (
                 SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodedAt, processingStatus, redactionReason, capture_trigger, mousePosition
                 FROM frame
@@ -1654,7 +1660,8 @@ public enum FrameQueries {
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodedAt, f.processingStatus, f.redactionReason,
                    f.capture_trigger, s.bundleID, s.windowName, s.browserUrl, f.mousePosition,
-                   v.path, v.frameRate, v.width, v.height, v.processingState
+                   v.path, v.frameRate, v.width, v.height, v.processingState, v.fileSize, v.frameCount,
+                   (SELECT MAX(fr.rewrittenAt) FROM frame fr WHERE fr.videoId = f.videoId) AS videoReencodedAt
             FROM frame f
             LEFT JOIN segment s ON f.segmentId = s.id
             LEFT JOIN video v ON f.videoId = v.id
@@ -1683,7 +1690,7 @@ public enum FrameQueries {
     /// Parse a row from a query that JOINs frame with segment and video tables
     /// Columns: f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodedAt, f.processingStatus,
     ///          f.redactionReason, f.capture_trigger, s.bundleID, s.windowName, s.browserUrl, f.mousePosition,
-    ///          v.path, v.frameRate, v.width, v.height, v.processingState
+    ///          v.path, v.frameRate, v.width, v.height, v.processingState, v.fileSize, v.frameCount, MAX(frame.rewrittenAt for videoId)
     private static func parseFrameWithVideoInfoRow(
         statement: OpaquePointer,
         storageRoot: String
@@ -1728,7 +1735,7 @@ public enum FrameQueries {
             source: .native
         )
 
-        // Parse video info (columns 13-17: v.path, v.frameRate, v.width, v.height, v.processingState)
+        // Parse video info (columns 13-20: v.path, v.frameRate, v.width, v.height, v.processingState, v.fileSize, v.frameCount, MAX(frame.rewrittenAt for videoId))
         var videoInfo: FrameVideoInfo? = nil
         let videoPath = getTextOrNil(statement, 13)
 
@@ -1744,6 +1751,15 @@ public enum FrameQueries {
             // v.processingState: 0 = finalized/complete, 1 = still being written
             let videoProcessingState = Int(sqlite3_column_int(statement, 17))
             let isVideoFinalized = videoProcessingState == 0
+            let fileSizeBytes = sqlite3_column_type(statement, 18) != SQLITE_NULL
+                ? sqlite3_column_int64(statement, 18)
+                : nil
+            let frameCount = sqlite3_column_type(statement, 19) != SQLITE_NULL
+                ? Int(sqlite3_column_int(statement, 19))
+                : nil
+            let videoReencodedAt = sqlite3_column_type(statement, 20) != SQLITE_NULL
+                ? Schema.timestampToDate(sqlite3_column_int64(statement, 20))
+                : nil
 
             let fullPath = (storageRoot as NSString).appendingPathComponent(videoPath)
 
@@ -1753,7 +1769,10 @@ public enum FrameQueries {
                 frameRate: frameRate,
                 width: width,
                 height: height,
-                isVideoFinalized: isVideoFinalized
+                isVideoFinalized: isVideoFinalized,
+                videoReencodedAt: videoReencodedAt,
+                fileSizeBytes: fileSizeBytes,
+                frameCount: frameCount
             )
         } else {
             Log.warning("[FrameQueries]   ⚠️ videoInfo is nil (videoPath=\(videoPath ?? "nil"), videoID=\(videoID.value))", category: .database)

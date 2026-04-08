@@ -286,6 +286,16 @@ public struct FrameVideoInfo: Sendable, Equatable, Codable {
     /// If true, the video is complete and can be read regardless of file size
     public let isVideoFinalized: Bool
 
+    /// Timestamp of the last successful segment-level re-encode for this video.
+    /// Nil means the segment has never been re-encoded (or historical value is unavailable).
+    public let videoReencodedAt: Date?
+
+    /// File size in bytes for the containing video segment (from `video.fileSize`).
+    public let fileSizeBytes: Int64?
+
+    /// Total encoded frame count for the containing video segment (from `video.frameCount`).
+    public let frameCount: Int?
+
     /// Calculated time in seconds for this frame
     /// WARNING: This uses floating point which can cause precision issues at certain frame indices
     /// For precise seeking, use frameTimeCMTime instead
@@ -309,13 +319,57 @@ public struct FrameVideoInfo: Sendable, Equatable, Codable {
         }
     }
 
-    public init(videoPath: String, frameIndex: Int, frameRate: Double, width: Int? = nil, height: Int? = nil, isVideoFinalized: Bool = true) {
+    /// Approximate average bitrate derived from persisted file size and frame count.
+    /// Returns nil when size/count are missing or invalid.
+    public var averageBitrateBitsPerSecond: Double? {
+        guard let fileSizeBytes,
+              let frameCount,
+              fileSizeBytes > 0,
+              frameCount > 0 else {
+            return nil
+        }
+
+        let effectiveFrameRate = frameRate > 0 ? frameRate : 30.0
+        return Double(fileSizeBytes) * 8.0 * effectiveFrameRate / Double(frameCount)
+    }
+
+    /// Approximate payload size per frame in KiB.
+    /// Returns nil when size/count are missing or invalid.
+    public var kibibytesPerFrame: Double? {
+        guard let fileSizeBytes,
+              let frameCount,
+              fileSizeBytes > 0,
+              frameCount > 0 else {
+            return nil
+        }
+
+        return (Double(fileSizeBytes) / Double(frameCount)) / 1024.0
+    }
+
+    public var isVideoReencoded: Bool {
+        videoReencodedAt != nil
+    }
+
+    public init(
+        videoPath: String,
+        frameIndex: Int,
+        frameRate: Double,
+        width: Int? = nil,
+        height: Int? = nil,
+        isVideoFinalized: Bool = true,
+        videoReencodedAt: Date? = nil,
+        fileSizeBytes: Int64? = nil,
+        frameCount: Int? = nil
+    ) {
         self.videoPath = videoPath
         self.frameIndex = frameIndex
         self.frameRate = frameRate
         self.width = width
         self.height = height
         self.isVideoFinalized = isVideoFinalized
+        self.videoReencodedAt = videoReencodedAt
+        self.fileSizeBytes = fileSizeBytes
+        self.frameCount = frameCount
     }
 }
 

@@ -1537,6 +1537,78 @@ final class DatabaseManagerTests: XCTestCase {
         XCTAssertEqual(videoCount, 1)
     }
 
+    func testFinalizeVideoRewriteRefreshesVideoFileSizeFromDisk() async throws {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RetraceRewriteFileSizeRefresh_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: tempDir)
+        }
+
+        let isolatedDatabase = DatabaseManager(
+            databasePath: "file:rewrite_filesize_refresh_\(UUID().uuidString)?mode=memory&cache=private",
+            storageRootPath: tempDir.path
+        )
+
+        do {
+            try await isolatedDatabase.initialize()
+
+            let relativePath = "chunks/202604/08/rewrite-filesize-\(UUID().uuidString).mp4"
+            let segmentURL = tempDir.appendingPathComponent(relativePath)
+            try FileManager.default.createDirectory(
+                at: segmentURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+
+            let onDiskFileSize = 6_355_843
+            try Data(repeating: 0x7A, count: onDiskFileSize).write(to: segmentURL)
+
+            let timestamp = Date(timeIntervalSince1970: 1_775_200_000)
+            let videoID = try await isolatedDatabase.insertVideoSegment(
+                VideoSegment(
+                    id: VideoSegmentID(value: 0),
+                    startTime: timestamp,
+                    endTime: timestamp.addingTimeInterval(5),
+                    frameCount: 150,
+                    fileSizeBytes: 5_794_598,
+                    relativePath: relativePath,
+                    width: 3024,
+                    height: 1964,
+                    source: .native
+                )
+            )
+
+            let plan = VideoRewritePlan(
+                videoID: videoID,
+                redactions: [
+                    VideoFrameRedaction(
+                        frameID: 999_999_999,
+                        frameIndex: 0,
+                        targets: []
+                    )
+                ]
+            )
+            try await isolatedDatabase.finalizeVideoRewrite(plan)
+
+            guard let db = await isolatedDatabase.getConnection() else {
+                XCTFail("Expected active database connection")
+                return
+            }
+
+            let refreshedSize = try fetchInt64(
+                "SELECT fileSize FROM video WHERE id = ?;",
+                db: db,
+                bind: { sqlite3_bind_int64($0, 1, videoID) }
+            )
+            XCTAssertEqual(refreshedSize, Int64(onDiskFileSize))
+
+            try await isolatedDatabase.close()
+        } catch {
+            try? await isolatedDatabase.close()
+            throw error
+        }
+    }
+
     func testHasProtectedPhraseRedactionDataReturnsTrueWhenEncryptedNodesExist() async throws {
         let frameID = try await insertTestFrame(browserURL: nil)
         let hasProtectedDataBeforeInsert = try await database.hasProtectedPhraseRedactionData()

@@ -1575,6 +1575,22 @@ public actor DataAdapter {
         )
     }
 
+    private static func videoInfoProjection(
+        source: FrameSource,
+        frameAlias: String,
+        videoAlias: String
+    ) -> String {
+        if source == .rewind {
+            return "\(videoAlias).path, \(videoAlias).frameRate, \(videoAlias).width, \(videoAlias).height, 0 as videoProcessingState, NULL as videoFileSize, NULL as videoFrameCount, NULL as videoReencodedAt"
+        }
+
+        return """
+            \(videoAlias).path, \(videoAlias).frameRate, \(videoAlias).width, \(videoAlias).height,
+            \(videoAlias).processingState as videoProcessingState, \(videoAlias).fileSize as videoFileSize, \(videoAlias).frameCount as videoFrameCount,
+            (SELECT MAX(fr.rewrittenAt) FROM frame fr WHERE fr.videoId = \(frameAlias).videoId) as videoReencodedAt
+            """
+    }
+
     private static func queryFramesWithVideoInfo(
         from startDate: Date,
         to endDate: Date,
@@ -1635,10 +1651,7 @@ public actor DataAdapter {
                 \(projection.mousePositionColumn),
                 \(projection.scrollPositionColumn),
                 \(projection.videoCurrentTimeColumn),
-                v.path,
-                v.frameRate,
-                v.width,
-                v.height
+                \(Self.videoInfoProjection(source: config.source, frameAlias: "f", videoAlias: "v"))
             FROM frame f
             LEFT JOIN segment s ON f.segmentId = s.id
             \(tagJoin)
@@ -1714,7 +1727,7 @@ public actor DataAdapter {
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, \(projection.encodedAtColumn), \(projection.processingStatusColumn), \(projection.redactionReasonColumn),
                    \(projection.captureTriggerColumn),
                    s.bundleID, s.windowName, s.browserUrl, \(projection.mousePositionColumn), \(projection.scrollPositionColumn), \(projection.videoCurrentTimeColumn),
-                   v.path, v.frameRate, v.width, v.height
+                   \(Self.videoInfoProjection(source: config.source, frameAlias: "f", videoAlias: "v"))
             FROM (
                 SELECT id, createdAt, segmentId, videoId, videoFrameIndex, \(subqueryProjection.encodedAtColumn), \(subqueryProjection.processingStatusColumn), \(subqueryProjection.redactionReasonColumn), \(subqueryProjection.captureTriggerColumn), \(subqueryProjection.mousePositionColumn), \(subqueryProjection.scrollPositionColumn), \(subqueryProjection.videoCurrentTimeColumn)
                 FROM frame
@@ -1797,7 +1810,7 @@ public actor DataAdapter {
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, \(projection.encodedAtColumn), \(projection.processingStatusColumn), \(projection.redactionReasonColumn),
                    \(projection.captureTriggerColumn),
                    s.bundleID, s.windowName, s.browserUrl, \(projection.mousePositionColumn), \(projection.scrollPositionColumn), \(projection.videoCurrentTimeColumn),
-                   v.path, v.frameRate, v.width, v.height
+                   \(Self.videoInfoProjection(source: config.source, frameAlias: "f", videoAlias: "v"))
             FROM frame f
             INNER JOIN segment s ON f.segmentId = s.id
             \(filterComponents.tagJoin)
@@ -1989,7 +2002,7 @@ public actor DataAdapter {
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, \(projection.encodedAtColumn), \(projection.processingStatusColumn), \(projection.redactionReasonColumn),
                    \(projection.captureTriggerColumn),
                    s.bundleID, s.windowName, s.browserUrl, \(projection.mousePositionColumn), \(projection.scrollPositionColumn), \(projection.videoCurrentTimeColumn),
-                   v.path, v.frameRate, v.width, v.height
+                   \(Self.videoInfoProjection(source: config.source, frameAlias: "f", videoAlias: "v"))
             FROM frame f
             INNER JOIN segment s ON f.segmentId = s.id
             LEFT JOIN video v ON f.videoId = v.id
@@ -2072,7 +2085,7 @@ public actor DataAdapter {
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, \(projection.encodedAtColumn), \(projection.processingStatusColumn), \(projection.redactionReasonColumn),
                    \(projection.captureTriggerColumn),
                    s.bundleID, s.windowName, s.browserUrl, \(projection.mousePositionColumn), \(projection.scrollPositionColumn), \(projection.videoCurrentTimeColumn),
-                   v.path, v.frameRate, v.width, v.height
+                   \(Self.videoInfoProjection(source: config.source, frameAlias: "f", videoAlias: "v"))
             FROM frame f
             INNER JOIN segment s ON f.segmentId = s.id
             \(filterComponents.tagJoin)
@@ -2145,7 +2158,7 @@ public actor DataAdapter {
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, \(projection.encodedAtColumn), \(projection.processingStatusColumn), \(projection.redactionReasonColumn),
                    \(projection.captureTriggerColumn),
                    s.bundleID, s.windowName, s.browserUrl, \(projection.mousePositionColumn), \(projection.scrollPositionColumn), \(projection.videoCurrentTimeColumn),
-                   v.path, v.frameRate, v.width, v.height
+                   \(Self.videoInfoProjection(source: config.source, frameAlias: "f", videoAlias: "v"))
             FROM frame f
             INNER JOIN segment s ON f.segmentId = s.id
             \(filterComponents.tagJoin)
@@ -2224,7 +2237,7 @@ public actor DataAdapter {
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, \(projection.encodedAtColumn), \(projection.processingStatusColumn), \(projection.redactionReasonColumn),
                    \(projection.captureTriggerColumn),
                    s.bundleID, s.windowName, s.browserUrl, \(projection.mousePositionColumn), \(projection.scrollPositionColumn), \(projection.videoCurrentTimeColumn),
-                   v.path, v.frameRate, v.width, v.height
+                   \(Self.videoInfoProjection(source: config.source, frameAlias: "f", videoAlias: "v"))
             FROM frame f
             INNER JOIN segment s ON f.segmentId = s.id
             \(filterComponents.tagJoin)
@@ -2323,7 +2336,7 @@ public actor DataAdapter {
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, \(projection.encodedAtColumn), \(projection.processingStatusColumn), \(projection.redactionReasonColumn),
                    \(projection.captureTriggerColumn),
                    s.bundleID, s.windowName, s.browserUrl, \(projection.mousePositionColumn), \(projection.scrollPositionColumn), \(projection.videoCurrentTimeColumn),
-                   v.path, v.frameRate, v.width, v.height
+                   \(Self.videoInfoProjection(source: config.source, frameAlias: "f", videoAlias: "v"))
             FROM (
                 SELECT id, createdAt, segmentId, videoId, videoFrameIndex, \(subqueryProjection.encodedAtColumn), \(subqueryProjection.processingStatusColumn), \(subqueryProjection.redactionReasonColumn), \(subqueryProjection.captureTriggerColumn), \(subqueryProjection.mousePositionColumn), \(subqueryProjection.scrollPositionColumn), \(subqueryProjection.videoCurrentTimeColumn)
                 FROM frame
@@ -2427,7 +2440,7 @@ public actor DataAdapter {
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, \(projection.encodedAtColumn), \(projection.processingStatusColumn), \(projection.redactionReasonColumn),
                    \(projection.captureTriggerColumn),
                    s.bundleID, s.windowName, s.browserUrl, \(projection.mousePositionColumn), \(projection.scrollPositionColumn), \(projection.videoCurrentTimeColumn),
-                   v.path, v.frameRate, v.width, v.height
+                   \(Self.videoInfoProjection(source: config.source, frameAlias: "f", videoAlias: "v"))
             FROM (
                 SELECT id, createdAt, segmentId, videoId, videoFrameIndex, \(subqueryProjection.encodedAtColumn), \(subqueryProjection.processingStatusColumn), \(subqueryProjection.redactionReasonColumn), \(subqueryProjection.captureTriggerColumn), \(subqueryProjection.mousePositionColumn), \(subqueryProjection.scrollPositionColumn), \(subqueryProjection.videoCurrentTimeColumn)
                 FROM frame
@@ -2500,7 +2513,7 @@ public actor DataAdapter {
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, \(projection.encodedAtColumn), \(projection.processingStatusColumn), \(projection.redactionReasonColumn),
                    \(projection.captureTriggerColumn),
                    s.bundleID, s.windowName, s.browserUrl, \(projection.mousePositionColumn), \(projection.scrollPositionColumn), \(projection.videoCurrentTimeColumn),
-                   v.path, v.frameRate, v.width, v.height
+                   \(Self.videoInfoProjection(source: config.source, frameAlias: "f", videoAlias: "v"))
             FROM frame f
             LEFT JOIN segment s ON f.segmentId = s.id
             LEFT JOIN video v ON f.videoId = v.id
@@ -4731,6 +4744,10 @@ public actor DataAdapter {
         let frameRate = sqlite3_column_type(statement, 16) != SQLITE_NULL ? sqlite3_column_double(statement, 16) : nil
         let width = sqlite3_column_type(statement, 17) != SQLITE_NULL ? Int(sqlite3_column_int(statement, 17)) : nil
         let height = sqlite3_column_type(statement, 18) != SQLITE_NULL ? Int(sqlite3_column_int(statement, 18)) : nil
+        let videoProcessingState = sqlite3_column_type(statement, 19) != SQLITE_NULL ? Int(sqlite3_column_int(statement, 19)) : 0
+        let fileSizeBytes = sqlite3_column_type(statement, 20) != SQLITE_NULL ? sqlite3_column_int64(statement, 20) : nil
+        let frameCount = sqlite3_column_type(statement, 21) != SQLITE_NULL ? Int(sqlite3_column_int(statement, 21)) : nil
+        let videoReencodedAt = config.parseDate(from: statement, column: 22)
 
         let metadata = FrameMetadata(
             appBundleID: bundleID.isEmpty ? nil : bundleID,
@@ -4762,7 +4779,11 @@ public actor DataAdapter {
                 frameIndex: videoFrameIndex,
                 frameRate: rate,
                 width: w,
-                height: h
+                height: h,
+                isVideoFinalized: videoProcessingState == 0,
+                videoReencodedAt: videoReencodedAt,
+                fileSizeBytes: fileSizeBytes,
+                frameCount: frameCount
             )
         } else {
             videoInfo = nil

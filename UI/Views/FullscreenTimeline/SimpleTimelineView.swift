@@ -1,3 +1,4 @@
+import Foundation
 import SwiftUI
 import AVKit
 import Shared
@@ -6232,6 +6233,48 @@ struct DebugFrameIDBadge: View {
         }
     }
 
+    private var videoReencodeText: String {
+        guard let videoInfo = viewModel.currentVideoInfo else {
+            return "n/a"
+        }
+
+        return videoInfo.isVideoReencoded ? "yes" : "no"
+    }
+
+    private var videoReencodeColor: Color {
+        guard let videoInfo = viewModel.currentVideoInfo else {
+            return .blue.opacity(0.8)
+        }
+
+        return videoInfo.isVideoReencoded ? .green.opacity(0.85) : .white.opacity(0.75)
+    }
+
+    private var bitrateText: String {
+        guard let videoInfo = viewModel.currentVideoInfo,
+              let bitsPerSecond = videoInfo.averageBitrateBitsPerSecond,
+              bitsPerSecond.isFinite,
+              bitsPerSecond > 0 else {
+            return "--"
+        }
+
+        if bitsPerSecond >= 1_000_000 {
+            return String(format: "%.2f Mbps", bitsPerSecond / 1_000_000)
+        }
+
+        return String(format: "%.0f kbps", bitsPerSecond / 1_000)
+    }
+
+    private var kibPerFrameText: String {
+        guard let videoInfo = viewModel.currentVideoInfo,
+              let kibPerFrame = videoInfo.kibibytesPerFrame,
+              kibPerFrame.isFinite,
+              kibPerFrame > 0 else {
+            return "--"
+        }
+
+        return String(format: "%.1f", kibPerFrame)
+    }
+
     var body: some View {
         Button(action: {
             viewModel.copyCurrentFrameID()
@@ -6267,6 +6310,14 @@ struct DebugFrameIDBadge: View {
                         Text("VidIdx: \(videoInfo.frameIndex)")
                             .font(.retraceMonoSmall)
                             .foregroundColor(.orange.opacity(0.8))
+
+                        Text("Bitrate: \(bitrateText)")
+                            .font(.retraceMonoSmall)
+                            .foregroundColor(.white.opacity(0.85))
+
+                        Text("KiB/f: \(kibPerFrameText)")
+                            .font(.retraceMonoSmall)
+                            .foregroundColor(.white.opacity(0.78))
                     }
 
                     // Debug: Show processing status
@@ -6294,6 +6345,10 @@ struct DebugFrameIDBadge: View {
                                 : .yellow.opacity(0.8)
                             )
                     }
+
+                    Text("Re-encoded: \(videoReencodeText)")
+                        .font(.retraceMonoSmall)
+                        .foregroundColor(videoReencodeColor)
 
                     Text("Shown: \(renderedMediaText)")
                         .font(.retraceMonoSmall)
