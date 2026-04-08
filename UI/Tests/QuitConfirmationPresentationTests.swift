@@ -56,14 +56,14 @@ final class QuitConfirmationPresentationTests: XCTestCase {
         XCTAssertNil(anchor)
     }
 
-    func testFreshLaunchContinuesWhenCurrentProcessOwnsLockEvenIfMatchingRunningAppStillExists() {
+    func testFreshLaunchActivatesExistingInstanceWhenMatchingRunningAppExistsEvenIfLockWasAcquired() {
         XCTAssertEqual(
             AppDelegate.launchGateAction(
                 mode: .fresh,
                 lockResult: .acquired(descriptor: 42, attempts: 1),
                 matchingRunningAppDetected: true
             ),
-            .continueLaunchIgnoringStaleRunningApp
+            .activateExistingInstanceAndExitDuplicate
         )
     }
 
@@ -111,14 +111,14 @@ final class QuitConfirmationPresentationTests: XCTestCase {
         )
     }
 
-    func testFreshLaunchContinuesWhenLockErrorOccursWithoutMatch() {
+    func testFreshLaunchFailsClosedWhenLockErrorOccursWithoutMatch() {
         XCTAssertEqual(
             AppDelegate.launchGateAction(
                 mode: .fresh,
                 lockResult: .failedError(code: EIO, attempts: 1),
                 matchingRunningAppDetected: false
             ),
-            .continueLaunch
+            .exitDueToLockFailure
         )
     }
 }

@@ -249,8 +249,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     enum LaunchGateAction: Equatable {
         case continueLaunch
-        case continueLaunchIgnoringStaleRunningApp
         case activateExistingInstanceAndExitDuplicate
+        case exitDueToLockFailure
     }
 
     var menuBarManager: MenuBarManager?
@@ -2150,7 +2150,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         switch lockResult {
         case .acquired:
             if mode == .fresh, matchingRunningAppDetected {
-                return .continueLaunchIgnoringStaleRunningApp
+                return .activateExistingInstanceAndExitDuplicate
             }
             return .continueLaunch
 
@@ -2161,7 +2161,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if mode == .relaunch {
                 return .continueLaunch
             }
-            return matchingRunningAppDetected ? .activateExistingInstanceAndExitDuplicate : .continueLaunch
+            return matchingRunningAppDetected ? .activateExistingInstanceAndExitDuplicate : .exitDueToLockFailure
         }
     }
 
@@ -2198,15 +2198,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             return true
 
-        case .continueLaunchIgnoringStaleRunningApp:
-            Log.warning(
-                "[AppDelegate] Matching running application detected after acquiring the single-instance lock; continuing launch because the lock is authoritative and the other instance is likely terminating.",
-                category: .app
-            )
-            return true
-
         case .activateExistingInstanceAndExitDuplicate:
             switch (mode, lockResult) {
+            case (.fresh, .acquired):
+                Log.warning(
+                    "[AppDelegate] Matching running application detected during fresh launch even though the single-instance lock was acquired; activating existing instance and exiting duplicate prelaunch.",
+                    category: .app
+                )
+
             case (.relaunch, .failedHeldByAnotherProcess):
                 Log.warning(
                     "[AppDelegate] Relaunch could not reacquire the single-instance lock after handoff window; activating existing instance and exiting duplicate prelaunch.",
@@ -2230,6 +2229,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
 
             activateExistingInstance()
+            exitDuplicatePrelaunchProcess()
+
+        case .exitDueToLockFailure:
+            Log.error(
+                "[AppDelegate] Single-instance lock failed during fresh launch and no matching running instance was detected; exiting duplicate prelaunch to keep launch enforcement fail-closed.",
+                category: .app
+            )
             exitDuplicatePrelaunchProcess()
         }
     }
