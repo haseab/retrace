@@ -40,6 +40,8 @@ enum AppUsageLayoutSize {
     var horizontalPadding: CGFloat { 12 }
     var verticalPadding: CGFloat { 10 }
     var windowRowIndent: CGFloat { 52 }
+    var websiteTabRowIndent: CGFloat { windowRowIndent + 30 }
+    var websiteTabSectionLeading: CGFloat { websiteTabRowIndent + 14 }
 }
 
 // MARK: - Scroll Affordance
@@ -613,7 +615,7 @@ struct AppUsageListView: View {
                     Spacer()
                 }
                 .padding(.vertical, 6)
-                .padding(.leading, layoutSize.windowRowIndent + 20)
+                .padding(.leading, layoutSize.websiteTabSectionLeading)
             } else if tabs.isEmpty {
                 HStack {
                     Text("No tab data for this site")
@@ -622,7 +624,7 @@ struct AppUsageListView: View {
                         .italic()
                 }
                 .padding(.vertical, 6)
-                .padding(.leading, layoutSize.windowRowIndent + 20)
+                .padding(.leading, layoutSize.websiteTabSectionLeading)
             } else {
                 ForEach(Array(displayedTabs.enumerated()), id: \.element.id) { index, tab in
                     domainTabRow(tab: tab, app: app, appColor: appColor, layoutSize: layoutSize)
@@ -652,7 +654,7 @@ struct AppUsageListView: View {
         } label: {
             HStack(spacing: 8) {
                 Spacer()
-                    .frame(width: layoutSize.windowRowIndent + 6)
+                    .frame(width: layoutSize.websiteTabRowIndent)
 
                 // Sub-row marker to keep nested/tabbed hierarchy visible without a heavy card
                 Capsule()
@@ -734,7 +736,7 @@ struct AppUsageListView: View {
             .padding(.horizontal, 10)
         }
         .buttonStyle(.plain)
-        .padding(.leading, layoutSize.windowRowIndent + 20)
+        .padding(.leading, layoutSize.websiteTabSectionLeading)
         .padding(.top, 4)
     }
 
