@@ -333,9 +333,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func beginPostSingleInstanceLaunchSetup() {
-        // Temporarily disabled while investigating App Management permission prompts.
-        // Prompt user to move app to Applications folder if not already there.
-        // AppMover.moveToApplicationsFolderIfNecessary()
         TextInputContextMenuAutofillFilter.install()
         setupExternalDashboardRevealObserver()
         installMainMenuIfNeeded(force: true)
