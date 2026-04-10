@@ -162,6 +162,81 @@ final class TimelineBoundaryOlderFallbackTests: XCTestCase {
         XCTAssertFalse(paginationState.hasReachedAbsoluteStart)
     }
 
+    func testLoadOlderFramesDropsStaleResultWhenFrameWindowChangesMidFetch() async {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let baseDate = Date(timeIntervalSince1970: 1_700_402_000)
+        var beforeCallCount = 0
+
+        viewModel.frames = [
+            makeTimelineFrame(
+                id: 10,
+                timestamp: baseDate,
+                frameIndex: 0,
+                bundleID: "com.apple.Safari"
+            ),
+            makeTimelineFrame(
+                id: 11,
+                timestamp: baseDate.addingTimeInterval(1),
+                frameIndex: 1,
+                bundleID: "com.apple.Safari"
+            )
+        ]
+        viewModel.currentIndex = 1
+        viewModel.filterCriteria = FilterCriteria()
+        viewModel.test_setBoundaryPaginationState(hasMoreOlder: true, hasMoreNewer: false)
+        viewModel.test_updateWindowBoundaries()
+
+        viewModel.test_windowFetchHooks.getFramesWithVideoInfoBefore = { _, limit, _, reason in
+            beforeCallCount += 1
+            XCTAssertEqual(limit, 35)
+            XCTAssertTrue(reason.contains("loadOlderFrames.reason=test"))
+
+            // Simulate a jump/reload replacing the frame window while this boundary fetch is in flight.
+            viewModel.frames = [
+                self.makeTimelineFrame(
+                    id: 100,
+                    timestamp: baseDate.addingTimeInterval(600),
+                    frameIndex: 0,
+                    bundleID: "com.apple.Notes"
+                ),
+                self.makeTimelineFrame(
+                    id: 101,
+                    timestamp: baseDate.addingTimeInterval(601),
+                    frameIndex: 1,
+                    bundleID: "com.apple.Notes"
+                )
+            ]
+            viewModel.currentIndex = 1
+            viewModel.test_updateWindowBoundaries()
+
+            return [
+                self.makeFrameWithVideoInfo(
+                    id: 8,
+                    timestamp: baseDate.addingTimeInterval(-120),
+                    frameIndex: 8,
+                    bundleID: "com.apple.Rewind"
+                ),
+                self.makeFrameWithVideoInfo(
+                    id: 7,
+                    timestamp: baseDate.addingTimeInterval(-240),
+                    frameIndex: 7,
+                    bundleID: "com.apple.Rewind"
+                )
+            ]
+        }
+
+        await viewModel.test_loadOlderFrames()
+
+        XCTAssertEqual(beforeCallCount, 2)
+        XCTAssertEqual(viewModel.frames.count, 2)
+        XCTAssertEqual(viewModel.frames.first?.frame.id.value, 100)
+        XCTAssertEqual(viewModel.frames.last?.frame.id.value, 101)
+
+        let paginationState = viewModel.test_boundaryPaginationState()
+        XCTAssertTrue(paginationState.hasMoreOlder)
+        XCTAssertFalse(paginationState.hasReachedAbsoluteStart)
+    }
+
     private func makeTimelineFrame(
         id: Int64,
         timestamp: Date,

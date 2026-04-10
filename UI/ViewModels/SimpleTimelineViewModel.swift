@@ -2520,6 +2520,9 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Flag to prevent concurrent loads in the "newer" direction
     private var isLoadingNewer = false
 
+    /// Monotonic generation used to invalidate stale boundary-pagination responses after view-context changes.
+    private var boundaryLoadContextGeneration: UInt64 = 0
+
     /// In-flight boundary load tasks. Cancel these when a jump/reload replaces the frame window.
     private var olderBoundaryLoadTask: Task<Void, Never>?
     private var newerBoundaryLoadTask: Task<Void, Never>?
@@ -4031,7 +4034,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         logCmdFPlayheadState("reload.start", trace: cmdFTrace, targetTimestamp: timestamp)
         setLoadingState(true, reason: "reloadFramesAroundTimestamp")
         clearError()
-        cancelBoundaryLoadTasks(reason: "reloadFramesAroundTimestamp")
+        resetBoundaryLoads(reason: "reloadFramesAroundTimestamp")
 
         do {
             let calendar = Calendar.current
@@ -7387,6 +7390,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Restore timeline state from a snapshot
     private func restoreTimelineState(_ snapshot: TimelineStateSnapshot) {
+        resetBoundaryLoads(reason: "restoreTimelineState")
         let normalized = normalizedTimelineFilterCriteria(snapshot.filterCriteria)
         filterCriteria = normalized
         pendingFilterCriteria = normalized
@@ -7508,7 +7512,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Clear stale timeline content when active filters yield zero matches.
     private func applyFilteredEmptyTimelineState(context: String) {
         let clearedFrameCount = frames.count
-        cancelBoundaryLoadTasks(reason: "filteredEmpty.\(context)")
+        resetBoundaryLoads(reason: "filteredEmpty.\(context)")
         pendingCurrentIndexAfterFrameReplacement = nil
         selectedFrameIndex = nil
         frames = []
@@ -7532,6 +7536,15 @@ public class SimpleTimelineViewModel: ObservableObject {
         showErrorWithAutoDismiss("No frames found matching the current filters. Clear filters to see all frames.")
     }
 
+    private func invalidateBoundaryLoadContext(reason _: String) {
+        boundaryLoadContextGeneration &+= 1
+    }
+
+    private func resetBoundaryLoads(reason: String) {
+        invalidateBoundaryLoadContext(reason: reason)
+        cancelBoundaryLoadTasks(reason: reason)
+    }
+
     private func cancelBoundaryLoadTasks(reason: String) {
         let hadOlder = olderBoundaryLoadTask != nil
         let hadNewer = newerBoundaryLoadTask != nil
@@ -7545,7 +7558,10 @@ public class SimpleTimelineViewModel: ObservableObject {
         isLoadingNewer = false
 
         if hadOlder || hadNewer {
-            Log.debug("[InfiniteScroll] Cancelled boundary tasks (\(reason)) older=\(hadOlder) newer=\(hadNewer)", category: .ui)
+            Log.debug(
+                "[InfiniteScroll] Cancelled boundary tasks (\(reason)) older=\(hadOlder) newer=\(hadNewer)",
+                category: .ui
+            )
         }
     }
 
@@ -7561,6 +7577,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         clearDiskBufferReason: String,
         memoryLogContext: String? = nil
     ) {
+        resetBoundaryLoads(reason: "applyNavigationFrameWindow")
         let oldCacheCount = diskFrameBufferIndex.count
         clearDiskFrameBuffer(reason: clearDiskBufferReason)
         if let memoryLogContext, oldCacheCount > 0 {
@@ -8079,6 +8096,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         setLoadingState(true, reason: "loadMostRecentFrame")
         clearError()
+        resetBoundaryLoads(reason: "loadMostRecentFrame")
 
         do {
             // Load most recent frames
@@ -8190,6 +8208,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         setLoadingState(true, reason: "loadFramesDirectly")
         clearError()
+        resetBoundaryLoads(reason: "loadFramesDirectly")
 
         guard !framesWithVideoInfo.isEmpty else {
             if filterCriteria.hasActiveFilters {
@@ -14765,7 +14784,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         scrollDebounceTask = nil
         isActivelyScrolling = false
         subFrameOffset = 0
-        cancelBoundaryLoadTasks(reason: "goToNow")
+        resetBoundaryLoads(reason: "goToNow")
 
         // Clear filters without triggering reload (we'll handle that ourselves)
         if activeFilterCount > 0 {
@@ -15010,7 +15029,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     private func navigateToDate(_ targetDate: Date) async {
         setLoadingState(true, reason: "navigateToDate")
         clearError()
-        cancelBoundaryLoadTasks(reason: "navigateToDate")
+        resetBoundaryLoads(reason: "navigateToDate")
         cancelPendingStoppedPositionRecording()
         _ = recordCurrentPositionImmediatelyForUndo(reason: "navigateToDate.source")
 
@@ -15081,7 +15100,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         setLoadingState(true, reason: "searchForDate")
         clearError()
-        cancelBoundaryLoadTasks(reason: "searchForDate")
+        resetBoundaryLoads(reason: "searchForDate")
         dateJumpTraceID += 1
         let jumpTraceID = dateJumpTraceID
         cancelPendingStoppedPositionRecording()
@@ -15243,7 +15262,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         includeHiddenSegments: Bool = false,
         showFailureUI: Bool = true
     ) async -> Bool {
-        cancelBoundaryLoadTasks(reason: "searchForFrameID")
+        resetBoundaryLoads(reason: "searchForFrameID")
         cancelPendingStoppedPositionRecording()
         _ = recordCurrentPositionImmediatelyForUndo(reason: "searchForFrameID.source")
 
@@ -16644,8 +16663,78 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
     }
 
-    private func makeBoundedBoundaryFilters(rangeStart: Date, rangeEnd: Date) -> FilterCriteria? {
-        var boundedFilters = filterCriteria
+    private struct BoundaryLoadContext: Equatable {
+        let generation: UInt64
+        let filters: FilterCriteria
+        let boundaryFrameID: FrameID
+    }
+
+    private enum BoundaryLoadDirection {
+        case older
+        case newer
+
+        var label: String {
+            switch self {
+            case .older:
+                return "BoundaryOlder"
+            case .newer:
+                return "BoundaryNewer"
+            }
+        }
+    }
+
+    private func captureBoundaryLoadContext(direction: BoundaryLoadDirection) -> BoundaryLoadContext? {
+        let boundaryFrameID: FrameID?
+        switch direction {
+        case .older:
+            boundaryFrameID = frames.first?.frame.id
+        case .newer:
+            boundaryFrameID = frames.last?.frame.id
+        }
+
+        guard let boundaryFrameID else { return nil }
+        return BoundaryLoadContext(
+            generation: boundaryLoadContextGeneration,
+            filters: filterCriteria,
+            boundaryFrameID: boundaryFrameID
+        )
+    }
+
+    private func summarizeBoundaryLoadContextForLog(_ context: BoundaryLoadContext) -> String {
+        "generation=\(context.generation) boundaryFrameID=\(context.boundaryFrameID.value) filters={\(summarizeFiltersForLog(context.filters))}"
+    }
+
+    private func isBoundaryLoadContextCurrent(
+        direction: BoundaryLoadDirection,
+        reason: String,
+        requestContext: BoundaryLoadContext
+    ) -> Bool {
+        let label = direction.label
+        guard let currentContext = captureBoundaryLoadContext(direction: direction) else {
+            Log.info(
+                "[\(label)] ABORT reason=\(reason) staleResult=frameBufferClearedWhileLoading",
+                category: .ui
+            )
+            return false
+        }
+
+        if requestContext != currentContext {
+            Log.info(
+                "[\(label)] ABORT reason=\(reason) staleResult=contextChanged old={\(summarizeBoundaryLoadContextForLog(requestContext))} current={\(summarizeBoundaryLoadContextForLog(currentContext))}",
+                category: .ui
+            )
+            return false
+        }
+
+        return true
+    }
+
+    private func makeBoundedBoundaryFilters(
+        rangeStart: Date,
+        rangeEnd: Date,
+        criteria: FilterCriteria
+    ) -> FilterCriteria? {
+        var boundedFilters = criteria
         let effectiveStart = max(rangeStart, boundedFilters.startDate ?? rangeStart)
         let effectiveEnd = min(rangeEnd, boundedFilters.endDate ?? rangeEnd)
 
@@ -16707,15 +16796,20 @@ public class SimpleTimelineViewModel: ObservableObject {
         reason: String = "unspecified",
         cmdFTrace: CmdFQuickFilterLatencyTrace? = nil
     ) async {
-        guard let oldestTimestamp = oldestLoadedTimestamp else { return }
+        guard let oldestTimestamp = oldestLoadedTimestamp,
+              let requestContext = captureBoundaryLoadContext(direction: .older) else { return }
         guard !isLoadingOlder else { return }
         guard !Task.isCancelled else { return }
+        let requestFilters = requestContext.filters
         beginCriticalTimelineFetch()
         defer { endCriticalTimelineFetch() }
 
         let loadStart = CFAbsoluteTimeGetCurrent()
         isLoadingOlder = true
-        defer { olderBoundaryLoadTask = nil }
+        defer {
+            olderBoundaryLoadTask = nil
+            isLoadingOlder = false
+        }
         Log.debug("[InfiniteScroll] Loading older frames before \(oldestTimestamp)...", category: .ui)
         if let cmdFTrace {
             Log.info("[CmdFPerf][\(cmdFTrace.id)] Boundary older load started reason=\(reason) oldest=\(oldestTimestamp)", category: .ui)
@@ -16726,13 +16820,13 @@ public class SimpleTimelineViewModel: ObservableObject {
             // Use a bounded window to avoid expensive full-history scans.
             // Always pass filterCriteria to ensure hidden filter is applied (default: .hide)
             let rangeEnd = oneMillisecondBefore(oldestTimestamp)
-            let hasMetadataFilter = filterCriteria.windowNameFilter?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-                || filterCriteria.browserUrlFilter?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            let hasMetadataFilter = requestFilters.windowNameFilter?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+                || requestFilters.browserUrlFilter?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
 
             let queryFilters: FilterCriteria
             if hasMetadataFilter {
                 // Metadata filters can be very sparse; avoid a narrow one-day probe so we can jump large gaps.
-                var metadataFilters = filterCriteria
+                var metadataFilters = requestFilters
                 if let explicitEnd = metadataFilters.endDate {
                     metadataFilters.endDate = min(explicitEnd, rangeEnd)
                 } else {
@@ -16747,14 +16841,17 @@ public class SimpleTimelineViewModel: ObservableObject {
                 )
             } else {
                 let rangeStart = rangeEnd.addingTimeInterval(-WindowConfig.loadWindowSpanSeconds)
-                guard let boundedFilters = makeBoundedBoundaryFilters(rangeStart: rangeStart, rangeEnd: rangeEnd) else {
+                guard let boundedFilters = makeBoundedBoundaryFilters(
+                    rangeStart: rangeStart,
+                    rangeEnd: rangeEnd,
+                    criteria: requestFilters
+                ) else {
                     Log.info(
                         "[BoundaryOlder] SKIP reason=\(reason) window=\(Log.timestamp(from: rangeStart))->\(Log.timestamp(from: rangeEnd)) no-overlap-with-filters",
                         category: .ui
                     )
                     hasMoreOlder = false
                     hasReachedAbsoluteStart = true
-                    isLoadingOlder = false
                     return
                 }
                 queryFilters = boundedFilters
@@ -16773,7 +16870,6 @@ public class SimpleTimelineViewModel: ObservableObject {
             let queryElapsedMs = (CFAbsoluteTimeGetCurrent() - queryStart) * 1000
 
             if Task.isCancelled {
-                isLoadingOlder = false
                 return
             }
 
@@ -16803,7 +16899,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                 let fallbackFramesWithVideoInfoDescending = try await fetchFramesWithVideoInfoBeforeLogged(
                     timestamp: oldestTimestamp,
                     limit: WindowConfig.nearestFallbackBatchSize,
-                    filters: filterCriteria,
+                    filters: requestFilters,
                     reason: "loadOlderFrames.reason=\(reason).nearestFallback"
                 )
                 let fallbackElapsedMs = (CFAbsoluteTimeGetCurrent() - fallbackStart) * 1000
@@ -16836,11 +16932,18 @@ public class SimpleTimelineViewModel: ObservableObject {
                 }
             }
 
+            guard isBoundaryLoadContextCurrent(
+                direction: .older,
+                reason: reason,
+                requestContext: requestContext
+            ) else {
+                return
+            }
+
             guard !framesWithVideoInfoDescending.isEmpty else {
                 Log.debug("[InfiniteScroll] No more older frames available - reached absolute start", category: .ui)
                 hasMoreOlder = false
                 hasReachedAbsoluteStart = true  // Mark that we've hit the absolute start
-                isLoadingOlder = false
 
                 if let cmdFTrace {
                     let loadElapsedMs = (CFAbsoluteTimeGetCurrent() - loadStart) * 1000
@@ -16868,25 +16971,6 @@ public class SimpleTimelineViewModel: ObservableObject {
                 TimelineFrame(frameWithVideoInfo: $0)
             }
 
-            // If timeline state changed while the query was in-flight (filter/apply/reload), drop stale results.
-            guard let currentOldest = frames.first?.frame.timestamp else {
-                Log.warning(
-                    "[BoundaryOlder] ABORT reason=\(reason) staleResult=frameBufferClearedWhileLoading",
-                    category: .ui
-                )
-                isLoadingOlder = false
-                return
-            }
-            let oldestDriftMs = abs(currentOldest.timeIntervalSince(oldestTimestamp) * 1000)
-            if oldestDriftMs > 1 {
-                Log.info(
-                    "[BoundaryOlder] ABORT reason=\(reason) staleResult=oldestChanged old=\(Log.timestamp(from: oldestTimestamp)) current=\(Log.timestamp(from: currentOldest)) driftMs=\(String(format: "%.1f", oldestDriftMs))",
-                    category: .ui
-                )
-                isLoadingOlder = false
-                return
-            }
-
             // Prepend to existing frames
             // Use insert(contentsOf:) to avoid unnecessary @Published triggers
             let beforeCount = frames.count
@@ -16900,7 +16984,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             }
             let oldCurrentIndex = currentIndex
             let oldTimestamp = frames[oldCurrentIndex].frame.timestamp
-            let oldFirstTimestamp = currentOldest
+            let oldFirstTimestamp = oldestTimestamp
 
             frames.insert(contentsOf: newTimelineFrames, at: 0)
 
@@ -16935,8 +17019,6 @@ public class SimpleTimelineViewModel: ObservableObject {
             // Trim if we've exceeded max frames
             trimWindowIfNeeded(preserveDirection: .older)
 
-            isLoadingOlder = false
-
             if let cmdFTrace {
                 let loadElapsedMs = (CFAbsoluteTimeGetCurrent() - loadStart) * 1000
                 let totalFromShortcutMs = (CFAbsoluteTimeGetCurrent() - cmdFTrace.startedAt) * 1000
@@ -16963,7 +17045,6 @@ public class SimpleTimelineViewModel: ObservableObject {
                     category: .ui
                 )
             }
-            isLoadingOlder = false
         }
     }
 
@@ -16972,15 +17053,20 @@ public class SimpleTimelineViewModel: ObservableObject {
         reason: String = "unspecified",
         cmdFTrace: CmdFQuickFilterLatencyTrace? = nil
     ) async {
-        guard let newestTimestamp = newestLoadedTimestamp else { return }
+        guard let newestTimestamp = newestLoadedTimestamp,
+              let requestContext = captureBoundaryLoadContext(direction: .newer) else { return }
         guard !isLoadingNewer else { return }
         guard !Task.isCancelled else { return }
+        let requestFilters = requestContext.filters
         beginCriticalTimelineFetch()
         defer { endCriticalTimelineFetch() }
 
         let loadStart = CFAbsoluteTimeGetCurrent()
         isLoadingNewer = true
-        defer { newerBoundaryLoadTask = nil }
+        defer {
+            newerBoundaryLoadTask = nil
+            isLoadingNewer = false
+        }
         Log.debug("[InfiniteScroll] Loading newer frames after \(newestTimestamp)...", category: .ui)
         Log.info(
             "[BOUNDARY-NEWER-PLAYHEAD] START reason=\(reason) currentIndex=\(currentIndex) frameCount=\(frames.count) newestLoadedIndex=\(max(frames.count - 1, 0)) hasMoreNewer=\(hasMoreNewer) isActivelyScrolling=\(isActivelyScrolling) subFrameOffset=\(String(format: "%.1f", subFrameOffset))",
@@ -17005,13 +17091,12 @@ public class SimpleTimelineViewModel: ObservableObject {
                 from: rangeStart,
                 to: rangeEnd,
                 limit: WindowConfig.loadBatchSize,
-                filters: filterCriteria,
+                filters: requestFilters,
                 reason: "loadNewerFrames.reason=\(reason)"
             )
             let queryElapsedMs = (CFAbsoluteTimeGetCurrent() - queryStart) * 1000
 
             if Task.isCancelled {
-                isLoadingNewer = false
                 return
             }
 
@@ -17040,7 +17125,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                 let fallbackFramesWithVideoInfo = try await fetchFramesWithVideoInfoAfterLogged(
                     timestamp: newestTimestamp,
                     limit: WindowConfig.nearestFallbackBatchSize,
-                    filters: filterCriteria,
+                    filters: requestFilters,
                     reason: "loadNewerFrames.reason=\(reason).nearestFallback"
                 )
                 let fallbackElapsedMs = (CFAbsoluteTimeGetCurrent() - fallbackStart) * 1000
@@ -17073,11 +17158,18 @@ public class SimpleTimelineViewModel: ObservableObject {
                 }
             }
 
+            guard isBoundaryLoadContextCurrent(
+                direction: .newer,
+                reason: reason,
+                requestContext: requestContext
+            ) else {
+                return
+            }
+
             guard !framesWithVideoInfo.isEmpty else {
                 Log.debug("[InfiniteScroll] No more newer frames available - reached absolute end", category: .ui)
                 hasMoreNewer = false
                 hasReachedAbsoluteEnd = true  // Mark that we've hit the absolute end
-                isLoadingNewer = false
 
                 if let cmdFTrace {
                     let loadElapsedMs = (CFAbsoluteTimeGetCurrent() - loadStart) * 1000
@@ -17117,7 +17209,6 @@ public class SimpleTimelineViewModel: ObservableObject {
                 )
                 hasMoreNewer = false
                 hasReachedAbsoluteEnd = true
-                isLoadingNewer = false
                 return
             }
 
@@ -17188,8 +17279,6 @@ public class SimpleTimelineViewModel: ObservableObject {
             // Trim if we've exceeded max frames
             trimWindowIfNeeded(preserveDirection: .newer)
 
-            isLoadingNewer = false
-
             if let cmdFTrace {
                 let loadElapsedMs = (CFAbsoluteTimeGetCurrent() - loadStart) * 1000
                 let totalFromShortcutMs = (CFAbsoluteTimeGetCurrent() - cmdFTrace.startedAt) * 1000
@@ -17216,7 +17305,6 @@ public class SimpleTimelineViewModel: ObservableObject {
                     category: .ui
                 )
             }
-            isLoadingNewer = false
         }
     }
 
