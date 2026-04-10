@@ -183,7 +183,7 @@ final class SettingsShellViewModel: ObservableObject {
         SettingsSearchEntry(id: "capture.rate", tab: .capture, cardTitle: "Capture Rate", cardIcon: "gauge.with.dots.needle.50percent",
             searchableText: ["capture rate", "capture interval", "capture on window change", "frame rate", "screenshot frequency", "mouse position", "capture mouse", "pointer overlay", "timeline cursor"]),
         SettingsSearchEntry(id: "capture.compression", tab: .capture, cardTitle: "Compression", cardIcon: "archivebox",
-            searchableText: ["compression", "video quality", "deduplication", "duplicate frames", "storage size", "mouse movement dedup", "keep frames on mouse movement"]),
+            searchableText: ["compression", "video quality", "similar frames deduplication threshold", "deduplication", "duplicate frames", "similar frames", "storage size", "mouse movement dedup", "keep frames on mouse movement"]),
         SettingsSearchEntry(id: "capture.pauseReminder", tab: .capture, cardTitle: "Recording Stopped Reminder", cardIcon: "bell.badge",
             searchableText: ["recording stopped reminder", "pause reminder", "remind me later", "notification", "reminder interval"]),
         SettingsSearchEntry(id: "capture.inPageURLs", tab: .capture, cardTitle: "In-Page URLs (Experimental)", cardIcon: "link.badge.plus",

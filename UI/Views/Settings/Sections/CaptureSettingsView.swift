@@ -181,7 +181,7 @@ extension SettingsView {
                     .background(Color.white.opacity(0.1))
 
                 HStack {
-                    Text("Deduplication")
+                    Text("Similar Frames Deduplication Threshold")
                         .font(.retraceCalloutMedium)
                         .foregroundColor(.retracePrimary)
                     Spacer()
