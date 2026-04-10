@@ -671,7 +671,7 @@ public actor CaptureManager: CaptureProtocol {
             : nil
 
         if currentConfig.adaptiveCaptureEnabled {
-            let similarity = lastKeptFrame != nil ? deduplicator.computeSimilarity(frame, lastKeptFrame!) : 0.0
+            let similarity = lastKeptFrame.map { deduplicator.computeSimilarity(frame, $0) }
             let keepBySimilarity = deduplicator.shouldKeepFrame(
                 frame,
                 comparedTo: lastKeptFrame,
@@ -702,17 +702,17 @@ public actor CaptureManager: CaptureProtocol {
                     reportMouseClickOutcome(.captured)
                 }
 
-                if keepByMouseMovement && !keepBySimilarity {
-                    Log.verbose(
-                        "Frame kept (trigger: \(triggerDescription), mouse moved, similarity: \(String(format: "%.2f%%", similarity * 100)))",
-                        category: .capture
-                    )
-                } else {
-                    Log.verbose(
-                        "Frame kept (trigger: \(triggerDescription), similarity: \(String(format: "%.2f%%", similarity * 100)))",
-                        category: .capture
-                    )
-                }
+                Log.info(
+                    Self.deduplicationAnalysisLogMessage(
+                        triggerDescription: triggerDescription,
+                        similarity: similarity,
+                        threshold: currentConfig.deduplicationThreshold,
+                        keepBySimilarity: keepBySimilarity,
+                        keepByMouseMovement: keepByMouseMovement,
+                        outcome: "kept"
+                    ),
+                    category: .capture
+                )
             } else {
                 stats = CaptureStatistics(
                     totalFramesCaptured: totalFrames,
@@ -727,7 +727,14 @@ public actor CaptureManager: CaptureProtocol {
                 }
 
                 Log.info(
-                    "Frame deduplicated (similarity: \(String(format: "%.2f%%", similarity * 100)), threshold: \(String(format: "%.2f%%", currentConfig.deduplicationThreshold * 100)))",
+                    Self.deduplicationAnalysisLogMessage(
+                        triggerDescription: triggerDescription,
+                        similarity: similarity,
+                        threshold: currentConfig.deduplicationThreshold,
+                        keepBySimilarity: keepBySimilarity,
+                        keepByMouseMovement: keepByMouseMovement,
+                        outcome: "deduplicated"
+                    ),
                     category: .capture
                 )
             }
@@ -749,8 +756,15 @@ public actor CaptureManager: CaptureProtocol {
                 reportMouseClickOutcome(.captured)
             }
 
-            Log.verbose(
-                "Frame kept (trigger: \(triggerDescription), deduplication: disabled)",
+            Log.info(
+                Self.deduplicationAnalysisLogMessage(
+                    triggerDescription: triggerDescription,
+                    similarity: nil,
+                    threshold: nil,
+                    keepBySimilarity: nil,
+                    keepByMouseMovement: false,
+                    outcome: "kept"
+                ),
                 category: .capture
             )
         }
@@ -811,6 +825,21 @@ public actor CaptureManager: CaptureProtocol {
         }
     }
 
+    static func deduplicationAnalysisLogMessage(
+        triggerDescription: String,
+        similarity: Double?,
+        threshold: Double?,
+        keepBySimilarity: Bool?,
+        keepByMouseMovement: Bool,
+        outcome: String
+    ) -> String {
+        let similarityDescription = similarity.map(Self.percentageLogDescription(for:)) ?? "n/a"
+        let thresholdDescription = threshold.map(Self.percentageLogDescription(for:)) ?? "disabled"
+        let keepBySimilarityDescription = keepBySimilarity.map(String.init(describing:)) ?? "n/a"
+
+        return "Deduplication analysis (trigger: \(triggerDescription), similarity: \(similarityDescription), threshold: \(thresholdDescription), keepBySimilarity: \(keepBySimilarityDescription), keepByMouseMovement: \(keepByMouseMovement), outcome: \(outcome))"
+    }
+
     private static func triggerLogDescription(for trigger: CaptureTrigger) -> String {
         switch trigger {
         case .mouseClick:
@@ -820,6 +849,10 @@ public actor CaptureManager: CaptureProtocol {
         case .interval:
             return "interval"
         }
+    }
+
+    private static func percentageLogDescription(for value: Double) -> String {
+        String(format: "%.2f%%", value * 100)
     }
 
     private static func mousePositionWithinCapturedFrame(_ frame: CapturedFrame) -> CGPoint? {

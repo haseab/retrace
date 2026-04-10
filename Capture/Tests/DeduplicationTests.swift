@@ -243,7 +243,6 @@ final class DeduplicationTests: XCTestCase {
 
         XCTAssertTrue(shouldKeep, "Movement at threshold should keep frame")
     }
-
     // ┌──────────────────────────────────────────────────────────────────────────┐
     // │                         Performance Tests                                │
     // └──────────────────────────────────────────────────────────────────────────┘

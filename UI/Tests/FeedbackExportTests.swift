@@ -1027,8 +1027,8 @@ final class FeedbackExportTests: XCTestCase {
 
     private func groupedLogInputEntries() -> [String] {
         [
-            "[2026-04-05T01:05:25Z] [INFO] [Capture] CaptureManager.swift:729 - Frame deduplicated (similarity: 99.91%, threshold: 99.85%)",
-            "[2026-04-05T01:06:32Z] [INFO] [Capture] CaptureManager.swift:729 - Frame deduplicated (similarity: 99.95%, threshold: 99.85%)",
+            "[2026-04-05T01:05:25Z] [INFO] [Capture] CaptureManager.swift:729 - Deduplication analysis (trigger: interval, similarity: 99.91%, threshold: 99.85%, keepBySimilarity: false, keepByMouseMovement: false, outcome: deduplicated)",
+            "[2026-04-05T01:06:32Z] [INFO] [Capture] CaptureManager.swift:729 - Deduplication analysis (trigger: mouse_click, similarity: 99.95%, threshold: 99.85%, keepBySimilarity: true, keepByMouseMovement: true, outcome: kept)",
             "[2026-04-05T01:05:35Z] [DEBUG] [Processing] ProcessingManager.swift:141 - [ProcessingManager] Region OCR: 24/64 tiles, 62% energy saved, 81.6ms",
             "[2026-04-05T01:05:40Z] [DEBUG] [Processing] ProcessingManager.swift:141 - [ProcessingManager] Region OCR: 8/64 tiles, 87% energy saved, 24.3ms",
             "[2026-04-05T01:05:42Z] [INFO] [Storage] HEVCEncoder.swift:559 - 📦 Fragment 18 written: +512KB (total: 6144KB, 12 frames flushed, video time: 5.0s) - frames now readable!",

@@ -456,14 +456,14 @@ extension FeedbackService {
     }
 
     private enum HighVolumeLogKind: CaseIterable {
-        case frameDeduplicated
+        case frameDeduplicationAnalysis
         case regionOCR
         case hevcFragmentWritten
         case timelineScrub
 
         var code: String {
             switch self {
-            case .frameDeduplicated:
+            case .frameDeduplicationAnalysis:
                 return "fd"
             case .regionOCR:
                 return "ro"
@@ -476,9 +476,9 @@ extension FeedbackService {
 
         var schema: DiagnosticInfo.GroupedRecentLogs.SchemaEntry {
             switch self {
-            case .frameDeduplicated:
+            case .frameDeduplicationAnalysis:
                 return .init(
-                    event: "frame_deduplicated",
+                    event: "frame_deduplication_analysis",
                     fields: [
                         "dt": "timestamp_delta_ms",
                         "t0": "base_timestamp_epoch_ms",
@@ -617,8 +617,9 @@ extension FeedbackService {
         _ parsedLine: ParsedFeedbackLogLine
     ) -> ParsedHighVolumeLogEntry? {
         let kind: HighVolumeLogKind
-        if parsedLine.message.hasPrefix("Frame deduplicated (") {
-            kind = .frameDeduplicated
+        if parsedLine.message.hasPrefix("Deduplication analysis (")
+            || parsedLine.message.hasPrefix("Frame deduplicated (") {
+            kind = .frameDeduplicationAnalysis
         } else if parsedLine.message.hasPrefix("[ProcessingManager] Region OCR:") {
             kind = .regionOCR
         } else if parsedLine.message.contains("Fragment "),
