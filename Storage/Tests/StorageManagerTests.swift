@@ -84,28 +84,68 @@ final class StorageManagerTests: XCTestCase {
         return url
     }
 
-    private func diskUsageBytes(at url: URL) throws -> Int64 {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/du")
-        process.arguments = ["-sk", url.path]
+    private func logicalUsageBytes(at url: URL) throws -> Int64 {
+        let fileManager = FileManager.default
+        let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey, .fileSizeKey])
 
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = FileHandle.nullDevice
+        if values.isRegularFile == true {
+            return Int64(values.fileSize ?? 0)
+        }
 
-        try process.run()
-        process.waitUntilExit()
-
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        guard
-            let output = String(data: data, encoding: .utf8),
-            let sizeKB = Int64(output.split(separator: "\t").first ?? "")
-        else {
-            XCTFail("Failed to parse du output for \(url.path)")
+        guard values.isDirectory == true else {
             return 0
         }
 
-        return sizeKB * 1024
+        var total: Int64 = 0
+        guard let enumerator = fileManager.enumerator(
+            at: url,
+            includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return 0
+        }
+
+        for case let fileURL as URL in enumerator {
+            let fileValues = try fileURL.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+            guard fileValues.isRegularFile == true else { continue }
+            total += Int64(fileValues.fileSize ?? 0)
+        }
+
+        return total
+    }
+
+    private func createSparseSegmentFile(
+        root: URL,
+        id: VideoSegmentID,
+        date: Date,
+        ext: String? = nil,
+        logicalSize: Int,
+        modDate: Date
+    ) throws -> URL {
+        let calendar = Calendar.current
+        let year = calendar.component(.year, from: date)
+        let month = calendar.component(.month, from: date)
+        let day = calendar.component(.day, from: date)
+
+        let dir = root
+            .appendingPathComponent("chunks", isDirectory: true)
+            .appendingPathComponent(String(format: "%04d%02d", year, month), isDirectory: true)
+            .appendingPathComponent(String(format: "%02d", day), isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+
+        let fileName: String
+        if let ext, !ext.isEmpty {
+            fileName = "\(id.stringValue).\(ext)"
+        } else {
+            fileName = id.stringValue
+        }
+        let url = dir.appendingPathComponent(fileName)
+        FileManager.default.createFile(atPath: url.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: url)
+        try handle.truncate(atOffset: UInt64(logicalSize))
+        try handle.close()
+        try FileManager.default.setAttributes([.modificationDate: modDate], ofItemAtPath: url.path)
+        return url
     }
 
     private func makeCapturedFrame(
@@ -416,7 +456,7 @@ final class StorageManagerTests: XCTestCase {
     // │                        Storage Metrics Tests                             │
     // └──────────────────────────────────────────────────────────────────────────┘
 
-    func testTotalStorageUsedMatchesChunkDiskUsage() async throws {
+    func testTotalStorageUsedMatchesLogicalChunkUsage() async throws {
         let root = makeTempRoot()
         let storage = StorageManager(storageRoot: root)
         try await storage.initialize(config: makeStorageConfig(root: root))
@@ -424,12 +464,51 @@ final class StorageManagerTests: XCTestCase {
         let now = Date()
         let id1 = VideoSegmentID(value: 301)
         let id2 = VideoSegmentID(value: 302)
-        _ = try createFakeSegmentFile(root: root, id: id1, date: now, size: 123, modDate: now)
+        _ = try createSparseSegmentFile(root: root, id: id1, date: now, logicalSize: 1_000_123, modDate: now)
         _ = try createFakeSegmentFile(root: root, id: id2, date: now, ext: "mp4", size: 456, modDate: now)
 
         let chunksURL = root.appendingPathComponent("chunks", isDirectory: true)
-        let expected = try diskUsageBytes(at: chunksURL)
+        let expected = try logicalUsageBytes(at: chunksURL)
         let total = try await storage.getTotalStorageUsed(includeRewind: false)
+        XCTAssertEqual(total, expected)
+
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    func testStorageUsedForDateRangeMatchesLogicalImmediateChunkUsage() async throws {
+        let root = makeTempRoot()
+        let storage = StorageManager(storageRoot: root)
+        try await storage.initialize(config: makeStorageConfig(root: root))
+
+        let calendar = Calendar.current
+        let day = Date()
+        let nextDay = calendar.date(byAdding: .day, value: 1, to: day) ?? day
+
+        let sparseURL = try createSparseSegmentFile(
+            root: root,
+            id: VideoSegmentID(value: 401),
+            date: day,
+            logicalSize: 2_000_321,
+            modDate: day
+        )
+        let regularURL = try createFakeSegmentFile(
+            root: root,
+            id: VideoSegmentID(value: 402),
+            date: day,
+            ext: "mp4",
+            size: 789,
+            modDate: day
+        )
+        _ = try createSparseSegmentFile(
+            root: root,
+            id: VideoSegmentID(value: 403),
+            date: nextDay,
+            logicalSize: 7_000_000,
+            modDate: nextDay
+        )
+
+        let expected = try logicalUsageBytes(at: sparseURL) + logicalUsageBytes(at: regularURL)
+        let total = try await storage.getStorageUsedForDateRange(from: day, to: day)
         XCTAssertEqual(total, expected)
 
         try? FileManager.default.removeItem(at: root)

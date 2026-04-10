@@ -221,17 +221,18 @@ extension SettingsView {
         )
     }
 
-    /// Estimate storage impact using observed monthly storage normalization.
-    /// 40% maps to the legacy ~7.29 Mbps tier, and 70% maps to the current
-    /// observed ~11.14 Mbps tier that users experience in practice.
+    /// Estimate storage impact using observed bitrate tiers normalized to the
+    /// 50% quality baseline used by the default 2s capture estimate.
+    /// 40% ≈ 7.29 Mbps, 50% ≈ 8.61 Mbps, 70% ≈ 11.31 Mbps, 100% ≈ 65.75 Mbps.
     private static func videoQualityMultiplier(for videoQuality: Double) -> Double {
         interpolateVideoQuality(
             normalizedVideoQuality(videoQuality),
             points: [
-                (quality: 0.00, bpppf: 3.207 / 11.14),
-                (quality: 0.40, bpppf: 7.29 / 11.14),
-                (quality: 0.70, bpppf: 1.00),
-                (quality: 1.00, bpppf: 15.145 / 11.14),
+                (quality: 0.00, bpppf: 3.207 / 8.61),
+                (quality: 0.40, bpppf: 7.29 / 8.61),
+                (quality: 0.50, bpppf: 1.00),
+                (quality: 0.70, bpppf: 11.31 / 8.61),
+                (quality: 1.00, bpppf: 65.75 / 8.61),
             ]
         )
     }
@@ -269,21 +270,45 @@ extension SettingsView {
         return 2.0 / captureIntervalSeconds
     }
 
+    private static let intervalOnlyBaselineLowGBAtTwoSeconds = 8.0
+    private static let intervalOnlyBaselineHighGBAtTwoSeconds = 15.0
+
+    // Observed trigger split across tracked provenance days after capture_trigger rollout.
+    // We apply this split to a range where interval captures account for 50-75% of total
+    // captures at the 2s baseline, producing a low/high event-driven storage range instead
+    // of a single weighted midpoint.
+    private static let mouseClickEventShare = 0.6394960927384343
+    private static let windowChangeEventShare = 0.36050390726156567
+    private static let minimumIntervalCaptureShare = 0.50
+    private static let maximumIntervalCaptureShare = 0.75
+
+    private static func storageOverheadMultiplier(intervalCaptureShare: Double) -> Double {
+        guard intervalCaptureShare > 0 else { return 0 }
+        return (1.0 - intervalCaptureShare) / intervalCaptureShare
+    }
+
     static func eventDrivenCaptureStorageHeuristicGB(
         captureOnWindowChange: Bool,
         captureOnMouseClick: Bool
     ) -> (lowGB: Double, highGB: Double) {
+        let lowExtraMultiplier = storageOverheadMultiplier(
+            intervalCaptureShare: maximumIntervalCaptureShare
+        )
+        let highExtraMultiplier = storageOverheadMultiplier(
+            intervalCaptureShare: minimumIntervalCaptureShare
+        )
+
         var lowGB = 0.0
         var highGB = 0.0
 
         if captureOnWindowChange {
-            lowGB += 0.5
-            highGB += 2.0
+            lowGB += intervalOnlyBaselineLowGBAtTwoSeconds * lowExtraMultiplier * windowChangeEventShare
+            highGB += intervalOnlyBaselineHighGBAtTwoSeconds * highExtraMultiplier * windowChangeEventShare
         }
 
         if captureOnMouseClick {
-            lowGB += 0.25
-            highGB += 1.0
+            lowGB += intervalOnlyBaselineLowGBAtTwoSeconds * lowExtraMultiplier * mouseClickEventShare
+            highGB += intervalOnlyBaselineHighGBAtTwoSeconds * highExtraMultiplier * mouseClickEventShare
         }
 
         return (lowGB, highGB)
@@ -317,15 +342,15 @@ extension SettingsView {
             captureOnMouseClick: captureOnMouseClick
         )
 
-        let baselineLowGB = (6.0 * intervalMultiplier) + eventDrivenHeuristic.lowGB
-        let baselineHighGB = (14.0 * intervalMultiplier) + eventDrivenHeuristic.highGB
+        let baselineLowGB = (intervalOnlyBaselineLowGBAtTwoSeconds * intervalMultiplier) + eventDrivenHeuristic.lowGB
+        let baselineHighGB = (intervalOnlyBaselineHighGBAtTwoSeconds * intervalMultiplier) + eventDrivenHeuristic.highGB
         let lowGB = baselineLowGB * qualityMultiplier
         let highGB = baselineHighGB * qualityMultiplier
         return Self.formatStorageEstimate(lowGB: lowGB, highGB: highGB)
     }
 
-    /// Estimated storage per month based on video quality and capture interval settings
-    /// Reference: 70% quality at 2s interval ≈ 6-14 GB/month
+    /// Estimated storage per month based on video quality and capture interval settings.
+    /// Reference: 50% quality at 2s interval ≈ 8-15 GB/month before event-driven uplift.
     var videoQualityEstimateText: String {
         Self.captureStorageEstimateText(
             videoQuality: videoQuality,

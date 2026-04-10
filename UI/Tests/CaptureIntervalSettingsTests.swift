@@ -139,43 +139,79 @@ final class CaptureIntervalSettingsTests: XCTestCase {
         )
     }
 
-    func testEventDrivenCaptureStorageHeuristicAddsRequestedWindowChangeAndClickOverheads() {
+    func testCaptureStorageEstimateUsesFiftyPercentAsDefaultTimerOnlyBaseline() {
+        XCTAssertEqual(
+            SettingsView.captureStorageEstimateText(
+                videoQuality: 0.5,
+                captureIntervalSeconds: 2,
+                captureOnWindowChange: false,
+                captureOnMouseClick: false
+            ),
+            "Estimated: ~8.0-15.0 GB per month"
+        )
+    }
+
+    func testCaptureStorageEstimateUsesObservedHundredPercentBitrateAsMultiplierOverFiftyPercent() {
+        XCTAssertEqual(
+            SettingsView.captureStorageEstimateText(
+                videoQuality: 1.0,
+                captureIntervalSeconds: 2,
+                captureOnWindowChange: false,
+                captureOnMouseClick: false
+            ),
+            "Estimated: ~61.1-114.5 GB per month"
+        )
+    }
+
+    func testCaptureStorageEstimateUsesObservedSeventyPercentBitrateAsMultiplierOverFiftyPercent() {
+        XCTAssertEqual(
+            SettingsView.captureStorageEstimateText(
+                videoQuality: 0.7,
+                captureIntervalSeconds: 2,
+                captureOnWindowChange: false,
+                captureOnMouseClick: false
+            ),
+            "Estimated: ~10.5-19.7 GB per month"
+        )
+    }
+
+    func testEventDrivenCaptureStorageHeuristicUsesObservedWindowChangeAndClickShares() {
         let windowChangeOnly = SettingsView.eventDrivenCaptureStorageHeuristicGB(
             captureOnWindowChange: true,
             captureOnMouseClick: false
         )
-        XCTAssertEqual(windowChangeOnly.lowGB, 0.5, accuracy: 0.0001)
-        XCTAssertEqual(windowChangeOnly.highGB, 2.0, accuracy: 0.0001)
+        XCTAssertEqual(windowChangeOnly.lowGB, 0.9613437527, accuracy: 0.0001)
+        XCTAssertEqual(windowChangeOnly.highGB, 5.4075586089, accuracy: 0.0001)
 
         let mouseClickOnly = SettingsView.eventDrivenCaptureStorageHeuristicGB(
             captureOnWindowChange: false,
             captureOnMouseClick: true
         )
-        XCTAssertEqual(mouseClickOnly.lowGB, 0.25, accuracy: 0.0001)
-        XCTAssertEqual(mouseClickOnly.highGB, 1.0, accuracy: 0.0001)
+        XCTAssertEqual(mouseClickOnly.lowGB, 1.7053229140, accuracy: 0.0001)
+        XCTAssertEqual(mouseClickOnly.highGB, 9.5924413911, accuracy: 0.0001)
     }
 
     func testCaptureStorageEstimateIncludesEventDrivenHeuristicsWhenIntervalIsOff() {
         XCTAssertEqual(
             SettingsView.captureStorageEstimateText(
-                videoQuality: 0.7,
+                videoQuality: 0.5,
                 captureIntervalSeconds: 0,
                 captureOnWindowChange: true,
                 captureOnMouseClick: true
             ),
-            "Estimated: ~0.8-3.0 GB per month"
+            "Estimated: ~2.7-15.0 GB per month"
         )
     }
 
     func testCaptureStorageEstimateAddsEventDrivenHeuristicsOnTopOfTimerEstimate() {
         XCTAssertEqual(
             SettingsView.captureStorageEstimateText(
-                videoQuality: 0.7,
+                videoQuality: 0.5,
                 captureIntervalSeconds: 2,
                 captureOnWindowChange: true,
                 captureOnMouseClick: true
             ),
-            "Estimated: ~6.8-17.0 GB per month"
+            "Estimated: ~10.7-30.0 GB per month"
         )
     }
 
@@ -187,7 +223,7 @@ final class CaptureIntervalSettingsTests: XCTestCase {
                 captureOnWindowChange: true,
                 captureOnMouseClick: true
             ),
-            "Estimated: ~4.4-11.1 GB per month"
+            "Estimated: ~9.0-25.4 GB per month"
         )
     }
 

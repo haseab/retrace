@@ -1326,7 +1326,10 @@ struct ZoomControl: View {
                         .font(.system(size: TimelineScaleFactor.fontCaption2, weight: .medium))
                         .foregroundColor(.white.opacity(0.5))
 
-                    ZoomSlider(value: $viewModel.zoomLevel)
+                    ZoomSlider(
+                        value: $viewModel.zoomLevel,
+                        range: 0...TimelineConfig.maxZoomLevel
+                    )
                         .frame(width: TimelineScaleFactor.zoomSliderWidth)
 
                     Image(systemName: "plus.magnifyingglass")
@@ -1751,13 +1754,16 @@ extension View {
 /// Custom slider for zoom control with Rewind-style appearance
 struct ZoomSlider: View {
     @Binding var value: CGFloat
+    let range: ClosedRange<CGFloat>
 
     @State private var isDragging = false
 
     var body: some View {
         GeometryReader { geometry in
-            let trackWidth = geometry.size.width
-            let thumbX = value * trackWidth
+            let trackWidth = max(geometry.size.width, 1)
+            let clampedValue = min(max(value, range.lowerBound), range.upperBound)
+            let progress = (clampedValue - range.lowerBound) / (range.upperBound - range.lowerBound)
+            let thumbX = progress * trackWidth
 
             ZStack(alignment: .leading) {
                 // Track background
@@ -1784,8 +1790,8 @@ struct ZoomSlider: View {
                 DragGesture(minimumDistance: 0)
                     .onChanged { gesture in
                         isDragging = true
-                        let newValue = gesture.location.x / trackWidth
-                        value = max(0, min(1, newValue))
+                        let clampedProgress = max(0, min(1, gesture.location.x / trackWidth))
+                        value = range.lowerBound + (clampedProgress * (range.upperBound - range.lowerBound))
                     }
                     .onEnded { _ in
                         isDragging = false

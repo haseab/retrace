@@ -11,12 +11,39 @@ import UniformTypeIdentifiers
 import ImageIO
 
 /// Shared timeline configuration
+public enum TimelineZoomSettings {
+    /// Fit-to-screen baseline expressed as a percentage.
+    public static let resetPercent: CGFloat = 100.0
+    /// Historical maximum detail stop for the tape zoom curve.
+    public static let legacyTimelineDetailPercent: CGFloat = 1000.0
+    /// Single source of truth for the configured maximum zoom ceiling.
+    public static let maxPercent: CGFloat = 3000.0
+    /// Minimum in-frame zoom scale.
+    public static let minFrameScale: CGFloat = 0.25
+    /// Maximum in-frame zoom scale derived from the configured ceiling.
+    public static let maxFrameScale: CGFloat = maxPercent / resetPercent
+    /// Slider max preserving the old tape curve up to the legacy detail stop.
+    public static let maxTimelineZoomLevel: CGFloat = maxFrameScale / (legacyTimelineDetailPercent / resetPercent)
+
+    public static var resetLabel: String {
+        "\(Int(resetPercent))%"
+    }
+
+    public static func percentLabel(forScale scale: CGFloat) -> String {
+        "\(Int(scale * resetPercent))%"
+    }
+}
+
 public enum TimelineConfig {
-    /// Base pixels per frame at 100% zoom (max detail)
-    public static let basePixelsPerFrame: CGFloat = 75.0
     /// Minimum pixels per frame at 0% zoom (most zoomed out)
     public static let minPixelsPerFrame: CGFloat = 8.0
-    /// Default zoom level (0.0 to 1.0, where 1.0 is max detail)
+    /// Pixels per frame at the legacy max-detail stop (1.0 zoom level).
+    public static let basePixelsPerFrame: CGFloat = 75.0
+    /// Extended max-detail density derived from the shared zoom ceiling.
+    public static let maxPixelsPerFrame: CGFloat = minPixelsPerFrame * TimelineZoomSettings.maxFrameScale
+    /// Maximum timeline zoom level exposed by the slider.
+    public static let maxZoomLevel: CGFloat = TimelineZoomSettings.maxTimelineZoomLevel
+    /// Default zoom level, preserving the existing initial tape density.
     public static let defaultZoomLevel: CGFloat = 0.6
 }
 
@@ -775,7 +802,8 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Selected hour (0-23) when keyboard focus is on the time grid
     @Published public var selectedCalendarHour: Int? = nil
 
-    /// Zoom level (0.0 to 1.0, where 1.0 is max detail/zoomed in)
+    /// Zoom level (0.0 to TimelineConfig.maxZoomLevel).
+    /// 1.0 preserves the legacy max-detail stop; the upper bound is derived from TimelineZoomSettings.maxPercent.
     @Published public var zoomLevel: CGFloat = TimelineConfig.defaultZoomLevel
 
     /// Whether the zoom slider is expanded/visible
@@ -1052,10 +1080,10 @@ public class SimpleTimelineViewModel: ObservableObject {
     @Published public var frameZoomOffset: CGSize = .zero
 
     /// Minimum zoom scale (frame smaller than display)
-    public static let minFrameZoomScale: CGFloat = 0.25
+    public static let minFrameZoomScale: CGFloat = TimelineZoomSettings.minFrameScale
 
     /// Maximum zoom scale (zoomed in)
-    public static let maxFrameZoomScale: CGFloat = 10.0
+    public static let maxFrameZoomScale: CGFloat = TimelineZoomSettings.maxFrameScale
 
     /// Whether the frame is currently zoomed (not at 100%)
     public var isFrameZoomed: Bool {
@@ -1906,8 +1934,16 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Current pixels per frame based on zoom level
     public var pixelsPerFrame: CGFloat {
-        let range = TimelineConfig.basePixelsPerFrame - TimelineConfig.minPixelsPerFrame
-        return TimelineConfig.minPixelsPerFrame + (range * zoomLevel)
+        let clampedZoomLevel = zoomLevel.clamped(to: 0...TimelineConfig.maxZoomLevel)
+        let legacyRange = TimelineConfig.basePixelsPerFrame - TimelineConfig.minPixelsPerFrame
+
+        if clampedZoomLevel <= 1.0 {
+            return TimelineConfig.minPixelsPerFrame + (legacyRange * clampedZoomLevel)
+        }
+
+        let extendedRange = TimelineConfig.maxPixelsPerFrame - TimelineConfig.basePixelsPerFrame
+        let extendedProgress = (clampedZoomLevel - 1.0) / (TimelineConfig.maxZoomLevel - 1.0)
+        return TimelineConfig.basePixelsPerFrame + (extendedRange * extendedProgress)
     }
 
     /// Frame skip factor - how many frames to skip when displaying

@@ -1469,31 +1469,24 @@ public actor StorageManager: StorageProtocol {
 
     public func getTotalStorageUsed(includeRewind: Bool = false) async throws -> Int64 {
         var totalSize: Int64 = 0
-        var fileCount = 0
 
         // Retrace storage: chunks/ folder + retrace.db
         let retraceChunksURL = storageRootURL.appendingPathComponent("chunks", isDirectory: true)
         let retraceDbURL = storageRootURL.appendingPathComponent("retrace.db")
-        let (retraceChunksSize, retraceFileCount) = calculateFolderSizeWithCount(at: retraceChunksURL)
+        let retraceChunksSize = calculateFolderSize(at: retraceChunksURL)
         totalSize += retraceChunksSize
-        fileCount += retraceFileCount
 
-        if let dbSize = try? retraceDbURL.resourceValues(forKeys: [.totalFileAllocatedSizeKey]).totalFileAllocatedSize {
-            totalSize += Int64(dbSize)
-        }
+        totalSize += logicalFileSizeIfPresent(at: retraceDbURL)
 
         // Rewind storage: only include if enabled
         if includeRewind {
             let rewindURL = URL(fileURLWithPath: AppPaths.expandedRewindStorageRoot)
             let rewindChunksURL = rewindURL.appendingPathComponent("chunks", isDirectory: true)
             let rewindDbURL = rewindURL.appendingPathComponent("db-enc.sqlite3")
-            let (rewindChunksSize, rewindFileCount) = calculateFolderSizeWithCount(at: rewindChunksURL)
+            let rewindChunksSize = calculateFolderSize(at: rewindChunksURL)
             totalSize += rewindChunksSize
-            fileCount += rewindFileCount
 
-            if let dbSize = try? rewindDbURL.resourceValues(forKeys: [.totalFileAllocatedSizeKey]).totalFileAllocatedSize {
-                totalSize += Int64(dbSize)
-            }
+            totalSize += logicalFileSizeIfPresent(at: rewindDbURL)
         }
 
         return totalSize
@@ -1524,7 +1517,7 @@ public actor StorageManager: StorageProtocol {
                 .appendingPathComponent(dayStr, isDirectory: true)
 
             if fileManager.fileExists(atPath: dayFolderURL.path) {
-                totalSize += calculateImmediateChildrenAllocatedSize(at: dayFolderURL)
+                totalSize += calculateImmediateChildrenLogicalSize(at: dayFolderURL)
             }
 
             currentDate = calendar.date(byAdding: .day, value: 1, to: currentDate)!
@@ -1533,13 +1526,13 @@ public actor StorageManager: StorageProtocol {
         return totalSize
     }
 
-    /// Sum allocated sizes of immediate files in a day folder (non-recursive).
+    /// Sum logical sizes of immediate files in a day folder (non-recursive).
     /// Ignores nested directories and their contents.
-    private func calculateImmediateChildrenAllocatedSize(at url: URL) -> Int64 {
+    private func calculateImmediateChildrenLogicalSize(at url: URL) -> Int64 {
         let fileManager = FileManager.default
         guard let entries = try? fileManager.contentsOfDirectory(
             at: url,
-            includingPropertiesForKeys: [.isRegularFileKey, .totalFileAllocatedSizeKey, .fileAllocatedSizeKey],
+            includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
             options: [.skipsHiddenFiles]
         ) else {
             return 0
@@ -1548,57 +1541,29 @@ public actor StorageManager: StorageProtocol {
         var totalSize: Int64 = 0
         for entry in entries {
             guard let values = try? entry.resourceValues(
-                forKeys: [.isRegularFileKey, .totalFileAllocatedSizeKey, .fileAllocatedSizeKey]
+                forKeys: [.isRegularFileKey, .fileSizeKey]
             ) else {
                 continue
             }
             guard values.isRegularFile == true else {
                 continue
             }
-            if let allocated = values.totalFileAllocatedSize ?? values.fileAllocatedSize {
-                totalSize += Int64(allocated)
+            if let fileSize = values.fileSize {
+                totalSize += Int64(fileSize)
             }
         }
 
         return totalSize
     }
 
-    /// Get the total allocated size of a folder (fast version using du)
+    /// Get the total logical size of a folder by summing file sizes recursively.
     private func calculateFolderSize(at url: URL) -> Int64 {
-        // Use du -sk for fast kernel-level size calculation
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/du")
-        process.arguments = ["-sk", url.path]  // -s = summary, -k = kilobytes
-
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = FileHandle.nullDevice
-
-        do {
-            try process.run()
-            process.waitUntilExit()
-
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            if let output = String(data: data, encoding: .utf8),
-               let sizeStr = output.split(separator: "\t").first,
-               let sizeKB = Int64(sizeStr) {
-                return sizeKB * 1024  // Convert KB to bytes
-            }
-        } catch {
-            // Fallback on error
-        }
-
-        return calculateFolderSizeFallback(at: url)
-    }
-
-    /// Fallback: enumerate files if du fails
-    private func calculateFolderSizeFallback(at url: URL) -> Int64 {
         let fileManager = FileManager.default
         var totalSize: Int64 = 0
 
         guard let enumerator = fileManager.enumerator(
             at: url,
-            includingPropertiesForKeys: [.totalFileAllocatedSizeKey, .isRegularFileKey],
+            includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey],
             options: [.skipsHiddenFiles]
         ) else {
             return 0
@@ -1606,8 +1571,8 @@ public actor StorageManager: StorageProtocol {
 
         for case let fileURL as URL in enumerator {
             do {
-                let resourceValues = try fileURL.resourceValues(forKeys: [.totalFileAllocatedSizeKey, .isRegularFileKey])
-                if resourceValues.isRegularFile == true, let fileSize = resourceValues.totalFileAllocatedSize {
+                let resourceValues = try fileURL.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey])
+                if resourceValues.isRegularFile == true, let fileSize = resourceValues.fileSize {
                     totalSize += Int64(fileSize)
                 }
             } catch {
@@ -1639,6 +1604,14 @@ public actor StorageManager: StorageProtocol {
         }
 
         return (size, fileCount)
+    }
+
+    private func logicalFileSizeIfPresent(at url: URL) -> Int64 {
+        guard FileManager.default.fileExists(atPath: url.path),
+              let fileSize = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize else {
+            return 0
+        }
+        return Int64(fileSize)
     }
 
     public func getAvailableDiskSpace() async throws -> Int64 {

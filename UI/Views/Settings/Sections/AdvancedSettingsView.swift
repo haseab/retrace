@@ -115,8 +115,8 @@ extension SettingsView {
                 .padding(.vertical, 8)
 
             ModernToggleRow(
-                title: "Show frame IDs in UI",
-                subtitle: "Display frame IDs in the timeline for debugging",
+                title: "Show frame card in UI",
+                subtitle: "Display the debug frame card with frame IDs and media diagnostics in the timeline",
                 isOn: $showFrameIDs
             )
 

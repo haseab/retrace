@@ -25,7 +25,7 @@ public struct SimpleTimelineView: View {
     @State private var isSearchHighlightControlsHintDismissed = false
     @State private var browserURLDebugWindowPosition = CGSize(width: 320, height: 16)
     @State private var isInFrameSearchFieldFocused = false
-    @AppStorage("showFrameIDs", store: timelineSettingsStore) private var showFrameIDs = SettingsDefaults.showFrameIDs
+    @AppStorage("showFrameIDs", store: timelineSettingsStore) private var showFrameCard = SettingsDefaults.showFrameIDs
 
     let coordinator: AppCoordinator
     let onClose: () -> Void
@@ -167,10 +167,10 @@ public struct SimpleTimelineView: View {
                     .transition(.opacity.animation(.easeInOut(duration: 0.2).delay(0.1)))
                 }
 
-                // Debug frame ID badge, OCR status indicator, and developer actions menu (top-left)
+                // Debug frame card, OCR status indicator, and developer actions menu (top-left)
                 VStack {
                     HStack(spacing: 8) {
-                        if showFrameIDs {
+                        if showFrameCard {
                             DebugFrameIDBadge(viewModel: viewModel)
                         }
                         // OCR status indicator (only visible when OCR is in progress)
@@ -1374,7 +1374,7 @@ public struct SimpleTimelineView: View {
 
 // MARK: - Reset Zoom Button
 
-/// Floating button that appears when the frame is zoomed, allowing quick reset to 100%
+/// Floating button that appears when the frame is zoomed, allowing quick reset to fit-to-screen.
 struct ResetZoomButton: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel
     @State private var isHovering = false
@@ -1412,7 +1412,7 @@ struct ResetZoomButton: View {
                 NSCursor.pop()
             }
         }
-        .help("Reset zoom to 100% (Cmd+0)")
+        .help("Reset zoom to \(TimelineZoomSettings.resetLabel) (Cmd+0)")
     }
 }
 
@@ -2827,7 +2827,7 @@ struct FrameZoomIndicator: View {
         HStack(spacing: .spacingS) {
             Image(systemName: zoomScale > 1.0 ? "plus.magnifyingglass" : "minus.magnifyingglass")
                 .font(.retraceCaption)
-            Text("\(Int(zoomScale * 100))%")
+            Text(TimelineZoomSettings.percentLabel(forScale: zoomScale))
                 .font(.retraceCaption.monospacedDigit())
         }
         .foregroundColor(.white)
@@ -6592,7 +6592,7 @@ struct DeveloperActionsMenu: View {
     let onClose: () -> Void
     @State private var isHovering = false
     @State private var showReprocessFeedback = false
-    @AppStorage("showFrameIDs", store: timelineSettingsStore) private var showFrameIDs = SettingsDefaults.showFrameIDs
+    @AppStorage("showFrameIDs", store: timelineSettingsStore) private var showFrameCard = SettingsDefaults.showFrameIDs
 
     /// Whether the current frame can be reprocessed (only Retrace frames)
     private var canReprocess: Bool {
@@ -6607,8 +6607,8 @@ struct DeveloperActionsMenu: View {
                 }
             }) {
                 Label(
-                    showFrameIDs ? "Hide Frame ID" : "Show Frame ID",
-                    systemImage: "number.circle"
+                    showFrameCard ? "Hide Frame Card" : "Show Frame Card",
+                    systemImage: "info.square"
                 )
             }
 
