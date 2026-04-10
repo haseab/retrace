@@ -223,7 +223,10 @@ extension SettingsView {
 
     /// Estimate storage impact using observed bitrate tiers normalized to the
     /// 50% quality baseline used by the default 2s capture estimate.
-    /// 40% ≈ 7.29 Mbps, 50% ≈ 8.61 Mbps, 70% ≈ 11.31 Mbps, 100% ≈ 65.75 Mbps.
+    /// 40% ≈ 7.29 Mbps, 50% ≈ 8.61 Mbps, 70% ≈ 11.31 Mbps,
+    /// 80% ≈ 13.00 Mbps, 100% ≈ 65.75 Mbps.
+    /// 90% ≈ 14.48 Mbps, 100% ≈ 65.75 Mbps.
+    /// 95% ≈ 15.31 Mbps, 100% ≈ 65.75 Mbps.
     private static func videoQualityMultiplier(for videoQuality: Double) -> Double {
         interpolateVideoQuality(
             normalizedVideoQuality(videoQuality),
@@ -232,6 +235,9 @@ extension SettingsView {
                 (quality: 0.40, bpppf: 7.29 / 8.61),
                 (quality: 0.50, bpppf: 1.00),
                 (quality: 0.70, bpppf: 11.31 / 8.61),
+                (quality: 0.80, bpppf: 13.0 / 8.61),
+                (quality: 0.90, bpppf: 14.48 / 8.61),
+                (quality: 0.95, bpppf: 15.31 / 8.61),
                 (quality: 1.00, bpppf: 65.75 / 8.61),
             ]
         )
