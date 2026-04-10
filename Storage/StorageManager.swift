@@ -678,7 +678,6 @@ public actor StorageManager: StorageProtocol {
                         releaseGeneratorEntry(entry)
                     }
                     publishVideoDecodingMemory(reason: "storage.video_decoding.cache")
-                    Log.info("[VideoExtract] Invalidated stale cache for \(videoURL.lastPathComponent), creating fresh generator", category: .storage)
                 }
 
                 // Handle extensionless files by creating symlink
@@ -2092,8 +2091,6 @@ public actor StorageManager: StorageProtocol {
         generatorCache.removeAll()
         decodeRetainedGenerationByCacheKey.removeAll()
         publishVideoDecodingMemory(reason: "storage.video_decoding.cache")
-
-        Log.info("[StorageManager] Purged frame extraction caches (\(reason))", category: .storage)
     }
 
     /// Validate cached paths still exist. Call after drive reconnection to clean stale entries.

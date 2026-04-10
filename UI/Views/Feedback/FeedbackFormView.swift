@@ -11,7 +11,6 @@ public struct FeedbackFormView: View {
     @EnvironmentObject private var coordinatorWrapper: AppCoordinatorWrapper
     @Environment(\.dismiss) private var dismiss
 
-    private let liveChatURL = URL(string: "https://retrace.to/chat")!
     private let launchContext: FeedbackLaunchContext?
     private let onSuccessfulSubmit: (() -> Void)?
 
@@ -119,9 +118,12 @@ public struct FeedbackFormView: View {
             guard isSubmitting else { return }
             beginSendingAnimations()
         }
+        .onChange(of: viewModel.completionState) { completionState in
+            guard completionState != nil else { return }
+            playSuccessAnimation()
+        }
         .onChange(of: viewModel.isSubmitted) { isSubmitted in
             guard isSubmitted else { return }
-            playSuccessAnimation()
             onSuccessfulSubmit?()
         }
         .onChange(of: focusedField) { newValue in
@@ -168,7 +170,7 @@ public struct FeedbackFormView: View {
     }
 
     private var presentationState: PresentationState {
-        if viewModel.isSubmitted {
+        if viewModel.hasSuccessfulCompletion {
             return .success
         }
         if viewModel.isSubmitting {
@@ -1167,7 +1169,7 @@ public struct FeedbackFormView: View {
                     .font(.retraceCaptionBold)
                     .foregroundColor(.retracePrimary)
 
-                Text("Download the report to your Desktop as a .txt file. If you attached an image, Retrace saves it next to the text file.")
+                Text("Download the report as a .json.gz file and email it to support@retrace.to. If you attached an image, Retrace saves it next to the gzipped JSON file.")
                     .font(.system(size: 10))
                     .foregroundColor(.retraceSecondary.opacity(0.78))
                     .fixedSize(horizontal: false, vertical: true)
@@ -1183,7 +1185,7 @@ public struct FeedbackFormView: View {
                     if viewModel.isExporting {
                         SpinnerView(size: 12, lineWidth: 2, color: .white)
                     }
-                    Text(viewModel.isExporting ? "Preparing..." : "Download .txt")
+                    Text(viewModel.isExporting ? "Preparing..." : "Download .json.gz")
                         .font(.system(size: 11, weight: .semibold))
                 }
                 .foregroundColor(.white)
@@ -1288,7 +1290,7 @@ public struct FeedbackFormView: View {
                         if viewModel.isExporting {
                             SpinnerView(size: 14, lineWidth: 2, color: .white)
                         }
-                        Text(viewModel.isExporting ? "Preparing..." : "Download .txt")
+                        Text(viewModel.isExporting ? "Preparing..." : "Download .json.gz")
                             .font(.retraceCalloutBold)
                     }
                     .foregroundColor(.white)
@@ -1388,42 +1390,23 @@ public struct FeedbackFormView: View {
             .offset(y: successTextOffset * -0.35)
 
             VStack(spacing: 8) {
-                Text("Feedback Sent!")
+                Text(viewModel.completionPresentation?.title ?? "Feedback Sent!")
                     .font(.retraceMediumNumber)
                     .foregroundColor(.retracePrimary)
 
-                Text("Thanks for helping improve Retrace.")
+                Text(viewModel.completionPresentation?.detail ?? "Thanks for helping improve Retrace.")
                     .font(.retraceBodyMedium)
                     .foregroundColor(.retraceSecondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 330)
             }
             .opacity(successTextOpacity)
             .offset(y: successTextOffset)
 
             Spacer()
 
-            // Live chat link
-            VStack(spacing: 14) {
-                Text("Need a faster response?")
-                    .font(.retraceCaptionMedium)
-                    .foregroundColor(.retraceSecondary)
-
-                Link(destination: liveChatURL) {
-                    HStack(spacing: 8) {
-                        Image(systemName: "message.fill")
-                            .font(.retraceCallout)
-                        Text("Chat with me on retrace.to")
-                            .font(.retraceCalloutMedium)
-                    }
-                    .foregroundColor(.white)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 10)
-                    .background(Color.retraceAccent.opacity(0.3))
-                    .cornerRadius(10)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 10)
-                            .stroke(Color.retraceAccent.opacity(0.5), lineWidth: 1)
-                    )
-                }
+            if let completionPresentation = viewModel.completionPresentation {
+                completionCallToAction(for: completionPresentation)
             }
 
             Spacer()
@@ -1442,6 +1425,40 @@ public struct FeedbackFormView: View {
             .padding(.bottom, 20)
         }
         .padding(28)
+    }
+
+    @ViewBuilder
+    private func completionCallToAction(
+        for presentation: FeedbackCompletionPresentation
+    ) -> some View {
+        if let linkTitle = presentation.linkTitle,
+           let linkURL = presentation.linkURL {
+            VStack(spacing: 14) {
+                if let callToActionTitle = presentation.callToActionTitle {
+                    Text(callToActionTitle)
+                        .font(.retraceCaptionMedium)
+                        .foregroundColor(.retraceSecondary)
+                }
+
+                Link(destination: linkURL) {
+                    HStack(spacing: 8) {
+                        Image(systemName: presentation.linkSymbolName ?? "message.fill")
+                            .font(.retraceCallout)
+                        Text(linkTitle)
+                            .font(.retraceCalloutMedium)
+                    }
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                    .background(Color.retraceAccent.opacity(0.3))
+                    .cornerRadius(10)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 10)
+                            .stroke(Color.retraceAccent.opacity(0.5), lineWidth: 1)
+                    )
+                }
+            }
+        }
     }
 }
 

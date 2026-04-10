@@ -26,50 +26,15 @@ extension FeedbackSubmission: Encodable {
         launchSource: FeedbackLaunchContext.Source? = nil,
         screenshotFileName: String? = nil
     ) -> String {
-        let filteredDiagnostics = FilteredDiagnosticInfo(
+        let exportDiagnostics = FilteredDiagnosticInfo(
             diagnostics: diagnostics,
             includedSections: includedDiagnosticSections
         )
-        let generatedAtString = Self.exportTimestampFormatter.string(from: generatedAt)
-        let diagnosticsTimestamp = Self.exportTimestampFormatter.string(from: diagnostics.timestamp)
-        let screenshotLabel = includeScreenshot ? (screenshotFileName ?? "(attached separately)") : "(none)"
-        let trimmedDescription = description.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        let structureGuide = [
-            "summary header: export metadata, report type, and attachment state",
-            "structure guide: quick map of the sections that follow",
-            "feedback section: user-entered email and description",
-            "diagnostics section: full environment snapshot included with the report",
-            "attachment section: exported screenshot filename when present",
-            "JSON footer markers: BEGIN/END SUBMISSION JSON delimit the machine-readable payload"
-        ]
-
-        let summaryLines = [
-            "RETRACE FEEDBACK EXPORT (USER REPORT)",
-            "generated_at: \(generatedAtString)",
-            "export_format_version: 1",
-            "submission_endpoint: https://retrace.to/api/feedback",
-            "feedback_type: \(type)",
-            "launch_source: \(launchSource?.rawValue ?? FeedbackLaunchContext.Source.manual.rawValue)",
-            "report_email: \(email ?? "(none)")",
-            "description_length: \(description.count)",
-            "diagnostics_timestamp: \(diagnosticsTimestamp)",
-            "diagnostics_included_section_count: \(filteredDiagnostics.includedSectionIDs.count)",
-            "diagnostics_excluded_section_count: \(filteredDiagnostics.excludedSectionIDs.count)",
-            "recent_errors_count: \(filteredDiagnostics.recentErrorsCount)",
-            "recent_logs_count: \(filteredDiagnostics.recentLogsCount)",
-            "includes_screenshot: \(includeScreenshot ? "yes" : "no")",
-            "screenshot_file: \(screenshotLabel)",
-            "",
-            "STRUCTURE GUIDE",
-        ] + structureGuide.enumerated().map { index, line in
-            "\(String(format: "%02d", index + 1)). \(line)"
-        }
 
         let payload = FeedbackExportEnvelope(
             metadata: FeedbackExportEnvelope.Metadata(
-                description: "LLM-oriented export of the feedback report prepared by Retrace.",
-                exportFormatVersion: 1,
+                description: "Manual export",
+                exportFormatVersion: 4,
                 generatedAt: generatedAt,
                 submissionEndpoint: "https://retrace.to/api/feedback",
                 launchSource: launchSource?.rawValue ?? FeedbackLaunchContext.Source.manual.rawValue,
@@ -77,34 +42,24 @@ extension FeedbackSubmission: Encodable {
                 screenshotByteCount: screenshotData?.count
             ),
             report: FeedbackExportEnvelope.Report(
-                type: type,
-                email: email,
-                description: description,
-                includeScreenshot: includeScreenshot,
-                diagnostics: filteredDiagnostics
+                feedback: FeedbackExportEnvelope.Report.Feedback(
+                    type: type,
+                    email: email,
+                    description: description,
+                    includeScreenshot: includeScreenshot
+                ),
+                diagnostics: HierarchicalDiagnosticInfo(filteredDiagnostics: exportDiagnostics)
             )
         )
 
-        return [
-            summaryLines.joined(separator: "\n"),
-            "",
-            "=== FEEDBACK ===",
-            "Type: \(type)",
-            "Email: \(email ?? "(none)")",
-            "",
-            "Description:",
-            trimmedDescription.isEmpty ? "(empty)" : trimmedDescription,
-            "",
-            "=== DIAGNOSTICS ===",
-            diagnostics.fullFormattedText(including: includedDiagnosticSections),
-            "",
-            "=== ATTACHMENTS ===",
-            includeScreenshot ? "Screenshot: \(screenshotLabel)" : "Screenshot: none",
-            "",
-            "=== BEGIN SUBMISSION JSON ===",
-            payload.prettyPrintedJSON() ?? "{}",
-            "=== END SUBMISSION JSON ==="
-        ].joined(separator: "\n")
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        guard let data = try? encoder.encode(payload),
+              let json = String(data: data, encoding: .utf8) else {
+            return "{}"
+        }
+
+        return json
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -145,6 +100,14 @@ private struct FilteredDiagnosticInfo: Encodable {
     let diagnostics: DiagnosticInfo
     let includedSections: Set<DiagnosticInfo.SectionID>
 
+    init(
+        diagnostics: DiagnosticInfo,
+        includedSections: Set<DiagnosticInfo.SectionID>
+    ) {
+        self.diagnostics = diagnostics
+        self.includedSections = includedSections
+    }
+
     var availableSectionIDs: [DiagnosticInfo.SectionID] {
         diagnostics.availableSectionIDs(includeVerboseSections: true)
     }
@@ -165,17 +128,10 @@ private struct FilteredDiagnosticInfo: Encodable {
         inactiveSectionIDs.map(\.rawValue)
     }
 
-    var recentErrorsCount: Int {
-        activeSectionIDs.contains(.recentErrors) ? diagnostics.recentErrors.count : 0
-    }
-
-    var recentLogsCount: Int {
-        diagnostics.filteredRecentLogs(including: Set(activeSectionIDs)).count
-    }
-
     func encode(to encoder: Encoder) throws {
         let activeSections = Set(activeSectionIDs)
         let filteredLogs = diagnostics.filteredRecentLogs(including: activeSections)
+        let groupedLogs = diagnostics.filteredGroupedRecentLogs(including: activeSections)
 
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(diagnostics.timestamp, forKey: .timestamp)
@@ -205,6 +161,16 @@ private struct FilteredDiagnosticInfo: Encodable {
 
         if !filteredLogs.isEmpty {
             try container.encode(filteredLogs, forKey: .recentLogs)
+        }
+
+        if let groupedLogs,
+           !groupedLogs.schema.isEmpty {
+            try container.encode(groupedLogs.schema, forKey: .recentLogSchema)
+        }
+
+        if let groupedLogs,
+           !groupedLogs.groups.isEmpty {
+            try container.encode(groupedLogs.groups, forKey: .recentLogGroups)
         }
 
         if activeSections.contains(.recentActions), !diagnostics.recentMetricEvents.isEmpty {
@@ -248,6 +214,8 @@ private struct FilteredDiagnosticInfo: Encodable {
         case settingsSnapshot
         case recentErrors
         case recentLogs
+        case recentLogSchema
+        case recentLogGroups
         case recentMetricEvents
         case displayInfo
         case processInfo
@@ -269,23 +237,239 @@ private struct FeedbackExportEnvelope: Encodable {
     }
 
     struct Report: Encodable {
-        let type: String
-        let email: String?
-        let description: String
-        let includeScreenshot: Bool
-        let diagnostics: FilteredDiagnosticInfo
+        struct Feedback: Encodable {
+            let type: String
+            let email: String?
+            let description: String
+            let includeScreenshot: Bool
+        }
+
+        let feedback: Feedback
+        let diagnostics: HierarchicalDiagnosticInfo
     }
 
     let metadata: Metadata
     let report: Report
+}
 
-    func prettyPrintedJSON() -> String? {
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        guard let data = try? encoder.encode(self) else {
-            return nil
+private struct HierarchicalDiagnosticInfo: Encodable {
+    struct Summary: Encodable {
+        struct Counts: Encodable {
+            let memorySummaryEntries: Int
+            let recentErrors: Int
+            let recentActions: Int
+            let emergencyCrashReports: Int
+            let fullLogEntries: Int
         }
-        return String(data: data, encoding: .utf8)
+
+        let capturedAt: Date
+        let includedSectionIDs: [String]
+        let excludedSectionIDs: [String]
+        let sectionOrder: [String]
+        let sectionCount: Int
+        let excludedSectionCount: Int
+        let counts: Counts
     }
+
+    let filteredDiagnostics: FilteredDiagnosticInfo
+
+    func encode(to encoder: Encoder) throws {
+        let diagnostics = filteredDiagnostics.diagnostics
+        let activeSectionIDs = filteredDiagnostics.activeSectionIDs
+        let activeSectionSet = Set(activeSectionIDs)
+
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(
+            Summary(
+                capturedAt: diagnostics.timestamp,
+                includedSectionIDs: filteredDiagnostics.includedSectionIDs,
+                excludedSectionIDs: filteredDiagnostics.excludedSectionIDs,
+                sectionOrder: activeSectionIDs.map(\.rawValue),
+                sectionCount: filteredDiagnostics.includedSectionIDs.count,
+                excludedSectionCount: filteredDiagnostics.excludedSectionIDs.count,
+                counts: Summary.Counts(
+                    memorySummaryEntries: activeSectionSet.contains(.memorySummary)
+                        ? diagnostics.filteredRecentLogs(including: [.memorySummary]).count
+                        : 0,
+                    recentErrors: activeSectionSet.contains(.recentErrors)
+                        ? diagnostics.recentErrors.count
+                        : 0,
+                    recentActions: activeSectionSet.contains(.recentActions)
+                        ? diagnostics.recentMetricEvents.count
+                        : 0,
+                    emergencyCrashReports: activeSectionSet.contains(.emergencyCrashReports)
+                        ? (diagnostics.emergencyCrashReports?.count ?? 0)
+                        : 0,
+                    fullLogEntries: activeSectionSet.contains(.fullLogs)
+                        ? diagnostics.filteredRecentLogEntryCount(including: [.fullLogs])
+                        : 0
+                )
+            ),
+            forKey: .summary
+        )
+
+        var sectionsContainer = container.nestedContainer(keyedBy: DynamicCodingKey.self, forKey: .sections)
+
+        for sectionID in activeSectionIDs {
+            let key = DynamicCodingKey(sectionID.rawValue)
+
+            switch sectionID {
+            case .appSystem:
+                try sectionsContainer.encode(
+                    AppSystemSectionData(
+                        appVersion: diagnostics.appVersion,
+                        buildNumber: diagnostics.buildNumber,
+                        macOSVersion: diagnostics.macOSVersion,
+                        deviceModel: diagnostics.deviceModel,
+                        disk: AppSystemSectionData.Disk(
+                            total: diagnostics.totalDiskSpace,
+                            free: diagnostics.freeDiskSpace
+                        )
+                    ),
+                    forKey: key
+                )
+            case .database:
+                try sectionsContainer.encode(diagnostics.databaseStats, forKey: key)
+            case .displays:
+                try sectionsContainer.encode(diagnostics.displayInfo, forKey: key)
+            case .performance:
+                try sectionsContainer.encode(diagnostics.performanceInfo, forKey: key)
+            case .memorySummary:
+                try sectionsContainer.encode(
+                    LogEntriesSectionData(entries: diagnostics.filteredRecentLogs(including: [.memorySummary])),
+                    forKey: key
+                )
+            case .runningApps:
+                try sectionsContainer.encode(diagnostics.processInfo, forKey: key)
+            case .accessibility:
+                try sectionsContainer.encode(diagnostics.accessibilityInfo, forKey: key)
+            case .recentErrors:
+                try sectionsContainer.encode(
+                    LogEntriesSectionData(entries: diagnostics.recentErrors),
+                    forKey: key
+                )
+            case .settings:
+                try sectionsContainer.encode(
+                    SettingsSectionData(values: diagnostics.settingsSnapshot),
+                    forKey: key
+                )
+            case .recentActions:
+                try sectionsContainer.encode(
+                    RecentActionsSectionData(events: diagnostics.recentMetricEvents),
+                    forKey: key
+                )
+            case .emergencyCrashReports:
+                try sectionsContainer.encode(
+                    EmergencyCrashReportsSectionData(reports: diagnostics.emergencyCrashReports ?? []),
+                    forKey: key
+                )
+            case .fullLogs:
+                let groupedLogs = diagnostics.filteredGroupedRecentLogs(including: [.fullLogs])
+                let rawEntries = diagnostics.filteredRecentLogs(including: [.fullLogs])
+                let encodedRawLogs = encodeRawLogPayload(rawEntries)
+                try sectionsContainer.encode(
+                    FullLogsSectionData(
+                        counts: FullLogsSectionData.Counts(
+                            representedEntries: diagnostics.filteredRecentLogEntryCount(including: [.fullLogs]),
+                            rawEntries: rawEntries.count,
+                            groupedEntries: groupedLogs?.representedEntryCount ?? 0,
+                            groupedFamilies: groupedLogs?.groups.count ?? 0
+                        ),
+                        rawEncoding: encodedRawLogs.encoding,
+                        rawData: encodedRawLogs.data,
+                        grouped: groupedLogs,
+                        recentErrorsStoredSeparately: true
+                    ),
+                    forKey: key
+                )
+            }
+        }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case summary
+        case sections
+    }
+
+    private struct DynamicCodingKey: CodingKey {
+        let stringValue: String
+        let intValue: Int?
+
+        init(_ stringValue: String) {
+            self.stringValue = stringValue
+            self.intValue = nil
+        }
+
+        init?(stringValue: String) {
+            self.init(stringValue)
+        }
+
+        init?(intValue: Int) {
+            self.stringValue = "\(intValue)"
+            self.intValue = intValue
+        }
+    }
+}
+
+private func encodeRawLogPayload(_ rawEntries: [String]) -> (encoding: FullLogsSectionData.RawEncoding, data: String) {
+    let rawText = rawEntries.joined(separator: "\n")
+    let utf8Data = Data(rawText.utf8)
+    guard !utf8Data.isEmpty else {
+        return (.gzipBase64UTF8, "")
+    }
+
+    if let compressed = try? FeedbackService.gzipCompress(utf8Data) {
+        return (.gzipBase64UTF8, compressed.base64EncodedString())
+    }
+
+    return (.base64UTF8, utf8Data.base64EncodedString())
+}
+
+private struct AppSystemSectionData: Encodable {
+    struct Disk: Encodable {
+        let total: String
+        let free: String
+    }
+
+    let appVersion: String
+    let buildNumber: String
+    let macOSVersion: String
+    let deviceModel: String
+    let disk: Disk
+}
+
+private struct LogEntriesSectionData: Encodable {
+    let entries: [String]
+}
+
+private struct SettingsSectionData: Encodable {
+    let values: [String: String]
+}
+
+private struct RecentActionsSectionData: Encodable {
+    let events: [FeedbackRecentMetricEvent]
+}
+
+private struct EmergencyCrashReportsSectionData: Encodable {
+    let reports: [String]
+}
+
+private struct FullLogsSectionData: Encodable {
+    enum RawEncoding: String, Encodable {
+        case gzipBase64UTF8 = "gzip_base64_utf8"
+        case base64UTF8 = "base64_utf8"
+    }
+
+    struct Counts: Encodable {
+        let representedEntries: Int
+        let rawEntries: Int
+        let groupedEntries: Int
+        let groupedFamilies: Int
+    }
+
+    let counts: Counts
+    let rawEncoding: RawEncoding
+    let rawData: String
+    let grouped: DiagnosticInfo.GroupedRecentLogs?
+    let recentErrorsStoredSeparately: Bool
 }

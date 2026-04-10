@@ -8,6 +8,7 @@ import Search
 import Migration
 import CoreGraphics
 import ImageIO
+import CryptoKit
 
 // MARK: - OCR Power Settings Notifications
 
@@ -123,6 +124,20 @@ public struct OCRPowerSettingsSnapshot: Sendable {
             appFilterModeRaw: defaults.string(forKey: "ocrAppFilterMode") ?? "all",
             filteredAppsJSON: defaults.string(forKey: "ocrFilteredApps") ?? ""
         )
+    }
+}
+
+private enum SegmentLogSanitizer {
+    static func obfuscatedWindowToken(_ windowName: String?) -> String {
+        guard let normalizedWindowName = windowName?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !normalizedWindowName.isEmpty else {
+            return "none"
+        }
+
+        let digest = SHA256.hash(data: Data(normalizedWindowName.utf8))
+        let token = digest.prefix(6).map { String(format: "%02x", $0) }.joined()
+        return "w_\(token)"
     }
 }
 
@@ -673,7 +688,6 @@ public actor AppCoordinator {
         if let queue = await services.processingQueue {
             await queue.setTimelineVisibleForRewriteScheduling(visible)
         }
-        Log.info("Timeline visibility changed: \(visible) - frame processing \(visible ? "paused" : "resumed")", category: .app)
     }
 
     public func setTimelineScrubbing(_ scrubbing: Bool) async {
@@ -688,7 +702,6 @@ public actor AppCoordinator {
         if let adapter = await services.dataAdapter {
             await adapter.purgeFrameExtractionCaches(reason: reason)
         }
-        Log.info("[AppCoordinator] Purged video decoding caches (\(reason))", category: .app)
     }
 
     // MARK: - Lifecycle
@@ -2873,7 +2886,6 @@ public actor AppCoordinator {
                     idleDetected: idleDetected
                 )
                 try await services.database.updateSegmentEndDate(id: segID, endDate: segmentEndDate)
-                Log.debug("Closed segment: \(currentSegment?.bundleID ?? "unknown") - \(currentSegment?.windowName ?? "nil")", category: .app)
 
                 if let closedSegment = currentSegment,
                    closedSegment.browserUrl?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false,
@@ -2902,7 +2914,7 @@ public actor AppCoordinator {
 
             currentSegmentID = newSegmentID
             Log.debug(
-                "Started segment: \(metadata.appBundleID ?? "unknown") - \(metadata.windowName ?? "nil") [segmentID=\(newSegmentID), browserURL=\(normalizedBrowserURL == nil ? "nil" : "present")]",
+                "Started segment: \(metadata.appBundleID ?? "unknown") [segmentID=\(newSegmentID), windowToken=\(SegmentLogSanitizer.obfuscatedWindowToken(metadata.windowName)), browserURL=\(normalizedBrowserURL == nil ? "nil" : "present")]",
                 category: .app
             )
             if let browserURL = normalizedBrowserURL {

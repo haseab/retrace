@@ -1820,15 +1820,6 @@ public actor DataAdapter {
             LIMIT ?
             """
 
-        Log.debug("[Filter] ====== QUERY DEBUG START ======", category: .database)
-        Log.debug("[Filter] Query SQL:\n\(sql)", category: .database)
-        Log.debug("[Filter] Apps filter: \(filters.selectedApps ?? []), mode: \(filters.appFilterMode.rawValue)", category: .database)
-        Log.debug("[Filter] Tags to filter: \(filters.selectedTags ?? []), mode: \(filters.tagFilterMode.rawValue)", category: .database)
-        Log.debug("[Filter] Hidden filter: \(filters.hiddenFilter.rawValue), hiddenTagId: \(String(describing: hiddenTagId))", category: .database)
-        Log.debug("[Filter] Window name filter: \(filters.windowNameFilter ?? "nil")", category: .database)
-        Log.debug("[Filter] Browser URL filter: \(filters.browserUrlFilter ?? "nil")", category: .database)
-        Log.debug("[Filter] Date ranges: \(filters.effectiveDateRanges)", category: .database)
-
         let statement: OpaquePointer?
         do {
             statement = try connection.prepare(sql: sql)
@@ -1847,45 +1838,36 @@ public actor DataAdapter {
 
         var bindIndex: Int32 = 1
         for tagId in filterComponents.includedTagIDs {
-            Log.debug("[Filter] Binding tagId \(tagId) at index \(bindIndex)", category: .database)
             sqlite3_bind_int64(stmt, bindIndex, tagId)
             bindIndex += 1
         }
         for app in filterComponents.appBundleIDs {
-            Log.debug("[Filter] Binding app '\(app)' at index \(bindIndex)", category: .database)
             sqlite3_bind_text(stmt, bindIndex, (app as NSString).utf8String, -1, nil)
             bindIndex += 1
         }
         for stringValue in filterComponents.metadataBindValues {
-            Log.debug("[Filter] Binding metadata pattern '\(stringValue)' at index \(bindIndex)", category: .database)
             sqlite3_bind_text(stmt, bindIndex, (stringValue as NSString).utf8String, -1, nil)
             bindIndex += 1
         }
         for date in filterComponents.dateRangeBounds {
-            Log.debug("[Filter] Binding date bound at index \(bindIndex)", category: .database)
             config.bindDate(date, to: stmt, at: bindIndex)
             bindIndex += 1
         }
         for date in filterComponents.sourceBoundaryBounds {
-            Log.debug("[Filter] Binding source boundary at index \(bindIndex)", category: .database)
             config.bindDate(date, to: stmt, at: bindIndex)
             bindIndex += 1
         }
         for tagId in filterComponents.excludedTagIDs {
-            Log.debug("[Filter] Binding exclude tagId \(tagId) at index \(bindIndex)", category: .database)
             sqlite3_bind_int64(stmt, bindIndex, tagId)
             bindIndex += 1
         }
         if let hiddenTagID = filterComponents.hiddenTagID {
-            Log.debug("[Filter] Binding hiddenTagId \(hiddenTagID) at index \(bindIndex)", category: .database)
             sqlite3_bind_int64(stmt, bindIndex, hiddenTagID)
             bindIndex += 1
         }
 
         // Bind limit
-        Log.debug("[Filter] Binding limit \(limit) at index \(bindIndex)", category: .database)
         sqlite3_bind_int(stmt, bindIndex, Int32(limit))
-        Log.debug("[Filter] ====== QUERY DEBUG END ======", category: .database)
 
         var frames: [FrameWithVideoInfo] = []
         var stepCount = 0
@@ -1902,8 +1884,6 @@ public actor DataAdapter {
         if stepResult != SQLITE_DONE {
             Log.error("[Filter] sqlite3_step error code: \(stepResult)", category: .database)
         }
-
-        Log.debug("[Filter] Query returned \(frames.count) frames (stepped \(stepCount) times)", category: .database)
 
         return frames
     }

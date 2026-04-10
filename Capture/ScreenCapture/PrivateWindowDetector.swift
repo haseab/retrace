@@ -759,9 +759,7 @@ struct PrivateWindowDetector {
             normalizedWindowTitle == "fire window"
     }
 
-    private static func tracePrivateRedaction(_ message: String) {
-        _ = message
-    }
+    private static func tracePrivateRedaction(_ : String) {}
 
     private static func tracePreview(_ value: String, limit: Int = 180) -> String {
         let collapsed = value

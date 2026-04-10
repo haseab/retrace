@@ -2070,39 +2070,10 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Video info for displaying the current frame - derived from currentIndex
     public var currentVideoInfo: FrameVideoInfo? {
-        guard let timelineFrame = currentTimelineFrame else {
-            // Only log if we haven't logged this state recently
-            if _lastLoggedVideoInfoFrameID != -1 {
-                Log.debug("[SimpleTimelineViewModel] currentVideoInfo: no currentTimelineFrame at index \(currentIndex)", category: .ui)
-                _lastLoggedVideoInfoFrameID = -1
-            }
+        guard let timelineFrame = currentTimelineFrame,
+              let info = timelineFrame.videoInfo,
+              info.frameIndex >= 0 else {
             return nil
-        }
-        guard let info = timelineFrame.videoInfo else {
-            if _lastLoggedVideoInfoFrameID != -2 {
-                Log.debug(
-                    "[SimpleTimelineViewModel] currentVideoInfo: frame \(timelineFrame.frame.id.value) has nil videoInfo, source=\(timelineFrame.frame.source), processingStatus=\(timelineFrame.processingStatus)",
-                    category: .ui
-                )
-                _lastLoggedVideoInfoFrameID = -2
-            }
-            return nil
-        }
-        guard info.frameIndex >= 0 else {
-            if _lastLoggedVideoInfoFrameID != -3 {
-                Log.debug("[SimpleTimelineViewModel] currentVideoInfo: frame \(timelineFrame.frame.id.value) has invalid frameIndex=\(info.frameIndex)", category: .ui)
-                _lastLoggedVideoInfoFrameID = -3
-            }
-            return nil
-        }
-        // Only log when frame ID changes
-        let frameID = timelineFrame.frame.id.value
-        if _lastLoggedVideoInfoFrameID != frameID {
-            Log.debug(
-                "[SimpleTimelineViewModel] currentVideoInfo: frame \(frameID) videoPath=\(info.videoPath), frameIndex=\(info.frameIndex), processingStatus=\(timelineFrame.processingStatus)",
-                category: .ui
-            )
-            _lastLoggedVideoInfoFrameID = frameID
         }
         return info
     }
@@ -2309,9 +2280,6 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     // MARK: - Private State
-
-    /// Last logged frame ID for currentVideoInfo (prevents duplicate logs from SwiftUI view updates)
-    private var _lastLoggedVideoInfoFrameID: Int64?
 
     /// Sub-frame pixel offset for continuous tape scrolling.
     /// Represents how far the tape has moved beyond the current frame center.
@@ -2757,10 +2725,6 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     private func logDiskFrameBufferMemorySnapshot() {
-        Log.info(
-            "[Timeline-Memory] diskFrameBufferCount=\(diskFrameBufferIndex.count) diskFrameBufferBytes=\(Self.formatBytes(diskFrameBufferBytes)) frameWindowCount=\(frames.count)",
-            category: .ui
-        )
         updateTimelineMemoryLedger()
         logAndResetDiskFrameBufferTelemetry()
     }
@@ -3331,21 +3295,11 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     public func resetVisibleSessionScrubTracking(reason: String = "timeline shown") {
         hasStartedScrubbingThisVisibleSession = false
-        if Self.isVerboseTimelineLoggingEnabled {
-            Log.debug(
-                "[TIMELINE-REOPEN] reset visible-session scrub tracking reason=\(reason)",
-                category: .ui
-            )
-        }
     }
 
     func markVisibleSessionScrubStarted(source: String) {
         guard !hasStartedScrubbingThisVisibleSession else { return }
         hasStartedScrubbingThisVisibleSession = true
-        Log.info(
-            "[TIMELINE-REOPEN] suppressing auto-advance after visible-session scrub source=\(source) index=\(currentIndex) frames=\(frames.count)",
-            category: .ui
-        )
     }
 
     private func readFrameDataFromDiskFrameBuffer(frameID: FrameID) async -> Data? {
@@ -3459,16 +3413,11 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     private func logCmdFPlayheadState(
-        _ stage: String,
-        trace: CmdFQuickFilterLatencyTrace?,
-        targetTimestamp: Date? = nil,
-        extra: String? = nil
-    ) {
-        _ = stage
-        _ = trace
-        _ = targetTimestamp
-        _ = extra
-    }
+        _ _: String,
+        trace _: CmdFQuickFilterLatencyTrace?,
+        targetTimestamp _: Date? = nil,
+        extra _: String? = nil
+    ) {}
 
     private func setLoadingState(_ loading: Bool, reason: String) {
         if loading {
@@ -7127,10 +7076,6 @@ public class SimpleTimelineViewModel: ObservableObject {
         trigger: String,
         source: FrameSource
     ) {
-        _ = bundleID
-        _ = action
-        _ = trigger
-        _ = source
         pendingCmdFQuickFilterLatencyTrace = nil
     }
 
@@ -8066,7 +8011,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Load the most recent frame on startup
     /// - Parameter clickStartTime: Optional start time from dashboard tab click for end-to-end timing
     public func loadMostRecentFrame(
-        clickStartTime: CFAbsoluteTime? = nil,
+        clickStartTime _: CFAbsoluteTime? = nil,
         refreshPresentation: Bool = true
     ) async {
         // Coalesce concurrent startup loads (e.g., TimelineWindowController.prepareWindow + SimpleTimelineView.onAppear).
@@ -8092,7 +8037,6 @@ public class SimpleTimelineViewModel: ObservableObject {
             isInitialLoadInProgress = false
             completeMostRecentLoadWaiters()
         }
-        _ = clickStartTime
 
         setLoadingState(true, reason: "loadMostRecentFrame")
         clearError()
@@ -8196,7 +8140,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// - Parameters:
     ///   - framesWithVideoInfo: Pre-fetched frames from parallel query
     ///   - clickStartTime: Start time for end-to-end timing
-    public func loadFramesDirectly(_ framesWithVideoInfo: [FrameWithVideoInfo], clickStartTime: CFAbsoluteTime? = nil) async {
+    public func loadFramesDirectly(_ framesWithVideoInfo: [FrameWithVideoInfo], clickStartTime _: CFAbsoluteTime? = nil) async {
         // Guard against concurrent calls - use dedicated flag to avoid race conditions
         guard !isInitialLoadInProgress && !isLoading else {
             Log.debug("[SimpleTimelineViewModel] loadFramesDirectly skipped - already loading", category: .ui)
@@ -8204,7 +8148,6 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
         isInitialLoadInProgress = true
         defer { isInitialLoadInProgress = false }
-        _ = clickStartTime
 
         setLoadingState(true, reason: "loadFramesDirectly")
         clearError()
@@ -8299,11 +8242,6 @@ public class SimpleTimelineViewModel: ObservableObject {
 
             if requiresFullReloadOnNextRefresh {
                 requiresFullReloadOnNextRefresh = false
-                Log.info(
-                    "[TIMELINE-REOPEN] forcing full reload after filter expiry navigateToNewest=\(shouldNavigateToNewest) frames=\(frames.count) index=\(currentIndex)",
-                    category: .ui
-                )
-
                 if shouldNavigateToNewest {
                     await loadMostRecentFrame(refreshPresentation: refreshPresentation)
                 } else if let timestamp = currentTimestamp {
@@ -8340,11 +8278,6 @@ public class SimpleTimelineViewModel: ObservableObject {
                             // A full reload here would hard-reset to newest and break continuity.
                             if shouldAutoAdvanceAfterFetch {
                                 await loadMostRecentFrame(refreshPresentation: refreshPresentation)
-                            } else if shouldNavigateToNewest {
-                                Log.info(
-                                    "[TIMELINE-REOPEN] refreshSnap suppressed source=fullReload currentIndex=\(currentIndex) total=\(frames.count) appended=\(newFrames.count)",
-                                    category: .ui
-                                )
                             }
                             return
                         }
@@ -8359,19 +8292,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
                         // Navigate to newest frame
                         if shouldAutoAdvanceAfterFetch {
-                            let oldIndex = currentIndex
                             currentIndex = frames.count - 1
-                            if oldIndex != currentIndex {
-                                Log.info(
-                                    "[TIMELINE-REOPEN] refreshSnap source=newFrames oldIndex=\(oldIndex) newIndex=\(currentIndex) appended=\(newTimelineFrames.count) total=\(frames.count)",
-                                    category: .ui
-                                )
-                            }
-                        } else if shouldNavigateToNewest {
-                            Log.info(
-                                "[TIMELINE-REOPEN] refreshSnap suppressed source=newFrames currentIndex=\(currentIndex) total=\(frames.count) appended=\(newTimelineFrames.count)",
-                                category: .ui
-                            )
                         }
 
                         // Trim if we've exceeded max frames (preserve newer since we just added new frames)
@@ -8381,18 +8302,8 @@ public class SimpleTimelineViewModel: ObservableObject {
                         // Without this, users can remain a few frames behind indefinitely on static screens.
                         let newestIndex = max(0, frames.count - 1)
                         if currentIndex != newestIndex {
-                            let oldIndex = currentIndex
                             currentIndex = newestIndex
-                            Log.info(
-                                "[TIMELINE-REOPEN] refreshSnap source=noNewFrames oldIndex=\(oldIndex) newIndex=\(newestIndex) total=\(frames.count)",
-                                category: .ui
-                            )
                         }
-                    } else if shouldNavigateToNewest {
-                        Log.info(
-                            "[TIMELINE-REOPEN] refreshSnap suppressed source=noNewFrames currentIndex=\(currentIndex) total=\(frames.count)",
-                            category: .ui
-                        )
                     }
                 } catch {
                     Log.error("[TIMELINE-REFRESH] Failed to check for new frames: \(error)", category: .ui)
@@ -10910,13 +10821,12 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
 
         Log.debug(
-            "[BrowserLinkOpen] start frameId=\(timelineFrame.frame.id.value) baseURL=\(urlString) scrollY=\(String(describing: timelineFrame.scrollY)) videoCurrentTime=\(String(describing: timelineFrame.videoCurrentTime))",
+            "[BrowserLinkOpen] start frameId=\(timelineFrame.frame.id.value) baseURL=\(urlString) videoCurrentTime=\(String(describing: timelineFrame.videoCurrentTime))",
             category: .ui
         )
-        let finalURLString = currentBrowserOpenURLString(
+        let finalURLString = timestampedCurrentBrowserURLString(
             baseURLString: urlString,
-            videoCurrentTime: timelineFrame.videoCurrentTime,
-            scrollY: timelineFrame.scrollY
+            videoCurrentTime: timelineFrame.videoCurrentTime
         )
         Log.debug(
             "[BrowserLinkOpen] resolved frameId=\(timelineFrame.frame.id.value) finalURL=\(finalURLString)",
@@ -10930,7 +10840,6 @@ public class SimpleTimelineViewModel: ObservableObject {
             return false
         }
 
-        let usedTextFragment = Self.urlContainsTextFragment(finalURLString)
         let usedYouTubeTimestamp = Self.urlContainsYouTubeTimestamp(finalURLString)
 
         guard let browserApplicationURL = Self.hyperlinkBrowserApplicationURL(for: finalURL) else {
@@ -10941,7 +10850,6 @@ public class SimpleTimelineViewModel: ObservableObject {
                     coordinator: coordinator,
                     source: "current_browser_url",
                     url: finalURLString,
-                    usedTextFragment: usedTextFragment,
                     usedYouTubeTimestamp: usedYouTubeTimestamp
                 )
             } else {
@@ -10971,7 +10879,6 @@ public class SimpleTimelineViewModel: ObservableObject {
                         coordinator: self.coordinator,
                         source: "current_browser_url",
                         url: finalURLString,
-                        usedTextFragment: usedTextFragment,
                         usedYouTubeTimestamp: usedYouTubeTimestamp
                     )
                 }
@@ -11074,18 +10981,6 @@ public class SimpleTimelineViewModel: ObservableObject {
     ) -> String {
         Self.youtubeTimestampedBrowserURLString(
             baseURLString,
-            videoCurrentTime: videoCurrentTime
-        )
-    }
-
-    private func currentBrowserOpenURLString(
-        baseURLString: String,
-        videoCurrentTime: Double?,
-        scrollY: Double?
-    ) -> String {
-        _ = scrollY
-        return timestampedCurrentBrowserURLString(
-            baseURLString: baseURLString,
             videoCurrentTime: videoCurrentTime
         )
     }
@@ -11602,57 +11497,6 @@ public class SimpleTimelineViewModel: ObservableObject {
         return host == "youtu.be" || host == "youtube.com" || host.hasSuffix(".youtube.com")
     }
 
-    private func hasScrolledPastFirstViewport(scrollY: Double?) -> Bool {
-        guard let scrollY,
-              scrollY.isFinite,
-              scrollY > 0 else {
-            return false
-        }
-
-        guard let estimatedViewportHeight = estimatedViewportHeightForCurrentFrame() else {
-            return true
-        }
-        return scrollY >= estimatedViewportHeight
-    }
-
-    private func estimatedViewportHeightForCurrentFrame() -> Double? {
-        if let imageHeight = displayableCurrentImage?.size.height,
-           imageHeight > 1 {
-            return Double(imageHeight)
-        }
-
-        if let videoHeight = currentTimelineFrame?.videoInfo?.height,
-           videoHeight > 1 {
-            let scale = max(NSScreen.main?.backingScaleFactor ?? 2.0, 1.0)
-            return Double(videoHeight) / scale
-        }
-
-        return nil
-    }
-
-    private static func shouldUseSmartTextFragment(for url: URL) -> Bool {
-        guard let scheme = url.scheme?.lowercased(),
-              scheme == "http" || scheme == "https" else {
-            return false
-        }
-
-        let host = normalizedHost(url.host)
-        guard !host.isEmpty else {
-            return false
-        }
-
-        return !textFragmentExcludedDomains.contains { blocked in
-            host == blocked || host.hasSuffix(".\(blocked)")
-        }
-    }
-
-    private struct BrowserTextFragmentNodeCandidate {
-        let startText: String
-        let endText: String?
-        let centerY: CGFloat
-        let isolationScore: CGFloat
-    }
-
     private struct YouTubeMarkdownCopyContext: Sendable {
         let windowName: String
         let urlString: String
@@ -11662,266 +11506,6 @@ public class SimpleTimelineViewModel: ObservableObject {
         let titleText: String
         let channelText: String
     }
-
-    private func smartTextFragmentDirectiveForCurrentFrame() -> String? {
-        if let selectedDirective = Self.smartTextFragmentDirective(startText: selectedText, endText: nil) {
-            Log.debug(
-                "[BrowserLinkOpen] fragment candidate selectedText length=\(selectedText.count) directive=\(selectedDirective)",
-                category: .ui
-            )
-            return selectedDirective
-        }
-
-        let candidates = visibleOCRTextFragmentNodeCandidates()
-        guard let bestCandidateIndex = Self.bestTextFragmentNodeCandidateIndex(candidates) else {
-            Log.debug(
-                "[BrowserLinkOpen] fragment candidates empty count=\(candidates.count)",
-                category: .ui
-            )
-            return nil
-        }
-
-        let candidate = candidates[bestCandidateIndex]
-        let directive = Self.smartTextFragmentDirective(
-            startText: candidate.startText,
-            endText: candidate.endText
-        )
-        Log.debug(
-            "[BrowserLinkOpen] fragment candidate chosen start=\(candidate.startText) end=\(candidate.endText ?? "<none>") centerY=\(candidate.centerY) isolation=\(candidate.isolationScore) directive=\(String(describing: directive)) candidates=\(candidates.count)",
-            category: .ui
-        )
-        return directive
-    }
-
-    private func visibleOCRTextFragmentNodeCandidates() -> [BrowserTextFragmentNodeCandidate] {
-        let nodes = isZoomRegionActive ? ocrNodesInZoomRegion : ocrNodes
-        guard !nodes.isEmpty else { return [] }
-
-        let orderedNodes = nodes.sorted {
-            if abs($0.y - $1.y) > Self.searchHighlightLineTolerance {
-                return $0.y < $1.y
-            }
-            return $0.x < $1.x
-        }
-
-        let nodeWords: [(node: OCRNodeWithText, words: [String])] = orderedNodes.compactMap { node in
-            guard let visibleText = visibleTextFragmentText(for: node) else {
-                return nil
-            }
-
-            let words = Self.cleanTextFragmentWords(from: visibleText)
-            guard words.count >= 3 else {
-                return nil
-            }
-
-            return (node: node, words: words)
-        }
-
-        guard !nodeWords.isEmpty else { return [] }
-
-        return nodeWords.enumerated().compactMap { index, entry in
-            let startText = Self.textFragmentWordSlice(from: entry.words)
-            guard !startText.isEmpty else {
-                return nil
-            }
-
-            let endText = Self.nextTextFragmentEndText(after: index, in: nodeWords)
-            return BrowserTextFragmentNodeCandidate(
-                startText: startText,
-                endText: endText,
-                centerY: entry.node.y + (entry.node.height / 2.0),
-                isolationScore: isolationScore(for: entry.node, among: orderedNodes)
-            )
-        }
-    }
-
-    private func visibleTextFragmentText(for node: OCRNodeWithText) -> String? {
-        let rawText = node.text
-        let trimmedFullText = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedFullText.isEmpty else { return nil }
-
-        guard let range = getVisibleCharacterRange(for: node) else {
-            return trimmedFullText
-        }
-
-        let clampedStart = min(max(range.start, 0), rawText.count)
-        let clampedEnd = min(max(range.end, clampedStart), rawText.count)
-        guard clampedStart < clampedEnd else { return nil }
-
-        let startIndex = rawText.index(rawText.startIndex, offsetBy: clampedStart)
-        let endIndex = rawText.index(rawText.startIndex, offsetBy: clampedEnd)
-        let clippedText = String(rawText[startIndex..<endIndex]).trimmingCharacters(in: .whitespacesAndNewlines)
-        return clippedText.isEmpty ? nil : clippedText
-    }
-
-    private func isolationScore(for target: OCRNodeWithText, among nodes: [OCRNodeWithText]) -> CGFloat {
-        let targetCenterY = target.y + (target.height / 2.0)
-        let targetMinX = target.x
-        let targetMaxX = target.x + target.width
-
-        var nearestGap: CGFloat = 1.0
-
-        for node in nodes where node.id != target.id {
-            let nodeCenterY = node.y + (node.height / 2.0)
-            guard abs(nodeCenterY - targetCenterY) <= Self.searchHighlightLineTolerance else {
-                continue
-            }
-
-            let nodeMinX = node.x
-            let nodeMaxX = node.x + node.width
-            let gap: CGFloat
-            if nodeMaxX <= targetMinX {
-                gap = targetMinX - nodeMaxX
-            } else if nodeMinX >= targetMaxX {
-                gap = nodeMinX - targetMaxX
-            } else {
-                gap = 0
-            }
-
-            nearestGap = min(nearestGap, gap)
-        }
-
-        return nearestGap
-    }
-
-    private static func bestTextFragmentNodeCandidateIndex(_ candidates: [BrowserTextFragmentNodeCandidate]) -> Int? {
-        guard !candidates.isEmpty else { return nil }
-
-        var bestIndex: Int?
-        var bestScore = -Double.greatestFiniteMagnitude
-
-        for (index, candidate) in candidates.enumerated() {
-            let centerPenalty = Double(abs(candidate.centerY - 0.5)) * 120.0
-            let combinedText = candidate.startText + (candidate.endText.map { " " + $0 } ?? "")
-            let usefulLength = min(Double(combinedText.count), 96.0)
-            let shortPenalty = candidate.endText == nil ? 20.0 : 0.0
-            let isolationBonus = Double(min(candidate.isolationScore, 0.12)) * 320.0
-            let score = usefulLength + isolationBonus - centerPenalty - shortPenalty
-            if score > bestScore {
-                bestScore = score
-                bestIndex = index
-            }
-        }
-
-        return bestIndex
-    }
-
-    private static func smartTextFragmentDirective(startText: String, endText: String?) -> String? {
-        guard let normalizedStartText = normalizedTextFragmentComponent(
-            startText,
-            maxLength: 48,
-            minimumLength: 8
-        ) else {
-            return nil
-        }
-
-        let encodedStartText = encodedTextFragmentComponent(normalizedStartText)
-
-        guard let endText,
-              let normalizedEndText = normalizedTextFragmentComponent(
-                endText,
-                maxLength: 48,
-                minimumLength: 8
-              ) else {
-            return ":~:text=" + encodedStartText
-        }
-
-        return ":~:text=" + encodedStartText + "," + encodedTextFragmentComponent(normalizedEndText)
-    }
-
-    static func appendingSmartTextFragment(to urlString: String, directive: String?) -> String {
-        guard let directive,
-              !directive.isEmpty,
-              var components = URLComponents(string: urlString) else {
-            return urlString
-        }
-
-        let existingFragment = components.percentEncodedFragment ?? ""
-        guard !existingFragment.contains(":~:text=") else {
-            return urlString
-        }
-
-        components.percentEncodedFragment = existingFragment.isEmpty
-            ? directive
-            : existingFragment + directive
-        return components.string ?? urlString
-    }
-
-    private static func normalizedTextFragmentComponent(
-        _ text: String?,
-        maxLength: Int,
-        minimumLength: Int
-    ) -> String? {
-        guard let text else { return nil }
-        let collapsed = text
-            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard collapsed.count >= minimumLength else { return nil }
-        if collapsed.count <= maxLength {
-            return collapsed
-        }
-
-        let truncated = String(collapsed.prefix(maxLength))
-        let whitespace = CharacterSet.whitespacesAndNewlines
-
-        if let lastWhitespaceIndex = truncated.lastIndex(where: {
-            $0.unicodeScalars.allSatisfy(whitespace.contains)
-        }) {
-            let wordSafe = truncated[..<lastWhitespaceIndex].trimmingCharacters(in: .whitespacesAndNewlines)
-            if wordSafe.count >= minimumLength {
-                return wordSafe
-            }
-        }
-
-        return truncated.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private static func cleanTextFragmentWords(from text: String) -> [String] {
-        let collapsed = text
-            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-
-        guard !collapsed.isEmpty else { return [] }
-
-        return collapsed
-            .components(separatedBy: .whitespacesAndNewlines)
-            .map { token in
-                token.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
-            }
-            .filter { $0.count >= 2 }
-    }
-
-    private static func textFragmentWordSlice(from words: [String], count: Int = 3) -> String {
-        Array(words.prefix(count)).joined(separator: " ")
-    }
-
-    private static func nextTextFragmentEndText(
-        after index: Int,
-        in entries: [(node: OCRNodeWithText, words: [String])]
-    ) -> String? {
-        guard index + 1 < entries.count else {
-            return nil
-        }
-
-        for nextIndex in (index + 1)..<entries.count {
-            let endText = textFragmentWordSlice(from: entries[nextIndex].words)
-            if !endText.isEmpty {
-                return endText
-            }
-        }
-
-        return nil
-    }
-
-    private static func encodedTextFragmentComponent(_ text: String) -> String {
-        text.addingPercentEncoding(withAllowedCharacters: textFragmentAllowedCharacters) ?? text
-    }
-
-    private static let textFragmentAllowedCharacters: CharacterSet = {
-        var allowed = CharacterSet.urlQueryAllowed
-        allowed.remove(charactersIn: "#&?=,+-")
-        return allowed
-    }()
 
     private static let youTubeExactActionLabels: Set<String> = [
         "join",
@@ -11935,20 +11519,6 @@ public class SimpleTimelineViewModel: ObservableObject {
         "more",
         "show more",
     ]
-
-    private static let textFragmentExcludedDomains: [String] = [
-        "youtube.com",
-        "youtu.be",
-        "x.com",
-        "twitter.com",
-        "facebook.com",
-        "instagram.com",
-        "tiktok.com"
-    ]
-
-    private static func urlContainsTextFragment(_ urlString: String) -> Bool {
-        urlString.contains(":~:text=")
-    }
 
     private static func urlContainsYouTubeTimestamp(_ urlString: String) -> Bool {
         guard let url = URL(string: urlString),
@@ -12093,7 +11663,6 @@ public class SimpleTimelineViewModel: ObservableObject {
                     coordinator: coordinator,
                     source: "in_page_url_hyperlink",
                     url: resolvedURLString,
-                    usedTextFragment: false,
                     usedYouTubeTimestamp: false
                 )
             } else {
@@ -12122,7 +11691,6 @@ public class SimpleTimelineViewModel: ObservableObject {
                         coordinator: coordinator,
                         source: "in_page_url_hyperlink",
                         url: resolvedURLString,
-                        usedTextFragment: false,
                         usedYouTubeTimestamp: false
                     )
                 }
@@ -12399,19 +11967,6 @@ public class SimpleTimelineViewModel: ObservableObject {
         if showOCRDebugOverlay {
             previousOcrNodes = ocrNodes
         }
-
-        let redactedNodes = nodes.filter(\.isRedacted)
-        if !redactedNodes.isEmpty {
-            let sample = redactedNodes.prefix(5).map { node in
-                "id=\(node.id) rect=(\(String(format: "%.4f", node.x)),\(String(format: "%.4f", node.y)),\(String(format: "%.4f", node.width)),\(String(format: "%.4f", node.height)))"
-            }.joined(separator: "; ")
-            let frameID = redactedNodes.first?.frameId ?? -1
-            Log.debug(
-                "[PhraseRedaction][UI] Loaded redacted nodes frame=\(frameID) count=\(redactedNodes.count) sample=\(sample)",
-                category: .ui
-            )
-        }
-
         if let activeRedactionTooltipNodeID,
            !nodes.contains(where: { $0.id == activeRedactionTooltipNodeID }) {
             dismissRedactionTooltip()
@@ -12538,20 +12093,8 @@ public class SimpleTimelineViewModel: ObservableObject {
     public func togglePhraseLevelRedactionReveal(for node: OCRNodeWithText) {
         guard node.isRedacted else { return }
         guard let frame = currentTimelineFrame?.frame else { return }
-        guard Self.isSuccessfulProcessingStatus(currentTimelineFrame?.processingStatus ?? -1) else {
-            Log.debug(
-                "[PhraseRedaction][UI] Skip reveal node=\(node.id) frame=\(node.frameId) processingStatus=\(currentTimelineFrame?.processingStatus ?? -1)",
-                category: .ui
-            )
-            return
-        }
-        guard let secret = ReversibleOCRScrambler.currentAppWideSecret() else {
-            Log.warning(
-                "[PhraseRedaction][UI] Skip reveal node=\(node.id) frame=\(node.frameId) because no master key exists",
-                category: .ui
-            )
-            return
-        }
+        guard Self.isSuccessfulProcessingStatus(currentTimelineFrame?.processingStatus ?? -1) else { return }
+        guard let secret = ReversibleOCRScrambler.currentAppWideSecret() else { return }
 
         if let revealedPatch = revealedRedactedNodePatches.removeValue(forKey: node.id) {
             hidingRedactedNodePatches[node.id] = revealedPatch
@@ -12562,7 +12105,6 @@ public class SimpleTimelineViewModel: ObservableObject {
                 }
             }
             dismissRedactionTooltip()
-            Log.debug("[PhraseRedaction][UI] Hide node \(node.id) frame=\(node.frameId)", category: .ui)
             return
         }
 
@@ -12656,13 +12198,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             imageWidth: width,
             imageHeight: height
         )
-        guard patchRect.width > 1, patchRect.height > 1 else {
-            Log.warning(
-                "[PhraseRedaction][UI] Skipping reveal for tiny node \(node.id) frame=\(node.frameId)",
-                category: .ui
-            )
-            return nil
-        }
+        guard patchRect.width > 1, patchRect.height > 1 else { return nil }
 
         guard let patch = BGRAImageUtilities.extractPatch(
             from: frameData,
@@ -12679,11 +12215,6 @@ public class SimpleTimelineViewModel: ObservableObject {
             frameID: node.frameId,
             nodeID: node.id,
             secret: secret
-        )
-
-        Log.debug(
-            "[PhraseRedaction][UI] Reveal node=\(node.id) frame=\(node.frameId) strategy=COVERING+CURRENT pixelRect=(x=\(Int(patchRect.origin.x)),y=\(Int(patchRect.origin.y)),w=\(Int(patchRect.width)),h=\(Int(patchRect.height))) image=\(width)x\(height)",
-            category: .ui
         )
 
         guard let patchImage = nsImageFromBGRA(

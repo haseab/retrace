@@ -130,8 +130,6 @@ actor DisplaySwitchMonitor {
 
         self.axObserver = observer
         self.observedApp = app
-
-        Log.debug("[DisplaySwitchMonitor] AX observer set up for \(app.localizedName ?? "unknown")", category: .capture)
     }
 
     /// Remove the current AX observer

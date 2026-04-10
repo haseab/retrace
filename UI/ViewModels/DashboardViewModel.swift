@@ -640,6 +640,32 @@ public class DashboardViewModel: ObservableObject {
         }
     }
 
+    nonisolated static func loadRecentDiagnosticCrashReportSummariesForFeedback(
+        fileManager: FileManager = .default,
+        diagnosticReportDirectories: [String] = DashboardViewModel.diagnosticCrashReportDirectories,
+        now: Date = Date(),
+        maxReports: Int = 5
+    ) -> [DashboardCrashReportSummary] {
+        let resourceKeys: Set<URLResourceKey> = [
+            .isRegularFileKey,
+            .contentModificationDateKey,
+            .creationDateKey
+        ]
+
+        return diagnosticReportDirectories
+            .flatMap { directory in
+                loadDiagnosticCrashReports(
+                    fileManager: fileManager,
+                    directoryURL: URL(fileURLWithPath: directory, isDirectory: true),
+                    resourceKeys: resourceKeys,
+                    now: now
+                )
+            }
+            .sorted { $0.capturedAt > $1.capturedAt }
+            .prefix(maxReports)
+            .map { $0 }
+    }
+
     nonisolated static func loadRecentWALFailureCrash(
         fileManager: FileManager = .default,
         crashReportDirectory: String = EmergencyDiagnostics.crashReportDirectory,
@@ -2339,13 +2365,11 @@ public class DashboardViewModel: ObservableObject {
         coordinator: AppCoordinator,
         source: String,
         url: String,
-        usedTextFragment: Bool,
         usedYouTubeTimestamp: Bool
     ) {
         let metadata = jsonMetadata([
             "source": source,
             "url": url,
-            "usedTextFragment": usedTextFragment,
             "usedYouTubeTimestamp": usedYouTubeTimestamp
         ])
         recordMetric(

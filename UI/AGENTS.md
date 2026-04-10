@@ -39,6 +39,12 @@ UI/
 │   │   ├── FeedbackDiagnosticsPresentation.swift # Feedback diagnostics section building + readable formatting helpers
 │   │   ├── FeedbackModels.swift         # Feedback launch context, diagnostics, and payload models
 │   │   ├── FeedbackSubmissionExport.swift # Feedback export text/JSON generation + filtered payload builder
+│   │   ├── FeedbackCrashCompaction.swift # Crash-report compaction helpers for feedback exports/submissions
+│   │   ├── FeedbackCompression.swift    # Shared gzip compression utility for feedback payloads/exports
+│   │   ├── FeedbackDiagnosticsCollector.swift # Diagnostic snapshot collection helpers (system/settings/perf/memory summaries)
+│   │   ├── FeedbackLogSnapshotter.swift # Log-tail filtering/grouping/snapshot helpers for feedback diagnostics
+│   │   ├── FeedbackSubmissionTransport.swift # Feedback submission request construction + network transport helpers
+│   │   ├── FeedbackExportIO.swift      # Screenshot capture and feedback diagnostics/report export file I/O
 │   │   └── FeedbackService.swift        # Feedback submission and export implementation
 │   └── Settings/
 │       ├── SettingsView.swift           # Thin settings shell hosting navigation, alerts, and top-level wiring

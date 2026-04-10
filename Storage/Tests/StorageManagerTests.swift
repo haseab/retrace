@@ -241,8 +241,7 @@ final class StorageManagerTests: XCTestCase {
         return Double(total) / Double(samples)
     }
 
-    private func makeDatabase(name: String) async throws -> RecoveryTestDatabase {
-        _ = name
+    private func makeDatabase(name _: String) async throws -> RecoveryTestDatabase {
         let database = RecoveryTestDatabase()
         try await database.initialize()
         return database
@@ -4097,43 +4096,29 @@ private actor RecoveryTestDatabase: DatabaseProtocol {
     }
 
     func insertNodes(
-        frameID: FrameID,
-        nodes: [(textOffset: Int, textLength: Int, bounds: CGRect, windowIndex: Int?)],
-        frameWidth: Int,
-        frameHeight: Int
-    ) async throws {
-        _ = frameID
-        _ = nodes
-        _ = frameWidth
-        _ = frameHeight
-    }
+        frameID _: FrameID,
+        nodes _: [(textOffset: Int, textLength: Int, bounds: CGRect, windowIndex: Int?)],
+        frameWidth _: Int,
+        frameHeight _: Int
+    ) async throws {}
 
-    func getNodes(frameID: FrameID, frameWidth: Int, frameHeight: Int) async throws -> [OCRNode] {
-        _ = frameID
-        _ = frameWidth
-        _ = frameHeight
+    func getNodes(frameID _: FrameID, frameWidth _: Int, frameHeight _: Int) async throws -> [OCRNode] {
         return []
     }
 
-    func getNodesWithText(frameID: FrameID, frameWidth: Int, frameHeight: Int) async throws -> [(node: OCRNode, text: String)] {
-        _ = frameID
-        _ = frameWidth
-        _ = frameHeight
+    func getNodesWithText(frameID _: FrameID, frameWidth _: Int, frameHeight _: Int) async throws -> [(node: OCRNode, text: String)] {
         return []
     }
 
-    func deleteNodes(frameID: FrameID) async throws {
-        _ = frameID
-    }
+    func deleteNodes(frameID _: FrameID) async throws {}
 
     func indexFrameText(
         mainText: String,
         chromeText: String?,
         windowTitle: String?,
-        segmentId: Int64,
+        segmentId _: Int64,
         frameId: Int64
     ) async throws -> Int64 {
-        _ = segmentId
         let docID = nextDocumentID
         nextDocumentID += 1
         docIDsByFrameID[frameId] = docID
@@ -4268,33 +4253,24 @@ private actor RecoveryTestStorage: StorageProtocol {
     }
 
     func readFrameFromWAL(
-        segmentID: VideoSegmentID,
-        frameID: Int64,
-        fallbackFrameIndex: Int
+        segmentID _: VideoSegmentID,
+        frameID _: Int64,
+        fallbackFrameIndex _: Int
     ) async throws -> CapturedFrame? {
-        _ = segmentID
-        _ = frameID
-        _ = fallbackFrameIndex
         return nil
     }
 
     func applySegmentRewrite(
-        segmentID: VideoSegmentID,
-        plan: SegmentRewritePlan,
-        secret: String?
-    ) async throws {
-        _ = segmentID
-        _ = plan
-        _ = secret
-    }
+        segmentID _: VideoSegmentID,
+        plan _: SegmentRewritePlan,
+        secret _: String?
+    ) async throws {}
 
     func recoverInterruptedSegmentRewrites() async throws -> [SegmentRewriteRecoveryAction] {
         []
     }
 
-    func finishInterruptedSegmentRewriteRecovery(segmentID: VideoSegmentID) async throws {
-        _ = segmentID
-    }
+    func finishInterruptedSegmentRewriteRecovery(segmentID _: VideoSegmentID) async throws {}
 
     func isVideoValid(id: VideoSegmentID) async throws -> Bool {
         validVideoIDs.contains(id.value)

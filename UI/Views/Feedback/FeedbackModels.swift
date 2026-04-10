@@ -94,6 +94,7 @@ public struct DiagnosticInfo: Codable {
     public let settingsSnapshot: [String: String]
     public let recentErrors: [String]
     public let recentLogs: [String]
+    public let groupedRecentLogs: GroupedRecentLogs?
     public let recentMetricEvents: [FeedbackRecentMetricEvent]
     public let timestamp: Date
 
@@ -103,6 +104,110 @@ public struct DiagnosticInfo: Codable {
     public let accessibilityInfo: AccessibilityInfo
     public let performanceInfo: PerformanceInfo
     public let emergencyCrashReports: [String]?
+
+    public struct GroupedRecentLogs: Codable, Sendable {
+        public struct SchemaEntry: Codable, Sendable {
+            public let event: String
+            public let fields: [String: String]
+
+            public init(event: String, fields: [String: String]) {
+                self.event = event
+                self.fields = fields
+            }
+        }
+
+        public struct Group: Codable, Sendable {
+            public let eventCode: String
+            public let baseTimestampMs: Int64
+            public let scalarFields: [String: Int64]
+            public let seriesFields: [String: [Int64]]
+
+            public init(
+                eventCode: String,
+                baseTimestampMs: Int64,
+                scalarFields: [String: Int64] = [:],
+                seriesFields: [String: [Int64]]
+            ) {
+                self.eventCode = eventCode
+                self.baseTimestampMs = baseTimestampMs
+                self.scalarFields = scalarFields
+                self.seriesFields = seriesFields
+            }
+
+            public var entryCount: Int {
+                seriesFields["dt"]?.count ?? 0
+            }
+
+            public func encode(to encoder: Encoder) throws {
+                var container = encoder.container(keyedBy: DynamicCodingKey.self)
+                try container.encode(eventCode, forKey: DynamicCodingKey("e"))
+                try container.encode(baseTimestampMs, forKey: DynamicCodingKey("t0"))
+
+                for key in scalarFields.keys.sorted() {
+                    if let value = scalarFields[key] {
+                        try container.encode(value, forKey: DynamicCodingKey(key))
+                    }
+                }
+
+                for key in seriesFields.keys.sorted() {
+                    if let values = seriesFields[key] {
+                        try container.encode(values, forKey: DynamicCodingKey(key))
+                    }
+                }
+            }
+
+            public init(from decoder: Decoder) throws {
+                let container = try decoder.container(keyedBy: DynamicCodingKey.self)
+                eventCode = try container.decode(String.self, forKey: DynamicCodingKey("e"))
+                baseTimestampMs = try container.decode(Int64.self, forKey: DynamicCodingKey("t0"))
+
+                var scalarFields: [String: Int64] = [:]
+                var seriesFields: [String: [Int64]] = [:]
+
+                for key in container.allKeys where key.stringValue != "e" && key.stringValue != "t0" {
+                    if let values = try? container.decode([Int64].self, forKey: key) {
+                        seriesFields[key.stringValue] = values
+                    } else if let value = try? container.decode(Int64.self, forKey: key) {
+                        scalarFields[key.stringValue] = value
+                    }
+                }
+
+                self.scalarFields = scalarFields
+                self.seriesFields = seriesFields
+            }
+
+            private struct DynamicCodingKey: CodingKey, Hashable {
+                let stringValue: String
+                let intValue: Int?
+
+                init(_ stringValue: String) {
+                    self.stringValue = stringValue
+                    self.intValue = nil
+                }
+
+                init?(stringValue: String) {
+                    self.init(stringValue)
+                }
+
+                init?(intValue: Int) {
+                    self.stringValue = "\(intValue)"
+                    self.intValue = intValue
+                }
+            }
+        }
+
+        public let schema: [String: SchemaEntry]
+        public let groups: [Group]
+
+        public init(schema: [String: SchemaEntry], groups: [Group]) {
+            self.schema = schema
+            self.groups = groups
+        }
+
+        public var representedEntryCount: Int {
+            groups.reduce(0) { $0 + $1.entryCount }
+        }
+    }
 
     public struct DatabaseStats: Codable, Sendable {
         public let sessionCount: Int
@@ -229,6 +334,7 @@ public struct DiagnosticInfo: Codable {
         settingsSnapshot: [String: String] = [:],
         recentErrors: [String],
         recentLogs: [String] = [],
+        groupedRecentLogs: GroupedRecentLogs? = nil,
         recentMetricEvents: [FeedbackRecentMetricEvent] = [],
         displayInfo: DisplayInfo = DisplayInfo(count: 0, displays: [], mainDisplayIndex: 0),
         processInfo: ProcessInfo = ProcessInfo(totalRunning: 0, eventMonitoringApps: 0, windowManagementApps: 0, securityApps: 0, hasJamf: false, hasKandji: false, axuiServerCPU: 0, windowServerCPU: 0),
@@ -247,6 +353,7 @@ public struct DiagnosticInfo: Codable {
         self.settingsSnapshot = settingsSnapshot
         self.recentErrors = recentErrors
         self.recentLogs = recentLogs
+        self.groupedRecentLogs = groupedRecentLogs
         self.recentMetricEvents = recentMetricEvents
         self.displayInfo = displayInfo
         self.processInfo = processInfo
@@ -268,6 +375,7 @@ public struct DiagnosticInfo: Codable {
             settingsSnapshot: settingsSnapshot,
             recentErrors: recentErrors,
             recentLogs: recentLogs,
+            groupedRecentLogs: groupedRecentLogs,
             recentMetricEvents: events,
             displayInfo: displayInfo,
             processInfo: processInfo,

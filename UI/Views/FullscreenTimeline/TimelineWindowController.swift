@@ -699,10 +699,6 @@ public class TimelineWindowController: NSObject {
             processIdentifier: frontmost.processIdentifier,
             bundleIdentifier: frontmost.bundleIdentifier
         )
-        Log.debug(
-            "[TIMELINE-FOCUS] Captured restore target pid=\(frontmost.processIdentifier) bundleID=\(frontmost.bundleIdentifier ?? "nil")",
-            category: .ui
-        )
     }
 
     private func restoreFocusIfNeeded(
@@ -726,17 +722,7 @@ public class TimelineWindowController: NSObject {
 
         let hideElapsedMs = hideRequestedAt.map { (CFAbsoluteTimeGetCurrent() - $0) * 1000 }
         guard let app = NSRunningApplication(processIdentifier: target.processIdentifier),
-              !app.isTerminated else {
-            if let hideElapsedMs {
-                Log.debug(
-                    "[TIMELINE-FOCUS] Skip restore: prior app no longer running pid=\(target.processIdentifier) afterHide=\(String(format: "%.1f", hideElapsedMs))ms",
-                    category: .ui
-                )
-            } else {
-                Log.debug("[TIMELINE-FOCUS] Skip restore: prior app no longer running pid=\(target.processIdentifier)", category: .ui)
-            }
-            return
-        }
+              !app.isTerminated else { return }
 
         if let hideElapsedMs {
             Log.recordLatency(
@@ -747,36 +733,15 @@ public class TimelineWindowController: NSObject {
                 warningThresholdMs: 350,
                 criticalThresholdMs: 700
             )
-            Log.info(
-                "[TIMELINE-FOCUS] Restoring app focus pid=\(target.processIdentifier) bundleID=\(target.bundleIdentifier ?? "nil") afterHide=\(String(format: "%.1f", hideElapsedMs))ms",
-                category: .ui
-            )
-        } else {
-            Log.info(
-                "[TIMELINE-FOCUS] Restoring app focus pid=\(target.processIdentifier) bundleID=\(target.bundleIdentifier ?? "nil")",
-                category: .ui
-            )
         }
 
-        if !app.activate(options: [.activateIgnoringOtherApps]) {
-            if let hideElapsedMs {
-                Log.warning(
-                    "[TIMELINE-FOCUS] Failed to restore app focus pid=\(target.processIdentifier) bundleID=\(target.bundleIdentifier ?? "nil") afterHide=\(String(format: "%.1f", hideElapsedMs))ms",
-                    category: .ui
-                )
-            } else {
-                Log.warning(
-                    "[TIMELINE-FOCUS] Failed to restore app focus pid=\(target.processIdentifier) bundleID=\(target.bundleIdentifier ?? "nil")",
-                    category: .ui
-                )
-            }
-        }
+        _ = app.activate(options: [.activateIgnoringOtherApps])
     }
 
     private func applyHiddenState(
         restorePreviousFocus: Bool,
         hideRequestedAt: CFAbsoluteTime?,
-        reason: String
+        reason _: String
     ) {
         let wasHidingToShowDashboard = isHidingToShowDashboard
         isHiding = false
@@ -809,15 +774,6 @@ public class TimelineWindowController: NSObject {
                 summaryEvery: 10,
                 warningThresholdMs: 300,
                 criticalThresholdMs: 600
-            )
-            Log.info(
-                "[TimelineToggle] window hidden after \(String(format: "%.1f", hideElapsedMs))ms",
-                category: .ui
-            )
-        } else {
-            Log.info(
-                "[TimelineToggle] window hidden reason=\(reason)",
-                category: .ui
             )
         }
 
@@ -1147,34 +1103,19 @@ public class TimelineWindowController: NSObject {
     /// Prepare a metadata-only timeline state at startup.
     /// The hidden window/view hierarchy is no longer kept alive; we only warm the view model.
     public func prepareWindow() {
-        let prepareStartTime = CFAbsoluteTimeGetCurrent()
-        Log.info("[TIMELINE-PRERENDER] 🚀 prepareWindow() started", category: .ui)
+        guard let coordinator = coordinator else { return }
 
-        guard let coordinator = coordinator else {
-            Log.info("[TIMELINE-PRERENDER] ⚠️ prepareWindow() skipped - no coordinator", category: .ui)
-            return
-        }
-
-        if isPrepared, timelineViewModel != nil {
-            Log.info("[TIMELINE-PRERENDER] ⚠️ prepareWindow() skipped - metadata already prepared", category: .ui)
-            return
-        }
+        if isPrepared, timelineViewModel != nil { return }
 
         let viewModel = ensurePreparedViewModel(coordinator: coordinator)
         viewModel.isTapeHidden = true
-        Log.info(
-            "[TIMELINE-PRERENDER] 📊 Headless view model prepared, elapsed=\(String(format: "%.3f", (CFAbsoluteTimeGetCurrent() - prepareStartTime) * 1000))ms",
-            category: .ui
-        )
 
         // Load the most recent frame data in the background
         Task { @MainActor in
             await viewModel.loadMostRecentFrame(refreshPresentation: false)
-            Log.info("[TIMELINE-PRERENDER] 📊 Frame data loaded, total elapsed=\(String(format: "%.3f", (CFAbsoluteTimeGetCurrent() - prepareStartTime) * 1000))ms", category: .ui)
         }
 
         isPrepared = true
-        Log.info("[TIMELINE-PRERENDER] ✅ prepareWindow() completed, total=\(String(format: "%.3f", (CFAbsoluteTimeGetCurrent() - prepareStartTime) * 1000))ms", category: .ui)
     }
 
     // MARK: - Show/Hide
@@ -1204,10 +1145,6 @@ public class TimelineWindowController: NSObject {
         guard !isVisible, let coordinator = coordinator else {
             return
         }
-        Log.info(
-            "[TimelineToggle] show requested state=\(presentationState.rawValue) actualVisible=\(isActuallyVisible) searchOverlayVisible=\(timelineViewModel?.isSearchOverlayVisible ?? false)",
-            category: .ui
-        )
         let showStartTime = CFAbsoluteTimeGetCurrent()
         liveModeCaptureTask?.cancel()
         liveModeCaptureTask = nil
@@ -1244,50 +1181,26 @@ public class TimelineWindowController: NSObject {
                 ((instantEligible && instantLiveExpiryElapsed) || (nearEligible && nearLiveExpiryElapsed))
             let shouldSnapToNewestOnShow = cacheExpired || shouldAutoAdvanceNearLive
             let shouldClearSearchForReopenPolicy = shouldSnapToNewestOnShow
-            let hiddenLabel = hiddenElapsedSeconds.isFinite ? String(format: "%.1f", hiddenElapsedSeconds) : "inf"
-
-            let snapReason: String
-            if cacheExpired {
-                snapReason = "cache_expired"
-            } else if instantEligible && instantLiveExpiryElapsed {
-                snapReason = "instant_near_edge"
-            } else if nearEligible && nearLiveExpiryElapsed {
-                snapReason = "near_live_expired"
-            } else {
-                snapReason = "none"
-            }
 
             if shouldClearSearchForReopenPolicy {
                 let searchViewModel = viewModel.searchViewModel
                 if searchViewModel.hasResults || !searchViewModel.searchQuery.isEmpty {
-                    Log.info(
-                        "[TIMELINE-REOPEN] Clearing search state before show (reason=\(snapReason))",
-                        category: .ui
-                    )
                     searchViewModel.clearSearchResults()
                 }
             }
 
             if shouldSnapToNewestOnShow, !viewModel.frames.isEmpty {
                 let newestIndex = max(0, viewModel.frames.count - 1)
-                let oldIndex = viewModel.currentIndex
                 let didSnapToNewest: Bool
                 if cacheExpired {
                     didSnapToNewest = viewModel.applyCacheBustReopenSnapToNewest(newestIndex: newestIndex)
                 } else {
-                    if oldIndex != newestIndex {
+                    if viewModel.currentIndex != newestIndex {
                         viewModel.currentIndex = newestIndex
                         didSnapToNewest = true
                     } else {
                         didSnapToNewest = false
                     }
-                }
-
-                if didSnapToNewest {
-                    Log.info(
-                        "[TIMELINE-REOPEN] snapOnShow oldIndex=\(oldIndex) newIndex=\(newestIndex) reason=\(snapReason)",
-                        category: .ui
-                    )
                 }
 
                 shouldShowPositionRecoveryHintOnShow = Self.shouldShowPositionRecoveryHintOnReopen(
@@ -1303,14 +1216,8 @@ public class TimelineWindowController: NSObject {
             navigateToNewestOnShowRefresh = shouldSnapToNewestOnShow
             allowNearLiveAutoAdvanceOnShowRefresh = shouldAutoAdvanceNearLive || cacheExpired
 
-            let framesFromNewestAfter = max(0, viewModel.frames.count - 1 - viewModel.currentIndex)
             shouldUseLiveMode = loadedTapeIsRecent &&
                 viewModel.isNearLatestLoadedFrame(within: Self.instantLiveReopenFrameThreshold)
-
-            Log.info(
-                "[TIMELINE-REOPEN] hidden=\(hiddenLabel)s framesFromNewestBefore=\(framesFromNewestBefore) framesFromNewestAfter=\(framesFromNewestAfter) loadedTapeIsRecent=\(loadedTapeIsRecent) instantEligible=\(instantEligible) instantExpiryElapsed=\(instantLiveExpiryElapsed) nearEligible=\(nearEligible) nearExpiryElapsed=\(nearLiveExpiryElapsed) cacheExpired=\(cacheExpired) hasActiveFilters=\(hasActiveFilters) shouldSnapOnShow=\(shouldSnapToNewestOnShow) liveModeOnShow=\(shouldUseLiveMode)",
-                category: .ui
-            )
         }
 
         // Remember if dashboard was the key window before we take over
@@ -1337,14 +1244,6 @@ public class TimelineWindowController: NSObject {
             viewModel.isTapeHidden = true
             tapeShowAnimationTask?.cancel()
 
-            // Log cache state
-            if let lastHidden = lastHiddenAt {
-                let elapsed = Date().timeIntervalSince(lastHidden)
-                Log.info("[TIMELINE-SHOW] Using headless prepared state (hidden \(Int(elapsed))s ago)", category: .ui)
-            } else {
-                Log.info("[TIMELINE-SHOW] First show after headless prerender", category: .ui)
-            }
-
             showPreparedWindow(
                 coordinator: coordinator,
                 openPath: "prepared_headless",
@@ -1366,7 +1265,6 @@ public class TimelineWindowController: NSObject {
         }
 
         // Fallback: Create presentation and view model from scratch (prerender disabled or unavailable).
-        Log.info("[TIMELINE-SHOW] ⚠️ Using FALLBACK path - creating new window and viewModel from scratch", category: .ui)
         let viewModel = SimpleTimelineViewModel(coordinator: coordinator)
         setTimelineViewModel(viewModel)
         prepareLiveModeState(shouldUseLiveMode: shouldUseLiveMode, viewModel: viewModel)
@@ -1404,17 +1302,6 @@ public class TimelineWindowController: NSObject {
         timelineViewModel?.isTapeHidden = true
         tapeShowAnimationTask?.cancel()
 
-        // Log current view model state before showing
-        if let viewModel = timelineViewModel {
-            let currentVideoInfo = viewModel.currentVideoInfo
-            Log.info("[TIMELINE-SHOW] 🎬 About to show window - currentIndex=\(viewModel.currentIndex), frames.count=\(viewModel.frames.count), videoPath=\(currentVideoInfo?.videoPath.suffix(30) ?? "nil"), frameIndex=\(currentVideoInfo?.frameIndex ?? -1)", category: .ui)
-            let searchViewModel = viewModel.searchViewModel
-            Log.info(
-                "[TIMELINE-SHOW] 🔎 Search overlay snapshot visible=\(viewModel.isSearchOverlayVisible) queuedRestore=\(shouldRestoreSearchOverlayAfterNextShow) queryLength=\(searchViewModel.searchQuery.count) committedLength=\(searchViewModel.committedSearchQuery.count) totalResults=\(searchViewModel.results?.results.count ?? 0) visibleResults=\(searchViewModel.visibleResults.count) thumbnailsCached=\(searchViewModel.thumbnailCache.count) appIconsCached=\(searchViewModel.appIconCache.count)",
-                category: .ui
-            )
-        }
-
         // Force video reload BEFORE showing window to avoid flicker
         // This ensures AVPlayer loads fresh video data with any new frames
         // Skip this when in live mode since we're showing a live screenshot instead
@@ -1444,7 +1331,6 @@ public class TimelineWindowController: NSObject {
             viewModel.dismissTimelineContextMenu()
         }
 
-        Log.info("[TIMELINE-SHOW] 🚀 WINDOW BECOMING VISIBLE NOW (makeKeyAndOrderFront)", category: .ui)
         // Re-assert Space behavior before each open so cached windows always
         // materialize on the currently active Desktop.
         window.collectionBehavior.remove(.canJoinAllSpaces)
@@ -1570,10 +1456,6 @@ public class TimelineWindowController: NSObject {
     public func hide(restorePreviousFocus: Bool = true) {
         reconcileVisibilityState(reason: "hide")
         guard isVisible, let window = window, !isHiding else { return }
-        Log.info(
-            "[TimelineToggle] hide requested state=\(presentationState.rawValue) restorePreviousFocus=\(restorePreviousFocus) searchOverlayVisible=\(timelineViewModel?.isSearchOverlayVisible ?? false)",
-            category: .ui
-        )
         let hideRequestStartedAt = CFAbsoluteTimeGetCurrent()
         isHiding = true
         presentationState = .hiding
@@ -1751,13 +1633,11 @@ public class TimelineWindowController: NSObject {
 
     /// Save state for cross-session persistence (call on app termination)
     public func saveStateForTermination() {
-        Log.info("[TIMELINE-PRERENDER] 💾 saveStateForTermination() called", category: .ui)
         timelineViewModel?.saveState()
     }
 
     /// Completely destroy the pre-rendered window (call when memory pressure is high or app is terminating)
     public func destroyPreparedWindow() {
-        Log.info("[TIMELINE-PRERENDER] 🗑️ destroyPreparedWindow() called", category: .ui)
         // Save state before destroying for cross-session persistence
         timelineViewModel?.saveState()
         timelineViewModel?.compactPresentationState(reason: "destroyPreparedWindow", purgeDiskFrameBuffer: true)
@@ -1785,8 +1665,6 @@ public class TimelineWindowController: NSObject {
             )
             // Reset zoom region state on hide.
             viewModel.exitZoomRegion()
-        } else {
-            Log.warning("[TimelineToggle] Missing timeline view model during hide compaction", category: .ui)
         }
 
         // Always detach any mounted presentation and purge decode caches, even if the
@@ -1895,10 +1773,6 @@ public class TimelineWindowController: NSObject {
         let action = Self.toggleAction(
             presentationState: presentationState,
             isActuallyVisible: actualVisible
-        )
-        Log.info(
-            "[TimelineToggle] toggle invoked state=\(presentationState.rawValue) currentlyVisible=\(isVisible) actualVisible=\(actualVisible) searchOverlayVisible=\(timelineViewModel?.isSearchOverlayVisible ?? false)",
-            category: .ui
         )
         if action == .hide {
             hide()

@@ -2003,8 +2003,6 @@ class DoubleBufferedVideoView: NSView {
         isPlayerAActive = true
         playerViewA?.isHidden = false
         playerViewB?.isHidden = true
-
-        Log.debug("[VideoView] Released decoder resources (\(reason))", category: .ui)
     }
 
     private func release(player: AVPlayer?, playerView: AVPlayerView?) {
@@ -3599,8 +3597,6 @@ struct ZoomUnifiedOverlay<Content: View>: View {
         // For final state, progress is 1.0
         let progress: CGFloat = (isTransitioning || isExitTransitioning) ? animationProgress : 1.0
 
-        let _ = Log.debug("[ZoomDismiss] ZoomUnifiedOverlay rendered - isTransitioning: \(isTransitioning), isExitTransitioning: \(isExitTransitioning), progress: \(progress)", category: .ui)
-
         // Convert zoomRegion from actualFrameRect-normalized coords to screen coords
         // The normalized Y from screenToNormalizedCoords is already in "top-down" space (0=top, 1=bottom)
         // So we just multiply directly without flipping again
@@ -4235,7 +4231,6 @@ struct ZoomedTextSelectionNSView: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: ZoomedSelectionView, context: Context) {
-        Log.debug("[ZoomedTextSelectionNSView] updateNSView called, selectionStart=\(viewModel.selectionStart != nil)", category: .ui)
         nsView.zoomRegion = zoomRegion
         nsView.enlargedSize = enlargedSize
 
@@ -5814,9 +5809,8 @@ struct SearchHighlightOverlay: View {
     static func shouldDismissTooltip(
         for location: CGPoint,
         highlightedRects: [CGRect],
-        tooltipFrame: CGRect?
+        tooltipFrame _: CGRect?
     ) -> Bool {
-        _ = tooltipFrame
         return !highlightedRects.contains(where: { $0.contains(location) })
     }
 

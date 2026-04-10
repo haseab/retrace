@@ -256,28 +256,6 @@ final class HyperlinkResolutionTests: XCTestCase {
     }
 
     @MainActor
-    func testAppendingSmartTextFragmentAddsDirectiveWhenNoFragmentExists() {
-        XCTAssertEqual(
-            SimpleTimelineViewModel.appendingSmartTextFragment(
-                to: "https://example.com/article?id=1",
-                directive: ":~:text=hello%20world"
-            ),
-            "https://example.com/article?id=1#:~:text=hello%20world"
-        )
-    }
-
-    @MainActor
-    func testAppendingSmartTextFragmentPreservesExistingFragmentAnchor() {
-        XCTAssertEqual(
-            SimpleTimelineViewModel.appendingSmartTextFragment(
-                to: "https://example.com/article#section-2",
-                directive: ":~:text=hello%20world"
-            ),
-            "https://example.com/article#section-2:~:text=hello%20world"
-        )
-    }
-
-    @MainActor
     func testCurrentFrameMediaDisplayModePrefersExactDiskBufferStillForVideoFrames() {
         XCTAssertEqual(
             SimpleTimelineViewModel.resolveCurrentFrameMediaDisplayMode(

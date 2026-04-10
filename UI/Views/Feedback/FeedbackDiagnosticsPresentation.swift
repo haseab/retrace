@@ -88,7 +88,7 @@ public extension DiagnosticInfo {
             sectionIDs.append(.emergencyCrashReports)
         }
 
-        if includeVerboseSections, !nonMemoryProfileLogs.isEmpty {
+        if includeVerboseSections, hasFullLogsContent {
             sectionIDs.append(.fullLogs)
         }
 
@@ -102,10 +102,40 @@ public extension DiagnosticInfo {
             return []
         }
 
+        let recentErrorEntries = Set(recentErrors)
         return recentLogs.filter { entry in
             let isMemoryProfile = Self.isMemoryProfileLog(entry)
+            if recentErrorEntries.contains(entry) {
+                return false
+            }
             return (isMemoryProfile && includeMemorySummary) || (!isMemoryProfile && includeFullLogs)
         }
+    }
+
+    func filteredGroupedRecentLogs(including includedSections: Set<SectionID>) -> GroupedRecentLogs? {
+        guard includedSections.contains(.fullLogs) else {
+            return nil
+        }
+
+        return groupedRecentLogs
+    }
+
+    func filteredRecentLogEntryCount(including includedSections: Set<SectionID>) -> Int {
+        var count = 0
+
+        if includedSections.contains(.memorySummary) {
+            count += memoryProfileEntries.count
+        }
+
+        if includedSections.contains(.fullLogs) {
+            count += fullLogRepresentedEntryCount
+        }
+
+        return count
+    }
+
+    static func fullLogsPreviewDisclosureText() -> String {
+        "Preview truncated. Download .json.gz below to inspect all included log entries from the last ~30 minutes."
     }
 }
 
@@ -124,7 +154,38 @@ private extension DiagnosticInfo {
     }
 
     var nonMemoryProfileLogs: [String] {
-        recentLogs.filter { !Self.isMemoryProfileLog($0) }
+        let recentErrorEntries = Set(recentErrors)
+        return recentLogs.filter { entry in
+            !Self.isMemoryProfileLog(entry) && !recentErrorEntries.contains(entry)
+        }
+    }
+
+    var hasFullLogsContent: Bool {
+        !fullLogEntries.isEmpty
+    }
+
+    var fullLogRepresentedEntryCount: Int {
+        nonMemoryProfileLogs.count + (groupedRecentLogs?.representedEntryCount ?? 0)
+    }
+
+    var fullLogEntries: [String] {
+        var entries: [String] = []
+
+        if let groupedRecentLogs,
+           !groupedRecentLogs.groups.isEmpty {
+            if let schemaLine = minifiedGroupedLogSchemaLine(groupedRecentLogs.schema) {
+                entries.append(schemaLine)
+            }
+
+            entries.append(contentsOf: groupedRecentLogs.groups.compactMap(Self.minifiedJSONLine))
+
+            if !nonMemoryProfileLogs.isEmpty {
+                entries.append("--- RAW LOGS ---")
+            }
+        }
+
+        entries.append(contentsOf: nonMemoryProfileLogs)
+        return entries
     }
 
     static func isMemoryProfileLog(_ entry: String) -> Bool {
@@ -174,7 +235,7 @@ private extension DiagnosticInfo {
 
         switch sectionID {
         case .fullLogs:
-            return "Preview truncated. Download .txt below to inspect all included log entries."
+            return Self.fullLogsPreviewDisclosureText()
         case .appSystem,
              .database,
              .displays,
@@ -186,7 +247,7 @@ private extension DiagnosticInfo {
              .settings,
              .recentActions,
              .emergencyCrashReports:
-            return "Preview truncated. Download .txt below to inspect the full contents."
+            return "Preview truncated. Download .json.gz below to inspect the full contents."
         }
     }
 
@@ -244,7 +305,7 @@ private extension DiagnosticInfo {
         case .emergencyCrashReports:
             return "EMERGENCY CRASH REPORTS"
         case .fullLogs:
-            return "FULL LOGS (last hour)"
+            return "FULL LOGS (last ~30 minutes)"
         }
     }
 
@@ -273,7 +334,7 @@ private extension DiagnosticInfo {
         case .emergencyCrashReports:
             return "Auto-captured when the app was frozen and included only with your permission."
         case .fullLogs:
-            return "Complete log output for tracing event sequences leading to the issue."
+            return "High-volume log families are compacted into exact columnar JSON blocks before raw one-off logs."
         }
     }
 
@@ -298,7 +359,7 @@ private extension DiagnosticInfo {
             let count = emergencyCrashReports?.count ?? 0
             return "\(count) report\(count == 1 ? "" : "s")"
         case .fullLogs:
-            let count = nonMemoryProfileLogs.count
+            let count = fullLogRepresentedEntryCount
             return "\(count) log entr\(count == 1 ? "y" : "ies")"
         case .appSystem, .database, .performance, .runningApps, .accessibility:
             return nil
@@ -353,7 +414,7 @@ private extension DiagnosticInfo {
         case .emergencyCrashReports:
             return (emergencyCrashReports ?? []).joined(separator: "\n---\n")
         case .fullLogs:
-            return nonMemoryProfileLogs.joined(separator: "\n")
+            return fullLogEntries.joined(separator: "\n")
         }
     }
 
@@ -432,13 +493,30 @@ private extension DiagnosticInfo {
 
     func fullLogsPreviewContent() -> PreviewContent {
         previewContent(
-            from: nonMemoryProfileLogs,
+            from: fullLogEntries,
             lineLimit: 4,
             characterLimit: 260,
             overflowText: { remainingCount in
-                "\(remainingCount) more log entr\(remainingCount == 1 ? "y" : "ies") in the downloadable .txt report"
+                "\(remainingCount) more log entr\(remainingCount == 1 ? "y" : "ies") in the downloadable .json.gz report"
             }
         )
+    }
+
+    func minifiedGroupedLogSchemaLine(
+        _ schema: [String: GroupedRecentLogs.SchemaEntry]
+    ) -> String? {
+        Self.minifiedJSONLine(GroupedLogSchemaEnvelope(logSchema: schema))
+    }
+
+    static func minifiedJSONLine<T: Encodable>(_ value: T) -> String? {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+
+        guard let data = try? encoder.encode(value) else {
+            return nil
+        }
+
+        return String(data: data, encoding: .utf8)
     }
 
     func crashReportsPreviewContent() -> PreviewContent {
@@ -542,6 +620,14 @@ private extension DiagnosticInfo {
         }
 
         return enabledFeatures.joined(separator: "\n")
+    }
+}
+
+private struct GroupedLogSchemaEnvelope: Encodable {
+    let logSchema: [String: DiagnosticInfo.GroupedRecentLogs.SchemaEntry]
+
+    private enum CodingKeys: String, CodingKey {
+        case logSchema = "log_schema"
     }
 }
 

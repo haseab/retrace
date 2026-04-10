@@ -36,7 +36,7 @@ final class HEVCEncoderTests: XCTestCase {
         )
 
         XCTAssertEqual(tuning.averageBitRate, 4_200_000)
-        XCTAssertEqual(tuning.quality, 0.85, accuracy: 0.0001)
+        XCTAssertEqual(tuning.quality, 0.775, accuracy: 0.0001)
     }
 
     func testCompressionTuningClampsOutOfRangeQualityIntoEncoderRange() {

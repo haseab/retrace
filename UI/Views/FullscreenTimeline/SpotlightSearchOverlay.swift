@@ -422,7 +422,6 @@ public struct SpotlightSearchOverlay: View {
                         viewModel.openFilterSignal = (7, UUID())
                     },
                     onFocus: {
-                        Log.info("\(searchLog)[\(overlaySessionID)] search field focused", category: .ui)
                         isSearchFieldFocused = true
                         viewModel.isSearchFieldFocused = true
                         clearResultKeyboardNavigation()
@@ -655,7 +654,6 @@ public struct SpotlightSearchOverlay: View {
             highlightedRecentEntryIndex = 0
             hoveredRecentEntryKey = nil
         }
-        logRecentEntriesState(context: "refreshRecentEntriesPopoverVisibility")
     }
 
     private func scheduleRecentEntriesMetadataWarmupIfNeeded() {
@@ -2233,12 +2231,7 @@ struct SpotlightSearchField: NSViewRepresentable {
             NSApp.activate(ignoringOtherApps: true)
         }
         window.makeKeyAndOrderFront(nil)
-        let isKeyAfterMakeKey = window.isKeyWindow
         let success = window.makeFirstResponder(textField)
-        Log.info(
-            "\(searchLog)[FieldFocus] performFocus attempt=\(attempt) isKeyAfterMakeKey=\(isKeyAfterMakeKey) makeFirstResponderSuccess=\(success)",
-            category: .ui
-        )
 
         // Ensure field editor exists for caret to appear
         if window.fieldEditor(false, for: textField) == nil {
@@ -2263,7 +2256,7 @@ struct SpotlightSearchField: NSViewRepresentable {
 
         // If the window isn't key yet (activation is async on external monitors),
         // retry so keystrokes actually reach the text field
-        if !isKeyAfterMakeKey && attempt < maxAttempts {
+        if !window.isKeyWindow && attempt < maxAttempts {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                 self.focusTextField(
                     textField,

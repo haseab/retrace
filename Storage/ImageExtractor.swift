@@ -492,7 +492,6 @@ public final class HEVCStorageExtractor: ImageExtractor, FrameExtractionCacheInv
         imageCache.removeAll()
         generatorCache.removeAll()
         updateMemoryLedger()
-        Log.info("[HEVCStorageExtractor] Purged frame extraction caches (\(reason))", category: .storage)
     }
 
     private func updateMemoryLedger() {
@@ -709,7 +708,6 @@ public final class AVAssetExtractor: ImageExtractor, FrameExtractionCacheInvalid
         imageCache.removeAll()
         generatorCache.removeAll()
         updateMemoryLedger()
-        Log.info("[AVAssetExtractor] Purged frame extraction caches (\(reason))", category: .storage)
     }
 
     private func updateMemoryLedger() {

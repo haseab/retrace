@@ -1198,7 +1198,6 @@ public actor FrameProcessingQueue {
     /// Returns ProcessFrameResult indicating success, skip, or deferral
     private func processFrame(_ queuedFrame: QueuedFrame) async throws -> ProcessFrameResult {
         let frameID = queuedFrame.frameID
-        let t0 = CFAbsoluteTimeGetCurrent()
 
         // Get frame with video info (includes isVideoFinalized and bundleID in metadata)
         guard let frameWithInfo = try await databaseManager.getFrameWithVideoInfoByID(id: FrameID(value: frameID)) else {
@@ -1222,8 +1221,6 @@ public actor FrameProcessingQueue {
             throw DatabaseError.queryFailed(query: "getVideoSegment", underlying: "Video segment \(frameRef.videoID) not found")
         }
 
-        let tPrep = CFAbsoluteTimeGetCurrent()
-
         // Resolve segment ID encoded in the video file path (WAL and storage use this ID).
         let actualSegmentID = try parseActualSegmentID(from: videoSegment.relativePath)
         let ocrStageResult = try await performOCRStage(
@@ -1242,8 +1239,6 @@ public actor FrameProcessingQueue {
         case .ready(let stage):
             ocrStage = stage
         }
-        let tFrame = ocrStage.ocrStartTime
-        let tOCR = CFAbsoluteTimeGetCurrent()
 
         let phraseRedactionResult = applyPhraseLevelRedaction(
             to: ocrStage.extractedText,
@@ -1332,9 +1327,6 @@ public actor FrameProcessingQueue {
         if frameWithInfo.videoInfo?.isVideoFinalized ?? true {
             _ = try? await processPendingRewrites(for: frameRef.videoID.value)
         }
-
-        let tDone = CFAbsoluteTimeGetCurrent()
-        Log.info("[Queue-TIMING] Frame \(frameID): prep=\(String(format: "%.0f", (tPrep-t0)*1000))ms frame=\(String(format: "%.0f", (tFrame-tPrep)*1000))ms ocr=\(String(format: "%.0f", (tOCR-tFrame)*1000))ms index=\(String(format: "%.0f", (tDone-tOCR)*1000))ms total=\(String(format: "%.0f", (tDone-t0)*1000))ms size=\(ocrStage.frameWidth)x\(ocrStage.frameHeight)", category: .processing)
 
         return .success
     }
@@ -3269,15 +3261,6 @@ public actor FrameProcessingQueue {
     private func logMemorySnapshot() async {
         let counts = await refreshLiveQueueCounts()
         let processSnapshot = ProcessingMemoryDiagnostics.currentProcessMemorySnapshot()
-        let processFields = processSnapshot.map {
-            "footprint=\(ProcessingMemoryDiagnostics.formatBytes($0.physFootprintBytes)) resident=\(ProcessingMemoryDiagnostics.formatBytes($0.residentBytes)) internal=\(ProcessingMemoryDiagnostics.formatBytes($0.internalBytes)) compressed=\(ProcessingMemoryDiagnostics.formatBytes($0.compressedBytes)) "
-        } ?? ""
-
-        Log.info(
-            "[Queue-Memory] \(processFields)ocrQueueDepth=\(counts.ocrDepth) ocrPending=\(counts.ocrPending) ocrProcessing=\(counts.ocrProcessing) rewritePending=\(counts.rewritePending) rewriteProcessing=\(counts.rewriteProcessing) workers=\(workers.count) memoryPaused=\(isPausedForMemoryPressure)",
-            category: .processing
-        )
-
         MemoryLedger.setProcessSnapshot(
             footprintBytes: processSnapshot?.physFootprintBytes,
             residentBytes: processSnapshot?.residentBytes,

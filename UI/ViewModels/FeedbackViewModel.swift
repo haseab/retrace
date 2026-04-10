@@ -14,6 +14,45 @@ struct FeedbackSubmissionFailureState: Equatable {
     let isNetworkRelated: Bool
 }
 
+struct FeedbackCompletionPresentation: Equatable {
+    let title: String
+    let detail: String
+    let callToActionTitle: String?
+    let linkTitle: String?
+    let linkURL: URL?
+    let linkSymbolName: String?
+}
+
+enum FeedbackCompletionState: Equatable {
+    case submitted
+    case exported
+
+    private static let directChatURL = URL(string: "https://retrace.to/chat")!
+
+    var presentation: FeedbackCompletionPresentation {
+        switch self {
+        case .submitted:
+            return FeedbackCompletionPresentation(
+                title: "Feedback Sent!",
+                detail: "Thanks for helping improve Retrace.",
+                callToActionTitle: "Need a faster response?",
+                linkTitle: "Chat with me on retrace.to",
+                linkURL: Self.directChatURL,
+                linkSymbolName: "message.fill"
+            )
+        case .exported:
+            return FeedbackCompletionPresentation(
+                title: "Download Complete",
+                detail: "Your report was saved. Use chat to choose whether to send it by email, Discord, or live chat.",
+                callToActionTitle: "Next Steps:",
+                linkTitle: "Choose a Channel to Send",
+                linkURL: Self.directChatURL,
+                linkSymbolName: "message.fill"
+            )
+        }
+    }
+}
+
 enum FeedbackExportDestinationError: LocalizedError {
     case downloadsUnavailable
 
@@ -56,6 +95,7 @@ public final class FeedbackViewModel: ObservableObject {
     @Published private(set) var submissionStage: FeedbackSubmissionStage?
     @Published private(set) var submissionProgress: Double = 0
     @Published private(set) var submissionFailure: FeedbackSubmissionFailureState?
+    @Published private(set) var completionState: FeedbackCompletionState?
 
     // MARK: - Services
 
@@ -113,6 +153,14 @@ public final class FeedbackViewModel: ObservableObject {
 
     var hasSubmissionFailure: Bool {
         submissionFailure != nil
+    }
+
+    var hasSuccessfulCompletion: Bool {
+        completionState != nil
+    }
+
+    var completionPresentation: FeedbackCompletionPresentation? {
+        completionState?.presentation
     }
 
     var submissionFailureTitle: String {
@@ -372,28 +420,15 @@ public final class FeedbackViewModel: ObservableObject {
         beginSubmissionExperience(for: submissionType)
 
         do {
-            await loadDiagnosticsWithRealStats(includeLogs: submissionType == .bug)
-
-            guard let diagnostics else {
-                throw FeedbackError.invalidData
-            }
-
             transitionSubmission(to: .packaging, cancelAutomaticStages: true)
-            let submission = FeedbackSubmission(
-                type: submissionType,
-                email: email.trimmingCharacters(in: .whitespacesAndNewlines),
-                description: description,
-                diagnostics: diagnostics,
-                includedDiagnosticSections: includedDiagnosticSections,
-                includeScreenshot: attachedImageData != nil,
-                screenshotData: attachedImageData
-            )
+            let submission = try await buildSubmission(forUpload: true)
 
             transitionSubmission(to: .upload, cancelAutomaticStages: true)
             _ = try await feedbackService.submitFeedback(submission)
             await waitForMinimumUploadDisplay()
             transitionSubmission(to: .confirmation, cancelAutomaticStages: true)
             await completeSubmissionExperience()
+            completionState = .submitted
             isSubmitted = true
         } catch {
             if uploadStageStartedAt != nil {
@@ -412,7 +447,7 @@ public final class FeedbackViewModel: ObservableObject {
 
         error = nil
 
-        let suggestedFileName = "\(FeedbackSubmission.suggestedBaseName(forType: feedbackType.rawValue)).txt"
+        let suggestedFileName = "\(FeedbackSubmission.suggestedBaseName(forType: feedbackType.rawValue)).json.gz"
         let exportURL: URL
         do {
             guard let selectedExportURL = try await chooseExportURL(defaultFileName: suggestedFileName) else {
@@ -430,13 +465,14 @@ public final class FeedbackViewModel: ObservableObject {
         defer { isExporting = false }
 
         do {
-            let submission = try await buildSubmission()
+            let submission = try await buildSubmission(forUpload: true)
             let exportedURLs = try await feedbackService.exportFeedbackReport(
                 submission,
                 to: exportURL,
                 launchSource: launchSource
             )
             NSWorkspace.shared.activateFileViewerSelecting(exportedURLs)
+            completionState = .exported
             recordFeedbackExportMetric(outcome: "exported", exportedFileCount: exportedURLs.count)
         } catch {
             self.error = "Failed to save feedback report: \(error.localizedDescription)"
@@ -476,6 +512,7 @@ public final class FeedbackViewModel: ObservableObject {
         submissionStage = nil
         submissionProgress = 0
         submissionFailure = nil
+        completionState = nil
         Task {
             await loadDiagnosticsWithRealStats(includeLogs: true)
         }
@@ -723,22 +760,75 @@ public final class FeedbackViewModel: ObservableObject {
         }
     }
 
-    private func buildSubmission() async throws -> FeedbackSubmission {
-        await loadDiagnosticsWithRealStats(includeLogs: feedbackType == .bug)
+    private func buildSubmission(forUpload: Bool = false) async throws -> FeedbackSubmission {
+        let includeLogs = feedbackType == .bug
+        let submissionDiagnostics: DiagnosticInfo
+        if forUpload, includeLogs {
+            async let stats = submissionDatabaseStats()
+            async let recentMetricEvents = submissionRecentMetricEvents()
+            let expandedDiagnostics = await feedbackService.collectSubmissionDiagnosticsAsync(with: stats)
+            submissionDiagnostics = expandedDiagnostics.withRecentMetricEvents(await recentMetricEvents)
+        } else {
+            await loadDiagnosticsWithRealStats(includeLogs: includeLogs)
 
-        guard let diagnostics else {
-            throw FeedbackError.invalidData
+            guard let diagnostics else {
+                throw FeedbackError.invalidData
+            }
+
+            submissionDiagnostics = diagnostics
         }
 
         return FeedbackSubmission(
             type: feedbackType,
             email: email.trimmingCharacters(in: .whitespacesAndNewlines),
             description: description,
-            diagnostics: diagnostics,
+            diagnostics: submissionDiagnostics,
             includedDiagnosticSections: includedDiagnosticSections,
             includeScreenshot: attachedImageData != nil,
             screenshotData: attachedImageData
         )
+    }
+
+    private func submissionDatabaseStats() async -> DiagnosticInfo.DatabaseStats {
+        if let diagnostics {
+            return diagnostics.databaseStats
+        }
+
+        guard let wrapper = coordinatorWrapper else {
+            return fallbackDatabaseStats
+        }
+
+        do {
+            let quickStats = try await wrapper.coordinator.getDatabaseStatisticsQuick()
+
+            let dbPath = NSString(string: AppPaths.databasePath).expandingTildeInPath
+            let dbSizeMB: Double
+            if let attrs = try? FileManager.default.attributesOfItem(atPath: dbPath),
+               let size = attrs[.size] as? Int64 {
+                dbSizeMB = Double(size) / (1024 * 1024)
+            } else {
+                dbSizeMB = 0
+            }
+
+            let stats = DiagnosticInfo.DatabaseStats(
+                sessionCount: quickStats.sessionCount,
+                frameCount: quickStats.frameCount,
+                segmentCount: 0,
+                databaseSizeMB: dbSizeMB
+            )
+            return stats
+        } catch {
+            Log.warning("[FeedbackViewModel] Failed to load submission stats: \(error)", category: .ui)
+            return fallbackDatabaseStats
+        }
+    }
+
+    private func submissionRecentMetricEvents() async -> [FeedbackRecentMetricEvent] {
+        if let diagnostics {
+            return diagnostics.recentMetricEvents
+        }
+
+        return await loadRecentMetricEvents()
     }
 
     private func chooseExportURL(defaultFileName: String) async throws -> URL? {
@@ -746,11 +836,11 @@ public final class FeedbackViewModel: ObservableObject {
 
         return await withCheckedContinuation { continuation in
             let panel = NSSavePanel()
-            panel.allowedContentTypes = [.plainText]
+            panel.allowedContentTypes = [.gzip]
             panel.canCreateDirectories = true
             panel.directoryURL = suggestedURL.deletingLastPathComponent()
             panel.nameFieldStringValue = suggestedURL.lastPathComponent
-            panel.message = "Save the feedback report as a text file"
+            panel.message = "Save the feedback report as a gzipped JSON file"
             panel.prompt = "Download"
 
             panel.begin { response in
@@ -814,7 +904,7 @@ public final class FeedbackViewModel: ObservableObject {
         if case FeedbackError.networkError = error {
             return FeedbackSubmissionFailureState(
                 title: "No network connection",
-                detail: "Retrace couldn't reach the internet from this Mac. If network access is blocked, go back and use Download .txt instead.",
+                detail: "Retrace couldn't reach the internet from this Mac. If network access is blocked, go back and use Download .json.gz instead.",
                 symbolName: "wifi.slash",
                 isNetworkRelated: true
             )

@@ -33,6 +33,7 @@ public final class StorageHealthMonitor: @unchecked Sendable {
         // Check intervals
         static let healthCheckInterval: TimeInterval = 30 // seconds
         static let keepAliveInterval: TimeInterval = 30   // seconds (combined with health check)
+        static let diskCheckFailureLogThrottleSeconds: TimeInterval = 300
 
         // Disk space thresholds
         static let warningThresholdGB: Double = 5.0
@@ -67,6 +68,7 @@ public final class StorageHealthMonitor: @unchecked Sendable {
 
     // Disk space state
     private var lastDiskSpaceWarningTime: Date?
+    private var lastDiskCheckFailureLogTime: Date?
     private var lastAvailableGB: Double = 0
 
     // Keep-alive file
@@ -123,6 +125,7 @@ public final class StorageHealthMonitor: @unchecked Sendable {
             criticalWriteCount = 0
             spinupCount = 0
             lastDiskSpaceWarningTime = nil
+            lastDiskCheckFailureLogTime = nil
         }
         lock.unlock()
 
@@ -134,7 +137,6 @@ public final class StorageHealthMonitor: @unchecked Sendable {
         // Start periodic health check task
         startHealthCheckTask()
 
-        Log.info("[StorageHealth] Started monitoring: \(storagePath)", category: .storage)
     }
 
     /// Stop monitoring. Call this when pipeline stops.
@@ -179,13 +181,10 @@ public final class StorageHealthMonitor: @unchecked Sendable {
             try? FileManager.default.removeItem(at: keepAliveToRemove)
         }
 
-        Log.info("[StorageHealth] Stopped monitoring", category: .storage)
     }
 
     /// Record a write latency sample. Called by IncrementalSegmentWriter after each frame write.
     public func recordWriteLatency(_ latencyMs: Double) {
-        var shouldLogCritical = false
-
         lock.lock()
         recentLatencies.append(latencyMs)
         if recentLatencies.count > Config.maxLatencySamples {
@@ -194,15 +193,12 @@ public final class StorageHealthMonitor: @unchecked Sendable {
 
         if latencyMs > Config.slowIOCriticalMs {
             criticalWriteCount += 1
-            shouldLogCritical = true
         } else if latencyMs > Config.slowIOWarningMs {
             slowWriteCount += 1
         }
         lock.unlock()
 
-        // Log and notify outside lock
-        if shouldLogCritical {
-            Log.error("[StorageHealth] Critical write latency: \(String(format: "%.0f", latencyMs))ms", category: .storage)
+        if latencyMs > Config.slowIOCriticalMs {
             postNotification(.storageSlowIO, object: latencyMs)
         }
     }
@@ -267,7 +263,6 @@ public final class StorageHealthMonitor: @unchecked Sendable {
 
         // Check if this volume contains our storage path
         if storagePath.hasPrefix(volumeURL.path) {
-            Log.warning("[StorageHealth] Storage volume ejecting: \(volumeURL.path)", category: .storage)
             handleStorageInaccessible(reason: "Volume ejecting")
         }
     }
@@ -277,7 +272,6 @@ public final class StorageHealthMonitor: @unchecked Sendable {
               let storagePath = snapshot().storagePath else { return }
 
         if storagePath.hasPrefix(volumeURL.path) {
-            Log.error("[StorageHealth] Storage volume ejected: \(volumeURL.path)", category: .storage)
             handleStorageInaccessible(reason: "Volume ejected")
         }
     }
@@ -287,7 +281,6 @@ public final class StorageHealthMonitor: @unchecked Sendable {
               let storagePath = snapshot().storagePath else { return }
 
         if storagePath.hasPrefix(volumeURL.path) {
-            Log.info("[StorageHealth] Storage volume mounted: \(volumeURL.path)", category: .storage)
             // Post notification so caches can be validated
             postNotification(.storageVolumeMounted, object: volumeURL)
         }
@@ -327,7 +320,6 @@ public final class StorageHealthMonitor: @unchecked Sendable {
         let exists = FileManager.default.fileExists(atPath: storageURL.path, isDirectory: &isDirectory)
 
         if !exists || !isDirectory.boolValue {
-            Log.error("[StorageHealth] Storage path inaccessible: \(storageURL.path)", category: .storage)
             handleStorageInaccessible(reason: "Path inaccessible")
             return
         }
@@ -338,8 +330,6 @@ public final class StorageHealthMonitor: @unchecked Sendable {
         // 3. Keep-alive write (also detects spinup)
         await performKeepAliveWrite()
 
-        // 4. Log periodic health summary
-        logHealthSummary()
     }
 
     private func checkDiskSpace() async {
@@ -353,24 +343,23 @@ public final class StorageHealthMonitor: @unchecked Sendable {
             updateLastAvailableGB(availableGB)
 
             if availableGB < Config.stopThresholdGB {
-                Log.critical("[StorageHealth] Disk space critical: \(String(format: "%.2f", availableGB))GB - stopping recording", category: .storage)
                 postNotification(.storageCriticalLow, object: ["availableGB": availableGB, "shouldStop": true])
                 if let callback = snapshot.onCriticalError {
                     await callback()
                 }
             } else if availableGB < Config.criticalThresholdGB {
                 if shouldShowThrottledWarning() {
-                    Log.error("[StorageHealth] Disk space critical: \(String(format: "%.2f", availableGB))GB", category: .storage)
                     postNotification(.storageCriticalLow, object: ["availableGB": availableGB, "shouldStop": false])
                 }
             } else if availableGB < Config.warningThresholdGB {
                 if shouldShowThrottledWarning() {
-                    Log.warning("[StorageHealth] Disk space low: \(String(format: "%.2f", availableGB))GB", category: .storage)
                     postNotification(.storageLow, object: ["availableGB": availableGB])
                 }
             }
         } catch {
-            Log.error("[StorageHealth] Failed to check disk space: \(error.localizedDescription)", category: .storage)
+            if shouldLogDiskCheckFailure() {
+                Log.warning("[StorageHealth] Failed to check disk space: \(error.localizedDescription)", category: .storage)
+            }
         }
     }
 
@@ -384,7 +373,6 @@ public final class StorageHealthMonitor: @unchecked Sendable {
         do {
             try timestamp.write(to: keepAliveURL)
         } catch {
-            Log.warning("[StorageHealth] Keep-alive write failed: \(error.localizedDescription)", category: .storage)
             return
         }
 
@@ -393,7 +381,6 @@ public final class StorageHealthMonitor: @unchecked Sendable {
         // Detect drive spinup (write takes unusually long)
         if latencyMs > Config.spinupDetectionMs {
             incrementSpinupCount()
-            Log.warning("[StorageHealth] Drive spinup detected: \(String(format: "%.0f", latencyMs))ms write latency", category: .storage)
         }
     }
 
@@ -425,9 +412,17 @@ public final class StorageHealthMonitor: @unchecked Sendable {
         return false
     }
 
-    private func logHealthSummary() {
-        let stats = statistics
-        Log.info("[StorageHealth] diskFreeGB=\(String(format: "%.1f", stats.availableGB)) avgLatencyMs=\(String(format: "%.0f", stats.avgWriteLatencyMs)) slowWrites=\(stats.slowWriteCount) criticalWrites=\(stats.criticalWriteCount) spinups=\(stats.spinupCount)", category: .storage)
+    private func shouldLogDiskCheckFailure(now: Date = Date()) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+
+        if let lastFailureLog = lastDiskCheckFailureLogTime,
+           now.timeIntervalSince(lastFailureLog) < Config.diskCheckFailureLogThrottleSeconds {
+            return false
+        }
+
+        lastDiskCheckFailureLogTime = now
+        return true
     }
 
     private func postNotification(_ name: NSNotification.Name, object: Any?) {

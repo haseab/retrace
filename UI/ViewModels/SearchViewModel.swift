@@ -818,11 +818,6 @@ public class SearchViewModel: ObservableObject {
 
     private func logMemorySnapshot() {
         let resultCount = results?.results.count ?? 0
-        Log.info(
-            "[Search-Memory] results=\(resultCount) visibleResults=\(visibleResults.count) thumbnails=\(thumbnailCache.count)/\(Self.formatBytes(thumbnailCacheBytes)) appIcons=\(appIconCache.count)/\(Self.formatBytes(appIconCacheBytes))",
-            category: .ui
-        )
-
         updateMemoryLedger(resultCount: resultCount)
     }
 

@@ -834,9 +834,7 @@ public actor CGWindowListCapture {
         pattern.contains(where: { !$0.isWhitespace })
     }
 
-    private func tracePrivateRedaction(_ message: String) {
-        _ = message
-    }
+    private func tracePrivateRedaction(_ : String) {}
 
     private func tracePreview(_ value: String, limit: Int = 180) -> String {
         let collapsed = value
