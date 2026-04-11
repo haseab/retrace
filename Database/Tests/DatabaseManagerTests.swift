@@ -2668,9 +2668,7 @@ final class DatabaseManagerTests: XCTestCase {
 
         defer {
             sqlite3_close(db)
-            try? FileManager.default.removeItem(atPath: dbPath)
-            try? FileManager.default.removeItem(atPath: dbPath + "-wal")
-            try? FileManager.default.removeItem(atPath: dbPath + "-shm")
+            removeSQLiteTestArtifacts(atPath: dbPath)
         }
 
         try await runLegacyMigrations(throughVersion: 15, db: db)
@@ -2722,9 +2720,7 @@ final class DatabaseManagerTests: XCTestCase {
 
         defer {
             sqlite3_close(db)
-            try? FileManager.default.removeItem(atPath: dbPath)
-            try? FileManager.default.removeItem(atPath: dbPath + "-wal")
-            try? FileManager.default.removeItem(atPath: dbPath + "-shm")
+            removeSQLiteTestArtifacts(atPath: dbPath)
         }
 
         try executeRawSQL(Schema.createSchemaMigrationsTable, db: db)
@@ -2750,6 +2746,18 @@ final class DatabaseManagerTests: XCTestCase {
                 videoCurrentTime REAL,
                 rewritePurpose INTEGER,
                 rewrittenAt INTEGER
+            );
+            """,
+            db: db
+        )
+        try executeRawSQL(
+            """
+            CREATE TABLE daily_metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER NOT NULL,
+                metricType INTEGER NOT NULL,
+                value INTEGER NOT NULL DEFAULT 0,
+                metadata TEXT
             );
             """,
             db: db
@@ -2798,9 +2806,7 @@ final class DatabaseManagerTests: XCTestCase {
 
         defer {
             sqlite3_close(db)
-            try? FileManager.default.removeItem(atPath: dbPath)
-            try? FileManager.default.removeItem(atPath: dbPath + "-wal")
-            try? FileManager.default.removeItem(atPath: dbPath + "-shm")
+            removeSQLiteTestArtifacts(atPath: dbPath)
         }
 
         let createdAtMs: Int64 = 1_700_000_000_000
@@ -3992,6 +3998,25 @@ final class DatabaseManagerTests: XCTestCase {
         try executeRawSQL("PRAGMA journal_mode = WAL;", db: db)
         try executeRawSQL("PRAGMA synchronous = NORMAL;", db: db)
         return db
+    }
+
+    private func removeSQLiteTestArtifacts(atPath path: String) {
+        removeFileIfPresent(atPath: path)
+        removeFileIfPresent(atPath: path + "-wal")
+        removeFileIfPresent(atPath: path + "-shm")
+    }
+
+    private func removeFileIfPresent(atPath path: String) {
+        guard FileManager.default.fileExists(atPath: path) else { return }
+        do {
+            try FileManager.default.removeItem(atPath: path)
+        } catch let error as NSError
+            where error.domain == NSCocoaErrorDomain && error.code == NSFileNoSuchFileError
+        {
+            return
+        } catch {
+            XCTFail("Failed to remove test artifact at \(path): \(error)")
+        }
     }
 
     private func runLegacyMigrations(throughVersion version: Int, db: OpaquePointer) async throws {

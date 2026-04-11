@@ -2312,13 +2312,7 @@ public actor DatabaseManager: DatabaseProtocol {
         guard !attachments.isEmpty else { return }
 
         for attachment in attachments {
-            let rawPath = attachment.filePath
-            let resolvedPath: String
-            if rawPath.hasPrefix("/") || rawPath.hasPrefix("~") {
-                resolvedPath = NSString(string: rawPath).expandingTildeInPath
-            } else {
-                resolvedPath = (storageRootPath as NSString).appendingPathComponent(rawPath)
-            }
+            let resolvedPath = resolveStoragePath(forStoredPath: attachment.filePath)
 
             guard FileManager.default.fileExists(atPath: resolvedPath) else {
                 continue
@@ -2329,6 +2323,33 @@ public actor DatabaseManager: DatabaseProtocol {
             } catch {
                 Log.warning("[DB] Failed to remove attachment file at \(resolvedPath): \(error.localizedDescription)", category: .database)
             }
+        }
+    }
+
+    private func resolveStoragePath(forStoredPath storedPath: String) -> String {
+        if storedPath.hasPrefix("/") || storedPath.hasPrefix("~") {
+            return NSString(string: storedPath).expandingTildeInPath
+        }
+
+        return (storageRootPath as NSString).appendingPathComponent(storedPath)
+    }
+
+    private func refreshedFileSizeOnDisk(forStoredPath storedPath: String) -> Int64? {
+        let resolvedPath = resolveStoragePath(forStoredPath: storedPath)
+
+        guard FileManager.default.fileExists(atPath: resolvedPath) else {
+            return nil
+        }
+
+        do {
+            let attributes = try FileManager.default.attributesOfItem(atPath: resolvedPath)
+            return (attributes[.size] as? NSNumber)?.int64Value
+        } catch {
+            Log.warning(
+                "[DB] Failed to read rewritten video size at \(resolvedPath): \(error.localizedDescription)",
+                category: .database
+            )
+            return nil
         }
     }
 
@@ -2879,6 +2900,15 @@ public actor DatabaseManager: DatabaseProtocol {
                     guard sqlite3_step(statement) == SQLITE_DONE else {
                         throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
                     }
+                } else if let segment = try SegmentQueries.getByID(db: db, id: VideoSegmentID(value: plan.videoID)),
+                          let refreshedFileSize = refreshedFileSizeOnDisk(forStoredPath: segment.relativePath) {
+                    try SegmentQueries.update(
+                        db: db,
+                        id: plan.videoID,
+                        width: segment.width,
+                        height: segment.height,
+                        fileSize: refreshedFileSize
+                    )
                 }
 
                 try executeImmediateSQL("COMMIT;", db: db)
