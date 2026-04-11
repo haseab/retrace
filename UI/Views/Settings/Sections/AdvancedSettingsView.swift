@@ -83,11 +83,11 @@ extension SettingsView {
     @ViewBuilder
     var timelineCard: some View {
         ModernSettingsCard(title: "Timeline", icon: "play.rectangle") {
-                ModernToggleRow(
-                    title: "Show video controls",
-                    subtitle: "Display play/pause button in the timeline to auto-advance frames",
-                    isOn: $showVideoControls
-                )
+            ModernToggleRow(
+                title: "Show video controls",
+                subtitle: "Display play/pause button in the timeline to auto-advance frames",
+                isOn: $showVideoControls
+            )
         }
     }
 

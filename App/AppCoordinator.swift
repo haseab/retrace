@@ -20,6 +20,10 @@ public enum RecordingUnexpectedStopNotification {
     public static let didStop = Notification.Name("RecordingUnexpectedStop")
 }
 
+public enum CaptureObservedNotification {
+    public static let didObserve = Notification.Name("CaptureObserved")
+}
+
 public enum UnexpectedRecordingStopReason: String, Codable, Sendable {
     case captureStopped = "capture_stopped"
     case encoderMismatch = "encoder_mismatch"
@@ -1129,6 +1133,18 @@ public actor AppCoordinator {
         }
 
         services.capture.onCaptureStopped = nil
+        services.capture.onCaptureObserved = { timestamp, trigger in
+            await MainActor.run {
+                NotificationCenter.default.post(
+                    name: CaptureObservedNotification.didObserve,
+                    object: nil,
+                    userInfo: [
+                        "timestamp": timestamp,
+                        "trigger": trigger
+                    ]
+                )
+            }
+        }
         services.capture.onMouseClickCaptureOutcome = { [weak self] outcome, timestamp in
             guard let self else { return }
             await self.recordMouseClickCaptureMetricIfNeeded(

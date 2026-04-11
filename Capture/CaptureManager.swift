@@ -2,6 +2,73 @@ import Foundation
 import CoreGraphics
 import Shared
 
+struct CaptureAppSnapshot: Sendable {
+    let name: String?
+    let bundleID: String?
+    let pid: pid_t
+
+    var logDescription: String {
+        "\(Self.debugField(name)) [\(Self.debugField(bundleID))] pid=\(pid)"
+    }
+
+    func matches(bundleID otherBundleID: String?, appName otherAppName: String?) -> Bool {
+        if let bundleID = Self.normalized(bundleID),
+           let otherBundleID = Self.normalized(otherBundleID) {
+            return bundleID == otherBundleID
+        }
+
+        if let name = Self.normalized(name),
+           let otherAppName = Self.normalized(otherAppName) {
+            return name == otherAppName
+        }
+
+        return false
+    }
+
+    private static func normalized(_ value: String?) -> String? {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty else {
+            return nil
+        }
+        return value
+    }
+
+    private static func debugField(_ value: String?) -> String {
+        normalized(value) ?? "nil"
+    }
+}
+
+enum WindowChangeEventSource: String, Sendable {
+    case appActivation = "app_activation"
+    case axActivation = "ax_activation"
+}
+
+struct WindowChangeEvent: Sendable {
+    let id: UInt64
+    let source: WindowChangeEventSource
+    let observedAt: Date
+    let activatedApp: CaptureAppSnapshot?
+    let workspaceFrontmostApp: CaptureAppSnapshot?
+}
+
+private struct WindowChangeSignature: Sendable {
+    let normalizedTitle: String?
+    let normalizedBundleID: String?
+
+    init(metadata: FrameMetadata) {
+        self.normalizedTitle = Self.normalized(metadata.windowName)
+        self.normalizedBundleID = Self.normalized(metadata.appBundleID)
+    }
+
+    private static func normalized(_ value: String?) -> String? {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty else {
+            return nil
+        }
+        return value
+    }
+}
+
 protocol ScreenCaptureBackend: Actor {
     func startCapture(config: CaptureConfig, displayID: CGDirectDisplayID?) async throws
     func stopCapture() async throws
@@ -19,7 +86,7 @@ protocol CaptureDisplayMonitoring: Actor {
 protocol CaptureDisplaySwitchMonitoring: Actor {
     func setOnDisplaySwitch(_ callback: (@Sendable (UInt32, UInt32) async -> Void)?)
     func setOnAccessibilityPermissionDenied(_ callback: (@Sendable () async -> Void)?)
-    func setOnWindowChange(_ callback: (@Sendable () async -> Void)?)
+    func setOnWindowChange(_ callback: (@Sendable (WindowChangeEvent) async -> Void)?)
     func startMonitoring(initialDisplayID: UInt32)
     func stopMonitoring() async
 }
@@ -64,6 +131,7 @@ public enum MouseClickCaptureOutcome: String, Sendable {
 public actor CaptureManager: CaptureProtocol {
     private static let automaticTriggerConfigurationErrorReason =
         "At least one automatic capture trigger must be enabled."
+    private static let activationAgreementTimeout: TimeInterval = 0.15
 
     private enum CaptureTrigger: Sendable, Equatable {
         case mouseClick
@@ -94,6 +162,8 @@ public actor CaptureManager: CaptureProtocol {
     private struct PendingCapture: Sendable {
         let trigger: CaptureTrigger
         let fireTime: Date
+        let windowChangeEvent: WindowChangeEvent?
+        let windowChangeSignature: WindowChangeSignature?
     }
 
     private let cgWindowListCapture: any ScreenCaptureBackend
@@ -126,9 +196,9 @@ public actor CaptureManager: CaptureProtocol {
     private var hasReportedMouseMonitorUnavailable = false
     private var mouseClickMonitoringNeedsRetry = false
 
-    private var lastNormalizedTitle: String?
-    private var lastBundleID: String?
-    private var windowChangeEvaluationTask: Task<Void, Never>?
+    private var lastAcceptedWindowChangeSignature: WindowChangeSignature?
+    private var isWindowChangeEvaluationInFlight = false
+    private var latestWindowChangeEvent: WindowChangeEvent?
     private var deferredDisplaySyncTask: Task<Void, Never>?
     private var scheduledCaptureTask: Task<Void, Never>?
     private var pendingCapture: PendingCapture?
@@ -142,6 +212,7 @@ public actor CaptureManager: CaptureProtocol {
 
     nonisolated(unsafe) public var onAccessibilityPermissionWarning: (() -> Void)?
     nonisolated(unsafe) public var onCaptureStopped: (@Sendable () async -> Void)?
+    nonisolated(unsafe) public var onCaptureObserved: (@Sendable (Date, String) async -> Void)?
     nonisolated(unsafe) public var onMouseClickCaptureOutcome: (@Sendable (MouseClickCaptureOutcome, Date) async -> Void)?
 
     public init(config: CaptureConfig = .default) {
@@ -231,8 +302,8 @@ public actor CaptureManager: CaptureProtocol {
 
         scheduledCaptureTask?.cancel()
         scheduledCaptureTask = nil
-        windowChangeEvaluationTask?.cancel()
-        windowChangeEvaluationTask = nil
+        isWindowChangeEvaluationInFlight = false
+        latestWindowChangeEvent = nil
         deferredDisplaySyncTask?.cancel()
         deferredDisplaySyncTask = nil
         pendingCapture = nil
@@ -247,8 +318,7 @@ public actor CaptureManager: CaptureProtocol {
 
         lastKeptFrame = nil
         lastKeptMousePosition = nil
-        lastNormalizedTitle = nil
-        lastBundleID = nil
+        lastAcceptedWindowChangeSignature = nil
         updateCaptureMemoryLedger(currentFrameBytes: 0)
         currentCaptureDisplayID = nil
         lastActualCaptureTime = nil
@@ -323,14 +393,13 @@ public actor CaptureManager: CaptureProtocol {
         scheduledCaptureTask?.cancel()
         scheduledCaptureTask = nil
         pendingCapture = nil
-        windowChangeEvaluationTask?.cancel()
-        windowChangeEvaluationTask = nil
+        isWindowChangeEvaluationInFlight = false
+        latestWindowChangeEvent = nil
         deferredDisplaySyncTask?.cancel()
         deferredDisplaySyncTask = nil
         lastKeptFrame = nil
         lastKeptMousePosition = nil
-        lastNormalizedTitle = nil
-        lastBundleID = nil
+        lastAcceptedWindowChangeSignature = nil
         updateCaptureMemoryLedger(currentFrameBytes: 0)
         totalCapturedBytes = 0
         lastActualCaptureTime = nil
@@ -354,8 +423,8 @@ public actor CaptureManager: CaptureProtocol {
         await displaySwitchMonitor.setOnAccessibilityPermissionDenied { [weak self] in
             await self?.handleAccessibilityPermissionDenied()
         }
-        await displaySwitchMonitor.setOnWindowChange { [weak self] in
-            await self?.handleWindowChangeCoalesced()
+        await displaySwitchMonitor.setOnWindowChange { [weak self] event in
+            await self?.handleWindowChange(event)
         }
         await displaySwitchMonitor.startMonitoring(initialDisplayID: initialDisplayID)
     }
@@ -407,58 +476,122 @@ public actor CaptureManager: CaptureProtocol {
         enqueueCapture(trigger: .mouseClick, requestedAt: now())
     }
 
-    private func handleWindowChangeCoalesced() async {
+    private func handleWindowChange(_ event: WindowChangeEvent) async {
         guard _isCapturing else { return }
         guard currentConfig.captureOnWindowChange else { return }
 
-        if let task = windowChangeEvaluationTask {
-            await task.value
+        latestWindowChangeEvent = event
+
+        guard !isWindowChangeEvaluationInFlight else {
             return
         }
 
-        let task = Task<Void, Never> { [weak self] in
-            guard let self else { return }
-            await self.evaluateWindowChange()
+        isWindowChangeEvaluationInFlight = true
+        defer {
+            isWindowChangeEvaluationInFlight = false
         }
-        windowChangeEvaluationTask = task
-        await task.value
-        windowChangeEvaluationTask = nil
+
+        while let eventToEvaluate = latestWindowChangeEvent {
+            latestWindowChangeEvent = nil
+            await evaluateWindowChange(eventToEvaluate)
+        }
     }
 
-    private func evaluateWindowChange() async {
+    private func evaluateWindowChange(_ event: WindowChangeEvent) async {
         guard _isCapturing else { return }
         guard currentConfig.captureOnWindowChange else { return }
 
         await syncCaptureDisplayIfNeeded()
+        guard !hasQueuedNewerWindowChangeEvent(overriding: event) else { return }
 
         let currentMetadata = await appInfoProvider.getFrontmostAppInfo(
             includeBrowserURL: false,
             preferredDisplayID: nil
         )
-        let currentTitle = currentMetadata.windowName ?? ""
-        let currentBundleID = currentMetadata.appBundleID ?? ""
+        guard _isCapturing else { return }
+        guard !hasQueuedNewerWindowChangeEvent(overriding: event) else { return }
 
-        if let lastTitle = lastNormalizedTitle,
-           let lastBundle = lastBundleID,
-           lastBundle == currentBundleID {
-            let titlesRelated = lastTitle.contains(currentTitle) || currentTitle.contains(lastTitle)
-            if titlesRelated && !lastTitle.isEmpty && !currentTitle.isEmpty {
-                return
+        let decisionMetadata: FrameMetadata
+        switch event.source {
+        case .appActivation:
+            let expectedApp = event.activatedApp ?? event.workspaceFrontmostApp
+            let matchesExpected = expectedApp.map {
+                $0.matches(bundleID: currentMetadata.appBundleID, appName: currentMetadata.appName)
+            } ?? true
+
+            if let expectedApp, !matchesExpected {
+                let maxWaitSeconds = Self.activationAgreementTimeout
+                let deadline = now().addingTimeInterval(maxWaitSeconds)
+                let pollInterval = max(0.01, min(0.05, maxWaitSeconds / 6))
+                guard let agreedMetadata = await waitForExpectedAppMatch(
+                    expectedApp,
+                    pollInterval: pollInterval,
+                    deadline: deadline,
+                    supersededBy: event
+                ) else {
+                    return
+                }
+                guard _isCapturing else { return }
+                guard !hasQueuedNewerWindowChangeEvent(overriding: event) else { return }
+                decisionMetadata = agreedMetadata
+            } else {
+                decisionMetadata = currentMetadata
             }
+        case .axActivation:
+            decisionMetadata = currentMetadata
         }
 
-        lastNormalizedTitle = currentTitle
-        lastBundleID = currentBundleID
+        let decisionSignature = WindowChangeSignature(metadata: decisionMetadata)
+        guard !shouldSuppressWindowChangeCapture(for: decisionSignature) else {
+            return
+        }
+        guard !hasQueuedNewerWindowChangeEvent(overriding: event) else { return }
 
-        enqueueCapture(trigger: .windowChange, requestedAt: now())
+        if event.source == .appActivation {
+            enqueueCapture(
+                trigger: .windowChange,
+                fireTime: now(),
+                windowChangeEvent: event,
+                windowChangeSignature: decisionSignature
+            )
+        } else {
+            enqueueCapture(
+                trigger: .windowChange,
+                requestedAt: now(),
+                windowChangeEvent: event,
+                windowChangeSignature: decisionSignature
+            )
+        }
     }
 
-    private func enqueueCapture(trigger: CaptureTrigger, requestedAt: Date) {
+    private func enqueueCapture(
+        trigger: CaptureTrigger,
+        requestedAt: Date,
+        windowChangeEvent: WindowChangeEvent? = nil,
+        windowChangeSignature: WindowChangeSignature? = nil
+    ) {
+        let fireTime = requestedAt.addingTimeInterval(
+            trigger.settleDelay(using: schedulingConfiguration)
+        )
+        enqueueCapture(
+            trigger: trigger,
+            fireTime: fireTime,
+            windowChangeEvent: windowChangeEvent,
+            windowChangeSignature: windowChangeSignature
+        )
+    }
+
+    private func enqueueCapture(
+        trigger: CaptureTrigger,
+        fireTime: Date,
+        windowChangeEvent: WindowChangeEvent? = nil,
+        windowChangeSignature: WindowChangeSignature? = nil
+    ) {
         let capture = PendingCapture(
             trigger: trigger,
-            fireTime: requestedAt.addingTimeInterval(
-                trigger.settleDelay(using: schedulingConfiguration)
-            )
+            fireTime: fireTime,
+            windowChangeEvent: windowChangeEvent,
+            windowChangeSignature: windowChangeSignature
         )
         enqueueCapture(capture)
     }
@@ -549,6 +682,23 @@ public actor CaptureManager: CaptureProtocol {
         let captureAttemptCompletedAt = now()
         if let frame {
             lastActualCaptureTime = captureAttemptCompletedAt
+            if let windowChangeEvent = capture.windowChangeEvent {
+                let shouldDropFrame = shouldDropWindowChangeCapture(
+                    event: windowChangeEvent,
+                    capturedMetadata: frame.metadata
+                )
+                if shouldDropFrame {
+                    scheduleNextIntervalCapture(from: captureAttemptCompletedAt)
+                    if capture.trigger == .windowChange {
+                        await syncCaptureDisplayIfNeeded()
+                        scheduleDisplaySyncCheck()
+                    }
+                    return
+                }
+            }
+            if let windowChangeSignature = capture.windowChangeSignature {
+                lastAcceptedWindowChangeSignature = windowChangeSignature
+            }
             await handleCapturedFrame(frame, trigger: capture.trigger)
             scheduleNextIntervalCapture(from: captureAttemptCompletedAt)
         } else {
@@ -586,9 +736,41 @@ public actor CaptureManager: CaptureProtocol {
 
         let capture = PendingCapture(
             trigger: .interval,
-            fireTime: referenceTime.addingTimeInterval(currentConfig.captureIntervalSeconds)
+            fireTime: referenceTime.addingTimeInterval(currentConfig.captureIntervalSeconds),
+            windowChangeEvent: nil,
+            windowChangeSignature: nil
         )
         enqueueCapture(capture, bypassRefractoryDrop: true)
+    }
+
+    private func waitForExpectedAppMatch(
+        _ expectedApp: CaptureAppSnapshot,
+        pollInterval: TimeInterval,
+        deadline: Date,
+        supersededBy event: WindowChangeEvent
+    ) async -> FrameMetadata? {
+        while now() < deadline {
+            if hasQueuedNewerWindowChangeEvent(overriding: event) {
+                return nil
+            }
+            if Task.isCancelled { return nil }
+            let metadata = await appInfoProvider.getFrontmostAppInfo(
+                includeBrowserURL: false,
+                preferredDisplayID: nil
+            )
+            if hasQueuedNewerWindowChangeEvent(overriding: event) {
+                return nil
+            }
+            if expectedApp.matches(bundleID: metadata.appBundleID, appName: metadata.appName) {
+                return metadata
+            }
+            let remaining = deadline.timeIntervalSince(now())
+            let sleepSeconds = min(pollInterval, max(remaining, 0))
+            if sleepSeconds > 0 {
+                try? await Task.sleep(for: Self.sleepDuration(seconds: sleepSeconds), clock: .continuous)
+            }
+        }
+        return nil
     }
 
     private func shouldDropRequestDuringRefractory(
@@ -664,6 +846,7 @@ public actor CaptureManager: CaptureProtocol {
         }
 
         let triggerDescription = Self.triggerLogDescription(for: trigger)
+        reportCaptureObserved(trigger: trigger, timestamp: frame.timestamp)
         totalCapturedBytes += Int64(frame.imageData.count)
         let totalFrames = stats.totalFramesCaptured + 1
         let currentMousePosition = currentConfig.keepFramesOnMouseMovement
@@ -775,6 +958,14 @@ public actor CaptureManager: CaptureProtocol {
         let timestamp = now()
         Task {
             await onMouseClickCaptureOutcome(outcome, timestamp)
+        }
+    }
+
+    private func reportCaptureObserved(trigger: CaptureTrigger, timestamp: Date) {
+        guard let onCaptureObserved else { return }
+        let triggerDescription = Self.triggerLogDescription(for: trigger)
+        Task {
+            await onCaptureObserved(timestamp, triggerDescription)
         }
     }
 
@@ -971,6 +1162,42 @@ public actor CaptureManager: CaptureProtocol {
         let nanoseconds = max(Int64((seconds * 1_000_000_000).rounded()), 0)
         return .nanoseconds(nanoseconds)
     }
+
+    private func shouldDropWindowChangeCapture(
+        event: WindowChangeEvent,
+        capturedMetadata: FrameMetadata
+    ) -> Bool {
+        guard let activatedApp = event.activatedApp else {
+            return false
+        }
+        guard !activatedApp.matches(
+            bundleID: capturedMetadata.appBundleID,
+            appName: capturedMetadata.appName
+        ) else {
+            return false
+        }
+        return true
+    }
+
+    private func hasQueuedNewerWindowChangeEvent(overriding event: WindowChangeEvent) -> Bool {
+        guard let newerEvent = latestWindowChangeEvent else { return false }
+        return newerEvent.id != event.id
+    }
+
+    private func shouldSuppressWindowChangeCapture(for signature: WindowChangeSignature) -> Bool {
+        guard let previousSignature = lastAcceptedWindowChangeSignature,
+              let previousBundleID = previousSignature.normalizedBundleID,
+              let bundleID = signature.normalizedBundleID,
+              previousBundleID == bundleID,
+              let previousTitle = previousSignature.normalizedTitle,
+              let title = signature.normalizedTitle,
+              !previousTitle.isEmpty,
+              !title.isEmpty else {
+            return false
+        }
+
+        return previousTitle.contains(title) || title.contains(previousTitle)
+    }
 }
 
 extension CGWindowListCapture: ScreenCaptureBackend {}
@@ -986,7 +1213,7 @@ extension DisplaySwitchMonitor: CaptureDisplaySwitchMonitoring {
         onAccessibilityPermissionDenied = callback
     }
 
-    func setOnWindowChange(_ callback: (@Sendable () async -> Void)?) {
+    func setOnWindowChange(_ callback: (@Sendable (WindowChangeEvent) async -> Void)?) {
         onWindowChange = callback
     }
 }

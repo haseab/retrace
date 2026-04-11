@@ -15,6 +15,7 @@ extension SettingsView {
     var captureSettings: some View {
         VStack(alignment: .leading, spacing: 20) {
             captureRateCard
+            menuBarIconCard
             compressionCard
             Color.clear
                 .frame(height: 0)
@@ -250,6 +251,17 @@ extension SettingsView {
     }
 
     @ViewBuilder
+    var menuBarIconCard: some View {
+        ModernSettingsCard(title: "Menu Bar Icon", icon: "menubar.rectangle") {
+            ModernToggleRow(
+                title: "Show capture animation",
+                subtitle: "Animate the menu bar icon like a camera shutter every time Retrace takes a screenshot.",
+                isOn: menuBarCaptureFeedbackBinding
+            )
+        }
+    }
+
+    @ViewBuilder
     var pauseReminderCard: some View {
         ModernSettingsCard(title: "Recording Stopped Reminder", icon: "bell.badge") {
             VStack(alignment: .leading, spacing: 16) {
@@ -311,5 +323,24 @@ extension SettingsView {
                 )
                 .animation(.easeInOut(duration: 0.2), value: shellViewModel.isPauseReminderCardHighlighted)
         }
+    }
+}
+
+private extension SettingsView {
+    var menuBarCaptureFeedbackBinding: Binding<Bool> {
+        Binding(
+            get: {
+                showMenuBarCaptureFeedback
+            },
+            set: { isEnabled in
+                showMenuBarCaptureFeedback = isEnabled
+                DashboardViewModel.recordDeveloperSettingToggle(
+                    coordinator: coordinatorWrapper.coordinator,
+                    source: "settings.capture.menuBarIcon",
+                    settingKey: menuBarCaptureFeedbackDefaultsKey,
+                    isEnabled: isEnabled
+                )
+            }
+        )
     }
 }

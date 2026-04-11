@@ -182,6 +182,7 @@ public struct SettingsView: View {
     @AppStorage("enableFrameIDSearch", store: settingsStore) var enableFrameIDSearch = SettingsDefaults.enableFrameIDSearch
     @AppStorage("showOCRDebugOverlay", store: settingsStore) var showOCRDebugOverlay = SettingsDefaults.showOCRDebugOverlay
     @AppStorage("showVideoControls", store: settingsStore) var showVideoControls = SettingsDefaults.showVideoControls
+    @AppStorage(menuBarCaptureFeedbackDefaultsKey, store: settingsStore) var showMenuBarCaptureFeedback = SettingsDefaults.showMenuBarCaptureFeedback
 
     // MARK: OCR Power Settings
     @AppStorage("ocrEnabled", store: settingsStore) var ocrEnabled = SettingsDefaults.ocrEnabled

@@ -42,4 +42,94 @@ final class MenuBarManagerClickBehaviorTests: XCTestCase {
         XCTAssertEqual(actions.monitor.title, "Open System Monitor")
         XCTAssertEqual(actions.search.imageSystemName, "magnifyingglass")
     }
+
+    func testCaptureFeedbackEventDecisionMatrix() {
+        struct TestCase {
+            let isRunning: Bool
+            let settingEnabled: Bool
+            let shouldHideRecordingIndicator: Bool
+            let isAnimationInFlight: Bool
+            let expectedImmediateAnimation: Bool
+            let expectedReplayQueue: Bool
+        }
+
+        let cases = [
+            TestCase(
+                isRunning: true,
+                settingEnabled: true,
+                shouldHideRecordingIndicator: false,
+                isAnimationInFlight: false,
+                expectedImmediateAnimation: true,
+                expectedReplayQueue: false
+            ),
+            TestCase(
+                isRunning: true,
+                settingEnabled: true,
+                shouldHideRecordingIndicator: false,
+                isAnimationInFlight: true,
+                expectedImmediateAnimation: false,
+                expectedReplayQueue: true
+            ),
+            TestCase(
+                isRunning: true,
+                settingEnabled: true,
+                shouldHideRecordingIndicator: true,
+                isAnimationInFlight: false,
+                expectedImmediateAnimation: false,
+                expectedReplayQueue: false
+            )
+        ]
+
+        for testCase in cases {
+            let decision = MenuBarManager.captureFeedbackEventDecision(
+                isRunning: testCase.isRunning,
+                settingEnabled: testCase.settingEnabled,
+                shouldHideRecordingIndicator: testCase.shouldHideRecordingIndicator,
+                isAnimationInFlight: testCase.isAnimationInFlight
+            )
+
+            XCTAssertEqual(decision.shouldAnimateImmediately, testCase.expectedImmediateAnimation)
+            XCTAssertEqual(decision.shouldQueueReplay, testCase.expectedReplayQueue)
+        }
+    }
+
+    func testQueuedCapturePulseReplayMatrix() {
+        struct TestCase {
+            let hasQueuedReplay: Bool
+            let isRunning: Bool
+            let settingEnabled: Bool
+            let shouldHideRecordingIndicator: Bool
+            let expectedReplay: Bool
+        }
+
+        let cases = [
+            TestCase(
+                hasQueuedReplay: true,
+                isRunning: true,
+                settingEnabled: true,
+                shouldHideRecordingIndicator: false,
+                expectedReplay: true
+            ),
+            TestCase(
+                hasQueuedReplay: true,
+                isRunning: true,
+                settingEnabled: false,
+                shouldHideRecordingIndicator: false,
+                expectedReplay: false
+            )
+        ]
+
+        for testCase in cases {
+            XCTAssertEqual(
+                MenuBarManager.shouldReplayQueuedCapturePulse(
+                    hasQueuedReplay: testCase.hasQueuedReplay,
+                    isRunning: testCase.isRunning,
+                    settingEnabled: testCase.settingEnabled,
+                    shouldHideRecordingIndicator: testCase.shouldHideRecordingIndicator
+                ),
+                testCase.expectedReplay
+            )
+        }
+    }
+
 }

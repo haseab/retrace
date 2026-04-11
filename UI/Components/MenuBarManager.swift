@@ -44,6 +44,7 @@ public class MenuBarManager: ObservableObject {
     private var iconAnimationTimer: Timer?
     /// Current fill progress for icon animation (0.0 to 1.0)
     private var iconFillProgress: CGFloat = 0.0
+    private var hasPendingCapturePulse = false
     /// References used to keep the recording toggle pinned to the row's trailing edge.
     private weak var recordingToggleContainerView: NSView?
     private weak var recordingToggleControl: RecordingToggleSwitch?
@@ -67,6 +68,65 @@ public class MenuBarManager: ObservableObject {
     public var timedPauseRemainingSeconds: Int? {
         guard isPausedState, let scheduledResumeDate else { return nil }
         return max(0, Int(ceil(scheduledResumeDate.timeIntervalSinceNow)))
+    }
+
+    struct CaptureFeedbackEventDecision: Equatable {
+        let shouldAnimateImmediately: Bool
+        let shouldQueueReplay: Bool
+    }
+
+    enum CaptureFeedbackAnimationCompletion: Equatable {
+        case restoreCurrentIcon
+        case replayQueuedPulse
+    }
+
+    static func captureFeedbackEventDecision(
+        isRunning: Bool,
+        settingEnabled: Bool,
+        shouldHideRecordingIndicator: Bool,
+        isAnimationInFlight: Bool
+    ) -> CaptureFeedbackEventDecision {
+        guard settingEnabled, isRunning, !shouldHideRecordingIndicator else {
+            return CaptureFeedbackEventDecision(
+                shouldAnimateImmediately: false,
+                shouldQueueReplay: false
+            )
+        }
+
+        if isAnimationInFlight {
+            return CaptureFeedbackEventDecision(
+                shouldAnimateImmediately: false,
+                shouldQueueReplay: true
+            )
+        }
+
+        return CaptureFeedbackEventDecision(
+            shouldAnimateImmediately: true,
+            shouldQueueReplay: false
+        )
+    }
+
+    static func shouldReplayQueuedCapturePulse(
+        hasQueuedReplay: Bool,
+        isRunning: Bool,
+        settingEnabled: Bool,
+        shouldHideRecordingIndicator: Bool
+    ) -> Bool {
+        hasQueuedReplay && isRunning && settingEnabled && !shouldHideRecordingIndicator
+    }
+
+    static func captureFeedbackAnimationCompletion(
+        hasQueuedReplay: Bool,
+        isRunning: Bool,
+        settingEnabled: Bool,
+        shouldHideRecordingIndicator: Bool
+    ) -> CaptureFeedbackAnimationCompletion {
+        shouldReplayQueuedCapturePulse(
+            hasQueuedReplay: hasQueuedReplay,
+            isRunning: isRunning,
+            settingEnabled: settingEnabled,
+            shouldHideRecordingIndicator: shouldHideRecordingIndicator
+        ) ? .replayQueuedPulse : .restoreCurrentIcon
     }
 
     // MARK: - Initialization
@@ -121,6 +181,9 @@ public class MenuBarManager: ObservableObject {
 
     /// Setup timer to auto-refresh recording status
     private func setupAutoRefresh() {
+        refreshTimer?.cancel()
+        refreshTimer = nil
+
         // Sync recording status every 2 seconds with leeway for power efficiency
         let timer = DispatchSource.makeTimerSource(queue: .main)
         timer.schedule(deadline: .now(), repeating: 2.0, leeway: .milliseconds(500))
@@ -132,6 +195,15 @@ public class MenuBarManager: ObservableObject {
 
         // Setup periodic diagnostics logging (every 5 minutes)
         setupDiagnosticsLogging()
+    }
+
+    private static func menuBarCaptureFeedbackEnabled(
+        defaults: UserDefaults = settingsStore
+    ) -> Bool {
+        guard defaults.object(forKey: menuBarCaptureFeedbackDefaultsKey) != nil else {
+            return SettingsDefaults.showMenuBarCaptureFeedback
+        }
+        return defaults.bool(forKey: menuBarCaptureFeedbackDefaultsKey)
     }
 
     /// Setup periodic logging of UI responsiveness diagnostics
@@ -222,6 +294,62 @@ public class MenuBarManager: ObservableObject {
             queue: .main
         ) { [weak self] _ in
             self?.restoreRecordingIndicator()
+        }
+
+        NotificationCenter.default.addObserver(
+            forName: CaptureObservedNotification.didObserve,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            self?.handleCaptureObservedNotification(notification)
+        }
+    }
+
+    private func handleCaptureObservedNotification(_ notification: Notification) {
+        guard statusItem?.button != nil else { return }
+
+        let status = coordinator.statusHolder.status
+        let isCaptureFeedbackActive = status.isRunning || isRecording
+        let decision = Self.captureFeedbackEventDecision(
+            isRunning: isCaptureFeedbackActive,
+            settingEnabled: Self.menuBarCaptureFeedbackEnabled(),
+            shouldHideRecordingIndicator: shouldHideRecordingIndicator,
+            isAnimationInFlight: iconAnimationTimer != nil
+        )
+
+        if decision.shouldQueueReplay {
+            hasPendingCapturePulse = true
+            if let trigger = notification.userInfo?["trigger"] as? String {
+                Log.debug("[MenuBarCaptureFeedback] Queued replay trigger=\(trigger)", category: .ui)
+            }
+            return
+        }
+
+        guard decision.shouldAnimateImmediately else { return }
+        if let trigger = notification.userInfo?["trigger"] as? String {
+            Log.debug("[MenuBarCaptureFeedback] Pulse trigger=\(trigger)", category: .ui)
+        }
+        animateCapturePulseWithCommonMode()
+    }
+
+    private func completeIconAnimation() {
+        iconAnimationTimer = nil
+        let completion = Self.captureFeedbackAnimationCompletion(
+            hasQueuedReplay: hasPendingCapturePulse,
+            isRunning: coordinator.statusHolder.status.isRunning || isRecording,
+            settingEnabled: Self.menuBarCaptureFeedbackEnabled(),
+            shouldHideRecordingIndicator: shouldHideRecordingIndicator
+        )
+        hasPendingCapturePulse = false
+
+        switch completion {
+        case .restoreCurrentIcon:
+            updateIconForCurrentState()
+        case .replayQueuedPulse:
+            Log.debug("[MenuBarCaptureFeedback] Replaying queued pulse", category: .ui)
+            DispatchQueue.main.async { [weak self] in
+                self?.animateCapturePulseWithCommonMode()
+            }
         }
     }
 
@@ -372,6 +500,7 @@ public class MenuBarManager: ObservableObject {
     /// Hide recording indicator (called when timeline opens)
     private func hideRecordingIndicator() {
         shouldHideRecordingIndicator = true
+        hasPendingCapturePulse = false
         updateIcon(recording: false)
     }
 
@@ -413,6 +542,7 @@ public class MenuBarManager: ObservableObject {
     private func animateIconFill(toRecording: Bool) {
         // Cancel any existing animation
         iconAnimationTimer?.invalidate()
+        iconAnimationTimer = nil
 
         let frameRate: TimeInterval = 1.0 / 60.0
         let pressDuration: TimeInterval = 0.10   // Press down (100ms)
@@ -468,15 +598,88 @@ public class MenuBarManager: ObservableObject {
                     timer.invalidate()
                     // Ensure final state is correct
                     self.iconFillProgress = toRecording ? 1.0 : 0.0
+                    self.completeIconAnimation()
                 }
             }
         }
+    }
+
+    private func animateCapturePulseWithCommonMode() {
+        guard statusItem?.button != nil else { return }
+        guard iconAnimationTimer == nil else { return }
+
+        let frameRate: TimeInterval = 1.0 / 60.0
+        let contractDuration: TimeInterval = 0.14
+        let releaseDuration: TimeInterval = 0.28
+        let contractFrames = max(1, Int(contractDuration / frameRate))
+        let releaseFrames = max(1, Int(releaseDuration / frameRate))
+        let minimumVerticalScale: CGFloat = 0.22
+        var currentFrame = 0
+        var phase = 0
+
+        let timer = Timer(timeInterval: frameRate, repeats: true) { [weak self] timer in
+            guard let self else {
+                timer.invalidate()
+                return
+            }
+
+            currentFrame += 1
+            let verticalScale: CGFloat
+
+            if phase == 0 {
+                let progress = CGFloat(currentFrame) / CGFloat(contractFrames)
+                let easedProgress = progress * progress
+                verticalScale = 1.0 - ((1.0 - minimumVerticalScale) * easedProgress)
+            } else {
+                let progress = CGFloat(currentFrame) / CGFloat(releaseFrames)
+                let easedProgress = 1.0 - pow(1.0 - progress, 3)
+                verticalScale = minimumVerticalScale + ((1.0 - minimumVerticalScale) * easedProgress)
+            }
+
+            if let button = self.statusItem?.button {
+                let image = self.createStatusIcon(
+                    style: .recording,
+                    horizontalScale: 1.0,
+                    verticalScale: verticalScale
+                )
+                button.image = image
+                button.image?.isTemplate = true
+            }
+
+            let didFinishPhase = (phase == 0 && currentFrame >= contractFrames)
+                || (phase == 1 && currentFrame >= releaseFrames)
+            guard didFinishPhase else { return }
+
+            if phase == 0 {
+                phase = 1
+                currentFrame = 0
+                return
+            }
+
+            timer.invalidate()
+            self.completeIconAnimation()
+        }
+
+        RunLoop.main.add(timer, forMode: .common)
+        iconAnimationTimer = timer
     }
 
     /// Create a custom status icon with two triangles (Retrace logo)
     /// Left triangle: Points left, supports recording/off/paused visual states, with optional scale
     /// Right triangle: Points right, always outlined
     private func createStatusIcon(style: RecordingStatusIconStyle, scale: CGFloat = 1.0) -> NSImage {
+        createStatusIcon(
+            style: style,
+            horizontalScale: scale,
+            verticalScale: scale
+        )
+    }
+
+    private func createStatusIcon(
+        style: RecordingStatusIconStyle,
+        horizontalScale: CGFloat,
+        verticalScale: CGFloat
+    ) -> NSImage {
         let size = NSSize(width: 22, height: 16)
         let image = NSImage(size: size)
 
@@ -489,8 +692,8 @@ public class MenuBarManager: ObservableObject {
         let gap: CGFloat = 3.0 // Gap between triangles
 
         // Apply scale to left triangle dimensions
-        let triangleHeight = baseTriangleHeight * scale
-        let triangleWidth = baseTriangleWidth * scale
+        let triangleHeight = baseTriangleHeight * max(0.0, verticalScale)
+        let triangleWidth = baseTriangleWidth * max(0.0, horizontalScale)
 
         // Left triangle - Points left ◁ (recording indicator)
         // Center the scaled triangle at the same position
@@ -644,6 +847,7 @@ public class MenuBarManager: ObservableObject {
     /// Animate icon using common run loop mode (works while menu is open)
     private func animateIconFillWithCommonMode(toRecording: Bool) {
         iconAnimationTimer?.invalidate()
+        iconAnimationTimer = nil
 
         let frameRate: TimeInterval = 1.0 / 60.0
         let pressDuration: TimeInterval = 0.10   // Press down (100ms)
@@ -698,6 +902,7 @@ public class MenuBarManager: ObservableObject {
                 if currentFrame >= releaseFrames {
                     timer.invalidate()
                     self.iconFillProgress = toRecording ? 1.0 : 0.0
+                    self.completeIconAnimation()
                 }
             }
         }
@@ -1369,6 +1574,8 @@ public class MenuBarManager: ObservableObject {
         isRecording = recording
         if recording {
             isPausedByUser = false
+        } else {
+            hasPendingCapturePulse = false
         }
         setupMenu()
 
@@ -1394,6 +1601,7 @@ public class MenuBarManager: ObservableObject {
     public func hide() {
         isMenuBarIconEnabled = false
         DispatchQueue.main.async {
+            self.hasPendingCapturePulse = false
             self.teardownStatusClickMonitors()
             if let item = self.statusItem {
                 NSStatusBar.system.removeStatusItem(item)

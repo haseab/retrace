@@ -517,5 +517,6 @@ extension SettingsView {
         showFrameIDs = SettingsDefaults.showFrameIDs
         enableFrameIDSearch = SettingsDefaults.enableFrameIDSearch
         showVideoControls = SettingsDefaults.showVideoControls
+        showMenuBarCaptureFeedback = SettingsDefaults.showMenuBarCaptureFeedback
     }
 }

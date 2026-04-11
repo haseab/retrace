@@ -849,7 +849,6 @@ public actor CGWindowListCapture {
 
         return String(collapsed.prefix(limit)) + "..."
     }
-
     private func normalizedWindowCacheKey(windowName: String, ownerName: String) -> String {
         let trimmedWindowName = windowName.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmedWindowName.isEmpty {
