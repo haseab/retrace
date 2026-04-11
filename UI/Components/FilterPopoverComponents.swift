@@ -3046,7 +3046,7 @@ public struct DateRangeFilterPopover: View {
                         }
                     }
                     .instantTooltip(
-                        "Reset (⌘⌫)",
+                        allowMultipleRanges ? "Reset Ranges (⌘⌫)" : "Reset Range (⌘⌫)",
                         isVisible: .constant(isHoveringResetButton && isResetEnabled),
                         placement: .bottom
                     )

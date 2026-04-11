@@ -198,6 +198,30 @@ final class DashboardAppUsageDateRangeTests: XCTestCase {
         )
         XCTAssertEqual(
             DashboardView.appUsageRangeKeyboardShortcut(
+                keyCode: 51,
+                charactersIgnoringModifiers: nil,
+                modifiers: [.command],
+                isDatePopoverPresented: false,
+                isFeedbackPresented: false,
+                isSessionsPresented: false,
+                isTextInputFocused: false
+            ),
+            .reset
+        )
+        XCTAssertEqual(
+            DashboardView.appUsageRangeKeyboardShortcut(
+                keyCode: 117,
+                charactersIgnoringModifiers: nil,
+                modifiers: [.command],
+                isDatePopoverPresented: false,
+                isFeedbackPresented: false,
+                isSessionsPresented: false,
+                isTextInputFocused: false
+            ),
+            .reset
+        )
+        XCTAssertEqual(
+            DashboardView.appUsageRangeKeyboardShortcut(
                 keyCode: 37,
                 charactersIgnoringModifiers: "l",
                 modifiers: [],

@@ -10848,6 +10848,14 @@ struct FilterPanel: View {
         return nil
     }
 
+    private var clearButtonTitle: String {
+        isClearHovered ? "Clear (⌘⌫)" : "Clear"
+    }
+
+    private var applyButtonTitle: String {
+        isApplyHovered ? "Apply Filters (⌘↩)" : "Apply Filters"
+    }
+
     private func commitAdvancedDraftInputs() {
         advancedFilterDraftState.commitDraftInputs()
         var pendingCriteria = viewModel.pendingFilterCriteria
@@ -10862,6 +10870,15 @@ struct FilterPanel: View {
         commitAdvancedDraftInputs()
         withAnimation(.easeOut(duration: 0.15)) {
             viewModel.applyFilters(dismissPanel: dismissPanel)
+        }
+    }
+
+    private func clearFiltersByResettingAdvancedDrafts() {
+        focusedActionButton = nil
+        advancedFilterDraftState.clearDraftInputs()
+        viewModel.clearPendingFilters()
+        withAnimation(.easeOut(duration: 0.15)) {
+            viewModel.applyFilters(dismissPanel: false)
         }
     }
 
@@ -11069,14 +11086,9 @@ struct FilterPanel: View {
                 // Clear button
                 if hasClearButton {
                     Button(action: {
-                        focusedActionButton = nil
-                        advancedFilterDraftState.clearDraftInputs()
-                        viewModel.clearPendingFilters()
-                        withAnimation(.easeOut(duration: 0.15)) {
-                            viewModel.applyFilters(dismissPanel: false)
-                        }
+                        clearFiltersByResettingAdvancedDrafts()
                     }) {
-                        Text("Clear")
+                        Text(clearButtonTitle)
                             .font(.system(size: 14, weight: .semibold))
                             .foregroundColor(.white.opacity(0.7))
                             .frame(maxWidth: .infinity)
@@ -11110,7 +11122,7 @@ struct FilterPanel: View {
                     Button(action: {
                         applyFiltersByCommittingAdvancedDrafts()
                     }) {
-                        Text("Apply Filters")
+                        Text(applyButtonTitle)
                             .font(.system(size: 14, weight: .semibold))
                             .foregroundColor(.white)
                             .frame(maxWidth: .infinity)
@@ -11203,7 +11215,16 @@ struct FilterPanel: View {
 
                 // Cmd+Enter applies filters from anywhere in the filter panel.
                 if (event.keyCode == 36 || event.keyCode == 76) && modifiers == [.command] {
+                    viewModel.recordKeyboardShortcut("timeline.filter_panel.apply")
                     applyFiltersByCommittingAdvancedDrafts(dismissPanel: hasApplyButton)
+                    return nil
+                }
+
+                // Cmd+Backspace clears active filters without closing the panel.
+                if event.keyCode == 51 && modifiers == [.command] {
+                    guard hasClearButton else { return event }
+                    viewModel.recordKeyboardShortcut("timeline.filter_panel.clear")
+                    clearFiltersByResettingAdvancedDrafts()
                     return nil
                 }
 
@@ -11219,12 +11240,7 @@ struct FilterPanel: View {
                 // Handle Enter while action buttons are keyboard-highlighted.
                 if (event.keyCode == 36 || event.keyCode == 76), let focusedButton = focusedActionButton {
                     if focusedButton == .clear {
-                        focusedActionButton = nil
-                        advancedFilterDraftState.clearDraftInputs()
-                        viewModel.clearPendingFilters()
-                        withAnimation(.easeOut(duration: 0.15)) {
-                            viewModel.applyFilters(dismissPanel: false)
-                        }
+                        clearFiltersByResettingAdvancedDrafts()
                     } else {
                         applyFiltersByCommittingAdvancedDrafts()
                     }

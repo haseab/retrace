@@ -485,7 +485,7 @@ extension SettingsView {
 
             Spacer()
 
-            Text("Does not support")
+            Text("Does Not Support")
                 .font(.retraceCaption2Bold)
                 .foregroundColor(.retraceSecondary)
                 .padding(.horizontal, 10)

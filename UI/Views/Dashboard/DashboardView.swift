@@ -113,13 +113,16 @@ public struct DashboardView: View {
         case nextArrow
         case previousLetter
         case nextLetter
+        case reset
 
-        var shiftDirection: Int {
+        var shiftDirection: Int? {
             switch self {
             case .previousArrow, .previousLetter:
                 return -1
             case .nextArrow, .nextLetter:
                 return 1
+            case .reset:
+                return nil
             }
         }
 
@@ -133,13 +136,20 @@ public struct DashboardView: View {
                 return "dashboard.app_usage_date_range.previous_l"
             case .nextLetter:
                 return "dashboard.app_usage_date_range.next_semicolon"
+            case .reset:
+                return "dashboard.app_usage_date_range.reset_command_delete"
             }
         }
 
         var source: String {
-            shiftDirection < 0
-                ? "dashboard_app_usage_previous_range_shortcut"
-                : "dashboard_app_usage_next_range_shortcut"
+            switch self {
+            case .previousArrow, .previousLetter:
+                return "dashboard_app_usage_previous_range_shortcut"
+            case .nextArrow, .nextLetter:
+                return "dashboard_app_usage_next_range_shortcut"
+            case .reset:
+                return "dashboard_app_usage_reset_range_shortcut"
+            }
         }
     }
 
@@ -217,6 +227,9 @@ public struct DashboardView: View {
         }
 
         let normalizedModifiers = modifiers.intersection([.command, .shift, .option, .control])
+        if normalizedModifiers == [.command] && (keyCode == 51 || keyCode == 117) {
+            return .reset
+        }
         guard normalizedModifiers.isEmpty else {
             return nil
         }
@@ -324,18 +337,33 @@ public struct DashboardView: View {
     }
 
     private func isAppUsageRangeShortcutEnabled(_ shortcut: AppUsageRangeKeyboardShortcut) -> Bool {
-        shortcut.shiftDirection < 0
-            ? viewModel.canShiftAppUsageRangeBackward
-            : viewModel.canShiftAppUsageRangeForward
+        switch shortcut {
+        case .previousArrow, .previousLetter:
+            return viewModel.canShiftAppUsageRangeBackward
+        case .nextArrow, .nextLetter:
+            return viewModel.canShiftAppUsageRangeForward
+        case .reset:
+            return Self.isAppUsageRangeResetEnabled(
+                isDefaultLastSevenDays: viewModel.isDefaultAppUsageRangeSelected
+            )
+        }
     }
 
     private func handleAppUsageRangeShortcut(_ shortcut: AppUsageRangeKeyboardShortcut) {
         viewModel.recordKeyboardShortcut(shortcut.metricIdentifier)
         Task {
-            await viewModel.shiftAppUsageDateRange(
-                by: shortcut.shiftDirection,
-                source: shortcut.source
-            )
+            switch shortcut {
+            case .previousArrow, .previousLetter, .nextArrow, .nextLetter:
+                guard let shiftDirection = shortcut.shiftDirection else { return }
+                await viewModel.shiftAppUsageDateRange(
+                    by: shiftDirection,
+                    source: shortcut.source
+                )
+            case .reset:
+                await viewModel.resetAppUsageDateRangeToDefault(
+                    source: shortcut.source
+                )
+            }
         }
     }
 
@@ -1709,7 +1737,7 @@ public struct DashboardView: View {
                             }
                         }
                         .instantTooltip(
-                            "Reset Range",
+                            "Reset Range (⌘⌫)",
                             isVisible: $isHoveringAppUsageRangeReset,
                             placement: .bottom
                         )
