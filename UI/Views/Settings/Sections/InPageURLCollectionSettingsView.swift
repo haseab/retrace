@@ -18,7 +18,7 @@ extension SettingsView {
             VStack(alignment: .leading, spacing: 16) {
                 ModernToggleRow(
                     title: "Collect in-page URLs",
-                    subtitle: "Collect visible links from browser pages using AppleScript automation. Default is off.",
+                    subtitle: "Collect visible links from browser pages using AppleScript automation.",
                     isOn: $collectInPageURLsExperimental,
                     badge: "Experimental"
                 )
@@ -485,7 +485,7 @@ extension SettingsView {
 
             Spacer()
 
-            Text("Not supported")
+            Text("Does not support")
                 .font(.retraceCaption2Bold)
                 .foregroundColor(.retraceSecondary)
                 .padding(.horizontal, 10)

@@ -231,7 +231,7 @@ extension SettingsView {
                 ModernToggleRow(
                     title: "Keep frames on mouse movement",
                     subtitle: captureMousePosition
-                        ? "Do not deduplicate when the pointer moved between captures."
+                        ? "Keep duplicate frames even if only the mouse moved between captures."
                         : "Enable \"Capture mouse position\" in Capture Rate to use this setting.",
                     isOn: $keepFramesOnMouseMovement
                 )

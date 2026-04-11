@@ -1036,7 +1036,7 @@ public struct OnboardingView: View {
 
             Spacer()
 
-            Text("Not supported")
+            Text("Does not support")
                 .font(.retraceCaption2)
                 .foregroundColor(.retraceSecondary)
                 .padding(.horizontal, .spacingS)

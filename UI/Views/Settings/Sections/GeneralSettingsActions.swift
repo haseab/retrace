@@ -382,17 +382,17 @@ extension SettingsView {
         if threshold >= 1.0 {
             return "Records every frame (no deduplication)"
         } else if threshold >= 0.9998 {
-            return "New frame on: a single word changing"
+            return "Keep the next frame when: a single word changes"
         } else if threshold >= 0.999 {
-            return "New frame on: a few words changing"
+            return "Keep the next frame when: a few words change"
         } else if threshold >= 0.9985 {
-            return "New frame on: several words changing"
+            return "Keep the next frame when: several words change"
         } else if threshold >= 0.995 {
-            return "New frame on: line changes"
+            return "Keep the next frame when: a line changes"
         } else if threshold >= 0.99 {
-            return "New frame on: multiple line changes"
+            return "Keep the next frame when: multiple lines change"
         } else {
-            return "New frame on: paragraph changes"
+            return "Keep the next frame when: a paragraph changes"
         }
     }
 
