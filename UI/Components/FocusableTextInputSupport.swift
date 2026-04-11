@@ -161,7 +161,7 @@ struct FocusableTextInput: NSViewRepresentable {
         Self.syncResponderFocus(for: textField, wantsFocus: isFocused())
     }
 
-    private static func syncResponderFocus(for textField: FocusableTextField, wantsFocus: Bool) {
+    static func syncResponderFocus(for textField: FocusableTextField, wantsFocus: Bool) {
         guard let window = textField.window else { return }
 
         let currentEditor = textField.currentEditor()
@@ -169,7 +169,13 @@ struct FocusableTextInput: NSViewRepresentable {
 
         if wantsFocus {
             if !isCurrentResponder {
-                _ = window.makeFirstResponder(textField)
+                textField.selectText(nil)
+
+                let updatedEditor = textField.currentEditor()
+                let isEditing = window.firstResponder === textField || window.firstResponder === updatedEditor
+                if !isEditing {
+                    _ = window.makeFirstResponder(textField)
+                }
             }
             return
         }
@@ -210,9 +216,16 @@ struct FocusableTextInput: NSViewRepresentable {
         }
 
         func controlTextDidEndEditing(_ notification: Notification) {
-            if isFocused?() == true {
-                setFocused?(false)
+            let wantsFocus = isFocused?() ?? false
+
+            if wantsFocus, let textField = notification.object as? FocusableTextField {
+                DispatchQueue.main.async {
+                    FocusableTextInput.syncResponderFocus(for: textField, wantsFocus: true)
+                }
+                return
             }
+
+            setFocused?(false)
             onBlur?()
         }
 

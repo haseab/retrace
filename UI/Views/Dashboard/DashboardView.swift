@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import Darwin
 import Shared
@@ -53,6 +54,14 @@ private struct RecordingIndicatorAnchorPreferenceKey: PreferenceKey {
     }
 }
 
+private struct AppUsageDatePopoverAnchorPreferenceKey: PreferenceKey {
+    static var defaultValue: Anchor<CGRect>? = nil
+
+    static func reduce(value: inout Anchor<CGRect>?, nextValue: () -> Anchor<CGRect>?) {
+        value = nextValue() ?? value
+    }
+}
+
 /// Main dashboard view - analytics and statistics
 /// Default landing screen
 public struct DashboardView: View {
@@ -77,6 +86,9 @@ public struct DashboardView: View {
     @State private var showSessionsSheet = false
     @State private var showSystemMonitor = false
     @State private var showAppUsageDatePopover = false
+    @State private var appUsageDateFocusRequestID: UUID?
+    @State private var isHoveringAppUsageRangeReset = false
+    @State private var appUsageRangeShortcutMonitor: Any?
     @State private var showDiscordFollowup = false
     @State private var currentTheme: MilestoneCelebrationManager.ColorTheme = MilestoneCelebrationManager.getCurrentTheme()
     @Binding var hasLoadedInitialData: Bool
@@ -96,6 +108,41 @@ public struct DashboardView: View {
         case content
     }
 
+    enum AppUsageRangeKeyboardShortcut: Equatable {
+        case previousArrow
+        case nextArrow
+        case previousLetter
+        case nextLetter
+
+        var shiftDirection: Int {
+            switch self {
+            case .previousArrow, .previousLetter:
+                return -1
+            case .nextArrow, .nextLetter:
+                return 1
+            }
+        }
+
+        var metricIdentifier: String {
+            switch self {
+            case .previousArrow:
+                return "dashboard.app_usage_date_range.previous_arrow"
+            case .nextArrow:
+                return "dashboard.app_usage_date_range.next_arrow"
+            case .previousLetter:
+                return "dashboard.app_usage_date_range.previous_l"
+            case .nextLetter:
+                return "dashboard.app_usage_date_range.next_semicolon"
+            }
+        }
+
+        var source: String {
+            shiftDirection < 0
+                ? "dashboard_app_usage_previous_range_shortcut"
+                : "dashboard_app_usage_next_range_shortcut"
+        }
+    }
+
     struct AppUsageEmptyStateCopy: Equatable {
         let title: String
         let message: String
@@ -103,6 +150,7 @@ public struct DashboardView: View {
     }
 
     private static let pauseMenuWidth: CGFloat = 100
+    private static let appUsageDatePopoverWidth: CGFloat = 300
 
     static func appUsageSectionBodyState(
         isLoading: Bool,
@@ -134,8 +182,165 @@ public struct DashboardView: View {
         )
     }
 
+    static func appUsageRangeControlLabel(
+        selectedRangeLabel: String,
+        isDefaultLastSevenDays: Bool
+    ) -> String {
+        isDefaultLastSevenDays ? "Last 7 Days" : selectedRangeLabel
+    }
+
+    static func isAppUsageRangeResetEnabled(isDefaultLastSevenDays: Bool) -> Bool {
+        !isDefaultLastSevenDays
+    }
+
+    static func shouldResetAppUsageRangeOnEscape(
+        isDatePopoverPresented: Bool,
+        isDefaultLastSevenDays: Bool
+    ) -> Bool {
+        !isDatePopoverPresented && !isDefaultLastSevenDays
+    }
+
+    static func appUsageRangeKeyboardShortcut(
+        keyCode: UInt16,
+        charactersIgnoringModifiers: String?,
+        modifiers: NSEvent.ModifierFlags,
+        isDatePopoverPresented: Bool,
+        isFeedbackPresented: Bool,
+        isSessionsPresented: Bool,
+        isTextInputFocused: Bool
+    ) -> AppUsageRangeKeyboardShortcut? {
+        guard !isDatePopoverPresented,
+              !isFeedbackPresented,
+              !isSessionsPresented,
+              !isTextInputFocused else {
+            return nil
+        }
+
+        let normalizedModifiers = modifiers.intersection([.command, .shift, .option, .control])
+        guard normalizedModifiers.isEmpty else {
+            return nil
+        }
+
+        switch keyCode {
+        case 123:
+            return .previousArrow
+        case 124:
+            return .nextArrow
+        default:
+            break
+        }
+
+        guard let key = charactersIgnoringModifiers?.lowercased(),
+              key.count == 1 else {
+            return nil
+        }
+
+        switch key {
+        case "l":
+            return .previousLetter
+        case ";":
+            return .nextLetter
+        default:
+            return nil
+        }
+    }
+
     private var usageViewMode: AppUsageViewMode {
         AppUsageViewMode(rawValue: usageViewModeRawValue) ?? .list
+    }
+
+    private func toggleAppUsageDatePopoverFromShortcut() {
+        viewModel.recordKeyboardShortcut("cmd+g")
+        withAnimation(.easeOut(duration: 0.15)) {
+            showAppUsageDatePopover.toggle()
+        }
+    }
+
+    private func focusAppUsageDateInputFromShortcut() {
+        guard showAppUsageDatePopover else { return }
+        viewModel.recordKeyboardShortcut("cmd+k")
+        appUsageDateFocusRequestID = UUID()
+    }
+
+    private func resetAppUsageRangeFromInlineButton() {
+        Task {
+            await viewModel.resetAppUsageDateRangeToDefault(
+                source: "dashboard_app_usage_inline_reset"
+            )
+        }
+    }
+
+    private func resetAppUsageRangeFromEscapeShortcut() {
+        guard Self.shouldResetAppUsageRangeOnEscape(
+            isDatePopoverPresented: showAppUsageDatePopover,
+            isDefaultLastSevenDays: viewModel.isDefaultAppUsageRangeSelected
+        ) else {
+            return
+        }
+
+        viewModel.recordKeyboardShortcut("dashboard.app_usage_date_range.reset_escape")
+        Task {
+            await viewModel.resetAppUsageDateRangeToDefault(
+                source: "dashboard_app_usage_escape_reset"
+            )
+        }
+    }
+
+    private func installAppUsageRangeShortcutMonitorIfNeeded() {
+        guard appUsageRangeShortcutMonitor == nil else { return }
+
+        appUsageRangeShortcutMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [self] event in
+            guard event.window?.windowNumber == DashboardWindowController.shared.window?.windowNumber else {
+                return event
+            }
+
+            let shortcut = Self.appUsageRangeKeyboardShortcut(
+                keyCode: event.keyCode,
+                charactersIgnoringModifiers: event.charactersIgnoringModifiers,
+                modifiers: event.modifierFlags,
+                isDatePopoverPresented: showAppUsageDatePopover,
+                isFeedbackPresented: showFeedbackSheet,
+                isSessionsPresented: showSessionsSheet,
+                isTextInputFocused: Self.isTextInputFocused(event.window?.firstResponder)
+            )
+
+            guard let shortcut else {
+                return event
+            }
+
+            guard isAppUsageRangeShortcutEnabled(shortcut) else {
+                return event
+            }
+
+            handleAppUsageRangeShortcut(shortcut)
+            return nil
+        }
+    }
+
+    private func removeAppUsageRangeShortcutMonitor() {
+        guard let appUsageRangeShortcutMonitor else { return }
+        NSEvent.removeMonitor(appUsageRangeShortcutMonitor)
+        self.appUsageRangeShortcutMonitor = nil
+    }
+
+    private func isAppUsageRangeShortcutEnabled(_ shortcut: AppUsageRangeKeyboardShortcut) -> Bool {
+        shortcut.shiftDirection < 0
+            ? viewModel.canShiftAppUsageRangeBackward
+            : viewModel.canShiftAppUsageRangeForward
+    }
+
+    private func handleAppUsageRangeShortcut(_ shortcut: AppUsageRangeKeyboardShortcut) {
+        viewModel.recordKeyboardShortcut(shortcut.metricIdentifier)
+        Task {
+            await viewModel.shiftAppUsageDateRange(
+                by: shortcut.shiftDirection,
+                source: shortcut.source
+            )
+        }
+    }
+
+    private static func isTextInputFocused(_ responder: NSResponder?) -> Bool {
+        responder is NSTextView
     }
 
     private var hasDashboardBanners: Bool {
@@ -399,6 +604,12 @@ public struct DashboardView: View {
             .frame(width: 0, height: 0)
             .opacity(0)
         )
+        .onAppear {
+            installAppUsageRangeShortcutMonitorIfNeeded()
+        }
+        .onDisappear {
+            removeAppUsageRangeShortcutMonitor()
+        }
         .task {
             viewModel.isWindowVisible = true
             crashRecoveryBannerModel.refresh()
@@ -457,6 +668,36 @@ public struct DashboardView: View {
                 }
             }
             .zIndex(showPauseOptionsPopover ? 20 : 0)
+        }
+        .overlayPreferenceValue(AppUsageDatePopoverAnchorPreferenceKey.self) { anchor in
+            GeometryReader { proxy in
+                if showAppUsageDatePopover, let anchor {
+                    let anchorRect = proxy[anchor]
+                    ZStack(alignment: .topLeading) {
+                        Color.black.opacity(0.001)
+                            .ignoresSafeArea()
+                            .contentShape(Rectangle())
+                            .onTapGesture {
+                                withAnimation(.easeOut(duration: 0.15)) {
+                                    showAppUsageDatePopover = false
+                                    appUsageDateFocusRequestID = nil
+                                }
+                            }
+
+                        appUsageDatePopover
+                            .shadow(color: .black.opacity(0.4), radius: 12, y: 4)
+                            .offset(
+                                x: max(anchorRect.maxX - Self.appUsageDatePopoverWidth, 0),
+                                y: anchorRect.maxY + 8
+                            )
+                            .transition(
+                                .opacity.combined(with: .scale(scale: 0.95, anchor: .topTrailing))
+                            )
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                }
+            }
+            .zIndex(showAppUsageDatePopover ? 15 : 0)
         }
         .overlay {
             // Sessions detail overlay (replaces .sheet for faster presentation)
@@ -1035,7 +1276,7 @@ public struct DashboardView: View {
         let selectedRangeLabel = viewModel.appUsageRangeLabel
         let isDefaultLastSevenDays = viewModel.isDefaultAppUsageRangeSelected
         let activitySubtitle = isDefaultLastSevenDays ? "Last 7 days" : selectedRangeLabel
-        let daysRecordedTitle = isDefaultLastSevenDays ? "Total Days Recorded" : "Days Recorded"
+        let daysRecordedTitle = isDefaultLastSevenDays ? "Total Days Recorded" : "Days Selected"
         let daysRecordedSubtitle = formatRecordedHoursSubtitle(
             isDefaultLastSevenDays ? viewModel.totalCapturedDuration : viewModel.totalWeeklyTime
         )
@@ -1392,7 +1633,15 @@ public struct DashboardView: View {
     }
 
     private var appUsageRangeControls: some View {
-        HStack(spacing: 8) {
+        let rangeControlLabel = Self.appUsageRangeControlLabel(
+            selectedRangeLabel: viewModel.appUsageRangeLabel,
+            isDefaultLastSevenDays: viewModel.isDefaultAppUsageRangeSelected
+        )
+        let isResetEnabled = Self.isAppUsageRangeResetEnabled(
+            isDefaultLastSevenDays: viewModel.isDefaultAppUsageRangeSelected
+        )
+
+        return HStack(spacing: 8) {
             HStack(spacing: 0) {
                 rangeShiftButton(
                     icon: "chevron.left",
@@ -1411,72 +1660,111 @@ public struct DashboardView: View {
                     .fill(Color.white.opacity(0.08))
                     .frame(width: 1, height: 30)
 
-                Button(action: {
-                    withAnimation(.easeOut(duration: 0.15)) {
-                        showAppUsageDatePopover.toggle()
+                HStack(spacing: 2) {
+                    Button(action: {
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            showAppUsageDatePopover.toggle()
+                        }
+                    }) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "calendar")
+                                .font(.retraceCaption2Medium)
+                            Text(rangeControlLabel)
+                                .font(.retraceCaptionMedium)
+                        }
+                        .foregroundColor(.retraceSecondary)
+                        .padding(.leading, 12)
+                        .padding(.trailing, isResetEnabled ? 4 : 12)
+                        .frame(height: 30)
+                        .contentShape(Rectangle())
                     }
-                }) {
-                    HStack(spacing: 6) {
-                        Image(systemName: "calendar")
-                            .font(.retraceCaption2Medium)
-                        Text(viewModel.appUsageRangeLabel)
-                            .font(.retraceCaptionMedium)
+                    .buttonStyle(.plain)
+                    .onHover { hovering in
+                        if hovering {
+                            NSCursor.pointingHand.push()
+                        } else {
+                            NSCursor.pop()
+                        }
                     }
-                    .foregroundColor(.retraceSecondary)
-                    .padding(.horizontal, 12)
-                    .frame(height: 30)
-                    .background(showAppUsageDatePopover ? Color.white.opacity(0.06) : Color.clear)
-                }
-                .buttonStyle(.plain)
-                .onHover { hovering in
-                    if hovering {
-                        NSCursor.pointingHand.push()
-                    } else {
-                        NSCursor.pop()
-                    }
-                }
-                .dropdownOverlay(
-                    isPresented: $showAppUsageDatePopover,
-                    yOffset: 38,
-                    horizontalAnchor: .trailing
-                ) {
-                    DateRangeFilterPopover(
-                        dateRanges: [viewModel.appUsageDateRange],
-                        onApply: { ranges in
-                            withAnimation(.easeOut(duration: 0.15)) {
-                                showAppUsageDatePopover = false
-                            }
-                            guard let selectedRange = ranges.first else { return }
-                            Task {
-                                await viewModel.setAppUsageDateRange(
-                                    from: selectedRange,
-                                    source: "dashboard_app_usage_calendar_apply"
-                                )
-                            }
-                        },
-                        onClear: {
-                            withAnimation(.easeOut(duration: 0.15)) {
-                                showAppUsageDatePopover = false
-                            }
-                            Task {
-                                await viewModel.resetAppUsageDateRangeToDefault(
-                                    source: "dashboard_app_usage_calendar_clear"
-                                )
-                            }
-                        },
-                        width: 300,
-                        enableKeyboardNavigation: true,
-                        allowMultipleRanges: false,
-                        maxRangeDays: DashboardViewModel.maxAppUsageRangeDays,
-                        onQuickPresetShortcut: { preset in
-                            viewModel.recordKeyboardShortcut("dashboard.app_usage_date_range.\(preset.rawValue)")
-                        },
-                        onDismiss: {
-                            withAnimation(.easeOut(duration: 0.15)) {
-                                showAppUsageDatePopover = false
+
+                    if isResetEnabled {
+                        Button(action: {
+                            resetAppUsageRangeFromInlineButton()
+                        }) {
+                            Image(systemName: "arrow.counterclockwise")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundColor(.retraceSecondary.opacity(0.9))
+                                .padding(.leading, 2)
+                                .padding(.trailing, 12)
+                                .frame(height: 30)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .onHover { hovering in
+                            isHoveringAppUsageRangeReset = hovering
+                            if hovering {
+                                NSCursor.pointingHand.push()
+                            } else {
+                                NSCursor.pop()
                             }
                         }
-                    )
+                        .instantTooltip(
+                            "Reset Range",
+                            isVisible: $isHoveringAppUsageRangeReset,
+                            placement: .bottom
+                        )
+                        .zIndex(isHoveringAppUsageRangeReset ? 2 : 0)
+                    }
+                }
+                .frame(height: 30)
+                .background(showAppUsageDatePopover ? Color.white.opacity(0.06) : Color.clear)
+                .anchorPreference(
+                    key: AppUsageDatePopoverAnchorPreferenceKey.self,
+                    value: .bounds
+                ) { $0 }
+                .background {
+                    Group {
+                        Button(action: {
+                            toggleAppUsageDatePopoverFromShortcut()
+                        }) {
+                            EmptyView()
+                        }
+                        .buttonStyle(.plain)
+                        .keyboardShortcut("g", modifiers: .command)
+                        .frame(width: 0, height: 0)
+                        .opacity(0)
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
+
+                        Button(action: {
+                            focusAppUsageDateInputFromShortcut()
+                        }) {
+                            EmptyView()
+                        }
+                        .buttonStyle(.plain)
+                        .keyboardShortcut("k", modifiers: .command)
+                        .frame(width: 0, height: 0)
+                        .opacity(0)
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
+
+                        if Self.shouldResetAppUsageRangeOnEscape(
+                            isDatePopoverPresented: showAppUsageDatePopover,
+                            isDefaultLastSevenDays: viewModel.isDefaultAppUsageRangeSelected
+                        ) {
+                            Button(action: {
+                                resetAppUsageRangeFromEscapeShortcut()
+                            }) {
+                                EmptyView()
+                            }
+                            .buttonStyle(.plain)
+                            .keyboardShortcut(.escape, modifiers: [])
+                            .frame(width: 0, height: 0)
+                            .opacity(0)
+                            .allowsHitTesting(false)
+                            .accessibilityHidden(true)
+                        }
+                    }
                 }
 
                 Rectangle()
@@ -1515,6 +1803,59 @@ public struct DashboardView: View {
                 .stroke(Color.white.opacity(showAppUsageDatePopover ? 0.22 : 0.1), lineWidth: 1)
             )
         }
+    }
+
+    @ViewBuilder
+    private var appUsageDatePopover: some View {
+        let isResetEnabled = Self.isAppUsageRangeResetEnabled(
+            isDefaultLastSevenDays: viewModel.isDefaultAppUsageRangeSelected
+        )
+
+        DateRangeFilterPopover(
+            dateRanges: [viewModel.appUsageDateRange],
+            onApply: { ranges in
+                withAnimation(.easeOut(duration: 0.15)) {
+                    showAppUsageDatePopover = false
+                    appUsageDateFocusRequestID = nil
+                }
+                guard let selectedRange = ranges.first else { return }
+                Task {
+                    await viewModel.setAppUsageDateRange(
+                        from: selectedRange,
+                        source: "dashboard_app_usage_calendar_apply"
+                    )
+                }
+            },
+            onClear: {
+                withAnimation(.easeOut(duration: 0.15)) {
+                    showAppUsageDatePopover = false
+                    appUsageDateFocusRequestID = nil
+                }
+                Task {
+                    await viewModel.resetAppUsageDateRangeToDefault(
+                        source: "dashboard_app_usage_calendar_clear"
+                    )
+                }
+            },
+            width: Self.appUsageDatePopoverWidth,
+            enableKeyboardNavigation: true,
+            allowMultipleRanges: false,
+            maxRangeDays: DashboardViewModel.maxAppUsageRangeDays,
+            onQuickPresetShortcut: { preset in
+                viewModel.recordKeyboardShortcut("dashboard.app_usage_date_range.\(preset.rawValue)")
+            },
+            onClearShortcut: {
+                viewModel.recordKeyboardShortcut("dashboard.app_usage_date_range.clear")
+            },
+            focusPrimaryInputRequestID: appUsageDateFocusRequestID,
+            isResetEnabled: isResetEnabled,
+            onDismiss: {
+                withAnimation(.easeOut(duration: 0.15)) {
+                    showAppUsageDatePopover = false
+                    appUsageDateFocusRequestID = nil
+                }
+            }
+        )
     }
 
     private enum RangeShiftButtonPosition {

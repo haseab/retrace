@@ -254,7 +254,35 @@ public struct FilterPopoverContainer<Content: View>: View {
         }
         .frame(width: width)
         .retraceMenuContainer(addPadding: false)
-        .clipShape(RoundedRectangle(cornerRadius: RetraceMenuStyle.cornerRadius))
+    }
+}
+
+enum DropdownOverlayInteraction {
+    static func clickPointInScreen(for event: NSEvent) -> CGPoint? {
+        guard let window = event.window ?? NSApp.window(withWindowNumber: event.windowNumber) else {
+            return nil
+        }
+
+        return window.convertPoint(toScreen: event.locationInWindow)
+    }
+
+    static func isUsableFrame(_ frame: CGRect) -> Bool {
+        frame.width > 0 && frame.height > 0
+    }
+
+    static func shouldDismiss(
+        event: NSEvent,
+        triggerFrame: CGRect,
+        contentFrame: CGRect
+    ) -> Bool {
+        guard isUsableFrame(triggerFrame) || isUsableFrame(contentFrame) else {
+            return false
+        }
+        guard let clickPoint = clickPointInScreen(for: event) else {
+            return false
+        }
+
+        return !triggerFrame.contains(clickPoint) && !contentFrame.contains(clickPoint)
     }
 }
 
@@ -1943,19 +1971,26 @@ public struct DropdownOverlayModifier<DropdownContent: View>: ViewModifier {
     let yOffset: CGFloat
     let opensUpward: Bool
     let horizontalAnchor: HorizontalAnchor
+    let dismissOnOutsideClick: Bool
     let dropdownContent: () -> DropdownContent
+
+    @State private var triggerFrame: CGRect = .zero
+    @State private var contentFrame: CGRect = .zero
+    @State private var outsideClickMonitor: Any?
 
     public init(
         isPresented: Binding<Bool>,
         yOffset: CGFloat = 44,
         opensUpward: Bool = false,
         horizontalAnchor: HorizontalAnchor = .leading,
+        dismissOnOutsideClick: Bool = true,
         @ViewBuilder dropdownContent: @escaping () -> DropdownContent
     ) {
         self._isPresented = isPresented
         self.yOffset = yOffset
         self.opensUpward = opensUpward
         self.horizontalAnchor = horizontalAnchor
+        self.dismissOnOutsideClick = dismissOnOutsideClick
         self.dropdownContent = dropdownContent
     }
 
@@ -1972,13 +2007,60 @@ public struct DropdownOverlayModifier<DropdownContent: View>: ViewModifier {
         }
     }
 
+    private func installOutsideClickMonitorIfNeeded() {
+        guard dismissOnOutsideClick else { return }
+        guard outsideClickMonitor == nil else { return }
+
+        outsideClickMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+        ) { event in
+            guard isPresented else { return event }
+            guard DropdownOverlayInteraction.shouldDismiss(
+                event: event,
+                triggerFrame: triggerFrame,
+                contentFrame: contentFrame
+            ) else {
+                return event
+            }
+            isPresented = false
+            return event
+        }
+    }
+
+    private func removeOutsideClickMonitor() {
+        if let outsideClickMonitor {
+            NSEvent.removeMonitor(outsideClickMonitor)
+            self.outsideClickMonitor = nil
+        }
+    }
+
     public func body(content: Content) -> some View {
         content
             .background(GeometryReader { geo in
-                Color.clear.onAppear {
-                }.onChange(of: isPresented) { _ in
-                }
+                let globalFrame = geo.frame(in: .global)
+                Color.clear
+                    .onAppear {
+                        guard DropdownOverlayInteraction.isUsableFrame(globalFrame),
+                              triggerFrame != globalFrame else { return }
+                        triggerFrame = globalFrame
+                    }
+                    .onChange(of: globalFrame) { updatedFrame in
+                        guard DropdownOverlayInteraction.isUsableFrame(updatedFrame),
+                              triggerFrame != updatedFrame else { return }
+                        triggerFrame = updatedFrame
+                    }
             })
+            .onChange(of: isPresented) { isPresented in
+                if isPresented {
+                    installOutsideClickMonitorIfNeeded()
+                } else {
+                    removeOutsideClickMonitor()
+                    contentFrame = .zero
+                }
+            }
+            .onDisappear {
+                removeOutsideClickMonitor()
+            }
             .overlay(alignment: overlayAlignment) {
                 if isPresented {
                     // Wrap content in a background container to ensure solid background
@@ -2001,8 +2083,18 @@ public struct DropdownOverlayModifier<DropdownContent: View>: ViewModifier {
                     .transition(.opacity.combined(with: .scale(scale: 0.95, anchor: opensUpward ? .bottom : .top)))
                     .zIndex(1000)
                     .background(GeometryReader { geo in
-                        Color.clear.onAppear {
-                        }
+                        let globalFrame = geo.frame(in: .global)
+                        Color.clear
+                            .onAppear {
+                                guard DropdownOverlayInteraction.isUsableFrame(globalFrame),
+                                      contentFrame != globalFrame else { return }
+                                contentFrame = globalFrame
+                            }
+                            .onChange(of: globalFrame) { updatedFrame in
+                                guard DropdownOverlayInteraction.isUsableFrame(updatedFrame),
+                                      contentFrame != updatedFrame else { return }
+                                contentFrame = updatedFrame
+                            }
                     })
                 }
             }
@@ -2017,6 +2109,7 @@ public extension View {
         yOffset: CGFloat = 44,
         opensUpward: Bool = false,
         horizontalAnchor: DropdownOverlayModifier<Content>.HorizontalAnchor = .leading,
+        dismissOnOutsideClick: Bool = true,
         @ViewBuilder content: @escaping () -> Content
     ) -> some View {
         modifier(
@@ -2025,6 +2118,7 @@ public extension View {
                 yOffset: yOffset,
                 opensUpward: opensUpward,
                 horizontalAnchor: horizontalAnchor,
+                dismissOnOutsideClick: dismissOnOutsideClick,
                 dropdownContent: content
             )
         )
@@ -2033,11 +2127,591 @@ public extension View {
 
 // MARK: - Date Range Filter Popover
 
+enum DateRangeInputFocusTarget: Equatable {
+    case none
+    case primary
+    case additional(UUID)
+}
+
+enum DateRangeInputFocusEvent: Equatable {
+    case setPrimary(Bool)
+    case setAdditional(UUID, Bool)
+    case clear
+}
+
+enum DateRangeInputFocusResolver {
+    static func resolve(
+        current: DateRangeInputFocusTarget,
+        event: DateRangeInputFocusEvent
+    ) -> DateRangeInputFocusTarget {
+        switch event {
+        case .clear:
+            return .none
+        case .setPrimary(true):
+            return .primary
+        case .setPrimary(false):
+            return current == .primary ? .none : current
+        case let .setAdditional(id, true):
+            return .additional(id)
+        case let .setAdditional(id, false):
+            return current == .additional(id) ? .none : current
+        }
+    }
+
+    static func isPrimaryFocused(_ target: DateRangeInputFocusTarget) -> Bool {
+        target == .primary
+    }
+
+    static func focusedAdditionalID(_ target: DateRangeInputFocusTarget) -> UUID? {
+        guard case let .additional(id) = target else { return nil }
+        return id
+    }
+}
+
+struct DateRangeInputParser {
+    let calendar: Calendar
+
+    init(calendar: Calendar = .current) {
+        self.calendar = calendar
+    }
+
+    func parse(_ text: String, now: Date = Date()) -> (start: Date, end: Date)? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        if let naturalLanguageRange = parseNaturalLanguageRange(trimmed, now: now) {
+            return naturalLanguageRange
+        }
+
+        if let split = splitRangeText(trimmed),
+           let start = parseSingleDate(split.start, relativeTo: nil, now: now),
+           let end = parseSingleDate(split.end, relativeTo: start, now: now) {
+            return normalizeRange(start, end)
+        }
+
+        if let detectedRange = parseRangeWithDetector(trimmed, now: now) {
+            return normalizeRange(detectedRange.start, detectedRange.end)
+        }
+
+        if let single = parseSingleDate(trimmed, relativeTo: nil, now: now) {
+            let day = calendar.startOfDay(for: single)
+            return (day, day)
+        }
+
+        return nil
+    }
+
+    private func parseNaturalLanguageRange(_ text: String, now: Date) -> (start: Date, end: Date)? {
+        let normalized = normalizeNaturalLanguageRangeText(text)
+
+        switch normalized {
+        case "past week":
+            return rollingRange(daySpan: 7, now: now)
+        case "past month":
+            return rollingRange(daySpan: 30, now: now)
+        case "this week":
+            return currentWeekRange(now: now)
+        case "last week":
+            return previousWeekRange(now: now)
+        case "this month":
+            return currentMonthRange(now: now)
+        case "last month":
+            return previousMonthRange(now: now)
+        default:
+            break
+        }
+
+        if let leadingDaysRange = parseLeadingDaysWithinPeriod(normalized, now: now) {
+            return leadingDaysRange
+        }
+
+        if let dayCount = captureLeadingCount(
+            in: normalized,
+            pattern: #"^(?:last|past)\s+(\d+)\s+days?$"#
+        ) {
+            return rollingRange(daySpan: dayCount, now: now)
+        }
+
+        if let weekCount = captureLeadingCount(
+            in: normalized,
+            pattern: #"^(?:last|past)\s+(\d+)\s+weeks?$"#
+        ) {
+            return rollingRange(daySpan: weekCount * 7, now: now)
+        }
+
+        if let compactDayCount = captureLeadingCount(in: normalized, pattern: #"^(\d+)d$"#) {
+            return rollingRange(daySpan: compactDayCount, now: now)
+        }
+
+        return nil
+    }
+
+    private func parseLeadingDaysWithinPeriod(_ text: String, now: Date) -> (start: Date, end: Date)? {
+        guard let regex = try? NSRegularExpression(
+            pattern: #"^first\s+(\d+)\s+days?\s+of\s+(.+)$"#,
+            options: [.caseInsensitive]
+        ) else {
+            return nil
+        }
+
+        let range = NSRange(text.startIndex..., in: text)
+        guard let match = regex.firstMatch(in: text, options: [], range: range),
+              let countRange = Range(match.range(at: 1), in: text),
+              let targetRange = Range(match.range(at: 2), in: text),
+              let dayCount = Int(text[countRange]) else {
+            return nil
+        }
+
+        let rawTarget = String(text[targetRange])
+        guard let periodInterval = periodInterval(forLeadingDaysTarget: rawTarget, now: now) else {
+            return nil
+        }
+
+        return firstDaysRange(dayCount: dayCount, in: periodInterval)
+    }
+
+    private func normalizeNaturalLanguageRangeText(_ text: String) -> String {
+        text
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+    }
+
+    private func periodInterval(forLeadingDaysTarget target: String, now: Date) -> DateInterval? {
+        let cleanedTarget = target
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: #"^the\s+"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: #"\s+month$"#, with: "", options: .regularExpression)
+
+        switch cleanedTarget {
+        case "week", "this week":
+            return mondayAnchoredWeekInterval(containing: now)
+        case "last week":
+            guard let currentWeek = mondayAnchoredWeekInterval(containing: now),
+                  let previousWeekReference = calendar.date(byAdding: .day, value: -1, to: currentWeek.start) else {
+                return nil
+            }
+            return mondayAnchoredWeekInterval(containing: previousWeekReference)
+        case "month", "this month":
+            return calendar.dateInterval(of: .month, for: now)
+        case "last month":
+            guard let previousMonth = calendar.date(byAdding: .month, value: -1, to: now) else {
+                return nil
+            }
+            return calendar.dateInterval(of: .month, for: previousMonth)
+        default:
+            return monthInterval(for: cleanedTarget, now: now)
+        }
+    }
+
+    private func monthInterval(for target: String, now: Date) -> DateInterval? {
+        let startOfCurrentMonth = calendar.dateInterval(of: .month, for: now)?.start ?? calendar.startOfDay(for: now)
+        let candidateInputs = [
+            target,
+            target.prefix(1).uppercased() + target.dropFirst()
+        ]
+
+        let formatStrings = ["MMMM yyyy", "MMM yyyy", "MMMM", "MMM"]
+        for format in formatStrings {
+            let formatter = DateFormatter()
+            formatter.dateFormat = format
+            formatter.timeZone = calendar.timeZone
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.defaultDate = startOfCurrentMonth
+
+            for candidate in candidateInputs {
+                if let monthDate = formatter.date(from: String(candidate)) {
+                    return calendar.dateInterval(of: .month, for: monthDate)
+                }
+            }
+        }
+
+        return nil
+    }
+
+    private func captureLeadingCount(in text: String, pattern: String) -> Int? {
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+            return nil
+        }
+
+        let range = NSRange(text.startIndex..., in: text)
+        guard let match = regex.firstMatch(in: text, options: [], range: range),
+              let captureRange = Range(match.range(at: 1), in: text) else {
+            return nil
+        }
+
+        return Int(text[captureRange])
+    }
+
+    private func rollingRange(daySpan: Int, now: Date) -> (start: Date, end: Date)? {
+        let boundedDaySpan = max(1, daySpan)
+        let today = calendar.startOfDay(for: now)
+        let offset = -(boundedDaySpan - 1)
+        let start = calendar.date(byAdding: .day, value: offset, to: today) ?? today
+        return normalizeRange(start, today)
+    }
+
+    private func currentWeekRange(now: Date) -> (start: Date, end: Date)? {
+        guard let interval = mondayAnchoredWeekInterval(containing: now) else {
+            return nil
+        }
+
+        let start = interval.start
+        let today = calendar.startOfDay(for: now)
+        return normalizeRange(start, today)
+    }
+
+    private func previousWeekRange(now: Date) -> (start: Date, end: Date)? {
+        guard let currentWeek = mondayAnchoredWeekInterval(containing: now),
+              let previousWeekReference = calendar.date(byAdding: .day, value: -1, to: currentWeek.start),
+              let interval = mondayAnchoredWeekInterval(containing: previousWeekReference) else {
+            return nil
+        }
+
+        let end = interval.end.addingTimeInterval(-1)
+        return normalizeRange(interval.start, end)
+    }
+
+    private func currentMonthRange(now: Date) -> (start: Date, end: Date)? {
+        guard let interval = calendar.dateInterval(of: .month, for: now) else {
+            return nil
+        }
+
+        let start = interval.start
+        let today = calendar.startOfDay(for: now)
+        return normalizeRange(start, today)
+    }
+
+    private func previousMonthRange(now: Date) -> (start: Date, end: Date)? {
+        guard let previousMonthDate = calendar.date(byAdding: .month, value: -1, to: now),
+              let interval = calendar.dateInterval(of: .month, for: previousMonthDate) else {
+            return nil
+        }
+
+        let end = interval.end.addingTimeInterval(-1)
+        return normalizeRange(interval.start, end)
+    }
+
+    private func mondayAnchoredWeekInterval(containing date: Date) -> DateInterval? {
+        let day = calendar.startOfDay(for: date)
+        let weekday = calendar.component(.weekday, from: day)
+        let daysSinceMonday = (weekday + 5) % 7
+
+        guard let start = calendar.date(byAdding: .day, value: -daysSinceMonday, to: day),
+              let end = calendar.date(byAdding: .day, value: 7, to: start) else {
+            return nil
+        }
+
+        return DateInterval(start: start, end: end)
+    }
+
+    private func firstDaysRange(dayCount: Int, in interval: DateInterval) -> (start: Date, end: Date)? {
+        let boundedCount = max(1, dayCount)
+        let start = calendar.startOfDay(for: interval.start)
+        let intervalEndDay = calendar.startOfDay(for: interval.end.addingTimeInterval(-1))
+        let candidateEnd = calendar.date(byAdding: .day, value: boundedCount - 1, to: start) ?? start
+        let clampedEnd = min(candidateEnd, intervalEndDay)
+        return normalizeRange(start, clampedEnd)
+    }
+
+    private func parseRangeWithDetector(_ text: String, now: Date) -> (start: Date, end: Date)? {
+        guard let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.date.rawValue) else {
+            return nil
+        }
+
+        let range = NSRange(text.startIndex..., in: text)
+        let matches = detector.matches(in: text, options: [], range: range)
+        guard let first = matches.first, let firstDate = first.date else {
+            return nil
+        }
+
+        let firstMatchText = Range(first.range, in: text).map { String(text[$0]) } ?? text
+        let adjustedFirstDate = adjustImplicitFutureDateToPast(firstDate, originalText: firstMatchText, now: now)
+
+        if first.duration > 0 {
+            let rawEnd = firstDate.addingTimeInterval(first.duration)
+            let adjustedEnd = adjustImplicitFutureDateToPast(rawEnd, originalText: firstMatchText, now: now)
+            return (adjustedFirstDate, adjustedEnd)
+        }
+
+        if matches.count >= 2, let secondDate = matches[1].date {
+            let secondMatchText = Range(matches[1].range, in: text).map { String(text[$0]) } ?? text
+            let adjustedSecondDate = adjustImplicitFutureDateToPast(secondDate, originalText: secondMatchText, now: now)
+            return (adjustedFirstDate, adjustedSecondDate)
+        }
+
+        return nil
+    }
+
+    private func splitRangeText(_ text: String) -> (start: String, end: String)? {
+        let connectors = [" to ", " through ", " thru ", " until ", " - ", " – ", " — "]
+
+        for connector in connectors {
+            if let connectorRange = text.range(of: connector, options: .caseInsensitive) {
+                let left = text[..<connectorRange.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines)
+                let right = text[connectorRange.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
+                if !left.isEmpty, !right.isEmpty {
+                    return (String(left), String(right))
+                }
+            }
+        }
+
+        return nil
+    }
+
+    private func parseSingleDate(_ text: String, relativeTo referenceDate: Date?, now: Date) -> Date? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedLower = trimmed.lowercased()
+
+        Chrono.defaultImpliedHour = 0
+        let chrono = Chrono()
+        let results = chrono.parse(text: trimmed, refDate: referenceDate ?? now, opt: [.forwardDate: 0])
+        if let result = results.first?.start.date {
+            return adjustImplicitFutureDateToPast(result, originalText: trimmedLower, now: now)
+        }
+
+        if let referenceDate,
+           let day = Int(trimmedLower),
+           (1...31).contains(day) {
+            var referenceComponents = calendar.dateComponents([.year, .month, .day], from: referenceDate)
+            referenceComponents.day = day
+
+            if let candidate = calendar.date(from: referenceComponents) {
+                if let referenceDay = calendar.dateComponents([.day], from: referenceDate).day,
+                   day < referenceDay,
+                   let nextMonth = calendar.date(byAdding: .month, value: 1, to: referenceDate) {
+                    var nextMonthComponents = calendar.dateComponents([.year, .month], from: nextMonth)
+                    nextMonthComponents.day = day
+                    return calendar.date(from: nextMonthComponents) ?? candidate
+                }
+                return candidate
+            }
+        }
+
+        if let timeOnlyDate = parseTimeOnly(trimmedLower, relativeTo: now) {
+            return timeOnlyDate
+        }
+
+        let normalizedText = normalizeCompactTimeFormat(trimmedLower)
+        if let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.date.rawValue) {
+            let range = NSRange(normalizedText.startIndex..., in: normalizedText)
+            if let match = detector.firstMatch(in: normalizedText, options: [], range: range),
+               let date = match.date {
+                return adjustImplicitFutureDateToPast(date, originalText: trimmedLower, now: now)
+            }
+        }
+
+        let formatStrings = [
+            "MMM d yyyy h:mm a",
+            "MMM d yyyy h:mma",
+            "MMM d yyyy ha",
+            "MMM d h:mm a",
+            "MMM d h:mma",
+            "MMM d ha",
+            "MMM d h a",
+            "MM/dd/yyyy h:mm a",
+            "MM/dd h:mm a",
+            "yyyy-MM-dd HH:mm",
+            "yyyy-MM-dd'T'HH:mm:ss",
+            "MMM d",
+            "MMMM d"
+        ]
+
+        for formatString in formatStrings {
+            let formatter = DateFormatter()
+            formatter.dateFormat = formatString
+            formatter.timeZone = .current
+            formatter.defaultDate = referenceDate ?? now
+
+            if let date = formatter.date(from: text) {
+                return adjustImplicitFutureDateToPast(date, originalText: trimmedLower, now: now)
+            }
+            if let date = formatter.date(from: trimmed) {
+                return adjustImplicitFutureDateToPast(date, originalText: trimmedLower, now: now)
+            }
+
+            let capitalized = trimmed.prefix(1).uppercased() + trimmed.dropFirst()
+            if let date = formatter.date(from: capitalized) {
+                return adjustImplicitFutureDateToPast(date, originalText: trimmedLower, now: now)
+            }
+        }
+
+        return nil
+    }
+
+    private func adjustImplicitFutureDateToPast(_ date: Date, originalText: String, now: Date) -> Date {
+        guard shouldPreferPastYearForImplicitDateText(originalText) else {
+            return date
+        }
+
+        let cutoff = calendar.startOfDay(for: now)
+        var adjusted = date
+
+        while calendar.startOfDay(for: adjusted) > cutoff,
+              let previousYear = calendar.date(byAdding: .year, value: -1, to: adjusted) {
+            adjusted = previousYear
+        }
+
+        return adjusted
+    }
+
+    private func shouldPreferPastYearForImplicitDateText(_ text: String) -> Bool {
+        guard !textContainsExplicitYear(text) else { return false }
+        return textContainsMonthReference(text)
+    }
+
+    private func textContainsExplicitYear(_ text: String) -> Bool {
+        let patterns = [
+            #"\b(?:19|20)\d{2}\b"#,
+            #"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b"#
+        ]
+
+        return patterns.contains { pattern in
+            text.range(of: pattern, options: .regularExpression) != nil
+        }
+    }
+
+    private func textContainsMonthReference(_ text: String) -> Bool {
+        let patterns = [
+            #"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\b"#,
+            #"\b\d{1,2}[/-]\d{1,2}\b"#
+        ]
+
+        return patterns.contains { pattern in
+            text.range(of: pattern, options: .regularExpression) != nil
+        }
+    }
+
+    private func parseTimeOnly(_ text: String, relativeTo now: Date) -> Date? {
+        var input = text.trimmingCharacters(in: .whitespaces)
+        var isPM = false
+        var isAM = false
+
+        if input.hasSuffix("pm") || input.hasSuffix("p") {
+            isPM = true
+            input = input.replacingOccurrences(of: "pm", with: "")
+                .replacingOccurrences(of: "p", with: "")
+                .trimmingCharacters(in: .whitespaces)
+        } else if input.hasSuffix("am") || input.hasSuffix("a") {
+            isAM = true
+            input = input.replacingOccurrences(of: "am", with: "")
+                .replacingOccurrences(of: "a", with: "")
+                .trimmingCharacters(in: .whitespaces)
+        }
+
+        var hour: Int?
+        var minute = 0
+
+        if input.contains(":") {
+            let parts = input.split(separator: ":")
+            if parts.count == 2,
+               let h = Int(parts[0]),
+               let m = Int(parts[1]),
+               h >= 0 && h <= 23 && m >= 0 && m <= 59 {
+                hour = h
+                minute = m
+            }
+        } else if let numericValue = Int(input) {
+            if numericValue >= 0 && numericValue <= 23 {
+                hour = numericValue
+            } else if numericValue >= 100 && numericValue <= 2359 {
+                hour = numericValue / 100
+                minute = numericValue % 100
+                if hour! > 23 || minute > 59 {
+                    return nil
+                }
+            } else {
+                return nil
+            }
+        }
+
+        guard var finalHour = hour else { return nil }
+
+        if isPM && finalHour < 12 {
+            finalHour += 12
+        } else if isAM && finalHour == 12 {
+            finalHour = 0
+        }
+
+        var components = calendar.dateComponents([.year, .month, .day], from: now)
+        components.hour = finalHour
+        components.minute = minute
+        components.second = 0
+
+        return calendar.date(from: components)
+    }
+
+    private func normalizeCompactTimeFormat(_ text: String) -> String {
+        let pattern = #"(\d{3,4})\s*(am|pm)"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) else {
+            return text
+        }
+
+        var result = text
+        let range = NSRange(text.startIndex..., in: text)
+        let matches = regex.matches(in: text, options: [], range: range)
+
+        for match in matches.reversed() {
+            guard let numberRange = Range(match.range(at: 1), in: result),
+                  let suffixRange = Range(match.range(at: 2), in: result),
+                  let fullMatchRange = Range(match.range, in: result) else {
+                continue
+            }
+
+            let numberStr = String(result[numberRange])
+            let suffix = String(result[suffixRange])
+            guard let numericValue = Int(numberStr) else { continue }
+
+            let hour: Int
+            let minute: Int
+            if numericValue >= 100 && numericValue <= 1259 {
+                hour = numericValue / 100
+                minute = numericValue % 100
+            } else {
+                continue
+            }
+
+            guard hour >= 1 && hour <= 12 && minute >= 0 && minute <= 59 else {
+                continue
+            }
+
+            let normalizedTime = "\(hour):\(String(format: "%02d", minute))\(suffix)"
+            result.replaceSubrange(fullMatchRange, with: normalizedTime)
+        }
+
+        return result
+    }
+
+    private func normalizeRange(_ start: Date, _ end: Date) -> (start: Date, end: Date) {
+        var startDay = calendar.startOfDay(for: start)
+        var endDay = calendar.startOfDay(for: end)
+        if endDay < startDay {
+            swap(&startDay, &endDay)
+        }
+
+        return (startDay, endDay)
+    }
+}
+
 public enum DateRangeQuickPreset: String, CaseIterable {
     case today = "today"
     case yesterday = "yesterday"
     case lastSevenDays = "last_7_days"
     case lastThirtyDays = "last_30_days"
+
+    var title: String {
+        switch self {
+        case .today:
+            return "Today"
+        case .yesterday:
+            return "Yesterday"
+        case .lastSevenDays:
+            return "Last 7 Days"
+        case .lastThirtyDays:
+            return "Last 30 Days"
+        }
+    }
 
     var chipLabel: String {
         switch self {
@@ -2050,6 +2724,23 @@ public enum DateRangeQuickPreset: String, CaseIterable {
         case .lastThirtyDays:
             return "30d"
         }
+    }
+
+    var shortcutKeyLabel: String {
+        switch self {
+        case .today:
+            return "A"
+        case .yesterday:
+            return "S"
+        case .lastSevenDays:
+            return "D"
+        case .lastThirtyDays:
+            return "F"
+        }
+    }
+
+    var helpText: String {
+        "\(title) (\(shortcutKeyLabel))"
     }
 
     var focusedItemIndex: Int {
@@ -2163,6 +2854,9 @@ public struct DateRangeFilterPopover: View {
     let onMoveToNextFilter: (() -> Void)?
     let onCalendarEditingChange: ((Bool) -> Void)?
     let onQuickPresetShortcut: ((DateRangeQuickPreset) -> Void)?
+    let onClearShortcut: (() -> Void)?
+    let focusPrimaryInputRequestID: UUID?
+    let isResetEnabled: Bool
     var onDismiss: (() -> Void)?
 
     @State private var localStartDate: Date
@@ -2180,13 +2874,21 @@ public struct DateRangeFilterPopover: View {
     @State private var activeCalendarTarget: CalendarTarget = .primary
     @State private var lastFocusedCalendarTarget: CalendarTarget = .primary
     @State private var displayedMonth: Date = Date()
-    @State private var focusedItem: Int = 0
+    @State private var focusedItem: Int = -1
     @State private var keyboardMonitor: Any?
-    @FocusState private var isRangeInputFocused: Bool
-    @FocusState private var focusedAdditionalRangeID: UUID?
+    @State private var rangeInputFocusTarget: DateRangeInputFocusTarget = .none
+    @State private var isHoveringResetButton = false
+    @State private var isHoveringPrimaryInput = false
+    @State private var hoveredAdditionalRangeID: UUID?
+    @State private var isHoveringCalendarToggle = false
+    @State private var hoveredQuickPreset: DateRangeQuickPreset?
 
     private let calendar = Calendar.current
+    private var inputParser: DateRangeInputParser {
+        DateRangeInputParser(calendar: calendar)
+    }
     private let weekdaySymbols = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"]
+    private let primaryRangeFocusedItem = -1
     private let itemCount = 5
 
     private enum CalendarBoundary {
@@ -2216,7 +2918,61 @@ public struct DateRangeFilterPopover: View {
     }
 
     private var isAnyRangeInputFocused: Bool {
-        isRangeInputFocused || focusedAdditionalRangeID != nil
+        rangeInputFocusTarget != .none
+    }
+
+    private var isRangeInputFocused: Bool {
+        DateRangeInputFocusResolver.isPrimaryFocused(rangeInputFocusTarget)
+    }
+
+    private var focusedAdditionalRangeID: UUID? {
+        DateRangeInputFocusResolver.focusedAdditionalID(rangeInputFocusTarget)
+    }
+
+    private var isPrimaryInputHighlighted: Bool {
+        isRangeInputFocused ||
+        isHoveringPrimaryInput ||
+        (
+            enableKeyboardNavigation &&
+            focusedItem == primaryRangeFocusedItem &&
+            !isAnyRangeInputFocused &&
+            !isCalendarVisible
+        )
+    }
+
+    private func isAdditionalInputHighlighted(_ id: UUID) -> Bool {
+        focusedAdditionalRangeID == id || hoveredAdditionalRangeID == id
+    }
+
+    private var isCalendarToggleHighlighted: Bool {
+        isCalendarVisible ||
+        isHoveringCalendarToggle ||
+        (
+            enableKeyboardNavigation &&
+            focusedItem == 0 &&
+            !isAnyRangeInputFocused
+        )
+    }
+
+    private var calendarToggleForegroundColor: Color {
+        .white.opacity(isCalendarToggleHighlighted ? 1 : 0.88)
+    }
+
+    private var calendarToggleBackgroundColor: Color {
+        isCalendarToggleHighlighted
+            ? RetraceMenuStyle.actionBlue
+            : Color.white.opacity(0.08)
+    }
+
+    private var calendarToggleBorderColor: Color {
+        if isCalendarToggleHighlighted {
+            return RetraceMenuStyle.actionBlue.opacity(0.55)
+        }
+        return Color.white.opacity(0.08)
+    }
+
+    private var calendarToggleHintColor: Color {
+        isCalendarToggleHighlighted ? .white.opacity(0.82) : .white.opacity(0.55)
     }
 
     public init(
@@ -2230,6 +2986,9 @@ public struct DateRangeFilterPopover: View {
         onMoveToNextFilter: (() -> Void)? = nil,
         onCalendarEditingChange: ((Bool) -> Void)? = nil,
         onQuickPresetShortcut: ((DateRangeQuickPreset) -> Void)? = nil,
+        onClearShortcut: (() -> Void)? = nil,
+        focusPrimaryInputRequestID: UUID? = nil,
+        isResetEnabled: Bool = true,
         onDismiss: (() -> Void)? = nil
     ) {
         let maxRangeCount = allowMultipleRanges ? 5 : 1
@@ -2243,6 +3002,9 @@ public struct DateRangeFilterPopover: View {
         self.onMoveToNextFilter = onMoveToNextFilter
         self.onCalendarEditingChange = onCalendarEditingChange
         self.onQuickPresetShortcut = onQuickPresetShortcut
+        self.onClearShortcut = onClearShortcut
+        self.focusPrimaryInputRequestID = focusPrimaryInputRequestID
+        self.isResetEnabled = isResetEnabled
         self.onDismiss = onDismiss
 
         let now = Date()
@@ -2265,25 +3027,32 @@ public struct DateRangeFilterPopover: View {
                 Spacer()
 
                 if activeRangeCount > 0 {
-                    Button("Clear") {
-                        rangeInputText = ""
-                        parseError = nil
-                        hasCommittedPrimaryRange = false
-                        additionalRangeInputTexts.removeAll()
-                        additionalRangeIDs.removeAll()
-                        additionalParseErrors.removeAll()
-                        additionalParsedRanges.removeAll()
-                        activeCalendarTarget = .primary
-                        lastFocusedCalendarTarget = .primary
-                        focusedAdditionalRangeID = nil
-                        onClear()
-                        onDismiss?()
+                    Button("Reset") {
+                        guard isResetEnabled else { return }
+                        clearAllRangesAndDismiss()
                     }
                     .buttonStyle(.plain)
                     .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(Color.white.opacity(0.6))
+                    .foregroundColor(isResetEnabled ? RetraceMenuStyle.actionBlue : RetraceMenuStyle.textColorMuted.opacity(0.55))
+                    .disabled(!isResetEnabled)
+                    .onHover { hovering in
+                        isHoveringResetButton = hovering
+                        if isResetEnabled {
+                            if hovering {
+                                NSCursor.pointingHand.push()
+                            } else {
+                                NSCursor.pop()
+                            }
+                        }
+                    }
+                    .instantTooltip(
+                        "Reset (⌘⌫)",
+                        isVisible: .constant(isHoveringResetButton && isResetEnabled),
+                        placement: .bottom
+                    )
                 }
             }
+            .zIndex(isHoveringResetButton ? 10 : 0)
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
 
@@ -2306,14 +3075,17 @@ public struct DateRangeFilterPopover: View {
                         },
                         isFocused: { isRangeInputFocused },
                         setFocused: { isFocused in
-                            isRangeInputFocused = isFocused
+                            handleRangeInputFocusEvent(.setPrimary(isFocused))
                         },
-                        onBlur: canonicalizeInputTextIfPossible
+                        onBlur: canonicalizeInputTextIfPossible,
+                        onClick: {
+                            focusTextInput(.primary)
+                        }
                     )
                     .modifier(FocusEffectDisabledModifier())
                     .onChange(of: isRangeInputFocused) { isFocused in
                         if isFocused {
-                            focusedItem = -1  // Clear keyboard navigation highlight when text field is focused
+                            focusedItem = primaryRangeFocusedItem
                             lastFocusedCalendarTarget = .primary
                             if isCalendarVisible {
                                 synchronizeCalendarStateFromTarget(.primary)
@@ -2346,12 +3118,19 @@ public struct DateRangeFilterPopover: View {
                 )
                 .overlay(
                     RoundedRectangle(cornerRadius: 6)
-                        .stroke(isRangeInputFocused ? RetraceMenuStyle.filterStrokeMedium : Color.clear, lineWidth: 1)
+                        .stroke(
+                            isPrimaryInputHighlighted
+                                ? RetraceMenuStyle.filterStrokeMedium
+                                : Color.clear,
+                            lineWidth: 1
+                        )
                 )
                 .contentShape(Rectangle())
+                .onHover { hovering in
+                    isHoveringPrimaryInput = hovering
+                }
                 .onTapGesture {
-                    focusedAdditionalRangeID = nil
-                    isRangeInputFocused = true
+                    focusTextInput(.primary)
                 }
 
                 if let parseError {
@@ -2377,11 +3156,10 @@ public struct DateRangeFilterPopover: View {
                                 },
                                 isFocused: { focusedAdditionalRangeID == rangeID },
                                 setFocused: { isFocused in
-                                    if isFocused {
-                                        focusedAdditionalRangeID = rangeID
-                                    } else if focusedAdditionalRangeID == rangeID {
-                                        focusedAdditionalRangeID = nil
-                                    }
+                                    handleRangeInputFocusEvent(.setAdditional(rangeID, isFocused))
+                                },
+                                onClick: {
+                                    focusTextInput(.additional(rangeID))
                                 }
                             )
                             .modifier(FocusEffectDisabledModifier())
@@ -2404,14 +3182,16 @@ public struct DateRangeFilterPopover: View {
                         .overlay(
                             RoundedRectangle(cornerRadius: 6)
                                 .stroke(
-                                    focusedAdditionalRangeID == rangeID ? RetraceMenuStyle.filterStrokeMedium : Color.clear,
+                                    isAdditionalInputHighlighted(rangeID) ? RetraceMenuStyle.filterStrokeMedium : Color.clear,
                                     lineWidth: 1
                                 )
                         )
                         .contentShape(Rectangle())
+                        .onHover { hovering in
+                            hoveredAdditionalRangeID = hovering ? rangeID : (hoveredAdditionalRangeID == rangeID ? nil : hoveredAdditionalRangeID)
+                        }
                         .onTapGesture {
-                            isRangeInputFocused = false
-                            focusedAdditionalRangeID = rangeID
+                            focusTextInput(.additional(rangeID))
                         }
 
                         if let additionalError = additionalParseErrorMessage(for: rangeID) {
@@ -2459,51 +3239,40 @@ public struct DateRangeFilterPopover: View {
 
             // Calendar range toggle and hint
             Button(action: {
-                withAnimation(.easeOut(duration: 0.15)) {
-                    isCalendarVisible.toggle()
-                    if isCalendarVisible {
-                        synchronizeCalendarStateFromTarget(lastFocusedCalendarTarget)
-                        isRangeInputFocused = false
-                        focusedAdditionalRangeID = nil
-                    }
-                }
+                toggleCalendarVisibility()
             }) {
                 HStack(spacing: 8) {
                     Image(systemName: "calendar")
                         .font(.system(size: 12, weight: .medium))
-                        .foregroundColor(.white.opacity(0.9))
+                        .foregroundColor(calendarToggleForegroundColor)
                     Text(isCalendarVisible ? "Hide Calendar" : "Browse Calendar")
                         .font(.system(size: 12, weight: .medium))
-                        .foregroundColor(.white)
+                        .foregroundColor(calendarToggleForegroundColor)
 
                     Spacer()
 
                     if isCalendarVisible {
                         Text(activeCalendarBoundary == .start ? "Pick start" : "Pick end")
                             .font(.system(size: 10, weight: .semibold))
-                            .foregroundColor(.white.opacity(0.55))
+                            .foregroundColor(calendarToggleHintColor)
                     }
                 }
                 .padding(.horizontal, 10)
                 .padding(.vertical, 8)
                 .background(
                     RoundedRectangle(cornerRadius: 6)
-                        .fill(enableKeyboardNavigation && focusedItem == 0 ? Color.white.opacity(0.16) : Color.white.opacity(0.08))
+                        .fill(calendarToggleBackgroundColor)
                 )
                 .overlay(
                     RoundedRectangle(cornerRadius: 6)
-                        .stroke(
-                            enableKeyboardNavigation && focusedItem == 0
-                                ? RetraceMenuStyle.filterStrokeMedium
-                                : Color.clear,
-                            lineWidth: 1
-                        )
+                        .stroke(calendarToggleBorderColor, lineWidth: 1)
                 )
             }
             .buttonStyle(.plain)
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
             .onHover { hovering in
+                isHoveringCalendarToggle = hovering
                 if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
             }
 
@@ -2540,11 +3309,12 @@ public struct DateRangeFilterPopover: View {
             }
 
             DispatchQueue.main.async {
-                if enableKeyboardNavigation {
-                    isRangeInputFocused = false
-                    focusedAdditionalRangeID = nil
+                if focusPrimaryInputRequestID != nil {
+                    focusPrimaryRangeInput()
+                } else if enableKeyboardNavigation {
+                    setRangeInputFocus(.none)
                 } else {
-                    isRangeInputFocused = true
+                    setRangeInputFocus(.primary)
                 }
             }
         }
@@ -2560,12 +3330,15 @@ public struct DateRangeFilterPopover: View {
         .onChange(of: focusedAdditionalRangeID) { focusedID in
             if let focusedID {
                 focusedItem = -1
-                isRangeInputFocused = false
                 lastFocusedCalendarTarget = .additional(focusedID)
                 if isCalendarVisible {
                     synchronizeCalendarStateFromTarget(.additional(focusedID))
                 }
             }
+        }
+        .onChange(of: focusPrimaryInputRequestID) { requestID in
+            guard requestID != nil else { return }
+            focusPrimaryRangeInput()
         }
     }
 
@@ -2704,24 +3477,28 @@ public struct DateRangeFilterPopover: View {
         Button(action: {
             applyQuickPreset(preset)
         }) {
-            Text(preset.chipLabel)
-                .font(.system(size: 11, weight: .medium))
-                .foregroundColor(isHighlighted ? .white : .white.opacity(0.8))
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .background(
-                    RoundedRectangle(cornerRadius: 6)
-                        .fill(isHighlighted ? Color.white.opacity(0.2) : Color.white.opacity(0.1))
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 6)
-                        .stroke(isHighlighted ? RetraceMenuStyle.filterStrokeMedium : Color.clear, lineWidth: 1)
-                )
+            HStack(spacing: 0) {
+                Text(preset.chipLabel)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(isHighlighted ? .white : .white.opacity(0.8))
+            }
+            .frame(minWidth: 34, minHeight: 24, alignment: .center)
+            .padding(.horizontal, 10)
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(isHighlighted ? Color.white.opacity(0.2) : Color.white.opacity(0.1))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(isHighlighted ? RetraceMenuStyle.filterStrokeMedium : Color.clear, lineWidth: 1)
+            )
         }
         .buttonStyle(.plain)
         .onHover { hovering in
+            hoveredQuickPreset = hovering ? preset : (hoveredQuickPreset == preset ? nil : hoveredQuickPreset)
             if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
         }
+        .instantTooltip(preset.helpText, isVisible: .constant(hoveredQuickPreset == preset))
     }
 
     // MARK: - Helpers
@@ -2730,6 +3507,30 @@ public struct DateRangeFilterPopover: View {
         let formatter = DateFormatter()
         formatter.dateFormat = "MMMM yyyy"
         return formatter.string(from: displayedMonth)
+    }
+
+    private func setRangeInputFocus(_ target: DateRangeInputFocusTarget) {
+        guard rangeInputFocusTarget != target else { return }
+        rangeInputFocusTarget = target
+    }
+
+    private func focusTextInput(_ target: DateRangeInputFocusTarget) {
+        if isCalendarVisible {
+            withAnimation(.easeOut(duration: 0.15)) {
+                isCalendarVisible = false
+                activeCalendarBoundary = .start
+            }
+        }
+        setRangeInputFocus(target)
+    }
+
+    private func handleRangeInputFocusEvent(_ event: DateRangeInputFocusEvent) {
+        let resolvedTarget = DateRangeInputFocusResolver.resolve(
+            current: rangeInputFocusTarget,
+            event: event
+        )
+        guard resolvedTarget != rangeInputFocusTarget else { return }
+        rangeInputFocusTarget = resolvedTarget
     }
 
     private func configureInitialState() {
@@ -2767,15 +3568,8 @@ public struct DateRangeFilterPopover: View {
     }
 
     private func initialKeyboardFocusedItem(now: Date = Date()) -> Int {
-        guard dateRanges.count == 1,
-              let preset = DateRangeQuickPreset.matchingPreset(
-                for: dateRanges.first,
-                now: now,
-                calendar: calendar
-              ) else {
-            return DateRangeQuickPreset.today.focusedItemIndex
-        }
-        return preset.focusedItemIndex
+        _ = now
+        return primaryRangeFocusedItem
     }
 
     private func changeMonth(by value: Int) {
@@ -2969,14 +3763,13 @@ public struct DateRangeFilterPopover: View {
         return true
     }
 
-    private func applyCurrentSelection(moveToNextDropdown: Bool = false) {
+    @discardableResult
+    private func applyCurrentSelection(moveToNextDropdown: Bool = false) -> Bool {
         guard applyInputTextToLocalRange(applyImmediately: false) else {
-            if moveToNextDropdown {
-                onMoveToNextFilter?()
-            }
-            return
+            return false
         }
         applyAllRanges(moveToNextDropdown: moveToNextDropdown)
+        return true
     }
 
     private func applyQuickPreset(_ preset: DateRangeQuickPreset) {
@@ -2995,8 +3788,7 @@ public struct DateRangeFilterPopover: View {
         focusedItem = preset.focusedItemIndex
         rangeInputText = formatRangeInput(start: start, end: end)
         parseError = nil
-        isRangeInputFocused = false
-        focusedAdditionalRangeID = nil
+        setRangeInputFocus(.none)
 
         applyAllRanges(primaryOverride: range, moveToNextDropdown: false)
     }
@@ -3011,8 +3803,7 @@ public struct DateRangeFilterPopover: View {
         additionalParsedRanges.append(nil)
         normalizeAdditionalRangeState()
         DispatchQueue.main.async {
-            focusedAdditionalRangeID = newID
-            isRangeInputFocused = false
+            setRangeInputFocus(.additional(newID))
         }
     }
 
@@ -3036,37 +3827,42 @@ public struct DateRangeFilterPopover: View {
         applyAllRanges(moveToNextDropdown: false)
     }
 
-    private func applyAdditionalRangeInput(for id: UUID) {
-        guard allowMultipleRanges else { return }
+    @discardableResult
+    private func applyAdditionalRangeInput(
+        for id: UUID,
+        moveToNextDropdown: Bool = false
+    ) -> Bool {
+        guard allowMultipleRanges else { return false }
         guard let index = additionalRangeIndex(for: id),
               additionalRangeInputTexts.indices.contains(index),
               additionalParseErrors.indices.contains(index),
               additionalParsedRanges.indices.contains(index) else {
-            return
+            return false
         }
 
         let trimmed = additionalRangeInputTexts[index].trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty {
             additionalParsedRanges[index] = nil
             additionalParseErrors[index] = nil
-            applyAllRanges(moveToNextDropdown: false)
-            return
+            applyAllRanges(moveToNextDropdown: moveToNextDropdown)
+            return true
         }
 
         guard let parsedRange = parseDateRangeInput(trimmed) else {
             additionalParseErrors[index] = "Couldn’t parse that date range."
-            return
+            return false
         }
         if let validationError = rangeValidationError(start: parsedRange.start, end: parsedRange.end) {
             additionalParseErrors[index] = validationError
-            return
+            return false
         }
 
         let normalizedRange = normalizedFilterRange(start: parsedRange.start, end: parsedRange.end)
         additionalParsedRanges[index] = normalizedRange
         additionalParseErrors[index] = nil
         additionalRangeInputTexts[index] = formatRangeInput(start: parsedRange.start, end: parsedRange.end)
-        applyAllRanges(moveToNextDropdown: false)
+        applyAllRanges(moveToNextDropdown: moveToNextDropdown)
+        return true
     }
 
     private func applyAllRanges(
@@ -3152,8 +3948,11 @@ public struct DateRangeFilterPopover: View {
         }
 
         if moveToNextDropdown {
-            onDismiss?()
-            onMoveToNextFilter?()
+            if let onMoveToNextFilter {
+                onMoveToNextFilter()
+            } else {
+                onDismiss?()
+            }
         }
     }
 
@@ -3221,7 +4020,12 @@ public struct DateRangeFilterPopover: View {
 
         if let focusedID = focusedAdditionalRangeID,
            !additionalRangeIDs.contains(focusedID) {
-            focusedAdditionalRangeID = nil
+            setRangeInputFocus(.none)
+        }
+
+        if let hoveredAdditionalRangeID,
+           !additionalRangeIDs.contains(hoveredAdditionalRangeID) {
+            self.hoveredAdditionalRangeID = nil
         }
 
         if case .additional(let id) = activeCalendarTarget,
@@ -3293,258 +4097,7 @@ public struct DateRangeFilterPopover: View {
     }
 
     private func parseDateRangeInput(_ text: String) -> (start: Date, end: Date)? {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-
-        if let detectedRange = parseRangeWithDetector(trimmed) {
-            let normalized = normalizeRange(detectedRange.start, detectedRange.end)
-            return normalized
-        }
-
-        if let split = splitRangeText(trimmed),
-           let start = parseSingleDate(split.start, relativeTo: nil),
-           let end = parseSingleDate(split.end, relativeTo: start) {
-            let normalized = normalizeRange(start, end)
-            return normalized
-        }
-
-        if let single = parseSingleDate(trimmed, relativeTo: nil) {
-            let day = calendar.startOfDay(for: single)
-            return (day, day)
-        }
-
-        return nil
-    }
-
-    private func parseRangeWithDetector(_ text: String) -> (start: Date, end: Date)? {
-        guard let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.date.rawValue) else {
-            return nil
-        }
-
-        let range = NSRange(text.startIndex..., in: text)
-        let matches = detector.matches(in: text, options: [], range: range)
-        guard let first = matches.first, let firstDate = first.date else {
-            return nil
-        }
-
-        if first.duration > 0 {
-            let rawEnd = firstDate.addingTimeInterval(first.duration)
-            return (firstDate, rawEnd)
-        }
-
-        if matches.count >= 2, let secondDate = matches[1].date {
-            return (firstDate, secondDate)
-        }
-
-        return nil
-    }
-
-    private func splitRangeText(_ text: String) -> (start: String, end: String)? {
-        let connectors = [" to ", " through ", " thru ", " until ", " - ", " – ", " — "]
-
-        for connector in connectors {
-            if let connectorRange = text.range(of: connector, options: .caseInsensitive) {
-                let left = text[..<connectorRange.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines)
-                let right = text[connectorRange.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
-                if !left.isEmpty, !right.isEmpty {
-                    return (String(left), String(right))
-                }
-            }
-        }
-
-        return nil
-    }
-
-    private func parseSingleDate(_ text: String, relativeTo referenceDate: Date?) -> Date? {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        let trimmedLower = trimmed.lowercased()
-        let now = Date()
-
-        // === PRIMARY: SwiftyChrono NLP Parser ===
-        // Use reference date if provided for context-aware parsing
-        // forwardDate: 0 disables the "prefer future dates" behavior, perfect for a history search app
-        Chrono.defaultImpliedHour = 0
-        let chrono = Chrono()
-        let results = chrono.parse(text: trimmed, refDate: referenceDate ?? now, opt: [.forwardDate: 0])
-        if let result = results.first?.start.date {
-            return result
-        }
-
-        // === FALLBACK: Special cases ===
-
-        // Handle numeric day in context of reference date (e.g., "5 to 8" where "8" should be in same month)
-        if let referenceDate, let day = Int(trimmedLower), (1...31).contains(day) {
-            var referenceComponents = calendar.dateComponents([.year, .month, .day], from: referenceDate)
-            referenceComponents.day = day
-
-            if let candidate = calendar.date(from: referenceComponents) {
-                if let referenceDay = calendar.dateComponents([.day], from: referenceDate).day,
-                   day < referenceDay,
-                   let nextMonth = calendar.date(byAdding: .month, value: 1, to: referenceDate) {
-                    var nextMonthComponents = calendar.dateComponents([.year, .month], from: nextMonth)
-                    nextMonthComponents.day = day
-                    let result = calendar.date(from: nextMonthComponents) ?? candidate
-                    return result
-                }
-                return candidate
-            }
-        }
-
-        // Time-only parsing
-        if let timeOnlyDate = parseTimeOnly(trimmedLower, relativeTo: now) {
-            return timeOnlyDate
-        }
-
-        // NSDataDetector as final fallback
-        let normalizedText = normalizeCompactTimeFormat(trimmedLower)
-        if let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.date.rawValue) {
-            let range = NSRange(normalizedText.startIndex..., in: normalizedText)
-            if let match = detector.firstMatch(in: normalizedText, options: [], range: range),
-               let date = match.date {
-                return date
-            }
-        }
-
-        let formatStrings = [
-            "MMM d yyyy h:mm a",
-            "MMM d yyyy h:mma",
-            "MMM d yyyy ha",
-            "MMM d h:mm a",
-            "MMM d h:mma",
-            "MMM d ha",
-            "MMM d h a",
-            "MM/dd/yyyy h:mm a",
-            "MM/dd h:mm a",
-            "yyyy-MM-dd HH:mm",
-            "yyyy-MM-dd'T'HH:mm:ss",
-            "MMM d",
-            "MMMM d"
-        ]
-
-        for formatString in formatStrings {
-            let formatter = DateFormatter()
-            formatter.dateFormat = formatString
-            formatter.timeZone = .current
-            formatter.defaultDate = referenceDate ?? now
-
-            if let date = formatter.date(from: text) { return date }
-            if let date = formatter.date(from: trimmed) { return date }
-
-            let capitalized = trimmed.prefix(1).uppercased() + trimmed.dropFirst()
-            if let date = formatter.date(from: capitalized) { return date }
-        }
-
-        return nil
-    }
-
-    private func parseTimeOnly(_ text: String, relativeTo now: Date) -> Date? {
-        var input = text.trimmingCharacters(in: .whitespaces)
-        var isPM = false
-        var isAM = false
-
-        if input.hasSuffix("pm") || input.hasSuffix("p") {
-            isPM = true
-            input = input.replacingOccurrences(of: "pm", with: "")
-                .replacingOccurrences(of: "p", with: "")
-                .trimmingCharacters(in: .whitespaces)
-        } else if input.hasSuffix("am") || input.hasSuffix("a") {
-            isAM = true
-            input = input.replacingOccurrences(of: "am", with: "")
-                .replacingOccurrences(of: "a", with: "")
-                .trimmingCharacters(in: .whitespaces)
-        }
-
-        var hour: Int?
-        var minute = 0
-
-        if input.contains(":") {
-            let parts = input.split(separator: ":")
-            if parts.count == 2,
-               let h = Int(parts[0]),
-               let m = Int(parts[1]),
-               h >= 0 && h <= 23 && m >= 0 && m <= 59 {
-                hour = h
-                minute = m
-            }
-        } else if let numericValue = Int(input) {
-            if numericValue >= 0 && numericValue <= 23 {
-                hour = numericValue
-            } else if numericValue >= 100 && numericValue <= 2359 {
-                hour = numericValue / 100
-                minute = numericValue % 100
-                if hour! > 23 || minute > 59 {
-                    return nil
-                }
-            } else {
-                return nil
-            }
-        }
-
-        guard var finalHour = hour else { return nil }
-
-        if isPM && finalHour < 12 {
-            finalHour += 12
-        } else if isAM && finalHour == 12 {
-            finalHour = 0
-        }
-
-        var components = calendar.dateComponents([.year, .month, .day], from: now)
-        components.hour = finalHour
-        components.minute = minute
-        components.second = 0
-
-        return calendar.date(from: components)
-    }
-
-    private func normalizeCompactTimeFormat(_ text: String) -> String {
-        let pattern = #"(\d{3,4})\s*(am|pm)"#
-        guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) else {
-            return text
-        }
-
-        var result = text
-        let range = NSRange(text.startIndex..., in: text)
-        let matches = regex.matches(in: text, options: [], range: range)
-
-        for match in matches.reversed() {
-            guard let numberRange = Range(match.range(at: 1), in: result),
-                  let suffixRange = Range(match.range(at: 2), in: result),
-                  let fullMatchRange = Range(match.range, in: result) else {
-                continue
-            }
-
-            let numberStr = String(result[numberRange])
-            let suffix = String(result[suffixRange])
-            guard let numericValue = Int(numberStr) else { continue }
-
-            let hour: Int
-            let minute: Int
-            if numericValue >= 100 && numericValue <= 1259 {
-                hour = numericValue / 100
-                minute = numericValue % 100
-            } else {
-                continue
-            }
-
-            guard hour >= 1 && hour <= 12 && minute >= 0 && minute <= 59 else {
-                continue
-            }
-
-            let normalizedTime = "\(hour):\(String(format: "%02d", minute))\(suffix)"
-            result.replaceSubrange(fullMatchRange, with: normalizedTime)
-        }
-
-        return result
-    }
-
-    private func extractNumber(from text: String) -> Int? {
-        let pattern = "\\d+"
-        if let regex = try? NSRegularExpression(pattern: pattern),
-           let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
-           let range = Range(match.range, in: text) {
-            return Int(text[range])
-        }
-        return nil
+        inputParser.parse(text)
     }
 
     private func normalizeRange(_ start: Date, _ end: Date) -> (start: Date, end: Date) {
@@ -3565,12 +4118,77 @@ public struct DateRangeFilterPopover: View {
         return "Date range must be \(maxRangeDays) days or less."
     }
 
+    private func clearAllRangesAndDismiss() {
+        rangeInputText = ""
+        parseError = nil
+        hasCommittedPrimaryRange = false
+        additionalRangeInputTexts.removeAll()
+        additionalRangeIDs.removeAll()
+        additionalParseErrors.removeAll()
+        additionalParsedRanges.removeAll()
+        activeCalendarTarget = .primary
+        lastFocusedCalendarTarget = .primary
+        activeCalendarBoundary = .start
+        isCalendarVisible = false
+        setRangeInputFocus(.none)
+        onClear()
+        onDismiss?()
+    }
+
+    private func toggleCalendarVisibility() {
+        withAnimation(.easeOut(duration: 0.15)) {
+            isCalendarVisible.toggle()
+            focusedItem = 0
+            setRangeInputFocus(.none)
+            if isCalendarVisible {
+                synchronizeCalendarStateFromTarget(lastFocusedCalendarTarget)
+            } else {
+                activeCalendarBoundary = .start
+            }
+        }
+    }
+
+    private func addAnotherRangeAfterPrimarySubmitIfPossible() {
+        let hasTypedPrimaryRange = !rangeInputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        guard applyCurrentSelection(moveToNextDropdown: false) else { return }
+        guard hasTypedPrimaryRange, canAddAnotherRange else { return }
+        addAdditionalRangeInput()
+    }
+
+    private func addAnotherRangeAfterAdditionalSubmitIfPossible(for id: UUID) {
+        guard let index = additionalRangeIndex(for: id),
+              additionalRangeInputTexts.indices.contains(index) else {
+            return
+        }
+
+        let hasTypedAdditionalRange = !additionalRangeInputTexts[index]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty
+        guard applyAdditionalRangeInput(for: id, moveToNextDropdown: false) else { return }
+        guard hasTypedAdditionalRange, canAddAnotherRange else { return }
+        addAdditionalRangeInput()
+    }
+
     // MARK: - Keyboard Navigation
 
     private func setupKeyboardMonitor() {
         keyboardMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [self] event in
+            let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
             switch event.keyCode {
+            case 51 where modifiers == [.command], 117 where modifiers == [.command]: // Delete / Forward Delete
+                guard isResetEnabled else { return event }
+                onClearShortcut?()
+                clearAllRangesAndDismiss()
+                return nil
+
             case 53: // Escape
+                if isAnyRangeInputFocused {
+                    withAnimation(.easeOut(duration: 0.1)) {
+                        focusedItem = primaryRangeFocusedItem
+                    }
+                    setRangeInputFocus(.none)
+                    return nil
+                }
                 // Close calendar first, then dismiss the dropdown on the next Escape.
                 if isCalendarVisible {
                     withAnimation(.easeOut(duration: 0.15)) {
@@ -3595,12 +4213,20 @@ public struct DateRangeFilterPopover: View {
 
             case 36, 76: // Return/Enter
                 if isRangeInputFocused {
-                    // Match Tab behavior: apply/clear from input, then advance to next filter.
-                    applyCurrentSelection(moveToNextDropdown: true)
+                    if modifiers == [.shift] {
+                        addAnotherRangeAfterPrimarySubmitIfPossible()
+                    } else {
+                        // Match Tab behavior: apply/clear from input, then advance to next filter.
+                        _ = applyCurrentSelection(moveToNextDropdown: true)
+                    }
                     return nil
                 }
                 if let additionalID = focusedAdditionalRangeID {
-                    applyAdditionalRangeInput(for: additionalID)
+                    if modifiers == [.shift] {
+                        addAnotherRangeAfterAdditionalSubmitIfPossible(for: additionalID)
+                    } else {
+                        _ = applyAdditionalRangeInput(for: additionalID, moveToNextDropdown: true)
+                    }
                     return nil
                 }
 
@@ -3619,10 +4245,9 @@ public struct DateRangeFilterPopover: View {
             case 126: // Up arrow
                 if isAnyRangeInputFocused {
                     withAnimation(.easeOut(duration: 0.1)) {
-                        focusedItem = 0
+                        focusedItem = primaryRangeFocusedItem
                     }
-                    isRangeInputFocused = false
-                    focusedAdditionalRangeID = nil
+                    setRangeInputFocus(.none)
                     return nil
                 }
                 if isCalendarVisible {
@@ -3635,10 +4260,9 @@ public struct DateRangeFilterPopover: View {
             case 125: // Down arrow
                 if isAnyRangeInputFocused {
                     withAnimation(.easeOut(duration: 0.1)) {
-                        focusedItem = 0
+                        focusedItem = primaryRangeFocusedItem
                     }
-                    isRangeInputFocused = false
-                    focusedAdditionalRangeID = nil
+                    setRangeInputFocus(.none)
                     return nil
                 }
                 if isCalendarVisible {
@@ -3689,6 +4313,8 @@ public struct DateRangeFilterPopover: View {
 
     private func activateFocusedItem() {
         switch focusedItem {
+        case let item where item == primaryRangeFocusedItem:
+            focusPrimaryRangeInput()
         case 0:
             withAnimation(.easeOut(duration: 0.15)) {
                 isCalendarVisible.toggle()
@@ -3704,11 +4330,19 @@ public struct DateRangeFilterPopover: View {
         }
     }
 
+    private func focusPrimaryRangeInput() {
+        focusedItem = primaryRangeFocusedItem
+        lastFocusedCalendarTarget = .primary
+        setRangeInputFocus(.primary)
+        if isCalendarVisible {
+            synchronizeCalendarStateFromTarget(.primary)
+        }
+    }
+
     private func moveFocusedItem(by offset: Int) {
         withAnimation(.easeOut(duration: 0.1)) {
             focusedItem = max(0, min(itemCount - 1, focusedItem + offset))
-            isRangeInputFocused = false
-            focusedAdditionalRangeID = nil
+            setRangeInputFocus(.none)
         }
     }
 
@@ -3716,6 +4350,9 @@ public struct DateRangeFilterPopover: View {
         withAnimation(.easeOut(duration: 0.1)) {
             switch keyCode {
             case 123: // Left
+                if focusedItem == primaryRangeFocusedItem {
+                    return
+                }
                 if (1...4).contains(focusedItem) {
                     focusedItem = max(1, focusedItem - 1)
                 } else {
@@ -3723,6 +4360,10 @@ public struct DateRangeFilterPopover: View {
                 }
 
             case 124: // Right
+                if focusedItem == primaryRangeFocusedItem {
+                    focusedItem = 0
+                    break
+                }
                 if (1...4).contains(focusedItem) {
                     focusedItem = min(4, focusedItem + 1)
                 } else if focusedItem == 0 {
@@ -3732,6 +4373,10 @@ public struct DateRangeFilterPopover: View {
                 }
 
             case 125: // Down
+                if focusedItem == primaryRangeFocusedItem {
+                    focusedItem = 0
+                    break
+                }
                 if focusedItem == 0 {
                     focusedItem = 1
                 } else {
@@ -3739,22 +4384,22 @@ public struct DateRangeFilterPopover: View {
                 }
 
             case 126: // Up
-                if focusedItem == 0 {
-                    isRangeInputFocused = true
-                    focusedAdditionalRangeID = nil
+                if focusedItem == primaryRangeFocusedItem {
                     return
+                } else if focusedItem == 0 {
+                    focusedItem = primaryRangeFocusedItem
                 } else if (1...4).contains(focusedItem) {
                     focusedItem = 0
                 } else {
-                    moveFocusedItem(by: -1)
+                    setRangeInputFocus(.primary)
+                    return
                 }
 
             default:
                 break
             }
 
-            isRangeInputFocused = false
-            focusedAdditionalRangeID = nil
+            setRangeInputFocus(.none)
         }
     }
 

@@ -112,7 +112,10 @@ UI/
 │   ├── SimpleTimelineViewModel.swift    # Fullscreen timeline state, caching, playback, filters, OCR overlays
 │   ├── SearchViewModel.swift
 │   ├── DashboardViewModel.swift
+│   ├── DashboardViewModel+Metrics.swift # Extracted dashboard/timeline/system-monitor metric recording helpers
 │   ├── TimelineMetrics.swift         # Timeline-scoped daily_metrics helpers and shared UI metric recorder glue
+│   ├── TimelineYouTubeLinkSupport.swift # Shared YouTube timestamping + OCR markdown-link extraction helpers for timeline flows
+│   ├── UIMetricsRecorder.swift       # Shared UI metric recording + JSON payload helpers
 │   ├── CrashRecoveryBannerModel.swift   # Dashboard-facing banner state derived from crash recovery manager status
 │   ├── CommentComposerTargetDisplayInfo.swift # Shared display metadata/title logic for timeline and quick-comment composers
 │   ├── FeedbackViewModel.swift          # Feedback form state, diagnostics, export, submission

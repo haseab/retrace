@@ -138,9 +138,7 @@ public struct SpotlightSearchOverlay: View {
                 Color.black.opacity(isVisible ? 0.6 : 0)
                     .ignoresSafeArea()
                     .onTapGesture {
-                        if viewModel.isDropdownOpen {
-                            viewModel.closeDropdownsSignal += 1
-                        } else {
+                        if !viewModel.isDropdownOpen {
                             // Outside click should dismiss with animation but preserve search state.
                             dismissOverlayPreservingSearch()
                         }
@@ -175,10 +173,7 @@ public struct SpotlightSearchOverlay: View {
                                 resultsArea
                                     .contentShape(Rectangle())
                                     .onTapGesture {
-                                        // Dismiss dropdown when tapping on results area
-                                        if viewModel.isDropdownOpen {
-                                            viewModel.closeDropdownsSignal += 1
-                                        }
+                                        guard !viewModel.isDropdownOpen else { return }
                                     }
                             }
                         }

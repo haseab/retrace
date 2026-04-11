@@ -12646,6 +12646,9 @@ struct FilterDropdownOverlay: View {
                 onQuickPresetShortcut: { preset in
                     viewModel.recordKeyboardShortcut("timeline.date_range.\(preset.rawValue)")
                 },
+                onClearShortcut: {
+                    viewModel.recordKeyboardShortcut("timeline.date_range.clear")
+                },
                 onDismiss: {
                     withAnimation(.easeOut(duration: 0.15)) {
                         viewModel.dismissFilterDropdown()

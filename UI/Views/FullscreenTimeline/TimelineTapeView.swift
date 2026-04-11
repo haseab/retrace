@@ -1715,13 +1715,47 @@ enum TimelineHoverTooltipStyle {
     }
 }
 
+enum InstantTooltipPlacement {
+    case top
+    case bottom
+}
+
 struct InstantTooltip: ViewModifier {
     let text: String
     @Binding var isVisible: Bool
+    let placement: InstantTooltipPlacement
+
+    private var alignment: Alignment {
+        switch placement {
+        case .top:
+            return .top
+        case .bottom:
+            return .bottom
+        }
+    }
+
+    private var verticalOffset: CGFloat {
+        switch placement {
+        case .top:
+            return -44
+        case .bottom:
+            return 44
+        }
+    }
+
+    private var transitionYOffset: CGFloat {
+        switch placement {
+        case .top:
+            return 4
+        case .bottom:
+            return -4
+        }
+    }
 
     func body(content: Content) -> some View {
         content
-            .overlay(alignment: .top) {
+            .zIndex(isVisible ? 1 : 0)
+            .overlay(alignment: alignment) {
                 if isVisible {
                     Text(text)
                         .font(TimelineHoverTooltipStyle.font)
@@ -1734,8 +1768,8 @@ struct InstantTooltip: ViewModifier {
                             Capsule()
                                 .fill(TimelineHoverTooltipStyle.backgroundColor)
                         )
-                        .offset(y: -44)
-                        .transition(.opacity.combined(with: .offset(y: 4)))
+                        .offset(y: verticalOffset)
+                        .transition(.opacity.combined(with: .offset(y: transitionYOffset)))
                         .allowsHitTesting(false)
                 }
             }
@@ -1744,8 +1778,12 @@ struct InstantTooltip: ViewModifier {
 }
 
 extension View {
-    func instantTooltip(_ text: String, isVisible: Binding<Bool>) -> some View {
-        modifier(InstantTooltip(text: text, isVisible: isVisible))
+    func instantTooltip(
+        _ text: String,
+        isVisible: Binding<Bool>,
+        placement: InstantTooltipPlacement = .top
+    ) -> some View {
+        modifier(InstantTooltip(text: text, isVisible: isVisible, placement: placement))
     }
 }
 
@@ -1831,6 +1869,26 @@ struct FloatingDateSearchPanel: View {
 
     private var isCalendarKeyboardSelected: Bool {
         keyboardSelection == .calendar
+    }
+
+    private var calendarButtonForegroundColor: Color {
+        .white.opacity(isCalendarButtonHovering ? 1 : 0.9)
+    }
+
+    private var calendarButtonBackgroundColor: Color {
+        isCalendarButtonHovering
+            ? RetraceMenuStyle.actionBlue
+            : Color.white.opacity(0.08)
+    }
+
+    private var calendarButtonBorderColor: Color {
+        if isCalendarButtonHovering {
+            return RetraceMenuStyle.actionBlue.opacity(0.55)
+        }
+        if isCalendarKeyboardSelected {
+            return Color.white.opacity(0.95)
+        }
+        return Color.white.opacity(0.08)
     }
 
     private func openCalendarPicker() {
@@ -1989,17 +2047,17 @@ struct FloatingDateSearchPanel: View {
                     Text("Browse Calendar")
                         .font(.retraceCaptionMedium)
                 }
-                .foregroundColor(.white)
+                .foregroundColor(calendarButtonForegroundColor)
                 .padding(.horizontal, 16)
                 .padding(.vertical, 10)
                 .frame(maxWidth: .infinity)
                 .background(
                     RoundedRectangle(cornerRadius: 10)
-                        .fill(isCalendarButtonHovering ? RetraceMenuStyle.actionBlue : RetraceMenuStyle.actionBlue.opacity(0.8))
+                        .fill(calendarButtonBackgroundColor)
                 )
                 .overlay(
                     RoundedRectangle(cornerRadius: 10)
-                        .stroke(Color.white.opacity(isCalendarKeyboardSelected ? 0.95 : 0), lineWidth: 1.5)
+                        .stroke(calendarButtonBorderColor, lineWidth: isCalendarKeyboardSelected ? 1.5 : 1)
                 )
             }
             .buttonStyle(.plain)

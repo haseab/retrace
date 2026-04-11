@@ -177,6 +177,78 @@ final class FocusableTextInputSupportTests: XCTestCase {
         XCTAssertTrue(didInvokeCommandReturn)
     }
 
+    func testSyncResponderFocusStartsEditingWhenFocusIsRequestedProgrammatically() {
+        let window = KeyableWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 320, height: 120),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        let contentView = NSView(frame: window.contentRect(forFrameRect: window.frame))
+        window.contentView = contentView
+
+        let textField = FocusableTextField(frame: NSRect(x: 20, y: 40, width: 240, height: 24))
+        textField.stringValue = "Apr 9, 2026"
+        contentView.addSubview(textField)
+
+        window.makeKeyAndOrderFront(nil)
+
+        FocusableTextInput.syncResponderFocus(for: textField, wantsFocus: true)
+
+        let currentEditor = textField.currentEditor()
+        XCTAssertNotNil(currentEditor)
+        XCTAssertTrue(window.firstResponder === textField || window.firstResponder === currentEditor)
+    }
+
+    func testCoordinatorRestoresEditingWhenAppKitEndsEditingButFocusIsStillRequested() {
+        let window = KeyableWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 320, height: 120),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        let contentView = NSView(frame: window.contentRect(forFrameRect: window.frame))
+        window.contentView = contentView
+
+        let textField = FocusableTextField(frame: NSRect(x: 20, y: 40, width: 240, height: 24))
+        textField.stringValue = "Apr 9, 2026"
+        contentView.addSubview(textField)
+
+        window.makeKeyAndOrderFront(nil)
+        textField.selectText(nil)
+        _ = window.makeFirstResponder(nil)
+
+        var isFocused = true
+        var focusTransitions: [Bool] = []
+        var didBlur = false
+        let coordinator = FocusableTextInput.Coordinator(
+            text: .constant(textField.stringValue),
+            onSubmit: nil,
+            onEscape: nil,
+            isFocused: { isFocused },
+            setFocused: { isNowFocused in
+                focusTransitions.append(isNowFocused)
+                isFocused = isNowFocused
+            },
+            onBlur: {
+                didBlur = true
+            }
+        )
+
+        coordinator.controlTextDidEndEditing(
+            Notification(name: NSControl.textDidEndEditingNotification, object: textField)
+        )
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        XCTAssertTrue(isFocused)
+        XCTAssertTrue(focusTransitions.isEmpty)
+        XCTAssertFalse(didBlur)
+
+        let currentEditor = textField.currentEditor()
+        XCTAssertNotNil(currentEditor)
+        XCTAssertTrue(window.firstResponder === textField || window.firstResponder === currentEditor)
+    }
+
     func testShouldDeferRightClickToTextInputWhenHitEditableTextField() throws {
         let window = KeyableWindow(
             contentRect: NSRect(x: 0, y: 0, width: 320, height: 120),
@@ -267,5 +339,68 @@ final class FocusableTextInputSupportTests: XCTestCase {
         let filteredMenu = TextInputContextMenuAutofillFilter.filteredMenu(from: menu)
 
         XCTAssertEqual(filteredMenu?.items.map(\.title), ["Cut", "Copy", "Paste"])
+    }
+
+    func testDropdownOverlayHitTestingKeepsInsideClicksOpen() throws {
+        let window = makeWindowForDropdownHitTesting()
+        let triggerFrame = screenFrame(in: window, origin: NSPoint(x: 20, y: 20), size: CGSize(width: 120, height: 32))
+        let contentFrame = screenFrame(in: window, origin: NSPoint(x: 60, y: 72), size: CGSize(width: 220, height: 140))
+        let event = try mouseEvent(in: window, location: NSPoint(x: 90, y: 100))
+
+        XCTAssertFalse(
+            DropdownOverlayInteraction.shouldDismiss(
+                event: event,
+                triggerFrame: triggerFrame,
+                contentFrame: contentFrame
+            )
+        )
+    }
+
+    func testDropdownOverlayHitTestingDismissesOutsideClicks() throws {
+        let window = makeWindowForDropdownHitTesting()
+        let triggerFrame = screenFrame(in: window, origin: NSPoint(x: 20, y: 20), size: CGSize(width: 120, height: 32))
+        let contentFrame = screenFrame(in: window, origin: NSPoint(x: 60, y: 72), size: CGSize(width: 220, height: 140))
+        let event = try mouseEvent(in: window, location: NSPoint(x: 12, y: 12))
+
+        XCTAssertTrue(
+            DropdownOverlayInteraction.shouldDismiss(
+                event: event,
+                triggerFrame: triggerFrame,
+                contentFrame: contentFrame
+            )
+        )
+    }
+
+    private func makeWindowForDropdownHitTesting() -> NSWindow {
+        let window = KeyableWindow(
+            contentRect: NSRect(x: 420, y: 260, width: 360, height: 220),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = NSView(frame: window.contentRect(forFrameRect: window.frame))
+        window.makeKeyAndOrderFront(nil)
+        addTeardownBlock { window.orderOut(nil) }
+        return window
+    }
+
+    private func screenFrame(in window: NSWindow, origin: NSPoint, size: CGSize) -> CGRect {
+        CGRect(origin: window.convertPoint(toScreen: origin), size: size)
+    }
+
+    private func mouseEvent(in window: NSWindow, location: NSPoint) throws -> NSEvent {
+        try XCTUnwrap(
+            NSEvent.mouseEvent(
+                with: .leftMouseDown,
+                location: location,
+                modifierFlags: [],
+                timestamp: 0,
+                windowNumber: window.windowNumber,
+                context: nil,
+                eventNumber: 0,
+                clickCount: 1,
+                pressure: 1
+            )
+        )
     }
 }

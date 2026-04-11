@@ -65,24 +65,3 @@ enum TimelineMetrics {
         )
     }
 }
-
-private enum UIMetricsRecorder {
-    static func record(
-        coordinator: AppCoordinator,
-        type: DailyMetricsQueries.MetricType,
-        metadata: String? = nil
-    ) {
-        Task {
-            try? await coordinator.recordMetricEvent(metricType: type, metadata: metadata)
-        }
-    }
-
-    static func jsonMetadata(_ payload: [String: Any]) -> String? {
-        guard JSONSerialization.isValidJSONObject(payload),
-              let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
-              let json = String(data: data, encoding: .utf8) else {
-            return nil
-        }
-        return json
-    }
-}
