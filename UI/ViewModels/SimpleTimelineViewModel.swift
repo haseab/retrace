@@ -14629,6 +14629,14 @@ public class SimpleTimelineViewModel: ObservableObject {
             return finalizeParsedDate(timeOnlyDate)
         }
 
+        if let dateWithLeadingTime = parseDateWithLeadingTimeComponent(
+            normalizedWithCompactTimes,
+            now: now,
+            calendar: calendar
+        ) {
+            return finalizeParsedDate(dateWithLeadingTime)
+        }
+
         if let standaloneMonthDate = parseStandaloneMonthReference(
             normalizedRelativeInput,
             now: now,
@@ -15465,21 +15473,28 @@ public class SimpleTimelineViewModel: ObservableObject {
                 hour = h
                 minute = m
             }
-        } else if let numericValue = Int(input) {
-            // Parse compact format (e.g., "938", "1430", "9")
-            if numericValue >= 0 && numericValue <= 23 {
+        } else if input.range(of: #"^\d{1,4}$"#, options: .regularExpression) != nil,
+                  let numericValue = Int(input) {
+            switch input.count {
+            case 1, 2:
                 // Single or double digit hour (e.g., "9" or "21")
-                hour = numericValue
-                minute = 0
-            } else if numericValue >= 100 && numericValue <= 2359 {
-                // 3-4 digit time (e.g., "938" -> 9:38, "1430" -> 14:30)
-                hour = numericValue / 100
-                minute = numericValue % 100
-                // Validate
-                if hour! > 23 || minute > 59 {
+                guard numericValue >= 0 && numericValue <= 23 else {
                     return nil
                 }
-            } else {
+                hour = numericValue
+                minute = 0
+
+            case 3, 4:
+                // 3-4 digit time (e.g., "938" -> 9:38, "1430" -> 14:30, "0012" -> 00:12)
+                let parsedHour = numericValue / 100
+                let parsedMinute = numericValue % 100
+                guard parsedHour >= 0 && parsedHour <= 23 && parsedMinute >= 0 && parsedMinute <= 59 else {
+                    return nil
+                }
+                hour = parsedHour
+                minute = parsedMinute
+
+            default:
                 return nil
             }
         }
@@ -15505,10 +15520,61 @@ public class SimpleTimelineViewModel: ObservableObject {
         return calendar.date(from: components)
     }
 
+    private func parseDateWithLeadingTimeComponent(
+        _ text: String,
+        now: Date,
+        calendar: Calendar
+    ) -> Date? {
+        guard let regex = try? NSRegularExpression(
+            pattern: #"^\s*((?:\d{1,2}:\d{2}(?:\s*(?:am|pm|a|p))?|\d{3,4}(?:\s*(?:am|pm|a|p))?|\d{1,2}\s*(?:am|pm|a|p)))\s+(.+?)\s*$"#,
+            options: [.caseInsensitive]
+        ) else {
+            return nil
+        }
+
+        let searchRange = NSRange(text.startIndex..., in: text)
+        guard let match = regex.firstMatch(in: text, options: [], range: searchRange),
+              let timeRange = Range(match.range(at: 1), in: text),
+              let dateRange = Range(match.range(at: 2), in: text) else {
+            return nil
+        }
+
+        let timeToken = String(text[timeRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let dateToken = String(text[dateRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let lowercasedDateToken = dateToken.lowercased()
+        let dateTokenHasRelativeContext = lowercasedDateToken.range(
+            of: #"\b(?:today|tomorrow|yesterday|tonight|(?:next|last|this)\s+(?:mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:rs|rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?|week|month|year)|\d+\s*(?:day|days|week|weeks|wk|wks|month|months|mo|mos|year|years|yr|yrs)\s*(?:ago|from now)|in\s+\d+\s*(?:day|days|week|weeks|wk|wks|month|months|mo|mos|year|years|yr|yrs))\b"#,
+            options: [.regularExpression, .caseInsensitive]
+        ) != nil
+
+        if timeToken.range(of: #"^\d{4}$"#, options: .regularExpression) != nil,
+           let numericTimeToken = Int(timeToken),
+           (1900...2100).contains(numericTimeToken),
+           !dateTokenHasRelativeContext {
+            return nil
+        }
+
+        guard !dateToken.isEmpty,
+              let timeDate = parseTimeOnly(timeToken, relativeTo: now),
+              let dateOnly = parseNaturalLanguageDate(dateToken, now: now)
+        else {
+            return nil
+        }
+
+        var dateComponents = calendar.dateComponents([.year, .month, .day], from: dateOnly)
+        let timeComponents = calendar.dateComponents([.hour, .minute], from: timeDate)
+        dateComponents.hour = timeComponents.hour
+        dateComponents.minute = timeComponents.minute
+        dateComponents.second = 0
+
+        return calendar.date(from: dateComponents)
+    }
+
     /// Normalize compact time formats in a string to colon format for NSDataDetector
     /// Converts:
     /// - "827am" -> "8:27am", "1130pm" -> "11:30pm"
     /// - "feb 28 1417" -> "feb 28 14:17" (for date-jump compact 24-hour time)
+    /// - "1843 1 day ago" -> "18:43 1 day ago"
     private func normalizeCompactTimeFormat(_ text: String) -> String {
         // Pattern matches 3-4 digit numbers followed immediately by am/pm (with optional space)
         // Examples: "827am", "827 am", "1130pm", "1130 pm"
@@ -15557,28 +15623,60 @@ public class SimpleTimelineViewModel: ObservableObject {
             result.replaceSubrange(fullMatchRange, with: normalizedTime)
         }
 
-        // Support compact 24-hour time token in date context:
-        // "feb 28 1417" -> "feb 28 14:17"
-        if let trailingCompactRange = result.range(
-            of: #"\b\d{3,4}\b$"#,
+        // Support standalone compact 24-hour tokens when another part of the query
+        // makes it clear the token is time, not a bare year.
+        let lowercasedResult = result.lowercased()
+        let hasRelativeDateContext = lowercasedResult.range(
+            of: #"\b(?:today|tomorrow|yesterday|tonight|(?:next|last|this)\s+(?:mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:rs|rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?|week|month|year)|\d+\s*(?:day|days|week|weeks|wk|wks|month|months|mo|mos|year|years|yr|yrs)\s*(?:ago|from now)|in\s+\d+\s*(?:day|days|week|weeks|wk|wks|month|months|mo|mos|year|years|yr|yrs))\b"#,
             options: [.regularExpression, .caseInsensitive]
-        ) {
-            let token = String(result[trailingCompactRange])
-            if let numericValue = Int(token), numericValue >= 100, numericValue <= 2359 {
-                let hour = numericValue / 100
-                let minute = numericValue % 100
-                let isPlausibleModernYear = (1900...2100).contains(numericValue)
-                if hour <= 23 && minute <= 59 && !isPlausibleModernYear {
-                    let prefix = String(result[..<trailingCompactRange.lowerBound])
-                    let hasDateContext = prefix.range(
-                        of: #"\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?|today|tomorrow|yesterday|(?:next|last|this)\s+(?:mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:rs|rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?))\b|\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b|\b\d{4}-\d{1,2}-\d{1,2}\b"#,
-                        options: [.regularExpression, .caseInsensitive]
-                    ) != nil
-                    if hasDateContext {
-                        let normalizedTime = "\(hour):\(String(format: "%02d", minute))"
-                        result = prefix + normalizedTime
+        ) != nil
+        let hasCalendarDateContext = lowercasedResult.range(
+            of: #"\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b|\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b|\b\d{4}-\d{1,2}-\d{1,2}\b"#,
+            options: [.regularExpression, .caseInsensitive]
+        ) != nil
+
+        if hasRelativeDateContext || hasCalendarDateContext,
+           let standaloneTimeRegex = try? NSRegularExpression(pattern: #"\b\d{3,4}\b"#) {
+            let searchRange = NSRange(result.startIndex..., in: result)
+            let matches = standaloneTimeRegex.matches(in: result, options: [], range: searchRange)
+
+            for match in matches.reversed() {
+                guard let tokenRange = Range(match.range, in: result) else {
+                    continue
+                }
+
+                let token = String(result[tokenRange])
+                guard let numericValue = Int(token) else {
+                    continue
+                }
+
+                if tokenRange.lowerBound > result.startIndex {
+                    let previousIndex = result.index(before: tokenRange.lowerBound)
+                    let previousCharacter = result[previousIndex]
+                    if previousCharacter == "/" || previousCharacter == "-" {
+                        continue
                     }
                 }
+                if tokenRange.upperBound < result.endIndex {
+                    let nextCharacter = result[tokenRange.upperBound]
+                    if nextCharacter == "/" || nextCharacter == "-" {
+                        continue
+                    }
+                }
+
+                let hour = numericValue / 100
+                let minute = numericValue % 100
+                guard hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59 else {
+                    continue
+                }
+
+                if !hasRelativeDateContext, (1900...2100).contains(numericValue) {
+                    continue
+                }
+
+                let hourString = token.count == 4 ? String(format: "%02d", hour) : "\(hour)"
+                let normalizedTime = "\(hourString):\(String(format: "%02d", minute))"
+                result.replaceSubrange(tokenRange, with: normalizedTime)
             }
         }
 
