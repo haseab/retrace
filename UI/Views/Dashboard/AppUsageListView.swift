@@ -127,6 +127,7 @@ struct AppUsageListView: View {
     let apps: [AppUsageData]
     let totalTime: TimeInterval
     var layoutSize: AppUsageLayoutSize = .normal
+    var scrollAffordanceColor: Color = .retraceBackground
     var loadWindowUsage: ((String, Int) async -> WindowUsagePage)? = nil  // For websites (domain aggregation)
     var loadTabsForDomain: ((String, String) async -> [WindowUsageData])? = nil  // (bundleID, domain) -> tabs for that domain
     var onWindowTapped: ((AppUsageData, WindowUsageData) -> Void)? = nil
@@ -178,7 +179,7 @@ struct AppUsageListView: View {
             }
 
             // Inner shadow scroll affordance
-            ScrollAffordance(height: 40, color: Color.retraceBackground)
+            ScrollAffordance(height: 40, color: scrollAffordanceColor)
         }
     }
 

@@ -583,7 +583,7 @@ public struct DashboardView: View {
                                 .padding(.bottom, 20) // Extra padding for scroll affordance
                             }
 
-                            ScrollAffordance(height: 32, color: themeBaseBackground)
+                            ScrollAffordance(height: 32, color: themeScrollAffordanceColor)
                         }
                         .frame(width: layoutSize.cardWidth)
                     }
@@ -1509,6 +1509,7 @@ public struct DashboardView: View {
                     apps: viewModel.weeklyAppUsage,
                     totalTime: viewModel.totalWeeklyTime,
                     layoutSize: layoutSize,
+                    scrollAffordanceColor: themeScrollAffordanceColor,
                     loadWindowUsage: { bundleID, visibleCount in
                         await viewModel.getWindowUsageForApp(bundleID: bundleID, limit: visibleCount)
                     },
@@ -1541,6 +1542,28 @@ public struct DashboardView: View {
 
     private var themeBorderColor: Color {
         currentTheme.controlBorderColor
+    }
+
+    /// Keeps the scroll fades aligned with the selected accent without changing
+    /// the dashboard's actual background surface.
+    private var themeScrollAffordanceColor: Color {
+        let baseColor = NSColor(themeBaseBackground).usingColorSpace(.sRGB) ?? NSColor.black
+        let accentColor = NSColor(currentTheme.glowColor).usingColorSpace(.sRGB) ?? baseColor
+
+        let tintStrength: CGFloat = 0.22
+        let darknessScale: CGFloat = 0.60
+
+        let red = ((baseColor.redComponent * (1 - tintStrength)) + (accentColor.redComponent * tintStrength)) * darknessScale
+        let green = ((baseColor.greenComponent * (1 - tintStrength)) + (accentColor.greenComponent * tintStrength)) * darknessScale
+        let blue = ((baseColor.blueComponent * (1 - tintStrength)) + (accentColor.blueComponent * tintStrength)) * darknessScale
+
+        return Color(
+            .sRGB,
+            red: Double(min(max(red, 0), 1)),
+            green: Double(min(max(green, 0), 1)),
+            blue: Double(min(max(blue, 0), 1)),
+            opacity: 1
+        )
     }
 
     /// Theme-aware base background color
