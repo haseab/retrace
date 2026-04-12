@@ -972,6 +972,10 @@ public actor AppCoordinator {
         await services.refreshRewindCutoffDate()
     }
 
+    public func latestRewindFrameDate() async -> Date? {
+        await services.latestRewindFrameDate()
+    }
+
     /// Setup callback for accessibility permission warnings
     public func setupAccessibilityWarningCallback(_ callback: @escaping @Sendable () -> Void) async {
         services.capture.onAccessibilityPermissionWarning = callback

@@ -62,14 +62,16 @@ extension SettingsView {
     }
 
     func applyRewindCutoffDate(_ cutoffDate: Date) {
-        guard cutoffDate != rewindCutoffDateSelection else {
+        let normalizedCutoffDate = Calendar.current.startOfDay(for: cutoffDate)
+
+        guard normalizedCutoffDate != rewindCutoffDateSelection else {
             return
         }
 
-        rewindCutoffDateSelection = cutoffDate
-        settingsStore.set(cutoffDate, forKey: rewindCutoffDateDefaultsKey)
-        Log.info("Updated Rewind cutoff date to: \(cutoffDate)", category: .ui)
-        recordRewindCutoffMetric(cutoffDate)
+        rewindCutoffDateSelection = normalizedCutoffDate
+        settingsStore.set(normalizedCutoffDate, forKey: rewindCutoffDateDefaultsKey)
+        Log.info("Updated Rewind cutoff date to: \(normalizedCutoffDate)", category: .ui)
+        recordRewindCutoffMetric(normalizedCutoffDate)
         rewindCutoffRefreshTask?.cancel()
         isRefreshingRewindCutoff = true
 

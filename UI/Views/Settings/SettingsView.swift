@@ -98,7 +98,9 @@ public struct SettingsView: View {
     @State var previewRetentionDays: Int?  // Visual preview while selecting
     @AppStorage("maxStorageGB", store: settingsStore) var maxStorageGB: Double = SettingsDefaults.maxStorageGB
     @AppStorage("useRewindData", store: settingsStore) var useRewindData: Bool = SettingsDefaults.useRewindData
-    @State var rewindCutoffDateSelection: Date = ServiceContainer.rewindCutoffDate(in: settingsStore)
+    @State var rewindCutoffDateSelection: Date = Calendar.current.startOfDay(
+        for: ServiceContainer.rewindCutoffDate(in: settingsStore)
+    )
     @State var isRefreshingRewindCutoff = false
     @State var settingsToastMessage: String?
     @State var settingsToastVisible = false
@@ -239,7 +241,8 @@ public struct SettingsView: View {
     }
 
     var hasCustomRewindCutoffDate: Bool {
-        rewindCutoffDateSelection != SettingsDefaults.rewindCutoffDate
+        Calendar.current.startOfDay(for: rewindCutoffDateSelection)
+            != Calendar.current.startOfDay(for: SettingsDefaults.rewindCutoffDate)
     }
 
     var defaultRewindCutoffDateDescription: String {
@@ -247,7 +250,7 @@ public struct SettingsView: View {
     }
 
     var customRewindCutoffWarningText: String {
-        let formattedCutoff = rewindCutoffDateSelection.formatted(date: .abbreviated, time: .shortened)
+        let formattedCutoff = rewindCutoffDateSelection.formatted(date: .abbreviated, time: .omitted)
         return "When Rewind data is enabled, any native Retrace data before \(formattedCutoff) will not be available."
     }
 

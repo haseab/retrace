@@ -470,6 +470,10 @@ public actor ServiceContainer {
         return refreshed
     }
 
+    public func latestRewindFrameDate() async -> Date? {
+        Self.latestRewindFrameDate(databasePath: AppPaths.rewindDBPath)
+    }
+
     /// Helper to configure Rewind source on DataAdapter
     private func configureRewindSource(adapter: DataAdapter) async {
         let rewindDBPath = NSString(string: AppPaths.rewindDBPath).expandingTildeInPath
@@ -543,6 +547,70 @@ public actor ServiceContainer {
             password: rewindSQLCipherPassword,
             cipherCompatibility: rewindCipherCompatibility
         )
+    }
+
+    nonisolated static func latestRewindFrameDate(databasePath: String) -> Date? {
+        let expandedPath = NSString(string: databasePath).expandingTildeInPath
+
+        guard FileManager.default.fileExists(atPath: expandedPath) else {
+            Log.info("[ServiceContainer] Rewind database not found while probing latest frame: \(expandedPath)", category: .app)
+            return nil
+        }
+
+        let connection: DatabaseConnection
+        do {
+            connection = try makeRewindConnection(databasePath: expandedPath)
+        } catch {
+            Log.error("[ServiceContainer] Failed to open Rewind database while probing latest frame", category: .app, error: error)
+            return nil
+        }
+
+        guard let db = connection.getConnection() else {
+            Log.warning("[ServiceContainer] Rewind database connection was nil while probing latest frame", category: .app)
+            return nil
+        }
+
+        var statement: OpaquePointer?
+        defer {
+            sqlite3_finalize(statement)
+            let closeResult = sqlite3_close_v2(db)
+            if closeResult != SQLITE_OK {
+                let message = String(cString: sqlite3_errmsg(db))
+                Log.warning(
+                    "[ServiceContainer] Failed to close Rewind probe connection (\(closeResult)): \(message)",
+                    category: .app
+                )
+            }
+        }
+
+        let sql = "SELECT MAX(createdAt) FROM frame;"
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            let message = String(cString: sqlite3_errmsg(db))
+            Log.warning("[ServiceContainer] Failed to prepare latest Rewind frame probe: \(message)", category: .app)
+            return nil
+        }
+
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            let message = String(cString: sqlite3_errmsg(db))
+            Log.warning("[ServiceContainer] Latest Rewind frame probe did not return a row: \(message)", category: .app)
+            return nil
+        }
+
+        guard let value = sqlite3_column_text(statement, 0) else {
+            Log.info("[ServiceContainer] Latest Rewind frame probe returned no timestamp", category: .app)
+            return nil
+        }
+
+        let latestFrameTimestamp = String(cString: value)
+        guard let date = DatabaseConfig.rewindDateFormatter.date(from: latestFrameTimestamp) else {
+            Log.warning(
+                "[ServiceContainer] Failed to parse latest Rewind frame timestamp: \(latestFrameTimestamp)",
+                category: .app
+            )
+            return nil
+        }
+
+        return date
     }
 
     public nonisolated static func defaultRewindCutoffDate(calendar: Calendar = .current) -> Date {

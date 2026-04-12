@@ -63,26 +63,19 @@ extension SettingsView {
                             Text("Rewind cutoff date")
                                 .font(.retraceCalloutMedium)
                                 .foregroundColor(.retracePrimary)
-                            Text("Only Rewind frames before this date and time are shown. Default is \(defaultRewindCutoffDateDescription).")
+                            Text("Only Rewind frames before this date are shown. We use the start of the selected day. Default is \(defaultRewindCutoffDateDescription).")
                                 .font(.retraceCaption2)
                                 .foregroundColor(.retraceSecondary.opacity(0.8))
                         }
 
                         Spacer()
 
-                        DatePicker(
-                            "",
-                            selection: Binding(
-                                get: { rewindCutoffDateSelection },
-                                set: { newValue in
-                                    applyRewindCutoffDate(newValue)
-                                }
-                            ),
-                            displayedComponents: [.date, .hourAndMinute]
-                        )
-                        .datePickerStyle(.compact)
-                        .labelsHidden()
-                        .disabled(isRefreshingRewindCutoff)
+                        RewindCutoffCalendarTrigger(
+                            selectedDate: rewindCutoffDateSelection,
+                            isDisabled: isRefreshingRewindCutoff
+                        ) { newValue in
+                            applyRewindCutoffDate(newValue)
+                        }
                     }
 
                     if hasCustomRewindCutoffDate {
@@ -575,5 +568,356 @@ private struct RewindSettingsLogoIcon: View {
     var body: some View {
         RewindLogoIcon(color: .white)
             .frame(width: 18, height: 12)
+    }
+}
+
+private struct RewindCutoffCalendarTrigger: View {
+    let selectedDate: Date
+    let isDisabled: Bool
+    let onApply: (Date) -> Void
+
+    @State private var isPresented = false
+    @State private var draftSelection: Date
+    @State private var displayedMonth: Date
+
+    private let calendar = Calendar.current
+    private let panelWidth: CGFloat = 296
+
+    private static let monthFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = .current
+        formatter.dateFormat = "MMM yyyy"
+        return formatter
+    }()
+
+    private static let weekdayFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = .current
+        return formatter
+    }()
+
+    init(
+        selectedDate: Date,
+        isDisabled: Bool,
+        onApply: @escaping (Date) -> Void
+    ) {
+        self.selectedDate = selectedDate
+        self.isDisabled = isDisabled
+        self.onApply = onApply
+
+        let calendar = Calendar.current
+        let clampedSelection = min(selectedDate, Date())
+        let monthAnchor =
+            calendar.date(from: calendar.dateComponents([.year, .month], from: clampedSelection))
+            ?? clampedSelection
+
+        _draftSelection = State(initialValue: clampedSelection)
+        _displayedMonth = State(initialValue: monthAnchor)
+    }
+
+    var body: some View {
+        Button(action: openCalendar) {
+            HStack(spacing: 10) {
+                Image(systemName: "calendar")
+                    .font(.retraceCalloutMedium)
+
+                Text(selectedDate.formatted(date: .abbreviated, time: .omitted))
+                    .font(.retraceCaptionMedium)
+                    .foregroundColor(.white)
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+            .background(
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(isDisabled ? Color.white.opacity(0.04) : Color.white.opacity(0.08))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 10)
+                    .stroke(isPresented ? RetraceMenuStyle.actionBlue.opacity(0.75) : Color.white.opacity(0.12), lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .disabled(isDisabled)
+        .popover(isPresented: $isPresented, arrowEdge: .bottom) {
+            browserPanel
+        }
+        .onChange(of: selectedDate) { newValue in
+            guard !isPresented else { return }
+            let clampedSelection = clamp(newValue)
+            draftSelection = clampedSelection
+            displayedMonth = monthAnchor(for: clampedSelection)
+        }
+    }
+
+    private var browserPanel: some View {
+        VStack(spacing: 0) {
+            calendarPane
+            Divider()
+                .background(Color.white.opacity(0.1))
+
+            HStack {
+                Button("Today") {
+                    let today = clamp(Date())
+                    draftSelection = today
+                    displayedMonth = monthAnchor(for: today)
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(.white.opacity(0.82))
+
+                Spacer()
+
+                Button("Cancel") {
+                    closeWithoutSaving()
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(.white.opacity(0.68))
+
+                Button("Apply") {
+                    commitSelection()
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(.white)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(RetraceMenuStyle.actionBlue)
+                )
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+        }
+        .background(
+            ZStack {
+                RoundedRectangle(cornerRadius: 20)
+                    .fill(Color(white: 0.08))
+
+                RoundedRectangle(cornerRadius: 20)
+                    .fill(
+                        LinearGradient(
+                            colors: [Color.white.opacity(0.08), Color.white.opacity(0.02)],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+
+                RoundedRectangle(cornerRadius: 20)
+                    .stroke(
+                        LinearGradient(
+                            colors: [Color.white.opacity(0.15), Color.white.opacity(0.03)],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        ),
+                        lineWidth: 1
+                    )
+            }
+        )
+        .shadow(color: .black.opacity(0.28), radius: 28, y: 14)
+        .frame(width: panelWidth)
+        .padding(2)
+    }
+
+    private var calendarPane: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Spacer()
+                Text("Choose Cutoff Date")
+                    .font(.retraceCalloutBold)
+                    .foregroundColor(.white)
+                Spacer()
+            }
+            .padding(.top, 14)
+            .padding(.bottom, 12)
+
+            HStack {
+                Button(action: { changeMonth(by: -1) }) {
+                    Image(systemName: "chevron.left")
+                        .font(.retraceCaption2Bold)
+                        .foregroundColor(.white.opacity(0.6))
+                        .frame(width: 28, height: 28)
+                        .background(Color.white.opacity(0.08))
+                        .clipShape(Circle())
+                }
+                .buttonStyle(.plain)
+
+                Spacer()
+
+                Text(monthYearString)
+                    .font(.retraceCaptionMedium)
+                    .foregroundColor(.white.opacity(0.8))
+
+                Spacer()
+
+                Button(action: { changeMonth(by: 1) }) {
+                    Image(systemName: "chevron.right")
+                        .font(.retraceCaption2Bold)
+                        .foregroundColor(.white.opacity(canAdvanceMonth ? 0.6 : 0.25))
+                        .frame(width: 28, height: 28)
+                        .background(Color.white.opacity(canAdvanceMonth ? 0.08 : 0.03))
+                        .clipShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .disabled(!canAdvanceMonth)
+            }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 10)
+
+            HStack(spacing: 0) {
+                ForEach(weekdaySymbols, id: \.self) { day in
+                    Text(day)
+                        .font(.retraceTinyMedium)
+                        .foregroundColor(.white.opacity(0.4))
+                        .frame(maxWidth: .infinity)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.bottom, 8)
+
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 2), count: 7), spacing: 2) {
+                ForEach(daysInMonth(), id: \.self) { day in
+                    dayCell(for: day)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.bottom, 18)
+        }
+    }
+
+    private var maximumSelectableDate: Date {
+        calendar.startOfDay(for: Date())
+    }
+
+    private var monthYearString: String {
+        Self.monthFormatter.string(from: displayedMonth)
+    }
+
+    private var weekdaySymbols: [String] {
+        let symbols = Self.weekdayFormatter.shortStandaloneWeekdaySymbols
+            ?? Self.weekdayFormatter.shortWeekdaySymbols
+            ?? []
+        guard !symbols.isEmpty else { return ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"] }
+
+        let firstWeekdayIndex = max(0, min(symbols.count - 1, calendar.firstWeekday - 1))
+        return (Array(symbols[firstWeekdayIndex...]) + Array(symbols[..<firstWeekdayIndex]))
+            .map { String($0.prefix(3)) }
+    }
+
+    private var canAdvanceMonth: Bool {
+        guard let nextMonth = calendar.date(byAdding: .month, value: 1, to: displayedMonth) else {
+            return false
+        }
+
+        let maxMonth = monthAnchor(for: maximumSelectableDate)
+        return nextMonth <= maxMonth
+    }
+
+    private func openCalendar() {
+        let clampedSelection = clamp(selectedDate)
+        draftSelection = clampedSelection
+        displayedMonth = monthAnchor(for: clampedSelection)
+        isPresented = true
+    }
+
+    private func closeWithoutSaving() {
+        draftSelection = clamp(selectedDate)
+        displayedMonth = monthAnchor(for: draftSelection)
+        isPresented = false
+    }
+
+    private func commitSelection() {
+        onApply(clamp(draftSelection))
+        isPresented = false
+    }
+
+    private func clamp(_ date: Date) -> Date {
+        min(calendar.startOfDay(for: date), maximumSelectableDate)
+    }
+
+    private func monthAnchor(for date: Date) -> Date {
+        calendar.date(from: calendar.dateComponents([.year, .month], from: date)) ?? date
+    }
+
+    private func changeMonth(by value: Int) {
+        guard let newMonth = calendar.date(byAdding: .month, value: value, to: displayedMonth) else {
+            return
+        }
+
+        if newMonth <= monthAnchor(for: maximumSelectableDate) {
+            withAnimation(.easeInOut(duration: 0.2)) {
+                displayedMonth = newMonth
+            }
+        }
+    }
+
+    private func daysInMonth() -> [Date?] {
+        guard let monthInterval = calendar.dateInterval(of: .month, for: displayedMonth),
+              let firstWeek = calendar.dateInterval(of: .weekOfMonth, for: monthInterval.start) else {
+            return []
+        }
+
+        var days: [Date?] = []
+        var currentDate = firstWeek.start
+
+        for _ in 0..<42 {
+            days.append(currentDate)
+            currentDate = calendar.date(byAdding: .day, value: 1, to: currentDate) ?? currentDate
+        }
+
+        return days
+    }
+
+    @ViewBuilder
+    private func dayCell(for day: Date?) -> some View {
+        Group {
+            if let day {
+                let normalizedDay = calendar.startOfDay(for: day)
+                let isToday = calendar.isDateInToday(normalizedDay)
+                let isSelected = calendar.isDate(normalizedDay, inSameDayAs: draftSelection)
+                let isCurrentMonth = calendar.isDate(normalizedDay, equalTo: displayedMonth, toGranularity: .month)
+                let isFuture = normalizedDay > calendar.startOfDay(for: maximumSelectableDate)
+
+                Button(action: {
+                    selectDay(normalizedDay)
+                }) {
+                    Text("\(calendar.component(.day, from: normalizedDay))")
+                        .font(isToday ? .retraceCaptionBold : .retraceCaption)
+                        .foregroundColor(
+                            isFuture
+                                ? .white.opacity(0.16)
+                                : (isSelected
+                                    ? .white
+                                    : .white.opacity(isCurrentMonth ? 0.9 : 0.35))
+                        )
+                        .frame(width: 32, height: 32)
+                        .background(
+                            ZStack {
+                                if isSelected {
+                                    Circle()
+                                        .fill(RetraceMenuStyle.actionBlue)
+                                } else if isToday {
+                                    Circle()
+                                        .stroke(RetraceMenuStyle.actionBlue, lineWidth: 1.5)
+                                }
+                            }
+                        )
+                        .frame(maxWidth: .infinity, minHeight: 36)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(isFuture)
+            } else {
+                Color.clear
+                    .frame(maxWidth: .infinity, minHeight: 36)
+            }
+        }
+    }
+
+    private func selectDay(_ day: Date) {
+        draftSelection = clamp(day)
+        displayedMonth = monthAnchor(for: day)
     }
 }

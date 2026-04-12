@@ -149,54 +149,6 @@ final class SegmentUsageAlignmentTests: XCTestCase {
     }
 }
 
-final class ServiceContainerRewindCutoffTests: XCTestCase {
-    func testStoredRewindCutoffDateReturnsPersistedValue() {
-        let suiteName = "io.retrace.app.tests.rewindCutoff.\(UUID().uuidString)"
-        guard let defaults = UserDefaults(suiteName: suiteName) else {
-            XCTFail("Failed to create isolated defaults suite")
-            return
-        }
-        defer { defaults.removePersistentDomain(forName: suiteName) }
-
-        let storedDate = Date(timeIntervalSince1970: 1_772_934_400.123)
-        defaults.set(storedDate, forKey: "rewindCutoffDate")
-
-        XCTAssertEqual(ServiceContainer.storedRewindCutoffDate(in: defaults), storedDate)
-    }
-
-    func testDefaultRewindCutoffDateUsesDecember20_2025AtLocalMidnightForCalendar() {
-        var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = TimeZone(identifier: "America/Los_Angeles")!
-
-        let cutoffDate = ServiceContainer.defaultRewindCutoffDate(calendar: calendar)
-        let components = calendar.dateComponents([.year, .month, .day, .hour, .minute, .second], from: cutoffDate)
-
-        XCTAssertEqual(components.year, 2025)
-        XCTAssertEqual(components.month, 12)
-        XCTAssertEqual(components.day, 20)
-        XCTAssertEqual(components.hour, 0)
-        XCTAssertEqual(components.minute, 0)
-        XCTAssertEqual(components.second, 0)
-    }
-
-    func testRewindCutoffDateFallsBackToDefaultWhenUnset() {
-        let suiteName = "io.retrace.app.tests.rewindCutoff.\(UUID().uuidString)"
-        guard let defaults = UserDefaults(suiteName: suiteName) else {
-            XCTFail("Failed to create isolated defaults suite")
-            return
-        }
-        defer { defaults.removePersistentDomain(forName: suiteName) }
-
-        var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
-
-        XCTAssertEqual(
-            ServiceContainer.rewindCutoffDate(in: defaults, calendar: calendar),
-            ServiceContainer.defaultRewindCutoffDate(calendar: calendar)
-        )
-    }
-}
-
 final class DBStorageSnapshotLoggingTests: XCTestCase {
     func testDBStorageSnapshotDeltaSummaryUsesSameDayDelta() {
         let currentDay = Date(timeIntervalSince1970: 1_773_744_000)

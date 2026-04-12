@@ -5,7 +5,7 @@ import Shared
 private let settingsDefaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
 
 /// Manages first-launch onboarding flow
-/// Tracks whether user has completed the 8-step onboarding
+/// Tracks whether user has completed the current onboarding flow
 /// Owner: APP integration
 public actor OnboardingManager {
 

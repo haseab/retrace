@@ -158,6 +158,7 @@ retrace/
 │       ├── FeedbackRecentMetricSupportTests.swift # Feedback-export metric sanitization coverage
 │       ├── InPageURLCaptureRoutingTests.swift
 │       ├── MasterKeyManagerTests.swift
+│       ├── ServiceContainerRewindCutoffTests.swift # Rewind cutoff defaults and latest-frame probe coverage
 │       ├── TestLogger.swift
 │       ├── TimelineStillDiskWriterTests.swift
 │       └── UnexpectedRecordingStopHeuristicTests.swift # Unexpected-stop watchdog heuristic coverage
