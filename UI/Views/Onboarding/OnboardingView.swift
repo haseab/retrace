@@ -107,6 +107,7 @@ public struct OnboardingView: View {
         "org.mozilla.firefoxdeveloperedition",
         "org.mozilla.nightly",
         "com.openai.atlas",
+        "app.zen-browser.zen",
     ]
     // Exact apps where Retrace uses AppleScript-based URL extraction.
     nonisolated private static let automationPreflightBaseTargets: [AutomationPreflightTarget] = [
@@ -129,6 +130,8 @@ public struct OnboardingView: View {
             return "Firefox does not support in-page URL extraction."
         case "com.openai.atlas":
             return "ChatGPT Atlas does not support in-page URL extraction."
+        case "app.zen-browser.zen":
+            return "Zen does not support in-page URL extraction."
         default:
             return "This app does not support in-page URL extraction."
         }

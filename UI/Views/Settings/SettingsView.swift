@@ -328,6 +328,7 @@ public struct SettingsView: View {
         "com.duckduckgo.macos.browser",
         "com.sigmaos.sigmaos.macos",
         "com.openai.atlas",
+        "app.zen-browser.zen",
     ]
     nonisolated static let inPageURLChromiumHostBundleIDPrefixes: [String] = AppInfo.chromiumHostBrowserBundleIDPrefixes
     static let inPageURLTestURLString = "https://en.wikipedia.org/wiki/Cat"
