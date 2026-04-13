@@ -143,6 +143,80 @@ final class DateJumpTimeOnlyParsingTests: XCTestCase {
         assertDateComponents(result, year: 2024, month: 2, day: 28, hour: 0, minute: 0)
     }
 
+    func testBareFourDigitInputParsesAsCompact24HourTime() {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let now = makeDate(year: 2026, month: 3, day: 1, hour: 21, minute: 0)
+
+        guard let result = viewModel.test_parseNaturalLanguageDateForDateSearch("2024", now: now) else {
+            XCTFail("Expected parser to resolve bare four-digit input as compact 24-hour time")
+            return
+        }
+
+        assertDateComponents(result, year: 2026, month: 3, day: 1, hour: 20, minute: 24)
+    }
+
+    func testBareFourDigitInputWithLeadingZerosParsesAsCompact24HourTime() {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let now = makeDate(year: 2026, month: 3, day: 1, hour: 21, minute: 0)
+
+        guard let result = viewModel.test_parseNaturalLanguageDateForDateSearch("0012", now: now) else {
+            XCTFail("Expected parser to resolve bare four-digit input with leading zeros as compact 24-hour time")
+            return
+        }
+
+        assertDateComponents(result, year: 2026, month: 3, day: 1, hour: 0, minute: 12)
+    }
+
+    func testCompact24HourTimeWithCompactDayAgoShorthandParsesAsExactTime() {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let now = makeDate(year: 2026, month: 2, day: 23, hour: 21, minute: 0)
+
+        guard let result = viewModel.test_parseNaturalLanguageDateForDateSearch("1843 1da", now: now) else {
+            XCTFail("Expected parser to resolve compact 24-hour time with compact day-ago shorthand")
+            return
+        }
+
+        assertDateComponents(result, year: 2026, month: 2, day: 22, hour: 18, minute: 43)
+    }
+
+    func testLastYearInputParsesAsStartOfPreviousYear() {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let now = makeDate(year: 2026, month: 3, day: 1, hour: 9, minute: 0)
+
+        guard let result = viewModel.test_parseNaturalLanguageDateForDateSearch("last year", now: now) else {
+            XCTFail("Expected parser to resolve last-year input")
+            return
+        }
+
+        assertDateComponents(result, year: 2025, month: 1, day: 1, hour: 0, minute: 0)
+    }
+
+    func testLastMonthInputParsesAsStartOfPreviousMonth() {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let now = makeDate(year: 2026, month: 8, day: 5, hour: 9, minute: 0)
+
+        guard let result = viewModel.test_parseNaturalLanguageDateForDateSearch("last month", now: now) else {
+            XCTFail("Expected parser to resolve last-month input")
+            return
+        }
+
+        assertDateComponents(result, year: 2026, month: 7, day: 1, hour: 0, minute: 0)
+    }
+
+    func testMonthAndYearInputParses() {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let now = makeDate(year: 2026, month: 3, day: 1, hour: 9, minute: 0)
+
+        guard let result = viewModel.test_parseNaturalLanguageDateForDateSearch("july 2025", now: now) else {
+            XCTFail("Expected parser to resolve month and year input")
+            return
+        }
+
+        let components = Calendar.current.dateComponents([.year, .month], from: result)
+        XCTAssertEqual(components.year, 2025)
+        XCTAssertEqual(components.month, 7)
+    }
+
     private func makeDate(year: Int, month: Int, day: Int, hour: Int, minute: Int) -> Date {
         let calendar = Calendar.current
         let components = DateComponents(

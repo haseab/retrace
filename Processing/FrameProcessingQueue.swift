@@ -5,6 +5,476 @@ import Database
 import Search
 import ImageIO
 
+public enum PendingRewriteDeferralReason: String, Sendable, Equatable {
+    case timelineInteraction
+    case rewriteAlreadyInProgress
+    case videoNotFinalized
+    case videoRecordUnavailable
+    case pendingOCR
+    case missingMasterKey
+}
+
+public enum PendingRewriteDispatchOutcome: Sendable, Equatable {
+    case noPendingWork
+    case deferred(PendingRewriteDeferralReason)
+    case completed
+}
+
+enum OCRStageMemoryLedger {
+    private static let tracker = Tracker()
+    private static let phaseResidualHoldSeconds: TimeInterval = 0.8
+    private static let summaryIntervalSeconds: TimeInterval = 30
+    private static let transientResidualSpecs: [(tag: String, function: String, kind: String)] = [
+        ("processing.ocr.stageFrameLoadResidual", "processing.ocr.stage_load", "stage-frame-load-residual"),
+        ("processing.ocr.stageExtractResidual", "processing.ocr.stage_extract", "stage-extract-residual"),
+        ("processing.ocr.stageReleaseResidual", "processing.ocr.stage_release", "stage-release-residual"),
+        ("processing.ocr.stageObservedResidual", "processing.ocr.stage", "stage-observed-residual"),
+        ("processing.ocr.stageResidual", "processing.ocr.stage_residual", "stage-residual")
+    ]
+
+    static func measuredResidualBytes(
+        before: MemoryLedger.Snapshot,
+        after: MemoryLedger.Snapshot
+    ) -> Int64 {
+        let processDelta = after.footprintBytes > before.footprintBytes
+            ? after.footprintBytes - before.footprintBytes
+            : 0
+        let trackedDelta = after.trackedMemoryBytes > before.trackedMemoryBytes
+            ? after.trackedMemoryBytes - before.trackedMemoryBytes
+            : 0
+        let clampedTrackedDelta = UInt64(max(0, trackedDelta))
+
+        guard processDelta > clampedTrackedDelta else { return 0 }
+        let residualBytes = processDelta - clampedTrackedDelta
+        return Int64(min(residualBytes, UInt64(Int64.max)))
+    }
+
+    static func currentUnattributedBytes(_ snapshot: MemoryLedger.Snapshot) -> Int64 {
+        Int64(min(snapshot.unattributedBytes, UInt64(Int64.max)))
+    }
+
+    static func beginActiveFrame(bytes: Int64, reason: String) {
+        tracker.begin(
+            tag: "processing.ocr.activeFrames",
+            function: "processing.ocr.pipeline",
+            kind: "active-frame",
+            note: "estimated",
+            unit: "frames",
+            bytes: bytes,
+            reason: reason
+        )
+    }
+
+    static func endActiveFrame(bytes: Int64, reason: String) {
+        tracker.end(
+            tag: "processing.ocr.activeFrames",
+            bytes: bytes,
+            reason: reason
+        )
+    }
+
+    static func currentActiveFrameCount() -> Int {
+        tracker.currentCount(tag: "processing.ocr.activeFrames")
+    }
+
+    static func currentTrackedBytes(tag: String) -> Int64 {
+        tracker.currentBytes(tag: tag)
+    }
+
+    static func clearTransientStageResiduals(reason: String) {
+        for spec in transientResidualSpecs {
+            tracker.clear(
+                tag: spec.tag,
+                function: spec.function,
+                kind: spec.kind,
+                note: "cycle-reset",
+                unit: "samples",
+                reason: reason,
+                emitSummary: false
+            )
+        }
+    }
+
+    static func setActiveFrameCountForTesting(
+        _ count: Int,
+        bytesPerFrame: Int64 = 1
+    ) {
+        tracker.setCountForTesting(
+            tag: "processing.ocr.activeFrames",
+            function: "processing.ocr.pipeline",
+            kind: "active-frame",
+            note: "estimated",
+            unit: "frames",
+            count: count,
+            bytesPerUnit: bytesPerFrame
+        )
+    }
+
+    static func beginJPEGDecodeSurface(width: Int, height: Int, reason: String) {
+        tracker.begin(
+            tag: "processing.ocr.jpegDecodeSurface",
+            function: "processing.ocr.pipeline",
+            kind: "jpeg-decode-surface",
+            note: "estimated-native",
+            unit: "surfaces",
+            bytes: estimatedSurfaceBytes(width: width, height: height),
+            reason: reason
+        )
+    }
+
+    static func endJPEGDecodeSurface(width: Int, height: Int, reason: String) {
+        tracker.end(
+            tag: "processing.ocr.jpegDecodeSurface",
+            bytes: estimatedSurfaceBytes(width: width, height: height),
+            reason: reason
+        )
+    }
+
+    static func emitObservedResidual(reason: String) async {
+        let snapshot = await MemoryLedger.snapshot(waitForPendingUpdates: true)
+        let residualBytes = Int64(min(snapshot.unattributedBytes, UInt64(Int64.max)))
+        tracker.setRetained(
+            tag: "processing.ocr.stageResidual",
+            function: "processing.ocr.stage_residual",
+            kind: "stage-residual",
+            note: "observed-unattributed",
+            unit: "samples",
+            bytes: residualBytes,
+            reason: reason,
+            delay: 0
+        )
+    }
+
+    static func setResidual(
+        tag: String,
+        function: String,
+        kind: String,
+        note: String,
+        bytes: Int64,
+        reason: String,
+        delay: TimeInterval = phaseResidualHoldSeconds,
+        forceSummary: Bool = true
+    ) {
+        tracker.setRetained(
+            tag: tag,
+            function: function,
+            kind: kind,
+            note: note,
+            unit: "samples",
+            bytes: bytes,
+            reason: reason,
+            delay: delay,
+            forceSummary: forceSummary
+        )
+    }
+
+    static func fallbackStageResidualBytes(
+        totalStageResidualBytes: Int64,
+        frameLoadResidualBytes: Int64,
+        extractResidualBytes: Int64,
+        releaseResidualBytes: Int64,
+        stageObservedResidualBytes: Int64,
+        stageResidualExclusionBytes: Int64
+    ) -> Int64 {
+        max(
+            0,
+            totalStageResidualBytes -
+                max(0, frameLoadResidualBytes) -
+                max(0, extractResidualBytes) -
+                max(0, releaseResidualBytes) -
+                max(0, stageObservedResidualBytes) -
+                max(0, stageResidualExclusionBytes)
+        )
+    }
+
+    static func stageObservedResidualBytes(
+        settledHandoffObservedResidualBytes: Int64,
+        currentUnattributedBytes: Int64,
+        activeOCRFrameCount: Int
+    ) -> Int64 {
+        guard settledHandoffObservedResidualBytes <= 0 else { return 0 }
+        guard activeOCRFrameCount <= 0 else { return 0 }
+        return max(0, currentUnattributedBytes)
+    }
+
+    private static func estimatedSurfaceBytes(width: Int, height: Int) -> Int64 {
+        guard width > 0, height > 0 else { return 0 }
+        return max(0, Int64(width) * Int64(height) * 4)
+    }
+
+    private final class Tracker: @unchecked Sendable {
+        private struct Entry {
+            var bytes: Int64
+            var count: Int
+            var function: String
+            var kind: String
+            var note: String?
+            var unit: String
+            var category: MemoryLedger.ComponentCategory
+        }
+
+        private let lock = NSLock()
+        private var entriesByTag: [String: Entry] = [:]
+        private var retainedGenerationByTag: [String: UInt64] = [:]
+
+        func begin(
+            tag: String,
+            function: String,
+            kind: String,
+            note: String?,
+            unit: String,
+            bytes: Int64,
+            reason: String
+        ) {
+            guard bytes > 0 else { return }
+
+            lock.lock()
+            var entry = entriesByTag[tag] ?? Entry(
+                bytes: 0,
+                count: 0,
+                function: function,
+                kind: kind,
+                note: note,
+                unit: unit,
+                category: .explicit
+            )
+            entry.bytes += bytes
+            entry.count += 1
+            entry.function = function
+            entry.kind = kind
+            entry.note = note
+            entry.unit = unit
+            entry.category = .explicit
+            entriesByTag[tag] = entry
+            lock.unlock()
+
+            publish(tag: tag, entry: entry)
+            MemoryLedger.emitSummary(
+                reason: reason,
+                category: .processing,
+                minIntervalSeconds: OCRStageMemoryLedger.summaryIntervalSeconds
+            )
+        }
+
+        func end(tag: String, bytes: Int64, reason: String) {
+            guard bytes > 0 else { return }
+
+            lock.lock()
+            var entry = entriesByTag[tag] ?? Entry(
+                bytes: 0,
+                count: 0,
+                function: "processing.ocr.pipeline",
+                kind: "active-frame",
+                note: nil,
+                unit: "items",
+                category: .explicit
+            )
+            entry.bytes = max(0, entry.bytes - bytes)
+            entry.count = max(0, entry.count - 1)
+            entry.category = .explicit
+            entriesByTag[tag] = entry
+            lock.unlock()
+
+            publish(tag: tag, entry: entry)
+            MemoryLedger.emitSummary(
+                reason: reason,
+                category: .processing,
+                minIntervalSeconds: OCRStageMemoryLedger.summaryIntervalSeconds
+            )
+        }
+
+        func setRetained(
+            tag: String,
+            function: String,
+            kind: String,
+            note: String?,
+            unit: String,
+            bytes: Int64,
+            reason: String,
+            delay: TimeInterval,
+            forceSummary: Bool = false
+        ) {
+            let generation: UInt64
+
+            lock.lock()
+            var entry = entriesByTag[tag] ?? Entry(
+                bytes: 0,
+                count: 0,
+                function: function,
+                kind: kind,
+                note: note,
+                unit: unit,
+                category: .inferred
+            )
+            entry.bytes = max(0, bytes)
+            entry.count = entry.bytes > 0 ? 1 : 0
+            entry.function = function
+            entry.kind = kind
+            entry.note = note
+            entry.unit = unit
+            entry.category = .inferred
+            entriesByTag[tag] = entry
+            generation = (retainedGenerationByTag[tag] ?? 0) + 1
+            retainedGenerationByTag[tag] = generation
+            lock.unlock()
+
+            publish(tag: tag, entry: entry)
+            MemoryLedger.emitSummary(
+                reason: reason,
+                category: .processing,
+                minIntervalSeconds: OCRStageMemoryLedger.summaryIntervalSeconds
+            )
+
+            let boundedDelay = max(0, delay)
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + boundedDelay) { [self] in
+                clearRetainedIfCurrent(tag: tag, generation: generation, reason: reason)
+            }
+        }
+
+        private func clearRetainedIfCurrent(tag: String, generation: UInt64, reason: String) {
+            lock.lock()
+            guard retainedGenerationByTag[tag] == generation else {
+                lock.unlock()
+                return
+            }
+
+            var entry = entriesByTag[tag] ?? Entry(
+                bytes: 0,
+                count: 0,
+                function: "processing.ocr.stage_residual",
+                kind: "stage-residual",
+                note: "observed-unattributed",
+                unit: "samples",
+                category: .inferred
+            )
+            entry.bytes = 0
+            entry.count = 0
+            entry.category = .inferred
+            entriesByTag[tag] = entry
+            lock.unlock()
+
+            publish(tag: tag, entry: entry)
+            MemoryLedger.emitSummary(
+                reason: reason,
+                category: .processing,
+                minIntervalSeconds: OCRStageMemoryLedger.summaryIntervalSeconds
+            )
+        }
+
+        func currentCount(tag: String) -> Int {
+            lock.lock()
+            let count = entriesByTag[tag]?.count ?? 0
+            lock.unlock()
+            return count
+        }
+
+        func currentBytes(tag: String) -> Int64 {
+            lock.lock()
+            let bytes = entriesByTag[tag]?.bytes ?? 0
+            lock.unlock()
+            return bytes
+        }
+
+        func clear(
+            tag: String,
+            function: String,
+            kind: String,
+            note: String?,
+            unit: String,
+            reason: String,
+            emitSummary: Bool
+        ) {
+            lock.lock()
+            var entry = entriesByTag[tag] ?? Entry(
+                bytes: 0,
+                count: 0,
+                function: function,
+                kind: kind,
+                note: note,
+                unit: unit,
+                category: .inferred
+            )
+            entry.bytes = 0
+            entry.count = 0
+            entry.function = function
+            entry.kind = kind
+            entry.note = note
+            entry.unit = unit
+            entry.category = .inferred
+            entriesByTag[tag] = entry
+            lock.unlock()
+
+            publish(tag: tag, entry: entry)
+            guard emitSummary else { return }
+            MemoryLedger.emitSummary(
+                reason: reason,
+                category: .processing,
+                minIntervalSeconds: OCRStageMemoryLedger.summaryIntervalSeconds
+            )
+        }
+
+        func setCountForTesting(
+            tag: String,
+            function: String,
+            kind: String,
+            note: String?,
+            unit: String,
+            count: Int,
+            bytesPerUnit: Int64
+        ) {
+            let sanitizedCount = max(0, count)
+            let sanitizedBytesPerUnit = max(0, bytesPerUnit)
+            let totalBytes: Int64
+            if sanitizedCount == 0 || sanitizedBytesPerUnit == 0 {
+                totalBytes = 0
+            } else {
+                let (product, overflowed) = Int64(sanitizedCount).addingReportingOverflow(0)
+                if overflowed {
+                    totalBytes = Int64.max
+                } else {
+                    let (multiplied, didOverflow) = product.multipliedReportingOverflow(by: sanitizedBytesPerUnit)
+                    totalBytes = didOverflow ? Int64.max : multiplied
+                }
+            }
+
+            lock.lock()
+            var entry = entriesByTag[tag] ?? Entry(
+                bytes: 0,
+                count: 0,
+                function: function,
+                kind: kind,
+                note: note,
+                unit: unit,
+                category: .explicit
+            )
+            entry.bytes = totalBytes
+            entry.count = sanitizedCount
+            entry.function = function
+            entry.kind = kind
+            entry.note = note
+            entry.unit = unit
+            entry.category = .explicit
+            entriesByTag[tag] = entry
+            lock.unlock()
+
+            publish(tag: tag, entry: entry)
+        }
+
+        private func publish(tag: String, entry: Entry) {
+            MemoryLedger.set(
+                tag: tag,
+                bytes: entry.bytes,
+                count: entry.count,
+                unit: entry.unit,
+                function: entry.function,
+                kind: entry.kind,
+                note: entry.note,
+                category: entry.category
+            )
+        }
+    }
+}
+
 /// Asynchronous frame processing queue with SQLite-backed durability
 ///
 /// Features:
@@ -40,18 +510,21 @@ public actor FrameProcessingQueue {
     private static let memoryLedgerSummaryIntervalSeconds: TimeInterval = 30
     private static let memoryLedgerQueueTag = "processing.ocr.queueDepth"
     private static let memoryLedgerWorkersTag = "processing.ocr.workers"
-    private static let memoryLedgerRawCacheTag = "processing.ocr.rawFrameCache"
     private static let rewriteResumeDebounceNs: UInt64 = 300_000_000
+    private static let defaultRetryableRewriteRetryDelayNs: UInt64 = 5_000_000_000
     private static let phraseRedactionPhrasesDefaultsKey = "phraseLevelRedactionPhrases"
     private static let phraseRedactionEnabledDefaultsKey = "phraseLevelRedactionEnabled"
     private static let phraseRedactionExtraTokenSlack = 2
     private static let phraseRedactionMaxNodeSpan = 8
     private var isPausedForMemoryPressure = false
     private var activeRewriteVideoIDs: Set<Int64> = []
+    private var rewriteVideosNeedingRedrain: Set<Int64> = []
     private var isRewriteTimelineVisible = false
     private var isRewriteTimelineScrubbing = false
     private var rewriteResumeTask: Task<Void, Never>?
+    private var retryableRewriteRetryTask: Task<Void, Never>?
     private var startupRewriteRecoveryPending = false
+    private var exhaustedAutomaticRewriteRetryVideoIDs: Set<Int64> = []
 
     // MARK: - Power-Aware Processing Control
 
@@ -274,7 +747,7 @@ public actor FrameProcessingQueue {
             return
         }
 
-        await drainPendingRedactionsIfPossible(
+        await drainPendingRewritesIfPossible(
             includeInProgressJobs: false,
             includeRetryableFailures: false,
             trigger: "interactive-idle:\(trigger)"
@@ -295,43 +768,35 @@ public actor FrameProcessingQueue {
         startupRewriteRecoveryPending = false
 
         do {
-            await reconcileInterruptedSegmentRedactionsOnStartup()
+            await reconcileInterruptedSegmentRewritesOnStartup()
 
-            let pendingVideoIDs = try await databaseManager.getVideoIDsWithPendingNodeRedactions(
+            let pendingVideoIDs = try await databaseManager.getVideoIDsWithPendingRewrites(
                 includeRetryableFailures: true
             )
             guard !pendingVideoIDs.isEmpty else { return true }
 
-            guard ReversibleOCRScrambler.currentAppWideSecret() != nil else {
-                Log.warning(
-                    "[Queue-Rewrite] Deferring startup rewrite recovery for \(pendingVideoIDs.count) video(s) because no master key exists, purpose=redaction",
-                    category: .processing
-                )
-                return true
-            }
-
             Log.info(
-                "[Queue-Rewrite] Startup recovery found \(pendingVideoIDs.count) video(s) with pending rewrites, purpose=redaction (\(trigger))",
+                "[Queue-Rewrite] Startup recovery found \(pendingVideoIDs.count) video(s) with pending rewrites (\(trigger))",
                 category: .processing
             )
 
             for videoID in pendingVideoIDs {
                 do {
-                    try await processPendingRedactions(
+                    _ = try await processPendingRewrites(
                         for: videoID,
                         includeInProgressJobs: true,
                         includeRetryableFailures: true
                     )
                 } catch {
                     Log.error(
-                        "[Queue-Rewrite] Startup recovery failed for video \(videoID): \(error.localizedDescription), purpose=redaction",
+                        "[Queue-Rewrite] Startup recovery failed for video \(videoID): \(error.localizedDescription)",
                         category: .processing
                     )
                 }
             }
         } catch {
             Log.error(
-                "[Queue-Rewrite] Failed to scan pending rewrites on startup: \(error.localizedDescription), purpose=redaction",
+                "[Queue-Rewrite] Failed to scan pending rewrites on startup: \(error.localizedDescription)",
                 category: .processing
             )
         }
@@ -339,7 +804,7 @@ public actor FrameProcessingQueue {
         return true
     }
 
-    private func drainPendingRedactionsIfPossible(
+    private func drainPendingRewritesIfPossible(
         includeInProgressJobs: Bool,
         includeRetryableFailures: Bool,
         trigger: String
@@ -353,18 +818,10 @@ public actor FrameProcessingQueue {
         }
 
         do {
-            let pendingVideoIDs = try await databaseManager.getVideoIDsWithPendingNodeRedactions(
+            let pendingVideoIDs = try await databaseManager.getVideoIDsWithPendingRewrites(
                 includeRetryableFailures: includeRetryableFailures
             )
             guard !pendingVideoIDs.isEmpty else { return }
-
-            guard ReversibleOCRScrambler.currentAppWideSecret() != nil else {
-                Log.warning(
-                    "[Queue-Rewrite] Deferring pending rewrite drain for \(pendingVideoIDs.count) video(s) because no master key exists, purpose=redaction (\(trigger))",
-                    category: .processing
-                )
-                return
-            }
 
             Log.info(
                 "[Queue-Rewrite] Draining \(pendingVideoIDs.count) pending rewrite video(s), includeRetryableFailures=\(includeRetryableFailures), trigger=\(trigger)",
@@ -373,23 +830,149 @@ public actor FrameProcessingQueue {
 
             for videoID in pendingVideoIDs {
                 do {
-                    try await processPendingRedactions(
+                    _ = try await processPendingRewrites(
                         for: videoID,
                         includeInProgressJobs: includeInProgressJobs,
                         includeRetryableFailures: includeRetryableFailures
                     )
                 } catch {
                     Log.error(
-                        "[Queue-Rewrite] Pending rewrite drain failed for video \(videoID): \(error.localizedDescription), purpose=redaction, trigger=\(trigger)",
+                        "[Queue-Rewrite] Pending rewrite drain failed for video \(videoID): \(error.localizedDescription), trigger=\(trigger)",
                         category: .processing
                     )
                 }
             }
         } catch {
             Log.error(
-                "[Queue-Rewrite] Failed to scan pending rewrites for drain: \(error.localizedDescription), purpose=redaction, trigger=\(trigger)",
+                "[Queue-Rewrite] Failed to scan pending rewrites for drain: \(error.localizedDescription), trigger=\(trigger)",
                 category: .processing
             )
+        }
+    }
+
+    private func schedulePendingRewriteRedrainIfNeeded(for videoID: Int64) {
+        guard rewriteVideosNeedingRedrain.remove(videoID) != nil else { return }
+
+        Log.debug(
+            "[Queue-Rewrite] Scheduling follow-up rewrite drain after active rewrite finished for video \(videoID)",
+            category: .processing
+        )
+
+        Task {
+            await self.drainPendingRewritesIfPossible(
+                includeInProgressJobs: false,
+                includeRetryableFailures: false,
+                trigger: "post-active-rewrite:\(videoID)"
+            )
+        }
+    }
+
+    private func scheduleRetryableRewriteRetry(
+        trigger: String,
+        delayNs: UInt64? = nil
+    ) {
+        retryableRewriteRetryTask?.cancel()
+        let effectiveDelayNs = delayNs ?? config.retryableRewriteRetryDelayNs
+
+        retryableRewriteRetryTask = Task { [effectiveDelayNs] in
+            if effectiveDelayNs > 0 {
+                try? await Task.sleep(for: .nanoseconds(Int64(effectiveDelayNs)), clock: .continuous)
+            }
+            guard !Task.isCancelled else { return }
+            await self.drainRetryableFailedRewritesIfPossible(trigger: trigger)
+        }
+    }
+
+    private func drainRetryableFailedRewritesIfPossible(trigger: String) async {
+        guard !isRewriteSchedulingSuspended else {
+            Log.debug(
+                "[Queue-Rewrite] Deferring retryable failed rewrite drain while timeline interaction is active (\(trigger))",
+                category: .processing
+            )
+            scheduleRetryableRewriteRetry(trigger: "\(trigger)-timeline-active")
+            return
+        }
+
+        guard !startupRewriteRecoveryPending else {
+            Log.debug(
+                "[Queue-Rewrite] Skipping retryable failed rewrite drain because startup recovery is still pending (\(trigger))",
+                category: .processing
+            )
+            return
+        }
+
+        do {
+            let standardPendingVideoIDs = try await databaseManager.getVideoIDsWithPendingRewrites(
+                includeRetryableFailures: false
+            )
+            guard standardPendingVideoIDs.isEmpty else {
+                Log.debug(
+                    "[Queue-Rewrite] Delaying retryable failed rewrite drain until \(standardPendingVideoIDs.count) standard rewrite video(s) clear (\(trigger))",
+                    category: .processing
+                )
+                scheduleRetryableRewriteRetry(trigger: "\(trigger)-standard-pending")
+                return
+            }
+
+            let retryableFailedVideoIDs = try await databaseManager.getVideoIDsWithPendingRewrites(
+                includeRetryableFailures: true
+            )
+            let eligibleRetryableFailedVideoIDs = retryableFailedVideoIDs.filter {
+                !exhaustedAutomaticRewriteRetryVideoIDs.contains($0)
+            }
+            guard !eligibleRetryableFailedVideoIDs.isEmpty else {
+                Log.debug(
+                    "[Queue-Rewrite] No eligible retryable failed rewrites remain after one automatic retry (\(trigger))",
+                    category: .processing
+                )
+                return
+            }
+
+            Log.info(
+                "[Queue-Rewrite] Retrying \(eligibleRetryableFailedVideoIDs.count) retryable failed rewrite video(s) (\(trigger))",
+                category: .processing
+            )
+
+            for videoID in eligibleRetryableFailedVideoIDs {
+                do {
+                    let outcome = try await processPendingRewrites(
+                        for: videoID,
+                        includeRetryableFailures: true,
+                        isAutomaticRetryOfFailedRewrite: true
+                    )
+                    if case .deferred(let reason) = outcome {
+                        Log.debug(
+                            "[Queue-Rewrite] Retryable failed rewrite for video \(videoID) deferred during retry drain: \(reason.rawValue)",
+                            category: .processing
+                        )
+                    }
+                } catch {
+                    Log.error(
+                        "[Queue-Rewrite] Retryable failed rewrite retry failed for video \(videoID): \(error.localizedDescription), trigger=\(trigger)",
+                        category: .processing
+                    )
+                }
+            }
+
+            let remainingStandardVideoIDs = try await databaseManager.getVideoIDsWithPendingRewrites(
+                includeRetryableFailures: false
+            )
+            let remainingRetryableVideoIDs = try await databaseManager.getVideoIDsWithPendingRewrites(
+                includeRetryableFailures: true
+            )
+            let remainingStandardSet = Set(remainingStandardVideoIDs)
+            if remainingRetryableVideoIDs.contains(where: {
+                !remainingStandardSet.contains($0) &&
+                    !exhaustedAutomaticRewriteRetryVideoIDs.contains($0)
+            }) {
+                scheduleRetryableRewriteRetry(trigger: "\(trigger)-remaining")
+            }
+        } catch {
+            Log.error(
+                "[Queue-Rewrite] Failed to drain retryable failed rewrites: \(error.localizedDescription), trigger=\(trigger)",
+                category: .processing
+            )
+            scheduleRetryableRewriteRetry(trigger: "\(trigger)-scan-failed")
         }
     }
 
@@ -483,6 +1066,9 @@ public actor FrameProcessingQueue {
         memoryReportTask = nil
         rewriteResumeTask?.cancel()
         rewriteResumeTask = nil
+        retryableRewriteRetryTask?.cancel()
+        retryableRewriteRetryTask = nil
+        exhaustedAutomaticRewriteRetryVideoIDs.removeAll()
 
         MemoryLedger.set(
             tag: Self.memoryLedgerWorkersTag,
@@ -553,6 +1139,10 @@ public actor FrameProcessingQueue {
 
                     // Handle deferred processing result
                     if case .deferredSourceNotReady = result {
+                        // Dequeue now moves frames to `.processing` atomically, so deferred work
+                        // must explicitly return the frame to pending before re-enqueueing it.
+                        try await updateFrameProcessingStatus(queuedFrame.frameID, status: .pending)
+
                         // Frame's source is not readable yet (e.g. WAL write still catching up) - re-enqueue for later
                         try await databaseManager.enqueueFrameForProcessing(frameID: queuedFrame.frameID, priority: -1)
                         currentQueueDepth += 1
@@ -608,7 +1198,6 @@ public actor FrameProcessingQueue {
     /// Returns ProcessFrameResult indicating success, skip, or deferral
     private func processFrame(_ queuedFrame: QueuedFrame) async throws -> ProcessFrameResult {
         let frameID = queuedFrame.frameID
-        let t0 = CFAbsoluteTimeGetCurrent()
 
         // Get frame with video info (includes isVideoFinalized and bundleID in metadata)
         guard let frameWithInfo = try await databaseManager.getFrameWithVideoInfoByID(id: FrameID(value: frameID)) else {
@@ -632,8 +1221,6 @@ public actor FrameProcessingQueue {
             throw DatabaseError.queryFailed(query: "getVideoSegment", underlying: "Video segment \(frameRef.videoID) not found")
         }
 
-        let tPrep = CFAbsoluteTimeGetCurrent()
-
         // Resolve segment ID encoded in the video file path (WAL and storage use this ID).
         let actualSegmentID = try parseActualSegmentID(from: videoSegment.relativePath)
         let ocrStageResult = try await performOCRStage(
@@ -652,8 +1239,6 @@ public actor FrameProcessingQueue {
         case .ready(let stage):
             ocrStage = stage
         }
-        let tFrame = ocrStage.ocrStartTime
-        let tOCR = CFAbsoluteTimeGetCurrent()
 
         let phraseRedactionResult = applyPhraseLevelRedaction(
             to: ocrStage.extractedText,
@@ -740,11 +1325,8 @@ public actor FrameProcessingQueue {
         // Video rewrites run only on finalized segments. Defer the actual rewrite
         // until OCR has quiesced for the whole video so we only re-encode once.
         if frameWithInfo.videoInfo?.isVideoFinalized ?? true {
-            try? await processPendingRedactions(for: frameRef.videoID.value)
+            _ = try? await processPendingRewrites(for: frameRef.videoID.value)
         }
-
-        let tDone = CFAbsoluteTimeGetCurrent()
-        Log.info("[Queue-TIMING] Frame \(frameID): prep=\(String(format: "%.0f", (tPrep-t0)*1000))ms frame=\(String(format: "%.0f", (tFrame-tPrep)*1000))ms ocr=\(String(format: "%.0f", (tOCR-tFrame)*1000))ms index=\(String(format: "%.0f", (tDone-tOCR)*1000))ms total=\(String(format: "%.0f", (tDone-t0)*1000))ms size=\(ocrStage.frameWidth)x\(ocrStage.frameHeight)", category: .processing)
 
         return .success
     }
@@ -756,6 +1338,13 @@ public actor FrameProcessingQueue {
         videoSegment: VideoSegment,
         actualSegmentID: VideoSegmentID
     ) async throws -> OCRStageResult {
+        let residualEpoch = await MemoryLedger.beginResidualEpoch(
+            ownerFunction: "processing.ocr.stage",
+            candidateConcurrentFunctions: ["capture.screen_capture"]
+        )
+        OCRStageMemoryLedger.clearTransientStageResiduals(reason: "processing.ocr.stage")
+        let stageBaselineSnapshot = await MemoryLedger.snapshot(waitForPendingUpdates: true)
+
         // Source select:
         // - finalized video -> decode frame from encoded segment file
         // - non-finalized video -> read raw frame directly from WAL by frame index
@@ -772,6 +1361,7 @@ public actor FrameProcessingQueue {
                 Log.error("[Queue] This suggests database/storage path mismatch. Check AppPaths.storageRoot setting.", category: .processing)
 
                 try await updateFrameProcessingStatus(frameID, status: .failed)
+                await MemoryLedger.endResidualEpoch(residualEpoch)
                 return .failedPermanently
             }
 
@@ -782,6 +1372,7 @@ public actor FrameProcessingQueue {
 
             guard let convertedFrame = try convertJPEGToCapturedFrame(frameData, frameRef: frameRef) else {
                 Log.error("[Queue-DIAG] Frame \(frameID) image conversion failed!", category: .processing)
+                await MemoryLedger.endResidualEpoch(residualEpoch)
                 throw ProcessingError.imageConversionFailed
             }
             capturedFrame = convertedFrame
@@ -793,6 +1384,7 @@ public actor FrameProcessingQueue {
                 segmentID: actualSegmentID,
                 frameIndex: frameRef.frameIndexInSegment
             ) else {
+                await MemoryLedger.endResidualEpoch(residualEpoch)
                 return .deferred
             }
             capturedFrame = walFrame
@@ -800,11 +1392,174 @@ public actor FrameProcessingQueue {
             processedFrameHeight = walFrame.height
         }
 
-        try await updateFrameProcessingStatus(frameID, status: .processing)
+        let postFrameLoadSnapshot = await MemoryLedger.snapshot(waitForPendingUpdates: true)
+        let frameLoadResidualBytes = OCRStageMemoryLedger.measuredResidualBytes(
+            before: stageBaselineSnapshot,
+            after: postFrameLoadSnapshot
+        )
+        OCRStageMemoryLedger.setResidual(
+            tag: "processing.ocr.stageFrameLoadResidual",
+            function: "processing.ocr.stage_load",
+            kind: "stage-frame-load-residual",
+            note: "observed-footprint-delta",
+            bytes: frameLoadResidualBytes,
+            reason: "processing.ocr.stage_frame_load"
+        )
+
         let ocrStartTime = CFAbsoluteTimeGetCurrent()
+        let activeFrameBytes = Int64(capturedFrame.imageData.count)
+        OCRStageMemoryLedger.beginActiveFrame(
+            bytes: activeFrameBytes,
+            reason: "processing.ocr.stage"
+        )
+        let extractedText: ExtractedText
+        do {
+            extractedText = try await processing.extractText(from: capturedFrame)
+            let postExtractSnapshot = await MemoryLedger.snapshot(waitForPendingUpdates: true)
+            let extractResidualBytes = max(
+                0,
+                OCRStageMemoryLedger.measuredResidualBytes(
+                before: postFrameLoadSnapshot,
+                after: postExtractSnapshot
+                ) - ProcessingExtractMemoryLedger.currentStageResidualExclusionBytes()
+            )
+            await ProcessingExtractMemoryLedger.clearObservedResidualsForHandoff(
+                reason: "processing.ocr.stage_extract"
+            )
+            OCRStageMemoryLedger.setResidual(
+                tag: "processing.ocr.stageExtractResidual",
+                function: "processing.ocr.stage_extract",
+                kind: "stage-extract-residual",
+                note: "observed-footprint-delta-net-active-extract-residuals",
+                bytes: extractResidualBytes,
+                reason: "processing.ocr.stage_extract"
+            )
+            OCRStageMemoryLedger.endActiveFrame(
+                bytes: activeFrameBytes,
+                reason: "processing.ocr.stage"
+            )
+            let postReleaseSnapshot = await MemoryLedger.snapshot(waitForPendingUpdates: true)
+            let releaseResidualBytes = OCRStageMemoryLedger.measuredResidualBytes(
+                before: postExtractSnapshot,
+                after: postReleaseSnapshot
+            )
+            OCRStageMemoryLedger.setResidual(
+                tag: "processing.ocr.stageReleaseResidual",
+                function: "processing.ocr.stage_release",
+                kind: "stage-release-residual",
+                note: "observed-footprint-delta",
+                bytes: releaseResidualBytes,
+                reason: "processing.ocr.stage_release"
+            )
+            _ = ProcessingExtractMemoryLedger.settleObservedResidualAtStageRelease(
+                snapshot: postReleaseSnapshot,
+                reason: "processing.ocr.stage_release"
+            )
+            let settledHandoffObservedResidualBytes =
+                ProcessingExtractMemoryLedger.currentHandoffObservedResidualBytes()
+            let stageObservedResidualBytes = OCRStageMemoryLedger.stageObservedResidualBytes(
+                settledHandoffObservedResidualBytes: settledHandoffObservedResidualBytes,
+                currentUnattributedBytes: OCRStageMemoryLedger.currentUnattributedBytes(postReleaseSnapshot),
+                activeOCRFrameCount: OCRStageMemoryLedger.currentActiveFrameCount()
+            )
+            OCRStageMemoryLedger.setResidual(
+                tag: "processing.ocr.stageObservedResidual",
+                function: "processing.ocr.stage",
+                kind: "stage-observed-residual",
+                note: "observed-current-unattributed-after-stage-release",
+                bytes: stageObservedResidualBytes,
+                reason: "processing.ocr.stage_release",
+                delay: 0.8
+            )
+            let totalStageResidualBytes = OCRStageMemoryLedger.measuredResidualBytes(
+                before: stageBaselineSnapshot,
+                after: postReleaseSnapshot
+            )
+            let fallbackStageResidualBytes = OCRStageMemoryLedger.fallbackStageResidualBytes(
+                totalStageResidualBytes: totalStageResidualBytes,
+                frameLoadResidualBytes: frameLoadResidualBytes,
+                extractResidualBytes: extractResidualBytes,
+                releaseResidualBytes: releaseResidualBytes,
+                stageObservedResidualBytes: stageObservedResidualBytes,
+                stageResidualExclusionBytes: ProcessingExtractMemoryLedger.currentStageResidualExclusionBytes()
+            )
+            OCRStageMemoryLedger.setResidual(
+                tag: "processing.ocr.stageResidual",
+                function: "processing.ocr.stage_residual",
+                kind: "stage-residual",
+                note: "observed-stage-remainder",
+                bytes: fallbackStageResidualBytes,
+                reason: "processing.ocr.stage"
+            )
+        } catch {
+            OCRStageMemoryLedger.endActiveFrame(
+                bytes: activeFrameBytes,
+                reason: "processing.ocr.stage"
+            )
+            let postFailureSnapshot = await MemoryLedger.snapshot(waitForPendingUpdates: true)
+            let extractResidualBytes = max(
+                0,
+                OCRStageMemoryLedger.measuredResidualBytes(
+                before: postFrameLoadSnapshot,
+                after: postFailureSnapshot
+                ) - ProcessingExtractMemoryLedger.currentStageResidualExclusionBytes()
+            )
+            await ProcessingExtractMemoryLedger.clearObservedResidualsForHandoff(
+                reason: "processing.ocr.stage_extract"
+            )
+            OCRStageMemoryLedger.setResidual(
+                tag: "processing.ocr.stageExtractResidual",
+                function: "processing.ocr.stage_extract",
+                kind: "stage-extract-residual",
+                note: "observed-footprint-delta-net-active-extract-residuals",
+                bytes: extractResidualBytes,
+                reason: "processing.ocr.stage_extract"
+            )
+            let totalStageResidualBytes = OCRStageMemoryLedger.measuredResidualBytes(
+                before: stageBaselineSnapshot,
+                after: postFailureSnapshot
+            )
+            _ = ProcessingExtractMemoryLedger.settleObservedResidualAtStageRelease(
+                snapshot: postFailureSnapshot,
+                reason: "processing.ocr.stage_extract"
+            )
+            let settledHandoffObservedResidualBytes =
+                ProcessingExtractMemoryLedger.currentHandoffObservedResidualBytes()
+            let stageObservedResidualBytes = OCRStageMemoryLedger.stageObservedResidualBytes(
+                settledHandoffObservedResidualBytes: settledHandoffObservedResidualBytes,
+                currentUnattributedBytes: OCRStageMemoryLedger.currentUnattributedBytes(postFailureSnapshot),
+                activeOCRFrameCount: OCRStageMemoryLedger.currentActiveFrameCount()
+            )
+            OCRStageMemoryLedger.setResidual(
+                tag: "processing.ocr.stageObservedResidual",
+                function: "processing.ocr.stage",
+                kind: "stage-observed-residual",
+                note: "observed-current-unattributed-after-stage-failure",
+                bytes: stageObservedResidualBytes,
+                reason: "processing.ocr.stage_extract",
+                delay: 0.8
+            )
+            let fallbackStageResidualBytes = OCRStageMemoryLedger.fallbackStageResidualBytes(
+                totalStageResidualBytes: totalStageResidualBytes,
+                frameLoadResidualBytes: frameLoadResidualBytes,
+                extractResidualBytes: extractResidualBytes,
+                releaseResidualBytes: 0,
+                stageObservedResidualBytes: stageObservedResidualBytes,
+                stageResidualExclusionBytes: ProcessingExtractMemoryLedger.currentStageResidualExclusionBytes()
+            )
+            OCRStageMemoryLedger.setResidual(
+                tag: "processing.ocr.stageResidual",
+                function: "processing.ocr.stage_residual",
+                kind: "stage-residual",
+                note: "observed-stage-remainder",
+                bytes: fallbackStageResidualBytes,
+                reason: "processing.ocr.stage"
+            )
+            await MemoryLedger.endResidualEpoch(residualEpoch)
+            throw error
+        }
 
-        let extractedText = try await processing.extractText(from: capturedFrame)
-
+        await MemoryLedger.endResidualEpoch(residualEpoch)
         return .ready(OCRStageOutput(
             extractedText: extractedText,
             frameWidth: processedFrameWidth,
@@ -827,6 +1582,19 @@ public actor FrameProcessingQueue {
             guard let imageSource = CGImageSourceCreateWithData(jpegData as CFData, sourceOptions),
                   let cgImage = CGImageSourceCreateImageAtIndex(imageSource, 0, imageOptions) else {
                 return nil
+            }
+
+            OCRStageMemoryLedger.beginJPEGDecodeSurface(
+                width: cgImage.width,
+                height: cgImage.height,
+                reason: "processing.ocr.jpeg_decode"
+            )
+            defer {
+                OCRStageMemoryLedger.endJPEGDecodeSurface(
+                    width: cgImage.width,
+                    height: cgImage.height,
+                    reason: "processing.ocr.jpeg_decode"
+                )
             }
 
             let width = cgImage.width
@@ -1942,161 +2710,173 @@ public actor FrameProcessingQueue {
         return String(repeating: " ", count: text.count)
     }
 
-    public func processPendingRedactions(
+    public func processPendingRewrites(
         for videoDatabaseID: Int64,
         includeInProgressJobs: Bool = false,
-        includeRetryableFailures: Bool = false
-    ) async throws {
+        includeRetryableFailures: Bool = false,
+        isAutomaticRetryOfFailedRewrite: Bool = false
+    ) async throws -> PendingRewriteDispatchOutcome {
         if isRewriteSchedulingSuspended {
             Log.debug(
-                "[Queue-Rewrite] Deferring segment rewrite for video \(videoDatabaseID) while timeline interaction is active, purpose=redaction",
+                "[Queue-Rewrite] Deferring segment rewrite for video \(videoDatabaseID) while timeline interaction is active",
                 category: .processing
             )
-            return
+            return .deferred(.timelineInteraction)
         }
 
-        let jobs = try await databaseManager.getPendingNodeRedactionJobs(
+        guard let plan = try await databaseManager.buildVideoRewritePlan(
             videoID: videoDatabaseID,
             includeInProgressJobs: includeInProgressJobs,
             includeRetryableFailures: includeRetryableFailures
-        )
-        guard !jobs.isEmpty else { return }
-
-        if try await databaseManager.videoHasFramesAwaitingOCR(videoID: videoDatabaseID) {
-            let pendingFrameCount = Set(jobs.map(\.frameID)).count
-            Log.debug(
-                "[Queue-Rewrite] Deferring segment rewrite for video \(videoDatabaseID) until OCR quiesces; pendingRewriteFrames=\(pendingFrameCount), purpose=redaction",
-                category: .processing
-            )
-            return
+        ), plan.hasAnyRewrite else {
+            return .noPendingWork
         }
 
-        guard !activeRewriteVideoIDs.contains(videoDatabaseID) else { return }
+        if try await databaseManager.videoHasFramesAwaitingOCR(videoID: videoDatabaseID) {
+            let pendingFrameCount = plan.deletions.count + plan.redactions.count
+            Log.debug(
+                "[Queue-Rewrite] Deferring rewrite for video \(videoDatabaseID) until OCR quiesces; pendingRewriteFrames=\(pendingFrameCount), purpose=\(rewritePurposeSummary(for: plan))",
+                category: .processing
+            )
+            return .deferred(.pendingOCR)
+        }
+
+        guard !activeRewriteVideoIDs.contains(videoDatabaseID) else {
+            rewriteVideosNeedingRedrain.insert(videoDatabaseID)
+            Log.debug(
+                "[Queue-Rewrite] Deferring rewrite for video \(videoDatabaseID) because another rewrite is active; scheduling a follow-up drain",
+                category: .processing
+            )
+            return .deferred(.rewriteAlreadyInProgress)
+        }
         activeRewriteVideoIDs.insert(videoDatabaseID)
-        defer { activeRewriteVideoIDs.remove(videoDatabaseID) }
+        defer {
+            activeRewriteVideoIDs.remove(videoDatabaseID)
+            schedulePendingRewriteRedrainIfNeeded(for: videoDatabaseID)
+        }
+
+        guard try await databaseManager.isVideoFinalized(videoID: videoDatabaseID) else {
+            Log.debug(
+                "[Queue-Rewrite] Deferring rewrite for video \(videoDatabaseID) until finalization completes",
+                category: .processing
+            )
+            return .deferred(.videoNotFinalized)
+        }
 
         guard let videoSegment = try await databaseManager.getVideoSegment(
             id: VideoSegmentID(value: videoDatabaseID)
         ) else {
-            return
+            return .deferred(.videoRecordUnavailable)
         }
 
         let actualSegmentID = try parseActualSegmentID(from: videoSegment.relativePath)
-        var targetsByFrameIndex: [Int: [SegmentRedactionTarget]] = [:]
-        var frameIDs: Set<Int64> = []
-        var seenTargets: Set<String> = []
+        let secret = ReversibleOCRScrambler.currentAppWideSecret()
+        let executablePlan: VideoRewritePlan
 
-        for job in jobs {
-            let targetKey = "\(job.frameID)|\(job.nodeID)"
-            guard seenTargets.insert(targetKey).inserted else { continue }
-            frameIDs.insert(job.frameID)
-            targetsByFrameIndex[job.frameIndex, default: []].append(
-                SegmentRedactionTarget(
-                    frameID: job.frameID,
-                    nodeID: job.nodeID,
-                    normalizedRect: job.normalizedRect
+        if plan.hasRedactionTargets && secret == nil {
+            if plan.hasDeletionTargets {
+                executablePlan = plan.droppingRedactions()
+                Log.warning(
+                    "[Queue-Rewrite] Running deletion-only rewrite for video \(videoDatabaseID) because no master key exists for pending redactions",
+                    category: .processing
                 )
-            )
-        }
-
-        guard let secret = ReversibleOCRScrambler.currentAppWideSecret() else {
-            for frameID in frameIDs {
-                try? await updateFrameProcessingStatus(
-                    frameID,
-                    status: .rewritePending,
-                    rewritePurpose: "redaction"
+            } else {
+                try await databaseManager.resetVideoRewritePlanToPending(plan)
+                Log.warning(
+                    "[Queue-Rewrite] Deferring rewrite for video \(videoDatabaseID) because no master key exists for redaction work",
+                    category: .processing
                 )
+                return .deferred(.missingMasterKey)
             }
-            Log.warning(
-                "[Queue-Rewrite] Deferring segment rewrite for video \(videoDatabaseID) because no master key exists, purpose=redaction",
-                category: .processing
-            )
-            return
+        } else {
+            executablePlan = plan
         }
 
-        let sortedFrameIDs = Array(frameIDs).sorted()
+        if isAutomaticRetryOfFailedRewrite {
+            exhaustedAutomaticRewriteRetryVideoIDs.insert(videoDatabaseID)
+        }
+
         var rewriteCommitted = false
-
         do {
-            for frameID in frameIDs {
-                try await updateFrameProcessingStatus(
-                    frameID,
-                    status: .rewriteProcessing,
-                    rewritePurpose: "redaction"
-                )
-            }
-            try await storage.rewriteSegmentForRedaction(
+            try await markVideoRewritePlanStatus(
+                executablePlan,
+                status: .rewriteProcessing
+            )
+
+            try await storage.applySegmentRewrite(
                 segmentID: actualSegmentID,
-                frameIDs: sortedFrameIDs,
-                targetsByFrameIndex: targetsByFrameIndex,
+                plan: executablePlan.segmentRewritePlan,
                 secret: secret
             )
             rewriteCommitted = true
-            for frameID in frameIDs {
-                try await updateFrameProcessingStatus(
-                    frameID,
-                    status: .rewriteCompleted,
-                    rewritePurpose: "redaction"
-                )
-            }
-            totalRewritten += frameIDs.count
+            try await databaseManager.finalizeVideoRewrite(executablePlan)
+            totalRewritten += executablePlan.deletions.count + executablePlan.redactions.count
+
             do {
-                try await storage.finishInterruptedSegmentRedactionRecovery(segmentID: actualSegmentID)
+                try await storage.finishInterruptedSegmentRewriteRecovery(segmentID: actualSegmentID)
             } catch {
                 Log.warning(
                     "[Queue-Rewrite] Completed rewrite for video \(videoDatabaseID) but failed to remove rewrite artifacts for segment \(actualSegmentID.value): \(error.localizedDescription)",
                     category: .processing
                 )
             }
+
+            await recordRewriteOutcomeBestEffort(plan: executablePlan, outcome: "success")
+            exhaustedAutomaticRewriteRetryVideoIDs.remove(videoDatabaseID)
             Log.info(
-                "[Queue-Rewrite] Completed segment rewrite for video \(videoDatabaseID), frames=\(frameIDs.count), purpose=redaction",
+                "[Queue-Rewrite] Completed segment rewrite for video \(videoDatabaseID), purpose=\(rewritePurposeSummary(for: executablePlan)), frames=\(executablePlan.deletions.count + executablePlan.redactions.count)",
                 category: .processing
             )
+            return .completed
         } catch {
             if rewriteCommitted {
+                await recordRewriteOutcomeBestEffort(plan: executablePlan, outcome: "db_finalize_failed")
                 Log.error(
-                    "[Queue-Rewrite] Segment rewrite for video \(videoDatabaseID) committed to disk but DB completion failed; leaving rewrite artifacts for startup reconciliation: \(error.localizedDescription), purpose=redaction",
+                    "[Queue-Rewrite] Segment rewrite for video \(videoDatabaseID) committed to disk but DB completion failed; leaving rewrite artifacts for startup reconciliation: \(error.localizedDescription)",
                     category: .processing
                 )
             } else {
-                for frameID in frameIDs {
-                    try? await updateFrameProcessingStatus(
-                        frameID,
-                        status: .rewriteFailed,
-                        rewritePurpose: "redaction"
-                    )
+                try? await markVideoRewritePlanStatus(
+                    executablePlan,
+                    status: .rewriteFailed
+                )
+                await recordRewriteOutcomeBestEffort(plan: executablePlan, outcome: "file_mutation_failed")
+                if !exhaustedAutomaticRewriteRetryVideoIDs.contains(videoDatabaseID) {
+                    scheduleRetryableRewriteRetry(trigger: "rewrite-failed:\(videoDatabaseID)")
                 }
             }
             let failureSummary = rewriteCommitted
                 ? "segment bytes are committed; rewrite artifacts retained for startup reconciliation"
-                : "marked jobs retryable-failed"
+                : exhaustedAutomaticRewriteRetryVideoIDs.contains(videoDatabaseID)
+                    ? "marked jobs failed after exhausting the one automatic retry"
+                    : "marked jobs retryable-failed"
             Log.error(
-                "[Queue-Rewrite] Failed segment rewrite for video \(videoDatabaseID); \(failureSummary): \(error.localizedDescription), purpose=redaction",
+                "[Queue-Rewrite] Failed segment rewrite for video \(videoDatabaseID); \(failureSummary): \(error.localizedDescription), purpose=\(rewritePurposeSummary(for: executablePlan))",
                 category: .processing
             )
             throw error
         }
     }
 
-    private func recoverPendingRedactionsOnStartup() async {
+    private func recoverPendingRewritesOnStartup() async {
         _ = await performStartupRewriteRecoveryIfPending(trigger: "startup-manual")
     }
 
-    public func recoverPendingRedactionsIfPossible() async {
+    public func recoverPendingRewritesIfPossible() async {
         if await performStartupRewriteRecoveryIfPending(trigger: "manual-request") {
             return
         }
 
-        await drainPendingRedactionsIfPossible(
+        await drainPendingRewritesIfPossible(
             includeInProgressJobs: true,
             includeRetryableFailures: true,
             trigger: "manual-request"
         )
     }
 
-    private func reconcileInterruptedSegmentRedactionsOnStartup() async {
+    private func reconcileInterruptedSegmentRewritesOnStartup() async {
         do {
-            let actions = try await storage.recoverInterruptedSegmentRedactions()
+            let actions = try await storage.recoverInterruptedSegmentRewrites()
             guard !actions.isEmpty else { return }
 
             Log.warning(
@@ -2104,7 +2884,7 @@ public actor FrameProcessingQueue {
                 category: .processing
             )
 
-            let pendingVideoIDs = try await databaseManager.getVideoIDsWithPendingNodeRedactions(
+            let pendingVideoIDs = try await databaseManager.getVideoIDsWithPendingRewrites(
                 includeRetryableFailures: true
             )
             var videoIDBySegmentID: [Int64: Int64] = [:]
@@ -2121,21 +2901,14 @@ public actor FrameProcessingQueue {
             }
 
             for action in actions {
-                let frameIDs: [Int64]
-                if let videoID = videoIDBySegmentID[action.segmentID.value] {
-                    let jobs = try await databaseManager.getPendingNodeRedactionJobs(
+                guard let videoID = videoIDBySegmentID[action.segmentID.value],
+                      let plan = try await databaseManager.buildVideoRewritePlan(
                         videoID: videoID,
                         includeInProgressJobs: true,
-                        includeRetryableFailures: false
-                    )
-                    frameIDs = Array(Set(jobs.map(\.frameID))).sorted()
-                } else {
-                    frameIDs = []
-                }
-
-                guard !frameIDs.isEmpty else {
+                        includeRetryableFailures: true
+                      ) else {
                     do {
-                        try await storage.finishInterruptedSegmentRedactionRecovery(segmentID: action.segmentID)
+                        try await storage.finishInterruptedSegmentRewriteRecovery(segmentID: action.segmentID)
                     } catch {
                         Log.error(
                             "[Queue-Rewrite] Failed to clean stale interrupted rewrite artifacts for segment \(action.segmentID.value): \(error.localizedDescription)",
@@ -2145,36 +2918,23 @@ public actor FrameProcessingQueue {
                     continue
                 }
 
-                var didPersistAllStatuses = true
-                let targetStatus: FrameProcessingStatus = {
+                do {
                     switch action.mode {
                     case .rollbackToPending:
-                        return .rewritePending
-                    case .markCompleted:
-                        return .rewriteCompleted
+                        try await databaseManager.resetVideoRewritePlanToPending(plan)
+                    case .finalizeCommitted:
+                        try await databaseManager.finalizeVideoRewrite(plan)
                     }
-                }()
-
-                for frameID in frameIDs {
-                    do {
-                        try await updateFrameProcessingStatus(
-                            frameID,
-                            status: targetStatus,
-                            rewritePurpose: "redaction"
-                        )
-                    } catch {
-                        didPersistAllStatuses = false
-                        Log.error(
-                            "[Queue-Rewrite] Failed to persist startup rewrite reconciliation for segment \(action.segmentID.value), frame \(frameID): \(error.localizedDescription)",
-                            category: .processing
-                        )
-                    }
+                } catch {
+                    Log.error(
+                        "[Queue-Rewrite] Failed to persist startup rewrite reconciliation for segment \(action.segmentID.value): \(error.localizedDescription)",
+                        category: .processing
+                    )
+                    continue
                 }
 
-                guard didPersistAllStatuses else { continue }
-
                 do {
-                    try await storage.finishInterruptedSegmentRedactionRecovery(segmentID: action.segmentID)
+                    try await storage.finishInterruptedSegmentRewriteRecovery(segmentID: action.segmentID)
                 } catch {
                     Log.error(
                         "[Queue-Rewrite] Failed to clean interrupted rewrite artifacts for segment \(action.segmentID.value): \(error.localizedDescription)",
@@ -2185,6 +2945,58 @@ public actor FrameProcessingQueue {
         } catch {
             Log.error(
                 "[Queue-Rewrite] Failed to reconcile interrupted rewrite artifacts on startup: \(error.localizedDescription)",
+                category: .processing
+            )
+        }
+    }
+
+    private func markVideoRewritePlanStatus(
+        _ plan: VideoRewritePlan,
+        status: FrameProcessingStatus
+    ) async throws {
+        for deletion in plan.deletions {
+            try await updateFrameProcessingStatus(
+                deletion.frameID,
+                status: status,
+                rewritePurpose: "deletion"
+            )
+        }
+
+        for redaction in plan.redactions {
+            try await updateFrameProcessingStatus(
+                redaction.frameID,
+                status: status,
+                rewritePurpose: "redaction"
+            )
+        }
+    }
+
+    private func rewritePurposeSummary(for plan: VideoRewritePlan) -> String {
+        if plan.hasDeletionTargets && plan.hasRedactionTargets {
+            return "mixed"
+        }
+        if plan.hasDeletionTargets {
+            return "deletion"
+        }
+        return "redaction"
+    }
+
+    private func recordRewriteOutcomeBestEffort(
+        plan: VideoRewritePlan,
+        outcome: String
+    ) async {
+        let frameCount = plan.deletions.count + plan.redactions.count
+        let metadata = """
+            {"purpose":"\(rewritePurposeSummary(for: plan))","outcome":"\(outcome)","frameCount":\(frameCount),"videoCount":1}
+            """
+        do {
+            try await databaseManager.recordMetricEvent(
+                metricType: .videoRewriteOutcome,
+                metadata: metadata
+            )
+        } catch {
+            Log.warning(
+                "[Queue-Rewrite] Failed to record rewrite metric for video \(plan.videoID): \(error.localizedDescription)",
                 category: .processing
             )
         }
@@ -2449,15 +3261,6 @@ public actor FrameProcessingQueue {
     private func logMemorySnapshot() async {
         let counts = await refreshLiveQueueCounts()
         let processSnapshot = ProcessingMemoryDiagnostics.currentProcessMemorySnapshot()
-        let processFields = processSnapshot.map {
-            "footprint=\(ProcessingMemoryDiagnostics.formatBytes($0.physFootprintBytes)) resident=\(ProcessingMemoryDiagnostics.formatBytes($0.residentBytes)) internal=\(ProcessingMemoryDiagnostics.formatBytes($0.internalBytes)) compressed=\(ProcessingMemoryDiagnostics.formatBytes($0.compressedBytes)) "
-        } ?? ""
-
-        Log.info(
-            "[Queue-Memory] \(processFields)rawCacheFrames=0 rawCacheBytes=0 KB ocrQueueDepth=\(counts.ocrDepth) ocrPending=\(counts.ocrPending) ocrProcessing=\(counts.ocrProcessing) rewritePending=\(counts.rewritePending) rewriteProcessing=\(counts.rewriteProcessing) workers=\(workers.count) memoryPaused=\(isPausedForMemoryPressure)",
-            category: .processing
-        )
-
         MemoryLedger.setProcessSnapshot(
             footprintBytes: processSnapshot?.physFootprintBytes,
             residentBytes: processSnapshot?.residentBytes,
@@ -2481,15 +3284,6 @@ public actor FrameProcessingQueue {
             function: "processing.ocr",
             kind: "worker-pool",
             note: "count-only"
-        )
-        MemoryLedger.set(
-            tag: Self.memoryLedgerRawCacheTag,
-            bytes: 0,
-            count: 0,
-            unit: "frames",
-            function: "processing.ocr",
-            kind: "raw-frame-cache",
-            note: "currently-disabled"
         )
         MemoryLedger.emitSummary(
             reason: "processing.ocr.memory",
@@ -2601,7 +3395,7 @@ struct OCRMemoryBackpressurePolicy: Sendable {
         largestDisplayPixelCount: UInt64? = nil
     ) -> OCRMemoryBackpressurePolicy {
         let enabled = defaults.object(forKey: enabledDefaultsKey) == nil
-            ? true
+            ? false
             : defaults.bool(forKey: enabledDefaultsKey)
 
         let detectedLargestDisplayPixelCount = largestDisplayPixelCount
@@ -2763,11 +3557,18 @@ public struct ProcessingQueueConfig: Sendable {
     public let workerCount: Int
     public let maxRetryAttempts: Int
     public let maxQueueSize: Int
+    public let retryableRewriteRetryDelayNs: UInt64
 
-    public init(workerCount: Int = 1, maxRetryAttempts: Int = 3, maxQueueSize: Int = 1000) {
+    public init(
+        workerCount: Int = 1,
+        maxRetryAttempts: Int = 3,
+        maxQueueSize: Int = 1000,
+        retryableRewriteRetryDelayNs: UInt64 = 5_000_000_000
+    ) {
         self.workerCount = workerCount
         self.maxRetryAttempts = maxRetryAttempts
         self.maxQueueSize = maxQueueSize
+        self.retryableRewriteRetryDelayNs = retryableRewriteRetryDelayNs
     }
 
     public static let `default` = ProcessingQueueConfig()

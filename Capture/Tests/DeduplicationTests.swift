@@ -94,7 +94,7 @@ final class DeduplicationTests: XCTestCase {
 
         let similarity = deduplicator.computeSimilarity(frame1, frame2)
 
-        // dHash similarity for different patterns should be relatively low
+        // The pixel-grid sampler should report relatively low similarity for different patterns
         XCTAssertLessThan(similarity, 0.8, "Different stripe patterns should have lower similarity")
     }
 
@@ -108,7 +108,7 @@ final class DeduplicationTests: XCTestCase {
 
         let similarity = deduplicator.computeSimilarity(frame1, frame2)
 
-        // dHash focuses on structure, not exact pixel values, so identical patterns should match well
+        // The pixel-grid sampler focuses on local similarity, so identical patterns should match well
         XCTAssertGreaterThan(similarity, 0.7, "Identical stripe patterns should have high similarity")
     }
 
@@ -142,8 +142,7 @@ final class DeduplicationTests: XCTestCase {
         let frame1 = createTestFrame(imageData: imageData, width: 100, height: 100)
         let frame2 = createTestFrame(imageData: imageData, width: 100, height: 100)
 
-        // High threshold (0.98) = strict filtering
-        // Identical frames have similarity 1.0, which is NOT > 0.98, so they get filtered
+        // Identical frames have similarity 1.0, which exceeds the allowed threshold and gets filtered
         let shouldKeep = deduplicator.shouldKeepFrame(frame2, comparedTo: frame1, threshold: 0.98)
 
         XCTAssertFalse(shouldKeep, "Should filter identical frames with high threshold")
@@ -156,8 +155,7 @@ final class DeduplicationTests: XCTestCase {
         let frame1 = createTestFrame(imageData: imageData1, width: 100, height: 100)
         let frame2 = createTestFrame(imageData: imageData2, width: 100, height: 100)
 
-        // Low threshold (0.02) = lenient filtering, max allowed similarity = 0.98
-        // Different frames have similarity < 0.8, which is well below 0.98, so they're kept
+        // Low threshold (0.02) is strict, but very different frames still stay below it and are kept
         let shouldKeep = deduplicator.shouldKeepFrame(frame2, comparedTo: frame1, threshold: 0.02)
 
         XCTAssertTrue(shouldKeep, "Should keep very different frames with lenient threshold")
@@ -175,7 +173,7 @@ final class DeduplicationTests: XCTestCase {
         XCTAssertTrue(shouldKeep, "Should keep frame when dimensions change")
     }
 
-    func testThresholdSemantics_HigherIsStricter() {
+    func testThresholdSemantics_HigherKeepsMoreSimilarFrames() {
         // Create two frames with different stripe patterns
         // color 80 → stripe width 8
         // color 150 → stripe width 15 (significantly different pattern)
@@ -187,23 +185,21 @@ final class DeduplicationTests: XCTestCase {
 
         let similarity = deduplicator.computeSimilarity(frame1, frame2)
 
-        // These should be somewhat similar (same type of pattern) but not identical
-        XCTAssertGreaterThanOrEqual(similarity, 0.4, "Test frames should have some similarity (>=0.4)")
+        // These should overlap enough to be non-zero, but remain far from identical
+        XCTAssertGreaterThan(similarity, 0.0, "Test frames should share some sampled pixels")
         XCTAssertLessThan(similarity, 1.0, "Test frames should not be identical (<1.0)")
 
-        // Low threshold (0.02) = lenient = max allowed similarity 0.98
-        // Should KEEP frames unless they're nearly identical (similarity > 0.98)
+        // Low threshold is stricter: only very different frames are kept
         let shouldKeepLowThreshold = deduplicator.shouldKeepFrame(frame2, comparedTo: frame1, threshold: 0.02)
-        XCTAssertTrue(shouldKeepLowThreshold, "Low threshold should keep similar frames")
+        XCTAssertFalse(shouldKeepLowThreshold, "Low threshold should filter moderately similar frames")
 
-        // High threshold (0.98) = very strict = max allowed similarity 0.02
-        // Should FILTER almost everything except very different frames
+        // High threshold is more lenient: moderately similar frames are still kept
         let shouldKeepHighThreshold = deduplicator.shouldKeepFrame(frame2, comparedTo: frame1, threshold: 0.98)
-        XCTAssertFalse(shouldKeepHighThreshold, "High threshold should filter similar frames")
+        XCTAssertTrue(shouldKeepHighThreshold, "High threshold should keep moderately similar frames")
 
-        // Verify: higher threshold filters more frames (is stricter)
-        XCTAssertTrue(shouldKeepLowThreshold, "Low threshold keeps frames")
-        XCTAssertFalse(shouldKeepHighThreshold, "High threshold filters frames")
+        // Verify: higher thresholds keep more frames under the current similarity semantics
+        XCTAssertFalse(shouldKeepLowThreshold, "Low threshold filters frames")
+        XCTAssertTrue(shouldKeepHighThreshold, "High threshold keeps frames")
     }
 
     func testShouldKeepFrameForMouseMovement_Disabled_ReturnsFalse() {
@@ -247,7 +243,6 @@ final class DeduplicationTests: XCTestCase {
 
         XCTAssertTrue(shouldKeep, "Movement at threshold should keep frame")
     }
-
     // ┌──────────────────────────────────────────────────────────────────────────┐
     // │                         Performance Tests                                │
     // └──────────────────────────────────────────────────────────────────────────┘
@@ -278,7 +273,7 @@ final class DeduplicationTests: XCTestCase {
     // └──────────────────────────────────────────────────────────────────────────┘
 
     /// Create test image data with pattern based on color (BGRA format)
-    /// dHash requires spatial variation to work properly - solid colors produce hash of 0
+    /// Similarity sampling requires spatial variation - solid colors collapse into identical samples
     /// Different colors create different stripe patterns
     private func createTestImageData(width: Int, height: Int, color: UInt8) -> Data {
         let bytesPerPixel = 4

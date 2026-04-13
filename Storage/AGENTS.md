@@ -8,6 +8,7 @@ You are responsible for the **Storage** module of Retrace. Your job is to implem
 
 ```
 Storage/
+├── GeneratorCachePolicy.swift   # Shared idle/LRU eviction policy for AVAsset generator caches
 ├── StorageManager.swift         # Main StorageProtocol implementation
 ├── SegmentWriterImpl.swift      # SegmentWriter implementation
 ├── Encryption/

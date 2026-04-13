@@ -23,6 +23,8 @@ final class AsyncQueuePipelineTests: XCTestCase {
 
     // MARK: - Properties
 
+    private let integrationPipelineEnabled = ProcessInfo.processInfo.environment["RUN_ASYNC_QUEUE_PIPELINE"] == "1"
+
     var database: DatabaseManager!
     var ftsManager: FTSManager!
     var storage: StorageManager!
@@ -54,6 +56,9 @@ final class AsyncQueuePipelineTests: XCTestCase {
     // MARK: - Setup/Teardown
 
     override func setUp() async throws {
+        guard integrationPipelineEnabled else {
+            throw XCTSkip("Integration-only test. Set RUN_ASYNC_QUEUE_PIPELINE=1 to run manually.")
+        }
         guard screenshotPath != nil else {
             throw XCTSkip(Self.screenshotFixtureSkipMessage)
         }

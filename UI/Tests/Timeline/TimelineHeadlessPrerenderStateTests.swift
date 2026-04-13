@@ -458,6 +458,7 @@ final class TimelineHeadlessPrerenderStateTests: XCTestCase {
         XCTAssertEqual(dataLoads, 1)
         XCTAssertTrue(FileManager.default.fileExists(atPath: cacheFileURL.path))
         XCTAssertNotNil(viewModel.currentImage)
+        XCTAssertFalse(viewModel.currentFrameStillUsesFreshCaptureSource)
         XCTAssertFalse(viewModel.frameNotReady)
         XCTAssertFalse(viewModel.frameLoadError)
     }
@@ -521,6 +522,7 @@ final class TimelineHeadlessPrerenderStateTests: XCTestCase {
         XCTAssertEqual(dataLoads, 1)
         XCTAssertEqual(Int(currentImage.size.width), 31)
         XCTAssertEqual(Int(currentImage.size.height), 31)
+        XCTAssertTrue(viewModel.currentFrameStillUsesFreshCaptureSource)
         XCTAssertFalse(viewModel.frameNotReady)
         XCTAssertFalse(viewModel.frameLoadError)
     }
@@ -666,6 +668,7 @@ final class TimelineHeadlessPrerenderStateTests: XCTestCase {
         XCTAssertFalse(viewModel.isPendingVideoPresentationReady)
         XCTAssertEqual(viewModel.currentFrameMediaDisplayMode, .decodedVideo)
         XCTAssertEqual(viewModel.currentFrameStillDisplayMode, .waitingFallback)
+        XCTAssertTrue(viewModel.currentFrameStillUsesFreshCaptureSource)
 
         let fallbackImage = try XCTUnwrap(viewModel.waitingFallbackImage)
         XCTAssertEqual(Int(fallbackImage.size.width), 33)

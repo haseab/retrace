@@ -123,6 +123,44 @@ final class InFrameSearchTests: XCTestCase {
         XCTAssertNil(viewModel.searchHighlightQuery)
     }
 
+    func testUndoExitsLiveModeWhenNavigatingToLoadedHistoricalFrame() async {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        viewModel.frames = [
+            makeTimelineFrame(id: 1, frameIndex: 0, bundleID: "com.apple.Safari"),
+            makeTimelineFrame(id: 2, frameIndex: 1, bundleID: "com.apple.Safari"),
+            makeTimelineFrame(id: 3, frameIndex: 2, bundleID: "com.apple.Safari")
+        ]
+        viewModel.currentIndex = 0
+
+        viewModel.navigateToFrame(1)
+        try? await Task.sleep(for: .milliseconds(500), clock: .continuous)
+        viewModel.navigateToFrame(2)
+        try? await Task.sleep(for: .milliseconds(500), clock: .continuous)
+
+        viewModel.isInLiveMode = true
+        viewModel.liveScreenshot = NSImage(size: NSSize(width: 12, height: 12))
+
+        XCTAssertTrue(viewModel.undoToLastStoppedPosition())
+        XCTAssertEqual(viewModel.currentIndex, 1)
+        XCTAssertFalse(viewModel.isInLiveMode)
+        XCTAssertNil(viewModel.liveScreenshot)
+    }
+
+    func testCacheBustReopenSnapImmediatelyCreatesUndoReturnPath() {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        viewModel.frames = [
+            makeTimelineFrame(id: 1, frameIndex: 0, bundleID: "com.apple.Safari"),
+            makeTimelineFrame(id: 2, frameIndex: 1, bundleID: "com.apple.Safari"),
+            makeTimelineFrame(id: 3, frameIndex: 2, bundleID: "com.apple.Safari")
+        ]
+        viewModel.currentIndex = 1
+
+        XCTAssertTrue(viewModel.applyCacheBustReopenSnapToNewest(newestIndex: 2))
+        XCTAssertEqual(viewModel.currentIndex, 2)
+        XCTAssertTrue(viewModel.undoToLastStoppedPosition())
+        XCTAssertEqual(viewModel.currentIndex, 1)
+    }
+
     func testUndoThreeTimesThenRedoThreeTimesReturnsToOriginalPosition() async {
         let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
         viewModel.frames = [
@@ -369,6 +407,75 @@ final class InFrameSearchTests: XCTestCase {
         XCTAssertEqual(viewModel.currentTimelineFrame?.frame.id.value, 2)
     }
 
+    func testNavigateToSearchResultSlowPathResetsBoundaryStateForNewerPagination() async {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let baseDate = Date(timeIntervalSince1970: 1_700_000_000)
+        viewModel.frames = [
+            makeTimelineFrame(id: 1, frameIndex: 0, bundleID: "com.apple.Safari"),
+            makeTimelineFrame(id: 2, frameIndex: 1, bundleID: "com.apple.Safari"),
+            makeTimelineFrame(id: 3, frameIndex: 2, bundleID: "com.apple.Safari")
+        ]
+        viewModel.currentIndex = 1
+
+        var newerWindowFetches = 0
+
+        viewModel.test_windowFetchHooks.getFramesWithVideoInfo = { _, _, _, _, reason in
+            switch reason {
+            case "navigateToSearchResult":
+                return [
+                    self.makeFrameWithVideoInfo(
+                        id: 49,
+                        timestamp: baseDate.addingTimeInterval(119),
+                        frameIndex: 49,
+                        bundleID: "com.apple.Safari"
+                    ),
+                    self.makeFrameWithVideoInfo(
+                        id: 50,
+                        timestamp: baseDate.addingTimeInterval(120),
+                        frameIndex: 50,
+                        bundleID: "com.apple.Safari"
+                    ),
+                    self.makeFrameWithVideoInfo(
+                        id: 51,
+                        timestamp: baseDate.addingTimeInterval(121),
+                        frameIndex: 51,
+                        bundleID: "com.apple.Safari"
+                    )
+                ]
+            case "loadNewerFrames.reason=unspecified":
+                newerWindowFetches += 1
+                return [
+                    self.makeFrameWithVideoInfo(
+                        id: 52,
+                        timestamp: baseDate.addingTimeInterval(122),
+                        frameIndex: 52,
+                        bundleID: "com.apple.Safari"
+                    )
+                ]
+            default:
+                return []
+            }
+        }
+        viewModel.test_windowFetchHooks.getFramesWithVideoInfoBefore = { _, _, _, _ in [] }
+        viewModel.test_windowFetchHooks.getFramesWithVideoInfoAfter = { _, _, _, _ in [] }
+        viewModel.test_frameOverlayLoadHooks.getOCRStatus = { _ in .completed }
+        viewModel.test_frameOverlayLoadHooks.getAllOCRNodes = { _, _ in [] }
+
+        // Simulate stale boundary state from a previous "hit end" pagination result.
+        viewModel.test_setBoundaryPaginationState(hasMoreOlder: true, hasMoreNewer: false)
+
+        await viewModel.navigateToSearchResult(
+            frameID: FrameID(value: 51),
+            timestamp: baseDate.addingTimeInterval(121),
+            highlightQuery: "error"
+        )
+
+        try? await Task.sleep(for: .milliseconds(50), clock: .continuous)
+
+        XCTAssertGreaterThanOrEqual(newerWindowFetches, 1)
+        XCTAssertTrue(viewModel.frames.contains(where: { $0.frame.id.value == 52 }))
+    }
+
     func testUndoAndRedoRestoreSearchResultHighlightQuery() async {
         let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
         viewModel.frames = [
@@ -400,6 +507,60 @@ final class InFrameSearchTests: XCTestCase {
         XCTAssertEqual(viewModel.searchHighlightQuery, "beta")
         try? await Task.sleep(for: .milliseconds(650), clock: .continuous)
         XCTAssertTrue(viewModel.isShowingSearchHighlight)
+    }
+
+    func testNavigateToSearchResultKeepsSameQueryHighlightVisibleAcrossAdjacentFrames() async {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        viewModel.frames = [
+            makeTimelineFrame(id: 1, frameIndex: 0, bundleID: "com.apple.Safari"),
+            makeTimelineFrame(id: 2, frameIndex: 1, bundleID: "com.apple.Safari"),
+            makeTimelineFrame(id: 3, frameIndex: 2, bundleID: "com.apple.Safari")
+        ]
+        viewModel.currentIndex = 0
+        viewModel.setPresentationWorkEnabled(true, reason: "InFrameSearchTests")
+        viewModel.test_frameOverlayLoadHooks.getOCRStatus = { _ in .completed }
+        viewModel.test_frameOverlayLoadHooks.getAllOCRNodes = { frameID, _ in
+            if frameID.value == 3 {
+                try? await Task.sleep(for: .milliseconds(80), clock: .continuous)
+            }
+
+            return [
+                self.makeNode(
+                    id: Int(frameID.value),
+                    frameID: frameID.value,
+                    text: "alpha result \(frameID.value)"
+                )
+            ]
+        }
+
+        await viewModel.navigateToSearchResult(
+            frameID: FrameID(value: 2),
+            timestamp: viewModel.frames[1].frame.timestamp,
+            highlightQuery: "alpha"
+        )
+        XCTAssertFalse(viewModel.isShowingSearchHighlight)
+        try? await Task.sleep(for: .milliseconds(650), clock: .continuous)
+        XCTAssertTrue(viewModel.isShowingSearchHighlight)
+        XCTAssertEqual(viewModel.searchHighlightQuery, "alpha")
+
+        let navigationTask = Task {
+            await viewModel.navigateToSearchResult(
+                frameID: FrameID(value: 3),
+                timestamp: viewModel.frames[2].frame.timestamp,
+                highlightQuery: "alpha",
+                highlightImmediately: true
+            )
+        }
+
+        await Task.yield()
+
+        XCTAssertEqual(viewModel.currentIndex, 2)
+        XCTAssertEqual(viewModel.searchHighlightQuery, "alpha")
+        XCTAssertTrue(viewModel.isShowingSearchHighlight)
+        XCTAssertTrue(viewModel.ocrNodes.isEmpty)
+
+        await navigationTask.value
+        XCTAssertEqual(viewModel.searchHighlightNodes.map(\.node.id), [3])
     }
 
     private func makeTimelineFrame(id: Int64, frameIndex: Int, bundleID: String) -> TimelineFrame {
@@ -440,10 +601,16 @@ final class InFrameSearchTests: XCTestCase {
         return FrameWithVideoInfo(frame: frame, videoInfo: nil, processingStatus: 2)
     }
 
-    private func makeNode(id: Int, text: String, x: CGFloat = 0.1, y: CGFloat = 0.1) -> OCRNodeWithText {
+    private func makeNode(
+        id: Int,
+        frameID: Int64 = 1,
+        text: String,
+        x: CGFloat = 0.1,
+        y: CGFloat = 0.1
+    ) -> OCRNodeWithText {
         OCRNodeWithText(
             id: id,
-            frameId: 1,
+            frameId: frameID,
             x: x,
             y: y,
             width: 0.3,

@@ -7,8 +7,8 @@ struct ProcessCPUSummaryCard: View {
     private static let tableLeadingPadding: CGFloat = 6
     private static let tableTrailingPadding: CGFloat = 10
     private static let tableVerticalPadding: CGFloat = 10
-    private static let compactRankColumnWidth: CGFloat = 22
-    private static let expandedRankColumnWidth: CGFloat = 28
+    private static let compactRankColumnWidth: CGFloat = 34
+    private static let expandedRankColumnWidth: CGFloat = 42
     private static let processRowSpacing: CGFloat = 4
     private static let latestSampleTimeFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -33,6 +33,7 @@ struct ProcessCPUSummaryCard: View {
     @StateObject private var appMetadataCache = AppMetadataCache.shared
     @State private var cpuProcessRowsVisible = Self.cpuRowsPageSize
     @State private var cpuProcessScrollTargetID: String?
+    @State private var isHoveringCPURows = false
 
     init(
         onRowsHoverChanged: ((Bool) -> Void)? = nil,
@@ -194,12 +195,17 @@ struct ProcessCPUSummaryCard: View {
                         .frame(height: Self.cpuRowsContainerHeight)
                         .clipped()
                         .onHover { hovering in
-                            onRowsHoverChanged?(allowsInnerScroll ? hovering : false)
+                            isHoveringCPURows = hovering
+                            onRowsHoverChanged?(Self.parentHoverState(
+                                isHoveringRows: hovering,
+                                allowsInnerScroll: allowsInnerScroll
+                            ))
                         }
                         .onChange(of: allowsInnerScroll) { enabled in
-                            if !enabled {
-                                onRowsHoverChanged?(false)
-                            }
+                            onRowsHoverChanged?(Self.parentHoverState(
+                                isHoveringRows: isHoveringCPURows,
+                                allowsInnerScroll: enabled
+                            ))
                         }
                         .onChange(of: cpuProcessScrollTargetID) { targetID in
                             guard let targetID else { return }
@@ -257,6 +263,7 @@ struct ProcessCPUSummaryCard: View {
         .onAppear {
             cpuProcessRowsVisible = Self.cpuRowsPageSize
             cpuProcessScrollTargetID = nil
+            isHoveringCPURows = false
         }
         .onDisappear {
             onRowsHoverChanged?(false)
@@ -285,6 +292,10 @@ struct ProcessCPUSummaryCard: View {
 
     private func cpuProcessRowAnchorID(_ rowNumber: Int) -> String {
         "systemMonitor.cpuProcessRow.\(rowNumber)"
+    }
+
+    static func parentHoverState(isHoveringRows: Bool, allowsInnerScroll: Bool) -> Bool {
+        allowsInnerScroll && isHoveringRows
     }
 
     private func processRankColumnWidth(for displayedRows: [DisplayedCPURow]) -> CGFloat {

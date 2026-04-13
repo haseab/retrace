@@ -84,28 +84,68 @@ final class StorageManagerTests: XCTestCase {
         return url
     }
 
-    private func diskUsageBytes(at url: URL) throws -> Int64 {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/du")
-        process.arguments = ["-sk", url.path]
+    private func logicalUsageBytes(at url: URL) throws -> Int64 {
+        let fileManager = FileManager.default
+        let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey, .fileSizeKey])
 
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = FileHandle.nullDevice
+        if values.isRegularFile == true {
+            return Int64(values.fileSize ?? 0)
+        }
 
-        try process.run()
-        process.waitUntilExit()
-
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        guard
-            let output = String(data: data, encoding: .utf8),
-            let sizeKB = Int64(output.split(separator: "\t").first ?? "")
-        else {
-            XCTFail("Failed to parse du output for \(url.path)")
+        guard values.isDirectory == true else {
             return 0
         }
 
-        return sizeKB * 1024
+        var total: Int64 = 0
+        guard let enumerator = fileManager.enumerator(
+            at: url,
+            includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return 0
+        }
+
+        for case let fileURL as URL in enumerator {
+            let fileValues = try fileURL.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+            guard fileValues.isRegularFile == true else { continue }
+            total += Int64(fileValues.fileSize ?? 0)
+        }
+
+        return total
+    }
+
+    private func createSparseSegmentFile(
+        root: URL,
+        id: VideoSegmentID,
+        date: Date,
+        ext: String? = nil,
+        logicalSize: Int,
+        modDate: Date
+    ) throws -> URL {
+        let calendar = Calendar.current
+        let year = calendar.component(.year, from: date)
+        let month = calendar.component(.month, from: date)
+        let day = calendar.component(.day, from: date)
+
+        let dir = root
+            .appendingPathComponent("chunks", isDirectory: true)
+            .appendingPathComponent(String(format: "%04d%02d", year, month), isDirectory: true)
+            .appendingPathComponent(String(format: "%02d", day), isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+
+        let fileName: String
+        if let ext, !ext.isEmpty {
+            fileName = "\(id.stringValue).\(ext)"
+        } else {
+            fileName = id.stringValue
+        }
+        let url = dir.appendingPathComponent(fileName)
+        FileManager.default.createFile(atPath: url.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: url)
+        try handle.truncate(atOffset: UInt64(logicalSize))
+        try handle.close()
+        try FileManager.default.setAttributes([.modificationDate: modDate], ofItemAtPath: url.path)
+        return url
     }
 
     private func makeCapturedFrame(
@@ -227,8 +267,21 @@ final class StorageManagerTests: XCTestCase {
         return Double(totalDifference) / Double(lhs.count)
     }
 
-    private func makeDatabase(name: String) async throws -> RecoveryTestDatabase {
-        _ = name
+    private func averageColorByteValue(_ data: Data) -> Double {
+        guard data.count >= 4 else { return 0 }
+
+        var total = 0
+        var samples = 0
+        for (index, byte) in data.enumerated() where index % 4 != 3 {
+            total += Int(byte)
+            samples += 1
+        }
+
+        guard samples > 0 else { return 0 }
+        return Double(total) / Double(samples)
+    }
+
+    private func makeDatabase(name _: String) async throws -> RecoveryTestDatabase {
         let database = RecoveryTestDatabase()
         try await database.initialize()
         return database
@@ -242,9 +295,7 @@ final class StorageManagerTests: XCTestCase {
         RecoveryManager(
             walManager: walManager,
             storage: storage,
-            database: database,
-            processing: RecoveryTestProcessing(),
-            search: RecoveryTestSearch()
+            database: database
         )
     }
 
@@ -405,7 +456,7 @@ final class StorageManagerTests: XCTestCase {
     // │                        Storage Metrics Tests                             │
     // └──────────────────────────────────────────────────────────────────────────┘
 
-    func testTotalStorageUsedMatchesChunkDiskUsage() async throws {
+    func testTotalStorageUsedMatchesLogicalChunkUsage() async throws {
         let root = makeTempRoot()
         let storage = StorageManager(storageRoot: root)
         try await storage.initialize(config: makeStorageConfig(root: root))
@@ -413,12 +464,51 @@ final class StorageManagerTests: XCTestCase {
         let now = Date()
         let id1 = VideoSegmentID(value: 301)
         let id2 = VideoSegmentID(value: 302)
-        _ = try createFakeSegmentFile(root: root, id: id1, date: now, size: 123, modDate: now)
+        _ = try createSparseSegmentFile(root: root, id: id1, date: now, logicalSize: 1_000_123, modDate: now)
         _ = try createFakeSegmentFile(root: root, id: id2, date: now, ext: "mp4", size: 456, modDate: now)
 
         let chunksURL = root.appendingPathComponent("chunks", isDirectory: true)
-        let expected = try diskUsageBytes(at: chunksURL)
+        let expected = try logicalUsageBytes(at: chunksURL)
         let total = try await storage.getTotalStorageUsed(includeRewind: false)
+        XCTAssertEqual(total, expected)
+
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    func testStorageUsedForDateRangeMatchesLogicalImmediateChunkUsage() async throws {
+        let root = makeTempRoot()
+        let storage = StorageManager(storageRoot: root)
+        try await storage.initialize(config: makeStorageConfig(root: root))
+
+        let calendar = Calendar.current
+        let day = Date()
+        let nextDay = calendar.date(byAdding: .day, value: 1, to: day) ?? day
+
+        let sparseURL = try createSparseSegmentFile(
+            root: root,
+            id: VideoSegmentID(value: 401),
+            date: day,
+            logicalSize: 2_000_321,
+            modDate: day
+        )
+        let regularURL = try createFakeSegmentFile(
+            root: root,
+            id: VideoSegmentID(value: 402),
+            date: day,
+            ext: "mp4",
+            size: 789,
+            modDate: day
+        )
+        _ = try createSparseSegmentFile(
+            root: root,
+            id: VideoSegmentID(value: 403),
+            date: nextDay,
+            logicalSize: 7_000_000,
+            modDate: nextDay
+        )
+
+        let expected = try logicalUsageBytes(at: sparseURL) + logicalUsageBytes(at: regularURL)
+        let total = try await storage.getStorageUsedForDateRange(from: day, to: day)
         XCTAssertEqual(total, expected)
 
         try? FileManager.default.removeItem(at: root)
@@ -556,18 +646,23 @@ final class StorageManagerTests: XCTestCase {
         _ = try await writer.finalize()
 
         let beforeJPEG = try await storage.readFrame(segmentID: segmentID, frameIndex: 0)
-        try await storage.rewriteSegmentForRedaction(
+        try await storage.applySegmentRewrite(
             segmentID: segmentID,
-            frameIDs: [42],
-            targetsByFrameIndex: [
-                0: [
-                    SegmentRedactionTarget(
+            plan: SegmentRewritePlan(
+                redactions: [
+                    SegmentFrameRedaction(
                         frameID: 42,
-                        nodeID: 7,
-                        normalizedRect: CGRect(x: 0.25, y: 0.25, width: 0.5, height: 0.5)
+                        frameIndex: 0,
+                        targets: [
+                            SegmentRedactionTarget(
+                                frameID: 42,
+                                nodeID: 7,
+                                normalizedRect: CGRect(x: 0.25, y: 0.25, width: 0.5, height: 0.5)
+                            )
+                        ]
                     )
                 ]
-            ],
+            ),
             secret: "unit-test-secret"
         )
         let afterJPEG = try await storage.readFrame(segmentID: segmentID, frameIndex: 0)
@@ -599,6 +694,58 @@ final class StorageManagerTests: XCTestCase {
         try? FileManager.default.removeItem(at: root)
     }
 
+    func testApplySegmentRewriteBlacksTargetedFramesAndLeavesUntouchedFramesMateriallyStable() async throws {
+        let root = makeTempRoot()
+        let storage = StorageManager(storageRoot: root)
+        try await storage.initialize(config: makeStorageConfig(root: root))
+
+        let writer = try await storage.createSegmentWriter()
+        let segmentID = await writer.segmentID
+        let targetRect = CGRect(x: 16, y: 16, width: 32, height: 32)
+        try await writer.appendFrame(
+            makePatternedCapturedFrame(
+                width: 64,
+                height: 64,
+                targetRect: targetRect
+            )
+        )
+        try await writer.appendFrame(
+            makePatternedCapturedFrame(
+                width: 64,
+                height: 64,
+                targetRect: CGRect(x: 8, y: 8, width: 24, height: 24)
+            )
+        )
+        _ = try await writer.finalize()
+
+        let beforeBlackJPEG = try await storage.readFrame(segmentID: segmentID, frameIndex: 0)
+        let beforeUntouchedJPEG = try await storage.readFrame(segmentID: segmentID, frameIndex: 1)
+
+        try await storage.applySegmentRewrite(
+            segmentID: segmentID,
+            plan: SegmentRewritePlan(
+                blackFrameIndexes: [0]
+            ),
+            secret: nil
+        )
+
+        let afterBlackJPEG = try await storage.readFrame(segmentID: segmentID, frameIndex: 0)
+        let afterUntouchedJPEG = try await storage.readFrame(segmentID: segmentID, frameIndex: 1)
+
+        let beforeBlackBGRA = try StorageManager.makeBGRAData(from: decodeJPEG(beforeBlackJPEG))
+        let beforeUntouchedBGRA = try StorageManager.makeBGRAData(from: decodeJPEG(beforeUntouchedJPEG))
+        let afterBlackBGRA = try StorageManager.makeBGRAData(from: decodeJPEG(afterBlackJPEG))
+        let afterUntouchedBGRA = try StorageManager.makeBGRAData(from: decodeJPEG(afterUntouchedJPEG))
+
+        let blackDifference = averageAbsoluteDifference(beforeBlackBGRA, afterBlackBGRA)
+        let untouchedDifference = averageAbsoluteDifference(beforeUntouchedBGRA, afterUntouchedBGRA)
+
+        XCTAssertGreaterThan(blackDifference, max(untouchedDifference * 3.0, 30.0))
+        XCTAssertLessThan(averageColorByteValue(afterBlackBGRA), 8.0)
+
+        try? FileManager.default.removeItem(at: root)
+    }
+
     func testRecoverInterruptedCommittedSegmentRewriteReturnsCompletionAction() async throws {
         let root = makeTempRoot()
         let storage = StorageManager(storageRoot: root)
@@ -617,28 +764,34 @@ final class StorageManagerTests: XCTestCase {
         _ = try await writer.finalize()
 
         let beforeJPEG = try await storage.readFrame(segmentID: segmentID, frameIndex: 0)
-        try await storage.rewriteSegmentForRedaction(
+        try await storage.applySegmentRewrite(
             segmentID: segmentID,
-            frameIDs: [42],
-            targetsByFrameIndex: [
-                0: [
-                    SegmentRedactionTarget(
+            plan: SegmentRewritePlan(
+                redactions: [
+                    SegmentFrameRedaction(
                         frameID: 42,
-                        nodeID: 7,
-                        normalizedRect: CGRect(x: 0.25, y: 0.25, width: 0.5, height: 0.5)
+                        frameIndex: 0,
+                        targets: [
+                            SegmentRedactionTarget(
+                                frameID: 42,
+                                nodeID: 7,
+                                normalizedRect: CGRect(x: 0.25, y: 0.25, width: 0.5, height: 0.5)
+                            )
+                        ]
                     )
                 ]
-            ],
+            ),
             secret: "unit-test-secret"
         )
         let afterJPEG = try await storage.readFrame(segmentID: segmentID, frameIndex: 0)
 
-        let actions = try await storage.recoverInterruptedSegmentRedactions()
+        let actions = try await storage.recoverInterruptedSegmentRewrites()
         XCTAssertEqual(
             actions,
             [
-                SegmentRedactionRecoveryAction(
-                    mode: .markCompleted,
+                SegmentRewriteRecoveryAction(
+                    mode: .finalizeCommitted,
+                    operation: .partialRewrite,
                     segmentID: segmentID
                 )
             ]
@@ -652,8 +805,8 @@ final class StorageManagerTests: XCTestCase {
         let afterTarget = extractPatch(from: afterBGRA, imageWidth: afterImage.width, rect: targetRect)
         XCTAssertGreaterThan(averageAbsoluteDifference(beforeTarget, afterTarget), 6.0)
 
-        try await storage.finishInterruptedSegmentRedactionRecovery(segmentID: segmentID)
-        let actionsAfterCleanup = try await storage.recoverInterruptedSegmentRedactions()
+        try await storage.finishInterruptedSegmentRewriteRecovery(segmentID: segmentID)
+        let actionsAfterCleanup = try await storage.recoverInterruptedSegmentRewrites()
         XCTAssertTrue(actionsAfterCleanup.isEmpty)
 
         try? FileManager.default.removeItem(at: root)
@@ -677,28 +830,34 @@ final class StorageManagerTests: XCTestCase {
         _ = try await writer.finalize()
 
         let originalJPEG = try await storage.readFrame(segmentID: segmentID, frameIndex: 0)
-        try await storage.rewriteSegmentForRedaction(
+        try await storage.applySegmentRewrite(
             segmentID: segmentID,
-            frameIDs: [42],
-            targetsByFrameIndex: [
-                0: [
-                    SegmentRedactionTarget(
+            plan: SegmentRewritePlan(
+                redactions: [
+                    SegmentFrameRedaction(
                         frameID: 42,
-                        nodeID: 7,
-                        normalizedRect: CGRect(x: 0.25, y: 0.25, width: 0.5, height: 0.5)
+                        frameIndex: 0,
+                        targets: [
+                            SegmentRedactionTarget(
+                                frameID: 42,
+                                nodeID: 7,
+                                normalizedRect: CGRect(x: 0.25, y: 0.25, width: 0.5, height: 0.5)
+                            )
+                        ]
                     )
                 ]
-            ],
+            ),
             secret: "unit-test-secret"
         )
 
         try await storage.forceRollbackSegmentRewriteStateForTesting(segmentID: segmentID)
-        let actions = try await storage.recoverInterruptedSegmentRedactions()
+        let actions = try await storage.recoverInterruptedSegmentRewrites()
         XCTAssertEqual(
             actions,
             [
-                SegmentRedactionRecoveryAction(
+                SegmentRewriteRecoveryAction(
                     mode: .rollbackToPending,
+                    operation: .partialRewrite,
                     segmentID: segmentID
                 )
             ]
@@ -713,8 +872,54 @@ final class StorageManagerTests: XCTestCase {
         let recoveredTarget = extractPatch(from: recoveredBGRA, imageWidth: recoveredImage.width, rect: targetRect)
         XCTAssertLessThan(averageAbsoluteDifference(originalTarget, recoveredTarget), 1.0)
 
-        try await storage.finishInterruptedSegmentRedactionRecovery(segmentID: segmentID)
-        let actionsAfterCleanup = try await storage.recoverInterruptedSegmentRedactions()
+        try await storage.finishInterruptedSegmentRewriteRecovery(segmentID: segmentID)
+        let actionsAfterCleanup = try await storage.recoverInterruptedSegmentRewrites()
+        XCTAssertTrue(actionsAfterCleanup.isEmpty)
+
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    func testRecoverInterruptedWholeVideoDeleteReturnsCompletionAction() async throws {
+        let root = makeTempRoot()
+        let storage = StorageManager(storageRoot: root)
+        try await storage.initialize(config: makeStorageConfig(root: root))
+
+        let writer = try await storage.createSegmentWriter()
+        let segmentID = await writer.segmentID
+        try await writer.appendFrame(
+            makePatternedCapturedFrame(
+                width: 64,
+                height: 64,
+                targetRect: CGRect(x: 16, y: 16, width: 32, height: 32)
+            )
+        )
+        _ = try await writer.finalize()
+
+        let segmentURL = try await storage.getSegmentPath(id: segmentID)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: segmentURL.path))
+
+        try await storage.applySegmentRewrite(
+            segmentID: segmentID,
+            plan: SegmentRewritePlan(operation: .wholeVideoDelete),
+            secret: nil
+        )
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: segmentURL.path))
+
+        let actions = try await storage.recoverInterruptedSegmentRewrites()
+        XCTAssertEqual(
+            actions,
+            [
+                SegmentRewriteRecoveryAction(
+                    mode: .finalizeCommitted,
+                    operation: .wholeVideoDelete,
+                    segmentID: segmentID
+                )
+            ]
+        )
+
+        try await storage.finishInterruptedSegmentRewriteRecovery(segmentID: segmentID)
+        let actionsAfterCleanup = try await storage.recoverInterruptedSegmentRewrites()
         XCTAssertTrue(actionsAfterCleanup.isEmpty)
 
         try? FileManager.default.removeItem(at: root)
@@ -3576,7 +3781,6 @@ private actor RecoveryTestDatabase: DatabaseProtocol {
             segmentID: frame.segmentID,
             videoID: frame.videoID,
             frameIndexInSegment: frame.frameIndexInSegment,
-            encodingStatus: frame.encodingStatus,
             metadata: frame.metadata,
             source: frame.source
         )
@@ -3678,7 +3882,6 @@ private actor RecoveryTestDatabase: DatabaseProtocol {
             segmentID: existing.segmentID,
             videoID: videoID,
             frameIndexInSegment: frameIndex,
-            encodingStatus: existing.encodingStatus,
             metadata: existing.metadata,
             source: existing.source
         )
@@ -3765,7 +3968,6 @@ private actor RecoveryTestDatabase: DatabaseProtocol {
                 segmentID: frame.segmentID,
                 videoID: VideoSegmentID(value: 0),
                 frameIndexInSegment: frame.frameIndexInSegment,
-                encodingStatus: frame.encodingStatus,
                 metadata: frame.metadata,
                 source: frame.source
             )
@@ -3973,43 +4175,29 @@ private actor RecoveryTestDatabase: DatabaseProtocol {
     }
 
     func insertNodes(
-        frameID: FrameID,
-        nodes: [(textOffset: Int, textLength: Int, bounds: CGRect, windowIndex: Int?)],
-        frameWidth: Int,
-        frameHeight: Int
-    ) async throws {
-        _ = frameID
-        _ = nodes
-        _ = frameWidth
-        _ = frameHeight
-    }
+        frameID _: FrameID,
+        nodes _: [(textOffset: Int, textLength: Int, bounds: CGRect, windowIndex: Int?)],
+        frameWidth _: Int,
+        frameHeight _: Int
+    ) async throws {}
 
-    func getNodes(frameID: FrameID, frameWidth: Int, frameHeight: Int) async throws -> [OCRNode] {
-        _ = frameID
-        _ = frameWidth
-        _ = frameHeight
+    func getNodes(frameID _: FrameID, frameWidth _: Int, frameHeight _: Int) async throws -> [OCRNode] {
         return []
     }
 
-    func getNodesWithText(frameID: FrameID, frameWidth: Int, frameHeight: Int) async throws -> [(node: OCRNode, text: String)] {
-        _ = frameID
-        _ = frameWidth
-        _ = frameHeight
+    func getNodesWithText(frameID _: FrameID, frameWidth _: Int, frameHeight _: Int) async throws -> [(node: OCRNode, text: String)] {
         return []
     }
 
-    func deleteNodes(frameID: FrameID) async throws {
-        _ = frameID
-    }
+    func deleteNodes(frameID _: FrameID) async throws {}
 
     func indexFrameText(
         mainText: String,
         chromeText: String?,
         windowTitle: String?,
-        segmentId: Int64,
+        segmentId _: Int64,
         frameId: Int64
     ) async throws -> Int64 {
-        _ = segmentId
         let docID = nextDocumentID
         nextDocumentID += 1
         docIDsByFrameID[frameId] = docID
@@ -4144,35 +4332,24 @@ private actor RecoveryTestStorage: StorageProtocol {
     }
 
     func readFrameFromWAL(
-        segmentID: VideoSegmentID,
-        frameID: Int64,
-        fallbackFrameIndex: Int
+        segmentID _: VideoSegmentID,
+        frameID _: Int64,
+        fallbackFrameIndex _: Int
     ) async throws -> CapturedFrame? {
-        _ = segmentID
-        _ = frameID
-        _ = fallbackFrameIndex
         return nil
     }
 
-    func rewriteSegmentForRedaction(
-        segmentID: VideoSegmentID,
-        frameIDs: [Int64],
-        targetsByFrameIndex: [Int: [SegmentRedactionTarget]],
-        secret: String
-    ) async throws {
-        _ = segmentID
-        _ = frameIDs
-        _ = targetsByFrameIndex
-        _ = secret
-    }
+    func applySegmentRewrite(
+        segmentID _: VideoSegmentID,
+        plan _: SegmentRewritePlan,
+        secret _: String?
+    ) async throws {}
 
-    func recoverInterruptedSegmentRedactions() async throws -> [SegmentRedactionRecoveryAction] {
+    func recoverInterruptedSegmentRewrites() async throws -> [SegmentRewriteRecoveryAction] {
         []
     }
 
-    func finishInterruptedSegmentRedactionRecovery(segmentID: VideoSegmentID) async throws {
-        _ = segmentID
-    }
+    func finishInterruptedSegmentRewriteRecovery(segmentID _: VideoSegmentID) async throws {}
 
     func isVideoValid(id: VideoSegmentID) async throws -> Bool {
         validVideoIDs.contains(id.value)
@@ -4252,41 +4429,6 @@ private actor RecoveryTestSegmentWriter: SegmentWriter {
     func cancel() async throws {
         cancelled = true
     }
-}
-
-private actor RecoveryTestProcessing: ProcessingProtocol {
-    var queuedFrameCount: Int { 0 }
-
-    func initialize(config: ProcessingConfig) async throws {}
-    func extractText(from frame: CapturedFrame) async throws -> ExtractedText {
-        throw ProcessingError.ocrFailed(underlying: "unused")
-    }
-    func extractTextViaOCR(from frame: CapturedFrame) async throws -> [TextRegion] { [] }
-    func extractTextViaAccessibility() async throws -> [TextRegion] { [] }
-    func queueFrame(_ frame: CapturedFrame, completion: @escaping @Sendable (Result<ExtractedText, ProcessingError>) -> Void) async {}
-    func waitForQueueDrain() async {}
-    func updateConfig(_ config: ProcessingConfig) async {}
-    func getConfig() async -> ProcessingConfig { .default }
-}
-
-private actor RecoveryTestSearch: SearchProtocol {
-    func initialize(config: SearchConfig) async throws {}
-    func search(query: SearchQuery) async throws -> SearchResults {
-        SearchResults(query: query, results: [], totalCount: 0, searchTimeMs: 0)
-    }
-    func search(text: String, limit: Int) async throws -> SearchResults {
-        SearchResults(
-            query: SearchQuery(text: text, limit: limit),
-            results: [],
-            totalCount: 0,
-            searchTimeMs: 0
-        )
-    }
-    func getSuggestions(prefix: String, limit: Int) async throws -> [String] { [] }
-    func index(text: ExtractedText, segmentId: Int64, frameId: Int64) async throws -> Int64 { 0 }
-    func removeFromIndex(frameID: FrameID) async throws {}
-    func rebuildIndex() async throws {}
-    func getStatistics() async -> SearchStatistics { SearchStatistics(totalDocuments: 0, totalSearches: 0, averageSearchTimeMs: 0) }
 }
 
 private actor RecoveryEnqueueCollector {

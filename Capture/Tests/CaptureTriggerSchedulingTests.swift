@@ -446,6 +446,220 @@ final class CaptureTriggerSchedulingTests: XCTestCase {
         XCTAssertEqual(collectedFrameCount, 1)
     }
 
+    func testWindowChangeKeepsLatestAppActivationWhileEarlierEvaluationIsInFlight() async throws {
+        let backend = FakeScreenCaptureBackend(
+            frames: [
+                makeFrame(
+                    displayID: 15,
+                    pixelValue: 20,
+                    appBundleID: "com.google.Chrome",
+                    appName: "Google Chrome",
+                    windowName: "Docs"
+                )
+            ]
+        )
+        let displayMonitor = FakeDisplayMonitor(activeDisplayID: 15, hasPermission: true)
+        let displaySwitchMonitor = FakeDisplaySwitchMonitor()
+        let mouseClickMonitor = FakeMouseClickMonitor(startResult: true)
+        let collector = FrameCollector()
+        let firstLookupGate = AsyncGate()
+        let manager = makeManager(
+            backend: backend,
+            displayMonitor: displayMonitor,
+            displaySwitchMonitor: displaySwitchMonitor,
+            mouseClickMonitor: mouseClickMonitor,
+            appInfoProvider: BlockingSequencedFakeAppInfoProvider(
+                responses: [
+                    FrameMetadata(
+                        appBundleID: "com.apple.Safari",
+                        appName: "Safari",
+                        windowName: "Inbox",
+                        displayID: 15
+                    ),
+                    FrameMetadata(
+                        appBundleID: "com.google.Chrome",
+                        appName: "Google Chrome",
+                        windowName: "Docs",
+                        displayID: 15
+                    )
+                ],
+                firstLookupGate: firstLookupGate
+            ),
+            schedulingConfiguration: CaptureSchedulingConfiguration(
+                minimumInterCaptureInterval: 0.02,
+                mouseClickSettleDelay: 0.005,
+                windowChangeSettleDelay: 0.005,
+                startWithImmediateIntervalCapture: false
+            )
+        )
+
+        try await manager.startCapture(
+            config: testConfig(
+                captureIntervalSeconds: 0,
+                captureOnMouseClick: false
+            )
+        )
+        let stream = await manager.frameStream
+        let streamTask = collectFrames(from: stream, into: collector)
+        defer {
+            streamTask.cancel()
+            Task { try? await manager.stopCapture() }
+        }
+
+        let firstEventTask = Task {
+            await displaySwitchMonitor.emitActivationWindowChange(
+                bundleID: "com.apple.Safari",
+                appName: "Safari"
+            )
+        }
+        try await sleep(milliseconds: 10)
+        await displaySwitchMonitor.emitActivationWindowChange(
+            bundleID: "com.google.Chrome",
+            appName: "Google Chrome"
+        )
+        await firstLookupGate.open()
+        await firstEventTask.value
+
+        try await sleep(milliseconds: 40)
+        let captureCount = await backend.captureCount()
+        let collectedFrameCount = await collector.count()
+        let lastCollectedFrame = await collector.lastFrame()
+        XCTAssertEqual(captureCount, 1)
+        XCTAssertEqual(collectedFrameCount, 1)
+        XCTAssertEqual(lastCollectedFrame?.metadata.appBundleID, "com.google.Chrome")
+        XCTAssertEqual(lastCollectedFrame?.metadata.windowName, "Docs")
+    }
+
+    func testActivationWindowChangeDropsFrameWhenCapturedMetadataDisagrees() async throws {
+        let backend = FakeScreenCaptureBackend(
+            frames: [
+                makeFrame(
+                    displayID: 16,
+                    pixelValue: 30,
+                    appBundleID: "com.google.Chrome",
+                    appName: "Google Chrome",
+                    windowName: "Docs"
+                )
+            ]
+        )
+        let displayMonitor = FakeDisplayMonitor(activeDisplayID: 16, hasPermission: true)
+        let displaySwitchMonitor = FakeDisplaySwitchMonitor()
+        let mouseClickMonitor = FakeMouseClickMonitor(startResult: true)
+        let collector = FrameCollector()
+        let manager = makeManager(
+            backend: backend,
+            displayMonitor: displayMonitor,
+            displaySwitchMonitor: displaySwitchMonitor,
+            mouseClickMonitor: mouseClickMonitor,
+            appInfoProvider: FakeAppInfoProvider(
+                metadata: FrameMetadata(
+                    appBundleID: "com.apple.Safari",
+                    appName: "Safari",
+                    windowName: "Inbox",
+                    displayID: 16
+                )
+            )
+        )
+
+        try await manager.startCapture(
+            config: testConfig(
+                captureIntervalSeconds: 0,
+                captureOnMouseClick: false
+            )
+        )
+        let stream = await manager.frameStream
+        let streamTask = collectFrames(from: stream, into: collector)
+        defer {
+            streamTask.cancel()
+            Task { try? await manager.stopCapture() }
+        }
+
+        await displaySwitchMonitor.emitActivationWindowChange(
+            bundleID: "com.apple.Safari",
+            appName: "Safari"
+        )
+
+        try await sleep(milliseconds: 30)
+        let captureCount = await backend.captureCount()
+        let collectedFrameCount = await collector.count()
+        XCTAssertEqual(captureCount, 1)
+        XCTAssertEqual(collectedFrameCount, 0)
+    }
+
+    func testActivationWindowChangeRetryAfterDroppedCaptureStillSchedulesLaterRetry() async throws {
+        let backend = FakeScreenCaptureBackend(
+            frames: [
+                makeFrame(
+                    displayID: 17,
+                    pixelValue: 30,
+                    appBundleID: "com.google.Chrome",
+                    appName: "Google Chrome",
+                    windowName: "Docs"
+                ),
+                makeFrame(
+                    displayID: 17,
+                    pixelValue: 60,
+                    appBundleID: "com.apple.Safari",
+                    appName: "Safari",
+                    windowName: "Inbox"
+                )
+            ]
+        )
+        let displayMonitor = FakeDisplayMonitor(activeDisplayID: 17, hasPermission: true)
+        let displaySwitchMonitor = FakeDisplaySwitchMonitor()
+        let mouseClickMonitor = FakeMouseClickMonitor(startResult: true)
+        let collector = FrameCollector()
+        let manager = makeManager(
+            backend: backend,
+            displayMonitor: displayMonitor,
+            displaySwitchMonitor: displaySwitchMonitor,
+            mouseClickMonitor: mouseClickMonitor,
+            appInfoProvider: FakeAppInfoProvider(
+                metadata: FrameMetadata(
+                    appBundleID: "com.apple.Safari",
+                    appName: "Safari",
+                    windowName: "Inbox",
+                    displayID: 17
+                )
+            ),
+            schedulingConfiguration: CaptureSchedulingConfiguration(
+                minimumInterCaptureInterval: 0.02,
+                mouseClickSettleDelay: 0.005,
+                windowChangeSettleDelay: 0.005,
+                startWithImmediateIntervalCapture: false
+            )
+        )
+
+        try await manager.startCapture(
+            config: testConfig(
+                captureIntervalSeconds: 0,
+                captureOnMouseClick: false
+            )
+        )
+        let stream = await manager.frameStream
+        let streamTask = collectFrames(from: stream, into: collector)
+        defer {
+            streamTask.cancel()
+            Task { try? await manager.stopCapture() }
+        }
+
+        await displaySwitchMonitor.emitActivationWindowChange(
+            bundleID: "com.apple.Safari",
+            appName: "Safari"
+        )
+        try await sleep(milliseconds: 35)
+        await displaySwitchMonitor.emitActivationWindowChange(
+            bundleID: "com.apple.Safari",
+            appName: "Safari"
+        )
+
+        try await sleep(milliseconds: 45)
+        let captureCount = await backend.captureCount()
+        let collectedFrameCount = await collector.count()
+        XCTAssertEqual(captureCount, 2)
+        XCTAssertEqual(collectedFrameCount, 1)
+    }
+
     func testOffCaptureIntervalDisablesPeriodicSchedulingButStillAllowsEventDrivenCapture() async throws {
         let backend = FakeScreenCaptureBackend(
             frames: [
@@ -504,7 +718,7 @@ final class CaptureTriggerSchedulingTests: XCTestCase {
         displayMonitor: FakeDisplayMonitor,
         displaySwitchMonitor: FakeDisplaySwitchMonitor,
         mouseClickMonitor: FakeMouseClickMonitor,
-        appInfoProvider: FakeAppInfoProvider = FakeAppInfoProvider(
+        appInfoProvider: any CaptureAppInfoProviding = FakeAppInfoProvider(
             metadata: FrameMetadata(
                 appBundleID: "com.apple.Safari",
                 appName: "Safari",
@@ -552,6 +766,9 @@ final class CaptureTriggerSchedulingTests: XCTestCase {
     private func makeFrame(
         displayID: UInt32,
         pixelValue: UInt8,
+        appBundleID: String? = nil,
+        appName: String? = nil,
+        windowName: String? = nil,
         timestamp: Date = Date()
     ) -> CapturedFrame {
         let width = 4
@@ -564,7 +781,12 @@ final class CaptureTriggerSchedulingTests: XCTestCase {
             width: width,
             height: height,
             bytesPerRow: bytesPerRow,
-            metadata: FrameMetadata(displayID: displayID)
+            metadata: FrameMetadata(
+                appBundleID: appBundleID,
+                appName: appName,
+                windowName: windowName,
+                displayID: displayID
+            )
         )
     }
 
@@ -727,7 +949,8 @@ private actor FakeDisplayMonitor: CaptureDisplayMonitoring {
 private actor FakeDisplaySwitchMonitor: CaptureDisplaySwitchMonitoring {
     private var onDisplaySwitch: (@Sendable (UInt32, UInt32) async -> Void)?
     private var onAccessibilityPermissionDenied: (@Sendable () async -> Void)?
-    private var onWindowChange: (@Sendable () async -> Void)?
+    private var onWindowChange: (@Sendable (WindowChangeEvent) async -> Void)?
+    private var nextEventID: UInt64 = 0
 
     func setOnDisplaySwitch(_ callback: (@Sendable (UInt32, UInt32) async -> Void)?) {
         onDisplaySwitch = callback
@@ -737,7 +960,7 @@ private actor FakeDisplaySwitchMonitor: CaptureDisplaySwitchMonitoring {
         onAccessibilityPermissionDenied = callback
     }
 
-    func setOnWindowChange(_ callback: (@Sendable () async -> Void)?) {
+    func setOnWindowChange(_ callback: (@Sendable (WindowChangeEvent) async -> Void)?) {
         onWindowChange = callback
     }
 
@@ -745,7 +968,34 @@ private actor FakeDisplaySwitchMonitor: CaptureDisplaySwitchMonitoring {
     func stopMonitoring() async {}
 
     func emitWindowChange() async {
-        await onWindowChange?()
+        nextEventID += 1
+        await onWindowChange?(
+            WindowChangeEvent(
+                id: nextEventID,
+                source: .axActivation,
+                observedAt: Date(),
+                activatedApp: nil,
+                workspaceFrontmostApp: nil
+            )
+        )
+    }
+
+    func emitActivationWindowChange(bundleID: String, appName: String) async {
+        nextEventID += 1
+        let activatedApp = CaptureAppSnapshot(
+            name: appName,
+            bundleID: bundleID,
+            pid: 42
+        )
+        await onWindowChange?(
+            WindowChangeEvent(
+                id: nextEventID,
+                source: .appActivation,
+                observedAt: Date(),
+                activatedApp: activatedApp,
+                workspaceFrontmostApp: activatedApp
+            )
+        )
     }
 }
 
@@ -794,6 +1044,36 @@ private struct FakeAppInfoProvider: CaptureAppInfoProviding {
     }
 }
 
+private actor BlockingSequencedFakeAppInfoProvider: CaptureAppInfoProviding {
+    private var responses: [FrameMetadata]
+    let firstLookupGate: AsyncGate
+
+    init(responses: [FrameMetadata], firstLookupGate: AsyncGate) {
+        self.responses = responses
+        self.firstLookupGate = firstLookupGate
+    }
+
+    private var lookupCount = 0
+
+    func getFrontmostAppInfo(
+        includeBrowserURL: Bool,
+        preferredDisplayID: CGDirectDisplayID?
+    ) async -> FrameMetadata {
+        lookupCount += 1
+        let lookupNumber = lookupCount
+        if lookupNumber == 1 {
+            await firstLookupGate.wait()
+        }
+        guard let firstResponse = responses.first else {
+            return FrameMetadata(displayID: preferredDisplayID ?? 0)
+        }
+        if responses.count > 1 {
+            responses.removeFirst()
+        }
+        return firstResponse
+    }
+}
+
 private actor FrameCollector {
     private var frames: [CapturedFrame] = []
 
@@ -803,6 +1083,29 @@ private actor FrameCollector {
 
     func count() -> Int {
         frames.count
+    }
+
+    func lastFrame() -> CapturedFrame? {
+        frames.last
+    }
+}
+
+private actor AsyncGate {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var isOpen = false
+
+    func wait() async {
+        guard !isOpen else { return }
+        await withCheckedContinuation { continuation in
+            self.continuation = continuation
+        }
+    }
+
+    func open() {
+        guard !isOpen else { return }
+        isOpen = true
+        continuation?.resume()
+        continuation = nil
     }
 }
 

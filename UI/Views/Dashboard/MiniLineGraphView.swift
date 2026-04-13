@@ -10,6 +10,15 @@ import Shared
 /// - Hover detection with tooltips showing values
 /// - Interactive dots that highlight on hover
 struct MiniLineGraphView: View {
+    struct TooltipContent: Equatable {
+        let headline: String
+        let details: [String]
+
+        var allLines: [String] {
+            [headline] + details
+        }
+    }
+
     let dataPoints: [DailyDataPoint]
     let lineColor: Color
     let showGradientFill: Bool
@@ -137,7 +146,12 @@ struct MiniLineGraphView: View {
                             let x = xPosition(for: index, width: graphWidth)
                             let y = yPosition(for: point.value, height: graphHeight)
 
-                            tooltipView(for: point, at: CGPoint(x: x, y: y), in: graphWidth)
+                            tooltipView(
+                                for: point,
+                                at: CGPoint(x: x, y: y),
+                                in: graphWidth,
+                                totalHeight: graphHeight
+                            )
                                 .transition(.opacity.combined(with: .scale(scale: 0.9)))
                                 .animation(.easeOut(duration: 0.15), value: hoveredIndex)
                         }
@@ -247,16 +261,35 @@ struct MiniLineGraphView: View {
     // MARK: - Tooltip
 
     @ViewBuilder
-    private func tooltipView(for point: DailyDataPoint, at position: CGPoint, in totalWidth: CGFloat) -> some View {
-        let formattedValue = valueFormatter?(point.value) ?? formatValue(point.value)
+    private func tooltipView(
+        for point: DailyDataPoint,
+        at position: CGPoint,
+        in totalWidth: CGFloat,
+        totalHeight: CGFloat
+    ) -> some View {
+        let tooltipContent = Self.tooltipContent(for: point, valueFormatter: valueFormatter)
+        let hasBreakdown = !tooltipContent.details.isEmpty
+        let tooltipWidth = Self.estimatedTooltipWidth(for: tooltipContent)
+        let tooltipHeight = Self.estimatedTooltipHeight(for: tooltipContent)
 
-        VStack(spacing: 2) {
-            Text(formattedValue)
+        VStack(alignment: hasBreakdown ? .leading : .center, spacing: hasBreakdown ? 3 : 2) {
+            Text(tooltipContent.headline)
                 .font(.system(size: 11, weight: .semibold, design: .rounded))
                 .foregroundColor(.white)
+
+            if hasBreakdown {
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(tooltipContent.details, id: \.self) { detail in
+                        Text(detail)
+                            .font(.system(size: 9, weight: .medium, design: .monospaced))
+                            .foregroundColor(.white.opacity(0.8))
+                    }
+                }
+            }
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
+        .padding(.horizontal, hasBreakdown ? 10 : 8)
+        .padding(.vertical, hasBreakdown ? 6 : 4)
+        .fixedSize()
         .background(
             RoundedRectangle(cornerRadius: 6)
                 .fill(Color.black.opacity(0.85))
@@ -265,17 +298,55 @@ struct MiniLineGraphView: View {
                         .stroke(lineColor.opacity(0.5), lineWidth: 1)
                 )
         )
-        .position(x: clampTooltipX(position.x, in: totalWidth), y: position.y - 20)
+        .position(
+            x: clampTooltipX(position.x, in: totalWidth, tooltipWidth: tooltipWidth),
+            y: clampTooltipY(position.y, in: totalHeight, tooltipHeight: tooltipHeight)
+        )
     }
 
     /// Clamp tooltip X position to keep it within bounds
-    private func clampTooltipX(_ x: CGFloat, in width: CGFloat) -> CGFloat {
-        let tooltipHalfWidth: CGFloat = 30
+    private func clampTooltipX(_ x: CGFloat, in width: CGFloat, tooltipWidth: CGFloat) -> CGFloat {
+        let tooltipHalfWidth = tooltipWidth / 2
         return min(max(x, tooltipHalfWidth), width - tooltipHalfWidth)
     }
 
+    private func clampTooltipY(_ y: CGFloat, in height: CGFloat, tooltipHeight: CGFloat) -> CGFloat {
+        let tooltipHalfHeight = tooltipHeight / 2
+        let desiredY = y - tooltipHalfHeight - 8
+        return min(max(desiredY, tooltipHalfHeight), height - tooltipHalfHeight)
+    }
+
+    static func tooltipContent(
+        for point: DailyDataPoint,
+        valueFormatter: ((Int64) -> String)? = nil
+    ) -> TooltipContent {
+        let headline = valueFormatter?(point.value) ?? formatValue(point.value)
+        guard let storageBreakdown = point.storageBreakdown else {
+            return TooltipContent(headline: headline, details: [])
+        }
+
+        return TooltipContent(
+            headline: headline,
+            details: [
+                "DB: \(formatValue(storageBreakdown.databaseBytes))",
+                "MP4: \(formatValue(storageBreakdown.mp4Bytes))"
+            ]
+        )
+    }
+
+    private static func estimatedTooltipWidth(for content: TooltipContent) -> CGFloat {
+        let maxCharacters = content.allLines.map(\.count).max() ?? 0
+        let minimumWidth: CGFloat = content.details.isEmpty ? 60 : 86
+        return max(minimumWidth, CGFloat(maxCharacters) * 7.2 + 18)
+    }
+
+    private static func estimatedTooltipHeight(for content: TooltipContent) -> CGFloat {
+        let baseHeight: CGFloat = content.details.isEmpty ? 26 : 24
+        return baseHeight + (CGFloat(content.details.count) * 14)
+    }
+
     /// Default value formatter
-    private func formatValue(_ value: Int64) -> String {
+    private static func formatValue(_ value: Int64) -> String {
         if value >= 1_000_000_000 {
             return String(format: "%.1fGB", Double(value) / 1_000_000_000)
         } else if value >= 1_000_000 {

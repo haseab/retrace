@@ -98,7 +98,9 @@ public struct SettingsView: View {
     @State var previewRetentionDays: Int?  // Visual preview while selecting
     @AppStorage("maxStorageGB", store: settingsStore) var maxStorageGB: Double = SettingsDefaults.maxStorageGB
     @AppStorage("useRewindData", store: settingsStore) var useRewindData: Bool = SettingsDefaults.useRewindData
-    @State var rewindCutoffDateSelection: Date = ServiceContainer.rewindCutoffDate(in: settingsStore)
+    @State var rewindCutoffDateSelection: Date = Calendar.current.startOfDay(
+        for: ServiceContainer.rewindCutoffDate(in: settingsStore)
+    )
     @State var isRefreshingRewindCutoff = false
     @State var settingsToastMessage: String?
     @State var settingsToastVisible = false
@@ -182,6 +184,7 @@ public struct SettingsView: View {
     @AppStorage("enableFrameIDSearch", store: settingsStore) var enableFrameIDSearch = SettingsDefaults.enableFrameIDSearch
     @AppStorage("showOCRDebugOverlay", store: settingsStore) var showOCRDebugOverlay = SettingsDefaults.showOCRDebugOverlay
     @AppStorage("showVideoControls", store: settingsStore) var showVideoControls = SettingsDefaults.showVideoControls
+    @AppStorage(menuBarCaptureFeedbackDefaultsKey, store: settingsStore) var showMenuBarCaptureFeedback = SettingsDefaults.showMenuBarCaptureFeedback
 
     // MARK: OCR Power Settings
     @AppStorage("ocrEnabled", store: settingsStore) var ocrEnabled = SettingsDefaults.ocrEnabled
@@ -239,7 +242,8 @@ public struct SettingsView: View {
     }
 
     var hasCustomRewindCutoffDate: Bool {
-        rewindCutoffDateSelection != SettingsDefaults.rewindCutoffDate
+        Calendar.current.startOfDay(for: rewindCutoffDateSelection)
+            != Calendar.current.startOfDay(for: SettingsDefaults.rewindCutoffDate)
     }
 
     var defaultRewindCutoffDateDescription: String {
@@ -247,7 +251,7 @@ public struct SettingsView: View {
     }
 
     var customRewindCutoffWarningText: String {
-        let formattedCutoff = rewindCutoffDateSelection.formatted(date: .abbreviated, time: .shortened)
+        let formattedCutoff = rewindCutoffDateSelection.formatted(date: .abbreviated, time: .omitted)
         return "When Rewind data is enabled, any native Retrace data before \(formattedCutoff) will not be available."
     }
 
@@ -315,20 +319,7 @@ public struct SettingsView: View {
         qos: .utility,
         attributes: .concurrent
     )
-    nonisolated static let inPageURLKnownBrowserBundleIDs: [String] = [
-        "com.apple.Safari",
-        "com.google.Chrome",
-        "com.google.Chrome.canary",
-        "org.chromium.Chromium",
-        "com.microsoft.edgemac",
-        "com.brave.Browser",
-        "com.vivaldi.Vivaldi",
-        "com.operasoftware.Opera",
-        "company.thebrowser.Browser",
-        "ai.perplexity.comet",
-        "company.thebrowser.dia",
-        "com.nicklockwood.Thorium",
-    ]
+    nonisolated static let inPageURLKnownBrowserBundleIDs: [String] = AppInfo.supportedBrowserBundleIDOrder
     nonisolated static let inPageURLUnsupportedBundleIDs: [String] = [
         "org.mozilla.firefox",
         "org.mozilla.firefoxbeta",
@@ -338,19 +329,7 @@ public struct SettingsView: View {
         "com.sigmaos.sigmaos.macos",
         "com.openai.atlas",
     ]
-    nonisolated static let inPageURLChromiumHostBundleIDPrefixes: [String] = [
-        "com.google.Chrome",
-        "com.google.Chrome.canary",
-        "org.chromium.Chromium",
-        "com.microsoft.edgemac",
-        "com.brave.Browser",
-        "com.vivaldi.Vivaldi",
-        "com.operasoftware.Opera",
-        "company.thebrowser.Browser",
-        "ai.perplexity.comet",
-        "company.thebrowser.dia",
-        "com.nicklockwood.Thorium",
-    ]
+    nonisolated static let inPageURLChromiumHostBundleIDPrefixes: [String] = AppInfo.chromiumHostBrowserBundleIDPrefixes
     static let inPageURLTestURLString = "https://en.wikipedia.org/wiki/Cat"
     static let inPageURLNoMatchingWindowToken = "__NO_MATCHING_WINDOW__"
     nonisolated static let privateModeAutomationFallbackBundleIDs: [String] = [

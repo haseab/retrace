@@ -134,16 +134,7 @@ struct ContextMenuContent: View {
     }
 
     private func copyImageToClipboard() {
-        let coordinator = coordinatorWrapper.coordinator
-        let frameID = viewModel.currentFrame?.id.value
-        getCurrentFrameImage { image in
-            guard let image = image else { return }
-            let pasteboard = NSPasteboard.general
-            pasteboard.clearContents()
-            pasteboard.writeObjects([image])
-            // Record image copy metric with frame ID
-            DashboardViewModel.recordImageCopy(coordinator: coordinator, frameID: frameID)
-        }
+        viewModel.copyCurrentFrameImageToClipboard()
     }
 
     private func openDashboard() {
@@ -209,6 +200,12 @@ struct ContextMenuContent: View {
         }
 
         let asset = AVURLAsset(url: url)
+        let directDecodeBytes = UIDirectFrameDecodeMemoryLedger.begin(
+            tag: UIDirectFrameDecodeMemoryLedger.contextMenuGeneratorTag,
+            function: "ui.context_menu",
+            reason: "ui.context_menu.frame_decode",
+            videoInfo: videoInfo
+        )
         let imageGenerator = AVAssetImageGenerator(asset: asset)
         imageGenerator.appliesPreferredTrackTransform = true
         imageGenerator.requestedTimeToleranceBefore = .zero
@@ -218,6 +215,11 @@ struct ContextMenuContent: View {
 
         imageGenerator.generateCGImagesAsynchronously(forTimes: [NSValue(time: time)]) { _, cgImage, _, _, _ in
             DispatchQueue.main.async {
+                UIDirectFrameDecodeMemoryLedger.end(
+                    tag: UIDirectFrameDecodeMemoryLedger.contextMenuGeneratorTag,
+                    reason: "ui.context_menu.frame_decode",
+                    bytes: directDecodeBytes
+                )
                 if let cgImage = cgImage {
                     let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
                     completion(nsImage)

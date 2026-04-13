@@ -2,7 +2,7 @@
 
 You are the **UI** agent responsible for building the SwiftUI interface for Retrace.
 
-**Status**: ✅ Fully implemented with modern SwiftUI design. Timeline, dashboard, search, settings, onboarding, feedback, and bundled crash-recovery helper integration all working. Global hotkeys functional (Cmd+Shift+T for timeline, Cmd+Shift+D for dashboard). Menu bar integration complete. **Apple Silicon required**. Audio transcription UI not implemented (planned for future release).
+**Status**: ✅ Fully implemented with modern SwiftUI design. Timeline, dashboard, search, settings, onboarding, feedback, and bundled crash-recovery helper integration all working. Global hotkeys functional (Cmd+Shift+T for timeline, Cmd+Shift+D for dashboard). Menu bar integration complete. Automatic move-to-Applications prompting has been removed. **Apple Silicon required**. Audio transcription UI not implemented (planned for future release).
 
 ## Your Directory
 
@@ -36,7 +36,15 @@ UI/
 │   │   └── SupportLink.swift            # Twitter/support
 │   ├── Feedback/
 │   │   ├── FeedbackFormView.swift       # Feedback sheet with form, sending, and success states
+│   │   ├── FeedbackDiagnosticsPresentation.swift # Feedback diagnostics section building + readable formatting helpers
 │   │   ├── FeedbackModels.swift         # Feedback launch context, diagnostics, and payload models
+│   │   ├── FeedbackSubmissionExport.swift # Feedback export text/JSON generation + filtered payload builder
+│   │   ├── FeedbackCrashCompaction.swift # Crash-report compaction helpers for feedback exports/submissions
+│   │   ├── FeedbackCompression.swift    # Shared gzip compression utility for feedback payloads/exports
+│   │   ├── FeedbackDiagnosticsCollector.swift # Diagnostic snapshot collection helpers (system/settings/perf/memory summaries)
+│   │   ├── FeedbackLogSnapshotter.swift # Log-tail filtering/grouping/snapshot helpers for feedback diagnostics
+│   │   ├── FeedbackSubmissionTransport.swift # Feedback submission request construction + network transport helpers
+│   │   ├── FeedbackExportIO.swift      # Screenshot capture and feedback diagnostics/report export file I/O
 │   │   └── FeedbackService.swift        # Feedback submission and export implementation
 │   └── Settings/
 │       ├── SettingsView.swift           # Thin settings shell hosting navigation, alerts, and top-level wiring
@@ -82,20 +90,32 @@ UI/
 │   └── CrashRecoverySupport.swift       # Shared crash-recovery constants, disconnect suppression, and XPC protocol
 ├── LaunchAgents/
 │   └── io.retrace.app.crash-recovery.plist # SMAppService launch-agent plist for crash recovery
-├── BuildMetadata.generated.swift        # SwiftPM-generated fallback metadata for standalone `.build` runs
 ├── Components/
 │   ├── MasterKeyRedactionFlowCoordinator.swift # Shared missing-master-key prompt/recovery coordinator
 │   ├── BoundingBoxOverlay.swift         # Text region highlighting
 │   ├── CrashRecoveryManager.swift       # App-side SMAppService/XPC lifecycle manager
 │   ├── SessionTimeline.swift            # App session visualization
 │   ├── DeeplinkHandler.swift            # URL scheme routing
+│   ├── LaunchMenuRouting.swift          # Shared dashboard/timeline/settings/system-monitor routing and frontmost-window checks for app/status menus
+│   ├── AppMetadataCache.swift           # App name/icon lookup caches and app icon view
+│   ├── FaviconProvider.swift            # Favicon memory+disk cache and favicon view
+│   ├── FocusableTextInputSupport.swift  # Shared AppKit-backed text input wrapper and right-click deferral helpers for borderless UI surfaces
 │   ├── ProcessCPUMonitor.swift          # Shared process CPU+memory sampler + 24h aggregation service
+│   ├── ProcessMemoryCardPresentation.swift # Local presentation controller + row builder for memory monitor card
+│   ├── ProcessMonitorModels.swift       # System Monitor snapshot/models + ranking/build helpers
+│   ├── HoverLatchedScrollMonitor.swift  # Shared nested-scroll latch helper for hover-routed inner scroll regions
 │   ├── ProcessCPUSummaryCard.swift      # System Monitor CPU table/card UI
-│   └── ProcessMemorySummaryCard.swift   # System Monitor memory table/card UI
+│   ├── ProcessMemorySummaryCard.swift   # System Monitor memory table/card UI
+│   ├── RetraceAboutPanel.swift          # Custom About panel content and window factory used by the app menu
+│   └── UIMemoryEstimators.swift         # Shared UI memory-estimation helpers for telemetry
 ├── ViewModels/
-│   ├── TimelineViewModel.swift
+│   ├── SimpleTimelineViewModel.swift    # Fullscreen timeline state, caching, playback, filters, OCR overlays
 │   ├── SearchViewModel.swift
 │   ├── DashboardViewModel.swift
+│   ├── DashboardViewModel+Metrics.swift # Extracted dashboard/timeline/system-monitor metric recording helpers
+│   ├── TimelineMetrics.swift         # Timeline-scoped daily_metrics helpers and shared UI metric recorder glue
+│   ├── TimelineYouTubeLinkSupport.swift # Shared YouTube timestamping + OCR markdown-link extraction helpers for timeline flows
+│   ├── UIMetricsRecorder.swift       # Shared UI metric recording + JSON payload helpers
 │   ├── CrashRecoveryBannerModel.swift   # Dashboard-facing banner state derived from crash recovery manager status
 │   ├── CommentComposerTargetDisplayInfo.swift # Shared display metadata/title logic for timeline and quick-comment composers
 │   ├── FeedbackViewModel.swift          # Feedback form state, diagnostics, export, submission
@@ -121,14 +141,14 @@ UI/
     ├── FeedbackExportTests.swift         # Feedback report export formatting coverage
     ├── FeedbackSubmissionProgressTests.swift # Feedback sending-state sequence coverage
     ├── HyperlinkMappingTests.swift       # Stored hyperlink row to OCR-node mapping coverage
+    ├── FaviconProviderTests.swift        # Favicon memory-vs-disk cache behavior coverage
     ├── HyperlinkResolutionTests.swift    # Hyperlink parsing/resolution coverage
-    ├── InPageURLSettingsTests.swift      # In-page URL setup instructions and toggle coverage
-    ├── MilestoneCelebrationViewTests.swift # Milestone dialog action layout coverage
-    ├── OnboardingAutomationTargetTests.swift # Onboarding/settings unsupported browser coverage
     ├── AppNameResolverInstalledAppsTests.swift # Installed-app scan deduplication coverage
     ├── SearchViewModelAvailableAppsTests.swift # Search app-list merge/deduplication coverage
     ├── SpotlightSearchOverlayRecentEntryAppMapTests.swift # Recent entry app-name map deduplication coverage
+    ├── Search/SearchPaginationCancellationTests.swift # Search stale-pagination cancellation coverage on mode/sort changes
     ├── DashboardAppUsageDateRangeTests.swift # Dashboard app-usage date-range normalization coverage
+    ├── DateRangePresetShortcutTests.swift # Shared date-range preset shortcut mapping and inclusive-range coverage
     ├── CaptureIntervalSettingsTests.swift # Live capture-interval config update coverage
     ├── ProcessCPUDisplayMetricsTests.swift # CPU sampler display math and live ranking coverage
     ├── SearchHighlightTooltipTests.swift # Search highlight tooltip hover/dismiss coverage
@@ -137,7 +157,10 @@ UI/
     ├── Search/                           # Search/deeplink/overlay XCTestCase files
     ├── Settings/                         # Settings-focused XCTestCase files, including shell/view-model coverage
     ├── Support/                          # Shared XCTest helpers and support-only tests
+    │   └── FocusableTextInputSupportTests.swift # Borderless text-input keyboard shortcut, right-click deferral, and menu-filter coverage
     ├── SystemMonitor/                    # System monitor XCTestCase files
+    ├── Timeline/TimelineCopyFeedbackTests.swift # Timeline copy image/text toast feedback coverage
+    ├── Timeline/TimelinePositionRecoveryHintTests.swift # Timeline reopen Cmd+Z recovery hint behavior and policy coverage
     └── Timeline/                         # Timeline XCTestCase files
 ```
 

@@ -6,6 +6,7 @@ import Database
 import SQLCipher
 import Darwin
 import IOKit.ps
+import ObjectiveC.runtime
 import UniformTypeIdentifiers
 
 enum SingleInstanceLock {
@@ -59,6 +60,159 @@ enum SingleInstanceLock {
         descriptor = -1
     }
 }
+enum SingleInstanceLockRetryResult: Equatable {
+    case acquired(descriptor: CInt, attempts: Int)
+    case failedHeldByAnotherProcess(attempts: Int)
+    case failedError(code: Int32, attempts: Int)
+}
+
+enum SingleInstanceLockRetrier {
+    static func acquire(
+        maxAttempts: Int,
+        retryDelay: Duration,
+        existingDescriptor: CInt = -1,
+        acquire: (CInt) -> SingleInstanceLock.AcquireResult,
+        sleep: (Duration) async -> Void = { duration in
+            try? await Task.sleep(for: duration, clock: .continuous)
+        }
+    ) async -> SingleInstanceLockRetryResult {
+        let attempts = max(maxAttempts, 1)
+
+        for attempt in 1...attempts {
+            switch acquire(existingDescriptor) {
+            case .alreadyHeld(let descriptor), .acquired(let descriptor):
+                return .acquired(descriptor: descriptor, attempts: attempt)
+
+            case .heldByAnotherProcess:
+                if attempt == attempts {
+                    return .failedHeldByAnotherProcess(attempts: attempt)
+                }
+
+            case .error(let code):
+                if attempt == attempts {
+                    return .failedError(code: code, attempts: attempt)
+                }
+            }
+
+            await sleep(retryDelay)
+        }
+
+        return .failedHeldByAnotherProcess(attempts: attempts)
+    }
+}
+
+enum TextInputContextMenuAutofillFilter {
+    private static var isInstalled = false
+    private static let allowedActions: Set<Selector> = [
+        #selector(NSText.cut(_:)),
+        #selector(NSText.copy(_:)),
+        #selector(NSText.paste(_:))
+    ]
+
+    static func install() {
+        guard !isInstalled else { return }
+        isInstalled = true
+
+        swizzleMenuMethod(on: NSTextField.self, with: #selector(NSTextField.retrace_filteredContextMenu(for:)))
+        swizzleMenuMethod(on: NSTextView.self, with: #selector(NSTextView.retrace_filteredContextMenu(for:)))
+    }
+
+    static func filteredMenu(from menu: NSMenu?) -> NSMenu? {
+        guard let menu else { return nil }
+        filterAllowedItems(from: menu)
+        return menu
+    }
+
+    private static func swizzleMenuMethod(on cls: AnyClass, with swizzledSelector: Selector) {
+        let originalSelector = #selector(NSView.menu(for:))
+        guard let originalMethod = class_getInstanceMethod(cls, originalSelector),
+              let swizzledMethod = class_getInstanceMethod(cls, swizzledSelector) else {
+            return
+        }
+
+        let didAddMethod = class_addMethod(
+            cls,
+            originalSelector,
+            method_getImplementation(swizzledMethod),
+            method_getTypeEncoding(swizzledMethod)
+        )
+
+        if didAddMethod {
+            class_replaceMethod(
+                cls,
+                swizzledSelector,
+                method_getImplementation(originalMethod),
+                method_getTypeEncoding(originalMethod)
+            )
+        } else {
+            method_exchangeImplementations(originalMethod, swizzledMethod)
+        }
+    }
+
+    static func filterAllowedItems(from menu: NSMenu) {
+        for item in menu.items {
+            if let submenu = item.submenu {
+                filterAllowedItems(from: submenu)
+            }
+        }
+
+        for index in menu.items.indices.reversed() where shouldRemove(menu.items[index]) {
+            menu.removeItem(at: index)
+        }
+
+        collapseRedundantSeparators(in: menu)
+    }
+
+    private static func shouldRemove(_ item: NSMenuItem) -> Bool {
+        guard !item.isSeparatorItem else {
+            return false
+        }
+
+        guard let action = item.action else {
+            return true
+        }
+
+        return !allowedActions.contains(action)
+    }
+
+    private static func collapseRedundantSeparators(in menu: NSMenu) {
+        var previousWasSeparator = true
+        var indexesToRemove: [Int] = []
+
+        for (index, item) in menu.items.enumerated() {
+            if item.isSeparatorItem {
+                if previousWasSeparator {
+                    indexesToRemove.append(index)
+                }
+                previousWasSeparator = true
+            } else {
+                previousWasSeparator = false
+            }
+        }
+
+        if let lastIndex = menu.items.indices.last,
+           menu.items[lastIndex].isSeparatorItem {
+            indexesToRemove.append(lastIndex)
+        }
+
+        for index in Set(indexesToRemove).sorted(by: >) {
+            menu.removeItem(at: index)
+        }
+    }
+}
+
+private extension NSTextField {
+    @objc func retrace_filteredContextMenu(for event: NSEvent) -> NSMenu? {
+        TextInputContextMenuAutofillFilter.filteredMenu(from: retrace_filteredContextMenu(for: event))
+    }
+}
+
+private extension NSTextView {
+    @objc func retrace_filteredContextMenu(for event: NSEvent) -> NSMenu? {
+        TextInputContextMenuAutofillFilter.filteredMenu(from: retrace_filteredContextMenu(for: event))
+    }
+}
+
 /// Main app entry point
 @main
 struct RetraceApp: App {
@@ -70,102 +224,33 @@ struct RetraceApp: App {
     // MARK: - Body
 
     var body: some Scene {
-        // Windows are managed manually via window controllers; Settings scene exists for app commands.
+        // Windows are managed manually via window controllers.
         Settings {
             EmptyView()
         }
         .commands {
-            appCommands
+            CommandGroup(replacing: .newItem) {
+                // Remove "New Window" because window creation is managed by dedicated controllers.
+            }
         }
     }
-
-    // MARK: - Commands
-
-    @CommandsBuilder
-    private var appCommands: some Commands {
-        CommandGroup(replacing: .newItem) {
-            // Remove "New Window" because window creation is managed by dedicated controllers.
-        }
-
-        // Add Dashboard and Timeline to the app menu (top left, after "About Retrace")
-        CommandGroup(after: .appInfo) {
-            Button("Open Dashboard") {
-                if TimelineWindowController.shared.isVisible {
-                    TimelineWindowController.shared.hideToShowDashboard()
-                }
-                DashboardWindowController.shared.showDashboard()
-            }
-            // Note: Global hotkey is registered via HotkeyManager from saved settings
-            // Don't add a static .keyboardShortcut here as it would conflict
-
-            Button("Open Changelog") {
-                DashboardWindowController.shared.showChangelog()
-            }
-
-            Button("Open Timeline") {
-                TimelineWindowController.shared.toggle()
-            }
-            // Note: Global hotkey is registered via HotkeyManager from saved settings
-            // Don't add a static .keyboardShortcut here as it would conflict
-
-            Divider()
-        }
-
-        CommandMenu("View") {
-            Button("Dashboard") {
-                if TimelineWindowController.shared.isVisible {
-                    TimelineWindowController.shared.hideToShowDashboard()
-                }
-                DashboardWindowController.shared.showDashboard()
-            }
-
-            Button("Changelog") {
-                DashboardWindowController.shared.showChangelog()
-            }
-
-            Button("Timeline") {
-                // Open fullscreen timeline overlay
-                TimelineWindowController.shared.toggle()
-            }
-            // Note: Global hotkey is registered via HotkeyManager from saved settings
-            // Don't add a static .keyboardShortcut here as it would conflict
-
-            Divider()
-
-            Button("Settings") {
-                if TimelineWindowController.shared.isVisible {
-                    TimelineWindowController.shared.hideToShowDashboard()
-                }
-                DashboardWindowController.shared.showSettings()
-            }
-            .keyboardShortcut(",", modifiers: .command)
-        }
-
-        CommandMenu("Recording") {
-            Button("Start/Stop Recording") {
-                Task {
-                    if let appDelegate = NSApplication.shared.delegate as? AppDelegate {
-                        try? await appDelegate.toggleRecording()
-                    }
-                }
-            }
-            // Note: Global hotkey is registered via HotkeyManager from saved settings
-            // Don't add a static .keyboardShortcut here as it would conflict
-        }
-    }
-
 }
 
 // MARK: - App Delegate
 
 @MainActor
-class AppDelegate: NSObject, NSApplicationDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @MainActor static private(set) var isApplicationTerminating = false
 
-    enum FreshLaunchAction: Equatable {
+    enum LaunchMode: Equatable {
+        case fresh
+        case relaunch
+    }
+
+    enum LaunchGateAction: Equatable {
         case continueLaunch
-        case continueLaunchIgnoringStaleRunningApp
-        case activateExistingInstance
+        case activateExistingInstanceAndExitDuplicate
+        case exitDueToLockFailure
     }
 
     var menuBarManager: MenuBarManager?
@@ -189,15 +274,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var isTerminationDecisionInProgress = false
     private var bypassQuitConfirmationPromptOnce = false
     private var singleInstanceLockFileDescriptor: CInt = -1
+    private var aboutWindowController: NSWindowController?
     private let settingsStore = UserDefaults(suiteName: "io.retrace.app") ?? .standard
     private static let devDeeplinkEnvKey = "RETRACE_DEV_DEEPLINK_URL"
     private static let externalDashboardRevealNotification = Notification.Name("io.retrace.app.externalDashboardReveal")
     private static let quitConfirmationPreferenceKey = "quitConfirmationPreference"
     private static let showDockIconPreferenceKey = "showDockIcon"
+    private static let dashboardShortcutDefaultsKey = "dashboardShortcutConfig"
+    private static let recordingShortcutDefaultsKey = "recordingShortcutConfig"
+    private static let systemMonitorShortcutDefaultsKey = "systemMonitorShortcutConfig"
     private static let canonicalBundleIdentifier = "io.retrace.app"
     private static let singleInstanceLockPath = "/tmp/io.retrace.app.instance.lock"
     private static let relaunchLockRetryAttempts = 30
-    private static let relaunchLockRetryDelay: Duration = .milliseconds(100)
+    private static let singleInstanceLockRetryDelay: Duration = .milliseconds(100)
     nonisolated private static let watchdogSleepSuspensionSeconds: TimeInterval = 12 * 60 * 60
     nonisolated private static let watchdogWakeGracePeriodSeconds: TimeInterval = 60
 
@@ -208,57 +297,46 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Temporarily disabled while investigating App Management permission prompts.
-        // Prompt user to move app to Applications folder if not already there.
-        // AppMover.moveToApplicationsFolderIfNecessary()
-        setupExternalDashboardRevealObserver()
-        applyDockIconVisibilityPreference()
-
         // Check if another instance is already running. Relaunches still need to
-        // reacquire the lock, but can skip the duplicate-process scan during handoff.
+        // reacquire the lock during handoff, but fresh launches should decide immediately.
         let isRelaunch = UserDefaults.standard.bool(forKey: "isRelaunching")
         if isRelaunch {
             Log.info("[AppDelegate] App relaunched successfully", category: .app)
             UserDefaults.standard.removeObject(forKey: "isRelaunching")
-            Task { @MainActor [weak self] in
-                guard let self else { return }
+            Task { @MainActor in
+                let singleInstanceLockResult = await self.acquireSingleInstanceLock(
+                    maxAttempts: Self.relaunchLockRetryAttempts,
+                    reason: "relaunch handoff"
+                )
 
-                let hasSingleInstanceLock = await self.acquireSingleInstanceLockAfterRelaunch()
-                guard hasSingleInstanceLock else {
-                    Log.warning(
-                        "[AppDelegate] Relaunch could not reacquire the single-instance lock after handoff window; activating existing instance and terminating duplicate.",
-                        category: .app
-                    )
-                    self.activateExistingInstance()
-                    self.requestImmediateTermination(skipQuitConfirmation: true)
+                guard self.handleSingleInstanceLaunchDecision(
+                    mode: .relaunch,
+                    lockResult: singleInstanceLockResult
+                ) else {
                     return
                 }
 
-                self.finishApplicationLaunch()
+                self.beginPostSingleInstanceLaunchSetup()
             }
             return
         }
 
-        let freshLaunchAction = Self.freshLaunchAction(
-            hasSingleInstanceLock: acquireSingleInstanceLock(),
-            matchingRunningAppDetected: isAnotherInstanceRunning()
-        )
-
-        switch freshLaunchAction {
-        case .continueLaunch:
-            break
-        case .continueLaunchIgnoringStaleRunningApp:
-            Log.warning(
-                "[AppDelegate] Matching running application detected after acquiring the single-instance lock; continuing launch because the lock is authoritative and the other instance is likely terminating.",
-                category: .app
-            )
-        case .activateExistingInstance:
-            Log.info("[AppDelegate] Another instance already running, activating it", category: .app)
-            activateExistingInstance()
-            requestImmediateTermination(skipQuitConfirmation: true)
+        let singleInstanceLockResult = acquireSingleInstanceLockForFreshLaunch()
+        guard handleSingleInstanceLaunchDecision(
+            mode: .fresh,
+            lockResult: singleInstanceLockResult
+        ) else {
             return
         }
 
+        beginPostSingleInstanceLaunchSetup()
+    }
+
+    private func beginPostSingleInstanceLaunchSetup() {
+        TextInputContextMenuAutofillFilter.install()
+        setupExternalDashboardRevealObserver()
+        installMainMenuIfNeeded(force: true)
+        applyDockIconVisibilityPreference()
         finishApplicationLaunch()
     }
 
@@ -293,46 +371,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Note: Permissions are now handled in the onboarding flow
     }
 
-    private func acquireSingleInstanceLockAfterRelaunch() async -> Bool {
-        for attempt in 1...Self.relaunchLockRetryAttempts {
-            switch SingleInstanceLock.acquire(
-                atPath: Self.singleInstanceLockPath,
-                existingDescriptor: singleInstanceLockFileDescriptor
-            ) {
-            case .alreadyHeld(let descriptor), .acquired(let descriptor):
-                singleInstanceLockFileDescriptor = descriptor
-                Log.info(
-                    "[AppDelegate] Relaunch acquired single-instance lock attempt=\(attempt)/\(Self.relaunchLockRetryAttempts)",
-                    category: .app
-                )
-                return true
-
-            case .heldByAnotherProcess:
-                if attempt == Self.relaunchLockRetryAttempts {
-                    return false
-                }
-
-                if attempt == 1 || attempt % 5 == 0 {
-                    Log.info(
-                        "[AppDelegate] Waiting for previous instance to release single-instance lock attempt=\(attempt)/\(Self.relaunchLockRetryAttempts)",
-                        category: .app
-                    )
-                }
-
-                try? await Task.sleep(for: Self.relaunchLockRetryDelay, clock: .continuous)
-
-            case .error(let lockError):
-                Log.error(
-                    "[AppDelegate] Failed to reacquire single-instance lock at \(Self.singleInstanceLockPath): \(String(cString: strerror(lockError)))",
-                    category: .app
-                )
-                return true
-            }
-        }
-
-        return false
-    }
-
     private func applyDockIconVisibilityPreference() {
         let showDockIcon = settingsStore.object(forKey: Self.showDockIconPreferenceKey) as? Bool ?? true
         let targetPolicy: NSApplication.ActivationPolicy = showDockIcon ? .regular : .accessory
@@ -344,12 +382,321 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             "[LaunchSurface] Applied startup activation policy showDockIcon=\(showDockIcon) policy=\(policyName) changed=\(changed) missingBundleID=\(missingBundleIdentifier)",
             category: .app
         )
+
+        if showDockIcon {
+            installMainMenuIfNeeded(force: true)
+        }
+    }
+
+    func installMainMenuIfNeeded(force: Bool = false) {
+        let appName = Self.applicationMenuTitle()
+        let menu = Self.makeMainMenu(appName: appName, target: self)
+
+        if force || Self.mainMenuNeedsInstallation(existingMenu: NSApp.mainMenu, expectedTopLevelTitles: Self.topLevelMenuTitles(in: menu)) {
+            NSApp.mainMenu = menu
+            NSApp.windowsMenu = menu.item(withTitle: "Window")?.submenu
+            NSApp.helpMenu = menu.item(withTitle: "Help")?.submenu
+        }
+    }
+
+    static func applicationMenuTitle(bundle: Bundle = .main) -> String {
+        if let appName = bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String, !appName.isEmpty {
+            return appName
+        }
+
+        if let appName = bundle.object(forInfoDictionaryKey: kCFBundleNameKey as String) as? String, !appName.isEmpty {
+            return appName
+        }
+
+        return "Retrace"
+    }
+
+    static func topLevelMenuTitles(in menu: NSMenu) -> [String] {
+        menu.items.map(\.title)
+    }
+
+    static func mainMenuNeedsInstallation(existingMenu: NSMenu?, expectedTopLevelTitles: [String]) -> Bool {
+        guard let existingMenu else { return true }
+        return topLevelMenuTitles(in: existingMenu) != expectedTopLevelTitles
+    }
+
+    static func makeMainMenu(appName: String, target: AppDelegate) -> NSMenu {
+        let mainMenu = NSMenu(title: appName)
+
+        func makeTopLevelMenu(_ title: String, submenu: NSMenu) -> NSMenuItem {
+            let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            item.submenu = submenu
+            return item
+        }
+
+        func makeMenuItem(
+            _ title: String,
+            action: Selector,
+            keyEquivalent: String = "",
+            modifiers: NSEvent.ModifierFlags = [],
+            systemImageName: String? = nil,
+            target overrideTarget: AnyObject? = target
+        ) -> NSMenuItem {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: keyEquivalent)
+            item.target = overrideTarget
+            item.keyEquivalentModifierMask = modifiers
+            if let systemImageName,
+               let symbol = NSImage(systemSymbolName: systemImageName, accessibilityDescription: nil) {
+                symbol.isTemplate = true
+                item.image = symbol
+            }
+            return item
+        }
+
+        let appMenu = NSMenu(title: appName)
+        appMenu.delegate = target
+        target.populateMainAppMenu(appMenu, appName: appName)
+        mainMenu.addItem(makeTopLevelMenu(appName, submenu: appMenu))
+
+        let recordingMenu = NSMenu(title: "Recording")
+        recordingMenu.delegate = target
+        target.populateMainMenuRecording(recordingMenu)
+        mainMenu.addItem(makeTopLevelMenu("Recording", submenu: recordingMenu))
+
+        let windowMenu = NSMenu(title: "Window")
+        windowMenu.addItem(
+            makeMenuItem(
+                "Minimize",
+                action: #selector(NSWindow.performMiniaturize(_:)),
+                keyEquivalent: "m",
+                modifiers: [.command],
+                target: nil
+            )
+        )
+        windowMenu.addItem(
+            makeMenuItem(
+                "Zoom",
+                action: #selector(NSWindow.performZoom(_:)),
+                target: nil
+            )
+        )
+        windowMenu.addItem(.separator())
+        windowMenu.addItem(
+            makeMenuItem(
+                "Bring All to Front",
+                action: #selector(NSApplication.arrangeInFront(_:)),
+                target: nil
+            )
+        )
+        mainMenu.addItem(makeTopLevelMenu("Window", submenu: windowMenu))
+
+        let helpMenu = NSMenu(title: "Help")
+        helpMenu.addItem(
+            makeMenuItem(
+                "Get Help...",
+                action: #selector(AppDelegate.handleMainMenuOpenFeedback),
+                keyEquivalent: "h",
+                modifiers: [.command, .shift],
+                systemImageName: "exclamationmark.bubble"
+            )
+        )
+        helpMenu.addItem(
+            makeMenuItem(
+                "Changelog",
+                action: #selector(AppDelegate.handleMainMenuOpenChangelog),
+                systemImageName: "text.book.closed"
+            )
+        )
+        mainMenu.addItem(makeTopLevelMenu("Help", submenu: helpMenu))
+
+        return mainMenu
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        switch menu.title {
+        case Self.applicationMenuTitle():
+            populateMainAppMenu(menu, appName: Self.applicationMenuTitle())
+        case "Recording":
+            populateMainMenuRecording(menu)
+        default:
+            break
+        }
+    }
+
+    private func populateMainAppMenu(_ menu: NSMenu, appName: String) {
+        menu.removeAllItems()
+        let dashboardShortcut = OnboardingManager.loadShortcutConfig(
+            forKey: Self.dashboardShortcutDefaultsKey,
+            fallback: .defaultDashboard
+        )
+        let systemMonitorShortcut = OnboardingManager.loadShortcutConfig(
+            forKey: Self.systemMonitorShortcutDefaultsKey,
+            fallback: .defaultSystemMonitor
+        )
+
+        menu.addItem(
+            makeMainMenuItem(
+                "About \(appName)",
+                action: #selector(handleMainMenuOpenAbout),
+                systemImageName: "info.circle"
+            )
+        )
+        menu.addItem(.separator())
+        menu.addItem(
+            makeMainMenuItem(
+                "Settings...",
+                action: #selector(handleMainMenuOpenSettings),
+                keyEquivalent: ",",
+                modifiers: [.command],
+                systemImageName: "gearshape"
+            )
+        )
+        let checkForUpdatesItem = makeMainMenuItem(
+            UpdaterManager.shared.isCheckingForUpdates ? "Checking for Updates..." : "Check for Updates...",
+            action: #selector(handleMainMenuCheckForUpdates),
+            systemImageName: "arrow.down.circle"
+        )
+        checkForUpdatesItem.isEnabled = !UpdaterManager.shared.isCheckingForUpdates && UpdaterManager.shared.canCheckForUpdates
+        menu.addItem(checkForUpdatesItem)
+        menu.addItem(.separator())
+        menu.addItem(
+            makeMainMenuItem(
+                TimelineWindowController.shared.isVisible ? "Hide Timeline" : "Show Timeline",
+                action: #selector(handleMainMenuToggleTimeline),
+                systemImageName: "clock.arrow.circlepath"
+            )
+        )
+        menu.addItem(
+            makeMainMenuItem(
+                "Search Screen History",
+                action: #selector(handleMainMenuOpenSearch),
+                systemImageName: "magnifyingglass"
+            )
+        )
+        menu.addItem(.separator())
+        menu.addItem(
+            makeMainMenuItem(
+                LaunchMenuRouting.dashboardIsFrontAndCenter() ? "Hide Dashboard" : "Show Dashboard",
+                action: #selector(handleMainMenuToggleDashboard),
+                shortcut: dashboardShortcut,
+                systemImageName: "rectangle.3.group"
+            )
+        )
+        menu.addItem(
+            makeMainMenuItem(
+                LaunchMenuRouting.systemMonitorIsFrontAndCenter() ? "Hide System Monitor" : "Show System Monitor",
+                action: #selector(handleMainMenuToggleSystemMonitor),
+                shortcut: systemMonitorShortcut,
+                systemImageName: "waveform.path.ecg"
+            )
+        )
+        menu.addItem(.separator())
+        menu.addItem(
+            makeMainMenuItem(
+                "Quit \(appName)",
+                action: #selector(handleMainMenuQuit),
+                keyEquivalent: "q",
+                modifiers: [.command],
+                systemImageName: "xmark.square"
+            )
+        )
+    }
+
+    private func populateMainMenuRecording(_ menu: NSMenu) {
+        menu.removeAllItems()
+        let recordingShortcut = OnboardingManager.loadShortcutConfig(
+            forKey: Self.recordingShortcutDefaultsKey,
+            fallback: .defaultRecording
+        )
+
+        if recordingIsRunning {
+            menu.addItem(
+                makeMainMenuItem(
+                    "Pause for 5 Minutes",
+                    action: #selector(handleMainMenuPauseRecordingFor5Minutes),
+                    systemImageName: "timer"
+                )
+            )
+            menu.addItem(
+                makeMainMenuItem(
+                    "Pause for 30 Minutes",
+                    action: #selector(handleMainMenuPauseRecordingFor30Minutes),
+                    systemImageName: "timer"
+                )
+            )
+            menu.addItem(
+                makeMainMenuItem(
+                    "Pause for 60 Minutes",
+                    action: #selector(handleMainMenuPauseRecordingFor60Minutes),
+                    systemImageName: "timer"
+                )
+            )
+            menu.addItem(.separator())
+            menu.addItem(
+                makeMainMenuItem(
+                    "Stop Recording",
+                    action: #selector(handleMainMenuStopRecording),
+                    shortcut: recordingShortcut,
+                    systemImageName: "stop.circle"
+                )
+            )
+            return
+        }
+
+        if timedPauseIsActive, let subtitle = timedPauseSubtitle() {
+            let subtitleItem = NSMenuItem(title: subtitle, action: nil, keyEquivalent: "")
+            subtitleItem.isEnabled = false
+            subtitleItem.image = NSImage(systemSymbolName: "timer", accessibilityDescription: nil)
+            menu.addItem(subtitleItem)
+            menu.addItem(
+                makeMainMenuItem(
+                    "Resume Recording Now",
+                    action: #selector(handleMainMenuResumeRecordingNow),
+                    shortcut: recordingShortcut,
+                    systemImageName: "play.circle"
+                )
+            )
+            menu.addItem(
+                makeMainMenuItem(
+                    "Turn Off Recording",
+                    action: #selector(handleMainMenuStopRecording),
+                    systemImageName: "stop.circle"
+                )
+            )
+            return
+        }
+
+        menu.addItem(
+            makeMainMenuItem(
+                "Start Recording",
+                action: #selector(handleMainMenuResumeRecordingNow),
+                shortcut: recordingShortcut,
+                systemImageName: "record.circle"
+            )
+        )
+    }
+
+    private func makeMainMenuItem(
+        _ title: String,
+        action: Selector,
+        keyEquivalent: String = "",
+        modifiers: NSEvent.ModifierFlags = [],
+        shortcut: ShortcutConfig? = nil,
+        systemImageName: String? = nil
+    ) -> NSMenuItem {
+        let resolvedKeyEquivalent = shortcut?.menuKeyEquivalent ?? keyEquivalent
+        let resolvedModifiers = shortcut?.modifiers.nsModifiers ?? modifiers
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: resolvedKeyEquivalent)
+        item.target = self
+        item.keyEquivalentModifierMask = resolvedModifiers
+        if let systemImageName,
+           let symbol = NSImage(systemSymbolName: systemImageName, accessibilityDescription: nil) {
+            symbol.isTemplate = true
+            item.image = symbol
+        }
+        return item
     }
 
     @MainActor
     private func initializeApp() async {
         // Pre-flight check: Ensure custom storage path is accessible (if set)
-        if !(await checkStoragePathAvailable()) {
+        let storagePathAvailable = await checkStoragePathAvailable()
+        if !storagePathAvailable {
             return // User chose to quit or we're waiting for them to reconnect
         }
 
@@ -409,8 +756,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
             // Process any deeplinks that arrived before initialization completed
             var didHandleInitialDeeplink = false
-            if !pendingDeeplinkURLs.isEmpty {
-                Log.info("[AppDelegate] Processing \(pendingDeeplinkURLs.count) pending deeplink(s)", category: .app)
+            let pendingDeeplinkCount = pendingDeeplinkURLs.count
+            if pendingDeeplinkCount > 0 {
+                Log.info("[AppDelegate] Processing \(pendingDeeplinkCount) pending deeplink(s)", category: .app)
                 for url in pendingDeeplinkURLs {
                     handleDeeplink(url)
                 }
@@ -420,7 +768,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
             // Dev-only startup deeplink simulation from terminal:
             // RETRACE_DEV_DEEPLINK_URL='retrace://search?...' swift run Retrace
-            if processDevDeeplinkFromEnvironment() {
+            let didHandleDevDeeplink = processDevDeeplinkFromEnvironment()
+            if didHandleDevDeeplink {
                 didHandleInitialDeeplink = true
             }
 
@@ -494,8 +843,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
         let menu = NSMenu(title: "Retrace")
-        let isDashboardFrontAndCenter = dockDashboardIsFrontAndCenter()
-        let isSettingsFrontAndCenter = dockSettingsIsFrontAndCenter()
+        let isDashboardFrontAndCenter = LaunchMenuRouting.dashboardIsFrontAndCenter()
+        let isSettingsFrontAndCenter = LaunchMenuRouting.settingsIsFrontAndCenter()
 
         menu.addItem(
             makeDockMenuItem(
@@ -547,6 +896,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidBecomeActive(_ notification: Notification) {
         Task { @MainActor in
+            self.installMainMenuIfNeeded()
             CrashRecoveryManager.shared.refreshUserFacingStatus()
             let shouldReveal = shouldRevealDashboardForActivation()
             Log.info("[LaunchSurface] applicationDidBecomeActive shouldReveal=\(shouldReveal) state=\(launchSurfaceStateSnapshot())", category: .app)
@@ -590,6 +940,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             bypassQuitConfirmationPromptOnce = true
         }
         NSApp.terminate(nil)
+    }
+
+    private func exitDuplicatePrelaunchProcess() -> Never {
+        // Duplicate-prelaunch exits should not wait on normal AppKit termination flushes.
+        Darwin.exit(EXIT_SUCCESS)
     }
 
     private func terminationPreferenceForCurrentRequest() -> QuitTerminationPreference {
@@ -1429,45 +1784,30 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func handleDockToggleDashboard() {
-        if dockDashboardIsFrontAndCenter() {
-            recordDockMenuActionMetric("hide_dashboard")
+        if LaunchMenuRouting.dashboardIsFrontAndCenter() {
             DashboardWindowController.shared.hide()
             return
         }
 
-        recordDockMenuActionMetric("open_dashboard")
-        if TimelineWindowController.shared.isVisible {
-            TimelineWindowController.shared.hideToShowDashboard()
-        }
-        DashboardWindowController.shared.showDashboard()
+        LaunchMenuRouting.showDashboard()
     }
 
     @objc private func handleDockOpenTimeline() {
-        recordDockMenuActionMetric("open_timeline")
-        TimelineWindowController.shared.show()
+        LaunchMenuRouting.showTimeline()
     }
 
     @objc private func handleDockOpenSettings() {
-        if dockSettingsIsFrontAndCenter() {
-            recordDockMenuActionMetric("hide_settings")
+        if LaunchMenuRouting.settingsIsFrontAndCenter() {
             DashboardWindowController.shared.hide()
             return
         }
 
-        recordDockMenuActionMetric("open_settings")
-
-        if TimelineWindowController.shared.isVisible {
-            TimelineWindowController.shared.hideToShowDashboard()
-        }
-        DashboardWindowController.shared.showSettings()
+        LaunchMenuRouting.showSettings()
     }
 
     @objc private func handleDockToggleRecording() {
         Task { @MainActor [weak self] in
             guard let self else { return }
-            let currentlyCapturing = await self.coordinatorWrapper?.coordinator.isCapturing() ?? false
-            self.recordDockMenuActionMetric(currentlyCapturing ? "stop_recording" : "start_recording")
-
             do {
                 try await self.toggleRecording()
             } catch {
@@ -1477,13 +1817,163 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func handleDockOpenFeedback() {
-        recordDockMenuActionMetric("open_help")
+        openHelpFromMenu(source: "dock_menu")
+    }
+
+    @objc private func handleMainMenuOpenAbout() {
+        presentAboutWindow()
+    }
+
+    @objc private func handleMainMenuOpenChangelog() {
+        LaunchMenuRouting.showChangelog()
+    }
+
+    @objc private func handleMainMenuOpenSettings() {
+        LaunchMenuRouting.showSettings()
+    }
+
+    @objc private func handleMainMenuCheckForUpdates() {
+        UpdaterManager.shared.checkForUpdates()
+        installMainMenuIfNeeded(force: true)
+    }
+
+    @objc private func handleMainMenuToggleTimeline() {
+        if TimelineWindowController.shared.isVisible {
+            LaunchMenuRouting.hideTimeline()
+        } else {
+            LaunchMenuRouting.showTimeline()
+        }
+    }
+
+    @objc private func handleMainMenuOpenSearch() {
+        LaunchMenuRouting.showSearch(source: "main_menu")
+    }
+
+    @objc private func handleMainMenuToggleDashboard() {
+        if LaunchMenuRouting.dashboardIsFrontAndCenter() {
+            DashboardWindowController.shared.hide()
+        } else {
+            LaunchMenuRouting.showDashboard()
+        }
+    }
+
+    @objc private func handleMainMenuToggleSystemMonitor() {
+        if LaunchMenuRouting.systemMonitorIsFrontAndCenter() {
+            LaunchMenuRouting.toggleSystemMonitor()
+        } else {
+            LaunchMenuRouting.showSystemMonitor()
+        }
+    }
+
+    @objc private func handleMainMenuPauseRecordingFor5Minutes() {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.pauseRecordingFromMainMenu(duration: 5 * 60)
+        }
+    }
+
+    @objc private func handleMainMenuPauseRecordingFor30Minutes() {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.pauseRecordingFromMainMenu(duration: 30 * 60)
+        }
+    }
+
+    @objc private func handleMainMenuPauseRecordingFor60Minutes() {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.pauseRecordingFromMainMenu(duration: 60 * 60)
+        }
+    }
+
+    @objc private func handleMainMenuResumeRecordingNow() {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.startRecordingFromMainMenu()
+        }
+    }
+
+    @objc private func handleMainMenuStopRecording() {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.pauseRecordingFromMainMenu(duration: nil)
+        }
+    }
+
+    @objc private func handleMainMenuOpenFeedback() {
+        openHelpFromMenu(source: "main_menu")
+    }
+
+    @objc private func handleMainMenuQuit() {
+        NSApplication.shared.terminate(nil)
+    }
+
+    private func openHelpFromMenu(source: String) {
         if let coordinator = coordinatorWrapper?.coordinator {
             Task { @MainActor in
-                DashboardViewModel.recordHelpOpened(coordinator: coordinator, source: "dock_menu")
+                DashboardViewModel.recordHelpOpened(coordinator: coordinator, source: source)
             }
         }
         NotificationCenter.default.post(name: .openFeedback, object: nil)
+    }
+
+    private func startRecordingFromMainMenu() async {
+        if let menuBarManager {
+            await menuBarManager.startRecordingNow(source: "main_menu")
+            installMainMenuIfNeeded(force: true)
+            return
+        }
+
+        guard let wrapper = coordinatorWrapper else { return }
+
+        do {
+            try await wrapper.coordinator.startPipeline()
+            DashboardViewModel.recordRecordingStartedFromMenu(
+                coordinator: wrapper.coordinator,
+                source: "main_menu"
+            )
+        } catch {
+            Log.error("[MainMenu] Failed to start recording: \(error)", category: .ui)
+        }
+
+        installMainMenuIfNeeded(force: true)
+    }
+
+    private func pauseRecordingFromMainMenu(duration: TimeInterval?) async {
+        if let menuBarManager {
+            await menuBarManager.pauseRecording(for: duration, source: "main_menu")
+            installMainMenuIfNeeded(force: true)
+            return
+        }
+
+        guard let wrapper = coordinatorWrapper else { return }
+        let wasRecording = await wrapper.coordinator.isCapturing()
+        let isTimedPause = (duration ?? 0) > 0
+
+        guard wasRecording else {
+            installMainMenuIfNeeded(force: true)
+            return
+        }
+
+        do {
+            try await wrapper.coordinator.stopPipeline(persistState: !isTimedPause)
+            if isTimedPause, let duration {
+                DashboardViewModel.recordRecordingPauseSelected(
+                    coordinator: wrapper.coordinator,
+                    source: "main_menu",
+                    durationSeconds: Int(duration)
+                )
+            } else {
+                DashboardViewModel.recordRecordingTurnedOff(
+                    coordinator: wrapper.coordinator,
+                    source: "main_menu"
+                )
+            }
+        } catch {
+            Log.error("[MainMenu] Failed to stop recording: \(error)", category: .ui)
+        }
+
+        installMainMenuIfNeeded(force: true)
     }
 
     private func makeDockMenuItem(
@@ -1508,19 +1998,29 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return "Start Recording"
     }
 
-    private func dockDashboardIsFrontAndCenter() -> Bool {
-        guard NSApp.isActive else { return false }
-        let titles = [NSApp.keyWindow?.title, NSApp.mainWindow?.title]
-        return titles.contains("Dashboard")
+    private var recordingIsRunning: Bool {
+        if let menuBarManager {
+            return menuBarManager.isRecording
+        }
+        return coordinatorWrapper?.coordinator.statusHolder.status.isRunning ?? false
     }
 
-    private func dockSettingsIsFrontAndCenter() -> Bool {
-        guard NSApp.isActive else { return false }
-        let titles = [NSApp.keyWindow?.title, NSApp.mainWindow?.title]
-        return titles.contains { title in
-            guard let title else { return false }
-            return title.hasPrefix("Settings")
+    private var timedPauseIsActive: Bool {
+        guard let menuBarManager else { return false }
+        return menuBarManager.isPausedState
+    }
+
+    private func timedPauseSubtitle() -> String? {
+        guard let remainingSeconds = menuBarManager?.timedPauseRemainingSeconds else { return nil }
+        let hours = remainingSeconds / 3600
+        let minutes = (remainingSeconds % 3600) / 60
+        let seconds = remainingSeconds % 60
+
+        if hours > 0 {
+            return String(format: "Resumes in %d:%02d:%02d", hours, minutes, seconds)
         }
+
+        return String(format: "Resumes in %02d:%02d", minutes, seconds)
     }
 
     private func dockRecordingMenuSymbolName() -> String {
@@ -1530,30 +2030,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return "record.circle"
     }
 
-    private func recordDockMenuActionMetric(_ action: String) {
-        guard let coordinator = coordinatorWrapper?.coordinator else { return }
+    private func presentAboutWindow() {
+        let appName = Self.applicationMenuTitle()
+        let controller: NSWindowController
 
-        let metadata = Self.metricMetadata([
-            "action": action,
-            "source": "dock_menu"
-        ])
-
-        Task {
-            try? await coordinator.recordMetricEvent(
-                metricType: .dockMenuAction,
-                metadata: metadata
-            )
-        }
-    }
-
-    private static func metricMetadata(_ payload: [String: Any]) -> String? {
-        guard JSONSerialization.isValidJSONObject(payload),
-              let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
-              let json = String(data: data, encoding: .utf8) else {
-            return nil
+        if let aboutWindowController {
+            controller = aboutWindowController
+        } else {
+            let window = RetraceAboutPanel.makeWindow(appName: appName)
+            let newController = NSWindowController(window: window)
+            aboutWindowController = newController
+            controller = newController
         }
 
-        return json
+        controller.showWindow(nil)
+        controller.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     // MARK: - Single Instance Check
@@ -1575,24 +2067,72 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return Self.canonicalBundleIdentifier
     }
 
-    private func acquireSingleInstanceLock() -> Bool {
+    private func acquireSingleInstanceLock(
+        maxAttempts: Int,
+        reason: String
+    ) async -> SingleInstanceLockRetryResult {
+        let result = await SingleInstanceLockRetrier.acquire(
+            maxAttempts: maxAttempts,
+            retryDelay: Self.singleInstanceLockRetryDelay,
+            existingDescriptor: singleInstanceLockFileDescriptor
+        ) { descriptor in
+            SingleInstanceLock.acquire(
+                atPath: Self.singleInstanceLockPath,
+                existingDescriptor: descriptor
+            )
+        }
+
+        return finalizeSingleInstanceLockAcquisition(result, reason: reason)
+    }
+
+    private func acquireSingleInstanceLockForFreshLaunch() -> SingleInstanceLockRetryResult {
+        let result: SingleInstanceLockRetryResult
         switch SingleInstanceLock.acquire(
             atPath: Self.singleInstanceLockPath,
             existingDescriptor: singleInstanceLockFileDescriptor
         ) {
         case .alreadyHeld(let descriptor), .acquired(let descriptor):
-            singleInstanceLockFileDescriptor = descriptor
-            return true
-
+            result = .acquired(descriptor: descriptor, attempts: 1)
         case .heldByAnotherProcess:
-            return false
+            result = .failedHeldByAnotherProcess(attempts: 1)
+        case .error(let code):
+            result = .failedError(code: code, attempts: 1)
+        }
 
-        case .error(let lockError):
-            Log.error(
-                "[AppDelegate] Failed to acquire single-instance lock at \(Self.singleInstanceLockPath): \(String(cString: strerror(lockError)))",
+        return finalizeSingleInstanceLockAcquisition(result, reason: "launch")
+    }
+
+    private func finalizeSingleInstanceLockAcquisition(
+        _ result: SingleInstanceLockRetryResult,
+        reason: String
+    ) -> SingleInstanceLockRetryResult {
+        switch result {
+        case .acquired(let descriptor, let attempts):
+            singleInstanceLockFileDescriptor = descriptor
+
+            if attempts > 1 {
+                Log.info(
+                    "[AppDelegate] Acquired single-instance lock for \(reason) after \(attempts) attempts",
+                    category: .app
+                )
+            }
+
+            return .acquired(descriptor: descriptor, attempts: attempts)
+
+        case .failedHeldByAnotherProcess(let attempts):
+            let holder = lockFileInstancePID().map { String($0) } ?? "unknown"
+            Log.warning(
+                "[AppDelegate] Could not acquire single-instance lock for \(reason) after \(attempts) attempts because another process still holds it; holder pid=\(holder)",
                 category: .app
             )
-            return true
+            return .failedHeldByAnotherProcess(attempts: attempts)
+
+        case .failedError(let lockError, let attempts):
+            Log.error(
+                "[AppDelegate] Failed to acquire single-instance lock for \(reason) at \(Self.singleInstanceLockPath) after \(attempts) attempts: \(String(cString: strerror(lockError)))",
+                category: .app
+            )
+            return .failedError(code: lockError, attempts: attempts)
         }
     }
 
@@ -1600,19 +2140,102 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         SingleInstanceLock.release(descriptor: &singleInstanceLockFileDescriptor)
     }
 
-    static func freshLaunchAction(
-        hasSingleInstanceLock: Bool,
+    static func launchGateAction(
+        mode: LaunchMode,
+        lockResult: SingleInstanceLockRetryResult,
         matchingRunningAppDetected: Bool
-    ) -> FreshLaunchAction {
-        guard hasSingleInstanceLock else {
-            return .activateExistingInstance
+    ) -> LaunchGateAction {
+        switch lockResult {
+        case .acquired:
+            if mode == .fresh, matchingRunningAppDetected {
+                return .activateExistingInstanceAndExitDuplicate
+            }
+            return .continueLaunch
+
+        case .failedHeldByAnotherProcess:
+            return .activateExistingInstanceAndExitDuplicate
+
+        case .failedError:
+            if mode == .relaunch {
+                return .continueLaunch
+            }
+            return matchingRunningAppDetected ? .activateExistingInstanceAndExitDuplicate : .exitDueToLockFailure
+        }
+    }
+
+    private func handleSingleInstanceLaunchDecision(
+        mode: LaunchMode,
+        lockResult: SingleInstanceLockRetryResult
+    ) -> Bool {
+        let matchingRunningAppDetected: Bool
+        switch lockResult {
+        case .acquired, .failedError:
+            matchingRunningAppDetected = mode == .fresh ? isAnotherInstanceRunning() : false
+        case .failedHeldByAnotherProcess:
+            matchingRunningAppDetected = false
         }
 
-        if matchingRunningAppDetected {
-            return .continueLaunchIgnoringStaleRunningApp
-        }
+        let action = Self.launchGateAction(
+            mode: mode,
+            lockResult: lockResult,
+            matchingRunningAppDetected: matchingRunningAppDetected
+        )
 
-        return .continueLaunch
+        switch action {
+        case .continueLaunch:
+            if mode == .relaunch, case .failedError = lockResult {
+                Log.warning(
+                    "[AppDelegate] Continuing relaunch after single-instance lock error because relaunch handoff is authoritative.",
+                    category: .app
+                )
+            } else if mode == .fresh, case .failedError = lockResult {
+                Log.warning(
+                    "[AppDelegate] Continuing launch after single-instance lock error because no matching running instance was detected.",
+                    category: .app
+                )
+            }
+            return true
+
+        case .activateExistingInstanceAndExitDuplicate:
+            switch (mode, lockResult) {
+            case (.fresh, .acquired):
+                Log.warning(
+                    "[AppDelegate] Matching running application detected during fresh launch even though the single-instance lock was acquired; activating existing instance and exiting duplicate prelaunch.",
+                    category: .app
+                )
+
+            case (.relaunch, .failedHeldByAnotherProcess):
+                Log.warning(
+                    "[AppDelegate] Relaunch could not reacquire the single-instance lock after handoff window; activating existing instance and exiting duplicate prelaunch.",
+                    category: .app
+                )
+
+            case (.fresh, .failedHeldByAnotherProcess):
+                Log.info(
+                    "[AppDelegate] Could not acquire the single-instance lock for launch; activating existing instance if available and exiting duplicate prelaunch.",
+                    category: .app
+                )
+
+            case (.fresh, .failedError):
+                Log.warning(
+                    "[AppDelegate] Single-instance lock failed during launch and a matching running instance was detected; activating existing instance and exiting duplicate prelaunch.",
+                    category: .app
+                )
+
+            default:
+                break
+            }
+
+            activateExistingInstance()
+            exitDuplicatePrelaunchProcess()
+
+        case .exitDueToLockFailure:
+            Log.error(
+                "[AppDelegate] Single-instance lock failed during fresh launch and no matching running instance was detected; exiting duplicate prelaunch to keep launch enforcement fail-closed.",
+                category: .app
+            )
+            exitDuplicatePrelaunchProcess()
+        }
     }
 
     private func lockFileInstancePID() -> pid_t? {

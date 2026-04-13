@@ -40,4 +40,14 @@ final class QueryParserTests: XCTestCase {
         XCTAssertTrue(scoped.contains("(otherText:(haseab*))"))
         XCTAssertTrue(scoped.contains("NOT ((text:(wave)) OR (otherText:(wave)))"))
     }
+
+    func testParseIgnoresShellFlagsForCommandLikeQuery() throws {
+        let parsed = try parser.parse(
+            rawQuery: #"osascript -e 'tell application "Codex" to hide' -e 'delay 1'"#
+        )
+
+        XCTAssertTrue(parsed.excludedTerms.isEmpty)
+        XCTAssertEqual(parsed.searchTerms, ["osascript"])
+        XCTAssertEqual(parsed.phrases, [#"tell application "Codex" to hide"#, "delay 1"])
+    }
 }

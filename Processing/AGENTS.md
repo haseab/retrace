@@ -8,33 +8,46 @@ You are responsible for the **Processing** module of Retrace. Your job is to imp
 
 ```
 Processing/
+├── ExtractMemoryInstrumentation.swift # Request-scoped extract residual/handoff instrumentation helper
+├── ExtractRequestInstrumentation.swift # Request wrapper that drives extract-stage residual accounting
 ├── ProcessingManager.swift        # Main ProcessingProtocol implementation
-├── FrameProcessingQueue.swift     # OCR pipeline orchestration + phrase-level rewrite staging
-├── URLExtractor.swift             # URL extraction utilities
+├── FrameProcessingQueue.swift     # OCR pipeline orchestration + queue telemetry
+├── URLExtractor.swift             # URL extraction from OCR text
 ├── OCR/
-│   ├── FullFrameOCRCache.swift    # Full-frame OCR result cache
-│   ├── OCRTileCache.swift         # Tiled OCR cache
-│   ├── RegionOCRMerger.swift      # Merge tiled OCR regions into frame output
-│   ├── RegionOCRResult.swift      # OCR tile result model
-│   ├── TileChangeDetector.swift   # OCR tile invalidation helpers
-│   ├── TileGridConfig.swift       # OCR tiling configuration
-│   ├── TileOCRProcessor.swift     # Tiled Vision OCR runner
-│   └── VisionOCR.swift            # Vision framework OCR implementation
+│   ├── VisionOCR.swift            # Vision framework OCR implementation
+│   ├── VisionOCRHelpers.swift     # OCR output structs plus geometry/image helper methods
+│   ├── VisionOCRInstrumentation.swift # OCR-local memory ledger runtime and tracker plumbing
+│   ├── VisionOCRRequestConfig.swift # OCR request config type plus full-frame/region config builders
+│   ├── VisionOCRResidualSupport.swift # OCR residual reset tables and reconciliation helpers
+│   ├── FullFrameOCRCache.swift    # Cached full-frame OCR results for region re-OCR
+│   ├── OCRTileCache.swift         # Tile cache support for region OCR
+│   ├── RegionOCRMerger.swift      # Region OCR merge helpers
+│   ├── RegionOCRResult.swift      # Region OCR result/stat models
+│   ├── TileChangeDetector.swift   # Tile-based change detection
+│   ├── TileGridConfig.swift       # Tile grid tuning
+│   └── TileOCRProcessor.swift     # Tile OCR processing helpers
 ├── Accessibility/
-│   └── AccessibilityService.swift # AccessibilityProtocol implementation
+│   ├── AccessibilityService.swift  # AccessibilityProtocol implementation
+│   └── TextElementFilter.swift     # Filter relevant text elements
+│
 ├── TextMerger/
-│   └── TextMerger.swift           # Combine OCR + AX results
+│   └── TextMerger.swift            # Combine OCR + AX results
 └── Tests/
-    ├── InPageURLMetadataResolutionTests.swift # In-page URL metadata retry/resolve coverage
+    ├── ExtractRequestInstrumentationTests.swift # Region tail aggregation and coordinator helper coverage
+    ├── InPageURLMetadataResolutionTests.swift # In-page URL metadata retry and rewrite scheduling regression coverage
+    ├── OCRMemoryBackpressurePolicyTests.swift # OCR memory backpressure threshold/default coverage
     ├── PhraseLevelRedactionTests.swift        # Manual + automatic OCR phrase-level redaction coverage
-    └── TestLogger.swift                       # Shared processing test logging helpers
+    ├── RewriteRetryPolicyTests.swift          # Bounded automatic rewrite retry coverage
+    ├── TestLogger.swift                       # Shared processing test logging helpers
+    └── _future/
+        ├── AccessibilityTests.swift
+        └── VisionOCRTests.swift
 ```
 
 ## Protocols You Must Implement
 
 ### 1. `ProcessingProtocol` (from `Shared/Protocols/ProcessingProtocol.swift`)
 - Text extraction (combined OCR + Accessibility)
-- Processing queue management
 - Configuration
 
 ### 2. `OCRProtocol` (from `Shared/Protocols/ProcessingProtocol.swift`)
@@ -309,87 +322,12 @@ struct TextMerger {
 }
 ```
 
-### 4. Processing Queue
+### 4. Frame-ID Queueing
 
-```swift
-public actor ProcessingManager: ProcessingProtocol {
-    private let ocr: VisionOCR
-    private let accessibility: AccessibilityService
-    private let merger: TextMerger
-    private var config: ProcessingConfig
-
-    private var processingQueue: [(CapturedFrame, (Result<ExtractedText, ProcessingError>) -> Void)] = []
-    private var isProcessing = false
-
-    public var queuedFrameCount: Int { processingQueue.count }
-
-    public func extractText(from frame: CapturedFrame) async throws -> ExtractedText {
-        // OCR
-        let ocrRegions = try await ocr.recognizeText(
-            imageData: frame.imageData,
-            width: frame.width,
-            height: frame.height,
-            config: config
-        )
-
-        // Accessibility (if enabled and permitted)
-        var axResult: AccessibilityResult? = nil
-        if config.accessibilityEnabled && accessibility.hasPermission() {
-            axResult = try? await accessibility.getFocusedAppText()
-        }
-
-        // Merge results
-        var extractedText = merger.merge(ocrRegions: ocrRegions, accessibilityResult: axResult)
-
-        // Set frame ID and metadata
-        extractedText = ExtractedText(
-            frameID: frame.id,
-            timestamp: frame.timestamp,
-            regions: extractedText.regions,
-            fullText: extractedText.fullText,
-            metadata: frame.metadata
-        )
-
-        return extractedText
-    }
-
-    public func queueFrame(
-        _ frame: CapturedFrame,
-        completion: @escaping @Sendable (Result<ExtractedText, ProcessingError>) -> Void
-    ) async {
-        processingQueue.append((frame, completion))
-
-        if !isProcessing {
-            await processQueue()
-        }
-    }
-
-    private func processQueue() async {
-        isProcessing = true
-
-        while !processingQueue.isEmpty {
-            let (frame, completion) = processingQueue.removeFirst()
-
-            do {
-                let text = try await extractText(from: frame)
-                completion(.success(text))
-            } catch let error as ProcessingError {
-                completion(.failure(error))
-            } catch {
-                completion(.failure(.ocrFailed(underlying: error.localizedDescription)))
-            }
-        }
-
-        isProcessing = false
-    }
-
-    public func waitForQueueDrain() async {
-        while !processingQueue.isEmpty || isProcessing {
-            try? await Task.sleep(nanoseconds: 100_000_000)  // 100ms
-        }
-    }
-}
-```
+The live OCR pipeline does **not** queue raw `CapturedFrame` blobs in `ProcessingManager`.
+Capture persists frames first, then `FrameProcessingQueue` schedules OCR by `frameID`, loading
+image bytes from storage only when a worker is ready. Keep new queueing work in that style:
+bounded, storage-backed, and keyed by lightweight identifiers rather than in-memory frame data.
 
 ### 5. Handling Different Image Formats
 

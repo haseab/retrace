@@ -2,7 +2,7 @@ import Foundation
 import SwiftUI
 import UniformTypeIdentifiers
 import Dispatch
-import Database
+import App
 import Shared
 
 // MARK: - Feedback View Model
@@ -12,6 +12,56 @@ struct FeedbackSubmissionFailureState: Equatable {
     let detail: String
     let symbolName: String
     let isNetworkRelated: Bool
+}
+
+struct FeedbackCompletionPresentation: Equatable {
+    let title: String
+    let detail: String
+    let callToActionTitle: String?
+    let linkTitle: String?
+    let linkURL: URL?
+    let linkSymbolName: String?
+}
+
+enum FeedbackCompletionState: Equatable {
+    case submitted
+    case exported
+
+    private static let directChatURL = URL(string: "https://retrace.to/chat")!
+
+    var presentation: FeedbackCompletionPresentation {
+        switch self {
+        case .submitted:
+            return FeedbackCompletionPresentation(
+                title: "Feedback Sent!",
+                detail: "Thanks for helping improve Retrace.",
+                callToActionTitle: "Need a faster response?",
+                linkTitle: "Chat with me on retrace.to",
+                linkURL: Self.directChatURL,
+                linkSymbolName: "message.fill"
+            )
+        case .exported:
+            return FeedbackCompletionPresentation(
+                title: "Download Complete",
+                detail: "Your report was saved. Use chat to choose whether to send it by email, Discord, or live chat.",
+                callToActionTitle: "Next Steps:",
+                linkTitle: "Choose a Channel to Send",
+                linkURL: Self.directChatURL,
+                linkSymbolName: "message.fill"
+            )
+        }
+    }
+}
+
+enum FeedbackExportDestinationError: LocalizedError {
+    case downloadsUnavailable
+
+    var errorDescription: String? {
+        switch self {
+        case .downloadsUnavailable:
+            return "Retrace couldn't find your Downloads folder."
+        }
+    }
 }
 
 @MainActor
@@ -27,7 +77,13 @@ public final class FeedbackViewModel: ObservableObject {
 
     // MARK: - Diagnostic Info
 
-    @Published public var diagnostics: DiagnosticInfo?
+    @Published public var diagnostics: DiagnosticInfo? {
+        didSet {
+            diagnosticSections = diagnostics?.sectionSummaries(includeVerboseSections: true) ?? []
+        }
+    }
+    @Published private(set) var diagnosticSections: [DiagnosticInfo.SectionSummary] = []
+    @Published private(set) var includedDiagnosticSections: Set<DiagnosticInfo.SectionID> = Set(DiagnosticInfo.SectionID.allCases)
     @Published public var showDiagnosticsDetail: Bool = false
 
     // MARK: - Submission State
@@ -39,6 +95,7 @@ public final class FeedbackViewModel: ObservableObject {
     @Published private(set) var submissionStage: FeedbackSubmissionStage?
     @Published private(set) var submissionProgress: Double = 0
     @Published private(set) var submissionFailure: FeedbackSubmissionFailureState?
+    @Published private(set) var completionState: FeedbackCompletionState?
 
     // MARK: - Services
 
@@ -52,6 +109,8 @@ public final class FeedbackViewModel: ObservableObject {
 
     private let minimumUploadDisplaySeconds: TimeInterval = 8.0
     private let uploadProgressRampSeconds: TimeInterval = 8.0
+    private let recentMetricEventLimit = 100
+    private static let defaultDiagnosticSections = Set(DiagnosticInfo.SectionID.allCases)
 
     // MARK: - Computed Properties
 
@@ -96,6 +155,14 @@ public final class FeedbackViewModel: ObservableObject {
         submissionFailure != nil
     }
 
+    var hasSuccessfulCompletion: Bool {
+        completionState != nil
+    }
+
+    var completionPresentation: FeedbackCompletionPresentation? {
+        completionState?.presentation
+    }
+
     var submissionFailureTitle: String {
         submissionFailure?.title ?? "Feedback wasn't sent"
     }
@@ -133,6 +200,18 @@ public final class FeedbackViewModel: ObservableObject {
     public var diagnosticsSummary: String {
         guard let diagnostics = diagnostics else { return "Loading..." }
         return "v\(diagnostics.appVersion) • macOS \(diagnostics.macOSVersion) • \(diagnostics.deviceModel)"
+    }
+
+    var includedDiagnosticSectionCount: Int {
+        diagnosticSections.filter { includedDiagnosticSections.contains($0.id) }.count
+    }
+
+    var excludedDiagnosticSectionCount: Int {
+        max(0, diagnosticSections.count - includedDiagnosticSectionCount)
+    }
+
+    var hasSelectedDiagnosticSections: Bool {
+        includedDiagnosticSectionCount > 0
     }
 
     private var fallbackDatabaseStats: DiagnosticInfo.DatabaseStats {
@@ -182,8 +261,31 @@ public final class FeedbackViewModel: ObservableObject {
         guard feedbackType != type else { return }
         feedbackType = type
         diagnostics = nil
+        resetDiagnosticSectionSelection()
         if showDiagnosticsDetail {
             loadDiagnosticsIfNeeded()
+        }
+    }
+
+    public func isDiagnosticSectionIncluded(_ section: DiagnosticInfo.SectionID) -> Bool {
+        includedDiagnosticSections.contains(section)
+    }
+
+    public func toggleDiagnosticSection(_ section: DiagnosticInfo.SectionID) {
+        setDiagnosticSection(section, isIncluded: !includedDiagnosticSections.contains(section))
+    }
+
+    public func setDiagnosticSection(
+        _ section: DiagnosticInfo.SectionID,
+        isIncluded: Bool
+    ) {
+        let wasIncluded = includedDiagnosticSections.contains(section)
+        guard wasIncluded != isIncluded else { return }
+
+        if isIncluded {
+            includedDiagnosticSections.insert(section)
+        } else {
+            includedDiagnosticSections.remove(section)
         }
     }
 
@@ -194,10 +296,11 @@ public final class FeedbackViewModel: ObservableObject {
         let includeLogs = includesLogsInDiagnostics
         let stats = fallbackDatabaseStats
         Task {
-            diagnostics = await collectFullDiagnosticsInBackground(
+            let collectedDiagnostics = await collectFullDiagnosticsInBackground(
                 includeLogs: includeLogs,
                 stats: includeLogs ? nil : stats
             )
+            diagnostics = collectedDiagnostics
         }
     }
 
@@ -214,10 +317,11 @@ public final class FeedbackViewModel: ObservableObject {
                 segmentCount: 0,
                 databaseSizeMB: 0
             )
-            diagnostics = await collectQuickDiagnosticsInBackground(
+            let collectedDiagnostics = await collectQuickDiagnosticsInBackground(
                 includeLogs: includeLogs,
                 stats: stats
             )
+            diagnostics = collectedDiagnostics
             return
         }
 
@@ -240,10 +344,11 @@ public final class FeedbackViewModel: ObservableObject {
                 databaseSizeMB: dbSizeMB
             )
 
-            self.diagnostics = await collectQuickDiagnosticsInBackground(
+            let collectedDiagnostics = await collectQuickDiagnosticsInBackground(
                 includeLogs: includeLogs,
                 stats: stats
             )
+            self.diagnostics = collectedDiagnostics
         } catch {
             Log.warning("[FeedbackViewModel] Failed to load quick stats: \(error)", category: .ui)
             let stats = DiagnosticInfo.DatabaseStats(
@@ -252,20 +357,22 @@ public final class FeedbackViewModel: ObservableObject {
                 segmentCount: 0,
                 databaseSizeMB: 0
             )
-            diagnostics = await collectQuickDiagnosticsInBackground(
+            let collectedDiagnostics = await collectQuickDiagnosticsInBackground(
                 includeLogs: includeLogs,
                 stats: stats
             )
+            diagnostics = collectedDiagnostics
         }
     }
 
     /// Load full diagnostic information with complete stats.
     private func loadDiagnosticsWithRealStats(includeLogs: Bool) async {
         guard let wrapper = coordinatorWrapper else {
-            diagnostics = await collectFullDiagnosticsInBackground(
+            let collectedDiagnostics = await collectFullDiagnosticsInBackground(
                 includeLogs: includeLogs,
                 stats: includeLogs ? nil : fallbackDatabaseStats
             )
+            diagnostics = collectedDiagnostics
             return
         }
 
@@ -287,16 +394,18 @@ public final class FeedbackViewModel: ObservableObject {
                 databaseSizeMB: dbSizeMB
             )
 
-            self.diagnostics = await collectFullDiagnosticsInBackground(
+            let collectedDiagnostics = await collectFullDiagnosticsInBackground(
                 includeLogs: includeLogs,
                 stats: stats
             )
+            self.diagnostics = collectedDiagnostics
         } catch {
             Log.warning("[FeedbackViewModel] Failed to load real stats: \(error)", category: .ui)
-            diagnostics = await collectFullDiagnosticsInBackground(
+            let collectedDiagnostics = await collectFullDiagnosticsInBackground(
                 includeLogs: includeLogs,
                 stats: includeLogs ? nil : fallbackDatabaseStats
             )
+            diagnostics = collectedDiagnostics
         }
     }
 
@@ -311,27 +420,15 @@ public final class FeedbackViewModel: ObservableObject {
         beginSubmissionExperience(for: submissionType)
 
         do {
-            await loadDiagnosticsWithRealStats(includeLogs: submissionType == .bug)
-
-            guard let diagnostics else {
-                throw FeedbackError.invalidData
-            }
-
             transitionSubmission(to: .packaging, cancelAutomaticStages: true)
-            let submission = FeedbackSubmission(
-                type: submissionType,
-                email: email.trimmingCharacters(in: .whitespacesAndNewlines),
-                description: description,
-                diagnostics: diagnostics,
-                includeScreenshot: attachedImageData != nil,
-                screenshotData: attachedImageData
-            )
+            let submission = try await buildSubmission(forUpload: true)
 
             transitionSubmission(to: .upload, cancelAutomaticStages: true)
             _ = try await feedbackService.submitFeedback(submission)
             await waitForMinimumUploadDisplay()
             transitionSubmission(to: .confirmation, cancelAutomaticStages: true)
             await completeSubmissionExperience()
+            completionState = .submitted
             isSubmitted = true
         } catch {
             if uploadStageStartedAt != nil {
@@ -350,9 +447,17 @@ public final class FeedbackViewModel: ObservableObject {
 
         error = nil
 
-        let suggestedFileName = "\(FeedbackSubmission.suggestedBaseName(forType: feedbackType.rawValue)).txt"
-        guard let exportURL = await chooseExportURL(defaultFileName: suggestedFileName) else {
-            recordFeedbackExportMetric(outcome: "cancelled", exportedFileCount: 0)
+        let suggestedFileName = "\(FeedbackSubmission.suggestedBaseName(forType: feedbackType.rawValue)).json.gz"
+        let exportURL: URL
+        do {
+            guard let selectedExportURL = try await chooseExportURL(defaultFileName: suggestedFileName) else {
+                recordFeedbackExportMetric(outcome: "cancelled", exportedFileCount: 0)
+                return
+            }
+            exportURL = selectedExportURL
+        } catch {
+            self.error = "Failed to save feedback report: \(error.localizedDescription)"
+            recordFeedbackExportMetric(outcome: "failed", exportedFileCount: 0)
             return
         }
 
@@ -360,13 +465,14 @@ public final class FeedbackViewModel: ObservableObject {
         defer { isExporting = false }
 
         do {
-            let submission = try await buildSubmission()
+            let submission = try await buildSubmission(forUpload: true)
             let exportedURLs = try await feedbackService.exportFeedbackReport(
                 submission,
                 to: exportURL,
                 launchSource: launchSource
             )
             NSWorkspace.shared.activateFileViewerSelecting(exportedURLs)
+            completionState = .exported
             recordFeedbackExportMetric(outcome: "exported", exportedFileCount: exportedURLs.count)
         } catch {
             self.error = "Failed to save feedback report: \(error.localizedDescription)"
@@ -378,7 +484,10 @@ public final class FeedbackViewModel: ObservableObject {
     public func copyDiagnostics() {
         guard let diagnostics = diagnostics else { return }
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(diagnostics.formattedText(), forType: .string)
+        NSPasteboard.general.setString(
+            diagnostics.formattedText(including: includedDiagnosticSections),
+            forType: .string
+        )
     }
 
     /// Export diagnostics to file
@@ -395,6 +504,7 @@ public final class FeedbackViewModel: ObservableObject {
         description = ""
         attachedImage = nil
         attachedImageData = nil
+        resetDiagnosticSectionSelection()
         isSubmitting = false
         isExporting = false
         isSubmitted = false
@@ -402,6 +512,7 @@ public final class FeedbackViewModel: ObservableObject {
         submissionStage = nil
         submissionProgress = 0
         submissionFailure = nil
+        completionState = nil
         Task {
             await loadDiagnosticsWithRealStats(includeLogs: true)
         }
@@ -552,14 +663,15 @@ public final class FeedbackViewModel: ObservableObject {
         includeLogs: Bool,
         stats: DiagnosticInfo.DatabaseStats
     ) async -> DiagnosticInfo {
-        await withCheckedContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async { [feedbackService] in
-                let diagnostics = includeLogs
-                    ? feedbackService.collectDiagnosticsQuick(with: stats)
-                    : feedbackService.collectDiagnosticsNoLogs(with: stats)
-                continuation.resume(returning: diagnostics)
-            }
+        async let recentMetricEvents = loadRecentMetricEvents()
+
+        if includeLogs {
+            let diagnostics = await feedbackService.collectDiagnosticsQuickAsync(with: stats)
+            return diagnostics.withRecentMetricEvents(await recentMetricEvents)
         }
+
+        let diagnostics = feedbackService.collectDiagnosticsNoLogs(with: stats)
+        return diagnostics.withRecentMetricEvents(await recentMetricEvents)
     }
 
     private func collectFullDiagnosticsInBackground(
@@ -567,21 +679,37 @@ public final class FeedbackViewModel: ObservableObject {
         stats: DiagnosticInfo.DatabaseStats?
     ) async -> DiagnosticInfo {
         let fallbackStats = fallbackDatabaseStats
+        async let recentMetricEvents = loadRecentMetricEvents()
 
-        return await withCheckedContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async { [feedbackService] in
-                let diagnostics: DiagnosticInfo
-                if let stats {
-                    diagnostics = includeLogs
-                        ? feedbackService.collectDiagnostics(with: stats)
-                        : feedbackService.collectDiagnosticsNoLogs(with: stats)
-                } else if includeLogs {
-                    diagnostics = feedbackService.collectDiagnostics()
-                } else {
-                    diagnostics = feedbackService.collectDiagnosticsNoLogs(with: fallbackStats)
-                }
-                continuation.resume(returning: diagnostics)
+        if let stats {
+            if includeLogs {
+                let diagnostics = await feedbackService.collectDiagnosticsAsync(with: stats)
+                return diagnostics.withRecentMetricEvents(await recentMetricEvents)
             }
+
+            let diagnostics = feedbackService.collectDiagnosticsNoLogs(with: stats)
+            return diagnostics.withRecentMetricEvents(await recentMetricEvents)
+        }
+
+        if includeLogs {
+            let diagnostics = await feedbackService.collectDiagnosticsAsync()
+            return diagnostics.withRecentMetricEvents(await recentMetricEvents)
+        }
+
+        let diagnostics = feedbackService.collectDiagnosticsNoLogs(with: fallbackStats)
+        return diagnostics.withRecentMetricEvents(await recentMetricEvents)
+    }
+
+    private func loadRecentMetricEvents() async -> [FeedbackRecentMetricEvent] {
+        guard let coordinator = coordinatorWrapper?.coordinator else {
+            return []
+        }
+
+        do {
+            return try await coordinator.getRecentMetricEvents(limit: recentMetricEventLimit)
+        } catch {
+            Log.warning("[FeedbackViewModel] Failed to load recent metric events: \(error)", category: .ui)
+            return []
         }
     }
 
@@ -632,36 +760,113 @@ public final class FeedbackViewModel: ObservableObject {
         }
     }
 
-    private func buildSubmission() async throws -> FeedbackSubmission {
-        await loadDiagnosticsWithRealStats(includeLogs: feedbackType == .bug)
+    private func buildSubmission(forUpload: Bool = false) async throws -> FeedbackSubmission {
+        let includeLogs = feedbackType == .bug
+        let submissionDiagnostics: DiagnosticInfo
+        if forUpload, includeLogs {
+            async let stats = submissionDatabaseStats()
+            async let recentMetricEvents = submissionRecentMetricEvents()
+            let expandedDiagnostics = await feedbackService.collectSubmissionDiagnosticsAsync(with: stats)
+            submissionDiagnostics = expandedDiagnostics.withRecentMetricEvents(await recentMetricEvents)
+        } else {
+            await loadDiagnosticsWithRealStats(includeLogs: includeLogs)
 
-        guard let diagnostics else {
-            throw FeedbackError.invalidData
+            guard let diagnostics else {
+                throw FeedbackError.invalidData
+            }
+
+            submissionDiagnostics = diagnostics
         }
 
         return FeedbackSubmission(
             type: feedbackType,
             email: email.trimmingCharacters(in: .whitespacesAndNewlines),
             description: description,
-            diagnostics: diagnostics,
+            diagnostics: submissionDiagnostics,
+            includedDiagnosticSections: includedDiagnosticSections,
             includeScreenshot: attachedImageData != nil,
             screenshotData: attachedImageData
         )
     }
 
-    private func chooseExportURL(defaultFileName: String) async -> URL? {
-        await withCheckedContinuation { continuation in
+    private func submissionDatabaseStats() async -> DiagnosticInfo.DatabaseStats {
+        if let diagnostics {
+            return diagnostics.databaseStats
+        }
+
+        guard let wrapper = coordinatorWrapper else {
+            return fallbackDatabaseStats
+        }
+
+        do {
+            let quickStats = try await wrapper.coordinator.getDatabaseStatisticsQuick()
+
+            let dbPath = NSString(string: AppPaths.databasePath).expandingTildeInPath
+            let dbSizeMB: Double
+            if let attrs = try? FileManager.default.attributesOfItem(atPath: dbPath),
+               let size = attrs[.size] as? Int64 {
+                dbSizeMB = Double(size) / (1024 * 1024)
+            } else {
+                dbSizeMB = 0
+            }
+
+            let stats = DiagnosticInfo.DatabaseStats(
+                sessionCount: quickStats.sessionCount,
+                frameCount: quickStats.frameCount,
+                segmentCount: 0,
+                databaseSizeMB: dbSizeMB
+            )
+            return stats
+        } catch {
+            Log.warning("[FeedbackViewModel] Failed to load submission stats: \(error)", category: .ui)
+            return fallbackDatabaseStats
+        }
+    }
+
+    private func submissionRecentMetricEvents() async -> [FeedbackRecentMetricEvent] {
+        if let diagnostics {
+            return diagnostics.recentMetricEvents
+        }
+
+        return await loadRecentMetricEvents()
+    }
+
+    private func chooseExportURL(defaultFileName: String) async throws -> URL? {
+        let suggestedURL = try Self.downloadsExportURL(defaultFileName: defaultFileName)
+
+        return await withCheckedContinuation { continuation in
             let panel = NSSavePanel()
-            panel.allowedContentTypes = [.plainText]
+            panel.allowedContentTypes = [.gzip]
             panel.canCreateDirectories = true
-            panel.nameFieldStringValue = defaultFileName
-            panel.message = "Save the feedback report as a text file"
+            panel.directoryURL = suggestedURL.deletingLastPathComponent()
+            panel.nameFieldStringValue = suggestedURL.lastPathComponent
+            panel.message = "Save the feedback report as a gzipped JSON file"
             panel.prompt = "Download"
 
             panel.begin { response in
                 continuation.resume(returning: response == .OK ? panel.url : nil)
             }
         }
+    }
+
+    nonisolated static func downloadsExportURL(
+        defaultFileName: String,
+        fileManager: FileManager = .default
+    ) throws -> URL {
+        guard let downloadsURL = fileManager.urls(for: .downloadsDirectory, in: .userDomainMask).first else {
+            throw FeedbackExportDestinationError.downloadsUnavailable
+        }
+        return suggestedExportURL(
+            defaultFileName: defaultFileName,
+            directoryURL: downloadsURL
+        )
+    }
+
+    nonisolated static func suggestedExportURL(
+        defaultFileName: String,
+        directoryURL: URL
+    ) -> URL {
+        directoryURL.appendingPathComponent(defaultFileName, isDirectory: false)
     }
 
     private func recordFeedbackExportMetric(outcome: String, exportedFileCount: Int) {
@@ -673,6 +878,8 @@ public final class FeedbackViewModel: ObservableObject {
             "feedbackType": feedbackType.rawValue,
             "includeLogs": includesLogsInDiagnostics,
             "includeScreenshot": attachedImageData != nil,
+            "includedDiagnosticSections": includedDiagnosticSectionIdentifiers,
+            "excludedDiagnosticSections": excludedDiagnosticSectionIdentifiers,
             "exportedFileCount": exportedFileCount
         ])
 
@@ -697,7 +904,7 @@ public final class FeedbackViewModel: ObservableObject {
         if case FeedbackError.networkError = error {
             return FeedbackSubmissionFailureState(
                 title: "No network connection",
-                detail: "Retrace couldn't reach the internet from this Mac. If network access is blocked, go back and use Download .txt instead.",
+                detail: "Retrace couldn't reach the internet from this Mac. If network access is blocked, go back and use Download .json.gz instead.",
                 symbolName: "wifi.slash",
                 isNetworkRelated: true
             )
@@ -709,5 +916,25 @@ public final class FeedbackViewModel: ObservableObject {
             symbolName: "exclamationmark.triangle.fill",
             isNetworkRelated: false
         )
+    }
+
+    private func resetDiagnosticSectionSelection() {
+        includedDiagnosticSections = Self.defaultDiagnosticSections
+    }
+
+    private var orderedDiagnosticSectionIDs: [DiagnosticInfo.SectionID] {
+        diagnosticSections.map(\.id)
+    }
+
+    private var includedDiagnosticSectionIdentifiers: [String] {
+        orderedDiagnosticSectionIDs
+            .filter { includedDiagnosticSections.contains($0) }
+            .map(\.rawValue)
+    }
+
+    private var excludedDiagnosticSectionIdentifiers: [String] {
+        orderedDiagnosticSectionIDs
+            .filter { !includedDiagnosticSections.contains($0) }
+            .map(\.rawValue)
     }
 }

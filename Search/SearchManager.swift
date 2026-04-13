@@ -108,9 +108,6 @@ public actor SearchManager: SearchProtocol {
             offset: query.offset
         )
 
-        // Get total count for pagination
-        let totalCount = try await ftsEngine.getMatchCount(query: searchableColumnsFTSQuery, filters: filters)
-
         // Convert FTS matches to SearchResults
         var results: [SearchResult] = []
         for match in ftsMatches {
@@ -158,7 +155,6 @@ public actor SearchManager: SearchProtocol {
         return SearchResults(
             query: query,
             results: filteredResults,
-            totalCount: totalCount,
             searchTimeMs: searchTimeMs
         )
     }
@@ -312,7 +308,7 @@ public actor SearchManager: SearchProtocol {
 
         var query = "((text:(\(trimmedInclude))) OR (otherText:(\(trimmedInclude))))"
         for excluded in parsed.excludedTerms {
-            let escaped = escapeFTSSpecialChars(excluded)
+            let escaped = QueryTokenizer.sanitizeFTSTerm(excluded)
             let excludedToken = excluded.contains(where: \.isWhitespace) ? "\"\(escaped)\"" : escaped
             let excludedScope = "((text:(\(excludedToken))) OR (otherText:(\(excludedToken))))"
             query = "(\(query) NOT \(excludedScope))"
@@ -325,24 +321,15 @@ public actor SearchManager: SearchProtocol {
         var parts: [String] = []
 
         for term in parsed.searchTerms {
-            let escaped = escapeFTSSpecialChars(term)
+            let escaped = QueryTokenizer.sanitizeFTSTerm(term)
             parts.append("\(escaped)*")
         }
 
         for phrase in parsed.phrases {
-            let escaped = escapeFTSSpecialChars(phrase)
+            let escaped = QueryTokenizer.sanitizeFTSTerm(phrase)
             parts.append("\"\(escaped)\"")
         }
 
         return parts.joined(separator: " ")
-    }
-
-    private static func escapeFTSSpecialChars(_ text: String) -> String {
-        var escaped = text
-        let specialChars = ["\""]
-        for char in specialChars {
-            escaped = escaped.replacingOccurrences(of: char, with: "")
-        }
-        return escaped
     }
 }

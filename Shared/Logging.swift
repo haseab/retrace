@@ -66,7 +66,6 @@ public enum Log {
 
     /// Path to the log file - persists across crashes
     public static let logFilePath = NSHomeDirectory() + "/Library/Logs/Retrace/retrace.log"
-
     /// Get recent logs from the log file (fast file read, no OSLogStore)
     public static func getRecentLogs(maxCount: Int = 200) -> [String] {
         LogFile.shared.readLastLines(count: maxCount)
@@ -279,14 +278,30 @@ public enum Log {
         line: Int,
         consoleOnly: Bool = false
     ) {
-        let filename = (file as NSString).lastPathComponent
-        let formattedLog = "[\(timestamp())] [\(level)] [\(category.rawValue)] \(filename):\(line) - \(message)"
+        let formattedLog = formattedLogEntry(
+            level: level,
+            message: message,
+            category: category,
+            file: file,
+            line: line
+        )
         print(formattedLog)
 
         if !consoleOnly {
             // Also write to log file for persistence across crashes
             LogFile.shared.append(formattedLog)
         }
+    }
+
+    private static func formattedLogEntry(
+        level: String,
+        message: String,
+        category: Category,
+        file: String,
+        line: Int
+    ) -> String {
+        let filename = (file as NSString).lastPathComponent
+        return "[\(timestamp())] [\(level)] [\(category.rawValue)] \(filename):\(line) - \(message)"
     }
 
     /// Console-only debug log — prints to stdout but NOT to retrace.log.
@@ -497,6 +512,123 @@ extension Log {
 /// The remainder is reported as "unattributed" so allocator buckets are no longer the only view.
 public enum MemoryLedger {
     private static let store = MemoryLedgerStore()
+    private static let pendingWriteLock = NSLock()
+    private static var pendingWriteTail: Task<Void, Never>?
+    private static let summaryLoggingDefaultsKey = "retrace.debug.memoryLedgerSummaryLoggingEnabled"
+
+    public struct ResidualEpoch: Sendable {
+        fileprivate let id: UInt64
+    }
+
+    public enum ResidualClaimTarget: String, Sendable {
+        case owner
+        case concurrent
+        case none
+    }
+
+    public struct ResidualClaim: Sendable {
+        public let target: ResidualClaimTarget
+        public let bytes: Int64
+        public let activeConcurrentFunctions: [String]
+        public let processSnapshotGeneration: UInt64
+    }
+
+    public struct FunctionSnapshot: Sendable {
+        public let function: String
+        public let trackedBytes: Int64
+        public let contextualBytes: Int64
+        public let componentCount: Int
+    }
+
+    public enum ComponentCategory: String, Sendable, Codable {
+        case explicit
+        case inferred
+        case unattributed
+    }
+
+    public struct ComponentSnapshot: Sendable {
+        public let tag: String
+        public let category: ComponentCategory
+        public let bytes: Int64
+        public let count: Int?
+        public let unit: String?
+        public let function: String
+        public let kind: String
+        public let note: String?
+        public let countsTowardTrackedMemory: Bool
+    }
+
+    public struct Snapshot: Sendable {
+        public let componentCount: Int
+        public let trackedMemoryBytes: Int64
+        public let contextualBytes: Int64
+        public let trackedAllBytes: Int64
+        public let footprintBytes: UInt64
+        public let residentBytes: UInt64
+        public let internalBytes: UInt64
+        public let compressedBytes: UInt64
+        public let unattributedBytes: UInt64
+        public let components: [ComponentSnapshot]
+        public let functions: [FunctionSnapshot]
+    }
+
+    public static func beginResidualEpoch(
+        ownerFunction: String,
+        candidateConcurrentFunctions: [String] = []
+    ) async -> ResidualEpoch {
+        await store.beginResidualEpoch(
+            ownerFunction: ownerFunction,
+            candidateConcurrentFunctions: candidateConcurrentFunctions
+        )
+    }
+
+    public static func endResidualEpoch(_ epoch: ResidualEpoch) async {
+        await store.endResidualEpoch(epoch)
+    }
+
+    public static func claimCurrentUnattributed(
+        epoch: ResidualEpoch,
+        requestedBytes: Int64? = nil
+    ) async -> ResidualClaim {
+        await store.claimCurrentUnattributed(
+            epoch: epoch,
+            requestedBytes: requestedBytes
+        )
+    }
+
+    public static func flushPendingUpdates() async {
+        _ = await pendingWriteSnapshot()?.result
+    }
+
+    @discardableResult
+    private static func enqueuePendingWrite(
+        _ operation: @escaping @Sendable () async -> Void
+    ) -> Task<Void, Never> {
+        pendingWriteLock.lock()
+        let previousTail = pendingWriteTail
+        let task = Task(priority: .utility) {
+            if let previousTail {
+                _ = await previousTail.result
+            }
+            await operation()
+        }
+        pendingWriteTail = task
+        pendingWriteLock.unlock()
+        return task
+    }
+
+    private static func pendingWriteSnapshot() -> Task<Void, Never>? {
+        pendingWriteLock.lock()
+        let pendingWrite = pendingWriteTail
+        pendingWriteLock.unlock()
+        return pendingWrite
+    }
+
+    fileprivate static func isSummaryLoggingEnabled(
+        defaults: UserDefaults = .standard
+    ) -> Bool {
+        defaults.bool(forKey: summaryLoggingDefaultsKey)
+    }
 
     /// Set/update a memory component snapshot.
     ///
@@ -508,6 +640,7 @@ public enum MemoryLedger {
     ///   - function: Functional area (e.g. `ui.search`, `processing.ocr`)
     ///   - kind: Component type (e.g. `images`, `queue`, `telemetry-window`)
     ///   - note: Optional qualifier (e.g. `estimated`, `on-disk`)
+    ///   - category: Attribution bucket used by downstream memory views
     public static func set(
         tag: String,
         bytes: Int64,
@@ -516,10 +649,11 @@ public enum MemoryLedger {
         function: String,
         kind: String,
         note: String? = nil,
+        category: ComponentCategory = .explicit,
         countsTowardTrackedMemory: Bool = true
     ) {
         guard !tag.isEmpty else { return }
-        Task(priority: .utility) {
+        enqueuePendingWrite {
             await store.set(
                 tag: tag,
                 bytes: bytes,
@@ -528,17 +662,54 @@ public enum MemoryLedger {
                 function: function,
                 kind: kind,
                 note: note,
+                category: category,
                 countsTowardTrackedMemory: countsTowardTrackedMemory
             )
         }
     }
 
+    public static func setOrdered(
+        tag: String,
+        bytes: Int64,
+        count: Int? = nil,
+        unit: String? = nil,
+        function: String,
+        kind: String,
+        note: String? = nil,
+        category: ComponentCategory = .explicit,
+        countsTowardTrackedMemory: Bool = true
+    ) async {
+        guard !tag.isEmpty else { return }
+        let task = enqueuePendingWrite {
+            await store.set(
+                tag: tag,
+                bytes: bytes,
+                count: count,
+                unit: unit,
+                function: function,
+                kind: kind,
+                note: note,
+                category: category,
+                countsTowardTrackedMemory: countsTowardTrackedMemory
+            )
+        }
+        _ = await task.result
+    }
+
     /// Remove a component from the ledger.
     public static func remove(tag: String) {
         guard !tag.isEmpty else { return }
-        Task(priority: .utility) {
+        enqueuePendingWrite {
             await store.remove(tag: tag)
         }
+    }
+
+    public static func removeOrdered(tag: String) async {
+        guard !tag.isEmpty else { return }
+        let task = enqueuePendingWrite {
+            await store.remove(tag: tag)
+        }
+        _ = await task.result
     }
 
     /// Update process-level memory snapshot for tracked-vs-unattributed calculations.
@@ -548,7 +719,7 @@ public enum MemoryLedger {
         internalBytes: UInt64?,
         compressedBytes: UInt64?
     ) {
-        Task(priority: .utility) {
+        enqueuePendingWrite {
             await store.setProcessSnapshot(
                 footprintBytes: footprintBytes,
                 residentBytes: residentBytes,
@@ -558,6 +729,23 @@ public enum MemoryLedger {
         }
     }
 
+    public static func setProcessSnapshotOrdered(
+        footprintBytes: UInt64?,
+        residentBytes: UInt64?,
+        internalBytes: UInt64?,
+        compressedBytes: UInt64?
+    ) async {
+        let task = enqueuePendingWrite {
+            await store.setProcessSnapshot(
+                footprintBytes: footprintBytes,
+                residentBytes: residentBytes,
+                internalBytes: internalBytes,
+                compressedBytes: compressedBytes
+            )
+        }
+        _ = await task.result
+    }
+
     /// Emit a unified ledger summary if enough time has elapsed.
     public static func emitSummary(
         reason: String,
@@ -565,7 +753,7 @@ public enum MemoryLedger {
         minIntervalSeconds: TimeInterval = 30,
         force: Bool = false
     ) {
-        Task(priority: .utility) {
+        enqueuePendingWrite {
             await store.emitSummaryIfNeeded(
                 reason: reason,
                 category: category,
@@ -574,11 +762,43 @@ public enum MemoryLedger {
             )
         }
     }
+
+    public static func emitSummaryOrdered(
+        reason: String,
+        category: Log.Category = .app,
+        minIntervalSeconds: TimeInterval = 30,
+        force: Bool = false
+    ) async {
+        let task = enqueuePendingWrite {
+            await store.emitSummaryIfNeeded(
+                reason: reason,
+                category: category,
+                minIntervalSeconds: minIntervalSeconds,
+                force: force
+            )
+        }
+        _ = await task.result
+    }
+
+    public static func snapshot(waitForPendingUpdates: Bool = false) async -> Snapshot {
+        if waitForPendingUpdates {
+            await flushPendingUpdates()
+        }
+        return await store.snapshot()
+    }
 }
 
 private actor MemoryLedgerStore {
+    private struct FunctionSummary: Sendable {
+        let function: String
+        let trackedBytes: Int64
+        let contextualBytes: Int64
+        let componentCount: Int
+    }
+
     private struct ComponentEntry: Sendable {
         let tag: String
+        var category: MemoryLedger.ComponentCategory
         var bytes: Int64
         var count: Int?
         var unit: String?
@@ -598,10 +818,21 @@ private actor MemoryLedgerStore {
         let updatedAt: Date
     }
 
+    private struct ResidualEpochState: Sendable {
+        let ownerFunction: String
+        let candidateConcurrentFunctions: [String]
+    }
+
     private var entries: [String: ComponentEntry] = [:]
     private var processSnapshot: ProcessSnapshot?
+    private var processSnapshotGeneration: UInt64 = 0
     private var lastSummaryAt: Date?
+    private var nextResidualEpochID: UInt64 = 1
+    private var residualEpochs: [UInt64: ResidualEpochState] = [:]
+    private var activeFunctionCount: [String: Int] = [:]
+    private var claimedUnattributedBytesByGeneration: [UInt64: Int64] = [:]
     private static let maxBreakdownComponents = 12
+    private static let maxFunctionBreakdownComponents = 8
 
     func set(
         tag: String,
@@ -611,12 +842,14 @@ private actor MemoryLedgerStore {
         function: String,
         kind: String,
         note: String?,
+        category: MemoryLedger.ComponentCategory,
         countsTowardTrackedMemory: Bool
     ) {
         let normalizedBytes = max(0, bytes)
         let now = Date()
 
         if var existing = entries[tag] {
+            existing.category = category
             existing.bytes = normalizedBytes
             existing.count = count
             existing.unit = unit
@@ -630,6 +863,7 @@ private actor MemoryLedgerStore {
         } else {
             entries[tag] = ComponentEntry(
                 tag: tag,
+                category: category,
                 bytes: normalizedBytes,
                 count: count,
                 unit: unit,
@@ -653,12 +887,112 @@ private actor MemoryLedgerStore {
         internalBytes: UInt64?,
         compressedBytes: UInt64?
     ) {
+        processSnapshotGeneration &+= 1
         processSnapshot = ProcessSnapshot(
             footprintBytes: footprintBytes ?? 0,
             residentBytes: residentBytes ?? 0,
             internalBytes: internalBytes ?? 0,
             compressedBytes: compressedBytes ?? 0,
             updatedAt: Date()
+        )
+        let minimumGenerationToKeep = processSnapshotGeneration > 4 ? processSnapshotGeneration - 4 : 0
+        claimedUnattributedBytesByGeneration = claimedUnattributedBytesByGeneration.filter { generation, _ in
+            generation >= minimumGenerationToKeep
+        }
+    }
+
+    func beginResidualEpoch(
+        ownerFunction: String,
+        candidateConcurrentFunctions: [String]
+    ) -> MemoryLedger.ResidualEpoch {
+        let epochID = nextResidualEpochID
+        nextResidualEpochID &+= 1
+
+        residualEpochs[epochID] = ResidualEpochState(
+            ownerFunction: ownerFunction,
+            candidateConcurrentFunctions: candidateConcurrentFunctions
+        )
+        activeFunctionCount[ownerFunction, default: 0] += 1
+
+        return MemoryLedger.ResidualEpoch(id: epochID)
+    }
+
+    func endResidualEpoch(_ epoch: MemoryLedger.ResidualEpoch) {
+        guard let state = residualEpochs.removeValue(forKey: epoch.id) else { return }
+
+        let currentCount = activeFunctionCount[state.ownerFunction] ?? 0
+        if currentCount <= 1 {
+            activeFunctionCount.removeValue(forKey: state.ownerFunction)
+        } else {
+            activeFunctionCount[state.ownerFunction] = currentCount - 1
+        }
+    }
+
+    func claimCurrentUnattributed(
+        epoch: MemoryLedger.ResidualEpoch,
+        requestedBytes: Int64?
+    ) -> MemoryLedger.ResidualClaim {
+        guard let state = residualEpochs[epoch.id] else {
+            return MemoryLedger.ResidualClaim(
+                target: .none,
+                bytes: 0,
+                activeConcurrentFunctions: [],
+                processSnapshotGeneration: processSnapshotGeneration
+            )
+        }
+
+        let rankedEntries = entries.values.sorted { lhs, rhs in
+            if lhs.bytes != rhs.bytes {
+                return lhs.bytes > rhs.bytes
+            }
+            return lhs.tag < rhs.tag
+        }
+
+        let trackedMemoryBytes = rankedEntries
+            .filter(\.countsTowardTrackedMemory)
+            .reduce(into: Int64(0)) { runningTotal, entry in
+                if runningTotal > Int64.max - entry.bytes {
+                    runningTotal = Int64.max
+                } else {
+                    runningTotal += entry.bytes
+                }
+            }
+        let trackedMemoryBytesUInt64 = UInt64(max(trackedMemoryBytes, 0))
+        let footprintBytes = processSnapshot?.footprintBytes ?? 0
+        let unattributedBytes = footprintBytes > trackedMemoryBytesUInt64
+            ? footprintBytes - trackedMemoryBytesUInt64
+            : 0
+        let totalUnattributedBytes = Int64(min(unattributedBytes, UInt64(Int64.max)))
+        let generation = processSnapshotGeneration
+        let claimedBytes = claimedUnattributedBytesByGeneration[generation] ?? 0
+        let availableBytes = max(0, totalUnattributedBytes - claimedBytes)
+        let requestedBytesOrAvailable = requestedBytes.map { max(0, $0) } ?? availableBytes
+        let allocatedBytes = min(availableBytes, requestedBytesOrAvailable)
+
+        let activeConcurrentFunctions = state.candidateConcurrentFunctions
+            .filter { function in
+                function != state.ownerFunction && (activeFunctionCount[function] ?? 0) > 0
+            }
+            .sorted()
+
+        if allocatedBytes > 0 {
+            claimedUnattributedBytesByGeneration[generation] = claimedBytes + allocatedBytes
+        }
+
+        let target: MemoryLedger.ResidualClaimTarget
+        if allocatedBytes <= 0 {
+            target = .none
+        } else if activeConcurrentFunctions.isEmpty {
+            target = .owner
+        } else {
+            target = .concurrent
+        }
+
+        return MemoryLedger.ResidualClaim(
+            target: target,
+            bytes: allocatedBytes,
+            activeConcurrentFunctions: activeConcurrentFunctions,
+            processSnapshotGeneration: generation
         )
     }
 
@@ -668,6 +1002,7 @@ private actor MemoryLedgerStore {
         minIntervalSeconds: TimeInterval,
         force: Bool
     ) {
+        guard MemoryLedger.isSummaryLoggingEnabled() else { return }
         let now = Date()
         if !force, let lastSummaryAt, now.timeIntervalSince(lastSummaryAt) < max(1, minIntervalSeconds) {
             return
@@ -723,13 +1058,97 @@ private actor MemoryLedgerStore {
         let topEntries = rankedEntries.prefix(Self.maxBreakdownComponents)
         let breakdown = topEntries.map(Self.formatEntry).joined(separator: " | ")
         let omittedCount = max(0, rankedEntries.count - topEntries.count)
+        let functionSummaries = Self.summarizeByFunction(rankedEntries)
+        let topFunctions = functionSummaries.prefix(Self.maxFunctionBreakdownComponents)
+        let functionBreakdown = topFunctions.map(Self.formatFunctionSummary).joined(separator: " | ")
+        let omittedFunctionCount = max(0, functionSummaries.count - topFunctions.count)
 
-        var message = "[Memory-Ledger] reason=\(reason) components=\(rankedEntries.count) tracked=\(Self.formatBytes(trackedMemoryBytesUInt64)) contextual=\(Self.formatBytes(contextualBytesUInt64)) trackedAll=\(Self.formatBytes(trackedBytesForCompatibilityUInt64)) footprint=\(Self.formatBytes(footprintBytes)) resident=\(Self.formatBytes(residentBytes)) internal=\(Self.formatBytes(internalBytes)) compressed=\(Self.formatBytes(compressedBytes)) unattributed=\(Self.formatBytes(unattributedBytes)) breakdown=[\(breakdown)]"
+        var message = "[Memory-Ledger] reason=\(reason) components=\(rankedEntries.count) tracked=\(Self.formatBytes(trackedMemoryBytesUInt64)) contextual=\(Self.formatBytes(contextualBytesUInt64)) trackedAll=\(Self.formatBytes(trackedBytesForCompatibilityUInt64)) footprint=\(Self.formatBytes(footprintBytes)) resident=\(Self.formatBytes(residentBytes)) internal=\(Self.formatBytes(internalBytes)) compressed=\(Self.formatBytes(compressedBytes)) unattributed=\(Self.formatBytes(unattributedBytes)) breakdown=[\(breakdown)] functions=[\(functionBreakdown)]"
         if omittedCount > 0 {
             message += " omitted=\(omittedCount)"
         }
+        if omittedFunctionCount > 0 {
+            message += " functionOmitted=\(omittedFunctionCount)"
+        }
 
         Log.info(message, category: category)
+    }
+
+    func snapshot() -> MemoryLedger.Snapshot {
+        let rankedEntries = entries.values.sorted { lhs, rhs in
+            if lhs.bytes != rhs.bytes {
+                return lhs.bytes > rhs.bytes
+            }
+            return lhs.tag < rhs.tag
+        }
+
+        let trackedMemoryBytes = rankedEntries
+            .filter(\.countsTowardTrackedMemory)
+            .reduce(into: Int64(0)) { runningTotal, entry in
+                if runningTotal > Int64.max - entry.bytes {
+                    runningTotal = Int64.max
+                } else {
+                    runningTotal += entry.bytes
+                }
+            }
+        let contextualBytes = rankedEntries
+            .filter { !$0.countsTowardTrackedMemory }
+            .reduce(into: Int64(0)) { runningTotal, entry in
+                if runningTotal > Int64.max - entry.bytes {
+                    runningTotal = Int64.max
+                } else {
+                    runningTotal += entry.bytes
+                }
+            }
+        let trackedAllBytes = rankedEntries.reduce(into: Int64(0)) { runningTotal, entry in
+            if runningTotal > Int64.max - entry.bytes {
+                runningTotal = Int64.max
+            } else {
+                runningTotal += entry.bytes
+            }
+        }
+
+        let footprintBytes = processSnapshot?.footprintBytes ?? 0
+        let residentBytes = processSnapshot?.residentBytes ?? 0
+        let internalBytes = processSnapshot?.internalBytes ?? 0
+        let compressedBytes = processSnapshot?.compressedBytes ?? 0
+        let trackedMemoryBytesUInt64 = UInt64(max(trackedMemoryBytes, 0))
+        let unattributedBytes = footprintBytes > trackedMemoryBytesUInt64
+            ? footprintBytes - trackedMemoryBytesUInt64
+            : 0
+
+        return MemoryLedger.Snapshot(
+            componentCount: rankedEntries.count,
+            trackedMemoryBytes: trackedMemoryBytes,
+            contextualBytes: contextualBytes,
+            trackedAllBytes: trackedAllBytes,
+            footprintBytes: footprintBytes,
+            residentBytes: residentBytes,
+            internalBytes: internalBytes,
+            compressedBytes: compressedBytes,
+            unattributedBytes: unattributedBytes,
+            components: rankedEntries.map {
+                MemoryLedger.ComponentSnapshot(
+                    tag: $0.tag,
+                    category: $0.category,
+                    bytes: $0.bytes,
+                    count: $0.count,
+                    unit: $0.unit,
+                    function: $0.function,
+                    kind: $0.kind,
+                    note: $0.note,
+                    countsTowardTrackedMemory: $0.countsTowardTrackedMemory
+                )
+            },
+            functions: Self.summarizeByFunction(rankedEntries).map {
+                MemoryLedger.FunctionSnapshot(
+                    function: $0.function,
+                    trackedBytes: $0.trackedBytes,
+                    contextualBytes: $0.contextualBytes,
+                    componentCount: $0.componentCount
+                )
+            }
+        )
     }
 
     private static func formatEntry(_ entry: ComponentEntry) -> String {
@@ -746,6 +1165,45 @@ private actor MemoryLedgerStore {
         }
         parts.append("scope=\(entry.countsTowardTrackedMemory ? "memory" : "context")")
         return "\(entry.tag):\(formatBytes(UInt64(max(entry.bytes, 0)))) {\(parts.joined(separator: ","))}"
+    }
+
+    private static func summarizeByFunction(_ entries: [ComponentEntry]) -> [FunctionSummary] {
+        let summariesByFunction = entries.reduce(into: [String: FunctionSummary]()) { partialResult, entry in
+            let existing = partialResult[entry.function] ?? FunctionSummary(
+                function: entry.function,
+                trackedBytes: 0,
+                contextualBytes: 0,
+                componentCount: 0
+            )
+
+            let trackedBytes = existing.trackedBytes + (entry.countsTowardTrackedMemory ? entry.bytes : 0)
+            let contextualBytes = existing.contextualBytes + (entry.countsTowardTrackedMemory ? 0 : entry.bytes)
+
+            partialResult[entry.function] = FunctionSummary(
+                function: entry.function,
+                trackedBytes: trackedBytes,
+                contextualBytes: contextualBytes,
+                componentCount: existing.componentCount + 1
+            )
+        }
+
+        return summariesByFunction.values.sorted { lhs, rhs in
+            let lhsTotal = lhs.trackedBytes + lhs.contextualBytes
+            let rhsTotal = rhs.trackedBytes + rhs.contextualBytes
+            if lhsTotal != rhsTotal {
+                return lhsTotal > rhsTotal
+            }
+            if lhs.trackedBytes != rhs.trackedBytes {
+                return lhs.trackedBytes > rhs.trackedBytes
+            }
+            return lhs.function < rhs.function
+        }
+    }
+
+    private static func formatFunctionSummary(_ summary: FunctionSummary) -> String {
+        let tracked = formatBytes(UInt64(max(summary.trackedBytes, 0)))
+        let contextual = formatBytes(UInt64(max(summary.contextualBytes, 0)))
+        return "\(summary.function){tracked=\(tracked),context=\(contextual),components=\(summary.componentCount)}"
     }
 
     private static func formatBytes(_ bytes: UInt64) -> String {

@@ -15,6 +15,7 @@ extension SettingsView {
     var captureSettings: some View {
         VStack(alignment: .leading, spacing: 20) {
             captureRateCard
+            menuBarIconCard
             compressionCard
             Color.clear
                 .frame(height: 0)
@@ -181,7 +182,7 @@ extension SettingsView {
                     .background(Color.white.opacity(0.1))
 
                 HStack {
-                    Text("Deduplication")
+                    Text("Similar Frames Deduplication Threshold")
                         .font(.retraceCalloutMedium)
                         .foregroundColor(.retracePrimary)
                     Spacer()
@@ -231,7 +232,7 @@ extension SettingsView {
                 ModernToggleRow(
                     title: "Keep frames on mouse movement",
                     subtitle: captureMousePosition
-                        ? "Do not deduplicate when the pointer moved between captures."
+                        ? "Keep duplicate frames even if only the mouse moved between captures."
                         : "Enable \"Capture mouse position\" in Capture Rate to use this setting.",
                     isOn: $keepFramesOnMouseMovement
                 )
@@ -246,6 +247,17 @@ extension SettingsView {
                     )
                 }
             }
+        }
+    }
+
+    @ViewBuilder
+    var menuBarIconCard: some View {
+        ModernSettingsCard(title: "Menu Bar Icon", icon: "menubar.rectangle") {
+            ModernToggleRow(
+                title: "Show capture animation",
+                subtitle: "Animate the menu bar icon like a camera shutter every time Retrace takes a screenshot.",
+                isOn: menuBarCaptureFeedbackBinding
+            )
         }
     }
 
@@ -268,6 +280,12 @@ extension SettingsView {
                 }
 
                 PauseReminderDelayPicker(selectedMinutes: $pauseReminderDelayMinutes)
+                    .onChange(of: pauseReminderDelayMinutes) { newValue in
+                        NotificationCenter.default.post(
+                            name: PauseReminderSettingsNotification.didChange,
+                            object: PauseReminderSettingsSnapshot(delayMinutes: newValue)
+                        )
+                    }
 
                 HStack {
                     Text("How long to wait before reminding you again when recording is stopped")
@@ -305,5 +323,24 @@ extension SettingsView {
                 )
                 .animation(.easeInOut(duration: 0.2), value: shellViewModel.isPauseReminderCardHighlighted)
         }
+    }
+}
+
+private extension SettingsView {
+    var menuBarCaptureFeedbackBinding: Binding<Bool> {
+        Binding(
+            get: {
+                showMenuBarCaptureFeedback
+            },
+            set: { isEnabled in
+                showMenuBarCaptureFeedback = isEnabled
+                DashboardViewModel.recordDeveloperSettingToggle(
+                    coordinator: coordinatorWrapper.coordinator,
+                    source: "settings.capture.menuBarIcon",
+                    settingKey: menuBarCaptureFeedbackDefaultsKey,
+                    isEnabled: isEnabled
+                )
+            }
+        )
     }
 }

@@ -6,6 +6,7 @@ import App
 let settingsStore: UserDefaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
 let rewindCutoffDateDefaultsKey = "rewindCutoffDate"
 let phraseLevelRedactionEnabledDefaultsKey = "phraseLevelRedactionEnabled"
+let menuBarCaptureFeedbackDefaultsKey = "showMenuBarCaptureFeedback"
 
 enum MasterKeyProtectedFeature: String, Identifiable {
     case phraseLevelRedaction
@@ -93,6 +94,7 @@ enum SettingsDefaults {
     static let enableFrameIDSearch = false
     static let showOCRDebugOverlay = false
     static let showVideoControls = false
+    static let showMenuBarCaptureFeedback = false
 
     static let ocrEnabled = true
     static let ocrOnlyWhenPluggedIn = false

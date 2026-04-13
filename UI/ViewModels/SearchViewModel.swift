@@ -14,6 +14,7 @@ private struct CachedAppInfo: Codable {
 /// Handles search queries, filtering, and result management with debouncing
 @MainActor
 public class SearchViewModel: ObservableObject {
+    typealias SearchExecutor = @Sendable (SearchQuery) async throws -> SearchResults
 
     // MARK: - Recent Search Entry
 
@@ -225,6 +226,20 @@ public class SearchViewModel: ObservableObject {
         }
     }
 
+    struct ResultNavigationState: Equatable {
+        let currentIndex: Int
+        let loadedCount: Int
+        let canNavigatePrevious: Bool
+        let canNavigateNext: Bool
+        let canLoadMore: Bool
+        let isLoadingMore: Bool
+
+        var currentPosition: Int { currentIndex + 1 }
+        var requestsMoreResultsOnNextAdvance: Bool {
+            canLoadMore && currentIndex >= max(0, loadedCount - 2)
+        }
+    }
+
     // MARK: - Published State
 
     @Published public var searchQuery: String = "" {
@@ -234,6 +249,7 @@ public class SearchViewModel: ObservableObject {
     }
     @Published public var results: SearchResults? {
         didSet {
+            resultSetBytes = SearchMemoryEstimator.searchResultsBytes(results?.results ?? [])
             updateVisibleResults()
         }
     }
@@ -304,13 +320,13 @@ public class SearchViewModel: ObservableObject {
     // Thumbnail cache - persists across overlay open/close, cleared on new search
     @Published public var thumbnailCache: [String: NSImage] = [:] {
         didSet {
-            thumbnailCacheBytes = Self.estimatedImageBytes(thumbnailCache)
+            thumbnailCacheBytes = UIMemoryEstimator.imageDictionaryBytes(thumbnailCache)
         }
     }
     @Published public var loadingThumbnails: Set<String> = []
     @Published public var appIconCache: [String: NSImage] = [:] {
         didSet {
-            appIconCacheBytes = Self.estimatedImageBytes(appIconCache)
+            appIconCacheBytes = UIMemoryEstimator.imageDictionaryBytes(appIconCache)
         }
     }
 
@@ -341,6 +357,10 @@ public class SearchViewModel: ObservableObject {
     // Used by timeline-level event routing to keep scroll input inside the expanded overlay.
     @Published public var isSearchOverlayExpanded = false
 
+    // Whether the spotlight search text field currently owns focus.
+    // Used by Escape routing so results return focus to the field before dismissing.
+    @Published public var isSearchFieldFocused = false
+
     // Whether the DateFilterPopover is actively handling keyboard events (Tab/Enter/arrows)
     // When true, SearchFilterBar's tab monitor and TimelineWindowController's arrow key handler skip processing
     public var isDatePopoverHandlingKeys = false
@@ -359,11 +379,19 @@ public class SearchViewModel: ObservableObject {
     // Signal to collapse overlay UI back to compact search bar without dismissing.
     @Published public var collapseOverlaySignal: UUID = UUID()
 
+    // Signal to refocus the spotlight search field from parent-level handlers.
+    // selectAll=true is used when returning from results so the existing query is easy to replace.
+    @Published public var focusSearchFieldSignal: (selectAll: Bool, id: UUID) = (false, UUID())
+
     // Signal to dismiss the recent-entries popover as if the user clicked the header "x".
     @Published public var dismissRecentEntriesPopoverSignal: UUID = UUID()
 
     /// Recent submitted search queries used by spotlight "Recent Entries" popover.
-    @Published public private(set) var recentSearchEntries: [RecentSearchEntry] = []
+    @Published public private(set) var recentSearchEntries: [RecentSearchEntry] = [] {
+        didSet {
+            recentSearchEntriesBytes = SearchMemoryEstimator.recentSearchEntriesBytes(recentSearchEntries)
+        }
+    }
 
     /// One-shot delay for showing the "Recent Entries" popover on next overlay open.
     private var nextRecentEntriesRevealDelay: TimeInterval = 0
@@ -391,14 +419,18 @@ public class SearchViewModel: ObservableObject {
     // MARK: - Dependencies
 
     public let coordinator: AppCoordinator
+    private let executeSearch: SearchExecutor
     private var cancellables = Set<AnyCancellable>()
 
     // Active search tasks that can be cancelled
     private var currentSearchTask: Task<Void, Never>?
     private var currentLoadMoreTask: Task<Void, Never>?
+    private var pendingOtherAppsRefreshTask: Task<Void, Never>?
     private var memoryReportTask: Task<Void, Never>?
     private var thumbnailCacheBytes: Int64 = 0
     private var appIconCacheBytes: Int64 = 0
+    private var resultSetBytes: Int64 = 0
+    private var recentSearchEntriesBytes: Int64 = 0
     private var thumbnailLRUKeys: [String] = []
 
     // MARK: - Constants
@@ -406,14 +438,16 @@ public class SearchViewModel: ObservableObject {
     private let debounceDelay: TimeInterval = 0.3
     private let defaultResultLimit = 50
     private let maxSearchWords = 15  // Limit search queries to prevent performance issues
+    private let otherAppsRefreshDelayNs: UInt64 = 2_000_000_000
     private let memoryReportIntervalNs: UInt64 = 5_000_000_000
     private let maxInMemoryThumbnailCount = 60
     nonisolated private static let memoryLedgerSummaryIntervalSeconds: TimeInterval = 30
     nonisolated private static let memoryLedgerThumbnailTag = "ui.search.thumbnailCache"
     nonisolated private static let memoryLedgerAppIconTag = "ui.search.appIconCache"
     nonisolated private static let memoryLedgerResultSetTag = "ui.search.resultSet"
-    private static let thumbnailDiskCacheMaxBytes: Int64 = 512 * 1024 * 1024
-    private static let thumbnailDiskCacheMaxAge: TimeInterval = 7 * 24 * 60 * 60
+    nonisolated private static let memoryLedgerRecentSearchesTag = "ui.search.recentEntries"
+    private nonisolated static let thumbnailDiskCacheMaxBytes: Int64 = 512 * 1024 * 1024
+    private nonisolated static let thumbnailDiskCacheMaxAge: TimeInterval = 7 * 24 * 60 * 60
     private static let maxRecentSearchEntryCount = 80
     private static let recentSearchEntriesKey = "search.recentEntries.v1"
     private static let encodedMetadataFilterPrefix = "__retrace_meta_filter_v1__"
@@ -495,6 +529,18 @@ public class SearchViewModel: ObservableObject {
 
     public init(coordinator: AppCoordinator) {
         self.coordinator = coordinator
+        self.executeSearch = { query in
+            try await coordinator.search(query: query)
+        }
+        loadRecentSearchEntries()
+        setupBindings()
+        startMemoryReporting()
+        prepareThumbnailDiskCache()
+    }
+
+    init(coordinator: AppCoordinator, executeSearch: @escaping SearchExecutor) {
+        self.coordinator = coordinator
+        self.executeSearch = executeSearch
         loadRecentSearchEntries()
         setupBindings()
         startMemoryReporting()
@@ -517,6 +563,9 @@ public class SearchViewModel: ObservableObject {
                     self?.resetSearchOrderToDefault()
                     self?.clearInMemoryThumbnailCache()
                     self?.clearSearchCache()
+                } else {
+                    self?.pendingOtherAppsRefreshTask?.cancel()
+                    self?.pendingOtherAppsRefreshTask = nil
                 }
             }
             .store(in: &cancellables)
@@ -561,11 +610,7 @@ public class SearchViewModel: ObservableObject {
                   !self.isRestoringFromCache,
                   self.hasSubmittedSearch else { return }
 
-            // Cancel any existing search before starting a new one
-            self.currentSearchTask?.cancel()
-            self.currentSearchTask = Task {
-                await self.performSearch(query: self.searchQuery, trigger: "filter-change")
-            }
+            self.startFreshSearchTask(query: self.searchQuery, trigger: "filter-change")
         }
         .store(in: &cancellables)
     }
@@ -773,11 +818,6 @@ public class SearchViewModel: ObservableObject {
 
     private func logMemorySnapshot() {
         let resultCount = results?.results.count ?? 0
-        Log.info(
-            "[Search-Memory] results=\(resultCount) visibleResults=\(visibleResults.count) thumbnails=\(thumbnailCache.count)/\(Self.formatBytes(thumbnailCacheBytes)) appIcons=\(appIconCache.count)/\(Self.formatBytes(appIconCacheBytes))",
-            category: .ui
-        )
-
         updateMemoryLedger(resultCount: resultCount)
     }
 
@@ -800,37 +840,27 @@ public class SearchViewModel: ObservableObject {
         )
         MemoryLedger.set(
             tag: Self.memoryLedgerResultSetTag,
-            bytes: 0,
+            bytes: resultSetBytes,
             count: resultCount,
             unit: "results",
             function: "ui.search",
             kind: "result-window",
-            note: "count-only"
+            note: "estimated"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerRecentSearchesTag,
+            bytes: recentSearchEntriesBytes,
+            count: recentSearchEntries.count,
+            unit: "entries",
+            function: "ui.search",
+            kind: "recent-searches",
+            note: "estimated"
         )
         MemoryLedger.emitSummary(
             reason: "ui.search.memory",
             category: .ui,
             minIntervalSeconds: Self.memoryLedgerSummaryIntervalSeconds
         )
-    }
-
-    private static func estimatedImageBytes(_ images: [String: NSImage]) -> Int64 {
-        images.values.reduce(into: Int64(0)) { total, image in
-            total += estimatedMemoryBytes(for: image)
-        }
-    }
-
-    private static func estimatedMemoryBytes(for image: NSImage) -> Int64 {
-        if let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) {
-            return Int64(cgImage.bytesPerRow * cgImage.height)
-        }
-        if let bitmapRep = image.representations.first(where: { $0 is NSBitmapImageRep }) as? NSBitmapImageRep {
-            return Int64(bitmapRep.bytesPerRow * bitmapRep.pixelsHigh)
-        }
-
-        let width = max(Int(image.size.width), 1)
-        let height = max(Int(image.size.height), 1)
-        return Int64(width * height * 4)
     }
 
     private static func formatBytes(_ bytes: Int64) -> String {
@@ -1130,6 +1160,12 @@ public class SearchViewModel: ObservableObject {
         collapseOverlaySignal = UUID()
     }
 
+    /// Ask the overlay view to move focus back to the search field.
+    /// - Parameter selectAll: Whether the current query should be fully selected after focus is restored.
+    public func requestSearchFieldFocus(selectAll: Bool = false) {
+        focusSearchFieldSignal = (selectAll, UUID())
+    }
+
     /// Set a one-shot delay for the next "Recent Entries" popover reveal.
     public func setNextRecentEntriesRevealDelay(_ delay: TimeInterval) {
         let normalizedDelay = max(0, delay)
@@ -1162,11 +1198,25 @@ public class SearchViewModel: ObservableObject {
 
     // MARK: - Search
 
+    private func cancelInFlightLoadMore(reason: String) {
+        guard currentLoadMoreTask != nil || isLoadingMore else { return }
+
+        currentLoadMoreTask?.cancel()
+        currentLoadMoreTask = nil
+        isLoadingMore = false
+        Log.info("[SearchViewModel] Cancelled in-flight load more due to \(reason)", category: .ui)
+    }
+
+    private func startFreshSearchTask(query: String, trigger: String) {
+        currentSearchTask?.cancel()
+        cancelInFlightLoadMore(reason: trigger)
+        currentSearchTask = Task {
+            await performSearch(query: query, trigger: trigger)
+        }
+    }
+
     /// Trigger search with current query (called on Enter key)
     public func submitSearch(trigger: String = "submit") {
-        // Cancel any existing search before starting a new one
-        currentSearchTask?.cancel()
-
         // Mark that user has submitted a search - enables filter auto-refresh
         hasSubmittedSearch = true
 
@@ -1184,14 +1234,14 @@ public class SearchViewModel: ObservableObject {
 
             // Track filtered search if any filters are active
             if hasActiveFilters {
-                let filtersJson = buildFiltersJson()
-                DashboardViewModel.recordFilteredSearch(coordinator: coordinator, query: query, filters: filtersJson)
+                DashboardViewModel.recordFilteredSearch(
+                    coordinator: coordinator,
+                    metadata: buildFilteredSearchMetricMetadata(query: query)
+                )
             }
         }
 
-        currentSearchTask = Task {
-            await performSearch(query: query, trigger: trigger)
-        }
+        startFreshSearchTask(query: query, trigger: trigger)
     }
 
     /// Re-run the current query immediately without recording a new "submitted search" analytics event.
@@ -1201,98 +1251,68 @@ public class SearchViewModel: ObservableObject {
         guard !query.isEmpty else { return }
         guard hasSubmittedSearch else { return }
 
-        currentSearchTask?.cancel()
-        currentSearchTask = Task {
-            await performSearch(query: query, trigger: trigger)
-        }
+        startFreshSearchTask(query: query, trigger: trigger)
     }
 
-    /// Build JSON representation of active filters for metrics
-    private func buildFiltersJson() -> String {
-        var components: [String] = []
+    private func buildFilteredSearchMetricMetadata(
+        query: String
+    ) -> FilteredSearchMetricMetadata {
+        FilteredSearchMetricMetadata(
+            queryLength: query.count,
+            filterCount: activeFilterMetricCount()
+        )
+    }
+
+    private func activeFilterMetricCount() -> Int {
+        var count = 0
 
         if let apps = selectedAppFilters, !apps.isEmpty {
-            let appsArray = apps.map { "\"\($0)\"" }.joined(separator: ",")
-            components.append("\"apps\":[\(appsArray)]")
-            components.append("\"appMode\":\"\(appFilterMode.rawValue)\"")
+            count += 1
         }
 
-        if effectiveDateRanges.count == 1 {
-            if let startDate = effectiveDateRanges[0].start {
-                components.append("\"startDate\":\"\(Log.timestamp(from: startDate))\"")
-            }
-            if let endDate = effectiveDateRanges[0].end {
-                components.append("\"endDate\":\"\(Log.timestamp(from: endDate))\"")
-            }
-        } else if !effectiveDateRanges.isEmpty {
-            let encodedRanges = effectiveDateRanges.map { range in
-                let start = range.start.map { "\"\(Log.timestamp(from: $0))\"" } ?? "null"
-                let end = range.end.map { "\"\(Log.timestamp(from: $0))\"" } ?? "null"
-                return "{\"start\":\(start),\"end\":\(end)}"
-            }.joined(separator: ",")
-            components.append("\"dateRanges\":[\(encodedRanges)]")
+        if effectiveDateRanges.contains(where: { $0.start != nil || $0.end != nil }) {
+            count += 1
         }
 
         if contentType != .all {
-            components.append("\"contentType\":\"\(contentType.rawValue)\"")
+            count += 1
         }
 
         if let tags = selectedTags, !tags.isEmpty {
-            let tagsArray = tags.map { "\($0)" }.joined(separator: ",")
-            components.append("\"tags\":[\(tagsArray)]")
-            components.append("\"tagMode\":\"\(tagFilterMode.rawValue)\"")
+            count += 1
         }
 
         if hiddenFilter != .hide {
-            components.append("\"hiddenFilter\":\"\(hiddenFilter.rawValue)\"")
+            count += 1
         }
 
         if commentFilter != .allFrames {
-            components.append("\"commentFilter\":\"\(commentFilter.rawValue)\"")
+            count += 1
         }
 
         let normalizedWindowBuckets = normalizedMetadataFilterBuckets(
             include: windowNameTerms,
             exclude: windowNameExcludedTerms
         )
-        if !normalizedWindowBuckets.includeTerms.isEmpty {
-            let escapedTerms = normalizedWindowBuckets.includeTerms
-                .map { "\"\($0.replacingOccurrences(of: "\"", with: "\\\""))\"" }
-                .joined(separator: ",")
-            components.append("\"windowNamesInclude\":[\(escapedTerms)]")
-        }
-        if !normalizedWindowBuckets.excludeTerms.isEmpty {
-            let escapedTerms = normalizedWindowBuckets.excludeTerms
-                .map { "\"\($0.replacingOccurrences(of: "\"", with: "\\\""))\"" }
-                .joined(separator: ",")
-            components.append("\"windowNamesExclude\":[\(escapedTerms)]")
+        if !normalizedWindowBuckets.includeTerms.isEmpty ||
+            !normalizedWindowBuckets.excludeTerms.isEmpty {
+            count += 1
         }
 
         let normalizedBrowserBuckets = normalizedMetadataFilterBuckets(
             include: browserUrlTerms,
             exclude: browserUrlExcludedTerms
         )
-        if !normalizedBrowserBuckets.includeTerms.isEmpty {
-            let escapedTerms = normalizedBrowserBuckets.includeTerms
-                .map { "\"\($0.replacingOccurrences(of: "\"", with: "\\\""))\"" }
-                .joined(separator: ",")
-            components.append("\"browserUrlsInclude\":[\(escapedTerms)]")
-        }
-        if !normalizedBrowserBuckets.excludeTerms.isEmpty {
-            let escapedTerms = normalizedBrowserBuckets.excludeTerms
-                .map { "\"\($0.replacingOccurrences(of: "\"", with: "\\\""))\"" }
-                .joined(separator: ",")
-            components.append("\"browserUrlsExclude\":[\(escapedTerms)]")
+        if !normalizedBrowserBuckets.includeTerms.isEmpty ||
+            !normalizedBrowserBuckets.excludeTerms.isEmpty {
+            count += 1
         }
 
-        if !excludedSearchTerms.isEmpty {
-            let escapedTerms = normalizedExcludedSearchTerms(excludedSearchTerms)
-                .map { "\"\($0.replacingOccurrences(of: "\"", with: "\\\""))\"" }
-                .joined(separator: ",")
-            components.append("\"excludedTerms\":[\(escapedTerms)]")
+        if !normalizedExcludedSearchTerms(excludedSearchTerms).isEmpty {
+            count += 1
         }
 
-        return "{\(components.joined(separator: ","))}"
+        return count
     }
 
     private func armFilterAutoSearchSuppression() {
@@ -1302,20 +1322,29 @@ public class SearchViewModel: ObservableObject {
     }
 
     public func performSearch(query: String, trigger: String = "unknown") async {
+        cancelInFlightLoadMore(reason: trigger)
+
         guard !query.isEmpty else {
             results = nil
             committedSearchQuery = ""
+            selectedResult = nil
+            showingFrameViewer = false
             clearInMemoryThumbnailCache()
             didReachPaginationEnd = false
             nextPageCursor = nil
             return
         }
 
+        pendingOtherAppsRefreshTask?.cancel()
+        pendingOtherAppsRefreshTask = nil
+
         isSearching = true
         error = nil
 
         results = nil  // Clear old results immediately to prevent stale thumbnail loads
         savedScrollPosition = 0  // Reset scroll position for new search
+        selectedResult = nil
+        showingFrameViewer = false
         clearInMemoryThumbnailCache()  // Clear in-memory thumbnail cache for new search
         searchGeneration += 1  // Increment generation to invalidate in-flight thumbnail loads
         committedSearchQuery = query  // Set committed query for thumbnail cache keys
@@ -1327,15 +1356,10 @@ public class SearchViewModel: ObservableObject {
             try Task.checkCancellation()
 
             let searchQuery = buildSearchQuery(query)
-
-            let searchResults = try await coordinator.search(query: searchQuery)
+            let searchResults = try await executeSearch(searchQuery)
 
             // Check for cancellation after the search completes
             try Task.checkCancellation()
-
-            if !searchResults.results.isEmpty {
-                let firstResult = searchResults.results[0]
-            }
 
             // Ensure UI updates happen on main actor
             await MainActor.run {
@@ -1349,7 +1373,6 @@ public class SearchViewModel: ObservableObject {
                 isSearching = false
             }
         } catch {
-            Log.error("[SearchViewModel] Search failed: \(error.localizedDescription)", category: .ui)
             // Ensure UI updates happen on main actor
             await MainActor.run {
                 self.error = "Search failed: \(error.localizedDescription)"
@@ -1544,11 +1567,7 @@ public class SearchViewModel: ObservableObject {
         searchMode = mode
         // Clear results and re-search with new mode (only if user has submitted a search)
         if !searchQuery.isEmpty && hasSubmittedSearch {
-            // Cancel any existing search before starting a new one
-            currentSearchTask?.cancel()
-            currentSearchTask = Task {
-                await performSearch(query: searchQuery, trigger: "search-mode-change")
-            }
+            startFreshSearchTask(query: searchQuery, trigger: "search-mode-change")
         }
     }
 
@@ -1558,10 +1577,7 @@ public class SearchViewModel: ObservableObject {
         sortOrder = order
         // Re-search with new sort order (only if user has submitted a search)
         if !searchQuery.isEmpty && hasSubmittedSearch {
-            currentSearchTask?.cancel()
-            currentSearchTask = Task {
-                await performSearch(query: searchQuery, trigger: "sort-order-change")
-            }
+            startFreshSearchTask(query: searchQuery, trigger: "sort-order-change")
         }
     }
 
@@ -1582,10 +1598,7 @@ public class SearchViewModel: ObservableObject {
         guard didChange else { return }
 
         if !searchQuery.isEmpty && hasSubmittedSearch {
-            currentSearchTask?.cancel()
-            currentSearchTask = Task {
-                await performSearch(query: searchQuery, trigger: "search-mode-or-sort-change")
-            }
+            startFreshSearchTask(query: searchQuery, trigger: "search-mode-or-sort-change")
         }
     }
 
@@ -1599,7 +1612,11 @@ public class SearchViewModel: ObservableObject {
 
     /// Load more results for infinite scroll
     public func loadMore() {
-        currentLoadMoreTask?.cancel()
+        guard currentLoadMoreTask == nil, !isLoadingMore, !isSearching else {
+            Log.debug("[SearchViewModel] Ignoring duplicate load more trigger while pagination is already in flight", category: .ui)
+            return
+        }
+
         currentLoadMoreTask = Task { @MainActor [weak self] in
             await self?.performLoadMore()
         }
@@ -1620,7 +1637,7 @@ public class SearchViewModel: ObservableObject {
             try Task.checkCancellation()
 
             let query = buildSearchQuery(searchQuery, offset: 0, cursor: nextPageCursor)
-            let moreResults = try await coordinator.search(query: query)
+            let moreResults = try await executeSearch(query)
 
             // Check for cancellation after the search completes
             try Task.checkCancellation()
@@ -1633,8 +1650,8 @@ public class SearchViewModel: ObservableObject {
                 results = SearchResults(
                     query: currentResults.query,
                     results: currentResults.results,
-                    totalCount: currentResults.results.count,
-                    searchTimeMs: moreResults.searchTimeMs
+                    searchTimeMs: moreResults.searchTimeMs,
+                    nextCursor: nil
                 )
                 isLoadingMore = false
                 return
@@ -1645,8 +1662,8 @@ public class SearchViewModel: ObservableObject {
             results = SearchResults(
                 query: moreResults.query,
                 results: combinedResults,
-                totalCount: moreResults.totalCount,
-                searchTimeMs: moreResults.searchTimeMs
+                searchTimeMs: moreResults.searchTimeMs,
+                nextCursor: moreResults.nextCursor
             )
             nextPageCursor = moreResults.nextCursor
             didReachPaginationEnd = moreResults.nextCursor == nil
@@ -1665,6 +1682,10 @@ public class SearchViewModel: ObservableObject {
     public func selectResult(_ result: SearchResult) {
         selectedResult = result
         showingFrameViewer = true
+        updateSavedScrollPosition(for: result)
+        if let selectedIndex = selectedResultIndex(in: results?.results, selectedResult: result) {
+            prefetchMoreResultsIfNeeded(selectedIndex: selectedIndex)
+        }
     }
 
     public func closeFrameViewer() {
@@ -1736,13 +1757,38 @@ public class SearchViewModel: ObservableObject {
 
         // If cache is stale or empty, refresh from DB in background.
         if snapshot.cacheIsStale || snapshot.cachedOtherApps.isEmpty {
-            Task.detached { [weak self] in
-                await self?.refreshOtherAppsFromDB(installedBundleIDs: snapshot.installedBundleIDs)
-            }
+            scheduleOtherAppsRefresh(installedBundleIDs: snapshot.installedBundleIDs)
         }
 
         let totalTime = CFAbsoluteTimeGetCurrent() - startTime
         Log.info("[SearchViewModel] Total: \(installedApps.count) installed + \(otherApps.count) other apps in \(Int(totalTime * 1000))ms", category: .ui)
+    }
+
+    private func scheduleOtherAppsRefresh(installedBundleIDs: Set<String>) {
+        pendingOtherAppsRefreshTask?.cancel()
+        pendingOtherAppsRefreshTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+
+            do {
+                try await Task.sleep(nanoseconds: otherAppsRefreshDelayNs)
+            } catch {
+                return
+            }
+
+            guard !Task.isCancelled else { return }
+            guard searchQuery.isEmpty, !isSearching, !hasSubmittedSearch else {
+                Log.info(
+                    "[SearchViewModel] Skipping deferred other apps refresh because search became active",
+                    category: .ui
+                )
+                pendingOtherAppsRefreshTask = nil
+                return
+            }
+
+            Log.info("[SearchViewModel] Starting deferred other apps refresh", category: .ui)
+            await refreshOtherAppsFromDB(installedBundleIDs: installedBundleIDs)
+            pendingOtherAppsRefreshTask = nil
+        }
     }
 
     // MARK: - Other Apps Cache
@@ -1785,7 +1831,9 @@ public class SearchViewModel: ObservableObject {
 
         do {
             let bundleIDs = try await coordinator.getDistinctAppBundleIDs()
+            guard !Task.isCancelled else { return }
             let dbApps = AppNameResolver.shared.resolveAll(bundleIDs: bundleIDs)
+            guard !Task.isCancelled else { return }
 
             // Filter to only apps that aren't currently installed
             let uninstalledApps = dbApps
@@ -1801,7 +1849,11 @@ public class SearchViewModel: ObservableObject {
             // This way if an app gets uninstalled later, it will appear in "Other Apps"
             saveOtherAppsToCache(dbApps)
 
-            Log.info("[SearchViewModel] Refreshed \(uninstalledApps.count) other apps from DB in \(Int((CFAbsoluteTimeGetCurrent() - startTime) * 1000))ms", category: .ui)
+            let elapsedMs = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
+            Log.info(
+                "[SearchViewModel] Refreshed \(uninstalledApps.count) other apps from DB in \(Int(elapsedMs))ms",
+                category: .ui
+            )
         } catch {
             Log.error("[SearchViewModel] Failed to refresh other apps from DB: \(error)", category: .ui)
         }
@@ -1865,6 +1917,10 @@ public class SearchViewModel: ObservableObject {
         } else {
             setDateRanges([DateRangeCriterion(start: start, end: end)])
         }
+    }
+
+    public func recordKeyboardShortcut(_ shortcut: String) {
+        DashboardViewModel.recordKeyboardShortcut(coordinator: coordinator, shortcut: shortcut)
     }
 
     public func setContentType(_ type: ContentType) {
@@ -2019,26 +2075,88 @@ public class SearchViewModel: ObservableObject {
 
     // MARK: - Navigation
 
-    public func nextResult() {
-        guard let results = results,
-              let current = selectedResult,
-              let index = results.results.firstIndex(where: { $0.frameID == current.frameID }),
-              index + 1 < results.results.count else {
-            return
+    var selectedResultNavigationState: ResultNavigationState? {
+        guard let loadedResults = results?.results,
+              let currentIndex = selectedResultIndex(in: loadedResults) else {
+            return nil
         }
 
-        selectResult(results.results[index + 1])
+        return ResultNavigationState(
+            currentIndex: currentIndex,
+            loadedCount: loadedResults.count,
+            canNavigatePrevious: currentIndex > 0,
+            canNavigateNext: currentIndex + 1 < loadedResults.count,
+            canLoadMore: canLoadMore,
+            isLoadingMore: isLoadingMore
+        )
     }
 
-    public func previousResult() {
-        guard let results = results,
-              let current = selectedResult,
-              let index = results.results.firstIndex(where: { $0.frameID == current.frameID }),
-              index > 0 else {
-            return
+    @discardableResult
+    public func nextResult() -> SearchResult? {
+        selectAdjacentResult(offset: 1)
+    }
+
+    @discardableResult
+    public func previousResult() -> SearchResult? {
+        selectAdjacentResult(offset: -1)
+    }
+
+    @discardableResult
+    func selectAdjacentResult(offset: Int) -> SearchResult? {
+        guard offset != 0,
+              let loadedResults = results?.results,
+              let currentIndex = selectedResultIndex(in: loadedResults) else {
+            return nil
         }
 
-        selectResult(results.results[index - 1])
+        prefetchMoreResultsIfNeeded(selectedIndex: currentIndex)
+
+        let targetIndex = currentIndex + offset
+        guard loadedResults.indices.contains(targetIndex) else {
+            return nil
+        }
+
+        let targetResult = loadedResults[targetIndex]
+        selectResult(targetResult)
+        return targetResult
+    }
+
+    private func selectedResultIndex(in loadedResults: [SearchResult]?, selectedResult: SearchResult? = nil) -> Int? {
+        guard let loadedResults else { return nil }
+        let targetResult = selectedResult ?? self.selectedResult
+        guard let targetResult else { return nil }
+        return loadedResults.firstIndex(where: { $0.id == targetResult.id })
+    }
+
+    private func updateSavedScrollPosition(for result: SearchResult) {
+        guard let selectedIndex = selectedResultIndex(in: results?.results, selectedResult: result) else {
+            return
+        }
+        savedScrollPosition = CGFloat(selectedIndex)
+    }
+
+    private func prefetchMoreResultsIfNeeded(selectedIndex: Int, threshold: Int = 1) {
+        guard let loadedResults = results?.results,
+              shouldPrefetchMoreResults(
+                  selectedIndex: selectedIndex,
+                  loadedCount: loadedResults.count,
+                  canLoadMore: canLoadMore,
+                  threshold: threshold
+              ) else {
+            return
+        }
+        loadMore()
+    }
+
+    private func shouldPrefetchMoreResults(
+        selectedIndex: Int,
+        loadedCount: Int,
+        canLoadMore: Bool,
+        threshold: Int
+    ) -> Bool {
+        guard loadedCount > 0, canLoadMore else { return false }
+        let prefetchBoundaryIndex = max(0, loadedCount - 1 - threshold)
+        return selectedIndex >= prefetchBoundaryIndex
     }
 
     // MARK: - Sharing
@@ -2087,6 +2205,28 @@ public class SearchViewModel: ObservableObject {
         Self.shouldDismissExpandedOverlayOnEscape(
             committedSearchQuery: committedSearchQuery,
             hasSearchResultsPayload: results != nil
+        )
+    }
+
+    public static func shouldRefocusSearchFieldOnEscape(
+        committedSearchQuery: String,
+        hasSearchResultsPayload: Bool,
+        isSearchFieldFocused: Bool
+    ) -> Bool {
+        guard shouldDismissExpandedOverlayOnEscape(
+            committedSearchQuery: committedSearchQuery,
+            hasSearchResultsPayload: hasSearchResultsPayload
+        ) else {
+            return false
+        }
+        return !isSearchFieldFocused
+    }
+
+    public var shouldRefocusSearchFieldOnEscape: Bool {
+        Self.shouldRefocusSearchFieldOnEscape(
+            committedSearchQuery: committedSearchQuery,
+            hasSearchResultsPayload: results != nil,
+            isSearchFieldFocused: isSearchFieldFocused
         )
     }
 
@@ -2435,6 +2575,8 @@ public class SearchViewModel: ObservableObject {
         currentSearchTask = nil
         currentLoadMoreTask?.cancel()
         currentLoadMoreTask = nil
+        pendingOtherAppsRefreshTask?.cancel()
+        pendingOtherAppsRefreshTask = nil
         isSearching = false
         isLoadingMore = false
     }
@@ -2443,6 +2585,7 @@ public class SearchViewModel: ObservableObject {
         // Cancel tasks directly - deinit is not actor-isolated so we can't call cancelSearch()
         currentSearchTask?.cancel()
         currentLoadMoreTask?.cancel()
+        pendingOtherAppsRefreshTask?.cancel()
         memoryReportTask?.cancel()
         cancellables.removeAll()
 

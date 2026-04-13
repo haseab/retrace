@@ -3,21 +3,19 @@ import Foundation
 import CoreGraphics
 import Shared
 import Database
-import Storage
 @testable import Processing
 
-private actor NoopSearch: SearchProtocol {
+private actor InPageURLNoopSearch: SearchProtocol {
     func initialize(config: SearchConfig) async throws {}
 
     func search(query: SearchQuery) async throws -> SearchResults {
-        SearchResults(query: query, results: [], totalCount: 0, searchTimeMs: 0)
+        SearchResults(query: query, results: [], searchTimeMs: 0)
     }
 
     func search(text: String, limit: Int) async throws -> SearchResults {
         SearchResults(
             query: SearchQuery(text: text, limit: limit),
             results: [],
-            totalCount: 0,
             searchTimeMs: 0
         )
     }
@@ -39,22 +37,157 @@ private actor NoopSearch: SearchProtocol {
     }
 }
 
+private actor InPageURLNoopProcessing: ProcessingProtocol {
+    private var config = ProcessingConfig.default
+
+    func initialize(config: ProcessingConfig) async throws {
+        self.config = config
+    }
+
+    func extractText(from frame: CapturedFrame) async throws -> ExtractedText {
+        ExtractedText(frameID: FrameID(value: 0), timestamp: Date(), regions: [])
+    }
+
+    func extractTextViaOCR(from frame: CapturedFrame) async throws -> [TextRegion] {
+        []
+    }
+
+    func extractTextViaAccessibility() async throws -> [TextRegion] {
+        []
+    }
+
+    func updateConfig(_ config: ProcessingConfig) async {
+        self.config = config
+    }
+
+    func getConfig() async -> ProcessingConfig {
+        config
+    }
+}
+
+private actor InPageURLStubSegmentWriter: SegmentWriter {
+    let segmentID = VideoSegmentID(value: 0)
+    let frameCount = 0
+    let startTime = Date(timeIntervalSince1970: 0)
+    let relativePath = "segments/test"
+    let frameWidth = 0
+    let frameHeight = 0
+    let currentFileSize: Int64 = 0
+    let hasFragmentWritten = false
+    let framesFlushedToDisk = 0
+
+    func appendFrame(_ frame: CapturedFrame) async throws {}
+
+    func finalize() async throws -> VideoSegment {
+        VideoSegment(
+            id: segmentID,
+            startTime: startTime,
+            endTime: startTime,
+            frameCount: frameCount,
+            fileSizeBytes: currentFileSize,
+            relativePath: relativePath,
+            width: frameWidth,
+            height: frameHeight
+        )
+    }
+
+    func cancel() async throws {}
+}
+
+private actor InPageURLRewriteTrackingStorage: StorageProtocol {
+    private var rewriteAttemptCount = 0
+
+    func initialize(config: StorageConfig) async throws {}
+
+    func createSegmentWriter() async throws -> SegmentWriter {
+        InPageURLStubSegmentWriter()
+    }
+
+    func readFrame(segmentID: VideoSegmentID, frameIndex: Int) async throws -> Data {
+        Data()
+    }
+
+    func getSegmentPath(id: VideoSegmentID) async throws -> URL {
+        FileManager.default.temporaryDirectory.appendingPathComponent(id.stringValue)
+    }
+
+    func deleteSegment(id: VideoSegmentID) async throws {}
+
+    func segmentExists(id: VideoSegmentID) async throws -> Bool {
+        true
+    }
+
+    func countFramesInSegment(id: VideoSegmentID) async throws -> Int {
+        0
+    }
+
+    func readFrameFromWAL(
+        segmentID: VideoSegmentID,
+        frameID: Int64,
+        fallbackFrameIndex: Int
+    ) async throws -> CapturedFrame? {
+        nil
+    }
+
+    func applySegmentRewrite(
+        segmentID: VideoSegmentID,
+        plan: SegmentRewritePlan,
+        secret: String?
+    ) async throws {
+        rewriteAttemptCount += 1
+    }
+
+    func recoverInterruptedSegmentRewrites() async throws -> [SegmentRewriteRecoveryAction] {
+        []
+    }
+
+    func finishInterruptedSegmentRewriteRecovery(segmentID: VideoSegmentID) async throws {}
+
+    func isVideoValid(id: VideoSegmentID) async throws -> Bool {
+        true
+    }
+
+    func getTotalStorageUsed(includeRewind: Bool) async throws -> Int64 {
+        0
+    }
+
+    func getStorageUsedForDateRange(from startDate: Date, to endDate: Date) async throws -> Int64 {
+        0
+    }
+
+    func getAvailableDiskSpace() async throws -> Int64 {
+        0
+    }
+
+    func cleanupOldSegments(olderThan date: Date) async throws -> [VideoSegmentID] {
+        []
+    }
+
+    func getStorageDirectory() -> URL {
+        FileManager.default.temporaryDirectory
+    }
+
+    func rewriteAttempts() -> Int {
+        rewriteAttemptCount
+    }
+}
+
 final class InPageURLMetadataResolutionTests: XCTestCase {
     private var database: DatabaseManager!
     private var queue: FrameProcessingQueue!
+    private var storage: InPageURLRewriteTrackingStorage!
 
     override func setUp() async throws {
         let uniqueDBPath = "file:memdb_processing_\(UUID().uuidString)?mode=memory&cache=private"
         database = DatabaseManager(databasePath: uniqueDBPath)
         try await database.initialize()
 
-        let storageRoot = FileManager.default.temporaryDirectory
-            .appendingPathComponent("RetraceProcessingQueueTests_\(UUID().uuidString)", isDirectory: true)
+        storage = InPageURLRewriteTrackingStorage()
         queue = FrameProcessingQueue(
             database: database,
-            storage: StorageManager(storageRoot: storageRoot),
-            processing: ProcessingManager(),
-            search: NoopSearch()
+            storage: storage,
+            processing: InPageURLNoopProcessing(),
+            search: InPageURLNoopSearch()
         )
     }
 
@@ -62,6 +195,7 @@ final class InPageURLMetadataResolutionTests: XCTestCase {
         try await database.close()
         database = nil
         queue = nil
+        storage = nil
     }
 
     func testResolveInPageURLMetadataSucceedsWhenRetriedAfterNodesArrive() async throws {
@@ -225,8 +359,8 @@ final class InPageURLMetadataResolutionTests: XCTestCase {
         XCTAssertNil(clearedMetadata)
     }
 
-    func testProcessPendingRedactionsDefersUntilVideoOCRQuiesces() async throws {
-        let fixture = try await insertFrameFixture()
+    func testProcessPendingRewritesDefersUntilVideoOCRQuiescesEvenAfterFinalization() async throws {
+        let fixture = try await insertFrameFixture(finalizeVideo: true)
         let pendingFrameID = try await insertFrame(
             videoID: fixture.videoID,
             segmentID: fixture.segmentID,
@@ -244,22 +378,45 @@ final class InPageURLMetadataResolutionTests: XCTestCase {
 
         try await database.updateFrameProcessingStatus(
             frameID: fixture.frameID.value,
-            status: 5,
+            status: FrameProcessingStatus.rewritePending.rawValue,
             rewritePurpose: "redaction"
         )
-        try await database.updateFrameProcessingStatus(frameID: pendingFrameID.value, status: 1)
+        try await database.updateFrameProcessingStatus(
+            frameID: pendingFrameID.value,
+            status: FrameProcessingStatus.processing.rawValue
+        )
 
-        try await queue.processPendingRedactions(for: fixture.videoID.value)
+        let outcome = try await queue.processPendingRewrites(for: fixture.videoID.value)
 
         let statuses = try await database.getFrameProcessingStatuses(
             frameIDs: [fixture.frameID.value, pendingFrameID.value]
         )
-        XCTAssertEqual(statuses[fixture.frameID.value], 5)
-        XCTAssertEqual(statuses[pendingFrameID.value], 1)
+        let rewriteAttempts = await storage.rewriteAttempts()
+        XCTAssertEqual(outcome, .deferred(.pendingOCR))
+        XCTAssertEqual(statuses[fixture.frameID.value], FrameProcessingStatus.rewritePending.rawValue)
+        XCTAssertEqual(statuses[pendingFrameID.value], FrameProcessingStatus.processing.rawValue)
+        XCTAssertEqual(rewriteAttempts, 0)
     }
 
-    func testProcessPendingRedactionsDefersWhileTimelineIsVisible() async throws {
+    func testProcessPendingRewritesDefersMixedDeletionAndRedactionUntilVideoOCRQuiesces() async throws {
         let fixture = try await insertFrameFixture()
+        let deletionFrameID = try await insertFrame(
+            videoID: fixture.videoID,
+            segmentID: fixture.segmentID,
+            timestamp: fixture.timestamp.addingTimeInterval(1),
+            frameIndex: 1
+        )
+        let pendingFrameID = try await insertFrame(
+            videoID: fixture.videoID,
+            segmentID: fixture.segmentID,
+            timestamp: fixture.timestamp.addingTimeInterval(2),
+            frameIndex: 2
+        )
+        try await database.markVideoFinalized(
+            id: fixture.videoID.value,
+            frameCount: 3,
+            fileSize: 1_024
+        )
 
         try await insertIndexedNode(
             frameID: fixture.frameID,
@@ -271,73 +428,88 @@ final class InPageURLMetadataResolutionTests: XCTestCase {
 
         try await database.updateFrameProcessingStatus(
             frameID: fixture.frameID.value,
-            status: 5,
+            status: FrameProcessingStatus.rewritePending.rawValue,
             rewritePurpose: "redaction"
+        )
+        try await database.updateFrameProcessingStatus(
+            frameID: deletionFrameID.value,
+            status: FrameProcessingStatus.rewritePending.rawValue,
+            rewritePurpose: "deletion"
+        )
+        try await database.updateFrameProcessingStatus(
+            frameID: pendingFrameID.value,
+            status: FrameProcessingStatus.processing.rawValue
+        )
+
+        let outcome = try await queue.processPendingRewrites(for: fixture.videoID.value)
+
+        let statuses = try await database.getFrameProcessingStatuses(
+            frameIDs: [fixture.frameID.value, deletionFrameID.value, pendingFrameID.value]
+        )
+        let rewriteAttempts = await storage.rewriteAttempts()
+        XCTAssertEqual(outcome, .deferred(.pendingOCR))
+        XCTAssertEqual(statuses[fixture.frameID.value], FrameProcessingStatus.rewritePending.rawValue)
+        XCTAssertEqual(statuses[deletionFrameID.value], FrameProcessingStatus.rewritePending.rawValue)
+        XCTAssertEqual(statuses[pendingFrameID.value], FrameProcessingStatus.processing.rawValue)
+        XCTAssertEqual(rewriteAttempts, 0)
+    }
+
+    func testProcessPendingRewritesDefersWhileTimelineIsVisible() async throws {
+        let fixture = try await insertFrameFixture(finalizeVideo: true)
+        try await database.updateFrameProcessingStatus(
+            frameID: fixture.frameID.value,
+            status: FrameProcessingStatus.rewritePending.rawValue,
+            rewritePurpose: "deletion"
         )
 
         await queue.setTimelineVisibleForRewriteScheduling(true)
-        try await queue.processPendingRedactions(for: fixture.videoID.value)
+        let outcome = try await queue.processPendingRewrites(for: fixture.videoID.value)
 
         let statuses = try await database.getFrameProcessingStatuses(frameIDs: [fixture.frameID.value])
-        XCTAssertEqual(statuses[fixture.frameID.value], 5)
+        let rewriteAttempts = await storage.rewriteAttempts()
+        XCTAssertEqual(outcome, .deferred(.timelineInteraction))
+        XCTAssertEqual(statuses[fixture.frameID.value], FrameProcessingStatus.rewritePending.rawValue)
+        XCTAssertEqual(rewriteAttempts, 0)
     }
 
-    func testProcessPendingRedactionsResumeAfterTimelineScrubbingEnds() async throws {
-        let fixture = try await insertFrameFixture()
-
-        try await insertIndexedNode(
-            frameID: fixture.frameID,
-            segmentID: fixture.segmentID,
-            text: "secret phrase",
-            bounds: CGRect(x: 100, y: 200, width: 300, height: 50),
-            redactedNodeOrders: [0]
-        )
-
+    func testProcessPendingRewritesResumeAfterTimelineScrubbingEnds() async throws {
+        let fixture = try await insertFrameFixture(finalizeVideo: true)
         try await database.updateFrameProcessingStatus(
             frameID: fixture.frameID.value,
-            status: 5,
-            rewritePurpose: "redaction"
+            status: FrameProcessingStatus.rewritePending.rawValue,
+            rewritePurpose: "deletion"
         )
 
         await queue.setTimelineScrubbingForRewriteScheduling(true)
-        try await queue.processPendingRedactions(for: fixture.videoID.value)
-
-        let deferredStatuses = try await database.getFrameProcessingStatuses(frameIDs: [fixture.frameID.value])
-        XCTAssertEqual(deferredStatuses[fixture.frameID.value], 5)
+        let deferredOutcome = try await queue.processPendingRewrites(for: fixture.videoID.value)
+        XCTAssertEqual(deferredOutcome, .deferred(.timelineInteraction))
 
         await queue.setTimelineScrubbingForRewriteScheduling(false)
+        try await waitForRewriteAttemptCount(1)
 
-        let resumedStatus = try await waitForProcessingStatus(
-            frameID: fixture.frameID.value,
-            expected: 8
-        )
-        XCTAssertEqual(resumedStatus, 8)
+        let frame = try await database.getFrame(id: fixture.frameID)
+        XCTAssertNil(frame)
     }
 
-    func testProcessPendingRedactionsMarksRewriteFailedWhenRewriteThrows() async throws {
-        let fixture = try await insertFrameFixture()
+    private func waitForRewriteAttemptCount(
+        _ expectedCount: Int,
+        timeoutNs: UInt64 = 2_000_000_000
+    ) async throws {
+        let start = ContinuousClock.now
 
-        try await insertIndexedNode(
-            frameID: fixture.frameID,
-            segmentID: fixture.segmentID,
-            text: "secret phrase",
-            bounds: CGRect(x: 100, y: 200, width: 300, height: 50),
-            redactedNodeOrders: [0]
-        )
+        while ContinuousClock.now - start < .nanoseconds(Int64(timeoutNs)) {
+            if await storage.rewriteAttempts() == expectedCount {
+                return
+            }
+            try await Task.sleep(for: .milliseconds(25), clock: .continuous)
+        }
 
-        try await database.updateFrameProcessingStatus(
-            frameID: fixture.frameID.value,
-            status: 5,
-            rewritePurpose: "redaction"
-        )
-
-        try? await queue.processPendingRedactions(for: fixture.videoID.value)
-
-        let statuses = try await database.getFrameProcessingStatuses(frameIDs: [fixture.frameID.value])
-        XCTAssertEqual(statuses[fixture.frameID.value], 8)
+        let rewriteAttempts = await storage.rewriteAttempts()
+        XCTAssertEqual(rewriteAttempts, expectedCount)
     }
 
     private func insertFrameFixture(
+        finalizeVideo: Bool = false,
         frameWidth: Int = 1_000,
         frameHeight: Int = 1_000
     ) async throws -> (frameID: FrameID, segmentID: Int64, videoID: VideoSegmentID, timestamp: Date) {
@@ -356,6 +528,14 @@ final class InPageURLMetadataResolutionTests: XCTestCase {
             )
         )
 
+        if finalizeVideo {
+            try await database.markVideoFinalized(
+                id: insertedVideoID,
+                frameCount: 1,
+                fileSize: 1_024
+            )
+        }
+
         let segmentID = try await database.insertSegment(
             bundleID: "com.apple.Safari",
             startDate: timestamp,
@@ -372,7 +552,6 @@ final class InPageURLMetadataResolutionTests: XCTestCase {
                 segmentID: AppSegmentID(value: segmentID),
                 videoID: VideoSegmentID(value: insertedVideoID),
                 frameIndexInSegment: 0,
-                encodingStatus: .success,
                 metadata: FrameMetadata(
                     appBundleID: "com.apple.Safari",
                     appName: "Safari",
@@ -404,7 +583,6 @@ final class InPageURLMetadataResolutionTests: XCTestCase {
                 segmentID: AppSegmentID(value: segmentID),
                 videoID: videoID,
                 frameIndexInSegment: frameIndex,
-                encodingStatus: .success,
                 metadata: FrameMetadata(
                     appBundleID: "com.apple.Safari",
                     appName: "Safari",
@@ -469,25 +647,6 @@ final class InPageURLMetadataResolutionTests: XCTestCase {
         }
     }
 
-    private func waitForProcessingStatus(
-        frameID: Int64,
-        expected: Int,
-        timeoutNs: UInt64 = 2_000_000_000
-    ) async throws -> Int? {
-        let start = ContinuousClock.now
-
-        while ContinuousClock.now - start < .nanoseconds(Int64(timeoutNs)) {
-            let statuses = try await database.getFrameProcessingStatuses(frameIDs: [frameID])
-            if statuses[frameID] == expected {
-                return expected
-            }
-            try await Task.sleep(for: .milliseconds(50), clock: .continuous)
-        }
-
-        let statuses = try await database.getFrameProcessingStatuses(frameIDs: [frameID])
-        return statuses[frameID]
-    }
-
     private func makeRawLinkMetadataJSON(
         pageURL: String,
         linkURL: String,
@@ -536,74 +695,5 @@ final class InPageURLMetadataResolutionTests: XCTestCase {
 
         let data = try JSONSerialization.data(withJSONObject: payload, options: [])
         return String(decoding: data, as: UTF8.self)
-    }
-}
-
-final class OCRMemoryBackpressurePolicyTests: XCTestCase {
-    func testHysteresisPausesAndResumesAtDifferentThresholds() {
-        let policy = OCRMemoryBackpressurePolicy(
-            enabled: true,
-            pauseThresholdBytes: 100,
-            resumeThresholdBytes: 60,
-            pollIntervalNs: 1_000_000_000
-        )
-
-        XCTAssertFalse(policy.shouldPause(footprintBytes: 99, currentlyPaused: false))
-        XCTAssertTrue(policy.shouldPause(footprintBytes: 100, currentlyPaused: false))
-        XCTAssertTrue(policy.shouldPause(footprintBytes: 80, currentlyPaused: true))
-        XCTAssertFalse(policy.shouldPause(footprintBytes: 59, currentlyPaused: true))
-    }
-
-    func testDefaultsUseBaseThresholdsForReferenceDisplaySize() {
-        let suiteName = "OCRMemoryBackpressurePolicyTests.reference.\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suiteName)!
-
-        let policy = OCRMemoryBackpressurePolicy.current(
-            defaults: defaults,
-            largestDisplayPixelCount: OCRMemoryBackpressurePolicy.referenceDisplayPixelCount
-        )
-
-        XCTAssertTrue(policy.enabled)
-        XCTAssertEqual(policy.pauseThresholdBytes, OCRMemoryBackpressurePolicy.defaultPauseThresholdBytes)
-        XCTAssertEqual(policy.resumeThresholdBytes, OCRMemoryBackpressurePolicy.defaultResumeThresholdBytes)
-        XCTAssertEqual(policy.pollIntervalNs, 1_000_000_000)
-
-        defaults.removePersistentDomain(forName: suiteName)
-    }
-
-    func testDefaultsScaleUpForUltraWideDisplays() {
-        let suiteName = "OCRMemoryBackpressurePolicyTests.ultrawide.\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suiteName)!
-
-        let policy = OCRMemoryBackpressurePolicy.current(
-            defaults: defaults,
-            largestDisplayPixelCount: 5_120 * 1_440
-        )
-
-        XCTAssertEqual(policy.pauseThresholdBytes, 2_172 * 1024 * 1024)
-        XCTAssertEqual(policy.resumeThresholdBytes, 2_028 * 1024 * 1024)
-
-        defaults.removePersistentDomain(forName: suiteName)
-    }
-
-    func testDefaultsClampResumeBelowPauseThreshold() {
-        let suiteName = "OCRMemoryBackpressurePolicyTests.\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suiteName)!
-        defaults.set(900, forKey: OCRMemoryBackpressurePolicy.pauseThresholdDefaultsKey)
-        defaults.set(950, forKey: OCRMemoryBackpressurePolicy.resumeThresholdDefaultsKey)
-        defaults.set(false, forKey: OCRMemoryBackpressurePolicy.enabledDefaultsKey)
-        defaults.set(250, forKey: OCRMemoryBackpressurePolicy.pollIntervalDefaultsKey)
-
-        let policy = OCRMemoryBackpressurePolicy.current(
-            defaults: defaults,
-            largestDisplayPixelCount: 5_120 * 1_440
-        )
-
-        XCTAssertFalse(policy.enabled)
-        XCTAssertEqual(policy.pauseThresholdBytes, 900 * 1024 * 1024)
-        XCTAssertEqual(policy.resumeThresholdBytes, 899 * 1024 * 1024)
-        XCTAssertEqual(policy.pollIntervalNs, 250 * 1_000_000)
-
-        defaults.removePersistentDomain(forName: suiteName)
     }
 }

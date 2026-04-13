@@ -7,6 +7,82 @@ import Database
 import ApplicationServices
 import Dispatch
 
+struct DashboardAppUsageRangeCacheKey: Hashable {
+    let start: Date
+    let end: Date
+
+    init(start: Date, end: Date, calendar: Calendar = .current) {
+        self.start = calendar.startOfDay(for: start)
+        self.end = calendar.startOfDay(for: end)
+    }
+}
+
+struct DashboardAppUsageRangeSnapshot {
+    let weeklyAppUsage: [AppUsageData]
+    let totalWeeklyTime: TimeInterval
+    let totalDailyTime: TimeInterval
+    let weeklyStorageBytes: Int64
+    let dailyScreenTimeData: [DailyDataPoint]
+    let dailyStorageData: [DailyDataPoint]
+    let dailyTimelineOpensData: [DailyDataPoint]
+    let dailySearchesData: [DailyDataPoint]
+    let dailyTextCopiesData: [DailyDataPoint]
+    let timelineOpensThisWeek: Int64
+    let searchesThisWeek: Int64
+    let textCopiesThisWeek: Int64
+}
+
+private struct DashboardAppUsageBreakdownSnapshot {
+    let weeklyAppUsage: [AppUsageData]
+    let totalWeeklyTime: TimeInterval
+}
+
+private struct DashboardAppUsageGraphSnapshot {
+    let dailyScreenTimeData: [DailyDataPoint]
+    let dailyStorageData: [DailyDataPoint]
+    let dailyTimelineOpensData: [DailyDataPoint]
+    let dailySearchesData: [DailyDataPoint]
+    let dailyTextCopiesData: [DailyDataPoint]
+    let timelineOpensThisWeek: Int64
+    let searchesThisWeek: Int64
+    let textCopiesThisWeek: Int64
+    let weeklyStorageBytes: Int64
+}
+
+struct DashboardAppUsageRangeCache {
+    let capacity: Int
+    private(set) var snapshotsByKey: [DashboardAppUsageRangeCacheKey: DashboardAppUsageRangeSnapshot] = [:]
+    private var orderedKeys: [DashboardAppUsageRangeCacheKey] = []
+
+    init(capacity: Int = 100) {
+        self.capacity = max(1, capacity)
+    }
+
+    var count: Int {
+        snapshotsByKey.count
+    }
+
+    mutating func snapshot(for key: DashboardAppUsageRangeCacheKey) -> DashboardAppUsageRangeSnapshot? {
+        snapshotsByKey[key]
+    }
+
+    mutating func insert(_ snapshot: DashboardAppUsageRangeSnapshot, for key: DashboardAppUsageRangeCacheKey) {
+        snapshotsByKey[key] = snapshot
+        orderedKeys.removeAll { $0 == key }
+        orderedKeys.append(key)
+
+        while orderedKeys.count > capacity {
+            let evictedKey = orderedKeys.removeFirst()
+            snapshotsByKey.removeValue(forKey: evictedKey)
+        }
+    }
+
+    mutating func removeAll() {
+        snapshotsByKey.removeAll()
+        orderedKeys.removeAll()
+    }
+}
+
 enum DashboardCrashReportSource: String, Equatable {
     case watchdogAutoQuit = "watchdog_auto_quit"
     case macOSDiagnosticReport = "macos_diagnostic_report"
@@ -85,10 +161,12 @@ public class DashboardViewModel: ObservableObject {
     @Published public var appUsageRangeEnd: Date
     @Published public var appUsageRangeLabel: String = ""
     @Published public var appUsageRangeErrorText: String?
+    @Published public var isDefaultAppUsageRangeSelected: Bool = true
 
     // Overall statistics
     @Published public var totalStorageBytes: Int64 = 0
     @Published public var weeklyStorageBytes: Int64 = 0
+    @Published public var totalCapturedDuration: TimeInterval = 0
     @Published public var daysRecorded: Int = 0
     @Published public var oldestRecordedDate: Date?
 
@@ -120,6 +198,7 @@ public class DashboardViewModel: ObservableObject {
     @Published var storageHealthBanner: StorageHealthBannerState?
     @Published var recentCrashReport: DashboardCrashReportSummary?
     @Published var recentWALFailureCrash: WALFailureCrashReportSummary?
+    @Published var unexpectedRecordingStop: UnexpectedRecordingStopState?
 
     // Track user dismissals — re-nag after 30 minutes
     private var accessibilityDismissedUntil: Date?
@@ -154,16 +233,12 @@ public class DashboardViewModel: ObservableObject {
     private var lastTrackedCrashBannerIdentifier: String?
     private var lastTrackedWALFailureBannerFileName: String?
     private var lastTrackedStorageHealthBannerSignature: String?
+    private var lastTrackedUnexpectedRecordingStopSignature: String?
     private var isAutoRefreshInFlight = false
-    private var dashboardLoadTraceID: UInt64 = 0
     private static let defaultAppUsageRangeDays = 7
     public nonisolated static let maxAppUsageRangeDays = 31
-    private static let dashboardPerfDateFormatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyy-MM-dd"
-        return formatter
-    }()
+    private var appUsageRangeCache = DashboardAppUsageRangeCache()
+    private var statisticsLoadGeneration: UInt64 = 0
 
     /// Whether the dashboard window is currently visible
     /// Set by DashboardWindowController on show/hide to gate UI updates
@@ -181,6 +256,7 @@ public class DashboardViewModel: ObservableObject {
         setupAutoRefresh()
         setupDataSourceObserver()
         setupStorageHealthObserver()
+        setupUnexpectedRecordingStopObserver()
         // Check permissions immediately on init
         checkPermissions()
     }
@@ -214,6 +290,21 @@ public class DashboardViewModel: ObservableObject {
             .sink { [weak self] notification in
                 Task { @MainActor [weak self] in
                     self?.handleStorageHealthNotification(notification, severity: .critical)
+                }
+            }
+            .store(in: &cancellables)
+    }
+
+    private func setupUnexpectedRecordingStopObserver() {
+        NotificationCenter.default.publisher(for: RecordingUnexpectedStopNotification.didStop)
+            .sink { [weak self] notification in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    if let state = notification.object as? UnexpectedRecordingStopState {
+                        self.presentUnexpectedRecordingStop(state)
+                    } else {
+                        await self.refreshUnexpectedRecordingStopState()
+                    }
                 }
             }
             .store(in: &cancellables)
@@ -421,6 +512,20 @@ public class DashboardViewModel: ObservableObject {
         recordWALFailureBannerAction("details_opened", report: report)
     }
 
+    public func dismissUnexpectedRecordingStop() {
+        guard let state = unexpectedRecordingStop else { return }
+        recordUnexpectedRecordingStopAction("dismissed", state: state)
+        unexpectedRecordingStop = nil
+        Task {
+            await coordinator.clearUnexpectedRecordingStopState()
+        }
+    }
+
+    public func recordUnexpectedRecordingStopFeedbackOpened() {
+        guard let state = unexpectedRecordingStop else { return }
+        recordUnexpectedRecordingStopAction("submit_bug_report_clicked", state: state)
+    }
+
     private func handleStorageHealthNotification(
         _ notification: Notification,
         severity: StorageHealthBannerState.Severity
@@ -614,6 +719,32 @@ public class DashboardViewModel: ObservableObject {
         }
     }
 
+    nonisolated static func loadRecentDiagnosticCrashReportSummariesForFeedback(
+        fileManager: FileManager = .default,
+        diagnosticReportDirectories: [String] = DashboardViewModel.diagnosticCrashReportDirectories,
+        now: Date = Date(),
+        maxReports: Int = 5
+    ) -> [DashboardCrashReportSummary] {
+        let resourceKeys: Set<URLResourceKey> = [
+            .isRegularFileKey,
+            .contentModificationDateKey,
+            .creationDateKey
+        ]
+
+        return diagnosticReportDirectories
+            .flatMap { directory in
+                loadDiagnosticCrashReports(
+                    fileManager: fileManager,
+                    directoryURL: URL(fileURLWithPath: directory, isDirectory: true),
+                    resourceKeys: resourceKeys,
+                    now: now
+                )
+            }
+            .sorted { $0.capturedAt > $1.capturedAt }
+            .prefix(maxReports)
+            .map { $0 }
+    }
+
     nonisolated static func loadRecentWALFailureCrash(
         fileManager: FileManager = .default,
         crashReportDirectory: String = EmergencyDiagnostics.crashReportDirectory,
@@ -719,6 +850,39 @@ public class DashboardViewModel: ObservableObject {
         """
     }
 
+    nonisolated static func makeUnexpectedRecordingStopFeedbackDescription(
+        for state: UnexpectedRecordingStopState,
+        now _: Date = Date()
+    ) -> String {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+
+        return """
+        Retrace Recording Stopped Unexpectedly
+
+        Recording stopped at \(formatter.string(from: state.stoppedAt)).
+        Reason: \(state.reason.description)
+        Summary: \(state.summary)
+
+        Enter any other relevant context here:
+        """
+    }
+
+    private func presentUnexpectedRecordingStop(
+        _ state: UnexpectedRecordingStopState?,
+        now: Date = Date()
+    ) {
+        unexpectedRecordingStop = state
+
+        guard let state, state.signature != lastTrackedUnexpectedRecordingStopSignature else {
+            return
+        }
+
+        lastTrackedUnexpectedRecordingStopSignature = state.signature
+        recordUnexpectedRecordingStopAction("banner_shown", state: state, now: now)
+    }
+
     nonisolated private static func parseWatchdogCrashTimestamp(from fileName: String) -> Date? {
         let prefix = "retrace-emergency-watchdog_auto_quit-"
         let suffix = ".txt"
@@ -777,6 +941,11 @@ public class DashboardViewModel: ObservableObject {
 
         return acknowledgedIdentifiers.contains(report.acknowledgmentIdentifier)
             || acknowledgedIdentifiers.contains(report.fileName)
+    }
+
+    private func refreshUnexpectedRecordingStopState(now: Date = Date()) async {
+        let state = await coordinator.getUnexpectedRecordingStopState()
+        presentUnexpectedRecordingStop(state, now: now)
     }
 
     private func refreshRecentCrashReportState(now: Date = Date()) async {
@@ -982,16 +1151,15 @@ public class DashboardViewModel: ObservableObject {
         report: DashboardCrashReportSummary,
         now: Date = Date()
     ) {
-        let metadata = Self.jsonMetadata([
-            "action": action,
-            "fileName": report.fileName,
-            "source": report.source.rawValue,
-            "reportAgeSeconds": max(0, Int(now.timeIntervalSince(report.capturedAt)))
-        ])
-        Self.recordMetric(
+        UIMetricsRecorder.recordDictionary(
             coordinator: coordinator,
             type: .watchdogCrashBannerAction,
-            metadata: metadata
+            payload: [
+                "action": action,
+                "fileName": report.fileName,
+                "source": report.source.rawValue,
+                "reportAgeSeconds": max(0, Int(now.timeIntervalSince(report.capturedAt)))
+            ]
         )
     }
 
@@ -1000,15 +1168,32 @@ public class DashboardViewModel: ObservableObject {
         report: WALFailureCrashReportSummary,
         now: Date = Date()
     ) {
-        let metadata = Self.jsonMetadata([
-            "action": action,
-            "fileName": report.fileName,
-            "reportAgeSeconds": max(0, Int(now.timeIntervalSince(report.capturedAt)))
-        ])
-        Self.recordMetric(
+        UIMetricsRecorder.recordDictionary(
             coordinator: coordinator,
             type: .walFailureBannerAction,
-            metadata: metadata
+            payload: [
+                "action": action,
+                "fileName": report.fileName,
+                "reportAgeSeconds": max(0, Int(now.timeIntervalSince(report.capturedAt)))
+            ]
+        )
+    }
+
+    private func recordUnexpectedRecordingStopAction(
+        _ action: String,
+        state: UnexpectedRecordingStopState,
+        now: Date = Date()
+    ) {
+        UIMetricsRecorder.recordDictionary(
+            coordinator: coordinator,
+            type: .unexpectedRecordingStopAction,
+            payload: [
+                "action": action,
+                "reason": state.reason.rawValue,
+                "stopAgeSeconds": max(0, Int(now.timeIntervalSince(state.stoppedAt))),
+                "pendingUnreadableFrameCount": state.pendingUnreadableFrameCount,
+                "activeWriterCount": state.activeWriterCount
+            ]
         )
     }
 
@@ -1016,16 +1201,15 @@ public class DashboardViewModel: ObservableObject {
         _ action: String,
         state: StorageHealthBannerState
     ) {
-        let metadata = Self.jsonMetadata([
-            "action": action,
-            "severity": state.severity.rawValue,
-            "availableGB": state.availableGB,
-            "shouldStop": state.shouldStop
-        ])
-        Self.recordMetric(
+        UIMetricsRecorder.recordDictionary(
             coordinator: coordinator,
             type: .storageHealthBannerAction,
-            metadata: metadata
+            payload: [
+                "action": action,
+                "severity": state.severity.rawValue,
+                "availableGB": state.availableGB,
+                "shouldStop": state.shouldStop
+            ]
         )
     }
 
@@ -1093,6 +1277,17 @@ public class DashboardViewModel: ObservableObject {
         return (start: startDay, end: endDay)
     }
 
+    static func shouldCacheAppUsageRange(
+        start: Date,
+        end: Date,
+        calendar: Calendar = .current,
+        now: Date = Date()
+    ) -> Bool {
+        let today = calendar.startOfDay(for: now)
+        let endDay = calendar.startOfDay(for: end)
+        return endDay < today
+    }
+
     public var appUsageDateRange: DateRangeCriterion {
         let calendar = Calendar.current
         let start = calendar.startOfDay(for: appUsageRangeStart)
@@ -1107,13 +1302,6 @@ public class DashboardViewModel: ObservableObject {
         let endDay = calendar.startOfDay(for: appUsageRangeEnd)
         let rawSpan = (calendar.dateComponents([.day], from: startDay, to: endDay).day ?? 0) + 1
         return max(1, rawSpan)
-    }
-
-    public var isDefaultAppUsageRangeSelected: Bool {
-        let calendar = Calendar.current
-        let defaultRange = Self.defaultAppUsageDateRange(calendar: calendar, now: Date())
-        return calendar.isDate(appUsageRangeStart, inSameDayAs: defaultRange.start)
-            && calendar.isDate(appUsageRangeEnd, inSameDayAs: defaultRange.end)
     }
 
     public var canShiftAppUsageRangeBackward: Bool {
@@ -1166,6 +1354,7 @@ public class DashboardViewModel: ObservableObject {
             return
         }
 
+        isDefaultAppUsageRangeSelected = false
         await applyAppUsageDateRange(
             start: requestedRange.start,
             end: requestedRange.end,
@@ -1179,6 +1368,7 @@ public class DashboardViewModel: ObservableObject {
         source: String = "dashboard_app_usage_default"
     ) async {
         let defaultRange = Self.defaultAppUsageDateRange()
+        isDefaultAppUsageRangeSelected = true
         await applyAppUsageDateRange(
             start: defaultRange.start,
             end: defaultRange.end,
@@ -1201,6 +1391,7 @@ public class DashboardViewModel: ObservableObject {
             return
         }
 
+        isDefaultAppUsageRangeSelected = false
         await applyAppUsageDateRange(
             start: shiftedStart,
             end: shiftedEnd,
@@ -1222,7 +1413,7 @@ public class DashboardViewModel: ObservableObject {
         let calendar = Calendar.current
         let startChanged = !calendar.isDate(normalized.start, inSameDayAs: appUsageRangeStart)
         let endChanged = !calendar.isDate(normalized.end, inSameDayAs: appUsageRangeEnd)
-        let normalizedRangeLabel = dashboardPerfRangeLabel(start: normalized.start, end: normalized.end)
+        let normalizedRangeLabel = Self.formatAppUsageRangeLabel(start: normalized.start, end: normalized.end)
 
         appUsageRangeStart = normalized.start
         appUsageRangeEnd = normalized.end
@@ -1243,7 +1434,8 @@ public class DashboardViewModel: ObservableObject {
             )
         }
 
-        await loadStatistics(reason: "range_\(action):\(source)")
+        let loadReason = "range_\(action):\(source)"
+        await loadStatistics(reason: loadReason)
 
         let applyElapsedMs = elapsedMs(since: applyStartedAt)
         Log.recordLatency(
@@ -1291,14 +1483,6 @@ public class DashboardViewModel: ObservableObject {
         return "\(formatter.string(from: startDay)) - \(formatter.string(from: endDay))"
     }
 
-    private func dashboardPerfDayLabel(_ date: Date) -> String {
-        Self.dashboardPerfDateFormatter.string(from: Calendar.current.startOfDay(for: date))
-    }
-
-    private func dashboardPerfRangeLabel(start: Date, end: Date) -> String {
-        "\(dashboardPerfDayLabel(start))...\(dashboardPerfDayLabel(end))"
-    }
-
     private func elapsedMs(since start: CFAbsoluteTime) -> Double {
         (CFAbsoluteTimeGetCurrent() - start) * 1000
     }
@@ -1307,9 +1491,28 @@ public class DashboardViewModel: ObservableObject {
         String(format: "%.1f", valueMs)
     }
 
-    private func nextDashboardLoadTraceID(prefix: String = "load") -> String {
-        dashboardLoadTraceID &+= 1
-        return "\(prefix)-\(dashboardLoadTraceID)"
+    private func nextStatisticsLoadGeneration() -> UInt64 {
+        statisticsLoadGeneration &+= 1
+        return statisticsLoadGeneration
+    }
+
+    private func isLatestStatisticsLoad(_ generation: UInt64) -> Bool {
+        generation == statisticsLoadGeneration
+    }
+
+    private func applyAppUsageRangeSnapshot(_ snapshot: DashboardAppUsageRangeSnapshot) {
+        weeklyAppUsage = snapshot.weeklyAppUsage
+        totalWeeklyTime = snapshot.totalWeeklyTime
+        totalDailyTime = snapshot.totalDailyTime
+        weeklyStorageBytes = snapshot.weeklyStorageBytes
+        dailyScreenTimeData = snapshot.dailyScreenTimeData
+        dailyStorageData = snapshot.dailyStorageData
+        dailyTimelineOpensData = snapshot.dailyTimelineOpensData
+        dailySearchesData = snapshot.dailySearchesData
+        dailyTextCopiesData = snapshot.dailyTextCopiesData
+        timelineOpensThisWeek = snapshot.timelineOpensThisWeek
+        searchesThisWeek = snapshot.searchesThisWeek
+        textCopiesThisWeek = snapshot.textCopiesThisWeek
     }
 
     private func recordAppUsageDateRangeAction(
@@ -1319,65 +1522,93 @@ public class DashboardViewModel: ObservableObject {
         end: Date,
         rangeDays: Int? = nil
     ) {
-        let metadata = Self.jsonMetadata([
-            "action": action,
-            "source": source,
-            "startDate": Int64(start.timeIntervalSince1970 * 1000),
-            "endDate": Int64(end.timeIntervalSince1970 * 1000),
-            "rangeDays": rangeDays ?? appUsageRangeDaySpan
-        ])
-        Self.recordMetric(
+        UIMetricsRecorder.recordDictionary(
             coordinator: coordinator,
             type: .timelineFilterQuery,
-            metadata: metadata
+            payload: [
+                "action": action,
+                "source": source,
+                "startDate": Int64(start.timeIntervalSince1970 * 1000),
+                "endDate": Int64(end.timeIntervalSince1970 * 1000),
+                "rangeDays": rangeDays ?? appUsageRangeDaySpan
+            ]
         )
     }
 
-    private func loadAppUsageStatsForSelectedRange(traceID: String) async throws {
-        let stageStartedAt = CFAbsoluteTimeGetCurrent()
-        let queryRange = resolvedAppUsageQueryRange()
-        let queryRangeLabel = dashboardPerfRangeLabel(start: queryRange.start, end: queryRange.end)
+    private func fetchAppUsageBreakdown(
+        rangeStart: Date,
+        rangeEnd: Date
+    ) async throws -> DashboardAppUsageBreakdownSnapshot {
+        let appUsageStartedAt = CFAbsoluteTimeGetCurrent()
+        let appStats = try await coordinator.getAppUsageStats(from: rangeStart, to: rangeEnd)
 
-        do {
-            let appStats = try await coordinator.getAppUsageStats(from: queryRange.start, to: queryRange.end)
-
-            totalWeeklyTime = appStats.reduce(0) { $0 + $1.duration }
-            let appNamesByBundleID = await resolveAppNames(bundleIDs: appStats.map(\.bundleID))
-            weeklyAppUsage = appStats.map { stat in
-                AppUsageData(
-                    appBundleID: stat.bundleID,
-                    appName: appNamesByBundleID[stat.bundleID] ?? Self.fallbackAppName(for: stat.bundleID),
-                    duration: stat.duration,
-                    uniqueItemCount: stat.uniqueItemCount,
-                    percentage: totalWeeklyTime > 0 ? stat.duration / totalWeeklyTime : 0
-                )
-            }
-            .sorted { $0.duration > $1.duration }
-
-            let stageElapsedMs = elapsedMs(since: stageStartedAt)
-            Log.recordLatency(
-                "dashboard.query.app_usage_stats_ms",
-                valueMs: stageElapsedMs,
-                category: .ui,
-                summaryEvery: 10,
-                warningThresholdMs: 800,
-                criticalThresholdMs: 2500
+        let totalWeeklyTime = appStats.reduce(0) { $0 + $1.duration }
+        let appNamesByBundleID = await resolveAppNames(bundleIDs: appStats.map(\.bundleID))
+        let weeklyAppUsage = appStats.map { stat in
+            AppUsageData(
+                appBundleID: stat.bundleID,
+                appName: appNamesByBundleID[stat.bundleID] ?? Self.fallbackAppName(for: stat.bundleID),
+                duration: stat.duration,
+                uniqueItemCount: stat.uniqueItemCount,
+                percentage: totalWeeklyTime > 0 ? stat.duration / totalWeeklyTime : 0
             )
-            let stageMessage = "[DASHBOARD-LOAD][\(traceID)] APP_USAGE END apps=\(weeklyAppUsage.count) totalSeconds=\(Int(totalWeeklyTime)) elapsed=\(formattedMs(stageElapsedMs))ms"
-            if stageElapsedMs >= 2500 {
-                Log.warning(stageMessage, category: .ui)
-            }
-        } catch {
-            let stageElapsedMs = elapsedMs(since: stageStartedAt)
-            Log.error(
-                "[DASHBOARD-LOAD][\(traceID)] APP_USAGE FAIL range=\(queryRangeLabel) after \(formattedMs(stageElapsedMs))ms: \(error)",
-                category: .ui
-            )
-            throw error
         }
+        .sorted { $0.duration > $1.duration }
+
+        let appUsageElapsedMs = elapsedMs(since: appUsageStartedAt)
+        Log.recordLatency(
+            "dashboard.load.app_usage_stage_ms",
+            valueMs: appUsageElapsedMs,
+            category: .ui,
+            summaryEvery: 10,
+            warningThresholdMs: 800,
+            criticalThresholdMs: 2500
+        )
+
+        return DashboardAppUsageBreakdownSnapshot(
+            weeklyAppUsage: weeklyAppUsage,
+            totalWeeklyTime: totalWeeklyTime
+        )
     }
 
-    private func loadBackgroundMeta(traceID: String) async {
+    private func fetchAppUsageRangeSnapshot(
+        rangeStart: Date,
+        rangeEnd: Date
+    ) async throws -> DashboardAppUsageRangeSnapshot {
+        let dailyGraphStartedAt = CFAbsoluteTimeGetCurrent()
+        async let appUsageBreakdownTask = fetchAppUsageBreakdown(rangeStart: rangeStart, rangeEnd: rangeEnd)
+        async let dailyGraphSnapshotTask = fetchDailyGraphSnapshot(rangeStart: rangeStart, rangeEnd: rangeEnd)
+
+        let appUsageBreakdown = try await appUsageBreakdownTask
+        let dailyGraphSnapshot = await dailyGraphSnapshotTask
+
+        let dailyGraphElapsedMs = elapsedMs(since: dailyGraphStartedAt)
+        Log.recordLatency(
+            "dashboard.load.daily_graph_stage_ms",
+            valueMs: dailyGraphElapsedMs,
+            category: .ui,
+            summaryEvery: 10,
+            warningThresholdMs: 1200,
+            criticalThresholdMs: 5000
+        )
+
+        return DashboardAppUsageRangeSnapshot(
+            weeklyAppUsage: appUsageBreakdown.weeklyAppUsage,
+            totalWeeklyTime: appUsageBreakdown.totalWeeklyTime,
+            totalDailyTime: appUsageBreakdown.totalWeeklyTime,
+            weeklyStorageBytes: dailyGraphSnapshot.weeklyStorageBytes,
+            dailyScreenTimeData: dailyGraphSnapshot.dailyScreenTimeData,
+            dailyStorageData: dailyGraphSnapshot.dailyStorageData,
+            dailyTimelineOpensData: dailyGraphSnapshot.dailyTimelineOpensData,
+            dailySearchesData: dailyGraphSnapshot.dailySearchesData,
+            dailyTextCopiesData: dailyGraphSnapshot.dailyTextCopiesData,
+            timelineOpensThisWeek: dailyGraphSnapshot.timelineOpensThisWeek,
+            searchesThisWeek: dailyGraphSnapshot.searchesThisWeek,
+            textCopiesThisWeek: dailyGraphSnapshot.textCopiesThisWeek
+        )
+    }
+
+    private func loadBackgroundMeta() async {
         let backgroundStartedAt = CFAbsoluteTimeGetCurrent()
 
         let totalStorageStartedAt = CFAbsoluteTimeGetCurrent()
@@ -1392,12 +1623,20 @@ public class DashboardViewModel: ObservableObject {
                 criticalThresholdMs: 2000
             )
             totalStorageBytes = storage
-        } else {
-            let totalStorageElapsedMs = (CFAbsoluteTimeGetCurrent() - totalStorageStartedAt) * 1000
-            Log.warning(
-                "[DASHBOARD-LOAD][\(traceID)] BACKGROUND_META total_storage unavailable after \(String(format: "%.1f", totalStorageElapsedMs))ms",
-                category: .ui
+        }
+
+        let totalCapturedDurationStartedAt = CFAbsoluteTimeGetCurrent()
+        if let duration = try? await coordinator.getTotalCapturedDuration() {
+            let totalCapturedDurationElapsedMs = (CFAbsoluteTimeGetCurrent() - totalCapturedDurationStartedAt) * 1000
+            Log.recordLatency(
+                "dashboard.query.total_captured_duration_ms",
+                valueMs: totalCapturedDurationElapsedMs,
+                category: .ui,
+                summaryEvery: 10,
+                warningThresholdMs: 500,
+                criticalThresholdMs: 2000
             )
+            totalCapturedDuration = duration
         }
 
         let distinctDatesStartedAt = CFAbsoluteTimeGetCurrent()
@@ -1413,12 +1652,6 @@ public class DashboardViewModel: ObservableObject {
             )
             daysRecorded = allDates.count
             oldestRecordedDate = allDates.last // sorted descending, so last is oldest
-        } else {
-            let distinctDatesElapsedMs = (CFAbsoluteTimeGetCurrent() - distinctDatesStartedAt) * 1000
-            Log.warning(
-                "[DASHBOARD-LOAD][\(traceID)] BACKGROUND_META distinct_dates unavailable after \(String(format: "%.1f", distinctDatesElapsedMs))ms",
-                category: .ui
-            )
         }
 
         let backgroundElapsedMs = (CFAbsoluteTimeGetCurrent() - backgroundStartedAt) * 1000
@@ -1433,15 +1666,14 @@ public class DashboardViewModel: ObservableObject {
     }
 
     public func loadStatistics(reason: String = "dashboard_refresh") async {
-        let traceID = nextDashboardLoadTraceID()
         let loadStartedAt = CFAbsoluteTimeGetCurrent()
-        isLoading = true
+        let loadGeneration = nextStatisticsLoadGeneration()
         error = nil
-        defer { isLoading = false }
 
         // Update recording status
         updateRecordingStatus()
         updatePauseStatus()
+        await refreshUnexpectedRecordingStopState()
         await refreshRecentCrashReportState()
         await refreshRecentWALFailureCrashState()
 
@@ -1449,11 +1681,15 @@ public class DashboardViewModel: ObservableObject {
             let now = Date()
 
             // Keep selected app-usage range valid (day-boundary, <= today, <= max range).
-            let normalizedAppUsageRange = Self.normalizedAppUsageDateRange(
-                start: appUsageRangeStart,
-                end: appUsageRangeEnd,
-                now: now
-            )
+            let normalizedAppUsageRange = if isDefaultAppUsageRangeSelected {
+                Self.defaultAppUsageDateRange(calendar: Calendar.current, now: now)
+            } else {
+                Self.normalizedAppUsageDateRange(
+                    start: appUsageRangeStart,
+                    end: appUsageRangeEnd,
+                    now: now
+                )
+            }
             appUsageRangeStart = normalizedAppUsageRange.start
             appUsageRangeEnd = normalizedAppUsageRange.end
             appUsageRangeLabel = Self.formatAppUsageRangeLabel(
@@ -1461,60 +1697,45 @@ public class DashboardViewModel: ObservableObject {
                 end: normalizedAppUsageRange.end
             )
             weekDateRange = appUsageRangeLabel
+
             let selectedRange = resolvedAppUsageQueryRange(now: now)
             let rangeStart = selectedRange.start
             let rangeEnd = selectedRange.end
-            let selectedRangeLabel = dashboardPerfRangeLabel(start: rangeStart, end: rangeEnd)
-
-            let appUsageStartedAt = CFAbsoluteTimeGetCurrent()
-            let dailyGraphStartedAt = CFAbsoluteTimeGetCurrent()
-            async let backgroundMetaTask: Void = loadBackgroundMeta(traceID: traceID)
-            async let appUsageTask: Void = loadAppUsageStatsForSelectedRange(traceID: traceID)
-            async let dailyGraphTask: Void = loadDailyGraphData(rangeStart: rangeStart, rangeEnd: rangeEnd, traceID: traceID)
-
-            // Await critical UI data first.
-            try await appUsageTask
-            let appUsageElapsedMs = elapsedMs(since: appUsageStartedAt)
-            Log.recordLatency(
-                "dashboard.load.app_usage_stage_ms",
-                valueMs: appUsageElapsedMs,
-                category: .ui,
-                summaryEvery: 10,
-                warningThresholdMs: 800,
-                criticalThresholdMs: 2500
+            let cacheKey = DashboardAppUsageRangeCacheKey(
+                start: normalizedAppUsageRange.start,
+                end: normalizedAppUsageRange.end,
+                calendar: Calendar.current
             )
-
-            await dailyGraphTask
-            let dailyGraphElapsedMs = elapsedMs(since: dailyGraphStartedAt)
-            Log.recordLatency(
-                "dashboard.load.daily_graph_stage_ms",
-                valueMs: dailyGraphElapsedMs,
-                category: .ui,
-                summaryEvery: 10,
-                warningThresholdMs: 1200,
-                criticalThresholdMs: 5000
+            let cacheEligible = Self.shouldCacheAppUsageRange(
+                start: normalizedAppUsageRange.start,
+                end: normalizedAppUsageRange.end,
+                calendar: Calendar.current,
+                now: now
             )
+            let cachedSnapshot = cacheEligible ? appUsageRangeCache.snapshot(for: cacheKey) : nil
+            isLoading = cachedSnapshot == nil
+            async let backgroundMetaTask: Void = loadBackgroundMeta()
 
-            // Keep metadata updates in-flight with chart/query work.
-            await backgroundMetaTask
+            if let cachedSnapshot {
+                applyAppUsageRangeSnapshot(cachedSnapshot)
+                isLoading = false
+                await backgroundMetaTask
+                guard isLatestStatisticsLoad(loadGeneration) else { return }
+            } else {
+                let snapshot = try await fetchAppUsageRangeSnapshot(rangeStart: rangeStart, rangeEnd: rangeEnd)
+                if cacheEligible {
+                    appUsageRangeCache.insert(snapshot, for: cacheKey)
+                }
+                guard isLatestStatisticsLoad(loadGeneration) else { return }
 
-            weeklyStorageBytes = dailyStorageData.reduce(0) { $0 + $1.value }
-            totalDailyTime = totalWeeklyTime
+                applyAppUsageRangeSnapshot(snapshot)
+                isLoading = false
 
-            let loadElapsedMs = elapsedMs(since: loadStartedAt)
-            Log.recordLatency(
-                "dashboard.load.total_ms",
-                valueMs: loadElapsedMs,
-                category: .ui,
-                summaryEvery: 10,
-                warningThresholdMs: 1800,
-                criticalThresholdMs: 7000
-            )
-            let completionMessage = "[DASHBOARD-LOAD][\(traceID)] END reason='\(reason)' range=\(selectedRangeLabel) apps=\(weeklyAppUsage.count) days=\(dailyScreenTimeData.count) elapsed=\(formattedMs(loadElapsedMs))ms"
-            if loadElapsedMs >= 7000 {
-                Log.warning(completionMessage, category: .ui)
+                // Keep metadata updates in-flight with chart/query work.
+                await backgroundMetaTask
+                guard isLatestStatisticsLoad(loadGeneration) else { return }
             }
-        } catch {
+
             let loadElapsedMs = elapsedMs(since: loadStartedAt)
             Log.recordLatency(
                 "dashboard.load.total_ms",
@@ -1524,10 +1745,19 @@ public class DashboardViewModel: ObservableObject {
                 warningThresholdMs: 1800,
                 criticalThresholdMs: 7000
             )
-            Log.error(
-                "[DASHBOARD-LOAD][\(traceID)] FAIL reason='\(reason)' after \(formattedMs(loadElapsedMs))ms: \(error)",
-                category: .ui
+        } catch {
+            guard isLatestStatisticsLoad(loadGeneration) else { return }
+            isLoading = false
+            let loadElapsedMs = elapsedMs(since: loadStartedAt)
+            Log.recordLatency(
+                "dashboard.load.total_ms",
+                valueMs: loadElapsedMs,
+                category: .ui,
+                summaryEvery: 10,
+                warningThresholdMs: 1800,
+                criticalThresholdMs: 7000
             )
+            Log.error("[DashboardViewModel] Failed to load statistics reason='\(reason)': \(error)", category: .ui)
             self.error = "Failed to load statistics: \(error.localizedDescription)"
         }
     }
@@ -1535,7 +1765,10 @@ public class DashboardViewModel: ObservableObject {
     // MARK: - Daily Graph Data
 
     /// Load daily data for all metric graphs using the selected dashboard date range.
-    private func loadDailyGraphData(rangeStart: Date, rangeEnd: Date, traceID: String) async {
+    private func fetchDailyGraphSnapshot(
+        rangeStart: Date,
+        rangeEnd: Date
+    ) async -> DashboardAppUsageGraphSnapshot {
         let totalStartedAt = CFAbsoluteTimeGetCurrent()
         let calendar = Calendar.current
 
@@ -1563,7 +1796,7 @@ public class DashboardViewModel: ObservableObject {
 
             async let dailyStorageResult: ([DailyDataPoint], Double) = {
                 let startedAt = CFAbsoluteTimeGetCurrent()
-                let data = try await loadDailyStorageData(for: allDays, traceID: traceID)
+                let data = try await loadDailyStorageData(for: allDays)
                 return (data, (CFAbsoluteTimeGetCurrent() - startedAt) * 1000)
             }()
 
@@ -1607,11 +1840,10 @@ public class DashboardViewModel: ObservableObject {
                 warningThresholdMs: 700,
                 criticalThresholdMs: 2000
             )
-            dailyScreenTimeData = fillMissingDays(data: screenTimeData, allDays: allDays)
+            let dailyScreenTimeData = fillMissingDays(data: screenTimeData, allDays: allDays)
 
             stage = "daily_storage"
             let (storageData, dailyStorageElapsedMs) = try await dailyStorageResult
-            dailyStorageData = storageData
             Log.recordLatency(
                 "dashboard.query.daily_storage_ms",
                 valueMs: dailyStorageElapsedMs,
@@ -1631,8 +1863,8 @@ public class DashboardViewModel: ObservableObject {
                 warningThresholdMs: 500,
                 criticalThresholdMs: 1500
             )
-            dailyTimelineOpensData = fillMissingDays(data: timelineData, allDays: allDays)
-            timelineOpensThisWeek = dailyTimelineOpensData.reduce(0) { $0 + $1.value }
+            let dailyTimelineOpensData = fillMissingDays(data: timelineData, allDays: allDays)
+            let timelineOpensThisWeek = dailyTimelineOpensData.reduce(0) { $0 + $1.value }
 
             stage = "daily_searches"
             let (searchesData, searchesElapsedMs) = try await searchesResult
@@ -1644,8 +1876,8 @@ public class DashboardViewModel: ObservableObject {
                 warningThresholdMs: 500,
                 criticalThresholdMs: 1500
             )
-            dailySearchesData = fillMissingDays(data: searchesData, allDays: allDays)
-            searchesThisWeek = dailySearchesData.reduce(0) { $0 + $1.value }
+            let dailySearchesData = fillMissingDays(data: searchesData, allDays: allDays)
+            let searchesThisWeek = dailySearchesData.reduce(0) { $0 + $1.value }
 
             stage = "daily_text_copies"
             let (textCopiesData, textCopiesElapsedMs) = try await textCopiesResult
@@ -1657,8 +1889,8 @@ public class DashboardViewModel: ObservableObject {
                 warningThresholdMs: 500,
                 criticalThresholdMs: 1500
             )
-            dailyTextCopiesData = fillMissingDays(data: textCopiesData, allDays: allDays)
-            textCopiesThisWeek = dailyTextCopiesData.reduce(0) { $0 + $1.value }
+            let dailyTextCopiesData = fillMissingDays(data: textCopiesData, allDays: allDays)
+            let textCopiesThisWeek = dailyTextCopiesData.reduce(0) { $0 + $1.value }
 
             let totalElapsedMs = elapsedMs(since: totalStartedAt)
             Log.recordLatency(
@@ -1669,11 +1901,18 @@ public class DashboardViewModel: ObservableObject {
                 warningThresholdMs: 1400,
                 criticalThresholdMs: 6000
             )
-            let completionMessage = "[DASHBOARD-LOAD][\(traceID)] DAILY_GRAPH END days=\(allDays.count) elapsed=\(formattedMs(totalElapsedMs))ms"
-            if totalElapsedMs >= 6000 {
-                Log.warning(completionMessage, category: .ui)
-            }
 
+            return DashboardAppUsageGraphSnapshot(
+                dailyScreenTimeData: dailyScreenTimeData,
+                dailyStorageData: storageData,
+                dailyTimelineOpensData: dailyTimelineOpensData,
+                dailySearchesData: dailySearchesData,
+                dailyTextCopiesData: dailyTextCopiesData,
+                timelineOpensThisWeek: timelineOpensThisWeek,
+                searchesThisWeek: searchesThisWeek,
+                textCopiesThisWeek: textCopiesThisWeek,
+                weeklyStorageBytes: storageData.reduce(0) { $0 + $1.value }
+            )
         } catch {
             let totalElapsedMs = elapsedMs(since: totalStartedAt)
             Log.recordLatency(
@@ -1684,24 +1923,24 @@ public class DashboardViewModel: ObservableObject {
                 warningThresholdMs: 1400,
                 criticalThresholdMs: 6000
             )
-            Log.error(
-                "[DASHBOARD-LOAD][\(traceID)] DAILY_GRAPH FAIL stage=\(stage) after \(formattedMs(totalElapsedMs))ms: \(error)",
-                category: .ui
+            Log.error("[DashboardViewModel] Failed to load daily graph data stage=\(stage): \(error)", category: .ui)
+            let emptyData = allDays.map { DailyDataPoint(date: $0, value: 0) }
+            return DashboardAppUsageGraphSnapshot(
+                dailyScreenTimeData: emptyData,
+                dailyStorageData: emptyData,
+                dailyTimelineOpensData: emptyData,
+                dailySearchesData: emptyData,
+                dailyTextCopiesData: emptyData,
+                timelineOpensThisWeek: 0,
+                searchesThisWeek: 0,
+                textCopiesThisWeek: 0,
+                weeklyStorageBytes: 0
             )
-            // Initialize with empty data on error
-            dailyScreenTimeData = allDays.map { DailyDataPoint(date: $0, value: 0) }
-            dailyStorageData = allDays.map { DailyDataPoint(date: $0, value: 0) }
-            dailyTimelineOpensData = allDays.map { DailyDataPoint(date: $0, value: 0) }
-            dailySearchesData = allDays.map { DailyDataPoint(date: $0, value: 0) }
-            dailyTextCopiesData = allDays.map { DailyDataPoint(date: $0, value: 0) }
-            timelineOpensThisWeek = 0
-            searchesThisWeek = 0
-            textCopiesThisWeek = 0
         }
     }
 
     /// Load storage for each day's folder
-    private func loadDailyStorageData(for days: [Date], traceID: String) async throws -> [DailyDataPoint] {
+    private func loadDailyStorageData(for days: [Date]) async throws -> [DailyDataPoint] {
         let totalStartedAt = CFAbsoluteTimeGetCurrent()
         let calendar = Calendar.current
 
@@ -1729,18 +1968,10 @@ public class DashboardViewModel: ObservableObject {
         )
 
         var dataPoints: [DailyDataPoint] = []
-        var dayQueryTotalMs = 0.0
-        var slowestDay: Date?
-        var slowestDayMs = 0.0
         for day in days {
             let dayQueryStartedAt = CFAbsoluteTimeGetCurrent()
             let dayStorage = try await coordinator.getStorageUsedForDateRange(from: day, to: day)
             let dayQueryElapsedMs = elapsedMs(since: dayQueryStartedAt)
-            dayQueryTotalMs += dayQueryElapsedMs
-            if dayQueryElapsedMs > slowestDayMs {
-                slowestDayMs = dayQueryElapsedMs
-                slowestDay = day
-            }
             Log.recordLatency(
                 "dashboard.query.storage_single_day_ms",
                 valueMs: dayQueryElapsedMs,
@@ -1749,19 +1980,20 @@ public class DashboardViewModel: ObservableObject {
                 warningThresholdMs: 250,
                 criticalThresholdMs: 1000
             )
-            if dayQueryElapsedMs >= 1000 {
-                Log.warning(
-                    "[DASHBOARD-LOAD][\(traceID)] DAILY_STORAGE slow_day date=\(dashboardPerfDayLabel(day)) elapsed=\(formattedMs(dayQueryElapsedMs))ms",
-                    category: .ui
-                )
-            }
             let dbEstimate = dbEstimateByDay[calendar.startOfDay(for: day)] ?? 0
-            dataPoints.append(DailyDataPoint(date: day, value: dayStorage + dbEstimate))
+            dataPoints.append(
+                DailyDataPoint(
+                    date: day,
+                    value: dayStorage + dbEstimate,
+                    storageBreakdown: DailyStorageBreakdown(
+                        databaseBytes: dbEstimate,
+                        mp4Bytes: dayStorage
+                    )
+                )
+            )
         }
 
         let totalElapsedMs = elapsedMs(since: totalStartedAt)
-        let averageDayMs = days.isEmpty ? 0 : dayQueryTotalMs / Double(days.count)
-        let slowestDayLabel = slowestDay.map(dashboardPerfDayLabel) ?? "none"
         Log.recordLatency(
             "dashboard.load.daily_storage_ms",
             valueMs: totalElapsedMs,
@@ -1770,10 +2002,6 @@ public class DashboardViewModel: ObservableObject {
             warningThresholdMs: 1200,
             criticalThresholdMs: 5000
         )
-        let completionMessage = "[DASHBOARD-LOAD][\(traceID)] DAILY_STORAGE END days=\(days.count) elapsed=\(formattedMs(totalElapsedMs))ms avgDay=\(formattedMs(averageDayMs))ms slowestDay=\(slowestDayLabel) slowestDayMs=\(formattedMs(slowestDayMs))ms"
-        if totalElapsedMs >= 5000 {
-            Log.warning(completionMessage, category: .ui)
-        }
         return dataPoints
     }
 
@@ -1827,24 +2055,26 @@ public class DashboardViewModel: ObservableObject {
         }
     }
 
-    /// Fetch window usage data for a specific app (aggregated by windowName or domain for browsers)
+    /// Fetch a page of window usage data for a specific app.
     /// For browsers: includes pre-aggregated tab counts for website rows.
-    /// - Parameter bundleID: The app's bundle identifier
-    /// - Returns: Array of window usage sorted by type (websites first) then duration descending
-    public func getWindowUsageForApp(bundleID: String) async -> [WindowUsageData] {
+    /// - Parameters:
+    ///   - bundleID: The app's bundle identifier
+    ///   - limit: Maximum number of rows to fetch for the current UI page
+    /// - Returns: Visible rows plus the full result count for load-more UI
+    public func getWindowUsageForApp(bundleID: String, limit: Int) async -> WindowUsagePage {
         do {
             let queryRange = resolvedAppUsageQueryRange()
 
             let windowStats = try await coordinator.getWindowUsageForApp(
                 bundleID: bundleID,
                 from: queryRange.start,
-                to: queryRange.end
+                to: queryRange.end,
+                limit: limit
             )
 
-            // Calculate total duration for percentage calculation
-            let totalDuration = windowStats.reduce(0) { $0 + $1.duration }
-
-            return windowStats.map { stat in
+            let totalDuration = windowStats.first?.totalDuration ?? 0
+            let totalCount = windowStats.first?.totalCount ?? 0
+            let rows = windowStats.map { stat in
                 WindowUsageData(
                     windowName: stat.windowName,
                     isWebsite: stat.isWebsite,
@@ -1853,9 +2083,10 @@ public class DashboardViewModel: ObservableObject {
                     tabCount: stat.tabCount
                 )
             }
+            return WindowUsagePage(rows: rows, totalCount: totalCount)
         } catch {
             Log.error("[DashboardViewModel] Failed to fetch window usage for app: \(error)", category: .ui)
-            return []
+            return WindowUsagePage(rows: [], totalCount: 0)
         }
     }
 
@@ -1977,736 +2208,8 @@ public class DashboardViewModel: ObservableObject {
         return candidate.isEmpty ? bundleID : candidate
     }
 
-    // MARK: - Metric Event Recording
-
-    /// Record a timeline open event
-    public static func recordTimelineOpen(coordinator: AppCoordinator) {
-        Task {
-            try? await coordinator.recordMetricEvent(metricType: .timelineOpens)
-        }
-    }
-
-    /// Record a search event
-    /// - Parameters:
-    ///   - coordinator: The app coordinator
-    ///   - query: The search query text to store in metadata
-    public static func recordSearch(coordinator: AppCoordinator, query: String) {
-        Task {
-            try? await coordinator.recordMetricEvent(metricType: .searches, metadata: query)
-        }
-    }
-
-    /// Record a text copy event
-    /// - Parameters:
-    ///   - coordinator: The app coordinator
-    ///   - text: The copied text to store in metadata
-    public static func recordTextCopy(coordinator: AppCoordinator, text: String) {
-        Task {
-            try? await coordinator.recordMetricEvent(metricType: .textCopies, metadata: text)
-        }
-    }
-
-    /// Record an image copy event
-    /// - Parameters:
-    ///   - coordinator: The app coordinator
-    ///   - frameID: Optional frame ID that was copied
-    public static func recordImageCopy(coordinator: AppCoordinator, frameID: Int64? = nil) {
-        Task {
-            let metadata = frameID.map { "\($0)" }
-            try? await coordinator.recordMetricEvent(metricType: .imageCopies, metadata: metadata)
-        }
-    }
-
-    /// Record an image save event
-    /// - Parameters:
-    ///   - coordinator: The app coordinator
-    ///   - frameID: Optional frame ID that was saved
-    public static func recordImageSave(coordinator: AppCoordinator, frameID: Int64? = nil) {
-        Task {
-            let metadata = frameID.map { "\($0)" }
-            try? await coordinator.recordMetricEvent(metricType: .imageSaves, metadata: metadata)
-        }
-    }
-
-    /// Record a deeplink copy event
-    /// - Parameters:
-    ///   - coordinator: The app coordinator
-    ///   - url: The deeplink URL that was copied
-    public static func recordDeeplinkCopy(coordinator: AppCoordinator, url: String) {
-        Task {
-            try? await coordinator.recordMetricEvent(metricType: .deeplinkCopies, metadata: url)
-        }
-    }
-
-    /// Record timeline session duration (only if > 3 seconds)
-    /// - Parameters:
-    ///   - coordinator: The app coordinator
-    ///   - duration: Duration in milliseconds
-    public static func recordTimelineSession(coordinator: AppCoordinator, durationMs: Int64) {
-        guard durationMs > 3000 else { return }  // Only record if > 3 seconds
-        Task {
-            try? await coordinator.recordMetricEvent(metricType: .timelineSessionDuration, metadata: "\(durationMs)")
-        }
-    }
-
-    /// Record a filtered search query
-    /// - Parameters:
-    ///   - coordinator: The app coordinator
-    ///   - query: The search query text
-    ///   - filters: JSON string of applied filters
-    public static func recordFilteredSearch(coordinator: AppCoordinator, query: String, filters: String) {
-        Task {
-            let json = "{\"query\":\"\(query)\",\"filters\":\(filters)}"
-            try? await coordinator.recordMetricEvent(metricType: .filteredSearchQuery, metadata: json)
-        }
-    }
-
-    /// Record a timeline filter query
-    /// - Parameters:
-    ///   - coordinator: The app coordinator
-    ///   - filterJson: JSON string of timeline filters
-    public static func recordTimelineFilter(coordinator: AppCoordinator, filterJson: String) {
-        Task {
-            try? await coordinator.recordMetricEvent(metricType: .timelineFilterQuery, metadata: filterJson)
-        }
-    }
-
-    /// Record scrub distance for the session
-    /// - Parameters:
-    ///   - coordinator: The app coordinator
-    ///   - distancePixels: Total scrub distance in pixels
-    public static func recordScrubDistance(coordinator: AppCoordinator, distancePixels: Double) {
-        Task {
-            try? await coordinator.recordMetricEvent(metricType: .scrubDistance, metadata: "\(Int(distancePixels))")
-        }
-    }
-
-    /// Record a search dialog open event
-    public static func recordSearchDialogOpen(coordinator: AppCoordinator) {
-        Task {
-            try? await coordinator.recordMetricEvent(metricType: .searchDialogOpens)
-        }
-    }
-
-    /// Record an OCR reprocess request
-    public static func recordOCRReprocess(coordinator: AppCoordinator) {
-        Task {
-            try? await coordinator.recordMetricEvent(metricType: .ocrReprocessRequests)
-        }
-    }
-
-    /// Record an arrow key navigation event
-    /// - Parameters:
-    ///   - coordinator: The app coordinator
-    ///   - direction: "left" or "right"
-    public static func recordArrowKeyNavigation(coordinator: AppCoordinator, direction: String) {
-        Task {
-            try? await coordinator.recordMetricEvent(metricType: .arrowKeyNavigation, metadata: direction)
-        }
-    }
-
-    /// Record a shift+drag zoom region event
-    /// - Parameters:
-    ///   - coordinator: The app coordinator
-    ///   - region: The bounding box of the zoom region
-    ///   - screenSize: The size of the screen
-    public static func recordShiftDragZoom(coordinator: AppCoordinator, region: CGRect, screenSize: CGSize) {
-        Task {
-            let json = "{\"region\":{\"x\":\(region.origin.x),\"y\":\(region.origin.y),\"width\":\(region.width),\"height\":\(region.height)},\"screenSize\":{\"width\":\(screenSize.width),\"height\":\(screenSize.height)}}"
-            try? await coordinator.recordMetricEvent(metricType: .shiftDragZoomRegion, metadata: json)
-        }
-    }
-
-    /// Record a shift+drag text copy event
-    /// - Parameters:
-    ///   - coordinator: The app coordinator
-    ///   - copiedText: The text that was copied
-    public static func recordShiftDragTextCopy(coordinator: AppCoordinator, copiedText: String) {
-        Task {
-            try? await coordinator.recordMetricEvent(metricType: .shiftDragTextCopy, metadata: copiedText)
-        }
-    }
-
-    /// Record transient OCR triggered by drag-start on a still-only frame (p=4).
-    /// - Parameters:
-    ///   - coordinator: The app coordinator
-    ///   - gesture: Gesture that triggered OCR ("shift-drag" or "cmd-drag")
-    ///   - frameID: Frame identifier for diagnostic correlation
-    public static func recordStillFrameDragOCR(coordinator: AppCoordinator, gesture: String, frameID: Int64) {
-        Task {
-            let json = "{\"gesture\":\"\(gesture)\",\"frameID\":\(frameID)}"
-            try? await coordinator.recordMetricEvent(metricType: .stillFrameDragOCR, metadata: json)
-        }
-    }
-
-    /// Record an app launch event
-    public static func recordAppLaunch(coordinator: AppCoordinator) {
-        Task {
-            try? await coordinator.recordMetricEvent(metricType: .appLaunches)
-        }
-    }
-
-    public static func recordCrashAutoRestart(
-        coordinator: AppCoordinator,
-        source: CrashRecoverySupport.RelaunchSource
-    ) {
-        recordMetric(
-            coordinator: coordinator,
-            type: .crashAutoRestart,
-            metadata: jsonMetadata(["source": source.rawValue])
-        )
-    }
-
-    /// Record a keyboard shortcut usage
-    /// - Parameters:
-    ///   - coordinator: The app coordinator
-    ///   - shortcut: The shortcut identifier (e.g. "cmd+shift+t", "cmd+f")
-    public static func recordKeyboardShortcut(coordinator: AppCoordinator, shortcut: String) {
-        Task {
-            try? await coordinator.recordMetricEvent(metricType: .keyboardShortcut, metadata: shortcut)
-        }
-    }
-
-    /// Record a debug-only watchdog hang trigger from the dashboard.
-    public static func recordDebugWatchdogHangTriggered(coordinator: AppCoordinator) {
-        recordMetric(coordinator: coordinator, type: .debugWatchdogHangTriggered)
-    }
-
-    /// Record a debug-only forced termination trigger from the dashboard.
-    public static func recordDebugForcedTerminationTriggered(coordinator: AppCoordinator) {
-        recordMetric(coordinator: coordinator, type: .debugForcedTerminationTriggered)
-    }
-
-    public static func recordDeveloperSettingToggle(
-        coordinator: AppCoordinator,
-        source: String,
-        settingKey: String,
-        isEnabled: Bool
-    ) {
-        let metadata = jsonMetadata([
-            "source": source,
-            "settingKey": settingKey,
-            "isEnabled": isEnabled
-        ])
-        recordMetric(
-            coordinator: coordinator,
-            type: .developerSettingToggle,
-            metadata: metadata
-        )
-    }
-    /// Record a debug-only crash trigger from the dashboard.
-    public static func recordDebugCrashTriggered(coordinator: AppCoordinator) {
-        recordMetric(coordinator: coordinator, type: .debugCrashTriggered)
-    }
-
-    public static func recordDateSearchSubmitted(
-        coordinator: AppCoordinator,
-        source: String,
-        query: String,
-        queryLength: Int,
-        frameIDSearchEnabled: Bool,
-        lookedLikeFrameID: Bool
-    ) {
-        let metadata = jsonMetadata([
-            "source": source,
-            "query": query,
-            "queryLength": queryLength,
-            "frameIDSearchEnabled": frameIDSearchEnabled,
-            "lookedLikeFrameID": lookedLikeFrameID
-        ])
-        recordMetric(coordinator: coordinator, type: .dateSearchSubmitted, metadata: metadata)
-    }
-
-    public static func recordDateSearchOutcome(
-        coordinator: AppCoordinator,
-        source: String,
-        query: String,
-        outcome: String,
-        queryLength: Int,
-        frameIDLookupAttempted: Bool,
-        frameCount: Int? = nil
-    ) {
-        var payload: [String: Any] = [
-            "source": source,
-            "query": query,
-            "outcome": outcome,
-            "queryLength": queryLength,
-            "frameIDLookupAttempted": frameIDLookupAttempted
-        ]
-        if let frameCount {
-            payload["frameCount"] = frameCount
-        }
-        recordMetric(
-            coordinator: coordinator,
-            type: .dateSearchOutcome,
-            metadata: jsonMetadata(payload)
-        )
-    }
-
-    // MARK: - Extended Metrics
-
-    private static func recordMetric(
-        coordinator: AppCoordinator,
-        type: DailyMetricsQueries.MetricType,
-        metadata: String? = nil
-    ) {
-        Task {
-            try? await coordinator.recordMetricEvent(metricType: type, metadata: metadata)
-        }
-    }
-
-    private static func jsonMetadata(_ payload: [String: Any]) -> String? {
-        guard JSONSerialization.isValidJSONObject(payload),
-              let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
-              let json = String(data: data, encoding: .utf8) else {
-            return nil
-        }
-        return json
-    }
-
-    private static func timelineAutoDismissMetadata(
-        activatedBundleID: String? = nil
-    ) -> String? {
-        var payload: [String: Any] = ["trigger": "app_activation"]
-        if let activatedBundleID {
-            payload["activatedBundleID"] = activatedBundleID
-        }
-        return jsonMetadata(payload)
-    }
-
-    public static func recordBrowserLinkOpened(
-        coordinator: AppCoordinator,
-        source: String,
-        url: String,
-        usedTextFragment: Bool,
-        usedYouTubeTimestamp: Bool
-    ) {
-        let metadata = jsonMetadata([
-            "source": source,
-            "url": url,
-            "usedTextFragment": usedTextFragment,
-            "usedYouTubeTimestamp": usedYouTubeTimestamp
-        ])
-        recordMetric(
-            coordinator: coordinator,
-            type: .browserLinkOpened,
-            metadata: metadata
-        )
-    }
-
-    public static func recordSegmentHide(
-        coordinator: AppCoordinator,
-        source: String,
-        segmentCount: Int,
-        frameCount: Int,
-        hiddenFilter: String
-    ) {
-        let metadata = jsonMetadata([
-            "source": source,
-            "segmentCount": segmentCount,
-            "frameCount": frameCount,
-            "hiddenFilter": hiddenFilter
-        ])
-        recordMetric(coordinator: coordinator, type: .segmentHide, metadata: metadata)
-    }
-
-    public static func recordSegmentUnhide(
-        coordinator: AppCoordinator,
-        source: String,
-        segmentCount: Int,
-        frameCount: Int,
-        hiddenFilter: String,
-        removedFromCurrentView: Bool
-    ) {
-        let metadata = jsonMetadata([
-            "source": source,
-            "segmentCount": segmentCount,
-            "frameCount": frameCount,
-            "hiddenFilter": hiddenFilter,
-            "removedFromCurrentView": removedFromCurrentView
-        ])
-        recordMetric(coordinator: coordinator, type: .segmentUnhide, metadata: metadata)
-    }
-
-    public static func recordTagSubmenuOpen(
-        coordinator: AppCoordinator,
-        source: String,
-        segmentCount: Int?,
-        frameCount: Int?,
-        selectedTagCount: Int?
-    ) {
-        var payload: [String: Any] = ["source": source]
-        if let segmentCount {
-            payload["segmentCount"] = segmentCount
-        }
-        if let frameCount {
-            payload["frameCount"] = frameCount
-        }
-        if let selectedTagCount {
-            payload["selectedTagCount"] = selectedTagCount
-        }
-        recordMetric(
-            coordinator: coordinator,
-            type: .tagSubmenuOpen,
-            metadata: jsonMetadata(payload)
-        )
-    }
-
-    public static func recordTagToggleOnBlock(
-        coordinator: AppCoordinator,
-        source: String,
-        tagID: Int64,
-        tagName: String,
-        action: String,
-        segmentCount: Int
-    ) {
-        let metadata = jsonMetadata([
-            "source": source,
-            "tagID": tagID,
-            "tagName": tagName,
-            "action": action,
-            "segmentCount": segmentCount
-        ])
-        recordMetric(coordinator: coordinator, type: .tagToggleOnBlock, metadata: metadata)
-    }
-
-    public static func recordTagCreateAndAddOnBlock(
-        coordinator: AppCoordinator,
-        source: String,
-        tagID: Int64,
-        tagName: String,
-        segmentCount: Int
-    ) {
-        let metadata = jsonMetadata([
-            "source": source,
-            "tagID": tagID,
-            "tagName": tagName,
-            "segmentCount": segmentCount
-        ])
-        recordMetric(coordinator: coordinator, type: .tagCreateAndAddOnBlock, metadata: metadata)
-    }
-
-    public static func recordCommentSubmenuOpen(
-        coordinator: AppCoordinator,
-        source: String,
-        segmentCount: Int?,
-        frameCount: Int?,
-        existingCommentCount: Int?
-    ) {
-        var payload: [String: Any] = ["source": source]
-        if let segmentCount {
-            payload["segmentCount"] = segmentCount
-        }
-        if let frameCount {
-            payload["frameCount"] = frameCount
-        }
-        if let existingCommentCount {
-            payload["existingCommentCount"] = existingCommentCount
-        }
-        recordMetric(
-            coordinator: coordinator,
-            type: .commentSubmenuOpen,
-            metadata: jsonMetadata(payload)
-        )
-    }
-
-    public static func recordQuickCommentOpened(
-        coordinator: AppCoordinator,
-        source: String
-    ) {
-        recordMetric(
-            coordinator: coordinator,
-            type: .quickCommentOpened,
-            metadata: jsonMetadata(["source": source])
-        )
-    }
-
-    public static func recordQuickCommentClosed(
-        coordinator: AppCoordinator,
-        source: String
-    ) {
-        recordMetric(
-            coordinator: coordinator,
-            type: .quickCommentClosed,
-            metadata: jsonMetadata(["source": source])
-        )
-    }
-
-    public static func recordQuickCommentContextPreviewToggle(
-        coordinator: AppCoordinator,
-        source: String,
-        isCollapsed: Bool
-    ) {
-        recordMetric(
-            coordinator: coordinator,
-            type: .quickCommentContextPreviewToggle,
-            metadata: jsonMetadata([
-                "source": source,
-                "isCollapsed": isCollapsed
-            ])
-        )
-    }
-
-    public static func recordTimelineAutoDismissed(
-        coordinator: AppCoordinator,
-        activatedBundleID: String? = nil
-    ) {
-        recordMetric(
-            coordinator: coordinator,
-            type: .timelineAutoDismissed,
-            metadata: timelineAutoDismissMetadata(
-                activatedBundleID: activatedBundleID
-            )
-        )
-    }
-
-    public static func recordCommentAdded(
-        coordinator: AppCoordinator,
-        source: String,
-        requestedSegmentCount: Int,
-        linkedSegmentCount: Int,
-        bodyLength: Int,
-        attachmentCount: Int,
-        hasFrameAnchor: Bool
-    ) {
-        let metadata = jsonMetadata([
-            "source": source,
-            "requestedSegmentCount": requestedSegmentCount,
-            "linkedSegmentCount": linkedSegmentCount,
-            "bodyLength": bodyLength,
-            "attachmentCount": attachmentCount,
-            "hasFrameAnchor": hasFrameAnchor
-        ])
-        recordMetric(coordinator: coordinator, type: .commentAdded, metadata: metadata)
-    }
-
-    public static func recordCommentDeletedFromBlock(
-        coordinator: AppCoordinator,
-        source: String,
-        linkedSegmentCount: Int,
-        hadFrameAnchor: Bool
-    ) {
-        let metadata = jsonMetadata([
-            "source": source,
-            "linkedSegmentCount": linkedSegmentCount,
-            "hadFrameAnchor": hadFrameAnchor
-        ])
-        recordMetric(coordinator: coordinator, type: .commentDeletedFromBlock, metadata: metadata)
-    }
-
-    public static func recordCommentAttachmentPickerOpened(coordinator: AppCoordinator, source: String) {
-        let metadata = jsonMetadata(["source": source])
-        recordMetric(
-            coordinator: coordinator,
-            type: .commentAttachmentPickerOpened,
-            metadata: metadata
-        )
-    }
-
-    public static func recordCommentAttachmentOpened(
-        coordinator: AppCoordinator,
-        source: String,
-        fileExtension: String
-    ) {
-        let metadata = jsonMetadata([
-            "source": source,
-            "fileExtension": fileExtension
-        ])
-        recordMetric(
-            coordinator: coordinator,
-            type: .commentAttachmentOpened,
-            metadata: metadata
-        )
-    }
-
-    public static func recordAllCommentsOpened(
-        coordinator: AppCoordinator,
-        source: String,
-        anchorCommentID: Int64?
-    ) {
-        var payload: [String: Any] = ["source": source]
-        if let anchorCommentID {
-            payload["anchorCommentID"] = anchorCommentID
-        }
-        recordMetric(coordinator: coordinator, type: .allCommentsOpened, metadata: jsonMetadata(payload))
-    }
-
-    public static func recordPlaybackToggled(
-        coordinator: AppCoordinator,
-        source: String,
-        wasPlaying: Bool,
-        isPlaying: Bool,
-        speed: Double
-    ) {
-        let metadata = jsonMetadata([
-            "source": source,
-            "wasPlaying": wasPlaying,
-            "isPlaying": isPlaying,
-            "speed": speed
-        ])
-        recordMetric(coordinator: coordinator, type: .playbackToggled, metadata: metadata)
-    }
-
-    public static func recordPlaybackSpeedChanged(
-        coordinator: AppCoordinator,
-        source: String,
-        previousSpeed: Double,
-        newSpeed: Double,
-        isPlaying: Bool
-    ) {
-        let metadata = jsonMetadata([
-            "source": source,
-            "previousSpeed": previousSpeed,
-            "newSpeed": newSpeed,
-            "isPlaying": isPlaying
-        ])
-        recordMetric(coordinator: coordinator, type: .playbackSpeedChanged, metadata: metadata)
-    }
-
-    public static func recordRecordingStartedFromMenu(coordinator: AppCoordinator, source: String) {
-        recordMetric(
-            coordinator: coordinator,
-            type: .recordingStartedFromMenu,
-            metadata: jsonMetadata(["source": source])
-        )
-    }
-
-    public static func recordRecordingPauseSelected(
-        coordinator: AppCoordinator,
-        source: String,
-        durationSeconds: Int
-    ) {
-        let metadata = jsonMetadata([
-            "source": source,
-            "durationSeconds": durationSeconds
-        ])
-        recordMetric(
-            coordinator: coordinator,
-            type: .recordingPauseSelected,
-            metadata: metadata
-        )
-    }
-
-    public static func recordRecordingTurnedOff(coordinator: AppCoordinator, source: String) {
-        recordMetric(
-            coordinator: coordinator,
-            type: .recordingTurnedOff,
-            metadata: jsonMetadata(["source": source])
-        )
-    }
-
-    public static func recordRecordingAutoResumed(
-        coordinator: AppCoordinator,
-        source: String,
-        pausedDurationSeconds: Int
-    ) {
-        let metadata = jsonMetadata([
-            "source": source,
-            "pausedDurationSeconds": pausedDurationSeconds
-        ])
-        recordMetric(
-            coordinator: coordinator,
-            type: .recordingAutoResumed,
-            metadata: metadata
-        )
-    }
-
-    public static func recordSystemMonitorOpened(coordinator: AppCoordinator, source: String) {
-        recordMetric(
-            coordinator: coordinator,
-            type: .systemMonitorOpened,
-            metadata: jsonMetadata(["source": source])
-        )
-    }
-
-    public static func recordHelpOpened(coordinator: AppCoordinator, source: String) {
-        recordMetric(
-            coordinator: coordinator,
-            type: .helpOpened,
-            metadata: jsonMetadata(["source": source])
-        )
-    }
-
-    public static func recordSettingsSearchOpened(coordinator: AppCoordinator, source: String) {
-        recordMetric(
-            coordinator: coordinator,
-            type: .settingsSearchOpened,
-            metadata: jsonMetadata(["source": source])
-        )
-    }
-
-    public static func recordRedactionRulesUpdated(
-        coordinator: AppCoordinator,
-        windowPatternCount: Int,
-        urlPatternCount: Int
-    ) {
-        let metadata = jsonMetadata([
-            "windowPatternCount": windowPatternCount,
-            "urlPatternCount": urlPatternCount
-        ])
-        recordMetric(coordinator: coordinator, type: .redactionRulesUpdated, metadata: metadata)
-    }
-
-    public static func recordPrivateWindowRedactionToggle(
-        coordinator: AppCoordinator,
-        enabled: Bool,
-        source: String
-    ) {
-        let metadata = jsonMetadata([
-            "enabled": enabled,
-            "source": source
-        ])
-        recordMetric(coordinator: coordinator, type: .privateWindowRedactionToggle, metadata: metadata)
-    }
-
-    public static func recordSystemMonitorSettingsOpened(coordinator: AppCoordinator, source: String) {
-        recordMetric(
-            coordinator: coordinator,
-            type: .systemMonitorSettingsOpened,
-            metadata: jsonMetadata(["source": source])
-        )
-    }
-
-    public static func recordSystemMonitorOpenPowerOCRCard(coordinator: AppCoordinator, source: String) {
-        recordMetric(
-            coordinator: coordinator,
-            type: .systemMonitorOpenPowerOCRCard,
-            metadata: jsonMetadata(["source": source])
-        )
-    }
-
-    public static func recordSystemMonitorOpenPowerOCRPriority(coordinator: AppCoordinator, source: String) {
-        recordMetric(
-            coordinator: coordinator,
-            type: .systemMonitorOpenPowerOCRPriority,
-            metadata: jsonMetadata(["source": source])
-        )
-    }
-
-    public static func recordFrameDeleted(
-        coordinator: AppCoordinator,
-        source: String,
-        frameID: Int64
-    ) {
-        let metadata = jsonMetadata([
-            "source": source,
-            "frameID": frameID
-        ])
-        recordMetric(coordinator: coordinator, type: .frameDeleted, metadata: metadata)
-    }
-
-    public static func recordSegmentDeleted(
-        coordinator: AppCoordinator,
-        source: String,
-        segmentCount: Int,
-        frameCount: Int
-    ) {
-        let metadata = jsonMetadata([
-            "source": source,
-            "segmentCount": segmentCount,
-            "frameCount": frameCount
-        ])
-        recordMetric(coordinator: coordinator, type: .segmentDeleted, metadata: metadata)
+    public func recordKeyboardShortcut(_ shortcut: String) {
+        Self.recordKeyboardShortcut(coordinator: coordinator, shortcut: shortcut)
     }
 
     // MARK: - Cleanup
@@ -2758,6 +2261,16 @@ public struct AppSessionDetail: Identifiable {
 }
 
 /// Represents aggregated window usage within an app
+public struct WindowUsagePage {
+    public let rows: [WindowUsageData]
+    public let totalCount: Int
+
+    public init(rows: [WindowUsageData], totalCount: Int) {
+        self.rows = rows
+        self.totalCount = totalCount
+    }
+}
+
 public struct WindowUsageData: Identifiable {
     public let id = UUID()
     public let windowName: String?
@@ -2785,16 +2298,27 @@ public struct WindowUsageData: Identifiable {
     }
 }
 
+struct DailyStorageBreakdown: Equatable, Sendable {
+    let databaseBytes: Int64
+    let mp4Bytes: Int64
+}
+
 /// Represents a single data point for daily graphs
 public struct DailyDataPoint: Identifiable {
     public let id = UUID()
     public let date: Date
     public let value: Int64
     public let label: String  // Formatted as MM/DD
+    let storageBreakdown: DailyStorageBreakdown?
 
     public init(date: Date, value: Int64) {
+        self.init(date: date, value: value, storageBreakdown: nil)
+    }
+
+    init(date: Date, value: Int64, storageBreakdown: DailyStorageBreakdown?) {
         self.date = date
         self.value = value
+        self.storageBreakdown = storageBreakdown
 
         let formatter = DateFormatter()
         formatter.dateFormat = "MM/dd"

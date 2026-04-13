@@ -98,13 +98,23 @@ public actor IncrementalSegmentWriter: SegmentWriter {
 
         // STEP 3: Encode frame to video
         // AVAssetWriter writes data incrementally, but file won't be playable until finalize()
-        let pixelBuffer = try FrameConverter.createPixelBuffer(from: frame)
+        let pixelBufferToken = await StorageVideoEncodingMemoryLedger.beginPixelBuffer(
+            width: frame.width,
+            height: frame.height
+        )
         // Use integer arithmetic to avoid floating point precision issues
         // At 30fps with timescale 600: each frame = 20 time units (600/30 = 20)
         // This ensures exact timestamps: frame 0 = 0, frame 1 = 20, frame 11 = 220, etc.
         let timestamp = CMTime(value: Int64(frameCount) * 20, timescale: 600)
 
-        try await encoder.encode(pixelBuffer: pixelBuffer, timestamp: timestamp)
+        do {
+            let pixelBuffer = try await encoder.makePixelBuffer(from: frame)
+            try await encoder.encode(pixelBuffer: pixelBuffer, timestamp: timestamp)
+            await StorageVideoEncodingMemoryLedger.endPixelBuffer(pixelBufferToken)
+        } catch {
+            await StorageVideoEncodingMemoryLedger.endPixelBuffer(pixelBufferToken)
+            throw error
+        }
 
         frameCount += 1
         lastFrameTime = frame.timestamp

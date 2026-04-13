@@ -11,12 +11,39 @@ import UniformTypeIdentifiers
 import ImageIO
 
 /// Shared timeline configuration
+public enum TimelineZoomSettings {
+    /// Fit-to-screen baseline expressed as a percentage.
+    public static let resetPercent: CGFloat = 100.0
+    /// Historical maximum detail stop for the tape zoom curve.
+    public static let legacyTimelineDetailPercent: CGFloat = 1000.0
+    /// Single source of truth for the configured maximum zoom ceiling.
+    public static let maxPercent: CGFloat = 3000.0
+    /// Minimum in-frame zoom scale.
+    public static let minFrameScale: CGFloat = 0.25
+    /// Maximum in-frame zoom scale derived from the configured ceiling.
+    public static let maxFrameScale: CGFloat = maxPercent / resetPercent
+    /// Slider max preserving the old tape curve up to the legacy detail stop.
+    public static let maxTimelineZoomLevel: CGFloat = maxFrameScale / (legacyTimelineDetailPercent / resetPercent)
+
+    public static var resetLabel: String {
+        "\(Int(resetPercent))%"
+    }
+
+    public static func percentLabel(forScale scale: CGFloat) -> String {
+        "\(Int(scale * resetPercent))%"
+    }
+}
+
 public enum TimelineConfig {
-    /// Base pixels per frame at 100% zoom (max detail)
-    public static let basePixelsPerFrame: CGFloat = 75.0
     /// Minimum pixels per frame at 0% zoom (most zoomed out)
     public static let minPixelsPerFrame: CGFloat = 8.0
-    /// Default zoom level (0.0 to 1.0, where 1.0 is max detail)
+    /// Pixels per frame at the legacy max-detail stop (1.0 zoom level).
+    public static let basePixelsPerFrame: CGFloat = 75.0
+    /// Extended max-detail density derived from the shared zoom ceiling.
+    public static let maxPixelsPerFrame: CGFloat = minPixelsPerFrame * TimelineZoomSettings.maxFrameScale
+    /// Maximum timeline zoom level exposed by the slider.
+    public static let maxZoomLevel: CGFloat = TimelineZoomSettings.maxTimelineZoomLevel
+    /// Default zoom level, preserving the existing initial tape density.
     public static let defaultZoomLevel: CGFloat = 0.6
 }
 
@@ -153,7 +180,125 @@ enum OCRTextLayoutEstimator {
         return 1.0
     }
 }
+enum UIDirectFrameDecodeMemoryLedger {
+    static let shiftDragGeneratorTag = "ui.timeline.shiftDragDecodeGenerator"
+    static let zoomCopyGeneratorTag = "ui.timeline.zoomCopyGenerator"
+    static let contextMenuGeneratorTag = "ui.contextMenu.frameDecodeGenerator"
+    static let timelineWindowGeneratorTag = "ui.timeline.windowFrameDecodeGenerator"
 
+    private static let tracker = Tracker()
+    private static let summaryIntervalSeconds: TimeInterval = 30
+
+    static func begin(
+        tag: String,
+        function: String,
+        reason: String,
+        videoInfo: FrameVideoInfo?
+    ) -> Int64 {
+        let estimatedBytes = TimelineMemoryEstimator.directDecodeGeneratorBytes(for: videoInfo)
+        let note = generatorNote(for: videoInfo)
+        Task(priority: .utility) {
+            await tracker.increment(
+                tag: tag,
+                function: function,
+                kind: "direct-decode-generator",
+                note: note,
+                bytes: estimatedBytes
+            )
+            MemoryLedger.emitSummary(
+                reason: reason,
+                category: .ui,
+                minIntervalSeconds: summaryIntervalSeconds
+            )
+        }
+        return estimatedBytes
+    }
+
+    static func end(tag: String, reason: String, bytes: Int64) {
+        Task(priority: .utility) {
+            await tracker.decrement(tag: tag, bytes: bytes)
+            MemoryLedger.emitSummary(
+                reason: reason,
+                category: .ui,
+                minIntervalSeconds: summaryIntervalSeconds
+            )
+        }
+    }
+
+    private static func generatorNote(for videoInfo: FrameVideoInfo?) -> String {
+        guard let width = videoInfo?.width,
+              let height = videoInfo?.height,
+              width > 0,
+              height > 0 else {
+            return "estimated-native,frame=unknown"
+        }
+        return "estimated-native,frame=\(width)x\(height)"
+    }
+
+    private actor Tracker {
+        private struct Entry {
+            var totalBytes: Int64
+            var count: Int
+            let function: String
+            let kind: String
+            var note: String
+        }
+
+        private var entries: [String: Entry] = [:]
+
+        func increment(
+            tag: String,
+            function: String,
+            kind: String,
+            note: String,
+            bytes: Int64
+        ) {
+            var entry = entries[tag] ?? Entry(
+                totalBytes: 0,
+                count: 0,
+                function: function,
+                kind: kind,
+                note: note
+            )
+            entry.totalBytes = clampedAdd(entry.totalBytes, bytes)
+            entry.count = clampedAdd(entry.count, 1)
+            entry.note = note
+            entries[tag] = entry
+            publish(tag: tag, entry: entry)
+        }
+
+        func decrement(tag: String, bytes: Int64) {
+            guard var entry = entries[tag] else { return }
+            entry.totalBytes = max(0, entry.totalBytes - bytes)
+            entry.count = max(0, entry.count - 1)
+            entries[tag] = entry
+            publish(tag: tag, entry: entry)
+        }
+
+        private func publish(tag: String, entry: Entry) {
+            MemoryLedger.set(
+                tag: tag,
+                bytes: entry.totalBytes,
+                count: entry.count,
+                unit: "requests",
+                function: entry.function,
+                kind: entry.kind,
+                note: entry.note
+            )
+        }
+
+        private func clampedAdd(_ lhs: Int64, _ rhs: Int64) -> Int64 {
+            if lhs > Int64.max - rhs {
+                return Int64.max
+            }
+            return lhs + rhs
+        }
+
+        private func clampedAdd(_ lhs: Int, _ rhs: Int) -> Int {
+            lhs.addingReportingOverflow(rhs).overflow ? Int.max : lhs + rhs
+        }
+    }
+}
 /// A frame paired with its preloaded video info for instant access
 public struct TimelineFrame: Identifiable, Equatable {
     public let frame: FrameReference
@@ -657,7 +802,8 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Selected hour (0-23) when keyboard focus is on the time grid
     @Published public var selectedCalendarHour: Int? = nil
 
-    /// Zoom level (0.0 to 1.0, where 1.0 is max detail/zoomed in)
+    /// Zoom level (0.0 to TimelineConfig.maxZoomLevel).
+    /// 1.0 preserves the legacy max-detail stop; the upper bound is derived from TimelineZoomSettings.maxPercent.
     @Published public var zoomLevel: CGFloat = TimelineConfig.defaultZoomLevel
 
     /// Whether the zoom slider is expanded/visible
@@ -723,13 +869,16 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Temporary in-memory overlays for revealed redacted OCR nodes (keyed by node ID).
     @Published public var revealedRedactedNodePatches: [Int: NSImage] = [:]
+    @Published public var hidingRedactedNodePatches: [Int: NSImage] = [:]
     private var revealedRedactedFrameID: FrameID?
     @Published public var activeRedactionTooltipNodeID: Int?
+    private var pendingRedactedNodeHideRemovalTasks: [Int: Task<Void, Never>] = [:]
+    private static let phraseLevelRedactionHideAnimationDuration: Duration = .milliseconds(520)
 
     enum PhraseLevelRedactionTooltipState: Equatable {
         case queued
         case reveal
-        case copyText
+        case hide
 
         var title: String {
             switch self {
@@ -737,8 +886,19 @@ public class SimpleTimelineViewModel: ObservableObject {
                 return "Queued..."
             case .reveal:
                 return "Reveal"
-            case .copyText:
-                return "Copy text"
+            case .hide:
+                return "Hide"
+            }
+        }
+
+        var tooltipText: String {
+            switch self {
+            case .queued:
+                return "Queued..."
+            case .reveal:
+                return "Reveal"
+            case .hide:
+                return "Hide"
             }
         }
 
@@ -746,7 +906,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             switch self {
             case .queued:
                 return false
-            case .reveal, .copyText:
+            case .reveal, .hide:
                 return true
             }
         }
@@ -851,6 +1011,9 @@ public class SimpleTimelineViewModel: ObservableObject {
     @Published public var shiftDragDisplaySnapshot: NSImage?
     @Published public var shiftDragDisplaySnapshotFrameID: Int64?
     private var shiftDragDisplayRequestID: Int = 0
+    private var shiftDragDisplayGenerator: AVAssetImageGenerator?
+    private var zoomCopyRequestID: Int = 0
+    private var zoomCopyGenerator: AVAssetImageGenerator?
 
     // MARK: - Text Selection Hint Banner State
 
@@ -870,6 +1033,14 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Whether the frame context menu should guide the user to the Show Controls row.
     @Published public private(set) var highlightShowControlsContextMenuRow: Bool = false
+
+    // MARK: - Timeline Position Recovery Hint State
+
+    /// Whether to show the top-center hint for returning to the pre-cache-bust playhead position.
+    @Published public private(set) var showPositionRecoveryHintBanner: Bool = false
+
+    /// Auto-dismiss task for the position recovery hint banner.
+    private var positionRecoveryHintDismissTask: Task<Void, Never>?
 
     // MARK: - Scroll Orientation Hint Banner State
 
@@ -909,10 +1080,10 @@ public class SimpleTimelineViewModel: ObservableObject {
     @Published public var frameZoomOffset: CGSize = .zero
 
     /// Minimum zoom scale (frame smaller than display)
-    public static let minFrameZoomScale: CGFloat = 0.25
+    public static let minFrameZoomScale: CGFloat = TimelineZoomSettings.minFrameScale
 
     /// Maximum zoom scale (zoomed in)
-    public static let maxFrameZoomScale: CGFloat = 10.0
+    public static let maxFrameZoomScale: CGFloat = TimelineZoomSettings.maxFrameScale
 
     /// Whether the frame is currently zoomed (not at 100%)
     public var isFrameZoomed: Bool {
@@ -1042,6 +1213,12 @@ public class SimpleTimelineViewModel: ObservableObject {
     @Published public var toastVisible: Bool = false
     private var toastDismissTask: Task<Void, Never>?
 
+    private static var positionRecoveryHintDismissedForSession = false
+#if DEBUG
+    static func resetPositionRecoveryHintDismissalForTesting() {
+        positionRecoveryHintDismissedForSession = false
+    }
+#endif
     /// Show a brief toast notification overlay
     public func showToast(_ message: String, icon: String? = nil) {
         toastDismissTask?.cancel()
@@ -1257,11 +1434,44 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Whether search highlight is currently being displayed
     @Published public var isShowingSearchHighlight: Bool = false
 
-    /// Timer to auto-dismiss search highlight
-    private var searchHighlightTimer: Timer?
+    public var isSearchResultNavigationModeActive: Bool {
+        searchHighlightMode == .matchedNodes &&
+        normalizedRestorableSearchHighlightQuery(searchHighlightQuery) != nil
+    }
+
+    private var pendingSearchHighlightRevealTask: Task<Void, Never>?
+    private var pendingSearchHighlightResetTask: Task<Void, Never>?
+    private var searchResultNavigationGeneration: UInt64 = 0
+
+    enum SearchResultNavigationTrigger {
+        case button
+        case keyboard
+
+        var metricTrigger: String {
+            switch self {
+            case .button:
+                return "button"
+            case .keyboard:
+                return "keyboard"
+            }
+        }
+    }
+
+    var searchResultHighlightNavigationState: SearchViewModel.ResultNavigationState? {
+        guard isSearchResultNavigationModeActive,
+              !hasActiveInFrameSearchQuery else {
+            return nil
+        }
+        return searchViewModel.selectedResultNavigationState
+    }
 
     private var hasActiveInFrameSearchQuery: Bool {
         !inFrameSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private enum FrameNavigationContext: Equatable {
+        case manual
+        case searchResult
     }
 
     /// Timer for periodic processing status refresh while timeline is open
@@ -1294,6 +1504,16 @@ public class SimpleTimelineViewModel: ObservableObject {
         isMoreOptionsMenuVisible = false
     }
 
+    enum TimelineContextMenuPresentationSource {
+        case secondaryClick
+        case actionBubble
+    }
+
+    enum TimelineContextMenuDismissReason {
+        case standard
+        case scroll
+    }
+
     // MARK: - Timeline Context Menu State (for right-click on timeline tape)
 
     /// Whether the timeline context menu is visible
@@ -1304,6 +1524,9 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// The segment index that was right-clicked on the timeline
     @Published public var timelineContextMenuSegmentIndex: Int? = nil
+
+    /// Whether to show the top hint teaching that the tape also supports right-click.
+    @Published public private(set) var showTimelineTapeRightClickHintBanner: Bool = false
 
     /// Whether the tag submenu is visible
     @Published public var showTagSubmenu: Bool = false
@@ -1422,9 +1645,23 @@ public class SimpleTimelineViewModel: ObservableObject {
     @Published public var hidingSegmentBlockRange: ClosedRange<Int>? = nil
 
     private static let timelineMenuDismissAnimationDuration: TimeInterval = 0.15
+    private var timelineContextMenuPresentationSource: TimelineContextMenuPresentationSource?
+    private var timelineTapeRightClickHintDismissTask: Task<Void, Never>?
 
     /// Dismiss the timeline context menu
     public func dismissTimelineContextMenu() {
+        dismissTimelineContextMenu(reason: .standard)
+    }
+
+    func dismissTimelineContextMenu(reason: TimelineContextMenuDismissReason) {
+        let shouldShowRightClickHint =
+            reason == .scroll &&
+            timelineContextMenuPresentationSource == .actionBubble &&
+            showTimelineContextMenu &&
+            !showTagSubmenu &&
+            !showCommentSubmenu &&
+            !showNewTagInput
+
         let resetMenuState = {
             self.cancelSelectedBlockCommentsLoad()
             self.showTimelineContextMenu = false
@@ -1446,6 +1683,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             self.isAllCommentsBrowserActive = false
             self.returnToThreadCommentsSignal = 0
             self.selectedSegmentTags = []
+            self.timelineContextMenuPresentationSource = nil
             self.resetCommentTimelineState()
             self.resetCommentSearchState()
         }
@@ -1457,6 +1695,10 @@ public class SimpleTimelineViewModel: ObservableObject {
             }
         } else {
             resetMenuState()
+        }
+
+        if shouldShowRightClickHint {
+            showTimelineTapeRightClickHint()
         }
     }
 
@@ -1490,6 +1732,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             self.isAddingComment = false
             self.isAllCommentsBrowserActive = false
             self.returnToThreadCommentsSignal = 0
+            self.timelineContextMenuPresentationSource = nil
             self.resetCommentTimelineState()
             self.resetCommentSearchState()
             self.currentCommentMetricsSource = "timeline_comment_submenu"
@@ -1560,6 +1803,9 @@ public class SimpleTimelineViewModel: ObservableObject {
         filterDropdownAnchorFrame = anchorFrame
         filterAnchorFrames[type] = anchorFrame
         activeFilterDropdown = type
+        if type == .apps {
+            startAvailableAppsForFilterLoadIfNeeded()
+        }
         // `.advanced` is rendered inline in the panel, not as a popover.
         isFilterDropdownOpen = type != .none && type != .advanced
         if type != .dateRange {
@@ -1589,6 +1835,24 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Whether apps for filter are currently being loaded
     @Published public var isLoadingAppsForFilter = false
+
+    /// Whether the timeline app filter is waiting on a live Rewind refresh.
+    @Published public var isRefreshingRewindAppsForFilter = false
+
+    /// Prevent repeated installed-app scans when the loaded result is legitimately empty.
+    private var hasLoadedInstalledAppsForFilter = false
+
+    /// Prevent repeated historical-app scans when the loaded result is legitimately empty.
+    private var hasLoadedHistoricalAppsForFilter = false
+
+    /// Tracks which effective Rewind context produced `otherAppsForFilter`.
+    private var lastHistoricalAppsForFilterContext: RewindAppBundleIDCacheContext?
+
+    /// Coalesced task for loading app-filter data.
+    private var availableAppsForFilterLoadTask: Task<Void, Never>?
+
+    /// Delayed task for loading non-app filter support data after the panel animation.
+    private var filterPanelSupportingDataLoadTask: Task<Void, Never>?
 
     /// Map of segment IDs to their tag IDs (for efficient tag filtering)
     @Published public var segmentTagsMap: [Int64: Set<Int64>] = [:] {
@@ -1670,8 +1934,16 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Current pixels per frame based on zoom level
     public var pixelsPerFrame: CGFloat {
-        let range = TimelineConfig.basePixelsPerFrame - TimelineConfig.minPixelsPerFrame
-        return TimelineConfig.minPixelsPerFrame + (range * zoomLevel)
+        let clampedZoomLevel = zoomLevel.clamped(to: 0...TimelineConfig.maxZoomLevel)
+        let legacyRange = TimelineConfig.basePixelsPerFrame - TimelineConfig.minPixelsPerFrame
+
+        if clampedZoomLevel <= 1.0 {
+            return TimelineConfig.minPixelsPerFrame + (legacyRange * clampedZoomLevel)
+        }
+
+        let extendedRange = TimelineConfig.maxPixelsPerFrame - TimelineConfig.basePixelsPerFrame
+        let extendedProgress = (clampedZoomLevel - 1.0) / (TimelineConfig.maxZoomLevel - 1.0)
+        return TimelineConfig.basePixelsPerFrame + (extendedRange * extendedProgress)
     }
 
     /// Frame skip factor - how many frames to skip when displaying
@@ -1787,6 +2059,26 @@ public class SimpleTimelineViewModel: ObservableObject {
         )
     }
 
+    var currentFrameStillUsesFreshCaptureSource: Bool {
+        switch currentFrameStillDisplayMode {
+        case .currentImage:
+            guard let currentFrameID = currentTimelineFrame?.frame.id,
+                  currentImage != nil,
+                  currentImageFrameID == currentFrameID else {
+                return false
+            }
+            return hasExternalCaptureStillInDiskFrameBuffer(frameID: currentFrameID)
+        case .waitingFallback:
+            guard let fallbackFrameID = waitingFallbackImageFrameID,
+                  waitingFallbackImage != nil else {
+                return false
+            }
+            return hasExternalCaptureStillInDiskFrameBuffer(frameID: fallbackFrameID)
+        case .none:
+            return false
+        }
+    }
+
     static func resolveCurrentFrameStillDisplayMode(
         currentFrameID: FrameID?,
         currentImageFrameID: FrameID?,
@@ -1814,39 +2106,10 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Video info for displaying the current frame - derived from currentIndex
     public var currentVideoInfo: FrameVideoInfo? {
-        guard let timelineFrame = currentTimelineFrame else {
-            // Only log if we haven't logged this state recently
-            if _lastLoggedVideoInfoFrameID != -1 {
-                Log.debug("[SimpleTimelineViewModel] currentVideoInfo: no currentTimelineFrame at index \(currentIndex)", category: .ui)
-                _lastLoggedVideoInfoFrameID = -1
-            }
+        guard let timelineFrame = currentTimelineFrame,
+              let info = timelineFrame.videoInfo,
+              info.frameIndex >= 0 else {
             return nil
-        }
-        guard let info = timelineFrame.videoInfo else {
-            if _lastLoggedVideoInfoFrameID != -2 {
-                Log.debug(
-                    "[SimpleTimelineViewModel] currentVideoInfo: frame \(timelineFrame.frame.id.value) has nil videoInfo, source=\(timelineFrame.frame.source), processingStatus=\(timelineFrame.processingStatus)",
-                    category: .ui
-                )
-                _lastLoggedVideoInfoFrameID = -2
-            }
-            return nil
-        }
-        guard info.frameIndex >= 0 else {
-            if _lastLoggedVideoInfoFrameID != -3 {
-                Log.debug("[SimpleTimelineViewModel] currentVideoInfo: frame \(timelineFrame.frame.id.value) has invalid frameIndex=\(info.frameIndex)", category: .ui)
-                _lastLoggedVideoInfoFrameID = -3
-            }
-            return nil
-        }
-        // Only log when frame ID changes
-        let frameID = timelineFrame.frame.id.value
-        if _lastLoggedVideoInfoFrameID != frameID {
-            Log.debug(
-                "[SimpleTimelineViewModel] currentVideoInfo: frame \(frameID) videoPath=\(info.videoPath), frameIndex=\(info.frameIndex), processingStatus=\(timelineFrame.processingStatus)",
-                category: .ui
-            )
-            _lastLoggedVideoInfoFrameID = frameID
         }
         return info
     }
@@ -2045,30 +2308,14 @@ public class SimpleTimelineViewModel: ObservableObject {
         cacheExpansionTask?.cancel()
         appBlockSnapshotBuildTask?.cancel()
         appBlockSnapshotApplyTask?.cancel()
+        availableAppsForFilterLoadTask?.cancel()
+        filterPanelSupportingDataLoadTask?.cancel()
         pendingDeleteCommitTask?.cancel()
-
-        MemoryLedger.set(
-            tag: Self.memoryLedgerDiskBufferTag,
-            bytes: 0,
-            count: 0,
-            unit: "frames",
-            function: "ui.timeline",
-            kind: "disk-frame-buffer"
-        )
-        MemoryLedger.set(
-            tag: Self.memoryLedgerFrameWindowTag,
-            bytes: 0,
-            count: 0,
-            unit: "frames",
-            function: "ui.timeline",
-            kind: "frame-window"
-        )
+        positionRecoveryHintDismissTask?.cancel()
+        Self.clearTimelineMemoryLedger()
     }
 
     // MARK: - Private State
-
-    /// Last logged frame ID for currentVideoInfo (prevents duplicate logs from SwiftUI view updates)
-    private var _lastLoggedVideoInfoFrameID: Int64?
 
     /// Sub-frame pixel offset for continuous tape scrolling.
     /// Represents how far the tape has moved beyond the current frame center.
@@ -2076,6 +2323,10 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Task for debouncing scroll end detection
     private var scrollDebounceTask: Task<Void, Never>?
+
+    /// Once the user scrubs during a visible timeline session, background refreshes should stop
+    /// auto-advancing the playhead until the next show cycle.
+    private var hasStartedScrubbingThisVisibleSession = false
 
     /// Task for tape drag momentum animation
     private var tapeDragMomentumTask: Task<Void, Never>?
@@ -2126,7 +2377,9 @@ public class SimpleTimelineViewModel: ObservableObject {
         didSet {
             let oldCount = oldValue.count
             let newCount = diskFrameBufferIndex.count
-            diskFrameBufferBytes = Self.estimatedDiskFrameBufferBytes(diskFrameBufferIndex)
+            diskFrameBufferBytes = diskFrameBufferIndex.values.reduce(into: Int64(0)) { total, entry in
+                total += entry.sizeBytes
+            }
             if oldCount != newCount {
                 if Self.isVerboseTimelineLoggingEnabled {
                     Log.debug(
@@ -2155,6 +2408,17 @@ public class SimpleTimelineViewModel: ObservableObject {
     nonisolated private static let memoryLedgerSummaryIntervalSeconds: TimeInterval = 30
     nonisolated private static let memoryLedgerDiskBufferTag = "ui.timeline.diskFrameBuffer"
     nonisolated private static let memoryLedgerFrameWindowTag = "ui.timeline.frameWindow"
+    nonisolated private static let memoryLedgerCurrentImageTag = "ui.timeline.currentImage"
+    nonisolated private static let memoryLedgerWaitingFallbackTag = "ui.timeline.waitingFallbackImage"
+    nonisolated private static let memoryLedgerLiveScreenshotTag = "ui.timeline.liveScreenshot"
+    nonisolated private static let memoryLedgerShiftDragSnapshotTag = "ui.timeline.shiftDragSnapshot"
+    nonisolated private static let memoryLedgerOCRNodesTag = "ui.timeline.ocrNodes"
+    nonisolated private static let memoryLedgerPreviousOCRNodesTag = "ui.timeline.previousOcrNodes"
+    nonisolated private static let memoryLedgerHyperlinkMatchesTag = "ui.timeline.hyperlinkMatches"
+    nonisolated private static let memoryLedgerAppBlockSnapshotTag = "ui.timeline.appBlockSnapshot"
+    nonisolated private static let memoryLedgerTagCatalogTag = "ui.timeline.tagCatalog"
+    nonisolated private static let memoryLedgerNodeSelectionCacheTag = "ui.timeline.nodeSelectionCache"
+    nonisolated private static let memoryLedgerPendingExpansionTag = "ui.timeline.cacheExpansionQueue"
     private var diskFrameBufferInitializationTask: Task<Void, Never>?
     nonisolated private static let appLaunchDate = Date(timeIntervalSinceNow: -ProcessInfo.processInfo.systemUptime)
     private var diskFrameBufferMemoryLogTask: Task<Void, Never>?
@@ -2260,6 +2524,9 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Flag to prevent concurrent loads in the "newer" direction
     private var isLoadingNewer = false
 
+    /// Monotonic generation used to invalidate stale boundary-pagination responses after view-context changes.
+    private var boundaryLoadContextGeneration: UInt64 = 0
+
     /// In-flight boundary load tasks. Cancel these when a jump/reload replaces the frame window.
     private var olderBoundaryLoadTask: Task<Void, Never>?
     private var newerBoundaryLoadTask: Task<Void, Never>?
@@ -2296,6 +2563,31 @@ public class SimpleTimelineViewModel: ObservableObject {
     private static let cachedFilterSavedAtKey = "timeline.cachedFilterSavedAt"
     /// How long the cached filter criteria remains valid (2 minutes)
     private static let filterCacheExpirationSeconds: TimeInterval = 120
+    nonisolated private static let rewindAppBundleIDCacheVersion = 1
+
+    struct RewindAppBundleIDCacheContext: Codable, Equatable {
+        let cutoffDate: Date
+        let effectiveRewindDatabasePath: String
+        let useRewindData: Bool
+    }
+
+    private struct RewindAppBundleIDCachePayload: Codable {
+        let version: Int
+        let bundleIDs: [String]
+        let context: RewindAppBundleIDCacheContext
+    }
+
+    private enum RewindAppBundleIDCacheReadResult {
+        case cacheHit([String])
+        case cacheMiss
+        case invalidate(String)
+    }
+
+    /// File path for cached Rewind app bundle IDs used by the timeline filter.
+    nonisolated static var cachedRewindAppBundleIDsPath: URL {
+        let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
+        return cacheDir.appendingPathComponent("timeline_rewind_app_bundle_ids.json")
+    }
 
     // MARK: - Background Refresh Throttling
 
@@ -2389,6 +2681,12 @@ public class SimpleTimelineViewModel: ObservableObject {
             segmentCommentCountsMap: [Int64: Int]
         ))?
     }
+    struct AvailableAppsForFilterTestHooks {
+        var getInstalledApps: (() -> [AppInfo])?
+        var getDistinctAppBundleIDs: ((FrameSource?) async throws -> [String])?
+        var resolveAllBundleIDs: (([String]) -> [AppInfo])?
+        var skipSupportingPanelDataLoad = false
+    }
     var test_refreshProcessingStatusesHooks = RefreshProcessingStatusesTestHooks()
     var test_refreshFrameDataHooks = RefreshFrameDataTestHooks()
     var test_windowFetchHooks = WindowFetchTestHooks()
@@ -2398,6 +2696,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     var test_dragStartStillOCRHooks = DragStartStillOCRTestHooks()
     var test_blockCommentsHooks = BlockCommentsTestHooks()
     var test_tapeIndicatorRefreshHooks = TapeIndicatorRefreshTestHooks()
+    var test_availableAppsForFilterHooks = AvailableAppsForFilterTestHooks()
 #endif
 
     // MARK: - Initialization
@@ -2462,31 +2761,150 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     private func logDiskFrameBufferMemorySnapshot() {
-        Log.info(
-            "[Timeline-Memory] diskFrameBufferCount=\(diskFrameBufferIndex.count) diskFrameBufferBytes=\(Self.formatBytes(diskFrameBufferBytes)) frameWindowCount=\(frames.count)",
-            category: .ui
-        )
         updateTimelineMemoryLedger()
         logAndResetDiskFrameBufferTelemetry()
     }
 
     private func updateTimelineMemoryLedger() {
+        let frameWindowBytes = TimelineMemoryEstimator.frameWindowBytes(frames)
+        let currentImageBytes = UIMemoryEstimator.imageBytes(for: currentImage)
+        let waitingFallbackBytes = UIMemoryEstimator.imageBytes(for: waitingFallbackImage)
+        let liveScreenshotBytes = UIMemoryEstimator.imageBytes(for: liveScreenshot)
+        let shiftDragSnapshotBytes = UIMemoryEstimator.imageBytes(for: shiftDragDisplaySnapshot)
+        let ocrNodeBytes = TimelineMemoryEstimator.ocrNodeBytes(ocrNodes)
+        let previousOCRNodeBytes = TimelineMemoryEstimator.ocrNodeBytes(previousOcrNodes)
+        let hyperlinkBytes = TimelineMemoryEstimator.hyperlinkBytes(hyperlinkMatches)
+        let appBlockSnapshotBytes = TimelineMemoryEstimator.appBlockSnapshotBytes(
+            blocks: _cachedAppBlockSnapshot?.blocks ?? [],
+            frameToBlockIndexCount: _cachedAppBlockSnapshot?.frameToBlockIndex.count ?? 0,
+            videoBoundaryCount: _cachedAppBlockSnapshot?.videoBoundaryIndices.count ?? 0,
+            segmentBoundaryCount: _cachedAppBlockSnapshot?.segmentBoundaryIndices.count ?? 0
+        )
+        let tagCatalogBytes = TimelineMemoryEstimator.tagCatalogBytes(cachedAvailableTagsByID)
+        let nodeSelectionCacheBytes = TimelineMemoryEstimator.nodeSelectionCacheBytes(
+            sortedNodes: cachedSortedNodes,
+            indexMapCount: cachedNodeIndexMap?.count ?? 0
+        )
+        let pendingExpansionBytes = TimelineMemoryEstimator.pendingExpansionBytes(
+            queuedVideoPaths: pendingCacheExpansionQueue.map(\.videoPath),
+            queuedOrInFlightCount: queuedOrInFlightCacheExpansionFrameIDs.count
+        )
+
         MemoryLedger.set(
             tag: Self.memoryLedgerDiskBufferTag,
             bytes: diskFrameBufferBytes,
             count: diskFrameBufferIndex.count,
             unit: "frames",
-            function: "ui.timeline",
+            function: "ui.timeline.state",
             kind: "disk-frame-buffer"
         )
         MemoryLedger.set(
             tag: Self.memoryLedgerFrameWindowTag,
-            bytes: 0,
+            bytes: frameWindowBytes,
             count: frames.count,
             unit: "frames",
-            function: "ui.timeline",
+            function: "ui.timeline.state",
             kind: "frame-window",
-            note: "count-only"
+            note: "estimated"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerCurrentImageTag,
+            bytes: currentImageBytes,
+            count: currentImage == nil ? 0 : 1,
+            unit: "images",
+            function: "ui.timeline.images",
+            kind: "current-frame",
+            note: "estimated"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerWaitingFallbackTag,
+            bytes: waitingFallbackBytes,
+            count: waitingFallbackImage == nil ? 0 : 1,
+            unit: "images",
+            function: "ui.timeline.images",
+            kind: "waiting-fallback",
+            note: "estimated"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerLiveScreenshotTag,
+            bytes: liveScreenshotBytes,
+            count: liveScreenshot == nil ? 0 : 1,
+            unit: "images",
+            function: "ui.timeline.images",
+            kind: "live-screenshot",
+            note: "estimated"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerShiftDragSnapshotTag,
+            bytes: shiftDragSnapshotBytes,
+            count: shiftDragDisplaySnapshot == nil ? 0 : 1,
+            unit: "images",
+            function: "ui.timeline.images",
+            kind: "zoom-snapshot",
+            note: "estimated"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerOCRNodesTag,
+            bytes: ocrNodeBytes,
+            count: ocrNodes.count,
+            unit: "nodes",
+            function: "ui.timeline.ocr_overlay",
+            kind: "ocr-nodes",
+            note: "estimated"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerPreviousOCRNodesTag,
+            bytes: previousOCRNodeBytes,
+            count: previousOcrNodes.count,
+            unit: "nodes",
+            function: "ui.timeline.ocr_overlay",
+            kind: "previous-ocr-nodes",
+            note: "estimated"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerHyperlinkMatchesTag,
+            bytes: hyperlinkBytes,
+            count: hyperlinkMatches.count,
+            unit: "matches",
+            function: "ui.timeline.ocr_overlay",
+            kind: "hyperlink-overlay",
+            note: "estimated"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerAppBlockSnapshotTag,
+            bytes: appBlockSnapshotBytes,
+            count: _cachedAppBlockSnapshot?.blocks.count ?? 0,
+            unit: "blocks",
+            function: "ui.timeline.state",
+            kind: "app-block-snapshot",
+            note: "estimated"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerTagCatalogTag,
+            bytes: tagCatalogBytes,
+            count: cachedAvailableTagsByID.count,
+            unit: "tags",
+            function: "ui.timeline.state",
+            kind: "tag-catalog",
+            note: "estimated"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerNodeSelectionCacheTag,
+            bytes: nodeSelectionCacheBytes,
+            count: cachedSortedNodes?.count ?? 0,
+            unit: "nodes",
+            function: "ui.timeline.state",
+            kind: "node-selection-cache",
+            note: "estimated"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerPendingExpansionTag,
+            bytes: pendingExpansionBytes,
+            count: queuedOrInFlightCacheExpansionFrameIDs.count,
+            unit: "frames",
+            function: "ui.timeline.state",
+            kind: "cache-expansion-queue",
+            note: "estimated"
         )
         MemoryLedger.emitSummary(
             reason: "ui.timeline.memory",
@@ -2538,6 +2956,10 @@ public class SimpleTimelineViewModel: ObservableObject {
             .appendingPathComponent("TimelineFrameBuffer", isDirectory: true)
     }
 
+    private static func defaultDiskFrameBufferDirectoryURL() -> URL {
+        timelineDiskFrameBufferDirectoryURL()
+    }
+
     nonisolated static func timelineDiskFrameBufferFileURL(for frameID: FrameID) -> URL {
         timelineDiskFrameBufferDirectoryURL()
             .appendingPathComponent("\(frameID.value)")
@@ -2574,10 +2996,6 @@ public class SimpleTimelineViewModel: ObservableObject {
             )
             return nil
         }
-    }
-
-    private static func defaultDiskFrameBufferDirectoryURL() -> URL {
-        timelineDiskFrameBufferDirectoryURL()
     }
 
     nonisolated private static func frameID(fromDiskFrameFileURL url: URL) -> FrameID? {
@@ -2911,6 +3329,15 @@ public class SimpleTimelineViewModel: ObservableObject {
         scheduleDiskFrameBufferInactivityCleanup()
     }
 
+    public func resetVisibleSessionScrubTracking(reason: String = "timeline shown") {
+        hasStartedScrubbingThisVisibleSession = false
+    }
+
+    func markVisibleSessionScrubStarted(source: String) {
+        guard !hasStartedScrubbingThisVisibleSession else { return }
+        hasStartedScrubbingThisVisibleSession = true
+    }
+
     private func readFrameDataFromDiskFrameBuffer(frameID: FrameID) async -> Data? {
         await awaitDiskFrameBufferInitializationIfNeeded()
         let existingEntry = diskFrameBufferIndex[frameID]
@@ -2982,6 +3409,35 @@ public class SimpleTimelineViewModel: ObservableObject {
         return formatter.string(fromByteCount: max(0, bytes))
     }
 
+    nonisolated private static func clearTimelineMemoryLedger() {
+        let zeroCountTags: [(tag: String, unit: String, function: String, kind: String)] = [
+            (Self.memoryLedgerDiskBufferTag, "frames", "ui.timeline.state", "disk-frame-buffer"),
+            (Self.memoryLedgerFrameWindowTag, "frames", "ui.timeline.state", "frame-window"),
+            (Self.memoryLedgerCurrentImageTag, "images", "ui.timeline.images", "current-frame"),
+            (Self.memoryLedgerWaitingFallbackTag, "images", "ui.timeline.images", "waiting-fallback"),
+            (Self.memoryLedgerLiveScreenshotTag, "images", "ui.timeline.images", "live-screenshot"),
+            (Self.memoryLedgerShiftDragSnapshotTag, "images", "ui.timeline.images", "zoom-snapshot"),
+            (Self.memoryLedgerOCRNodesTag, "nodes", "ui.timeline.ocr_overlay", "ocr-nodes"),
+            (Self.memoryLedgerPreviousOCRNodesTag, "nodes", "ui.timeline.ocr_overlay", "previous-ocr-nodes"),
+            (Self.memoryLedgerHyperlinkMatchesTag, "matches", "ui.timeline.ocr_overlay", "hyperlink-overlay"),
+            (Self.memoryLedgerAppBlockSnapshotTag, "blocks", "ui.timeline.state", "app-block-snapshot"),
+            (Self.memoryLedgerTagCatalogTag, "tags", "ui.timeline.state", "tag-catalog"),
+            (Self.memoryLedgerNodeSelectionCacheTag, "nodes", "ui.timeline.state", "node-selection-cache"),
+            (Self.memoryLedgerPendingExpansionTag, "frames", "ui.timeline.state", "cache-expansion-queue")
+        ]
+
+        for entry in zeroCountTags {
+            MemoryLedger.set(
+                tag: entry.tag,
+                bytes: 0,
+                count: 0,
+                unit: entry.unit,
+                function: entry.function,
+                kind: entry.kind
+            )
+        }
+    }
+
     private func summarizeFiltersForLog(_ filters: FilterCriteria) -> String {
         let appCount = filters.selectedApps?.count ?? 0
         let tagCount = filters.selectedTags?.count ?? 0
@@ -2993,16 +3449,11 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     private func logCmdFPlayheadState(
-        _ stage: String,
-        trace: CmdFQuickFilterLatencyTrace?,
-        targetTimestamp: Date? = nil,
-        extra: String? = nil
-    ) {
-        _ = stage
-        _ = trace
-        _ = targetTimestamp
-        _ = extra
-    }
+        _ _: String,
+        trace _: CmdFQuickFilterLatencyTrace?,
+        targetTimestamp _: Date? = nil,
+        extra _: String? = nil
+    ) {}
 
     private func setLoadingState(_ loading: Bool, reason: String) {
         if loading {
@@ -3568,7 +4019,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         logCmdFPlayheadState("reload.start", trace: cmdFTrace, targetTimestamp: timestamp)
         setLoadingState(true, reason: "reloadFramesAroundTimestamp")
         clearError()
-        cancelBoundaryLoadTasks(reason: "reloadFramesAroundTimestamp")
+        resetBoundaryLoads(reason: "reloadFramesAroundTimestamp")
 
         do {
             let calendar = Calendar.current
@@ -3757,12 +4208,6 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         Log.debug("[Delete] Frame \(frameID) removed from UI (optimistic deletion)", category: .ui)
 
-        DashboardViewModel.recordFrameDeleted(
-            coordinator: coordinator,
-            source: "timeline_delete",
-            frameID: frameID.value
-        )
-
         stagePendingDelete(
             PendingDeleteOperation(
                 id: UUID(),
@@ -3841,19 +4286,27 @@ public class SimpleTimelineViewModel: ObservableObject {
         restoreOnFailure: Bool
     ) async {
         do {
+            let result: FrameDeletionResult
             switch operation.payload {
             case .frame(let frameRef):
-                try await coordinator.deleteFrame(
+                result = try await coordinator.deleteFrame(
                     frameID: frameRef.id,
                     timestamp: frameRef.timestamp,
-                    source: frameRef.source
+                    source: frameRef.source,
+                    metricSource: "timeline_delete"
                 )
                 Log.debug("[Delete] Committed frame deletion frameID=\(frameRef.id.value) reason=\(reason)", category: .ui)
             case .frames(let frameRefs):
-                try await coordinator.deleteFrames(frameRefs)
+                result = try await coordinator.deleteFrames(
+                    frameRefs,
+                    metricSource: "timeline_delete"
+                )
                 Log.debug("[Delete] Committed segment deletion frames=\(frameRefs.count) reason=\(reason)", category: .ui)
             }
             clearPendingDeletedFrameIDs(operation.removedFrameIDs, reason: "commit-success.\(reason)")
+            if result.hasQueuedFrames {
+                showToast(queuedDeletionToastMessage(for: result), icon: "clock.badge.exclamationmark.fill")
+            }
         } catch {
             Log.error("[Delete] Failed to persist deletion reason=\(reason): \(error)", category: .ui)
             if restoreOnFailure {
@@ -3864,6 +4317,13 @@ public class SimpleTimelineViewModel: ObservableObject {
                 showToast("Delete may not have persisted", icon: "exclamationmark.triangle.fill")
             }
         }
+    }
+
+    private func queuedDeletionToastMessage(for result: FrameDeletionResult) -> String {
+        if result.completedFrames > 0 {
+            return "Deleted \(result.completedFrames) frame\(result.completedFrames == 1 ? "" : "s"); queued \(result.queuedFrames) for disk rewrite"
+        }
+        return "Deletion queued for \(result.queuedFrames) frame\(result.queuedFrames == 1 ? "" : "s")"
     }
 
     private func clearPendingDeletedFrameIDs(_ frameIDs: [FrameID], reason: String) {
@@ -4089,14 +4549,6 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         Log.debug("[Delete] Segment with \(deleteCount) frames removed from UI (optimistic deletion)", category: .ui)
 
-        let uniqueSegmentCount = Set(framesToDelete.map { $0.segmentID.value }).count
-        DashboardViewModel.recordSegmentDeleted(
-            coordinator: coordinator,
-            source: "timeline_delete",
-            segmentCount: uniqueSegmentCount,
-            frameCount: deleteCount
-        )
-
         stagePendingDelete(
             PendingDeleteOperation(
                 id: UUID(),
@@ -4118,6 +4570,69 @@ public class SimpleTimelineViewModel: ObservableObject {
         async let tagsTask: Void = loadTags()
         async let commentsTask: Void = loadCommentsForSelectedTimelineBlock()
         _ = await (tagsTask, commentsTask)
+    }
+
+    @discardableResult
+    func presentTimelineContextMenu(
+        at anchorIndex: Int,
+        menuLocation: CGPoint? = nil,
+        source: TimelineContextMenuPresentationSource
+    ) -> Bool {
+        guard anchorIndex >= 0, anchorIndex < frames.count else { return false }
+
+        clearTimelineTapeRightClickHint()
+        cancelSelectedBlockCommentsLoad()
+        timelineContextMenuSegmentIndex = anchorIndex
+        selectedFrameIndex = anchorIndex
+        showTagSubmenu = false
+        showCommentSubmenu = false
+        isHoveringAddTagButton = false
+        isHoveringAddCommentButton = false
+        selectedSegmentTags = []
+        showNewTagInput = false
+        newTagName = ""
+        newCommentText = ""
+        newCommentAttachmentDrafts = []
+        selectedBlockComments = []
+        selectedBlockCommentPreferredSegmentByID = [:]
+        blockCommentsLoadError = nil
+        isLoadingBlockComments = false
+        timelineContextMenuPresentationSource = source
+        resetCommentTimelineState()
+
+        if let resolvedLocation = menuLocation ?? currentMouseLocationInContentCoordinates() {
+            timelineContextMenuLocation = resolvedLocation
+        }
+
+        showTimelineContextMenu = true
+        return true
+    }
+
+    /// Opens the timeline action menu for a specific frame selection.
+    public func openTimelineContextMenu(at anchorIndex: Int, menuLocation: CGPoint? = nil) {
+        guard presentTimelineContextMenu(
+            at: anchorIndex,
+            menuLocation: menuLocation,
+            source: .secondaryClick
+        ) else { return }
+        Task { await loadTimelineContextMenuData() }
+    }
+
+    /// Opens the timeline action menu for a block using the best in-block anchor.
+    public func openTimelineContextMenuForTimelineBlock(_ block: AppBlock) {
+        guard block.frameCount > 0 else { return }
+
+        let anchorIndex = Self.resolvePreferredCommentTargetIndex(
+            in: block,
+            currentIndex: currentIndex,
+            selectedFrameIndex: selectedFrameIndex,
+            timelineContextMenuSegmentIndex: timelineContextMenuSegmentIndex
+        )
+        guard presentTimelineContextMenu(
+            at: anchorIndex,
+            source: .actionBubble
+        ) else { return }
+        Task { await loadTimelineContextMenuData() }
     }
 
     public func recordTagSubmenuOpen(source: String, block: AppBlock? = nil) {
@@ -4195,11 +4710,13 @@ public class SimpleTimelineViewModel: ObservableObject {
             return
         }
 
+        clearTimelineTapeRightClickHint()
         withAnimation(.easeOut(duration: Self.timelineMenuDismissAnimationDuration)) {
             showTimelineContextMenu = false
             showCommentSubmenu = true
             showTagSubmenu = true
         }
+        timelineContextMenuPresentationSource = nil
         recordTagSubmenuOpen(source: source, block: block)
 
         Task { await loadTags() }
@@ -4215,6 +4732,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             selectedFrameIndex: selectedFrameIndex,
             timelineContextMenuSegmentIndex: timelineContextMenuSegmentIndex
         )
+        clearTimelineTapeRightClickHint()
         timelineContextMenuSegmentIndex = anchorIndex
         selectedFrameIndex = anchorIndex
         newCommentText = ""
@@ -4228,6 +4746,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         currentCommentMetricsSource = source
         isHoveringAddTagButton = false
         isHoveringAddCommentButton = false
+        timelineContextMenuPresentationSource = nil
 
         if let pointerLocation = currentMouseLocationInContentCoordinates() {
             timelineContextMenuLocation = pointerLocation
@@ -4299,6 +4818,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     ) {
         guard anchorIndex >= 0, anchorIndex < frames.count else { return }
 
+        clearTimelineTapeRightClickHint()
         timelineContextMenuSegmentIndex = anchorIndex
         selectedFrameIndex = anchorIndex
         newCommentText = ""
@@ -4313,6 +4833,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         showCommentSubmenu = false
         isHoveringAddTagButton = true
         isHoveringAddCommentButton = false
+        timelineContextMenuPresentationSource = nil
 
         if let pointerLocation = currentMouseLocationInContentCoordinates() {
             timelineContextMenuLocation = pointerLocation
@@ -4450,7 +4971,8 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     private func currentMouseLocationInContentCoordinates() -> CGPoint? {
-        guard let window = NSApp.keyWindow,
+        let application = NSApplication.shared
+        guard let window = application.keyWindow ?? application.mainWindow,
               let contentView = window.contentView else {
             return nil
         }
@@ -6195,43 +6717,280 @@ public class SimpleTimelineViewModel: ObservableObject {
             return
         }
 
-        // Skip if already loaded
-        guard availableAppsForFilter.isEmpty else {
+        let rewindCacheContext = Self.currentRewindAppBundleIDCacheContext()
+        let needsInstalledApps = !hasLoadedInstalledAppsForFilter
+        let needsHistoricalApps = !hasLoadedHistoricalAppsForFilter || lastHistoricalAppsForFilterContext != rewindCacheContext
+        guard needsInstalledApps || needsHistoricalApps else {
             Log.debug("[Filter] loadAvailableAppsForFilter skipped - already have \(availableAppsForFilter.count) apps", category: .ui)
             return
         }
 
         isLoadingAppsForFilter = true
+        isRefreshingRewindAppsForFilter = false
         let startTime = CFAbsoluteTimeGetCurrent()
+        defer {
+            isLoadingAppsForFilter = false
+            isRefreshingRewindAppsForFilter = false
+        }
 
-        // Phase 1: Instant - get installed apps from /Applications folder
-        let installed = AppNameResolver.shared.getInstalledApps()
+        if needsHistoricalApps, hasLoadedHistoricalAppsForFilter {
+            otherAppsForFilter = []
+        }
+
+        // Phase 1: Load installed apps off-main, then publish immediately.
+        let installed: [AppInfo]
+        if needsInstalledApps {
+            installed = await installedAppsForFilter()
+        } else {
+            installed = availableAppsForFilter.map { AppInfo(bundleID: $0.bundleID, name: $0.name) }
+        }
         let installedBundleIDs = Set(installed.map { $0.bundleID })
         let allApps = installed.map { (bundleID: $0.bundleID, name: $0.name) }
         Log.info("[Filter] Phase 1: Loaded \(allApps.count) installed apps in \(Int((CFAbsoluteTimeGetCurrent() - startTime) * 1000))ms", category: .ui)
 
-        // Update UI immediately with installed apps
-        availableAppsForFilter = allApps.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        guard !Task.isCancelled else { return }
 
-        // Phase 2: Load apps from DB that aren't installed (historical apps)
-        do {
-            let bundleIDs = try await coordinator.getDistinctAppBundleIDs()
-            let dbApps = AppNameResolver.shared.resolveAll(bundleIDs: bundleIDs)
-            let historicalApps = dbApps
-                .filter { !installedBundleIDs.contains($0.bundleID) }
-                .map { (bundleID: $0.bundleID, name: $0.name) }
+        // Update UI immediately with installed apps.
+        if needsInstalledApps {
+            availableAppsForFilter = allApps.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+            hasLoadedInstalledAppsForFilter = true
+        }
 
+        // Phase 2: Load historical apps after installed apps are already visible.
+        if needsHistoricalApps {
+            let historicalApps = await loadHistoricalAppsForFilter(
+                installedBundleIDs: installedBundleIDs,
+                rewindCacheContext: rewindCacheContext
+            )
+            guard !Task.isCancelled else { return }
+            otherAppsForFilter = historicalApps
+            hasLoadedHistoricalAppsForFilter = true
+            lastHistoricalAppsForFilterContext = rewindCacheContext
             if !historicalApps.isEmpty {
-                otherAppsForFilter = historicalApps.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
                 Log.info("[Filter] Phase 2: Added \(historicalApps.count) historical apps to otherAppsForFilter", category: .ui)
             }
-        } catch {
-            Log.error("[Filter] Failed to load apps from DB: \(error)", category: .ui)
         }
 
         let totalTime = CFAbsoluteTimeGetCurrent() - startTime
         Log.info("[Filter] Total: \(availableAppsForFilter.count) installed + \(otherAppsForFilter.count) other apps loaded in \(Int(totalTime * 1000))ms", category: .ui)
-        isLoadingAppsForFilter = false
+    }
+
+    private func loadHistoricalAppsForFilter(
+        installedBundleIDs: Set<String>,
+        rewindCacheContext: RewindAppBundleIDCacheContext
+    ) async -> [(bundleID: String, name: String)] {
+        async let nativeBundleIDsTask = distinctAppBundleIDsForFilter(source: .native)
+
+        var rewindBundleIDs: [String] = []
+        if rewindCacheContext.useRewindData {
+            if let cachedBundleIDs = await Self.loadCachedRewindAppBundleIDs(matching: rewindCacheContext) {
+                rewindBundleIDs = cachedBundleIDs
+                Log.info("[Filter] Loaded \(cachedBundleIDs.count) Rewind app bundle IDs from cache", category: .ui)
+            } else {
+                isRefreshingRewindAppsForFilter = true
+                defer { isRefreshingRewindAppsForFilter = false }
+                do {
+                    rewindBundleIDs = try await distinctAppBundleIDsForFilter(source: .rewind)
+                    await Self.saveCachedRewindAppBundleIDs(rewindBundleIDs, context: rewindCacheContext)
+                    Log.info("[Filter] Cached \(rewindBundleIDs.count) Rewind app bundle IDs", category: .ui)
+                } catch {
+                    Log.error("[Filter] Failed to load Rewind app bundle IDs: \(error)", category: .ui)
+                }
+            }
+        } else {
+            await Self.removeCachedRewindAppBundleIDs()
+        }
+
+        var nativeBundleIDs: [String] = []
+        do {
+            nativeBundleIDs = try await nativeBundleIDsTask
+        } catch {
+            Log.error("[Filter] Failed to load native app bundle IDs: \(error)", category: .ui)
+        }
+
+        let bundleIDs = Array(Set(nativeBundleIDs).union(rewindBundleIDs)).sorted()
+        guard !bundleIDs.isEmpty else {
+            return []
+        }
+
+        let dbApps = await resolveAppsForFilter(bundleIDs: bundleIDs)
+        return dbApps
+            .filter { !installedBundleIDs.contains($0.bundleID) }
+            .map { (bundleID: $0.bundleID, name: $0.name) }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    private func needsAvailableAppsForFilterLoad() -> Bool {
+        let rewindCacheContext = Self.currentRewindAppBundleIDCacheContext()
+        return !hasLoadedInstalledAppsForFilter
+            || !hasLoadedHistoricalAppsForFilter
+            || lastHistoricalAppsForFilterContext != rewindCacheContext
+    }
+
+    private func startAvailableAppsForFilterLoadIfNeeded() {
+        guard needsAvailableAppsForFilterLoad() else { return }
+        guard availableAppsForFilterLoadTask == nil else { return }
+
+        availableAppsForFilterLoadTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.availableAppsForFilterLoadTask = nil }
+            await self.loadAvailableAppsForFilter()
+        }
+    }
+
+    private func scheduleFilterPanelSupportingDataLoad() {
+#if DEBUG
+        if test_availableAppsForFilterHooks.skipSupportingPanelDataLoad {
+            return
+        }
+#endif
+        filterPanelSupportingDataLoadTask?.cancel()
+        filterPanelSupportingDataLoadTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.filterPanelSupportingDataLoadTask = nil }
+            try? await Task.sleep(for: .milliseconds(200), clock: .continuous)
+            guard !Task.isCancelled else { return }
+            await self.loadFilterPanelSupportingDataBatched()
+        }
+    }
+
+    private func installedAppsForFilter() async -> [AppInfo] {
+#if DEBUG
+        if let getInstalledApps = test_availableAppsForFilterHooks.getInstalledApps {
+            return getInstalledApps()
+        }
+#endif
+        return await Task.detached(priority: .utility) {
+            AppNameResolver.shared.getInstalledApps()
+        }.value
+    }
+
+    private func distinctAppBundleIDsForFilter(source: FrameSource?) async throws -> [String] {
+#if DEBUG
+        if let getDistinctAppBundleIDs = test_availableAppsForFilterHooks.getDistinctAppBundleIDs {
+            return try await getDistinctAppBundleIDs(source)
+        }
+#endif
+        return try await coordinator.getDistinctAppBundleIDs(source: source)
+    }
+
+    private func resolveAppsForFilter(bundleIDs: [String]) async -> [AppInfo] {
+#if DEBUG
+        if let resolveAllBundleIDs = test_availableAppsForFilterHooks.resolveAllBundleIDs {
+            return resolveAllBundleIDs(bundleIDs)
+        }
+#endif
+        return await Task.detached(priority: .utility) {
+            AppNameResolver.shared.resolveAll(bundleIDs: bundleIDs)
+        }.value
+    }
+
+    nonisolated private static func currentRewindAppBundleIDCacheContext() -> RewindAppBundleIDCacheContext {
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        return RewindAppBundleIDCacheContext(
+            cutoffDate: ServiceContainer.rewindCutoffDate(in: defaults),
+            effectiveRewindDatabasePath: normalizedFilesystemPath(AppPaths.rewindDBPath),
+            useRewindData: defaults.bool(forKey: "useRewindData")
+        )
+    }
+
+    nonisolated private static func normalizedFilesystemPath(_ path: String) -> String {
+        let expanded = NSString(string: path).expandingTildeInPath
+        let resolved = NSString(string: expanded).resolvingSymlinksInPath
+        return URL(fileURLWithPath: resolved).standardizedFileURL.path
+    }
+
+    nonisolated private static func normalizedRewindAppBundleIDs(_ bundleIDs: [String]) -> [String] {
+        Array(Set(bundleIDs)).sorted()
+    }
+
+    nonisolated static func loadCachedRewindAppBundleIDs(
+        matching context: RewindAppBundleIDCacheContext,
+        from fileURL: URL? = nil
+    ) async -> [String]? {
+        let url = fileURL ?? cachedRewindAppBundleIDsPath
+
+        let readResult = await Task.detached(priority: .utility) { () -> RewindAppBundleIDCacheReadResult in
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                return .cacheMiss
+            }
+
+            do {
+                let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+                let payload = try JSONDecoder().decode(RewindAppBundleIDCachePayload.self, from: data)
+
+                guard payload.version == Self.rewindAppBundleIDCacheVersion else {
+                    return .invalidate("version mismatch")
+                }
+
+                guard payload.context == context else {
+                    var mismatches: [String] = []
+                    if payload.context.cutoffDate != context.cutoffDate {
+                        mismatches.append("cutoffDate")
+                    }
+                    if payload.context.effectiveRewindDatabasePath != context.effectiveRewindDatabasePath {
+                        mismatches.append("effectiveRewindDatabasePath")
+                    }
+                    if payload.context.useRewindData != context.useRewindData {
+                        mismatches.append("useRewindData")
+                    }
+
+                    let mismatchDescription = mismatches.isEmpty ? "context mismatch" : "context mismatch: \(mismatches.joined(separator: ", "))"
+                    return .invalidate(mismatchDescription)
+                }
+
+                return .cacheHit(Self.normalizedRewindAppBundleIDs(payload.bundleIDs))
+            } catch {
+                return .invalidate("decode failed: \(error.localizedDescription)")
+            }
+        }.value
+
+        switch readResult {
+        case .cacheHit(let bundleIDs):
+            return bundleIDs
+        case .cacheMiss:
+            return nil
+        case .invalidate(let reason):
+            Log.info("[Filter] Invalidating Rewind app bundle ID cache (\(reason))", category: .ui)
+            await removeCachedRewindAppBundleIDs(at: url)
+            return nil
+        }
+    }
+
+    nonisolated static func saveCachedRewindAppBundleIDs(
+        _ bundleIDs: [String],
+        context: RewindAppBundleIDCacheContext,
+        to fileURL: URL? = nil
+    ) async {
+        let url = fileURL ?? cachedRewindAppBundleIDsPath
+        let payload = RewindAppBundleIDCachePayload(
+            version: rewindAppBundleIDCacheVersion,
+            bundleIDs: normalizedRewindAppBundleIDs(bundleIDs),
+            context: context
+        )
+
+        do {
+            try await Task.detached(priority: .utility) {
+                let directoryURL = url.deletingLastPathComponent()
+                try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+                let data = try JSONEncoder().encode(payload)
+                try data.write(to: url, options: .atomic)
+            }.value
+        } catch {
+            Log.error("[Filter] Failed to save cached Rewind app bundle IDs: \(error)", category: .ui)
+        }
+    }
+
+    nonisolated static func removeCachedRewindAppBundleIDs(at fileURL: URL? = nil) async {
+        let url = fileURL ?? cachedRewindAppBundleIDsPath
+        do {
+            try await Task.detached(priority: .utility) {
+                guard FileManager.default.fileExists(atPath: url.path) else { return }
+                try FileManager.default.removeItem(at: url)
+            }.value
+        } catch {
+            Log.error("[Filter] Failed to remove cached Rewind app bundle IDs: \(error)", category: .ui)
+        }
     }
 
     /// Load segment-to-tags mapping for efficient tag filtering
@@ -6323,6 +7082,28 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
     }
 
+    public func recordKeyboardShortcut(_ shortcut: String) {
+        DashboardViewModel.recordKeyboardShortcut(coordinator: coordinator, shortcut: shortcut)
+    }
+
+    private func recordSearchResultNavigation(
+        direction: String,
+        trigger: SearchResultNavigationTrigger,
+        state: SearchViewModel.ResultNavigationState,
+        didMove: Bool,
+        didRequestMore: Bool
+    ) {
+        TimelineMetrics.recordSearchResultNavigation(
+            coordinator: coordinator,
+            direction: direction,
+            trigger: trigger.metricTrigger,
+            position: state.currentPosition,
+            loadedCount: state.loadedCount,
+            didMove: didMove,
+            didRequestMore: didRequestMore
+        )
+    }
+
     /// Starts a latency trace for app quick-filter execution.
     /// The trace is consumed by the next filter reload path.
     public func beginCmdFQuickFilterLatencyTrace(
@@ -6331,10 +7112,6 @@ public class SimpleTimelineViewModel: ObservableObject {
         trigger: String,
         source: FrameSource
     ) {
-        _ = bundleID
-        _ = action
-        _ = trigger
-        _ = source
         pendingCmdFQuickFilterLatencyTrace = nil
     }
 
@@ -6383,9 +7160,10 @@ public class SimpleTimelineViewModel: ObservableObject {
             extra: "applied={\(summarizeFiltersForLog(filterCriteria))}"
         )
 
-        // Record timeline filter metric with JSON of applied filters
-        let filterJson = buildTimelineFilterJson()
-        DashboardViewModel.recordTimelineFilter(coordinator: coordinator, filterJson: filterJson)
+        DashboardViewModel.recordTimelineFilter(
+            coordinator: coordinator,
+            metadata: buildTimelineFilterMetricMetadata()
+        )
 
         if dismissPanel {
             dismissFilterPanel()
@@ -6508,43 +7286,15 @@ public class SimpleTimelineViewModel: ObservableObject {
         saveFilterCriteria()
     }
 
-    /// Build JSON representation of active timeline filters for metrics
-    private func buildTimelineFilterJson() -> String {
-        var components: [String] = []
-
-        if let apps = filterCriteria.selectedApps, !apps.isEmpty {
-            let appsArray = apps.map { "\"\($0)\"" }.joined(separator: ",")
-            components.append("\"bundleIDs\":[\(appsArray)]")
-        }
-
-        if let windowName = filterCriteria.windowNameFilter {
-            let escaped = windowName.replacingOccurrences(of: "\"", with: "\\\"")
-            components.append("\"windowName\":\"\(escaped)\"")
-        }
-
-        if let browserUrl = filterCriteria.browserUrlFilter {
-            let escaped = browserUrl.replacingOccurrences(of: "\"", with: "\\\"")
-            components.append("\"browserUrl\":\"\(escaped)\"")
-        }
-
+    private func buildTimelineFilterMetricMetadata() -> TimelineFilterMetricMetadata {
         let effectiveDateRanges = filterCriteria.effectiveDateRanges
-        if effectiveDateRanges.count == 1 {
-            if let startDate = effectiveDateRanges[0].start {
-                components.append("\"startDate\":\"\(Log.timestamp(from: startDate))\"")
-            }
-            if let endDate = effectiveDateRanges[0].end {
-                components.append("\"endDate\":\"\(Log.timestamp(from: endDate))\"")
-            }
-        } else if !effectiveDateRanges.isEmpty {
-            let encodedRanges = effectiveDateRanges.map { range in
-                let start = range.start.map { "\"\(Log.timestamp(from: $0))\"" } ?? "null"
-                let end = range.end.map { "\"\(Log.timestamp(from: $0))\"" } ?? "null"
-                return "{\"start\":\(start),\"end\":\(end)}"
-            }.joined(separator: ",")
-            components.append("\"dateRanges\":[\(encodedRanges)]")
-        }
-
-        return "{\(components.joined(separator: ","))}"
+        return TimelineFilterMetricMetadata(
+            hasAppFilter: !(filterCriteria.selectedApps?.isEmpty ?? true),
+            hasWindowFilter: !(filterCriteria.windowNameFilter?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true),
+            hasURLFilter: !(filterCriteria.browserUrlFilter?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true),
+            hasStartDate: effectiveDateRanges.contains(where: { $0.start != nil }),
+            hasEndDate: effectiveDateRanges.contains(where: { $0.end != nil })
+        )
     }
 
     // MARK: - Peek Mode (View Full Context)
@@ -6621,6 +7371,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Restore timeline state from a snapshot
     private func restoreTimelineState(_ snapshot: TimelineStateSnapshot) {
+        resetBoundaryLoads(reason: "restoreTimelineState")
         let normalized = normalizedTimelineFilterCriteria(snapshot.filterCriteria)
         filterCriteria = normalized
         pendingFilterCriteria = normalized
@@ -6742,7 +7493,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Clear stale timeline content when active filters yield zero matches.
     private func applyFilteredEmptyTimelineState(context: String) {
         let clearedFrameCount = frames.count
-        cancelBoundaryLoadTasks(reason: "filteredEmpty.\(context)")
+        resetBoundaryLoads(reason: "filteredEmpty.\(context)")
         pendingCurrentIndexAfterFrameReplacement = nil
         selectedFrameIndex = nil
         frames = []
@@ -6766,6 +7517,15 @@ public class SimpleTimelineViewModel: ObservableObject {
         showErrorWithAutoDismiss("No frames found matching the current filters. Clear filters to see all frames.")
     }
 
+    private func invalidateBoundaryLoadContext(reason _: String) {
+        boundaryLoadContextGeneration &+= 1
+    }
+
+    private func resetBoundaryLoads(reason: String) {
+        invalidateBoundaryLoadContext(reason: reason)
+        cancelBoundaryLoadTasks(reason: reason)
+    }
+
     private func cancelBoundaryLoadTasks(reason: String) {
         let hadOlder = olderBoundaryLoadTask != nil
         let hadNewer = newerBoundaryLoadTask != nil
@@ -6779,7 +7539,10 @@ public class SimpleTimelineViewModel: ObservableObject {
         isLoadingNewer = false
 
         if hadOlder || hadNewer {
-            Log.debug("[InfiniteScroll] Cancelled boundary tasks (\(reason)) older=\(hadOlder) newer=\(hadNewer)", category: .ui)
+            Log.debug(
+                "[InfiniteScroll] Cancelled boundary tasks (\(reason)) older=\(hadOlder) newer=\(hadNewer)",
+                category: .ui
+            )
         }
     }
 
@@ -6788,6 +7551,26 @@ public class SimpleTimelineViewModel: ObservableObject {
         hasMoreNewer = true
         hasReachedAbsoluteStart = false
         hasReachedAbsoluteEnd = false
+    }
+
+    private func applyNavigationFrameWindow(
+        _ framesWithVideoInfo: [FrameWithVideoInfo],
+        clearDiskBufferReason: String,
+        memoryLogContext: String? = nil
+    ) {
+        resetBoundaryLoads(reason: "applyNavigationFrameWindow")
+        let oldCacheCount = diskFrameBufferIndex.count
+        clearDiskFrameBuffer(reason: clearDiskBufferReason)
+        if let memoryLogContext, oldCacheCount > 0 {
+            Log.info(
+                "[Memory] Cleared disk frame buffer on \(memoryLogContext) (\(oldCacheCount) frames removed)",
+                category: .ui
+            )
+        }
+
+        frames = framesWithVideoInfo.map { TimelineFrame(frameWithVideoInfo: $0) }
+        updateWindowBoundaries()
+        resetBoundaryStateForReloadWindow()
     }
 
     private func logFrameWindowSummary(context: String, traceID: UInt64? = nil) {
@@ -6856,6 +7639,8 @@ public class SimpleTimelineViewModel: ObservableObject {
                 filterCriteria = normalized
             }
             pendingFilterCriteria = normalized
+            filterPanelSupportingDataLoadTask?.cancel()
+            filterPanelSupportingDataLoadTask = nil
             dismissFilterDropdown()
             isFilterPanelVisible = false
         }
@@ -6898,6 +7683,8 @@ public class SimpleTimelineViewModel: ObservableObject {
             filterCriteria = normalized
         }
         pendingFilterCriteria = normalized
+        filterPanelSupportingDataLoadTask?.cancel()
+        filterPanelSupportingDataLoadTask = nil
         dismissFilterDropdown()
         isFilterPanelVisible = false
     }
@@ -6918,55 +7705,29 @@ public class SimpleTimelineViewModel: ObservableObject {
         pendingFilterCriteria = normalized
         // Set visible immediately - animation is handled by the View
         isFilterPanelVisible = true
-        // Load data asynchronously - delay slightly to let animation complete first
-        Task {
-            // Small delay to let the panel animation complete before loading data
-            try? await Task.sleep(for: .nanoseconds(Int64(200_000_000)), clock: .continuous) // 200ms
-            await loadFilterPanelDataBatched()
-        }
+        // Start app loading immediately so the Apps dropdown can populate incrementally.
+        startAvailableAppsForFilterLoadIfNeeded()
+        // Keep the rest of the supporting data delayed so the panel animation stays smooth.
+        scheduleFilterPanelSupportingDataLoad()
     }
 
-    /// Load all filter panel data in a single batch to minimize re-renders
-    private func loadFilterPanelDataBatched() async {
-        // Skip if already loaded
-        let needsApps = availableAppsForFilter.isEmpty
+    /// Load non-app filter panel data in a single batch after the open animation completes.
+    private func loadFilterPanelSupportingDataBatched() async {
         let needsTags = !hasLoadedAvailableTags
         let needsHidden = hiddenSegmentIds.isEmpty
         let needsTagsMap = !hasLoadedSegmentTagsMap
 
-        guard needsApps || needsTags || needsHidden || needsTagsMap else {
+        guard needsTags || needsHidden || needsTagsMap else {
             return
         }
 
         // Collect all data first without updating @Published properties
-        var newApps: [(bundleID: String, name: String)] = []
-        var newOtherApps: [(bundleID: String, name: String)] = []
         var newTags: [Tag] = []
         var newHiddenSegmentIds: Set<SegmentID> = []
         var newSegmentTagsMap: [Int64: Set<Int64>] = [:]
         var loadedTags = false
         var loadedHiddenSegmentIDs = false
         var loadedSegmentTagsMap = false
-
-        // Load apps
-        if needsApps {
-            let installed = AppNameResolver.shared.getInstalledApps()
-            let installedBundleIDs = Set(installed.map { $0.bundleID })
-            newApps = installed.map { (bundleID: $0.bundleID, name: $0.name) }
-                .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
-
-            // Load historical apps from DB
-            do {
-                let bundleIDs = try await coordinator.getDistinctAppBundleIDs()
-                let dbApps = AppNameResolver.shared.resolveAll(bundleIDs: bundleIDs)
-                newOtherApps = dbApps
-                    .filter { !installedBundleIDs.contains($0.bundleID) }
-                    .map { (bundleID: $0.bundleID, name: $0.name) }
-                    .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
-            } catch {
-                Log.error("[Filter] Failed to load apps from DB: \(error)", category: .ui)
-            }
-        }
 
         // Load tags
         if needsTags {
@@ -6999,10 +7760,6 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
 
         // Now update all @Published properties in one batch
-        if needsApps {
-            availableAppsForFilter = newApps
-            otherAppsForFilter = newOtherApps
-        }
         if needsTags && loadedTags {
             availableTags = newTags
         }
@@ -7031,6 +7788,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     public func closeDateSearch() {
         withAnimation(.easeOut(duration: 0.15)) {
             isDateSearchActive = false
+            closeCalendarPicker()
         }
         dateSearchText = ""
         // Clear any date search errors when closing
@@ -7114,8 +7872,8 @@ public class SimpleTimelineViewModel: ObservableObject {
             return
         }
 
-        searchHighlightTimer?.invalidate()
-        searchHighlightTimer = nil
+        invalidateSearchResultNavigation()
+        cancelPendingSearchHighlightTasks()
         searchHighlightMode = .matchedTextRanges
         searchHighlightQuery = normalizedQuery
         isShowingSearchHighlight = true
@@ -7289,7 +8047,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Load the most recent frame on startup
     /// - Parameter clickStartTime: Optional start time from dashboard tab click for end-to-end timing
     public func loadMostRecentFrame(
-        clickStartTime: CFAbsoluteTime? = nil,
+        clickStartTime _: CFAbsoluteTime? = nil,
         refreshPresentation: Bool = true
     ) async {
         // Coalesce concurrent startup loads (e.g., TimelineWindowController.prepareWindow + SimpleTimelineView.onAppear).
@@ -7315,10 +8073,10 @@ public class SimpleTimelineViewModel: ObservableObject {
             isInitialLoadInProgress = false
             completeMostRecentLoadWaiters()
         }
-        _ = clickStartTime
 
         setLoadingState(true, reason: "loadMostRecentFrame")
         clearError()
+        resetBoundaryLoads(reason: "loadMostRecentFrame")
 
         do {
             // Load most recent frames
@@ -7418,7 +8176,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// - Parameters:
     ///   - framesWithVideoInfo: Pre-fetched frames from parallel query
     ///   - clickStartTime: Start time for end-to-end timing
-    public func loadFramesDirectly(_ framesWithVideoInfo: [FrameWithVideoInfo], clickStartTime: CFAbsoluteTime? = nil) async {
+    public func loadFramesDirectly(_ framesWithVideoInfo: [FrameWithVideoInfo], clickStartTime _: CFAbsoluteTime? = nil) async {
         // Guard against concurrent calls - use dedicated flag to avoid race conditions
         guard !isInitialLoadInProgress && !isLoading else {
             Log.debug("[SimpleTimelineViewModel] loadFramesDirectly skipped - already loading", category: .ui)
@@ -7426,10 +8184,10 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
         isInitialLoadInProgress = true
         defer { isInitialLoadInProgress = false }
-        _ = clickStartTime
 
         setLoadingState(true, reason: "loadFramesDirectly")
         clearError()
+        resetBoundaryLoads(reason: "loadFramesDirectly")
 
         guard !framesWithVideoInfo.isEmpty else {
             if filterCriteria.hasActiveFilters {
@@ -7520,11 +8278,6 @@ public class SimpleTimelineViewModel: ObservableObject {
 
             if requiresFullReloadOnNextRefresh {
                 requiresFullReloadOnNextRefresh = false
-                Log.info(
-                    "[TIMELINE-REOPEN] forcing full reload after filter expiry navigateToNewest=\(shouldNavigateToNewest) frames=\(frames.count) index=\(currentIndex)",
-                    category: .ui
-                )
-
                 if shouldNavigateToNewest {
                     await loadMostRecentFrame(refreshPresentation: refreshPresentation)
                 } else if let timestamp = currentTimestamp {
@@ -7545,6 +8298,8 @@ public class SimpleTimelineViewModel: ObservableObject {
                         filters: filterCriteria,
                         reason: "refreshFrameData.navigateToNewest=\(shouldNavigateToNewest)"
                     )
+                    let shouldAutoAdvanceAfterFetch =
+                        shouldNavigateToNewest && !hasStartedScrubbingThisVisibleSession
 
                     // Filter to only truly new frames
                     let newFrames = newerFrames.filter { $0.frame.timestamp > newestCachedTimestamp }
@@ -7557,7 +8312,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                             // Preserve historical playhead when caller explicitly opted out of
                             // auto-advancing (timeline hide/reopen while scrubbing older frames).
                             // A full reload here would hard-reset to newest and break continuity.
-                            if shouldNavigateToNewest {
+                            if shouldAutoAdvanceAfterFetch {
                                 await loadMostRecentFrame(refreshPresentation: refreshPresentation)
                             }
                             return
@@ -7572,30 +8327,18 @@ public class SimpleTimelineViewModel: ObservableObject {
                         updateWindowBoundaries()
 
                         // Navigate to newest frame
-                        if shouldNavigateToNewest {
-                            let oldIndex = currentIndex
+                        if shouldAutoAdvanceAfterFetch {
                             currentIndex = frames.count - 1
-                            if oldIndex != currentIndex {
-                                Log.info(
-                                    "[TIMELINE-REOPEN] refreshSnap source=newFrames oldIndex=\(oldIndex) newIndex=\(currentIndex) appended=\(newTimelineFrames.count) total=\(frames.count)",
-                                    category: .ui
-                                )
-                            }
                         }
 
                         // Trim if we've exceeded max frames (preserve newer since we just added new frames)
                         trimWindowIfNeeded(preserveDirection: .newer)
-                    } else if shouldNavigateToNewest {
+                    } else if shouldAutoAdvanceAfterFetch {
                         // Reopen policy requested newest even if no fresh frame was appended.
                         // Without this, users can remain a few frames behind indefinitely on static screens.
                         let newestIndex = max(0, frames.count - 1)
                         if currentIndex != newestIndex {
-                            let oldIndex = currentIndex
                             currentIndex = newestIndex
-                            Log.info(
-                                "[TIMELINE-REOPEN] refreshSnap source=noNewFrames oldIndex=\(oldIndex) newIndex=\(newestIndex) total=\(frames.count)",
-                                category: .ui
-                            )
                         }
                     }
                 } catch {
@@ -7716,6 +8459,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         cancelDiskFrameBufferInactivityCleanup()
         cancelForegroundFrameLoad(reason: "compactPresentationState.\(reason)")
         cancelCacheExpansion(reason: "compactPresentationState.\(reason)")
+        cancelPendingDirectDecodeGenerators(reason: "compactPresentationState.\(reason)")
 
         isInLiveMode = false
         liveScreenshot = nil
@@ -7740,6 +8484,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         ocrStatus = .unknown
         ocrStatusPollingTask?.cancel()
         ocrStatusPollingTask = nil
+        clearPositionRecoveryHint(animated: false)
 
         if purgeDiskFrameBuffer {
             clearDiskFrameBuffer(reason: "compactPresentationState.\(reason)")
@@ -7870,6 +8615,18 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Navigate to a specific index in the frames array
     public func navigateToFrame(_ index: Int, fromScroll: Bool = false) {
+        performFrameNavigation(index, fromScroll: fromScroll, context: .manual)
+    }
+
+    private func navigateToFrameForSearchResult(_ index: Int) {
+        performFrameNavigation(index, fromScroll: false, context: .searchResult)
+    }
+
+    private func performFrameNavigation(
+        _ index: Int,
+        fromScroll: Bool,
+        context: FrameNavigationContext
+    ) {
         // Exit live mode on explicit navigation
         if isInLiveMode {
             exitLiveMode()
@@ -7884,14 +8641,19 @@ public class SimpleTimelineViewModel: ObservableObject {
         let clampedIndex = max(0, min(frames.count - 1, index))
         guard clampedIndex != currentIndex else { return }
         let previousIndex = currentIndex
+        clearPositionRecoveryHintForSupersedingNavigation()
 
         if !undonePositionHistory.isEmpty {
             undonePositionHistory.removeAll()
         }
 
         // Clear transient search-result highlight when manually navigating.
-        if isShowingSearchHighlight && !hasActiveInFrameSearchQuery {
-            clearSearchHighlight()
+        if context == .manual && !hasActiveInFrameSearchQuery {
+            if isShowingSearchHighlight {
+                clearSearchHighlight()
+            } else if isSearchResultNavigationModeActive {
+                clearSearchHighlightImmediately()
+            }
         }
         // Only dismiss search overlay if there's no active search query
         if isSearchOverlayVisible && searchViewModel.searchQuery.isEmpty {
@@ -7908,6 +8670,12 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
 
         currentIndex = clampedIndex
+        if clampedIndex >= frames.count - 1 && hasMoreNewer {
+            Log.info(
+                "[PLAYHEAD-EDGE] navigateToFrame fromScroll=\(fromScroll) requested=\(index) index=\(previousIndex)->\(clampedIndex) frameCount=\(frames.count) hasMoreNewer=\(hasMoreNewer) isLoadingNewer=\(isLoadingNewer) isActivelyScrolling=\(isActivelyScrolling) subFrameOffset=\(String(format: "%.1f", subFrameOffset))",
+                category: .ui
+            )
+        }
 
         if Self.isFilteredScrubDiagnosticsEnabled,
            filterCriteria.hasActiveFilters,
@@ -7986,6 +8754,22 @@ public class SimpleTimelineViewModel: ObservableObject {
             )
         }
         return didRecord
+    }
+
+    /// Preserve the current playhead as an undo target, then snap to newest immediately.
+    /// Used when hidden-state cache expiry advances reopen to "now".
+    @discardableResult
+    public func applyCacheBustReopenSnapToNewest(newestIndex: Int) -> Bool {
+        guard !frames.isEmpty else { return false }
+
+        let clampedNewestIndex = max(0, min(frames.count - 1, newestIndex))
+        guard clampedNewestIndex != currentIndex else { return false }
+
+        cancelPendingStoppedPositionRecording()
+        _ = recordCurrentPositionImmediatelyForUndo(reason: "timelineReopen.cacheBust.source")
+        currentIndex = clampedNewestIndex
+        _ = recordCurrentPositionImmediatelyForUndo(reason: "timelineReopen.cacheBust.destination")
+        return true
     }
 
     /// Record a position as a "stopped" position for undo history
@@ -8076,6 +8860,13 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         // Undo is an explicit timeline navigation action; clear transient search-result highlight.
         resetSearchHighlightState()
+        clearPositionRecoveryHint()
+
+        // History navigation targets historical frames, so it must leave live mode even
+        // when the destination frame is already loaded in memory.
+        if isInLiveMode {
+            exitLiveMode()
+        }
 
         // Fast path: check if frame exists in current frames array
         if let index = frames.firstIndex(where: { $0.frame.id == previousPosition.frameID }) {
@@ -8112,6 +8903,12 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         // Redo is explicit timeline navigation; clear transient search-result highlight.
         resetSearchHighlightState()
+
+        // Redoing to a previous playhead state should also leave live mode before the
+        // fast in-memory path updates the frame index.
+        if isInLiveMode {
+            exitLiveMode()
+        }
 
         // Keep undo history in sync with the redone position.
         if stoppedPositionHistory.last?.frameID != nextPosition.frameID {
@@ -8174,9 +8971,87 @@ public class SimpleTimelineViewModel: ObservableObject {
         Log.info("[PlayheadUndo] Navigation complete, now at index \(currentIndex)", category: .ui)
     }
 
+    private func beginSearchResultNavigation() -> UInt64 {
+        searchResultNavigationGeneration &+= 1
+        return searchResultNavigationGeneration
+    }
+
+    private func isCurrentSearchResultNavigation(_ generation: UInt64) -> Bool {
+        generation == searchResultNavigationGeneration
+    }
+
+    private func invalidateSearchResultNavigation() {
+        searchResultNavigationGeneration &+= 1
+    }
+
+    private func cancelPendingSearchHighlightTasks() {
+        pendingSearchHighlightRevealTask?.cancel()
+        pendingSearchHighlightRevealTask = nil
+        pendingSearchHighlightResetTask?.cancel()
+        pendingSearchHighlightResetTask = nil
+    }
+
+    private var activeSearchResultHighlightQuery: String? {
+        let candidates: [String?] = [
+            searchViewModel.committedSearchQuery,
+            searchViewModel.searchQuery,
+            searchHighlightQuery
+        ]
+
+        return candidates
+            .map { $0?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "" }
+            .first(where: { !$0.isEmpty })
+    }
+
+    func navigateToAdjacentSearchResult(
+        offset: Int,
+        trigger: SearchResultNavigationTrigger
+    ) async {
+        guard offset != 0,
+              let navigationState = searchResultHighlightNavigationState else {
+            return
+        }
+
+        let direction = offset > 0 ? "next" : "previous"
+        let didRequestMore = offset > 0 && navigationState.requestsMoreResultsOnNextAdvance
+
+        guard let targetResult = searchViewModel.selectAdjacentResult(offset: offset) else {
+            recordSearchResultNavigation(
+                direction: direction,
+                trigger: trigger,
+                state: navigationState,
+                didMove: false,
+                didRequestMore: didRequestMore
+            )
+            return
+        }
+
+        recordSearchResultNavigation(
+            direction: direction,
+            trigger: trigger,
+            state: navigationState,
+            didMove: true,
+            didRequestMore: didRequestMore
+        )
+
+        let highlightQuery = activeSearchResultHighlightQuery ?? targetResult.matchedText
+        await navigateToSearchResult(
+            frameID: targetResult.id,
+            timestamp: targetResult.timestamp,
+            highlightQuery: highlightQuery,
+            highlightImmediately: true
+        )
+    }
+
     /// Navigate to a specific frame by ID and highlight the search query
     /// Used when selecting a search result
-    public func navigateToSearchResult(frameID: FrameID, timestamp: Date, highlightQuery: String) async {
+    public func navigateToSearchResult(
+        frameID: FrameID,
+        timestamp: Date,
+        highlightQuery: String,
+        highlightImmediately: Bool = false
+    ) async {
+        let navigationGeneration = beginSearchResultNavigation()
         cancelPendingStoppedPositionRecording()
         _ = recordCurrentPositionImmediatelyForUndo(reason: "navigateToSearchResult.source")
 
@@ -8199,12 +9074,32 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         // First, try to find a frame with this ID in our current data
         if let index = frames.firstIndex(where: { $0.frame.id == frameID }) {
-            navigateToFrame(index)
+            guard isCurrentSearchResultNavigation(navigationGeneration) else {
+                setLoadingState(false, reason: "navigateToSearchResult.supersededBeforeFrameWindow")
+                return
+            }
+            navigateToFrameForSearchResult(index)
             _ = recordCurrentPositionImmediatelyForUndo(
                 reason: "navigateToSearchResult.destination",
                 highlightQueryOverride: highlightQuery
             )
-            showSearchHighlight(query: highlightQuery, mode: .matchedNodes)
+            if highlightImmediately {
+                showSearchHighlight(
+                    query: highlightQuery,
+                    mode: .matchedNodes,
+                    delay: 0,
+                    preserveExistingPresentation: true
+                )
+                await loadOCRNodesAsync()
+                guard isCurrentSearchResultNavigation(navigationGeneration) else { return }
+            } else {
+                showSearchHighlight(
+                    query: highlightQuery,
+                    mode: .matchedNodes,
+                    delay: 0.5
+                )
+            }
+            setLoadingState(false, reason: "navigateToSearchResult.localFrame")
             return
         }
 
@@ -8230,29 +9125,22 @@ public class SimpleTimelineViewModel: ObservableObject {
                 reason: "navigateToSearchResult"
             )
 
+            guard isCurrentSearchResultNavigation(navigationGeneration) else {
+                setLoadingState(false, reason: "navigateToSearchResult.supersededBeforeHighlight")
+                return
+            }
+
             guard !framesWithVideoInfo.isEmpty else {
                 Log.warning("[SearchNavigation] No frames found in time range", category: .ui)
                 setLoadingState(false, reason: "navigateToSearchResult.noFrames")
                 return
             }
 
-            // Clear disk frame buffer since we're jumping to a new time window
-            let oldCacheCount = diskFrameBufferIndex.count
-            clearDiskFrameBuffer(reason: "search navigation")
-            if oldCacheCount > 0 {
-            }
-
-            // Convert to TimelineFrame - video info is already included from the JOIN
-            let timelineFrames = framesWithVideoInfo.map { TimelineFrame(frameWithVideoInfo: $0) }
-
-            // Replace current frames with new window
-            frames = timelineFrames
-
-            // Update window boundaries
-            if let firstFrame = frames.first, let lastFrame = frames.last {
-                oldestLoadedTimestamp = firstFrame.frame.timestamp
-                newestLoadedTimestamp = lastFrame.frame.timestamp
-            }
+            applyNavigationFrameWindow(
+                framesWithVideoInfo,
+                clearDiskBufferReason: "search navigation"
+            )
+            clearPositionRecoveryHintForSupersedingNavigation()
 
             // Find and navigate to the target frame by ID
             if let index = frames.firstIndex(where: { $0.frame.id == frameID }) {
@@ -8279,10 +9167,29 @@ public class SimpleTimelineViewModel: ObservableObject {
             // Check if we need to pre-load more frames (near edge of loaded window)
             checkAndLoadMoreFrames()
 
+            if highlightImmediately {
+                showSearchHighlight(
+                    query: highlightQuery,
+                    mode: .matchedNodes,
+                    delay: 0,
+                    preserveExistingPresentation: true
+                )
+            }
+
             // Wait for OCR nodes to load before showing highlight
             // (loadImageIfNeeded calls loadOCRNodes but doesn't await it)
             await loadOCRNodesAsync()
-            showSearchHighlight(query: highlightQuery, mode: .matchedNodes)
+            guard isCurrentSearchResultNavigation(navigationGeneration) else {
+                setLoadingState(false, reason: "navigateToSearchResult.supersededAfterOCRLoad")
+                return
+            }
+            if !highlightImmediately {
+                showSearchHighlight(
+                    query: highlightQuery,
+                    mode: .matchedNodes,
+                    delay: 0.5
+                )
+            }
             setLoadingState(false, reason: "navigateToSearchResult.success")
             Log.info("[SearchNavigation] Navigation complete, now at index \(currentIndex)", category: .ui)
 
@@ -8294,48 +9201,62 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Show search highlight for the given query after a 0.5-second delay
     public func showSearchHighlight(query: String) {
-        showSearchHighlight(query: query, mode: .matchedTextRanges)
+        showSearchHighlight(query: query, mode: .matchedTextRanges, delay: 0.5)
     }
 
     func showSearchHighlight(
         query: String,
-        mode: SearchHighlightMode
+        mode: SearchHighlightMode,
+        delay: TimeInterval = 0.5,
+        preserveExistingPresentation: Bool = false
     ) {
-
-        // Clear any existing highlight first (so the view is removed and onAppear will fire again)
-        isShowingSearchHighlight = false
+        let shouldPreserveVisibleState = preserveExistingPresentation && isShowingSearchHighlight
+        cancelPendingSearchHighlightTasks()
+        // Clear any existing highlight first when we want the overlay to re-enter.
+        if !shouldPreserveVisibleState {
+            isShowingSearchHighlight = false
+        }
         searchHighlightQuery = query
         searchHighlightMode = mode
 
-        // Show highlight after 0.5 second delay
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-            guard let self = self else { return }
-            // Only show if the query and highlight mode haven't changed
-            if self.searchHighlightQuery == query && self.searchHighlightMode == mode {
-                self.isShowingSearchHighlight = true
-            }
+        guard delay > 0 else {
+            isShowingSearchHighlight = true
+            return
+        }
+
+        pendingSearchHighlightRevealTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(delay), clock: .continuous)
+            guard !Task.isCancelled, let self else { return }
+            guard self.searchHighlightQuery == query, self.searchHighlightMode == mode else { return }
+            self.isShowingSearchHighlight = true
+            self.pendingSearchHighlightRevealTask = nil
         }
     }
 
     /// Clear the search highlight
     public func clearSearchHighlight() {
-        searchHighlightTimer?.invalidate()
-        searchHighlightTimer = nil
+        invalidateSearchResultNavigation()
+        cancelPendingSearchHighlightTasks()
 
         let previousQuery = searchHighlightQuery
-        let previousMode = searchHighlightMode
         withAnimation(.easeOut(duration: 0.3)) {
             isShowingSearchHighlight = false
         }
+        searchHighlightMode = .matchedTextRanges
 
-        // Clear the query after animation
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-            guard let self else { return }
+        guard previousQuery != nil else {
+            searchHighlightQuery = nil
+            return
+        }
+
+        pendingSearchHighlightResetTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(300), clock: .continuous)
+            guard !Task.isCancelled, let self else { return }
             guard !self.isShowingSearchHighlight else { return }
             guard self.searchHighlightQuery == previousQuery else { return }
-            guard self.searchHighlightMode == previousMode else { return }
+            guard self.searchHighlightMode == .matchedTextRanges else { return }
             self.searchHighlightQuery = nil
-            self.searchHighlightMode = .matchedTextRanges
+            self.pendingSearchHighlightResetTask = nil
         }
     }
 
@@ -8345,8 +9266,8 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     private func clearSearchHighlightImmediately() {
-        searchHighlightTimer?.invalidate()
-        searchHighlightTimer = nil
+        invalidateSearchResultNavigation()
+        cancelPendingSearchHighlightTasks()
         isShowingSearchHighlight = false
         searchHighlightQuery = nil
         searchHighlightMode = .matchedTextRanges
@@ -8465,15 +9386,26 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     private enum SearchHighlightToken {
+        case term(String)
         case phrase(String)
     }
+
+    private static let searchResultHighlightStopwords: Set<String> = [
+        "a", "an", "and", "as", "at",
+        "be", "but", "by",
+        "for", "from",
+        "if", "in", "into", "is", "it",
+        "of", "on", "or",
+        "the", "to",
+        "with"
+    ]
 
     static func searchHighlightMatches(
         in nodes: [OCRNodeWithText],
         query: String,
         mode: SearchHighlightMode
     ) -> [(node: OCRNodeWithText, ranges: [Range<String.Index>])] {
-        let queryTokens = tokenizeSearchHighlightQuery(query)
+        let queryTokens = tokenizeSearchHighlightQuery(query, mode: mode)
         guard !queryTokens.isEmpty else { return [] }
 
         var matchingNodes: [(node: OCRNodeWithText, ranges: [Range<String.Index>])] = []
@@ -8496,11 +9428,54 @@ public class SimpleTimelineViewModel: ObservableObject {
         return matchingNodes
     }
 
-    private static func tokenizeSearchHighlightQuery(_ query: String) -> [SearchHighlightToken] {
+    private static func tokenizeSearchHighlightQuery(
+        _ query: String,
+        mode: SearchHighlightMode
+    ) -> [SearchHighlightToken] {
         let normalizedQuery = query
             .lowercased()
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalizedQuery.isEmpty else { return [] }
+
+        if mode == .matchedNodes {
+            var tokens: [SearchHighlightToken] = []
+            var seen = Set<String>()
+
+            func appendToken(_ token: SearchHighlightToken, key: String) {
+                if seen.insert(key).inserted {
+                    tokens.append(token)
+                }
+            }
+
+            if normalizedQuery.hasPrefix("\""),
+               normalizedQuery.hasSuffix("\""),
+               normalizedQuery.count > 2 {
+                let phrase = String(normalizedQuery.dropFirst().dropLast()).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !phrase.isEmpty {
+                    appendToken(.phrase(phrase), key: "p:\(phrase)")
+                }
+                return tokens
+            }
+
+            for rawTerm in normalizedQuery.split(whereSeparator: \.isWhitespace) {
+                let rawValue = String(rawTerm)
+                if isIgnoredSearchResultShellToken(rawValue) || rawValue.hasPrefix("-") {
+                    continue
+                }
+
+                let cleaned = rawValue
+                    .trimmingCharacters(in: CharacterSet(charactersIn: "\"'`"))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !cleaned.isEmpty else { continue }
+                if shouldIgnoreSearchResultTerm(cleaned) {
+                    continue
+                }
+
+                appendToken(.term(cleaned), key: "t:\(cleaned)")
+            }
+
+            return tokens
+        }
 
         return normalizedQuery
             .split(separator: ",", omittingEmptySubsequences: false)
@@ -8518,9 +9493,65 @@ public class SimpleTimelineViewModel: ObservableObject {
         in text: String
     ) -> [Range<String.Index>] {
         switch token {
+        case .term(let term):
+            let exactWordRanges = allWholeWordRanges(of: term, in: text)
+            if !exactWordRanges.isEmpty {
+                return exactWordRanges
+            }
+            return allRanges(of: term, in: text)
         case .phrase(let phrase):
             return allRanges(of: phrase, in: text)
         }
+    }
+
+    private static func allWholeWordRanges(
+        of needle: String,
+        in haystack: String
+    ) -> [Range<String.Index>] {
+        guard !needle.isEmpty else { return [] }
+        let pattern = #"\b\#(NSRegularExpression.escapedPattern(for: needle))\b"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else {
+            return []
+        }
+
+        let fullRange = NSRange(haystack.startIndex..<haystack.endIndex, in: haystack)
+        return regex.matches(in: haystack, options: [.withTransparentBounds], range: fullRange)
+            .compactMap { Range($0.range, in: haystack) }
+    }
+
+    private static func isIgnoredSearchResultShellToken(_ token: String) -> Bool {
+        guard token.hasPrefix("-"), token.count > 1 else { return false }
+        if token.hasPrefix("-\"") || token.hasPrefix("-'") {
+            return false
+        }
+
+        if token == "--" {
+            return true
+        }
+
+        let optionBody = token.hasPrefix("--") ? String(token.dropFirst(2)) : String(token.dropFirst())
+        let optionName = optionBody
+            .split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            .first
+            .map(String.init) ?? optionBody
+        guard !optionName.isEmpty else { return false }
+
+        if token.hasPrefix("--") {
+            return optionName.allSatisfy { $0.isLetter || $0.isNumber || $0 == "-" }
+        }
+
+        return optionName.count <= 3 && optionName.allSatisfy { $0.isLetter || $0.isNumber || $0 == "-" }
+    }
+
+    private static func shouldIgnoreSearchResultTerm(_ term: String) -> Bool {
+        let normalized = term.lowercased()
+        if normalized.count == 1 {
+            return true
+        }
+        if normalized.allSatisfy(\.isNumber) {
+            return true
+        }
+        return Self.searchResultHighlightStopwords.contains(normalized)
     }
 
     private static func allRanges(of needle: String, in haystack: String) -> [Range<String.Index>] {
@@ -9156,7 +10187,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         case 5, 6:
             return .queued
         case 2, 7:
-            return isRevealed ? .copyText : .reveal
+            return isRevealed ? .hide : .reveal
         default:
             return nil
         }
@@ -9826,13 +10857,12 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
 
         Log.debug(
-            "[BrowserLinkOpen] start frameId=\(timelineFrame.frame.id.value) baseURL=\(urlString) scrollY=\(String(describing: timelineFrame.scrollY)) videoCurrentTime=\(String(describing: timelineFrame.videoCurrentTime))",
+            "[BrowserLinkOpen] start frameId=\(timelineFrame.frame.id.value) baseURL=\(urlString) videoCurrentTime=\(String(describing: timelineFrame.videoCurrentTime))",
             category: .ui
         )
-        let finalURLString = currentBrowserOpenURLString(
+        let finalURLString = timestampedCurrentBrowserURLString(
             baseURLString: urlString,
-            videoCurrentTime: timelineFrame.videoCurrentTime,
-            scrollY: timelineFrame.scrollY
+            videoCurrentTime: timelineFrame.videoCurrentTime
         )
         Log.debug(
             "[BrowserLinkOpen] resolved frameId=\(timelineFrame.frame.id.value) finalURL=\(finalURLString)",
@@ -9846,7 +10876,6 @@ public class SimpleTimelineViewModel: ObservableObject {
             return false
         }
 
-        let usedTextFragment = Self.urlContainsTextFragment(finalURLString)
         let usedYouTubeTimestamp = Self.urlContainsYouTubeTimestamp(finalURLString)
 
         guard let browserApplicationURL = Self.hyperlinkBrowserApplicationURL(for: finalURL) else {
@@ -9857,7 +10886,6 @@ public class SimpleTimelineViewModel: ObservableObject {
                     coordinator: coordinator,
                     source: "current_browser_url",
                     url: finalURLString,
-                    usedTextFragment: usedTextFragment,
                     usedYouTubeTimestamp: usedYouTubeTimestamp
                 )
             } else {
@@ -9887,7 +10915,6 @@ public class SimpleTimelineViewModel: ObservableObject {
                         coordinator: self.coordinator,
                         source: "current_browser_url",
                         url: finalURLString,
-                        usedTextFragment: usedTextFragment,
                         usedYouTubeTimestamp: usedYouTubeTimestamp
                     )
                 }
@@ -9952,8 +10979,8 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     private func copyYouTubeMarkdownLinkToPasteboard(
-        match: YouTubeOCRMatch,
-        context: YouTubeMarkdownCopyContext
+        match: TimelineYouTubeLinkSupport.OCRMatch,
+        context: TimelineYouTubeLinkSupport.MarkdownCopyContext
     ) {
         let markdown = Self.youtubeMarkdownClipboardString(
             channelName: match.channelText,
@@ -9970,17 +10997,14 @@ public class SimpleTimelineViewModel: ObservableObject {
         Log.info("[Timeline] Copied YouTube markdown link: \(markdown)", category: .ui)
     }
 
-    private func currentYouTubeMarkdownCopyContext() -> YouTubeMarkdownCopyContext? {
-        guard let timelineFrame = currentTimelineFrame,
-              let windowName = normalizedMetadataString(timelineFrame.frame.metadata.windowName),
-              let urlString = normalizedMetadataString(timelineFrame.frame.metadata.browserURL),
-              Self.isYouTubeMarkdownCopyCandidate(windowName: windowName, urlString: urlString) else {
+    private func currentYouTubeMarkdownCopyContext() -> TimelineYouTubeLinkSupport.MarkdownCopyContext? {
+        guard let timelineFrame = currentTimelineFrame else {
             return nil
         }
 
-        return YouTubeMarkdownCopyContext(
-            windowName: windowName,
-            urlString: urlString
+        return TimelineYouTubeLinkSupport.copyContext(
+            windowName: normalizedMetadataString(timelineFrame.frame.metadata.windowName),
+            urlString: normalizedMetadataString(timelineFrame.frame.metadata.browserURL)
         )
     }
 
@@ -9988,20 +11012,8 @@ public class SimpleTimelineViewModel: ObservableObject {
         baseURLString: String,
         videoCurrentTime: Double?
     ) -> String {
-        Self.youtubeTimestampedBrowserURLString(
+        TimelineYouTubeLinkSupport.timestampedBrowserURLString(
             baseURLString,
-            videoCurrentTime: videoCurrentTime
-        )
-    }
-
-    private func currentBrowserOpenURLString(
-        baseURLString: String,
-        videoCurrentTime: Double?,
-        scrollY: Double?
-    ) -> String {
-        _ = scrollY
-        return timestampedCurrentBrowserURLString(
-            baseURLString: baseURLString,
             videoCurrentTime: videoCurrentTime
         )
     }
@@ -10010,35 +11022,20 @@ public class SimpleTimelineViewModel: ObservableObject {
         _ urlString: String,
         videoCurrentTime: Double?
     ) -> String {
-        guard let videoCurrentTime,
-              videoCurrentTime.isFinite,
-              videoCurrentTime >= 0,
-              let url = URL(string: urlString),
-              Self.isYouTubeWatchURL(url),
-              var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
-            return urlString
-        }
-
-        let seconds = Int(floor(videoCurrentTime))
-        var queryItems = components.queryItems ?? []
-        queryItems.removeAll { $0.name.caseInsensitiveCompare("t") == .orderedSame }
-        queryItems.append(URLQueryItem(name: "t", value: "\(seconds)"))
-        components.queryItems = queryItems
-        return components.url?.absoluteString ?? urlString
+        TimelineYouTubeLinkSupport.timestampedBrowserURLString(
+            urlString,
+            videoCurrentTime: videoCurrentTime
+        )
     }
 
     static func isYouTubeMarkdownCopyCandidate(
         windowName: String?,
         urlString: String?
     ) -> Bool {
-        guard let normalizedWindowName = normalizedNonEmptyString(windowName),
-              normalizedWindowName.localizedCaseInsensitiveContains("youtube"),
-              let normalizedURLString = normalizedNonEmptyString(urlString),
-              let url = URL(string: normalizedURLString) else {
-            return false
-        }
-
-        return isYouTubePageURL(url)
+        TimelineYouTubeLinkSupport.isMarkdownCopyCandidate(
+            windowName: windowName,
+            urlString: urlString
+        )
     }
 
     static func youtubeMarkdownClipboardString(
@@ -10046,390 +11043,21 @@ public class SimpleTimelineViewModel: ObservableObject {
         titleText: String,
         urlString: String
     ) -> String {
-        let safeChannelName = escapeMarkdownInlineText(
-            sanitizedYouTubeMarkdownChannelName(channelName)
+        TimelineYouTubeLinkSupport.markdownClipboardString(
+            channelName: channelName,
+            titleText: titleText,
+            urlString: urlString
         )
-        let safeTitleText = escapeMarkdownInlineText(sanitizedMarkdownClipboardComponent(titleText))
-        let destination = urlString
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .replacingOccurrences(of: ")", with: "%29")
-
-        return "\(safeChannelName) - [\(safeTitleText)](\(destination))"
-    }
-
-    private static func sanitizedYouTubeMarkdownChannelName(_ channelName: String) -> String {
-        let sanitized = sanitizedMarkdownClipboardComponent(channelName)
-        return sanitized
-            .replacingOccurrences(of: #"\s+[oO0]$"#, with: "", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     static func resolveYouTubeOCRMatch(
         windowName: String,
         nodes: [OCRNodeWithText]
-    ) -> YouTubeOCRMatch? {
-        let titleCandidates = youTubeWindowTitleCandidates(from: windowName)
-        guard let titleNode = youTubeTitleNode(
-            titleCandidates: titleCandidates,
-            nodes: nodes
-        ) else {
-            return nil
-        }
-
-        guard let titleText = normalizedNonEmptyString(titleNode.text),
-              let channelText = youTubeChannelText(
-            titleCandidates: titleCandidates,
-            titleNode: titleNode,
-            nodes: nodes
-        ) else {
-            return nil
-        }
-
-        return YouTubeOCRMatch(
-            titleText: sanitizedMarkdownClipboardComponent(titleText),
-            channelText: channelText
-        )
-    }
-
-    private static func youTubeTitleNode(
-        titleCandidates: [String],
-        nodes: [OCRNodeWithText]
-    ) -> OCRNodeWithText? {
-        let scoredNodes = nodes.compactMap { node -> (node: OCRNodeWithText, score: Double, hasChannel: Bool)? in
-            guard let nodeText = normalizedNonEmptyString(node.text) else {
-                return nil
-            }
-
-            let score = youTubeTitleNodeScore(
-                nodeText: nodeText,
-                titleCandidates: titleCandidates,
-                width: node.width
-            )
-
-            guard score >= 120 else {
-                return nil
-            }
-
-            return (
-                node: node,
-                score: score,
-                hasChannel: youTubeChannelText(
-                    titleCandidates: titleCandidates,
-                    titleNode: node,
-                    nodes: nodes
-                ) != nil
-            )
-        }
-
-        guard !scoredNodes.isEmpty else {
-            return nil
-        }
-
-        let preferredNodes = scoredNodes.filter(\.hasChannel)
-        let pool = preferredNodes.isEmpty ? scoredNodes : preferredNodes
-
-        return pool.max { lhs, rhs in
-            if lhs.score != rhs.score {
-                return lhs.score < rhs.score
-            }
-            if lhs.node.width != rhs.node.width {
-                return lhs.node.width < rhs.node.width
-            }
-            return lhs.node.y < rhs.node.y
-        }?.node
-    }
-
-    private static func youTubeChannelText(
-        titleCandidates: [String],
-        titleNode: OCRNodeWithText,
-        nodes: [OCRNodeWithText]
-    ) -> String? {
-        let candidateNodes = youTubeNodesBelowTitle(
-            titleNode: titleNode,
+    ) -> TimelineYouTubeLinkSupport.OCRMatch? {
+        TimelineYouTubeLinkSupport.resolveOCRMatch(
+            windowName: windowName,
             nodes: nodes
         )
-        guard !candidateNodes.isEmpty else {
-            return nil
-        }
-
-        if let subscriberNode = candidateNodes.first(where: {
-            youTubeIsSubscriberText($0.text)
-        }) {
-            if let inlineChannelText = youTubeInlineChannelText(
-                from: subscriberNode.text,
-                titleCandidates: titleCandidates
-            ) {
-                return inlineChannelText
-            }
-
-            let nodesAboveSubscriber = candidateNodes.prefix { $0.id != subscriberNode.id }
-            let alignedCandidate = nodesAboveSubscriber.compactMap { node -> (text: String, xGap: CGFloat, yGap: CGFloat)? in
-                guard let text = youTubeUsableChannelText(
-                    from: node.text,
-                    titleCandidates: titleCandidates
-                ) else {
-                    return nil
-                }
-
-                let yGap = max(0, subscriberNode.y - (node.y + node.height))
-                return (
-                    text: text,
-                    xGap: abs(node.x - subscriberNode.x),
-                    yGap: yGap
-                )
-            }.min { lhs, rhs in
-                if lhs.xGap != rhs.xGap {
-                    return lhs.xGap < rhs.xGap
-                }
-                return lhs.yGap < rhs.yGap
-            }
-
-            if let alignedCandidate {
-                return alignedCandidate.text
-            }
-        }
-
-        return candidateNodes.compactMap { node -> (text: String, score: Double)? in
-            guard let text = youTubeUsableChannelText(
-                from: node.text,
-                titleCandidates: titleCandidates
-            ) else {
-                return nil
-            }
-
-            return (
-                text: text,
-                score: youTubeChannelNodeScore(
-                    node: node,
-                    titleNode: titleNode,
-                    text: text
-                )
-            )
-        }.max { lhs, rhs in
-            if lhs.score != rhs.score {
-                return lhs.score < rhs.score
-            }
-            return lhs.text.count < rhs.text.count
-        }?.text
-    }
-
-    private static func youTubeNodesBelowTitle(
-        titleNode: OCRNodeWithText,
-        nodes: [OCRNodeWithText]
-    ) -> [OCRNodeWithText] {
-        let horizontalRange = youTubeMetadataHorizontalRange(for: titleNode)
-        let titleBottom = titleNode.y + titleNode.height
-        let maximumVerticalGap = youTubeMetadataVerticalGapLimit(for: titleNode)
-
-        return nodes.filter { node in
-            guard node.id != titleNode.id else {
-                return false
-            }
-            let nodeRight = node.x + node.width
-            guard nodeRight >= horizontalRange.lowerBound,
-                  node.x <= horizontalRange.upperBound else {
-                return false
-            }
-
-            let verticalGap = node.y - titleBottom
-            return verticalGap >= -0.01 && verticalGap <= maximumVerticalGap
-        }.sorted {
-            if $0.y != $1.y {
-                return $0.y < $1.y
-            }
-            return $0.x < $1.x
-        }
-    }
-
-    private static func youTubeUsableChannelText(
-        from rawText: String,
-        titleCandidates: [String]
-    ) -> String? {
-        guard let text = normalizedNonEmptyString(rawText) else {
-            return nil
-        }
-
-        let normalizedText = youTubeComparisonText(text)
-        guard !normalizedText.isEmpty else {
-            return nil
-        }
-        guard !isYouTubeURLLikeOCRText(text) else {
-            return nil
-        }
-        guard !youTubeIsSubscriberText(text) else {
-            return nil
-        }
-        guard !youTubeIsCountMetadataText(text) else {
-            return nil
-        }
-        guard !youTubeIsExactActionText(normalizedText) else {
-            return nil
-        }
-
-        if titleCandidates.contains(where: {
-            let normalizedTitle = youTubeComparisonText($0)
-            return normalizedText == normalizedTitle || normalizedTitle.contains(normalizedText)
-        }) {
-            return nil
-        }
-
-        let letterCount = text.unicodeScalars.filter(CharacterSet.letters.contains).count
-        guard letterCount >= 2 else {
-            return nil
-        }
-
-        let cleanedText = youTubeCleanChannelDisplayText(text)
-        guard let cleanedText = normalizedNonEmptyString(cleanedText) else {
-            return nil
-        }
-        return sanitizedMarkdownClipboardComponent(cleanedText)
-    }
-
-    private static func youTubeChannelNodeScore(
-        node: OCRNodeWithText,
-        titleNode: OCRNodeWithText,
-        text: String
-    ) -> Double {
-        let titleBottom = titleNode.y + titleNode.height
-        let verticalGap = max(0, node.y - titleBottom)
-        let leadingOffset = abs(node.x - titleNode.x)
-
-        var score = 320.0
-        score -= Double(verticalGap) * 1_800.0
-        score -= Double(leadingOffset) * 900.0
-        score += Double(min(max(0, node.width), 0.24)) * 140.0
-        score += Double(min(text.count, 28)) * 6.0
-
-        if node.x + node.width < titleNode.x {
-            score -= 120.0
-        }
-
-        return score
-    }
-
-    private static func youTubeTitleNodeScore(
-        nodeText: String,
-        titleCandidates: [String],
-        width: CGFloat
-    ) -> Double {
-        let normalizedNodeText = youTubeComparisonText(nodeText)
-        guard !normalizedNodeText.isEmpty else { return -Double.greatestFiniteMagnitude }
-        guard !isYouTubeURLLikeOCRText(nodeText) else { return -Double.greatestFiniteMagnitude }
-
-        var bestScore = -Double.greatestFiniteMagnitude
-
-        for titleCandidate in titleCandidates {
-            let normalizedTitle = youTubeComparisonText(titleCandidate)
-            guard !normalizedTitle.isEmpty else { continue }
-
-            if normalizedNodeText == normalizedTitle {
-                bestScore = max(bestScore, 1000 + Double(width) * 100)
-                continue
-            }
-
-            let titleTokens = Set(normalizedTitle.split(separator: " ").map(String.init))
-            let nodeTokens = Set(normalizedNodeText.split(separator: " ").map(String.init))
-            let overlapCount = titleTokens.intersection(nodeTokens).count
-            guard overlapCount > 0 else { continue }
-
-            let overlapRatio = Double(overlapCount) / Double(max(titleTokens.count, 1))
-            let tokenDeltaPenalty = Double(abs(titleTokens.count - nodeTokens.count)) * 20
-            let score = overlapRatio * 500 + Double(width) * 100 - tokenDeltaPenalty
-            bestScore = max(bestScore, score)
-        }
-
-        return bestScore
-    }
-
-    private static func youTubeWindowTitleCandidates(from windowName: String) -> [String] {
-        let trimmedWindowName = sanitizedMarkdownClipboardComponent(windowName)
-        guard !trimmedWindowName.isEmpty else { return [] }
-
-        var candidates = [trimmedWindowName]
-
-        if let range = trimmedWindowName.range(
-            of: " - YouTube",
-            options: [.caseInsensitive, .backwards]
-        ) {
-            let stripped = trimmedWindowName[..<range.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines)
-            if !stripped.isEmpty {
-                candidates.append(stripped)
-            }
-        }
-
-        return Array(NSOrderedSet(array: candidates)) as? [String] ?? candidates
-    }
-
-    private static func youTubeMetadataHorizontalRange(for titleNode: OCRNodeWithText) -> ClosedRange<CGFloat> {
-        let titleWidth = max(0, titleNode.width)
-        let leftPadding = min(max(titleWidth * 0.12, 0.02), 0.05)
-        let rightSpan = min(max(titleWidth * 0.9, 0.34), 0.52)
-        let minX = max(0, titleNode.x - leftPadding)
-        let maxX = min(titleNode.x + rightSpan, 0.62)
-        return minX...max(minX, maxX)
-    }
-
-    private static func youTubeMetadataVerticalGapLimit(for titleNode: OCRNodeWithText) -> CGFloat {
-        min(max(titleNode.height * 5.0, 0.18), 0.24)
-    }
-
-    private static func youTubeInlineChannelText(
-        from rawText: String,
-        titleCandidates: [String]
-    ) -> String? {
-        let lowered = rawText.lowercased()
-        guard let subscriberRange = lowered.range(of: "subscriber") else {
-            return nil
-        }
-
-        let rawPrefix = rawText[..<subscriberRange.lowerBound]
-        let cleanedPrefix = String(rawPrefix)
-            .replacingOccurrences(
-                of: "\\b\\d[\\d.,kKmM\\s]*$",
-                with: "",
-                options: .regularExpression
-            )
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-
-        return youTubeUsableChannelText(
-            from: cleanedPrefix,
-            titleCandidates: titleCandidates
-        )
-    }
-
-    private static func youTubeIsSubscriberText(_ text: String) -> Bool {
-        let normalizedText = youTubeComparisonText(text)
-        return normalizedText.contains("subscriber")
-    }
-
-    private static func youTubeIsCountMetadataText(_ text: String) -> Bool {
-        let normalizedText = youTubeComparisonText(text)
-        let digitCount = text.unicodeScalars.filter(CharacterSet.decimalDigits.contains).count
-        guard digitCount > 0 else {
-            return false
-        }
-
-        return normalizedText.contains("views")
-            || normalizedText.contains("ago")
-            || normalizedText.contains("comment")
-    }
-
-    private static func youTubeIsExactActionText(_ normalizedText: String) -> Bool {
-        youTubeExactActionLabels.contains(normalizedText)
-    }
-
-    private static func youTubeCleanChannelDisplayText(_ text: String) -> String {
-        text.trimmingCharacters(
-            in: CharacterSet.whitespacesAndNewlines.union(
-                CharacterSet(charactersIn: "•·-|:–—")
-            )
-        )
-    }
-
-    private static func normalizedNonEmptyString(_ rawValue: String?) -> String? {
-        guard let rawValue else { return nil }
-        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
     }
 
     static func makeCommentComposerTargetDisplayInfo(
@@ -10463,416 +11091,8 @@ public class SimpleTimelineViewModel: ObservableObject {
         )
     }
 
-    private static func sanitizedMarkdownClipboardComponent(_ value: String) -> String {
-        value
-            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private static func escapeMarkdownInlineText(_ text: String) -> String {
-        var escaped = ""
-        escaped.reserveCapacity(text.count)
-
-        for character in text {
-            switch character {
-            case "\\", "*", "_", "[", "]", "(", ")":
-                escaped.append("\\")
-                escaped.append(character)
-            default:
-                escaped.append(character)
-            }
-        }
-
-        return escaped
-    }
-
-    private static func youTubeComparisonText(_ text: String) -> String {
-        let lowered = text.lowercased()
-        let filteredScalars = lowered.unicodeScalars.map { scalar -> Character in
-            if CharacterSet.alphanumerics.contains(scalar) || CharacterSet.whitespacesAndNewlines.contains(scalar) {
-                return Character(scalar)
-            }
-            return " "
-        }
-
-        return sanitizedMarkdownClipboardComponent(String(filteredScalars))
-    }
-
-    private static func isYouTubeURLLikeOCRText(_ text: String) -> Bool {
-        let lowered = text.lowercased()
-        return lowered.contains("http://")
-            || lowered.contains("https://")
-            || lowered.contains("www.")
-            || lowered.contains("youtube.com/")
-            || lowered.contains("youtu.be/")
-            || lowered.contains("/watch")
-            || lowered.contains("?v=")
-    }
-
-    private static func isYouTubeWatchURL(_ url: URL) -> Bool {
-        normalizedHost(url.host) == "youtube.com" && url.path.lowercased() == "/watch"
-    }
-
-    private static func isYouTubePageURL(_ url: URL) -> Bool {
-        let host = normalizedHost(url.host)
-        return host == "youtu.be" || host == "youtube.com" || host.hasSuffix(".youtube.com")
-    }
-
-    private func hasScrolledPastFirstViewport(scrollY: Double?) -> Bool {
-        guard let scrollY,
-              scrollY.isFinite,
-              scrollY > 0 else {
-            return false
-        }
-
-        guard let estimatedViewportHeight = estimatedViewportHeightForCurrentFrame() else {
-            return true
-        }
-        return scrollY >= estimatedViewportHeight
-    }
-
-    private func estimatedViewportHeightForCurrentFrame() -> Double? {
-        if let imageHeight = displayableCurrentImage?.size.height,
-           imageHeight > 1 {
-            return Double(imageHeight)
-        }
-
-        if let videoHeight = currentTimelineFrame?.videoInfo?.height,
-           videoHeight > 1 {
-            let scale = max(NSScreen.main?.backingScaleFactor ?? 2.0, 1.0)
-            return Double(videoHeight) / scale
-        }
-
-        return nil
-    }
-
-    private static func shouldUseSmartTextFragment(for url: URL) -> Bool {
-        guard let scheme = url.scheme?.lowercased(),
-              scheme == "http" || scheme == "https" else {
-            return false
-        }
-
-        let host = normalizedHost(url.host)
-        guard !host.isEmpty else {
-            return false
-        }
-
-        return !textFragmentExcludedDomains.contains { blocked in
-            host == blocked || host.hasSuffix(".\(blocked)")
-        }
-    }
-
-    private struct BrowserTextFragmentNodeCandidate {
-        let startText: String
-        let endText: String?
-        let centerY: CGFloat
-        let isolationScore: CGFloat
-    }
-
-    private struct YouTubeMarkdownCopyContext: Sendable {
-        let windowName: String
-        let urlString: String
-    }
-
-    struct YouTubeOCRMatch: Sendable, Equatable {
-        let titleText: String
-        let channelText: String
-    }
-
-    private func smartTextFragmentDirectiveForCurrentFrame() -> String? {
-        if let selectedDirective = Self.smartTextFragmentDirective(startText: selectedText, endText: nil) {
-            Log.debug(
-                "[BrowserLinkOpen] fragment candidate selectedText length=\(selectedText.count) directive=\(selectedDirective)",
-                category: .ui
-            )
-            return selectedDirective
-        }
-
-        let candidates = visibleOCRTextFragmentNodeCandidates()
-        guard let bestCandidateIndex = Self.bestTextFragmentNodeCandidateIndex(candidates) else {
-            Log.debug(
-                "[BrowserLinkOpen] fragment candidates empty count=\(candidates.count)",
-                category: .ui
-            )
-            return nil
-        }
-
-        let candidate = candidates[bestCandidateIndex]
-        let directive = Self.smartTextFragmentDirective(
-            startText: candidate.startText,
-            endText: candidate.endText
-        )
-        Log.debug(
-            "[BrowserLinkOpen] fragment candidate chosen start=\(candidate.startText) end=\(candidate.endText ?? "<none>") centerY=\(candidate.centerY) isolation=\(candidate.isolationScore) directive=\(String(describing: directive)) candidates=\(candidates.count)",
-            category: .ui
-        )
-        return directive
-    }
-
-    private func visibleOCRTextFragmentNodeCandidates() -> [BrowserTextFragmentNodeCandidate] {
-        let nodes = isZoomRegionActive ? ocrNodesInZoomRegion : ocrNodes
-        guard !nodes.isEmpty else { return [] }
-
-        let orderedNodes = nodes.sorted {
-            if abs($0.y - $1.y) > Self.searchHighlightLineTolerance {
-                return $0.y < $1.y
-            }
-            return $0.x < $1.x
-        }
-
-        let nodeWords: [(node: OCRNodeWithText, words: [String])] = orderedNodes.compactMap { node in
-            guard let visibleText = visibleTextFragmentText(for: node) else {
-                return nil
-            }
-
-            let words = Self.cleanTextFragmentWords(from: visibleText)
-            guard words.count >= 3 else {
-                return nil
-            }
-
-            return (node: node, words: words)
-        }
-
-        guard !nodeWords.isEmpty else { return [] }
-
-        return nodeWords.enumerated().compactMap { index, entry in
-            let startText = Self.textFragmentWordSlice(from: entry.words)
-            guard !startText.isEmpty else {
-                return nil
-            }
-
-            let endText = Self.nextTextFragmentEndText(after: index, in: nodeWords)
-            return BrowserTextFragmentNodeCandidate(
-                startText: startText,
-                endText: endText,
-                centerY: entry.node.y + (entry.node.height / 2.0),
-                isolationScore: isolationScore(for: entry.node, among: orderedNodes)
-            )
-        }
-    }
-
-    private func visibleTextFragmentText(for node: OCRNodeWithText) -> String? {
-        let rawText = node.text
-        let trimmedFullText = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedFullText.isEmpty else { return nil }
-
-        guard let range = getVisibleCharacterRange(for: node) else {
-            return trimmedFullText
-        }
-
-        let clampedStart = min(max(range.start, 0), rawText.count)
-        let clampedEnd = min(max(range.end, clampedStart), rawText.count)
-        guard clampedStart < clampedEnd else { return nil }
-
-        let startIndex = rawText.index(rawText.startIndex, offsetBy: clampedStart)
-        let endIndex = rawText.index(rawText.startIndex, offsetBy: clampedEnd)
-        let clippedText = String(rawText[startIndex..<endIndex]).trimmingCharacters(in: .whitespacesAndNewlines)
-        return clippedText.isEmpty ? nil : clippedText
-    }
-
-    private func isolationScore(for target: OCRNodeWithText, among nodes: [OCRNodeWithText]) -> CGFloat {
-        let targetCenterY = target.y + (target.height / 2.0)
-        let targetMinX = target.x
-        let targetMaxX = target.x + target.width
-
-        var nearestGap: CGFloat = 1.0
-
-        for node in nodes where node.id != target.id {
-            let nodeCenterY = node.y + (node.height / 2.0)
-            guard abs(nodeCenterY - targetCenterY) <= Self.searchHighlightLineTolerance else {
-                continue
-            }
-
-            let nodeMinX = node.x
-            let nodeMaxX = node.x + node.width
-            let gap: CGFloat
-            if nodeMaxX <= targetMinX {
-                gap = targetMinX - nodeMaxX
-            } else if nodeMinX >= targetMaxX {
-                gap = nodeMinX - targetMaxX
-            } else {
-                gap = 0
-            }
-
-            nearestGap = min(nearestGap, gap)
-        }
-
-        return nearestGap
-    }
-
-    private static func bestTextFragmentNodeCandidateIndex(_ candidates: [BrowserTextFragmentNodeCandidate]) -> Int? {
-        guard !candidates.isEmpty else { return nil }
-
-        var bestIndex: Int?
-        var bestScore = -Double.greatestFiniteMagnitude
-
-        for (index, candidate) in candidates.enumerated() {
-            let centerPenalty = Double(abs(candidate.centerY - 0.5)) * 120.0
-            let combinedText = candidate.startText + (candidate.endText.map { " " + $0 } ?? "")
-            let usefulLength = min(Double(combinedText.count), 96.0)
-            let shortPenalty = candidate.endText == nil ? 20.0 : 0.0
-            let isolationBonus = Double(min(candidate.isolationScore, 0.12)) * 320.0
-            let score = usefulLength + isolationBonus - centerPenalty - shortPenalty
-            if score > bestScore {
-                bestScore = score
-                bestIndex = index
-            }
-        }
-
-        return bestIndex
-    }
-
-    private static func smartTextFragmentDirective(startText: String, endText: String?) -> String? {
-        guard let normalizedStartText = normalizedTextFragmentComponent(
-            startText,
-            maxLength: 48,
-            minimumLength: 8
-        ) else {
-            return nil
-        }
-
-        let encodedStartText = encodedTextFragmentComponent(normalizedStartText)
-
-        guard let endText,
-              let normalizedEndText = normalizedTextFragmentComponent(
-                endText,
-                maxLength: 48,
-                minimumLength: 8
-              ) else {
-            return ":~:text=" + encodedStartText
-        }
-
-        return ":~:text=" + encodedStartText + "," + encodedTextFragmentComponent(normalizedEndText)
-    }
-
-    static func appendingSmartTextFragment(to urlString: String, directive: String?) -> String {
-        guard let directive,
-              !directive.isEmpty,
-              var components = URLComponents(string: urlString) else {
-            return urlString
-        }
-
-        let existingFragment = components.percentEncodedFragment ?? ""
-        guard !existingFragment.contains(":~:text=") else {
-            return urlString
-        }
-
-        components.percentEncodedFragment = existingFragment.isEmpty
-            ? directive
-            : existingFragment + directive
-        return components.string ?? urlString
-    }
-
-    private static func normalizedTextFragmentComponent(
-        _ text: String?,
-        maxLength: Int,
-        minimumLength: Int
-    ) -> String? {
-        guard let text else { return nil }
-        let collapsed = text
-            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard collapsed.count >= minimumLength else { return nil }
-        if collapsed.count <= maxLength {
-            return collapsed
-        }
-
-        let truncated = String(collapsed.prefix(maxLength))
-        let whitespace = CharacterSet.whitespacesAndNewlines
-
-        if let lastWhitespaceIndex = truncated.lastIndex(where: {
-            $0.unicodeScalars.allSatisfy(whitespace.contains)
-        }) {
-            let wordSafe = truncated[..<lastWhitespaceIndex].trimmingCharacters(in: .whitespacesAndNewlines)
-            if wordSafe.count >= minimumLength {
-                return wordSafe
-            }
-        }
-
-        return truncated.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private static func cleanTextFragmentWords(from text: String) -> [String] {
-        let collapsed = text
-            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-
-        guard !collapsed.isEmpty else { return [] }
-
-        return collapsed
-            .components(separatedBy: .whitespacesAndNewlines)
-            .map { token in
-                token.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
-            }
-            .filter { $0.count >= 2 }
-    }
-
-    private static func textFragmentWordSlice(from words: [String], count: Int = 3) -> String {
-        Array(words.prefix(count)).joined(separator: " ")
-    }
-
-    private static func nextTextFragmentEndText(
-        after index: Int,
-        in entries: [(node: OCRNodeWithText, words: [String])]
-    ) -> String? {
-        guard index + 1 < entries.count else {
-            return nil
-        }
-
-        for nextIndex in (index + 1)..<entries.count {
-            let endText = textFragmentWordSlice(from: entries[nextIndex].words)
-            if !endText.isEmpty {
-                return endText
-            }
-        }
-
-        return nil
-    }
-
-    private static func encodedTextFragmentComponent(_ text: String) -> String {
-        text.addingPercentEncoding(withAllowedCharacters: textFragmentAllowedCharacters) ?? text
-    }
-
-    private static let textFragmentAllowedCharacters: CharacterSet = {
-        var allowed = CharacterSet.urlQueryAllowed
-        allowed.remove(charactersIn: "#&?=,+-")
-        return allowed
-    }()
-
-    private static let youTubeExactActionLabels: Set<String> = [
-        "join",
-        "subscribe",
-        "subscribed",
-        "share",
-        "save",
-        "download",
-        "clip",
-        "thanks",
-        "more",
-        "show more",
-    ]
-
-    private static let textFragmentExcludedDomains: [String] = [
-        "youtube.com",
-        "youtu.be",
-        "x.com",
-        "twitter.com",
-        "facebook.com",
-        "instagram.com",
-        "tiktok.com"
-    ]
-
-    private static func urlContainsTextFragment(_ urlString: String) -> Bool {
-        urlString.contains(":~:text=")
-    }
-
     private static func urlContainsYouTubeTimestamp(_ urlString: String) -> Bool {
-        guard let url = URL(string: urlString),
-              isYouTubeWatchURL(url),
-              let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
-            return false
-        }
-        return components.queryItems?.contains(where: { $0.name.caseInsensitiveCompare("t") == .orderedSame }) == true
+        TimelineYouTubeLinkSupport.urlContainsTimestamp(urlString)
     }
 
     static func inPageURLLinkMetricMetadata(
@@ -10880,18 +11100,11 @@ public class SimpleTimelineViewModel: ObservableObject {
         linkText: String,
         nodeID: Int
     ) -> String? {
-        let payload: [String: Any] = [
+        UIMetricsRecorder.jsonMetadata([
             "url": url,
             "linkText": linkText,
             "nodeID": nodeID
-        ]
-
-        guard JSONSerialization.isValidJSONObject(payload),
-              let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
-              let json = String(data: data, encoding: .utf8) else {
-            return nil
-        }
-        return json
+        ])
     }
 
     private static func inPageURLLinkText(for match: OCRHyperlinkMatch) -> String {
@@ -10908,18 +11121,15 @@ public class SimpleTimelineViewModel: ObservableObject {
         linkText: String,
         nodeID: Int
     ) {
-        let metadata = Self.inPageURLLinkMetricMetadata(
-            url: url,
-            linkText: linkText,
-            nodeID: nodeID
-        )
-
-        Task {
-            try? await coordinator.recordMetricEvent(
-                metricType: metricType,
-                metadata: metadata
+        UIMetricsRecorder.record(
+            coordinator: coordinator,
+            type: metricType,
+            metadata: Self.inPageURLLinkMetricMetadata(
+                url: url,
+                linkText: linkText,
+                nodeID: nodeID
             )
-        }
+        )
     }
 
     static func inPageURLHoverMetricKey(
@@ -11009,7 +11219,6 @@ public class SimpleTimelineViewModel: ObservableObject {
                     coordinator: coordinator,
                     source: "in_page_url_hyperlink",
                     url: resolvedURLString,
-                    usedTextFragment: false,
                     usedYouTubeTimestamp: false
                 )
             } else {
@@ -11038,7 +11247,6 @@ public class SimpleTimelineViewModel: ObservableObject {
                         coordinator: coordinator,
                         source: "in_page_url_hyperlink",
                         url: resolvedURLString,
-                        usedTextFragment: false,
                         usedYouTubeTimestamp: false
                     )
                 }
@@ -11256,15 +11464,6 @@ public class SimpleTimelineViewModel: ObservableObject {
         return components.url
     }
 
-    private static func normalizedHost(_ host: String?) -> String {
-        guard var host else { return "" }
-        host = host.lowercased()
-        if host.hasPrefix("www.") {
-            return String(host.dropFirst(4))
-        }
-        return host
-    }
-
     // MARK: - OCR Node Loading and Text Selection
 
     private func fetchURLBoundingBoxForPresentation(
@@ -11315,19 +11514,6 @@ public class SimpleTimelineViewModel: ObservableObject {
         if showOCRDebugOverlay {
             previousOcrNodes = ocrNodes
         }
-
-        let redactedNodes = nodes.filter(\.isRedacted)
-        if !redactedNodes.isEmpty {
-            let sample = redactedNodes.prefix(5).map { node in
-                "id=\(node.id) rect=(\(String(format: "%.4f", node.x)),\(String(format: "%.4f", node.y)),\(String(format: "%.4f", node.width)),\(String(format: "%.4f", node.height)))"
-            }.joined(separator: "; ")
-            let frameID = redactedNodes.first?.frameId ?? -1
-            Log.debug(
-                "[PhraseRedaction][UI] Loaded redacted nodes frame=\(frameID) count=\(redactedNodes.count) sample=\(sample)",
-                category: .ui
-            )
-        }
-
         if let activeRedactionTooltipNodeID,
            !nodes.contains(where: { $0.id == activeRedactionTooltipNodeID }) {
             dismissRedactionTooltip()
@@ -11338,6 +11524,11 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     public func clearTemporaryRedactionReveals() {
+        for task in pendingRedactedNodeHideRemovalTasks.values {
+            task.cancel()
+        }
+        pendingRedactedNodeHideRemovalTasks.removeAll()
+
         let revealedNodeIDs = Set(revealedRedactedNodePatches.keys)
         if !revealedNodeIDs.isEmpty {
             var updatedNodes = ocrNodes
@@ -11356,6 +11547,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
 
         revealedRedactedNodePatches.removeAll()
+        hidingRedactedNodePatches.removeAll()
         revealedRedactedFrameID = nil
         dismissRedactionTooltip()
     }
@@ -11372,23 +11564,15 @@ public class SimpleTimelineViewModel: ObservableObject {
         state: PhraseLevelRedactionTooltipState
     ) {
         guard state == .queued else { return }
-        let payload: [String: Any] = [
-            "nodeID": nodeID,
-            "frameID": currentTimelineFrame?.frame.id.value ?? -1,
-            "processingStatus": currentTimelineFrame?.processingStatus ?? -1
-        ]
-        guard JSONSerialization.isValidJSONObject(payload),
-              let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
-              let json = String(data: data, encoding: .utf8) else {
-            return
-        }
-
-        Task {
-            try? await coordinator.recordMetricEvent(
-                metricType: .phraseLevelRedactionQueuedHover,
-                metadata: json
-            )
-        }
+        UIMetricsRecorder.recordDictionary(
+            coordinator: coordinator,
+            type: .phraseLevelRedactionQueuedHover,
+            payload: [
+                "nodeID": nodeID,
+                "frameID": currentTimelineFrame?.frame.id.value ?? -1,
+                "processingStatus": currentTimelineFrame?.processingStatus ?? -1
+            ]
+        )
     }
 
     public func dismissRedactionTooltip() {
@@ -11423,60 +11607,43 @@ public class SimpleTimelineViewModel: ObservableObject {
         String(repeating: " ", count: node.text.count)
     }
 
-    func copyablePhraseLevelRedactionText(for node: OCRNodeWithText) -> String? {
-        let currentNode = ocrNodes.first(where: { $0.id == node.id }) ?? node
-        let visibleText = currentNode.text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !visibleText.isEmpty, visibleText != currentNode.encryptedText {
-            return visibleText
-        }
-
-        guard let secret = ReversibleOCRScrambler.currentAppWideSecret() else {
-            return nil
-        }
-
-        return decryptedOCRText(for: currentNode, secret: secret)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+    private func cancelPendingRedactedNodeHideRemoval(for nodeID: Int) {
+        pendingRedactedNodeHideRemovalTasks.removeValue(forKey: nodeID)?.cancel()
     }
 
-    public func copyPhraseLevelRedactionText(for node: OCRNodeWithText) {
-        guard let text = copyablePhraseLevelRedactionText(for: node), !text.isEmpty else {
-            showToast("Text unavailable", icon: "exclamationmark.circle.fill")
-            return
-        }
+    private func scheduleRedactedNodeHideRemoval(for nodeID: Int) {
+        cancelPendingRedactedNodeHideRemoval(for: nodeID)
+        pendingRedactedNodeHideRemovalTasks[nodeID] = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(
+                    for: Self.phraseLevelRedactionHideAnimationDuration,
+                    clock: .continuous
+                )
+            } catch {
+                return
+            }
 
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(text, forType: .string)
-        showToast("Text copied", icon: "doc.on.doc.fill")
-        DashboardViewModel.recordTextCopy(coordinator: coordinator, text: text)
+            guard let self else { return }
+            self.hidingRedactedNodePatches.removeValue(forKey: nodeID)
+            self.pendingRedactedNodeHideRemovalTasks.removeValue(forKey: nodeID)
+        }
     }
 
     public func togglePhraseLevelRedactionReveal(for node: OCRNodeWithText) {
         guard node.isRedacted else { return }
         guard let frame = currentTimelineFrame?.frame else { return }
-        guard Self.isSuccessfulProcessingStatus(currentTimelineFrame?.processingStatus ?? -1) else {
-            Log.debug(
-                "[PhraseRedaction][UI] Skip reveal node=\(node.id) frame=\(node.frameId) processingStatus=\(currentTimelineFrame?.processingStatus ?? -1)",
-                category: .ui
-            )
-            return
-        }
-        guard let secret = ReversibleOCRScrambler.currentAppWideSecret() else {
-            Log.warning(
-                "[PhraseRedaction][UI] Skip reveal node=\(node.id) frame=\(node.frameId) because no master key exists",
-                category: .ui
-            )
-            return
-        }
+        guard Self.isSuccessfulProcessingStatus(currentTimelineFrame?.processingStatus ?? -1) else { return }
+        guard let secret = ReversibleOCRScrambler.currentAppWideSecret() else { return }
 
-        if revealedRedactedNodePatches[node.id] != nil {
-            revealedRedactedNodePatches.removeValue(forKey: node.id)
+        if let revealedPatch = revealedRedactedNodePatches.removeValue(forKey: node.id) {
+            hidingRedactedNodePatches[node.id] = revealedPatch
+            scheduleRedactedNodeHideRemoval(for: node.id)
             if node.encryptedText != nil {
                 updateOCRNode(nodeID: node.id) { currentNode in
                     currentNode.replacingText(maskedOCRText(for: currentNode))
                 }
             }
             dismissRedactionTooltip()
-            Log.debug("[PhraseRedaction][UI] Hide node \(node.id) frame=\(node.frameId)", category: .ui)
             return
         }
 
@@ -11496,6 +11663,8 @@ public class SimpleTimelineViewModel: ObservableObject {
 
                 await MainActor.run {
                     guard self.currentTimelineFrame?.frame.id == frame.id else { return }
+                    self.cancelPendingRedactedNodeHideRemoval(for: node.id)
+                    self.hidingRedactedNodePatches.removeValue(forKey: node.id)
                     self.revealedRedactedFrameID = frame.id
                     self.revealedRedactedNodePatches[node.id] = patch
                     if let revealedText {
@@ -11504,9 +11673,13 @@ public class SimpleTimelineViewModel: ObservableObject {
                     self.dismissRedactionTooltip()
                 }
 
-                try? await self.coordinator.recordMetricEvent(
-                    metricType: .phraseLevelRedactionReveal,
-                    metadata: "{\"nodeID\":\(node.id),\"frameID\":\(node.frameId)}"
+                UIMetricsRecorder.recordDictionary(
+                    coordinator: self.coordinator,
+                    type: .phraseLevelRedactionReveal,
+                    payload: [
+                        "nodeID": node.id,
+                        "frameID": node.frameId
+                    ]
                 )
             } catch {
                 Log.warning("[PhraseRedaction] Failed to reveal node \(node.id): \(error.localizedDescription)", category: .ui)
@@ -11568,13 +11741,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             imageWidth: width,
             imageHeight: height
         )
-        guard patchRect.width > 1, patchRect.height > 1 else {
-            Log.warning(
-                "[PhraseRedaction][UI] Skipping reveal for tiny node \(node.id) frame=\(node.frameId)",
-                category: .ui
-            )
-            return nil
-        }
+        guard patchRect.width > 1, patchRect.height > 1 else { return nil }
 
         guard let patch = BGRAImageUtilities.extractPatch(
             from: frameData,
@@ -11591,11 +11758,6 @@ public class SimpleTimelineViewModel: ObservableObject {
             frameID: node.frameId,
             nodeID: node.id,
             secret: secret
-        )
-
-        Log.debug(
-            "[PhraseRedaction][UI] Reveal node=\(node.id) frame=\(node.frameId) strategy=COVERING+CURRENT pixelRect=(x=\(Int(patchRect.origin.x)),y=\(Int(patchRect.origin.y)),w=\(Int(patchRect.width)),h=\(Int(patchRect.height))) image=\(width)x\(height)",
-            category: .ui
         )
 
         guard let patchImage = nsImageFromBGRA(
@@ -12102,6 +12264,63 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
     }
 
+    // MARK: - Timeline Tape Right-Click Hint Methods
+
+    func showTimelineTapeRightClickHint(autoDismissAfter: TimeInterval = 5) {
+        timelineTapeRightClickHintDismissTask?.cancel()
+        timelineTapeRightClickHintDismissTask = nil
+
+        withAnimation(.spring(response: 0.3, dampingFraction: 0.82)) {
+            showTimelineTapeRightClickHintBanner = true
+        }
+
+        TimelineMetrics.recordTimelineTapeRightClickHintAction(
+            coordinator: coordinator,
+            action: "shown",
+            trigger: "bubble_scroll_dismiss"
+        )
+
+        let dismissDelayNs = Int64(max(0, autoDismissAfter) * 1_000_000_000)
+        timelineTapeRightClickHintDismissTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .nanoseconds(dismissDelayNs), clock: .continuous)
+            guard let self, !Task.isCancelled else { return }
+            self.timelineTapeRightClickHintDismissTask = nil
+            self.clearTimelineTapeRightClickHint(cancelDismissTask: false)
+            TimelineMetrics.recordTimelineTapeRightClickHintAction(
+                coordinator: self.coordinator,
+                action: "auto_dismissed",
+                trigger: "bubble_scroll_dismiss"
+            )
+        }
+    }
+
+    public func dismissTimelineTapeRightClickHint() {
+        clearTimelineTapeRightClickHint()
+        TimelineMetrics.recordTimelineTapeRightClickHintAction(
+            coordinator: coordinator,
+            action: "dismissed",
+            trigger: "bubble_scroll_dismiss"
+        )
+    }
+
+    func clearTimelineTapeRightClickHint(
+        animated: Bool = true,
+        cancelDismissTask: Bool = true
+    ) {
+        if cancelDismissTask {
+            timelineTapeRightClickHintDismissTask?.cancel()
+            timelineTapeRightClickHintDismissTask = nil
+        }
+
+        if animated {
+            withAnimation(.easeOut(duration: 0.2)) {
+                showTimelineTapeRightClickHintBanner = false
+            }
+        } else {
+            showTimelineTapeRightClickHintBanner = false
+        }
+    }
+
     // MARK: - Scroll Orientation Hint Methods
 
     /// Show the scroll orientation hint banner with auto-dismiss after 8 seconds
@@ -12169,6 +12388,52 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
     }
 
+    public func showPositionRecoveryHint(
+        hiddenElapsedSeconds: TimeInterval,
+        autoDismissAfter: TimeInterval = 10
+    ) {
+        guard !Self.positionRecoveryHintDismissedForSession else {
+            return
+        }
+
+        positionRecoveryHintDismissTask?.cancel()
+        positionRecoveryHintDismissTask = nil
+
+        withAnimation(.spring(response: 0.3, dampingFraction: 0.82)) {
+            showPositionRecoveryHintBanner = true
+        }
+
+        TimelineMetrics.recordPositionRecoveryHintAction(
+            coordinator: coordinator,
+            action: "shown",
+            source: "cache_bust_reopen",
+            seconds: max(0, Int(hiddenElapsedSeconds.rounded(.down)))
+        )
+
+        let dismissDelayNs = Int64(max(0, autoDismissAfter) * 1_000_000_000)
+        positionRecoveryHintDismissTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .nanoseconds(dismissDelayNs), clock: .continuous)
+            guard let self, !Task.isCancelled else { return }
+            self.positionRecoveryHintDismissTask = nil
+            self.clearPositionRecoveryHint(cancelDismissTask: false)
+            TimelineMetrics.recordPositionRecoveryHintAction(
+                coordinator: self.coordinator,
+                action: "auto_dismissed",
+                source: "cache_bust_reopen"
+            )
+        }
+    }
+
+    public func dismissPositionRecoveryHint() {
+        Self.positionRecoveryHintDismissedForSession = true
+        clearPositionRecoveryHint()
+        TimelineMetrics.recordPositionRecoveryHintAction(
+            coordinator: coordinator,
+            action: "dismissed",
+            source: "cache_bust_reopen"
+        )
+    }
+
     private func clearControlsHiddenRestoreGuidance(animated: Bool = true) {
         highlightShowControlsContextMenuRow = false
 
@@ -12178,6 +12443,29 @@ public class SimpleTimelineViewModel: ObservableObject {
             }
         } else {
             showControlsHiddenRestoreHintBanner = false
+        }
+    }
+
+    private func clearPositionRecoveryHintForSupersedingNavigation() {
+        guard showPositionRecoveryHintBanner else { return }
+        clearPositionRecoveryHint()
+    }
+
+    private func clearPositionRecoveryHint(
+        animated: Bool = true,
+        cancelDismissTask: Bool = true
+    ) {
+        if cancelDismissTask {
+            positionRecoveryHintDismissTask?.cancel()
+            positionRecoveryHintDismissTask = nil
+        }
+
+        if animated {
+            withAnimation(.easeOut(duration: 0.2)) {
+                showPositionRecoveryHintBanner = false
+            }
+        } else {
+            showPositionRecoveryHintBanner = false
         }
     }
 
@@ -12313,6 +12601,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     ) {
         shiftDragDisplayRequestID += 1
         let requestID = shiftDragDisplayRequestID
+        cancelShiftDragDisplayDecode(reason: "ui.timeline.shift_drag_decode")
 
         if isInLiveMode {
             shiftDragDisplaySnapshot = liveScreenshot
@@ -12332,15 +12621,29 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
 
         let requestedTime = videoInfo.frameTimeCMTime
+        let directDecodeBytes = UIDirectFrameDecodeMemoryLedger.begin(
+            tag: UIDirectFrameDecodeMemoryLedger.shiftDragGeneratorTag,
+            function: "ui.timeline.direct_decode",
+            reason: "ui.timeline.shift_drag_decode",
+            videoInfo: videoInfo
+        )
 
         let asset = AVURLAsset(url: url)
         let imageGenerator = AVAssetImageGenerator(asset: asset)
+        let generatorID = ObjectIdentifier(imageGenerator)
+        shiftDragDisplayGenerator = imageGenerator
         imageGenerator.appliesPreferredTrackTransform = true
         imageGenerator.requestedTimeToleranceBefore = .zero
         imageGenerator.requestedTimeToleranceAfter = .zero
 
         imageGenerator.generateCGImagesAsynchronously(forTimes: [NSValue(time: requestedTime)]) { _, cgImage, _, _, _ in
             DispatchQueue.main.async {
+                UIDirectFrameDecodeMemoryLedger.end(
+                    tag: UIDirectFrameDecodeMemoryLedger.shiftDragGeneratorTag,
+                    reason: "ui.timeline.shift_drag_decode",
+                    bytes: directDecodeBytes
+                )
+                self.clearShiftDragDisplayGeneratorIfMatching(generatorID)
                 guard requestID == self.shiftDragDisplayRequestID else {
                     return
                 }
@@ -12395,6 +12698,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Clear all zoom region state (called after exit animation completes)
     private func clearZoomRegionState() {
+        cancelShiftDragDisplayDecode(reason: "ui.timeline.shift_drag_cleanup")
         isZoomRegionActive = false
         isZoomExitTransitioning = false
         isZoomTransitioning = false
@@ -13048,14 +13352,55 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
+        showToast("Text copied", icon: "doc.on.doc.fill")
 
-        // Track text copy event with the copied text
-        // Track text copy event with the copied text
+        // Track text copy event with the copied text.
         DashboardViewModel.recordTextCopy(coordinator: coordinator, text: text)
         
         // Track shift+drag text copy if this was from a manual selection
         if hasSelection {
             DashboardViewModel.recordShiftDragTextCopy(coordinator: coordinator, copiedText: text)
+        }
+    }
+
+    /// Copy all text visible within the active zoom region.
+    public func copyZoomedRegionText() {
+        guard let _ = zoomRegion, isZoomRegionActive else {
+            showToast("Text unavailable", icon: "exclamationmark.circle.fill")
+            return
+        }
+
+        let text = visibleZoomRegionText()
+        guard !text.isEmpty else {
+            showToast("Text unavailable", icon: "exclamationmark.circle.fill")
+            return
+        }
+
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        showToast("Text copied", icon: "doc.on.doc.fill")
+        DashboardViewModel.recordTextCopy(coordinator: coordinator, text: text)
+    }
+
+    /// Copy the currently displayed frame image to the clipboard.
+    public func copyCurrentFrameImageToClipboard() {
+        getCurrentFrameImage { image in
+            guard let image = image else {
+                self.showToast("Failed to copy image", icon: "exclamationmark.triangle.fill")
+                return
+            }
+
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            let didWrite = pasteboard.writeObjects([image])
+
+            guard didWrite else {
+                self.showToast("Failed to copy image", icon: "exclamationmark.triangle.fill")
+                return
+            }
+
+            self.showToast("Image copied")
+            DashboardViewModel.recordImageCopy(coordinator: self.coordinator, frameID: self.currentFrame?.id.value)
         }
     }
 
@@ -13118,6 +13463,40 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
     }
 
+    private func visibleZoomRegionText() -> String {
+        let sortedNodes = ocrNodesInZoomRegion.sorted { node1, node2 in
+            let yTolerance: CGFloat = 0.02
+            if abs(node1.y - node2.y) > yTolerance {
+                return node1.y < node2.y
+            }
+            return node1.x < node2.x
+        }
+
+        return sortedNodes.compactMap { visibleTextInZoomRegion(for: $0) }
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func visibleTextInZoomRegion(for node: OCRNodeWithText) -> String? {
+        let rawText: String
+        if let range = getVisibleCharacterRange(for: node) {
+            let clampedStart = max(0, min(range.start, node.text.count))
+            let clampedEnd = max(clampedStart, min(range.end, node.text.count))
+            guard clampedStart < clampedEnd else {
+                return nil
+            }
+
+            let startIndex = node.text.index(node.text.startIndex, offsetBy: clampedStart)
+            let endIndex = node.text.index(node.text.startIndex, offsetBy: clampedEnd)
+            rawText = String(node.text[startIndex..<endIndex])
+        } else {
+            rawText = node.text
+        }
+
+        let trimmedText = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmedText.isEmpty ? nil : trimmedText
+    }
+
     /// Get the current frame as an image (handles both static images and video frames)
     private func getCurrentFrameImage(completion: @escaping (NSImage?) -> Void) {
         // Live mode uses the latest screenshot buffer, not timeline video/currentImage.
@@ -13159,8 +13538,19 @@ public class SimpleTimelineViewModel: ObservableObject {
             completion(nil)
             return
         }
+        zoomCopyRequestID &+= 1
+        let requestID = zoomCopyRequestID
+        cancelZoomCopyDecode(reason: "ui.timeline.zoom_copy_decode")
         let asset = AVURLAsset(url: url)
+        let directDecodeBytes = UIDirectFrameDecodeMemoryLedger.begin(
+            tag: UIDirectFrameDecodeMemoryLedger.zoomCopyGeneratorTag,
+            function: "ui.timeline.direct_decode",
+            reason: "ui.timeline.zoom_copy_decode",
+            videoInfo: videoInfo
+        )
         let imageGenerator = AVAssetImageGenerator(asset: asset)
+        let generatorID = ObjectIdentifier(imageGenerator)
+        zoomCopyGenerator = imageGenerator
         imageGenerator.appliesPreferredTrackTransform = true
         imageGenerator.requestedTimeToleranceBefore = .zero
         imageGenerator.requestedTimeToleranceAfter = .zero
@@ -13169,6 +13559,15 @@ public class SimpleTimelineViewModel: ObservableObject {
         let time = videoInfo.frameTimeCMTime
         imageGenerator.generateCGImagesAsynchronously(forTimes: [NSValue(time: time)]) { _, cgImage, _, _, _ in
             DispatchQueue.main.async {
+                UIDirectFrameDecodeMemoryLedger.end(
+                    tag: UIDirectFrameDecodeMemoryLedger.zoomCopyGeneratorTag,
+                    reason: "ui.timeline.zoom_copy_decode",
+                    bytes: directDecodeBytes
+                )
+                self.clearZoomCopyGeneratorIfMatching(generatorID)
+                guard requestID == self.zoomCopyRequestID else {
+                    return
+                }
                 if let cgImage = cgImage {
                     let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
                     completion(nsImage)
@@ -13180,6 +13579,37 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
     }
 
+    private func cancelPendingDirectDecodeGenerators(reason: String) {
+        cancelShiftDragDisplayDecode(reason: reason)
+        cancelZoomCopyDecode(reason: reason)
+    }
+
+    private func cancelShiftDragDisplayDecode(reason: String) {
+        guard let shiftDragDisplayGenerator else { return }
+        shiftDragDisplayGenerator.cancelAllCGImageGeneration()
+        self.shiftDragDisplayGenerator = nil
+        Log.debug("[Timeline-Decode] Cancelled shift-drag generator (\(reason))", category: .ui)
+    }
+
+    private func cancelZoomCopyDecode(reason: String) {
+        guard let zoomCopyGenerator else { return }
+        zoomCopyGenerator.cancelAllCGImageGeneration()
+        self.zoomCopyGenerator = nil
+        Log.debug("[Timeline-Decode] Cancelled zoom-copy generator (\(reason))", category: .ui)
+    }
+
+    private func clearShiftDragDisplayGeneratorIfMatching(_ generatorID: ObjectIdentifier) {
+        guard let shiftDragDisplayGenerator else { return }
+        guard ObjectIdentifier(shiftDragDisplayGenerator) == generatorID else { return }
+        self.shiftDragDisplayGenerator = nil
+    }
+
+    private func clearZoomCopyGeneratorIfMatching(_ generatorID: ObjectIdentifier) {
+        guard let zoomCopyGenerator else { return }
+        guard ObjectIdentifier(zoomCopyGenerator) == generatorID else { return }
+        self.zoomCopyGenerator = nil
+    }
+
     /// Handle scroll delta to navigate frames
     /// - Parameters:
     ///   - delta: The scroll delta value
@@ -13189,6 +13619,8 @@ public class SimpleTimelineViewModel: ObservableObject {
         if isPlaying {
             stopPlayback()
         }
+
+        markVisibleSessionScrubStarted(source: isTrackpad ? "trackpad-scroll" : "mouse-wheel")
 
         // Exit live mode on first scroll
         if isInLiveMode {
@@ -13207,7 +13639,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         if !isActivelyScrolling {
             isActivelyScrolling = true
             dismissContextMenu()
-            dismissTimelineContextMenu()
+            dismissTimelineContextMenu(reason: .scroll)
         }
 
         // Cancel previous debounce task
@@ -13370,6 +13802,18 @@ public class SimpleTimelineViewModel: ObservableObject {
         return isNearMostRecentFrame(within: 1)
     }
 
+    /// Whether the playhead is centered on a hard timeline edge with no more frames beyond it.
+    /// This is narrower than `isAtMostRecentFrame`: it only becomes true once scrolling has
+    /// fully settled on the absolute start/end, with no residual sub-frame offset.
+    var isSettledAtAbsoluteTimelineBoundary: Bool {
+        guard !frames.isEmpty else { return false }
+        guard abs(subFrameOffset) < 0.001 else { return false }
+
+        let atAbsoluteStart = currentIndex <= 0 && !hasMoreOlder
+        let atAbsoluteEnd = currentIndex >= frames.count - 1 && !hasMoreNewer
+        return atAbsoluteStart || atAbsoluteEnd
+    }
+
     /// Whether the timeline is within N frames of the most recent
     /// - Parameter within: Number of frames from the end to consider "near" (1 = last frame only, 2 = last 2 frames, etc.)
     public func isNearMostRecentFrame(within count: Int) -> Bool {
@@ -13414,7 +13858,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         scrollDebounceTask = nil
         isActivelyScrolling = false
         subFrameOffset = 0
-        cancelBoundaryLoadTasks(reason: "goToNow")
+        resetBoundaryLoads(reason: "goToNow")
 
         // Clear filters without triggering reload (we'll handle that ourselves)
         if activeFilterCount > 0 {
@@ -13441,6 +13885,15 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     // MARK: - Calendar Picker
+
+    /// Collapse the calendar picker and clear its selection state.
+    public func closeCalendarPicker() {
+        isCalendarPickerVisible = false
+        hoursWithFrames = []
+        selectedCalendarDate = nil
+        calendarKeyboardFocus = .dateGrid
+        selectedCalendarHour = nil
+    }
 
     /// Set keyboard navigation focus to the date grid.
     public func focusCalendarDateGrid() {
@@ -13518,7 +13971,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Also auto-loads hours for today if today has frames
     public func loadDatesWithFrames() async {
         do {
-            let dates = try await coordinator.getDistinctDates()
+            let dates = try await coordinator.getDistinctDates(filters: filterCriteria)
             await MainActor.run {
                 self.datesWithFrames = Set(dates)
             }
@@ -13540,7 +13993,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Load hours with frames for a specific date (displays available hours in the picker)
     public func loadHoursForDate(_ date: Date) async {
         do {
-            let hours = try await coordinator.getDistinctHoursForDate(date)
+            let hours = try await coordinator.getDistinctHoursForDate(date, filters: filterCriteria)
             await MainActor.run {
                 self.selectedCalendarDate = date
                 self.hoursWithFrames = hours
@@ -13650,7 +14103,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     private func navigateToDate(_ targetDate: Date) async {
         setLoadingState(true, reason: "navigateToDate")
         clearError()
-        cancelBoundaryLoadTasks(reason: "navigateToDate")
+        resetBoundaryLoads(reason: "navigateToDate")
         cancelPendingStoppedPositionRecording()
         _ = recordCurrentPositionImmediatelyForUndo(reason: "navigateToDate.source")
 
@@ -13681,17 +14134,12 @@ public class SimpleTimelineViewModel: ObservableObject {
                 return
             }
 
-            // Clear disk frame buffer
-            let oldCacheCount = diskFrameBufferIndex.count
-            clearDiskFrameBuffer(reason: "calendar navigation")
-            if oldCacheCount > 0 {
-                Log.info("[Memory] Cleared disk frame buffer on calendar navigation (\(oldCacheCount) frames removed)", category: .ui)
-            }
-
-            frames = framesWithVideoInfo.map { TimelineFrame(frameWithVideoInfo: $0) }
-
-            updateWindowBoundaries()
-            resetBoundaryStateForReloadWindow()
+            applyNavigationFrameWindow(
+                framesWithVideoInfo,
+                clearDiskBufferReason: "calendar navigation",
+                memoryLogContext: "calendar navigation"
+            )
+            clearPositionRecoveryHintForSupersedingNavigation()
 
             let closestIndex = findClosestFrameIndex(to: targetDate)
             currentIndex = closestIndex
@@ -13710,6 +14158,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     public func searchForDate(_ searchText: String, source: String = "timeline_date_search") async {
         let trimmedSearchText = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedSearchText.isEmpty else { return }
+        let normalizedPlayheadDaySearchText = normalizedPlayheadDayReferenceInput(trimmedSearchText)
         let numericFrameID = Int64(trimmedSearchText)
         let qualifiesForFrameIDSearch = numericFrameID.map { $0 >= Self.minimumFrameIDSearchValue } ?? false
         var frameIDLookupAttempted = false
@@ -13725,7 +14174,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         setLoadingState(true, reason: "searchForDate")
         clearError()
-        cancelBoundaryLoadTasks(reason: "searchForDate")
+        resetBoundaryLoads(reason: "searchForDate")
         dateJumpTraceID += 1
         let jumpTraceID = dateJumpTraceID
         cancelPendingStoppedPositionRecording()
@@ -13761,10 +14210,12 @@ public class SimpleTimelineViewModel: ObservableObject {
             // Parse natural language date.
             // "X minutes/hours earlier|later" is interpreted relative to the current playhead timestamp.
             let targetDate: Date
-            if let playheadRelativeDate = parsePlayheadRelativeDateIfNeeded(searchText) {
+            if let playheadRelativeDate = parsePlayheadRelativeDateIfNeeded(normalizedPlayheadDaySearchText) {
                 targetDate = playheadRelativeDate
+            } else if let playheadDayReferenceDate = parsePlayheadDayReferenceIfNeeded(trimmedSearchText) {
+                targetDate = playheadDayReferenceDate
             } else {
-                guard let parsedDate = parseNaturalLanguageDate(trimmedSearchText) else {
+                guard let parsedDate = parseNaturalLanguageDate(normalizedPlayheadDaySearchText) else {
                     let parseFailedReason: String
                     let outcome: String
                     if frameIDLookupAttempted, let frameID = numericFrameID {
@@ -13792,7 +14243,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
             let anchoredTargetDate = try await resolveDateSearchAnchorDate(
                 parsedDate: targetDate,
-                input: trimmedSearchText
+                input: normalizedPlayheadDaySearchText
             )
 
             // Load frames around the target date (±10 minutes window)
@@ -13825,19 +14276,12 @@ public class SimpleTimelineViewModel: ObservableObject {
                 return
             }
 
-            // Clear disk frame buffer since we're jumping to a new time window
-            let oldCacheCount = diskFrameBufferIndex.count
-            clearDiskFrameBuffer(reason: "date search")
-            if oldCacheCount > 0 {
-                Log.info("[Memory] Cleared disk frame buffer on date search (\(oldCacheCount) frames removed)", category: .ui)
-            }
-
-            // Convert to TimelineFrame - video info is already included from the JOIN
-            frames = framesWithVideoInfo.map { TimelineFrame(frameWithVideoInfo: $0) }
-
-            // Reset infinite scroll state for new window
-            updateWindowBoundaries()
-            resetBoundaryStateForReloadWindow()
+            applyNavigationFrameWindow(
+                framesWithVideoInfo,
+                clearDiskBufferReason: "date search",
+                memoryLogContext: "date search"
+            )
+            clearPositionRecoveryHintForSupersedingNavigation()
 
             // Find the frame closest to the target date in our centered set
             let closestIndex = findClosestFrameIndex(to: anchoredTargetDate)
@@ -13892,7 +14336,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         includeHiddenSegments: Bool = false,
         showFailureUI: Bool = true
     ) async -> Bool {
-        cancelBoundaryLoadTasks(reason: "searchForFrameID")
+        resetBoundaryLoads(reason: "searchForFrameID")
         cancelPendingStoppedPositionRecording()
         _ = recordCurrentPositionImmediatelyForUndo(reason: "searchForFrameID.source")
 
@@ -13936,19 +14380,12 @@ public class SimpleTimelineViewModel: ObservableObject {
                 return false
             }
 
-            // Clear disk frame buffer since we're jumping to a new time window
-            let oldCacheCount = diskFrameBufferIndex.count
-            clearDiskFrameBuffer(reason: "frame ID search")
-            if oldCacheCount > 0 {
-                Log.info("[Memory] Cleared disk frame buffer on frame ID search (\(oldCacheCount) frames removed)", category: .ui)
-            }
-
-            // Convert to TimelineFrame
-            frames = framesWithVideoInfo.map { TimelineFrame(frameWithVideoInfo: $0) }
-
-            // Reset infinite scroll state for new window
-            updateWindowBoundaries()
-            resetBoundaryStateForReloadWindow()
+            applyNavigationFrameWindow(
+                framesWithVideoInfo,
+                clearDiskBufferReason: "frame ID search",
+                memoryLogContext: "frame ID search"
+            )
+            clearPositionRecoveryHintForSupersedingNavigation()
 
             // Find the exact frame by ID in our loaded frames
             if let exactIndex = frames.firstIndex(where: { $0.frame.id.value == frameID }) {
@@ -14046,6 +14483,47 @@ public class SimpleTimelineViewModel: ObservableObject {
         )
     }
 
+    private func parsePlayheadDayReferenceIfNeeded(_ text: String) -> Date? {
+        guard hasPlayheadDayReference(text) else {
+            return nil
+        }
+
+        let normalizedInput = normalizedPlayheadDayReferenceInput(text)
+        let baseTimestamp: Date
+        if let currentTimestamp {
+            baseTimestamp = currentTimestamp
+        } else {
+            baseTimestamp = Date()
+            Log.warning("[DateSearch] Same-day reference '\(normalizedInput)' had no playhead timestamp; falling back to now", category: .ui)
+        }
+
+        let calendar = Calendar.current
+        if normalizedInput == "today" ||
+            normalizedInput.range(of: #"^start of (?:the )?today$"#, options: .regularExpression) != nil {
+            return calendar.startOfDay(for: baseTimestamp)
+        }
+
+        let strippedTodayInput = normalizedInput
+            .replacingOccurrences(of: #"\btoday\b"#, with: " ", options: .regularExpression)
+            .replacingOccurrences(of: #"\b(?:at|on)\b"#, with: " ", options: .regularExpression)
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if strippedTodayInput.isEmpty {
+            return calendar.startOfDay(for: baseTimestamp)
+        }
+
+        if let timeOnlyDate = parseTimeOnly(strippedTodayInput, relativeTo: baseTimestamp) {
+            return timeOnlyDate
+        }
+
+        if let parsedStrippedInput = parseNaturalLanguageDate(strippedTodayInput, now: baseTimestamp) {
+            return parsedStrippedInput
+        }
+
+        return parseNaturalLanguageDate(normalizedInput, now: baseTimestamp)
+    }
+
     private func parsePlayheadRelativeOffset(_ normalizedText: String) -> PlayheadRelativeOffset? {
         let normalizedInput = normalizeRelativeDateShorthand(normalizedText)
         guard let regex = try? NSRegularExpression(
@@ -14128,15 +14606,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         func finalizeParsedDate(_ parsedDate: Date) -> Date {
             let anchorMode = inferDateSearchAnchorMode(for: normalizedWithCompactTimes)
-            let dateForYearAdjustment: Date
-
-            // For date-only input ("Feb 23"), normalize to start-of-day before
-            // yearless-future coercion so "today" isn't treated as future.
-            if anchorMode == .firstFrameInDay {
-                dateForYearAdjustment = calendar.startOfDay(for: parsedDate)
-            } else {
-                dateForYearAdjustment = parsedDate
-            }
+            let dateForYearAdjustment = normalizedAnchorDate(parsedDate, mode: anchorMode, calendar: calendar)
 
             var normalized = adjustYearlessAbsoluteFutureDateToRecentPastIfNeeded(
                 dateForYearAdjustment,
@@ -14150,10 +14620,37 @@ public class SimpleTimelineViewModel: ObservableObject {
                 now: now,
                 calendar: calendar
             )
-            if anchorMode == .firstFrameInDay {
-                return calendar.startOfDay(for: normalized)
-            }
-            return normalized
+            return normalizedAnchorDate(normalized, mode: anchorMode, calendar: calendar)
+        }
+
+        // Bias bare compact numeric input like "2024" toward 20:24 before
+        // standalone year parsing can claim it.
+        if let timeOnlyDate = parseTimeOnly(normalizedRelativeInput, relativeTo: now) {
+            return finalizeParsedDate(timeOnlyDate)
+        }
+
+        if let dateWithLeadingTime = parseDateWithLeadingTimeComponent(
+            normalizedWithCompactTimes,
+            now: now,
+            calendar: calendar
+        ) {
+            return finalizeParsedDate(dateWithLeadingTime)
+        }
+
+        if let standaloneMonthDate = parseStandaloneMonthReference(
+            normalizedRelativeInput,
+            now: now,
+            calendar: calendar
+        ) {
+            return finalizeParsedDate(standaloneMonthDate)
+        }
+
+        if let standaloneYearDate = parseStandaloneYearReference(
+            normalizedRelativeInput,
+            now: now,
+            calendar: calendar
+        ) {
+            return finalizeParsedDate(standaloneYearDate)
         }
 
         // === PRIMARY: SwiftyChrono NLP Parser ===
@@ -14174,14 +14671,6 @@ public class SimpleTimelineViewModel: ObservableObject {
         // SwiftyChrono handles all relative dates (X days/weeks/months/years ago, yesterday, etc.)
         // We only need fallback for compact time formats and explicit date strings
         let trimmedLower = normalizedRelativeInput
-
-        // === TIME-ONLY INPUT ===
-
-        // Try parsing time-only input (assumes "today" if just time is given)
-        // Handles: "938pm", "9:38pm", "938 pm", "9:38 pm", "938", "9:38", "21:38"
-        if let timeOnlyDate = parseTimeOnly(trimmedLower, relativeTo: now) {
-            return finalizeParsedDate(timeOnlyDate)
-        }
 
         // Normalize compact time formats before passing to NSDataDetector.
         // Examples:
@@ -14212,6 +14701,8 @@ public class SimpleTimelineViewModel: ObservableObject {
             "MM/dd h:mm a",           // "12/16 6:05 PM"
             "yyyy-MM-dd HH:mm",       // "2024-12-16 18:05"
             "yyyy-MM-dd'T'HH:mm:ss",  // ISO 8601
+            "MMM yyyy",               // "Jul 2025"
+            "MMMM yyyy",              // "July 2025"
             "MMM d",                  // "Dec 16" (assumes current year, noon)
             "MMMM d",                 // "December 16"
         ]
@@ -14284,6 +14775,8 @@ public class SimpleTimelineViewModel: ObservableObject {
         case firstFrameInMinute
         case firstFrameInHour
         case firstFrameInDay
+        case firstFrameInMonth
+        case firstFrameInYear
     }
 
     private enum PlayheadRelativeDirection {
@@ -14410,8 +14903,8 @@ public class SimpleTimelineViewModel: ObservableObject {
         return anchoredTimestamp
     }
 
-    /// "X hour/day/month before|earlier", "X hour/day/month later|after", and "X hours ago"
-    /// should anchor to the edge frame of the full relative window, not an exact timestamp.
+    /// Relative before/after and ago expressions should anchor to the edge frame of the
+    /// full relative window, not an exact timestamp.
     private func relativeLookbackRangeIfNeeded(parsedDate: Date, input: String) -> RelativeLookbackRange? {
         if let range = playheadLookbackRangeIfNeeded(parsedDate: parsedDate, input: input) {
             return range
@@ -14475,26 +14968,20 @@ public class SimpleTimelineViewModel: ObservableObject {
             return nil
         }
 
-        switch offset.unit {
-        case .hour:
-            break
-        case .minute, .day, .week, .month, .year:
-            return nil
-        }
-
-        guard let endTimestamp = dateByApplyingPlayheadRelativeOffset(
+        let lookbackEnd = Date()
+        guard let lookbackStart = dateByApplyingPlayheadRelativeOffset(
             amount: offset.amount,
             unit: offset.unit,
-            directionSign: 1,
-            to: parsedDate
+            directionSign: -1,
+            to: lookbackEnd
         ) else {
             return nil
         }
 
-        if parsedDate <= endTimestamp {
-            return RelativeLookbackRange(start: parsedDate, end: endTimestamp, anchorEdge: .first)
+        if lookbackStart <= lookbackEnd {
+            return RelativeLookbackRange(start: lookbackStart, end: lookbackEnd, anchorEdge: .first)
         }
-        return RelativeLookbackRange(start: endTimestamp, end: parsedDate, anchorEdge: .first)
+        return RelativeLookbackRange(start: lookbackEnd, end: lookbackStart, anchorEdge: .first)
     }
 
     private func parseAgoRelativeOffset(_ normalizedText: String) -> PlayheadRelativeOffset? {
@@ -14523,12 +15010,105 @@ public class SimpleTimelineViewModel: ObservableObject {
         return PlayheadRelativeOffset(amount: amount, unit: unit, direction: .backward)
     }
 
+    private func parseStandaloneMonthReference(
+        _ normalizedText: String,
+        now: Date,
+        calendar: Calendar
+    ) -> Date? {
+        guard let currentMonthStart = calendar.dateInterval(of: .month, for: now)?.start else {
+            return nil
+        }
+
+        switch normalizedText {
+        case "last month":
+            return calendar.date(byAdding: .month, value: -1, to: currentMonthStart)
+        case "this month":
+            return currentMonthStart
+        case "next month":
+            return calendar.date(byAdding: .month, value: 1, to: currentMonthStart)
+        default:
+            return nil
+        }
+    }
+
+    private func parseStandaloneYearReference(
+        _ normalizedText: String,
+        now: Date,
+        calendar: Calendar
+    ) -> Date? {
+        if let explicitYear = parseExplicitStandaloneYear(normalizedText, calendar: calendar) {
+            return explicitYear
+        }
+
+        guard let currentYearStart = calendar.dateInterval(of: .year, for: now)?.start else {
+            return nil
+        }
+
+        switch normalizedText {
+        case "last year":
+            return calendar.date(byAdding: .year, value: -1, to: currentYearStart)
+        case "this year":
+            return currentYearStart
+        case "next year":
+            return calendar.date(byAdding: .year, value: 1, to: currentYearStart)
+        default:
+            return nil
+        }
+    }
+
+    private func parseExplicitStandaloneYear(_ normalizedText: String, calendar: Calendar) -> Date? {
+        guard normalizedText.range(of: #"^(?:19|20|21)\d{2}$"#, options: .regularExpression) != nil,
+              let year = Int(normalizedText) else {
+            return nil
+        }
+
+        var components = DateComponents()
+        components.calendar = calendar
+        components.timeZone = .current
+        components.year = year
+        components.month = 1
+        components.day = 1
+        components.hour = 0
+        components.minute = 0
+        components.second = 0
+        return calendar.date(from: components)
+    }
+
+    private func isStandaloneMonthBucketInput(_ normalizedText: String) -> Bool {
+        normalizedText.range(
+            of: #"^(?:last|this|next)\s+month$"#,
+            options: .regularExpression
+        ) != nil
+    }
+
+    private func isStandaloneYearBucketInput(_ normalizedText: String) -> Bool {
+        return normalizedText.range(
+            of: #"^(?:last|this|next)\s+year$"#,
+            options: .regularExpression
+        ) != nil
+    }
+
     private func inferDateSearchAnchorMode(for input: String) -> DateSearchAnchorMode {
         let normalized = input
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
         let normalizedRelativeInput = normalizeRelativeDateShorthand(normalized)
         let normalizedWithCompactTimes = normalizeCompactTimeFormat(normalizedRelativeInput)
+
+        if isStandaloneMonthBucketInput(normalizedRelativeInput) {
+            return .firstFrameInMonth
+        }
+
+        if isStandaloneYearBucketInput(normalizedRelativeInput) {
+            return .firstFrameInYear
+        }
+
+        if normalizedRelativeInput.range(
+            of: #"^(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)(?:\s+\d{4})?$"#,
+            options: .regularExpression
+        ) != nil {
+            return .firstFrameInMonth
+        }
 
         if normalizedRelativeInput.range(
             of: #"\b\d+\s*(minute|minutes|min|mins)\s+ago\b"#,
@@ -14584,12 +15164,33 @@ public class SimpleTimelineViewModel: ObservableObject {
             interval = calendar.dateInterval(of: .hour, for: date)
         case .firstFrameInDay:
             interval = calendar.dateInterval(of: .day, for: date)
+        case .firstFrameInMonth:
+            interval = calendar.dateInterval(of: .month, for: date)
+        case .firstFrameInYear:
+            interval = calendar.dateInterval(of: .year, for: date)
         }
 
         guard let interval else { return nil }
         let inclusiveEnd = interval.end.addingTimeInterval(-Self.boundedLoadBoundaryEpsilonSeconds)
         guard inclusiveEnd >= interval.start else { return nil }
         return (start: interval.start, end: inclusiveEnd)
+    }
+
+    private func normalizedAnchorDate(
+        _ date: Date,
+        mode: DateSearchAnchorMode,
+        calendar: Calendar
+    ) -> Date {
+        switch mode {
+        case .firstFrameInDay:
+            return calendar.startOfDay(for: date)
+        case .firstFrameInMonth:
+            return calendar.dateInterval(of: .month, for: date)?.start ?? date
+        case .firstFrameInYear:
+            return calendar.dateInterval(of: .year, for: date)?.start ?? date
+        case .exact, .firstFrameInMinute, .firstFrameInHour:
+            return date
+        }
     }
 
     /// Yearless absolute inputs (e.g. "dec 18 2pm") should prefer recent history for timeline jumps.
@@ -14686,6 +15287,33 @@ public class SimpleTimelineViewModel: ObservableObject {
             of: #"^(?:\d{1,2}(?::\d{2})?\s*(?:am|pm|a|p)?|\d{3,4}\s*(?:am|pm|a|p)?|noon|midnight)$"#,
             options: [.regularExpression, .caseInsensitive]
         ) != nil
+    }
+
+    private func hasPlayheadDayReference(_ text: String) -> Bool {
+        text.range(
+            of: #"\b(?:same|that)[-\s]+day\b"#,
+            options: [.regularExpression, .caseInsensitive]
+        ) != nil
+    }
+
+    private func normalizedPlayheadDayReferenceInput(_ text: String) -> String {
+        let collapsedInput = text
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+
+        guard hasPlayheadDayReference(collapsedInput) else {
+            return collapsedInput
+        }
+
+        return collapsedInput
+            .replacingOccurrences(
+                of: #"\b(?:same|that)[-\s]+day\b"#,
+                with: "today",
+                options: [.regularExpression, .caseInsensitive]
+            )
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func normalizeRelativeDateShorthand(_ text: String) -> String {
@@ -14845,21 +15473,28 @@ public class SimpleTimelineViewModel: ObservableObject {
                 hour = h
                 minute = m
             }
-        } else if let numericValue = Int(input) {
-            // Parse compact format (e.g., "938", "1430", "9")
-            if numericValue >= 0 && numericValue <= 23 {
+        } else if input.range(of: #"^\d{1,4}$"#, options: .regularExpression) != nil,
+                  let numericValue = Int(input) {
+            switch input.count {
+            case 1, 2:
                 // Single or double digit hour (e.g., "9" or "21")
-                hour = numericValue
-                minute = 0
-            } else if numericValue >= 100 && numericValue <= 2359 {
-                // 3-4 digit time (e.g., "938" -> 9:38, "1430" -> 14:30)
-                hour = numericValue / 100
-                minute = numericValue % 100
-                // Validate
-                if hour! > 23 || minute > 59 {
+                guard numericValue >= 0 && numericValue <= 23 else {
                     return nil
                 }
-            } else {
+                hour = numericValue
+                minute = 0
+
+            case 3, 4:
+                // 3-4 digit time (e.g., "938" -> 9:38, "1430" -> 14:30, "0012" -> 00:12)
+                let parsedHour = numericValue / 100
+                let parsedMinute = numericValue % 100
+                guard parsedHour >= 0 && parsedHour <= 23 && parsedMinute >= 0 && parsedMinute <= 59 else {
+                    return nil
+                }
+                hour = parsedHour
+                minute = parsedMinute
+
+            default:
                 return nil
             }
         }
@@ -14885,10 +15520,61 @@ public class SimpleTimelineViewModel: ObservableObject {
         return calendar.date(from: components)
     }
 
+    private func parseDateWithLeadingTimeComponent(
+        _ text: String,
+        now: Date,
+        calendar: Calendar
+    ) -> Date? {
+        guard let regex = try? NSRegularExpression(
+            pattern: #"^\s*((?:\d{1,2}:\d{2}(?:\s*(?:am|pm|a|p))?|\d{3,4}(?:\s*(?:am|pm|a|p))?|\d{1,2}\s*(?:am|pm|a|p)))\s+(.+?)\s*$"#,
+            options: [.caseInsensitive]
+        ) else {
+            return nil
+        }
+
+        let searchRange = NSRange(text.startIndex..., in: text)
+        guard let match = regex.firstMatch(in: text, options: [], range: searchRange),
+              let timeRange = Range(match.range(at: 1), in: text),
+              let dateRange = Range(match.range(at: 2), in: text) else {
+            return nil
+        }
+
+        let timeToken = String(text[timeRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let dateToken = String(text[dateRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let lowercasedDateToken = dateToken.lowercased()
+        let dateTokenHasRelativeContext = lowercasedDateToken.range(
+            of: #"\b(?:today|tomorrow|yesterday|tonight|(?:next|last|this)\s+(?:mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:rs|rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?|week|month|year)|\d+\s*(?:day|days|week|weeks|wk|wks|month|months|mo|mos|year|years|yr|yrs)\s*(?:ago|from now)|in\s+\d+\s*(?:day|days|week|weeks|wk|wks|month|months|mo|mos|year|years|yr|yrs))\b"#,
+            options: [.regularExpression, .caseInsensitive]
+        ) != nil
+
+        if timeToken.range(of: #"^\d{4}$"#, options: .regularExpression) != nil,
+           let numericTimeToken = Int(timeToken),
+           (1900...2100).contains(numericTimeToken),
+           !dateTokenHasRelativeContext {
+            return nil
+        }
+
+        guard !dateToken.isEmpty,
+              let timeDate = parseTimeOnly(timeToken, relativeTo: now),
+              let dateOnly = parseNaturalLanguageDate(dateToken, now: now)
+        else {
+            return nil
+        }
+
+        var dateComponents = calendar.dateComponents([.year, .month, .day], from: dateOnly)
+        let timeComponents = calendar.dateComponents([.hour, .minute], from: timeDate)
+        dateComponents.hour = timeComponents.hour
+        dateComponents.minute = timeComponents.minute
+        dateComponents.second = 0
+
+        return calendar.date(from: dateComponents)
+    }
+
     /// Normalize compact time formats in a string to colon format for NSDataDetector
     /// Converts:
     /// - "827am" -> "8:27am", "1130pm" -> "11:30pm"
     /// - "feb 28 1417" -> "feb 28 14:17" (for date-jump compact 24-hour time)
+    /// - "1843 1 day ago" -> "18:43 1 day ago"
     private func normalizeCompactTimeFormat(_ text: String) -> String {
         // Pattern matches 3-4 digit numbers followed immediately by am/pm (with optional space)
         // Examples: "827am", "827 am", "1130pm", "1130 pm"
@@ -14937,28 +15623,60 @@ public class SimpleTimelineViewModel: ObservableObject {
             result.replaceSubrange(fullMatchRange, with: normalizedTime)
         }
 
-        // Support compact 24-hour time token in date context:
-        // "feb 28 1417" -> "feb 28 14:17"
-        if let trailingCompactRange = result.range(
-            of: #"\b\d{3,4}\b$"#,
+        // Support standalone compact 24-hour tokens when another part of the query
+        // makes it clear the token is time, not a bare year.
+        let lowercasedResult = result.lowercased()
+        let hasRelativeDateContext = lowercasedResult.range(
+            of: #"\b(?:today|tomorrow|yesterday|tonight|(?:next|last|this)\s+(?:mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:rs|rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?|week|month|year)|\d+\s*(?:day|days|week|weeks|wk|wks|month|months|mo|mos|year|years|yr|yrs)\s*(?:ago|from now)|in\s+\d+\s*(?:day|days|week|weeks|wk|wks|month|months|mo|mos|year|years|yr|yrs))\b"#,
             options: [.regularExpression, .caseInsensitive]
-        ) {
-            let token = String(result[trailingCompactRange])
-            if let numericValue = Int(token), numericValue >= 100, numericValue <= 2359 {
-                let hour = numericValue / 100
-                let minute = numericValue % 100
-                let isPlausibleModernYear = (1900...2100).contains(numericValue)
-                if hour <= 23 && minute <= 59 && !isPlausibleModernYear {
-                    let prefix = String(result[..<trailingCompactRange.lowerBound])
-                    let hasDateContext = prefix.range(
-                        of: #"\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?|today|tomorrow|yesterday|(?:next|last|this)\s+(?:mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:rs|rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?))\b|\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b|\b\d{4}-\d{1,2}-\d{1,2}\b"#,
-                        options: [.regularExpression, .caseInsensitive]
-                    ) != nil
-                    if hasDateContext {
-                        let normalizedTime = "\(hour):\(String(format: "%02d", minute))"
-                        result = prefix + normalizedTime
+        ) != nil
+        let hasCalendarDateContext = lowercasedResult.range(
+            of: #"\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b|\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b|\b\d{4}-\d{1,2}-\d{1,2}\b"#,
+            options: [.regularExpression, .caseInsensitive]
+        ) != nil
+
+        if hasRelativeDateContext || hasCalendarDateContext,
+           let standaloneTimeRegex = try? NSRegularExpression(pattern: #"\b\d{3,4}\b"#) {
+            let searchRange = NSRange(result.startIndex..., in: result)
+            let matches = standaloneTimeRegex.matches(in: result, options: [], range: searchRange)
+
+            for match in matches.reversed() {
+                guard let tokenRange = Range(match.range, in: result) else {
+                    continue
+                }
+
+                let token = String(result[tokenRange])
+                guard let numericValue = Int(token) else {
+                    continue
+                }
+
+                if tokenRange.lowerBound > result.startIndex {
+                    let previousIndex = result.index(before: tokenRange.lowerBound)
+                    let previousCharacter = result[previousIndex]
+                    if previousCharacter == "/" || previousCharacter == "-" {
+                        continue
                     }
                 }
+                if tokenRange.upperBound < result.endIndex {
+                    let nextCharacter = result[tokenRange.upperBound]
+                    if nextCharacter == "/" || nextCharacter == "-" {
+                        continue
+                    }
+                }
+
+                let hour = numericValue / 100
+                let minute = numericValue % 100
+                guard hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59 else {
+                    continue
+                }
+
+                if !hasRelativeDateContext, (1900...2100).contains(numericValue) {
+                    continue
+                }
+
+                let hourString = token.count == 4 ? String(format: "%02d", hour) : "\(hour)"
+                let normalizedTime = "\(hourString):\(String(format: "%02d", minute))"
+                result.replaceSubrange(tokenRange, with: normalizedTime)
             }
         }
 
@@ -15117,8 +15835,78 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
     }
 
-    private func makeBoundedBoundaryFilters(rangeStart: Date, rangeEnd: Date) -> FilterCriteria? {
-        var boundedFilters = filterCriteria
+    private struct BoundaryLoadContext: Equatable {
+        let generation: UInt64
+        let filters: FilterCriteria
+        let boundaryFrameID: FrameID
+    }
+
+    private enum BoundaryLoadDirection {
+        case older
+        case newer
+
+        var label: String {
+            switch self {
+            case .older:
+                return "BoundaryOlder"
+            case .newer:
+                return "BoundaryNewer"
+            }
+        }
+    }
+
+    private func captureBoundaryLoadContext(direction: BoundaryLoadDirection) -> BoundaryLoadContext? {
+        let boundaryFrameID: FrameID?
+        switch direction {
+        case .older:
+            boundaryFrameID = frames.first?.frame.id
+        case .newer:
+            boundaryFrameID = frames.last?.frame.id
+        }
+
+        guard let boundaryFrameID else { return nil }
+        return BoundaryLoadContext(
+            generation: boundaryLoadContextGeneration,
+            filters: filterCriteria,
+            boundaryFrameID: boundaryFrameID
+        )
+    }
+
+    private func summarizeBoundaryLoadContextForLog(_ context: BoundaryLoadContext) -> String {
+        "generation=\(context.generation) boundaryFrameID=\(context.boundaryFrameID.value) filters={\(summarizeFiltersForLog(context.filters))}"
+    }
+
+    private func isBoundaryLoadContextCurrent(
+        direction: BoundaryLoadDirection,
+        reason: String,
+        requestContext: BoundaryLoadContext
+    ) -> Bool {
+        let label = direction.label
+        guard let currentContext = captureBoundaryLoadContext(direction: direction) else {
+            Log.info(
+                "[\(label)] ABORT reason=\(reason) staleResult=frameBufferClearedWhileLoading",
+                category: .ui
+            )
+            return false
+        }
+
+        if requestContext != currentContext {
+            Log.info(
+                "[\(label)] ABORT reason=\(reason) staleResult=contextChanged old={\(summarizeBoundaryLoadContextForLog(requestContext))} current={\(summarizeBoundaryLoadContextForLog(currentContext))}",
+                category: .ui
+            )
+            return false
+        }
+
+        return true
+    }
+
+    private func makeBoundedBoundaryFilters(
+        rangeStart: Date,
+        rangeEnd: Date,
+        criteria: FilterCriteria
+    ) -> FilterCriteria? {
+        var boundedFilters = criteria
         let effectiveStart = max(rangeStart, boundedFilters.startDate ?? rangeStart)
         let effectiveEnd = min(rangeEnd, boundedFilters.endDate ?? rangeEnd)
 
@@ -15140,11 +15928,18 @@ public class SimpleTimelineViewModel: ObservableObject {
     ) -> BoundaryLoadTrigger {
         let shouldLoadOlder = currentIndex < WindowConfig.loadThreshold && hasMoreOlder && !isLoadingOlder
         let shouldLoadNewer = currentIndex > frames.count - WindowConfig.loadThreshold && hasMoreNewer && !isLoadingNewer
+        let maxIndex = max(frames.count - 1, 0)
 
         if let cmdFTrace {
-            let maxIndex = max(frames.count - 1, 0)
             Log.info(
                 "[CmdFPerf][\(cmdFTrace.id)] Boundary check reason=\(reason) index=\(currentIndex)/\(maxIndex) threshold=\(WindowConfig.loadThreshold) loadOlder=\(shouldLoadOlder) loadNewer=\(shouldLoadNewer)",
+                category: .ui
+            )
+        }
+
+        if shouldLoadOlder || shouldLoadNewer {
+            Log.info(
+                "[BOUNDARY-CHECK] reason=\(reason) index=\(currentIndex)/\(maxIndex) loadOlder=\(shouldLoadOlder) loadNewer=\(shouldLoadNewer) hasMoreOlder=\(hasMoreOlder) hasMoreNewer=\(hasMoreNewer) isLoadingOlder=\(isLoadingOlder) isLoadingNewer=\(isLoadingNewer) isActivelyScrolling=\(isActivelyScrolling) subFrameOffset=\(String(format: "%.1f", subFrameOffset))",
                 category: .ui
             )
         }
@@ -15173,15 +15968,20 @@ public class SimpleTimelineViewModel: ObservableObject {
         reason: String = "unspecified",
         cmdFTrace: CmdFQuickFilterLatencyTrace? = nil
     ) async {
-        guard let oldestTimestamp = oldestLoadedTimestamp else { return }
+        guard let oldestTimestamp = oldestLoadedTimestamp,
+              let requestContext = captureBoundaryLoadContext(direction: .older) else { return }
         guard !isLoadingOlder else { return }
         guard !Task.isCancelled else { return }
+        let requestFilters = requestContext.filters
         beginCriticalTimelineFetch()
         defer { endCriticalTimelineFetch() }
 
         let loadStart = CFAbsoluteTimeGetCurrent()
         isLoadingOlder = true
-        defer { olderBoundaryLoadTask = nil }
+        defer {
+            olderBoundaryLoadTask = nil
+            isLoadingOlder = false
+        }
         Log.debug("[InfiniteScroll] Loading older frames before \(oldestTimestamp)...", category: .ui)
         if let cmdFTrace {
             Log.info("[CmdFPerf][\(cmdFTrace.id)] Boundary older load started reason=\(reason) oldest=\(oldestTimestamp)", category: .ui)
@@ -15192,13 +15992,13 @@ public class SimpleTimelineViewModel: ObservableObject {
             // Use a bounded window to avoid expensive full-history scans.
             // Always pass filterCriteria to ensure hidden filter is applied (default: .hide)
             let rangeEnd = oneMillisecondBefore(oldestTimestamp)
-            let hasMetadataFilter = filterCriteria.windowNameFilter?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-                || filterCriteria.browserUrlFilter?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            let hasMetadataFilter = requestFilters.windowNameFilter?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+                || requestFilters.browserUrlFilter?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
 
             let queryFilters: FilterCriteria
             if hasMetadataFilter {
                 // Metadata filters can be very sparse; avoid a narrow one-day probe so we can jump large gaps.
-                var metadataFilters = filterCriteria
+                var metadataFilters = requestFilters
                 if let explicitEnd = metadataFilters.endDate {
                     metadataFilters.endDate = min(explicitEnd, rangeEnd)
                 } else {
@@ -15213,14 +16013,17 @@ public class SimpleTimelineViewModel: ObservableObject {
                 )
             } else {
                 let rangeStart = rangeEnd.addingTimeInterval(-WindowConfig.loadWindowSpanSeconds)
-                guard let boundedFilters = makeBoundedBoundaryFilters(rangeStart: rangeStart, rangeEnd: rangeEnd) else {
+                guard let boundedFilters = makeBoundedBoundaryFilters(
+                    rangeStart: rangeStart,
+                    rangeEnd: rangeEnd,
+                    criteria: requestFilters
+                ) else {
                     Log.info(
                         "[BoundaryOlder] SKIP reason=\(reason) window=\(Log.timestamp(from: rangeStart))->\(Log.timestamp(from: rangeEnd)) no-overlap-with-filters",
                         category: .ui
                     )
                     hasMoreOlder = false
                     hasReachedAbsoluteStart = true
-                    isLoadingOlder = false
                     return
                 }
                 queryFilters = boundedFilters
@@ -15239,7 +16042,6 @@ public class SimpleTimelineViewModel: ObservableObject {
             let queryElapsedMs = (CFAbsoluteTimeGetCurrent() - queryStart) * 1000
 
             if Task.isCancelled {
-                isLoadingOlder = false
                 return
             }
 
@@ -15269,7 +16071,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                 let fallbackFramesWithVideoInfoDescending = try await fetchFramesWithVideoInfoBeforeLogged(
                     timestamp: oldestTimestamp,
                     limit: WindowConfig.nearestFallbackBatchSize,
-                    filters: filterCriteria,
+                    filters: requestFilters,
                     reason: "loadOlderFrames.reason=\(reason).nearestFallback"
                 )
                 let fallbackElapsedMs = (CFAbsoluteTimeGetCurrent() - fallbackStart) * 1000
@@ -15302,11 +16104,18 @@ public class SimpleTimelineViewModel: ObservableObject {
                 }
             }
 
+            guard isBoundaryLoadContextCurrent(
+                direction: .older,
+                reason: reason,
+                requestContext: requestContext
+            ) else {
+                return
+            }
+
             guard !framesWithVideoInfoDescending.isEmpty else {
                 Log.debug("[InfiniteScroll] No more older frames available - reached absolute start", category: .ui)
                 hasMoreOlder = false
                 hasReachedAbsoluteStart = true  // Mark that we've hit the absolute start
-                isLoadingOlder = false
 
                 if let cmdFTrace {
                     let loadElapsedMs = (CFAbsoluteTimeGetCurrent() - loadStart) * 1000
@@ -15334,25 +16143,6 @@ public class SimpleTimelineViewModel: ObservableObject {
                 TimelineFrame(frameWithVideoInfo: $0)
             }
 
-            // If timeline state changed while the query was in-flight (filter/apply/reload), drop stale results.
-            guard let currentOldest = frames.first?.frame.timestamp else {
-                Log.warning(
-                    "[BoundaryOlder] ABORT reason=\(reason) staleResult=frameBufferClearedWhileLoading",
-                    category: .ui
-                )
-                isLoadingOlder = false
-                return
-            }
-            let oldestDriftMs = abs(currentOldest.timeIntervalSince(oldestTimestamp) * 1000)
-            if oldestDriftMs > 1 {
-                Log.info(
-                    "[BoundaryOlder] ABORT reason=\(reason) staleResult=oldestChanged old=\(Log.timestamp(from: oldestTimestamp)) current=\(Log.timestamp(from: currentOldest)) driftMs=\(String(format: "%.1f", oldestDriftMs))",
-                    category: .ui
-                )
-                isLoadingOlder = false
-                return
-            }
-
             // Prepend to existing frames
             // Use insert(contentsOf:) to avoid unnecessary @Published triggers
             let beforeCount = frames.count
@@ -15366,7 +16156,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             }
             let oldCurrentIndex = currentIndex
             let oldTimestamp = frames[oldCurrentIndex].frame.timestamp
-            let oldFirstTimestamp = currentOldest
+            let oldFirstTimestamp = oldestTimestamp
 
             frames.insert(contentsOf: newTimelineFrames, at: 0)
 
@@ -15401,8 +16191,6 @@ public class SimpleTimelineViewModel: ObservableObject {
             // Trim if we've exceeded max frames
             trimWindowIfNeeded(preserveDirection: .older)
 
-            isLoadingOlder = false
-
             if let cmdFTrace {
                 let loadElapsedMs = (CFAbsoluteTimeGetCurrent() - loadStart) * 1000
                 let totalFromShortcutMs = (CFAbsoluteTimeGetCurrent() - cmdFTrace.startedAt) * 1000
@@ -15429,7 +16217,6 @@ public class SimpleTimelineViewModel: ObservableObject {
                     category: .ui
                 )
             }
-            isLoadingOlder = false
         }
     }
 
@@ -15438,16 +16225,25 @@ public class SimpleTimelineViewModel: ObservableObject {
         reason: String = "unspecified",
         cmdFTrace: CmdFQuickFilterLatencyTrace? = nil
     ) async {
-        guard let newestTimestamp = newestLoadedTimestamp else { return }
+        guard let newestTimestamp = newestLoadedTimestamp,
+              let requestContext = captureBoundaryLoadContext(direction: .newer) else { return }
         guard !isLoadingNewer else { return }
         guard !Task.isCancelled else { return }
+        let requestFilters = requestContext.filters
         beginCriticalTimelineFetch()
         defer { endCriticalTimelineFetch() }
 
         let loadStart = CFAbsoluteTimeGetCurrent()
         isLoadingNewer = true
-        defer { newerBoundaryLoadTask = nil }
+        defer {
+            newerBoundaryLoadTask = nil
+            isLoadingNewer = false
+        }
         Log.debug("[InfiniteScroll] Loading newer frames after \(newestTimestamp)...", category: .ui)
+        Log.info(
+            "[BOUNDARY-NEWER-PLAYHEAD] START reason=\(reason) currentIndex=\(currentIndex) frameCount=\(frames.count) newestLoadedIndex=\(max(frames.count - 1, 0)) hasMoreNewer=\(hasMoreNewer) isActivelyScrolling=\(isActivelyScrolling) subFrameOffset=\(String(format: "%.1f", subFrameOffset))",
+            category: .ui
+        )
         if let cmdFTrace {
             Log.info("[CmdFPerf][\(cmdFTrace.id)] Boundary newer load started reason=\(reason) newest=\(newestTimestamp)", category: .ui)
         }
@@ -15467,13 +16263,12 @@ public class SimpleTimelineViewModel: ObservableObject {
                 from: rangeStart,
                 to: rangeEnd,
                 limit: WindowConfig.loadBatchSize,
-                filters: filterCriteria,
+                filters: requestFilters,
                 reason: "loadNewerFrames.reason=\(reason)"
             )
             let queryElapsedMs = (CFAbsoluteTimeGetCurrent() - queryStart) * 1000
 
             if Task.isCancelled {
-                isLoadingNewer = false
                 return
             }
 
@@ -15502,7 +16297,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                 let fallbackFramesWithVideoInfo = try await fetchFramesWithVideoInfoAfterLogged(
                     timestamp: newestTimestamp,
                     limit: WindowConfig.nearestFallbackBatchSize,
-                    filters: filterCriteria,
+                    filters: requestFilters,
                     reason: "loadNewerFrames.reason=\(reason).nearestFallback"
                 )
                 let fallbackElapsedMs = (CFAbsoluteTimeGetCurrent() - fallbackStart) * 1000
@@ -15535,11 +16330,18 @@ public class SimpleTimelineViewModel: ObservableObject {
                 }
             }
 
+            guard isBoundaryLoadContextCurrent(
+                direction: .newer,
+                reason: reason,
+                requestContext: requestContext
+            ) else {
+                return
+            }
+
             guard !framesWithVideoInfo.isEmpty else {
                 Log.debug("[InfiniteScroll] No more newer frames available - reached absolute end", category: .ui)
                 hasMoreNewer = false
                 hasReachedAbsoluteEnd = true  // Mark that we've hit the absolute end
-                isLoadingNewer = false
 
                 if let cmdFTrace {
                     let loadElapsedMs = (CFAbsoluteTimeGetCurrent() - loadStart) * 1000
@@ -15579,7 +16381,6 @@ public class SimpleTimelineViewModel: ObservableObject {
                 )
                 hasMoreNewer = false
                 hasReachedAbsoluteEnd = true
-                isLoadingNewer = false
                 return
             }
 
@@ -15597,6 +16398,11 @@ public class SimpleTimelineViewModel: ObservableObject {
             let shouldPinToNewestAfterAppend = wasAtNewestBeforeAppend && shouldPinToNewestAfterBoundaryAppend(reason: reason)
             let oldLastTimestamp = frames.last?.frame.timestamp
             let previousNewestBlock = newestEdgeBlockSummary(in: frames)
+            let preAppendCurrentIndex = currentIndex
+            Log.info(
+                "[BOUNDARY-NEWER-PLAYHEAD] PRE_APPEND reason=\(reason) currentIndex=\(preAppendCurrentIndex) beforeCount=\(beforeCount) added=\(uniqueTimelineFrames.count) wasAtNewestLoaded=\(wasAtNewestBeforeAppend) shouldPinToNewest=\(shouldPinToNewestAfterAppend) hasMoreNewer=\(hasMoreNewer) isActivelyScrolling=\(isActivelyScrolling) subFrameOffset=\(String(format: "%.1f", subFrameOffset))",
+                category: .ui
+            )
             frames.append(contentsOf: uniqueTimelineFrames)
 
             // Keep playhead pinned to "now" only for flows that should track newest.
@@ -15604,6 +16410,10 @@ public class SimpleTimelineViewModel: ObservableObject {
                 currentIndex = frames.count - 1
                 subFrameOffset = 0
             }
+            Log.info(
+                "[BOUNDARY-NEWER-PLAYHEAD] POST_APPEND reason=\(reason) index=\(preAppendCurrentIndex)->\(currentIndex) beforeCount=\(beforeCount) afterCount=\(frames.count) pinnedToNewest=\(shouldPinToNewestAfterAppend) hasMoreNewer=\(hasMoreNewer) isActivelyScrolling=\(isActivelyScrolling) subFrameOffset=\(String(format: "%.1f", subFrameOffset))",
+                category: .ui
+            )
             logCmdFPlayheadState(
                 "boundary.newer.appended",
                 trace: cmdFTrace,
@@ -15641,8 +16451,6 @@ public class SimpleTimelineViewModel: ObservableObject {
             // Trim if we've exceeded max frames
             trimWindowIfNeeded(preserveDirection: .newer)
 
-            isLoadingNewer = false
-
             if let cmdFTrace {
                 let loadElapsedMs = (CFAbsoluteTimeGetCurrent() - loadStart) * 1000
                 let totalFromShortcutMs = (CFAbsoluteTimeGetCurrent() - cmdFTrace.startedAt) * 1000
@@ -15669,22 +16477,17 @@ public class SimpleTimelineViewModel: ObservableObject {
                     category: .ui
                 )
             }
-            isLoadingNewer = false
         }
     }
 
-    private func shouldPinToNewestAfterBoundaryAppend(reason: String) -> Bool {
+    private func shouldPinToNewestAfterBoundaryAppend(reason _: String) -> Bool {
         if isInLiveMode {
             return true
         }
 
-        switch reason {
-        case "searchForDate", "searchForFrameID":
-            // Date/frame-ID jumps should stay anchored on the chosen frame.
-            return false
-        default:
-            return true
-        }
+        // Boundary pagination should preserve the user's current frame.
+        // Explicit "snap to newest" behavior lives in launch/reopen/live-mode flows.
+        return false
     }
 
     /// Direction to preserve when trimming

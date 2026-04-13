@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import Darwin
 import Foundation
 import Shared
 import CoreMedia
@@ -15,35 +16,53 @@ public struct WALAvailabilityIssue: Sendable, Equatable {
 fileprivate struct SegmentRewriteArtifacts: Sendable {
     let segmentID: VideoSegmentID
     let segmentURL: URL
-    var tempURL: URL?
+    var workingURL: URL?
     var backupURL: URL?
+    var cleanupURLs: [URL]
+    var operation: SegmentRewriteOperation
+}
+
+fileprivate struct SegmentRewriteArtifactPiece: Sendable {
+    let segmentID: VideoSegmentID
+    let segmentURL: URL
+    let operation: SegmentRewriteOperation
+    let workingURL: URL?
+    let backupURL: URL?
+    let cleanupURL: URL?
 }
 
 fileprivate struct SegmentRewriteRequest: Sendable {
     let segmentID: VideoSegmentID
     let segmentURL: URL
-    let tempURL: URL
+    let workingURL: URL
     let backupURL: URL
-    let targetsByFrameIndex: [Int: [SegmentRedactionTarget]]
-    let secret: String
+    let plan: SegmentRewritePlan
+    let secret: String?
 }
 
 fileprivate func ensureNoConflictingSegmentRewriteArtifactsOnDisk(
     segmentID: VideoSegmentID,
     segmentURL: URL,
-    tempURL: URL,
-    backupURL: URL
+    workingURL: URL?,
+    backupURL: URL,
+    cleanupURLs: [URL] = []
 ) throws {
-    if FileManager.default.fileExists(atPath: tempURL.path) {
-        removeItemIfExistsOnDisk(at: tempURL)
+    if let workingURL, FileManager.default.fileExists(atPath: workingURL.path) {
+        removeItemIfExistsOnDisk(at: workingURL)
     }
 
     if FileManager.default.fileExists(atPath: backupURL.path) {
         Log.warning(
-            "[StorageManager] Removing stale rewrite backup before starting new rewrite for segment \(segmentID.value): \(backupURL.lastPathComponent)",
+            "[StorageManager] Removing stale segment mutation backup before starting new mutation for segment \(segmentID.value): \(backupURL.lastPathComponent)",
             category: .storage
         )
         removeItemIfExistsOnDisk(at: backupURL)
+    }
+
+    for cleanupURL in cleanupURLs {
+        if FileManager.default.fileExists(atPath: cleanupURL.path) {
+            removeItemIfExistsOnDisk(at: cleanupURL)
+        }
     }
 
     guard FileManager.default.fileExists(atPath: segmentURL.path) else {
@@ -51,16 +70,16 @@ fileprivate func ensureNoConflictingSegmentRewriteArtifactsOnDisk(
     }
 }
 
-fileprivate func swapRewrittenSegmentIntoPlaceOnDisk(
+fileprivate func swapMutatedSegmentIntoPlaceOnDisk(
     segmentURL: URL,
-    tempURL: URL,
+    workingURL: URL,
     backupURL: URL
 ) throws {
     let fileManager = FileManager.default
 
     try fileManager.moveItem(at: segmentURL, to: backupURL)
     do {
-        try fileManager.moveItem(at: tempURL, to: segmentURL)
+        try fileManager.moveItem(at: workingURL, to: segmentURL)
     } catch {
         if fileManager.fileExists(atPath: backupURL.path),
            !fileManager.fileExists(atPath: segmentURL.path) {
@@ -70,22 +89,32 @@ fileprivate func swapRewrittenSegmentIntoPlaceOnDisk(
     }
 }
 
-fileprivate func inferSegmentRewriteRecoveryModeFromDisk(
+fileprivate func commitWholeVideoDeleteOnDisk(
     segmentURL: URL,
-    tempURL: URL?,
+    backupURL: URL
+) throws {
+    try FileManager.default.moveItem(at: segmentURL, to: backupURL)
+}
+
+fileprivate func inferSegmentRewriteRecoveryModeFromDisk(
+    operation: SegmentRewriteOperation,
+    segmentURL: URL,
+    workingURL: URL?,
     backupURL: URL?
-) -> SegmentRedactionRecoveryAction.Mode {
+) -> SegmentRewriteRecoveryAction.Mode {
     let fileManager = FileManager.default
     let segmentExists = fileManager.fileExists(atPath: segmentURL.path)
-    let tempExists = tempURL.map { fileManager.fileExists(atPath: $0.path) } ?? false
     let backupExists = backupURL.map { fileManager.fileExists(atPath: $0.path) } ?? false
 
-    if segmentExists && backupExists {
-        return .markCompleted
-    }
-
-    if backupExists || tempExists {
-        return .rollbackToPending
+    switch operation {
+    case .partialRewrite:
+        if segmentExists && backupExists {
+            return .finalizeCommitted
+        }
+    case .wholeVideoDelete:
+        if !segmentExists && backupExists {
+            return .finalizeCommitted
+        }
     }
 
     return .rollbackToPending
@@ -93,7 +122,7 @@ fileprivate func inferSegmentRewriteRecoveryModeFromDisk(
 
 fileprivate func rollbackInterruptedSegmentRewriteIfNeededOnDisk(
     segmentURL: URL,
-    tempURL: URL?,
+    workingURL: URL?,
     backupURL: URL?
 ) {
     let fileManager = FileManager.default
@@ -112,14 +141,14 @@ fileprivate func rollbackInterruptedSegmentRewriteIfNeededOnDisk(
             }
         } catch {
             Log.error(
-                "[StorageManager] Failed to roll back interrupted segment rewrite at \(segmentURL.lastPathComponent): \(error.localizedDescription)",
+                "[StorageManager] Failed to roll back interrupted segment mutation at \(segmentURL.lastPathComponent): \(error.localizedDescription)",
                 category: .storage
             )
         }
     }
 
-    if let tempURL {
-        removeItemIfExistsOnDisk(at: tempURL)
+    if let workingURL {
+        removeItemIfExistsOnDisk(at: workingURL)
     }
 }
 
@@ -141,11 +170,29 @@ fileprivate actor SegmentRewriteExecutor {
     }
 
     func rewrite(_ request: SegmentRewriteRequest) async throws {
+        guard request.plan.operation == .partialRewrite else {
+            throw StorageError.fileWriteFailed(
+                path: request.segmentURL.path,
+                underlying: "Whole-video deletes must not use the rewrite executor"
+            )
+        }
+
+        if request.plan.hasRedactionTargets, request.secret == nil {
+            throw StorageError.fileWriteFailed(
+                path: request.segmentURL.path,
+                underlying: "Missing rewrite secret for redaction targets"
+            )
+        }
+
         let decodedFrames = try await decodeAllFrames(
             from: request.segmentURL,
             segmentID: request.segmentID.value
         )
         guard !decodedFrames.isEmpty else { return }
+        let redactionTargetsByFrameIndex = Dictionary(grouping: request.plan.redactions, by: \.frameIndex)
+            .mapValues { redactions in
+                redactions.flatMap(\.targets)
+            }
 
         let width = decodedFrames[0].image.width
         let height = decodedFrames[0].image.height
@@ -156,8 +203,9 @@ fileprivate actor SegmentRewriteExecutor {
             try ensureNoConflictingSegmentRewriteArtifactsOnDisk(
                 segmentID: request.segmentID,
                 segmentURL: request.segmentURL,
-                tempURL: request.tempURL,
-                backupURL: request.backupURL
+                workingURL: request.workingURL,
+                backupURL: request.backupURL,
+                cleanupURLs: [StorageManager.legacySegmentRewriteStateURL(for: request.segmentURL, segmentID: request.segmentID)]
             )
 
             let newEncoder = HEVCEncoder()
@@ -166,14 +214,16 @@ fileprivate actor SegmentRewriteExecutor {
                 width: width,
                 height: height,
                 config: encoderConfig,
-                outputURL: request.tempURL,
+                outputURL: request.workingURL,
                 segmentStartTime: Date()
             )
 
             var loggedTargets = 0
             for (frameIndex, decodedFrame) in decodedFrames.enumerated() {
                 var bgra = try StorageManager.makeBGRAData(from: decodedFrame.image)
-                if let targets = request.targetsByFrameIndex[frameIndex], !targets.isEmpty {
+                if request.plan.blackFrameIndexes.contains(frameIndex) {
+                    bgra = Data(repeating: 0, count: bgra.count)
+                } else if let targets = redactionTargetsByFrameIndex[frameIndex], !targets.isEmpty {
                     for target in targets {
                         let pixelRect = BGRAImageUtilities.pixelRect(
                             from: target.normalizedRect,
@@ -202,7 +252,7 @@ fileprivate actor SegmentRewriteExecutor {
                             bytesPerRow: patch.bytesPerRow,
                             frameID: target.frameID,
                             nodeID: target.nodeID,
-                            secret: request.secret
+                            secret: request.secret ?? ""
                         )
                         BGRAImageUtilities.writePatch(
                             patch,
@@ -226,16 +276,16 @@ fileprivate actor SegmentRewriteExecutor {
             }
 
             try await newEncoder.finalize()
-            try swapRewrittenSegmentIntoPlaceOnDisk(
+            try swapMutatedSegmentIntoPlaceOnDisk(
                 segmentURL: request.segmentURL,
-                tempURL: request.tempURL,
+                workingURL: request.workingURL,
                 backupURL: request.backupURL
             )
         } catch {
             await encoder?.reset()
             rollbackInterruptedSegmentRewriteIfNeededOnDisk(
                 segmentURL: request.segmentURL,
-                tempURL: request.tempURL,
+                workingURL: request.workingURL,
                 backupURL: request.backupURL
             )
             throw error
@@ -367,6 +417,14 @@ fileprivate actor SegmentRewriteExecutor {
 
 /// Main StorageProtocol implementation.
 public actor StorageManager: StorageProtocol {
+    private static let memoryLedgerSummaryIntervalSeconds: TimeInterval = 5
+    private static let memoryLedgerDecoderRetainDurationSeconds: TimeInterval = 4
+    private static let memoryLedgerGeneratorCacheTag = "storage.videoDecoding.generatorCache"
+    private static let memoryLedgerDecoderHeapTag = "storage.videoDecoding.decoderHeap"
+    private static let memoryLedgerDecodeSurfaceTag = "storage.videoDecoding.decodeSurface"
+    private static let memoryLedgerAppKitBridgeTag = "storage.videoDecoding.appKitBridge"
+    private static let memoryLedgerFrameCacheTag = "storage.videoDecoding.frameCache"
+    private static let memoryLedgerCIContextTag = "storage.videoDecoding.ciContext"
     private static let discardableQuarantinedWALRetentionInterval: TimeInterval = 7 * 24 * 60 * 60
     private var config: StorageConfig?
     private var storageRootURL: URL
@@ -393,14 +451,17 @@ public actor StorageManager: StorageProtocol {
     /// Cache is invalidated on time mismatch to handle growing video files
     private var generatorCache: [String: GeneratorCacheEntry] = [:]
 
-    /// Maximum number of generators to keep cached
-    private let maxCachedGenerators = 10
+    /// Evict cached generators that have been idle long enough to likely outlive active scrubbing work.
+    private static let generatorIdleRetentionSeconds = GeneratorCachePolicy.idleRetentionSeconds
+    private static let generatorCacheLimit = GeneratorCachePolicy.defaultCountLimit
 
     /// Cached AVAssetImageGenerator entry
     private struct GeneratorCacheEntry {
         let generator: AVAssetImageGenerator
         let symlinkURL: URL?  // Keep symlink alive while generator is cached
         var lastAccessTime: Date
+        var estimatedGeneratorBytes: Int64
+        var estimatedDecoderHeapBytes: Int64
     }
 
     /// Cache for segment file paths, keyed by segment ID
@@ -430,6 +491,7 @@ public actor StorageManager: StorageProtocol {
         var frames: [DecodedFrame]  // Sorted by PTS (presentation order)
         var lastAccessTime: Date
         let totalFrameCount: Int
+        let estimatedBytes: Int64
     }
 
     /// A decoded frame with its presentation timestamp
@@ -438,6 +500,17 @@ public actor StorageManager: StorageProtocol {
         let image: CGImage
         let presentationIndex: Int  // Index in presentation order (0, 1, 2, ...)
     }
+
+    private enum VideoDecodingTransientBucket {
+        case decodeSurface
+        case appKitBridge
+        case ciContext
+    }
+
+    private var activeDecodeSurfaceBytesByToken: [UUID: Int64] = [:]
+    private var activeAppKitBridgeBytesByToken: [UUID: Int64] = [:]
+    private var activeCIContextBytesByToken: [UUID: Int64] = [:]
+    private var decodeRetainedGenerationByCacheKey: [String: UInt64] = [:]
 
     public func initialize(config: StorageConfig) async throws {
         self.config = config
@@ -574,6 +647,9 @@ public actor StorageManager: StorageProtocol {
             time = CMTime(seconds: timeInSeconds, preferredTimescale: 600)
         }
 
+        let now = Date()
+        evictOldGenerators(referenceTime: now)
+
         // Try with cached generator first, retry with fresh generator on time mismatch
         for attempt in 0..<2 {
             let useCached = (attempt == 0)
@@ -581,19 +657,27 @@ public actor StorageManager: StorageProtocol {
             let imageGenerator: AVAssetImageGenerator
             var symlinkURL: URL? = nil
 
-            if useCached, var entry = generatorCache[cacheKey] {
+            if useCached,
+               var entry = generatorCache[cacheKey],
+               now.timeIntervalSince(entry.lastAccessTime) <= Self.generatorIdleRetentionSeconds {
                 // Use cached generator
-                entry.lastAccessTime = Date()
+                entry.lastAccessTime = now
                 generatorCache[cacheKey] = entry
                 imageGenerator = entry.generator
             } else {
+                if useCached, let staleEntry = generatorCache.removeValue(forKey: cacheKey) {
+                    releaseGeneratorEntry(staleEntry)
+                    decodeRetainedGenerationByCacheKey.removeValue(forKey: cacheKey)
+                    publishVideoDecodingMemory(reason: "storage.video_decoding.cache")
+                }
+
                 // Create fresh generator - invalidate cache first if this is a retry
                 if attempt > 0 {
-                    if let entry = generatorCache.removeValue(forKey: cacheKey),
-                       let oldSymlink = entry.symlinkURL {
-                        try? FileManager.default.removeItem(at: oldSymlink)
+                    decodeRetainedGenerationByCacheKey.removeValue(forKey: cacheKey)
+                    if let entry = generatorCache.removeValue(forKey: cacheKey) {
+                        releaseGeneratorEntry(entry)
                     }
-                    Log.info("[VideoExtract] Invalidated stale cache for \(videoURL.lastPathComponent), creating fresh generator", category: .storage)
+                    publishVideoDecodingMemory(reason: "storage.video_decoding.cache")
                 }
 
                 // Handle extensionless files by creating symlink
@@ -623,9 +707,12 @@ public actor StorageManager: StorageProtocol {
                 generatorCache[cacheKey] = GeneratorCacheEntry(
                     generator: generator,
                     symlinkURL: symlinkURL,
-                    lastAccessTime: Date()
+                    lastAccessTime: Date(),
+                    estimatedGeneratorBytes: 0,
+                    estimatedDecoderHeapBytes: 0
                 )
                 imageGenerator = generator
+                publishVideoDecodingMemory(reason: "storage.video_decoding.cache")
 
                 // Evict old generators if needed
                 evictOldGenerators()
@@ -634,7 +721,39 @@ public actor StorageManager: StorageProtocol {
             // Extract frame
             var actualTime = CMTime.zero
             do {
+                let decoderBaselineFootprintBytes = Self.currentProcessFootprintBytes()
                 let cgImage = try imageGenerator.copyCGImage(at: time, actualTime: &actualTime)
+                let frameBytes = Self.estimatedFrameBytes(width: cgImage.width, height: cgImage.height)
+                let generatorBytes = Self.estimatedGeneratorBytes(width: cgImage.width, height: cgImage.height)
+                let decoderHeapBytes = Self.measuredDecoderHeapBytes(
+                    baselineFootprintBytes: decoderBaselineFootprintBytes,
+                    width: cgImage.width,
+                    height: cgImage.height
+                )
+                if var updatedEntry = generatorCache[cacheKey] {
+                    updatedEntry.lastAccessTime = Date()
+                    updatedEntry.estimatedGeneratorBytes = generatorBytes
+                    generatorCache[cacheKey] = updatedEntry
+                }
+                refreshRetainedDecoderHeap(
+                    cacheKey: cacheKey,
+                    observedBytes: decoderHeapBytes,
+                    reason: "storage.video_decoding.cache"
+                )
+                publishVideoDecodingMemory(reason: "storage.video_decoding.cache")
+
+                let decodeSurfaceToken = beginVideoDecodingTransientBytes(
+                    bucket: .decodeSurface,
+                    bytes: frameBytes,
+                    reason: "storage.video_decoding.extract_frame"
+                )
+                defer {
+                    endVideoDecodingTransientBytes(
+                        bucket: .decodeSurface,
+                        token: decodeSurfaceToken,
+                        reason: "storage.video_decoding.extract_frame"
+                    )
+                }
 
                 // Check for time mismatch
                 let requestedSeconds = time.seconds
@@ -660,10 +779,11 @@ public actor StorageManager: StorageProtocol {
                 return try convertCGImageToJPEG(cgImage)
             } catch {
                 // Invalidate cache on error
-                if let entry = generatorCache.removeValue(forKey: cacheKey),
-                   let oldSymlink = entry.symlinkURL {
-                    try? FileManager.default.removeItem(at: oldSymlink)
+                if let entry = generatorCache.removeValue(forKey: cacheKey) {
+                    releaseGeneratorEntry(entry)
                 }
+                decodeRetainedGenerationByCacheKey.removeValue(forKey: cacheKey)
+                publishVideoDecodingMemory(reason: "storage.video_decoding.cache")
                 throw StorageError.fileReadFailed(
                     path: videoURL.path,
                     underlying: "Frame extraction failed: \(error.localizedDescription)"
@@ -676,20 +796,21 @@ public actor StorageManager: StorageProtocol {
     }
 
     /// Evict oldest generators when cache is full
-    private func evictOldGenerators() {
-        guard generatorCache.count > maxCachedGenerators else { return }
+    private func evictOldGenerators(referenceTime: Date = Date()) {
+        let keysToRemove = GeneratorCachePolicy.keysToEvict(
+            lastAccessByKey: generatorCache.mapValues(\.lastAccessTime),
+            referenceTime: referenceTime,
+            countLimit: Self.generatorCacheLimit,
+            idleRetentionSeconds: Self.generatorIdleRetentionSeconds
+        )
+        guard !keysToRemove.isEmpty else { return }
 
-        // Sort by last access time and remove oldest
-        let sorted = generatorCache.sorted { $0.value.lastAccessTime < $1.value.lastAccessTime }
-        let toRemove = sorted.prefix(generatorCache.count - maxCachedGenerators)
-
-        for (key, entry) in toRemove {
-            generatorCache.removeValue(forKey: key)
-            // Clean up symlink
-            if let symlinkURL = entry.symlinkURL {
-                try? FileManager.default.removeItem(at: symlinkURL)
-            }
+        for key in keysToRemove {
+            guard let entry = generatorCache.removeValue(forKey: key) else { continue }
+            decodeRetainedGenerationByCacheKey.removeValue(forKey: key)
+            releaseGeneratorEntry(entry)
         }
+        publishVideoDecodingMemory(reason: "storage.video_decoding.cache")
     }
 
     /// Read a frame from a video at a specific path
@@ -707,69 +828,110 @@ public actor StorageManager: StorageProtocol {
         )
     }
 
-    /// Rewrite a finalized segment by encoding a new file to a temp path, then swapping it into
-    /// the original segment location once complete.
-    public func rewriteSegmentForRedaction(
+    /// Apply a generic post-capture rewrite/delete mutation to a finalized segment.
+    public func applySegmentRewrite(
         segmentID: VideoSegmentID,
-        frameIDs: [Int64],
-        targetsByFrameIndex: [Int: [SegmentRedactionTarget]],
-        secret: String
+        plan: SegmentRewritePlan,
+        secret: String?
     ) async throws {
-        guard !targetsByFrameIndex.isEmpty else { return }
-        guard !frameIDs.isEmpty else { return }
+        guard plan.hasAnyRewrite else { return }
 
         let segmentURL = try await getSegmentPath(id: segmentID)
-        let tempURL = segmentRewriteTempURL(for: segmentURL, segmentID: segmentID)
+        let legacyStateURL = Self.legacySegmentRewriteStateURL(for: segmentURL, segmentID: segmentID)
+
+        if plan.deletesWholeVideo {
+            let backupURL = segmentDeleteBackupURL(for: segmentURL, segmentID: segmentID)
+            try ensureNoConflictingSegmentRewriteArtifactsOnDisk(
+                segmentID: segmentID,
+                segmentURL: segmentURL,
+                workingURL: nil,
+                backupURL: backupURL,
+                cleanupURLs: [legacyStateURL]
+            )
+
+            do {
+                try commitWholeVideoDeleteOnDisk(
+                    segmentURL: segmentURL,
+                    backupURL: backupURL
+                )
+            } catch {
+                rollbackInterruptedSegmentRewriteIfNeededOnDisk(
+                    segmentURL: segmentURL,
+                    workingURL: nil,
+                    backupURL: backupURL
+                )
+                throw error
+            }
+
+            clearFrameCache(for: segmentID)
+            if let entry = generatorCache.removeValue(forKey: segmentURL.path) {
+                releaseGeneratorEntry(entry)
+            }
+            publishVideoDecodingMemory(reason: "storage.video_decoding.cache")
+            Log.info(
+                "[StorageManager] Committed whole-video delete for segment \(segmentID.value)",
+                category: .storage
+            )
+            return
+        }
+
+        let workingURL = segmentRewriteWorkingURL(for: segmentURL, segmentID: segmentID)
         let backupURL = segmentRewriteBackupURL(for: segmentURL, segmentID: segmentID)
         let request = SegmentRewriteRequest(
             segmentID: segmentID,
             segmentURL: segmentURL,
-            tempURL: tempURL,
+            workingURL: workingURL,
             backupURL: backupURL,
-            targetsByFrameIndex: targetsByFrameIndex,
+            plan: plan,
             secret: secret
         )
 
-        try await Task.detached(priority: .utility) { [segmentRewriteExecutor] in
-            try await segmentRewriteExecutor.rewrite(request)
-        }.value
+        try await segmentRewriteExecutor.rewrite(request)
 
         clearFrameCache(for: segmentID)
-        generatorCache.removeValue(forKey: segmentURL.path)
+        if let entry = generatorCache.removeValue(forKey: segmentURL.path) {
+            releaseGeneratorEntry(entry)
+        }
+        publishVideoDecodingMemory(reason: "storage.video_decoding.cache")
 
         Log.info(
-            "[StorageManager] Rewrote segment \(segmentID.value) with reversible OCR scrambling (\(targetsByFrameIndex.count) frame(s))",
+            "[StorageManager] Applied segment rewrite to \(segmentID.value) (blackFrames=\(plan.blackFrameIndexes.count), redactionFrames=\(plan.redactions.count), operation=\(plan.operation.rawValue))",
             category: .storage
         )
     }
 
-    public func recoverInterruptedSegmentRedactions() async throws -> [SegmentRedactionRecoveryAction] {
+    public func recoverInterruptedSegmentRewrites() async throws -> [SegmentRewriteRecoveryAction] {
         let artifacts = try findInterruptedSegmentRewriteArtifacts()
-        var actions: [SegmentRedactionRecoveryAction] = []
+        var actions: [SegmentRewriteRecoveryAction] = []
         for artifact in artifacts {
-            let tempURL = artifact.tempURL
+            let workingURL = artifact.workingURL
             let backupURL = artifact.backupURL
             let recoveryMode = inferSegmentRewriteRecoveryMode(
+                operation: artifact.operation,
                 segmentURL: artifact.segmentURL,
-                tempURL: tempURL,
+                workingURL: workingURL,
                 backupURL: backupURL
             )
 
             if recoveryMode == .rollbackToPending {
                 rollbackInterruptedSegmentRewriteIfNeeded(
                     segmentURL: artifact.segmentURL,
-                    tempURL: tempURL,
+                    workingURL: workingURL,
                     backupURL: backupURL
                 )
-            } else if let tempURL {
-                removeItemIfExists(at: tempURL)
+            } else if let workingURL {
+                removeItemIfExists(at: workingURL)
             }
 
             clearFrameCache(for: artifact.segmentID)
-            generatorCache.removeValue(forKey: artifact.segmentURL.path)
+            if let entry = generatorCache.removeValue(forKey: artifact.segmentURL.path) {
+                releaseGeneratorEntry(entry)
+            }
+            publishVideoDecodingMemory(reason: "storage.video_decoding.cache")
             actions.append(
-                SegmentRedactionRecoveryAction(
+                SegmentRewriteRecoveryAction(
                     mode: recoveryMode,
+                    operation: artifact.operation,
                     segmentID: artifact.segmentID
                 )
             )
@@ -778,16 +940,19 @@ public actor StorageManager: StorageProtocol {
         return actions
     }
 
-    public func finishInterruptedSegmentRedactionRecovery(segmentID: VideoSegmentID) async throws {
+    public func finishInterruptedSegmentRewriteRecovery(segmentID: VideoSegmentID) async throws {
         guard let artifact = try findInterruptedSegmentRewriteArtifacts(segmentID: segmentID).first else {
             return
         }
 
-        if let tempURL = artifact.tempURL {
-            removeItemIfExists(at: tempURL)
+        if let workingURL = artifact.workingURL {
+            removeItemIfExists(at: workingURL)
         }
         if let backupURL = artifact.backupURL {
             removeItemIfExists(at: backupURL)
+        }
+        for cleanupURL in artifact.cleanupURLs {
+            removeItemIfExists(at: cleanupURL)
         }
     }
 
@@ -798,14 +963,14 @@ public actor StorageManager: StorageProtocol {
         }
 
         let segmentURL = artifact.segmentURL
-        let tempURL = artifact.tempURL ?? segmentRewriteTempURL(for: segmentURL, segmentID: segmentID)
+        let workingURL = artifact.workingURL ?? segmentRewriteWorkingURL(for: segmentURL, segmentID: segmentID)
         let fileManager = FileManager.default
 
         if fileManager.fileExists(atPath: segmentURL.path) {
-            if fileManager.fileExists(atPath: tempURL.path) {
-                removeItemIfExists(at: tempURL)
+            if fileManager.fileExists(atPath: workingURL.path) {
+                removeItemIfExists(at: workingURL)
             }
-            try fileManager.moveItem(at: segmentURL, to: tempURL)
+            try fileManager.moveItem(at: segmentURL, to: workingURL)
         }
     }
 
@@ -847,13 +1012,16 @@ public actor StorageManager: StorageProtocol {
             segmentID: segmentIDValue,
             frames: frames,
             lastAccessTime: Date(),
-            totalFrameCount: frames.count
+            totalFrameCount: frames.count,
+            estimatedBytes: Self.estimatedDecodedFrameBytes(for: frames)
         )
         frameCache[segmentIDValue] = cacheEntry
         evictOldCacheEntries()
+        publishVideoDecodingMemory(reason: "storage.video_decoding.frame_cache")
 
         guard frameIndex < frames.count else {
             frameCache.removeValue(forKey: segmentIDValue)
+            publishVideoDecodingMemory(reason: "storage.video_decoding.frame_cache")
             throw StorageError.fileReadFailed(
                 path: segmentURL.path,
                 underlying: "Frame index \(frameIndex) out of range (0..<\(frames.count))"
@@ -895,13 +1063,16 @@ public actor StorageManager: StorageProtocol {
             segmentID: cacheKey,
             frames: frames,
             lastAccessTime: Date(),
-            totalFrameCount: frames.count
+            totalFrameCount: frames.count,
+            estimatedBytes: Self.estimatedDecodedFrameBytes(for: frames)
         )
         frameCache[cacheKey] = cacheEntry
         evictOldCacheEntries()
+        publishVideoDecodingMemory(reason: "storage.video_decoding.frame_cache")
 
         guard frameIndex < frames.count else {
             frameCache.removeValue(forKey: cacheKey)
+            publishVideoDecodingMemory(reason: "storage.video_decoding.frame_cache")
             throw StorageError.fileReadFailed(
                 path: videoPath,
                 underlying: "Frame index \(frameIndex) out of range (0..<\(frames.count))"
@@ -978,7 +1149,20 @@ public actor StorageManager: StorageProtocol {
         // CRITICAL: Create CIContext ONCE outside the loop to avoid memory leak
         // Each CIContext allocates 20-50MB of Metal/GPU resources
         // Creating one per frame caused 40GB+ memory usage in VTDecoderXPCService
+        let ciContextBytes = Self.estimatedCIContextBytes()
+        let ciContextToken = beginVideoDecodingTransientBytes(
+            bucket: .ciContext,
+            bytes: ciContextBytes,
+            reason: "storage.video_decoding.decode_all"
+        )
         let ciContext = CIContext(options: [.useSoftwareRenderer: false])
+        defer {
+            endVideoDecodingTransientBytes(
+                bucket: .ciContext,
+                token: ciContextToken,
+                reason: "storage.video_decoding.decode_all"
+            )
+        }
 
         while let sampleBuffer = trackOutput.copyNextSampleBuffer() {
             let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
@@ -1030,6 +1214,19 @@ public actor StorageManager: StorageProtocol {
 
     /// Convert CGImage to JPEG data
     private func convertCGImageToJPEG(_ cgImage: CGImage) throws -> Data {
+        let bridgeToken = beginVideoDecodingTransientBytes(
+            bucket: .appKitBridge,
+            bytes: Self.estimatedAppKitBridgeBytes(width: cgImage.width, height: cgImage.height),
+            reason: "storage.video_decoding.jpeg_bridge"
+        )
+        defer {
+            endVideoDecodingTransientBytes(
+                bucket: .appKitBridge,
+                token: bridgeToken,
+                reason: "storage.video_decoding.jpeg_bridge"
+            )
+        }
+
         let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
         guard let tiffData = nsImage.tiffRepresentation,
               let bitmap = NSBitmapImageRep(data: tiffData),
@@ -1057,12 +1254,14 @@ public actor StorageManager: StorageProtocol {
                 Log.debug("[StorageManager] Evicted cache entry for segment \(oldestKey)", category: .storage)
             }
         }
+        publishVideoDecodingMemory(reason: "storage.video_decoding.frame_cache")
     }
 
     /// Clear the frame cache (useful when video files are modified)
     public func clearFrameCache() {
         frameCache.removeAll()
         segmentPathCache.removeAll()
+        publishVideoDecodingMemory(reason: "storage.video_decoding.frame_cache")
         Log.info("[StorageManager] Frame and segment path caches cleared", category: .storage)
     }
 
@@ -1070,6 +1269,7 @@ public actor StorageManager: StorageProtocol {
     public func clearFrameCache(for segmentID: VideoSegmentID) {
         frameCache.removeValue(forKey: segmentID.value)
         segmentPathCache.removeValue(forKey: segmentID.value)
+        publishVideoDecodingMemory(reason: "storage.video_decoding.frame_cache")
         Log.debug("[StorageManager] Cleared cache for segment \(segmentID.value)", category: .storage)
     }
 
@@ -1269,31 +1469,24 @@ public actor StorageManager: StorageProtocol {
 
     public func getTotalStorageUsed(includeRewind: Bool = false) async throws -> Int64 {
         var totalSize: Int64 = 0
-        var fileCount = 0
 
         // Retrace storage: chunks/ folder + retrace.db
         let retraceChunksURL = storageRootURL.appendingPathComponent("chunks", isDirectory: true)
         let retraceDbURL = storageRootURL.appendingPathComponent("retrace.db")
-        let (retraceChunksSize, retraceFileCount) = calculateFolderSizeWithCount(at: retraceChunksURL)
+        let retraceChunksSize = calculateFolderSize(at: retraceChunksURL)
         totalSize += retraceChunksSize
-        fileCount += retraceFileCount
 
-        if let dbSize = try? retraceDbURL.resourceValues(forKeys: [.totalFileAllocatedSizeKey]).totalFileAllocatedSize {
-            totalSize += Int64(dbSize)
-        }
+        totalSize += logicalFileSizeIfPresent(at: retraceDbURL)
 
         // Rewind storage: only include if enabled
         if includeRewind {
             let rewindURL = URL(fileURLWithPath: AppPaths.expandedRewindStorageRoot)
             let rewindChunksURL = rewindURL.appendingPathComponent("chunks", isDirectory: true)
             let rewindDbURL = rewindURL.appendingPathComponent("db-enc.sqlite3")
-            let (rewindChunksSize, rewindFileCount) = calculateFolderSizeWithCount(at: rewindChunksURL)
+            let rewindChunksSize = calculateFolderSize(at: rewindChunksURL)
             totalSize += rewindChunksSize
-            fileCount += rewindFileCount
 
-            if let dbSize = try? rewindDbURL.resourceValues(forKeys: [.totalFileAllocatedSizeKey]).totalFileAllocatedSize {
-                totalSize += Int64(dbSize)
-            }
+            totalSize += logicalFileSizeIfPresent(at: rewindDbURL)
         }
 
         return totalSize
@@ -1324,7 +1517,7 @@ public actor StorageManager: StorageProtocol {
                 .appendingPathComponent(dayStr, isDirectory: true)
 
             if fileManager.fileExists(atPath: dayFolderURL.path) {
-                totalSize += calculateImmediateChildrenAllocatedSize(at: dayFolderURL)
+                totalSize += calculateImmediateChildrenLogicalSize(at: dayFolderURL)
             }
 
             currentDate = calendar.date(byAdding: .day, value: 1, to: currentDate)!
@@ -1333,13 +1526,13 @@ public actor StorageManager: StorageProtocol {
         return totalSize
     }
 
-    /// Sum allocated sizes of immediate files in a day folder (non-recursive).
+    /// Sum logical sizes of immediate files in a day folder (non-recursive).
     /// Ignores nested directories and their contents.
-    private func calculateImmediateChildrenAllocatedSize(at url: URL) -> Int64 {
+    private func calculateImmediateChildrenLogicalSize(at url: URL) -> Int64 {
         let fileManager = FileManager.default
         guard let entries = try? fileManager.contentsOfDirectory(
             at: url,
-            includingPropertiesForKeys: [.isRegularFileKey, .totalFileAllocatedSizeKey, .fileAllocatedSizeKey],
+            includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
             options: [.skipsHiddenFiles]
         ) else {
             return 0
@@ -1348,57 +1541,29 @@ public actor StorageManager: StorageProtocol {
         var totalSize: Int64 = 0
         for entry in entries {
             guard let values = try? entry.resourceValues(
-                forKeys: [.isRegularFileKey, .totalFileAllocatedSizeKey, .fileAllocatedSizeKey]
+                forKeys: [.isRegularFileKey, .fileSizeKey]
             ) else {
                 continue
             }
             guard values.isRegularFile == true else {
                 continue
             }
-            if let allocated = values.totalFileAllocatedSize ?? values.fileAllocatedSize {
-                totalSize += Int64(allocated)
+            if let fileSize = values.fileSize {
+                totalSize += Int64(fileSize)
             }
         }
 
         return totalSize
     }
 
-    /// Get the total allocated size of a folder (fast version using du)
+    /// Get the total logical size of a folder by summing file sizes recursively.
     private func calculateFolderSize(at url: URL) -> Int64 {
-        // Use du -sk for fast kernel-level size calculation
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/du")
-        process.arguments = ["-sk", url.path]  // -s = summary, -k = kilobytes
-
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = FileHandle.nullDevice
-
-        do {
-            try process.run()
-            process.waitUntilExit()
-
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            if let output = String(data: data, encoding: .utf8),
-               let sizeStr = output.split(separator: "\t").first,
-               let sizeKB = Int64(sizeStr) {
-                return sizeKB * 1024  // Convert KB to bytes
-            }
-        } catch {
-            // Fallback on error
-        }
-
-        return calculateFolderSizeFallback(at: url)
-    }
-
-    /// Fallback: enumerate files if du fails
-    private func calculateFolderSizeFallback(at url: URL) -> Int64 {
         let fileManager = FileManager.default
         var totalSize: Int64 = 0
 
         guard let enumerator = fileManager.enumerator(
             at: url,
-            includingPropertiesForKeys: [.totalFileAllocatedSizeKey, .isRegularFileKey],
+            includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey],
             options: [.skipsHiddenFiles]
         ) else {
             return 0
@@ -1406,8 +1571,8 @@ public actor StorageManager: StorageProtocol {
 
         for case let fileURL as URL in enumerator {
             do {
-                let resourceValues = try fileURL.resourceValues(forKeys: [.totalFileAllocatedSizeKey, .isRegularFileKey])
-                if resourceValues.isRegularFile == true, let fileSize = resourceValues.totalFileAllocatedSize {
+                let resourceValues = try fileURL.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey])
+                if resourceValues.isRegularFile == true, let fileSize = resourceValues.fileSize {
                     totalSize += Int64(fileSize)
                 }
             } catch {
@@ -1439,6 +1604,14 @@ public actor StorageManager: StorageProtocol {
         }
 
         return (size, fileCount)
+    }
+
+    private func logicalFileSizeIfPresent(at url: URL) -> Int64 {
+        guard FileManager.default.fileExists(atPath: url.path),
+              let fileSize = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize else {
+            return 0
+        }
+        return Int64(fileSize)
     }
 
     public func getAvailableDiskSpace() async throws -> Int64 {
@@ -1570,20 +1743,45 @@ public actor StorageManager: StorageProtocol {
         )
     }
 
-    private func segmentRewriteTempURL(for segmentURL: URL, segmentID: VideoSegmentID) -> URL {
-        segmentURL
-            .deletingLastPathComponent()
-            .appendingPathComponent(".\(segmentURL.lastPathComponent).redaction-working-\(segmentID.value).mp4")
+    private enum SegmentRewriteArtifactRole {
+        case working
+        case backup
     }
 
-    private func segmentRewriteBackupName(for segmentURL: URL, segmentID: VideoSegmentID) -> String {
-        ".\(segmentURL.lastPathComponent).redaction-backup-\(segmentID.value)"
+    private func segmentRewriteWorkingURL(for segmentURL: URL, segmentID: VideoSegmentID) -> URL {
+        hiddenSegmentRewriteURL(
+            for: segmentURL,
+            suffix: ".rewrite-working-\(segmentID.value).mp4"
+        )
     }
 
     private func segmentRewriteBackupURL(for segmentURL: URL, segmentID: VideoSegmentID) -> URL {
+        hiddenSegmentRewriteURL(
+            for: segmentURL,
+            suffix: ".rewrite-backup-\(segmentID.value)"
+        )
+    }
+
+    private func segmentDeleteBackupURL(for segmentURL: URL, segmentID: VideoSegmentID) -> URL {
+        hiddenSegmentRewriteURL(
+            for: segmentURL,
+            suffix: ".delete-backup-\(segmentID.value)"
+        )
+    }
+
+    private func hiddenSegmentRewriteURL(for segmentURL: URL, suffix: String) -> URL {
         segmentURL
             .deletingLastPathComponent()
-            .appendingPathComponent(segmentRewriteBackupName(for: segmentURL, segmentID: segmentID))
+            .appendingPathComponent(".\(segmentURL.lastPathComponent)\(suffix)")
+    }
+
+    fileprivate static func legacySegmentRewriteStateURL(
+        for segmentURL: URL,
+        segmentID: VideoSegmentID
+    ) -> URL {
+        segmentURL
+            .deletingLastPathComponent()
+            .appendingPathComponent(".\(segmentURL.lastPathComponent).rewrite-state-\(segmentID.value).json")
     }
 
     private func findInterruptedSegmentRewriteArtifacts(
@@ -1605,7 +1803,8 @@ public actor StorageManager: StorageProtocol {
             guard (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else {
                 continue
             }
-            guard let artifact = parseSegmentRewriteArtifact(at: url) else {
+            guard let artifact = parseSegmentRewriteArtifact(at: url) ??
+                parseLegacySegmentRewriteArtifact(at: url) else {
                 continue
             }
             if let targetSegmentID, artifact.segmentID != targetSegmentID {
@@ -1615,88 +1814,188 @@ public actor StorageManager: StorageProtocol {
             var merged = artifactsByPath[artifact.segmentURL.path] ?? SegmentRewriteArtifacts(
                 segmentID: artifact.segmentID,
                 segmentURL: artifact.segmentURL,
-                tempURL: nil,
-                backupURL: nil
+                workingURL: nil,
+                backupURL: nil,
+                cleanupURLs: [],
+                operation: artifact.operation
             )
-            if let tempURL = artifact.tempURL {
-                merged.tempURL = tempURL
+            if let workingURL = artifact.workingURL {
+                merged.workingURL = workingURL
             }
             if let backupURL = artifact.backupURL {
                 merged.backupURL = backupURL
             }
+            if let cleanupURL = artifact.cleanupURL,
+               !merged.cleanupURLs.contains(where: { $0.path == cleanupURL.path }) {
+                merged.cleanupURLs.append(cleanupURL)
+            }
+            if artifact.operation == .wholeVideoDelete {
+                merged.operation = .wholeVideoDelete
+            }
             artifactsByPath[artifact.segmentURL.path] = merged
         }
 
-        return artifactsByPath.values.sorted { lhs, rhs in
-            if lhs.segmentID.value == rhs.segmentID.value {
-                return lhs.segmentURL.path < rhs.segmentURL.path
+        return artifactsByPath.values
+            .map { artifact in
+                var artifact = artifact
+                artifact.cleanupURLs.sort { $0.path < $1.path }
+                return artifact
             }
-            return lhs.segmentID.value < rhs.segmentID.value
-        }
+            .sorted { lhs, rhs in
+                if lhs.segmentID.value == rhs.segmentID.value {
+                    return lhs.segmentURL.path < rhs.segmentURL.path
+                }
+                return lhs.segmentID.value < rhs.segmentID.value
+            }
     }
 
-    private func parseSegmentRewriteArtifact(at url: URL) -> SegmentRewriteArtifacts? {
+    private func parseSegmentRewriteArtifact(at url: URL) -> SegmentRewriteArtifactPiece? {
+        parseHiddenSegmentRewriteArtifact(
+            at: url,
+            marker: ".rewrite-working-",
+            suffix: ".mp4",
+            operation: .partialRewrite,
+            role: .working
+        ) ??
+            parseHiddenSegmentRewriteArtifact(
+                at: url,
+                marker: ".rewrite-backup-",
+                operation: .partialRewrite,
+                role: .backup
+            ) ??
+            parseHiddenSegmentRewriteArtifact(
+                at: url,
+                marker: ".delete-backup-",
+                operation: .wholeVideoDelete,
+                role: .backup
+            )
+    }
+
+    private func parseLegacySegmentRewriteArtifact(at url: URL) -> SegmentRewriteArtifactPiece? {
+        if let artifact = parseHiddenSegmentRewriteArtifact(
+            at: url,
+            marker: ".redaction-working-",
+            suffix: ".mp4",
+            operation: .partialRewrite,
+            role: .working
+        ) {
+            return artifact
+        }
+
+        if let artifact = parseHiddenSegmentRewriteArtifact(
+            at: url,
+            marker: ".redaction-backup-",
+            operation: .partialRewrite,
+            role: .backup
+        ) {
+            return artifact
+        }
+
         let name = url.lastPathComponent
-        guard name.hasPrefix(".") else { return nil }
+        guard name.hasPrefix("."),
+              let markerRange = name.range(of: ".rewrite-state-", options: .backwards),
+              name.hasSuffix(".json") else {
+            return nil
+        }
 
         let hiddenStart = name.index(after: name.startIndex)
-
-        if let markerRange = name.range(of: ".redaction-working-", options: .backwards),
-           name.hasSuffix(".mp4") {
-            let originalName = String(name[hiddenStart..<markerRange.lowerBound])
-            let idEnd = name.index(name.endIndex, offsetBy: -4)
-            guard !originalName.isEmpty,
-                  markerRange.upperBound < idEnd,
-                  let rawID = Int64(name[markerRange.upperBound..<idEnd]) else {
-                return nil
-            }
-            let segmentURL = url.deletingLastPathComponent().appendingPathComponent(originalName)
-            return SegmentRewriteArtifacts(
-                segmentID: VideoSegmentID(value: rawID),
-                segmentURL: segmentURL,
-                tempURL: url,
-                backupURL: nil
-            )
+        let idEnd = name.index(name.endIndex, offsetBy: -".json".count)
+        let originalName = String(name[hiddenStart..<markerRange.lowerBound])
+        guard !originalName.isEmpty,
+              markerRange.upperBound < idEnd,
+              let rawID = Int64(name[markerRange.upperBound..<idEnd]) else {
+            return nil
         }
 
-        if let markerRange = name.range(of: ".redaction-backup-", options: .backwards) {
-            let originalName = String(name[hiddenStart..<markerRange.lowerBound])
-            guard !originalName.isEmpty,
-                  let rawID = Int64(name[markerRange.upperBound...]) else {
-                return nil
-            }
-            let segmentURL = url.deletingLastPathComponent().appendingPathComponent(originalName)
-            return SegmentRewriteArtifacts(
-                segmentID: VideoSegmentID(value: rawID),
-                segmentURL: segmentURL,
-                tempURL: nil,
-                backupURL: url
-            )
+        return SegmentRewriteArtifactPiece(
+            segmentID: VideoSegmentID(value: rawID),
+            segmentURL: url.deletingLastPathComponent().appendingPathComponent(originalName),
+            operation: loadLegacySegmentRewriteOperationFromManifest(at: url) ?? .partialRewrite,
+            workingURL: nil,
+            backupURL: nil,
+            cleanupURL: url
+        )
+    }
+
+    private func parseHiddenSegmentRewriteArtifact(
+        at url: URL,
+        marker: String,
+        suffix: String? = nil,
+        operation: SegmentRewriteOperation,
+        role: SegmentRewriteArtifactRole
+    ) -> SegmentRewriteArtifactPiece? {
+        let name = url.lastPathComponent
+        guard name.hasPrefix("."),
+              let markerRange = name.range(of: marker, options: .backwards) else {
+            return nil
         }
 
-        return nil
+        if let suffix, !name.hasSuffix(suffix) {
+            return nil
+        }
+
+        let hiddenStart = name.index(after: name.startIndex)
+        let idEnd = suffix.map { name.index(name.endIndex, offsetBy: -$0.count) } ?? name.endIndex
+        let originalName = String(name[hiddenStart..<markerRange.lowerBound])
+        guard !originalName.isEmpty,
+              markerRange.upperBound < idEnd,
+              let rawID = Int64(name[markerRange.upperBound..<idEnd]) else {
+            return nil
+        }
+
+        let segmentURL = url.deletingLastPathComponent().appendingPathComponent(originalName)
+        return SegmentRewriteArtifactPiece(
+            segmentID: VideoSegmentID(value: rawID),
+            segmentURL: segmentURL,
+            operation: operation,
+            workingURL: role == .working ? url : nil,
+            backupURL: role == .backup ? url : nil,
+            cleanupURL: nil
+        )
+    }
+
+    private struct LegacySegmentRewriteManifest: Decodable {
+        let operation: String
+    }
+
+    private func loadLegacySegmentRewriteOperationFromManifest(at url: URL) -> SegmentRewriteOperation? {
+        guard let data = try? Data(contentsOf: url),
+              let manifest = try? JSONDecoder().decode(LegacySegmentRewriteManifest.self, from: data) else {
+            return nil
+        }
+
+        switch manifest.operation {
+        case "wholeVideoDelete":
+            return .wholeVideoDelete
+        case "partialRewrite":
+            return .partialRewrite
+        default:
+            return nil
+        }
     }
 
     private func inferSegmentRewriteRecoveryMode(
+        operation: SegmentRewriteOperation,
         segmentURL: URL,
-        tempURL: URL?,
+        workingURL: URL?,
         backupURL: URL?
-    ) -> SegmentRedactionRecoveryAction.Mode {
+    ) -> SegmentRewriteRecoveryAction.Mode {
         inferSegmentRewriteRecoveryModeFromDisk(
+            operation: operation,
             segmentURL: segmentURL,
-            tempURL: tempURL,
+            workingURL: workingURL,
             backupURL: backupURL
         )
     }
 
     private func rollbackInterruptedSegmentRewriteIfNeeded(
         segmentURL: URL,
-        tempURL: URL?,
+        workingURL: URL?,
         backupURL: URL?
     ) {
         rollbackInterruptedSegmentRewriteIfNeededOnDisk(
             segmentURL: segmentURL,
-            tempURL: tempURL,
+            workingURL: workingURL,
             backupURL: backupURL
         )
     }
@@ -1746,11 +2045,11 @@ public actor StorageManager: StorageProtocol {
 
         // Clean up generator cache and remove any symlinks
         for (_, entry) in generatorCache {
-            if let symlinkURL = entry.symlinkURL {
-                try? FileManager.default.removeItem(at: symlinkURL)
-            }
+            releaseGeneratorEntry(entry)
         }
         generatorCache.removeAll()
+        decodeRetainedGenerationByCacheKey.removeAll()
+        publishVideoDecodingMemory(reason: "storage.video_decoding.cache")
 
         Log.info("[StorageManager] All caches invalidated", category: .storage)
     }
@@ -1760,13 +2059,11 @@ public actor StorageManager: StorageProtocol {
         frameCache.removeAll()
 
         for (_, entry) in generatorCache {
-            if let symlinkURL = entry.symlinkURL {
-                try? FileManager.default.removeItem(at: symlinkURL)
-            }
+            releaseGeneratorEntry(entry)
         }
         generatorCache.removeAll()
-
-        Log.info("[StorageManager] Purged frame extraction caches (\(reason))", category: .storage)
+        decodeRetainedGenerationByCacheKey.removeAll()
+        publishVideoDecodingMemory(reason: "storage.video_decoding.cache")
     }
 
     /// Validate cached paths still exist. Call after drive reconnection to clean stale entries.
@@ -1791,13 +2088,15 @@ public actor StorageManager: StorageProtocol {
         for (path, entry) in generatorCache {
             if !FileManager.default.fileExists(atPath: path) {
                 invalidPaths.append(path)
-                if let symlinkURL = entry.symlinkURL {
-                    try? FileManager.default.removeItem(at: symlinkURL)
-                }
+                releaseGeneratorEntry(entry)
             }
         }
         for path in invalidPaths {
             generatorCache.removeValue(forKey: path)
+            decodeRetainedGenerationByCacheKey.removeValue(forKey: path)
+        }
+        if !invalidSegmentIDs.isEmpty || !invalidPaths.isEmpty {
+            publishVideoDecodingMemory(reason: "storage.video_decoding.cache")
         }
 
         if !invalidSegmentIDs.isEmpty || !invalidPaths.isEmpty {
@@ -1806,6 +2105,268 @@ public actor StorageManager: StorageProtocol {
     }
 
     // MARK: - Private helpers
+
+    private func beginVideoDecodingTransientBytes(
+        bucket: VideoDecodingTransientBucket,
+        bytes: Int64,
+        reason: String
+    ) -> UUID? {
+        guard bytes > 0 else { return nil }
+        let token = UUID()
+        switch bucket {
+        case .decodeSurface:
+            activeDecodeSurfaceBytesByToken[token] = max(0, bytes)
+        case .appKitBridge:
+            activeAppKitBridgeBytesByToken[token] = max(0, bytes)
+        case .ciContext:
+            activeCIContextBytesByToken[token] = max(0, bytes)
+        }
+        publishVideoDecodingMemory(reason: reason)
+        return token
+    }
+
+    private func releaseGeneratorEntry(_ entry: GeneratorCacheEntry) {
+        entry.generator.cancelAllCGImageGeneration()
+        if let symlinkURL = entry.symlinkURL {
+            try? FileManager.default.removeItem(at: symlinkURL)
+        }
+    }
+
+    private func endVideoDecodingTransientBytes(
+        bucket: VideoDecodingTransientBucket,
+        token: UUID?,
+        reason: String
+    ) {
+        guard let token else { return }
+        switch bucket {
+        case .decodeSurface:
+            activeDecodeSurfaceBytesByToken.removeValue(forKey: token)
+        case .appKitBridge:
+            activeAppKitBridgeBytesByToken.removeValue(forKey: token)
+        case .ciContext:
+            activeCIContextBytesByToken.removeValue(forKey: token)
+        }
+        publishVideoDecodingMemory(reason: reason)
+    }
+
+    private func publishVideoDecodingMemory(reason: String) {
+        pruneExpiredRetainedDecoderHeap()
+
+        let generatorBytes = generatorCache.values.reduce(into: Int64(0)) { partialResult, entry in
+            partialResult += entry.estimatedGeneratorBytes
+        }
+        let decoderHeapBytes = generatorCache.values.reduce(into: Int64(0)) { partialResult, entry in
+            partialResult += entry.estimatedDecoderHeapBytes
+        }
+        let decoderHeapCount = generatorCache.values.reduce(into: 0) { partialResult, entry in
+            partialResult += entry.estimatedDecoderHeapBytes > 0 ? 1 : 0
+        }
+        let frameCacheBytes = frameCache.values.reduce(into: Int64(0)) { partialResult, entry in
+            partialResult += entry.estimatedBytes
+        }
+        let decodeSurfaceBytes = activeDecodeSurfaceBytesByToken.values.reduce(into: Int64(0)) { partialResult, bytes in
+            partialResult += bytes
+        }
+        let appKitBridgeBytes = activeAppKitBridgeBytesByToken.values.reduce(into: Int64(0)) { partialResult, bytes in
+            partialResult += bytes
+        }
+        let ciContextBytes = activeCIContextBytesByToken.values.reduce(into: Int64(0)) { partialResult, bytes in
+            partialResult += bytes
+        }
+
+        MemoryLedger.set(
+            tag: Self.memoryLedgerGeneratorCacheTag,
+            bytes: generatorBytes,
+            count: generatorCache.count,
+            unit: "generators",
+            function: "storage.video_decoding",
+            kind: "decode-generator-cache",
+            note: "estimated-native",
+            category: .inferred
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerDecoderHeapTag,
+            bytes: decoderHeapBytes,
+            count: decoderHeapCount,
+            unit: "generators",
+            function: "storage.video_decoding",
+            kind: "decode-private-heap",
+            note: "observed-footprint-delta"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerFrameCacheTag,
+            bytes: frameCacheBytes,
+            count: frameCache.count,
+            unit: "segments",
+            function: "storage.video_decoding",
+            kind: "decoded-frame-cache",
+            note: "estimated-native"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerDecodeSurfaceTag,
+            bytes: decodeSurfaceBytes,
+            count: activeDecodeSurfaceBytesByToken.count,
+            unit: "surfaces",
+            function: "storage.video_decoding",
+            kind: "decode-surface",
+            note: "estimated-native"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerAppKitBridgeTag,
+            bytes: appKitBridgeBytes,
+            count: activeAppKitBridgeBytesByToken.count,
+            unit: "bridges",
+            function: "storage.video_decoding",
+            kind: "appkit-jpeg-bridge",
+            note: "proxy-native"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerCIContextTag,
+            bytes: ciContextBytes,
+            count: activeCIContextBytesByToken.count,
+            unit: "contexts",
+            function: "storage.video_decoding",
+            kind: "ci-context",
+            note: "proxy-native"
+        )
+        MemoryLedger.emitSummary(
+            reason: reason,
+            category: .storage,
+            minIntervalSeconds: Self.memoryLedgerSummaryIntervalSeconds
+        )
+    }
+
+    private static func estimatedFrameBytes(width: Int, height: Int) -> Int64 {
+        guard width > 0, height > 0 else { return 0 }
+        return max(0, Int64(width) * Int64(height) * 4)
+    }
+
+    private static func estimatedGeneratorBytes(width: Int, height: Int) -> Int64 {
+        let frameBytes = estimatedFrameBytes(width: width, height: height)
+        guard frameBytes > 0 else { return 0 }
+        return max(frameBytes / 8, 1 * 1_024 * 1_024)
+    }
+
+    private static func estimatedDecoderHeapFallbackBytes(width: Int, height: Int) -> Int64 {
+        let frameBytes = estimatedFrameBytes(width: width, height: height)
+        guard frameBytes > 0 else { return 0 }
+        return max(frameBytes / 2, 8 * 1_024 * 1_024)
+    }
+
+    private static func estimatedAppKitBridgeBytes(width: Int, height: Int) -> Int64 {
+        let frameBytes = estimatedFrameBytes(width: width, height: height)
+        guard frameBytes > 0 else { return 0 }
+        return max(frameBytes * 2, 16 * 1_024 * 1_024)
+    }
+
+    private static func estimatedCIContextBytes() -> Int64 {
+        24 * 1_024 * 1_024
+    }
+
+    private static func estimatedDecodedFrameBytes(for frames: [DecodedFrame]) -> Int64 {
+        frames.reduce(into: Int64(0)) { partialResult, frame in
+            partialResult += estimatedFrameBytes(width: frame.image.width, height: frame.image.height)
+        }
+    }
+
+    private func refreshRetainedDecoderHeap(
+        cacheKey: String,
+        observedBytes: Int64,
+        reason: String
+    ) {
+        guard var entry = generatorCache[cacheKey] else { return }
+
+        if observedBytes > 0 {
+            entry.estimatedDecoderHeapBytes = observedBytes
+        } else if entry.estimatedDecoderHeapBytes <= 0 {
+            entry.estimatedDecoderHeapBytes = 0
+            decodeRetainedGenerationByCacheKey.removeValue(forKey: cacheKey)
+            generatorCache[cacheKey] = entry
+            return
+        }
+
+        generatorCache[cacheKey] = entry
+        let generation = (decodeRetainedGenerationByCacheKey[cacheKey] ?? 0) + 1
+        decodeRetainedGenerationByCacheKey[cacheKey] = generation
+
+        Task.detached(priority: .utility) { [weak self] in
+            try? await Task.sleep(for: .seconds(Self.memoryLedgerDecoderRetainDurationSeconds))
+            await self?.clearRetainedDecoderHeapIfCurrent(
+                cacheKey: cacheKey,
+                generation: generation,
+                reason: reason
+            )
+        }
+    }
+
+    private func clearRetainedDecoderHeapIfCurrent(
+        cacheKey: String,
+        generation: UInt64,
+        reason: String
+    ) {
+        guard decodeRetainedGenerationByCacheKey[cacheKey] == generation else { return }
+        decodeRetainedGenerationByCacheKey.removeValue(forKey: cacheKey)
+        guard var entry = generatorCache[cacheKey] else { return }
+        entry.estimatedDecoderHeapBytes = 0
+        generatorCache[cacheKey] = entry
+        publishVideoDecodingMemory(reason: reason)
+    }
+
+    private func pruneExpiredRetainedDecoderHeap() {
+        for cacheKey in Array(generatorCache.keys) {
+            guard decodeRetainedGenerationByCacheKey[cacheKey] == nil,
+                  var entry = generatorCache[cacheKey],
+                  entry.estimatedDecoderHeapBytes > 0 else { continue }
+            entry.estimatedDecoderHeapBytes = 0
+            generatorCache[cacheKey] = entry
+        }
+    }
+
+    private static func measuredDecoderHeapBytes(
+        baselineFootprintBytes: UInt64?,
+        width: Int,
+        height: Int
+    ) -> Int64 {
+        guard let baselineFootprintBytes,
+              let currentFootprintBytes = currentProcessFootprintBytes() else {
+            return estimatedDecoderHeapFallbackBytes(width: width, height: height)
+        }
+
+        guard currentFootprintBytes > baselineFootprintBytes else {
+            return 0
+        }
+
+        let deltaBytes = min(
+            currentFootprintBytes - baselineFootprintBytes,
+            UInt64(Int64.max)
+        )
+        return Int64(deltaBytes)
+    }
+
+    private static func currentProcessFootprintBytes() -> UInt64? {
+        currentTaskVMInfo()?.phys_footprint
+    }
+
+    private static func currentTaskVMInfo() -> task_vm_info_data_t? {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(
+            MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size
+        )
+
+        let kernResult = withUnsafeMutablePointer(to: &info) { pointer in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { reboundPointer in
+                task_info(
+                    mach_task_self_,
+                    task_flavor_t(TASK_VM_INFO),
+                    reboundPointer,
+                    &count
+                )
+            }
+        }
+
+        guard kernResult == KERN_SUCCESS else { return nil }
+        return info
+    }
 
     private func parseSegmentID(from url: URL) -> VideoSegmentID? {
         // Files are named with just the Int64 ID (e.g., "12345") or with .mp4 extension (e.g., "12345.mp4")

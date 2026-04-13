@@ -7,9 +7,9 @@ set -e  # Exit on error
 
 APP_NAME="Retrace"
 BUNDLE_ID="io.retrace.app"
-BUILD_DIR=".build/release"
-APP_BUNDLE="$BUILD_DIR/$APP_NAME.app"
 BUILD_CONFIG="release"
+BUILD_DIR="$(swift build -c "$BUILD_CONFIG" --show-bin-path)"
+APP_BUNDLE="$BUILD_DIR/$APP_NAME.app"
 
 # ---------------------------------------------------------------------------
 # Parse version from project.yml (single source of truth)
@@ -53,6 +53,12 @@ echo "🔨 Building Retrace v${MARKETING_VERSION} (${BUILD_CONFIG})..."
 echo "   commit: ${GIT_COMMIT} (${GIT_BRANCH})"
 ./scripts/check_no_nanoseconds_sleep.sh
 swift build -c release
+
+if [ ! -f "$BUILD_DIR/$APP_NAME" ]; then
+    echo "❌ Expected release executable not found at $BUILD_DIR/$APP_NAME"
+    echo "   SwiftPM release bin path: $BUILD_DIR"
+    exit 1
+fi
 
 echo "📦 Creating app bundle..."
 

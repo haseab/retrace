@@ -551,7 +551,11 @@ extension SettingsView {
         isRecording: Binding<Bool>,
         otherShortcuts: [SettingsShortcutKey]
     ) -> some View {
-        HStack {
+        let defaultShortcut = Self.defaultShortcut(for: kind)
+        let isUsingDefaultShortcut = Self.usesDefaultShortcut(shortcut.wrappedValue, for: kind)
+        let canClearShortcut = Self.canClearShortcut(shortcut.wrappedValue)
+
+        return HStack {
             Text(label)
                 .font(.retraceCaptionMedium)
                 .foregroundColor(.retracePrimary)
@@ -645,23 +649,49 @@ extension SettingsView {
                 .frame(width: 0, height: 0)
             )
 
-            // Clear button (×)
-            if !shortcut.wrappedValue.isEmpty && !isRecording.wrappedValue {
-                Button(action: {
-                    shortcut.wrappedValue = .empty
-                    persistShortcutChange(kind)
-                }) {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundColor(.white.opacity(0.5))
-                        .frame(width: 18, height: 18)
-                        .background(Color.white.opacity(0.1))
-                        .cornerRadius(4)
+            if !isRecording.wrappedValue {
+                HStack(spacing: 6) {
+                    shortcutControlButton(
+                        systemName: "arrow.counterclockwise",
+                        isEnabled: !isUsingDefaultShortcut,
+                        helpText: isUsingDefaultShortcut ? "Already using default shortcut" : "Reset to default shortcut"
+                    ) {
+                        shortcut.wrappedValue = defaultShortcut
+                        persistShortcutChange(kind)
+                    }
+
+                    shortcutControlButton(
+                        systemName: "xmark",
+                        isEnabled: canClearShortcut,
+                        helpText: canClearShortcut ? "Clear shortcut" : "Shortcut is already cleared"
+                    ) {
+                        shortcut.wrappedValue = .empty
+                        persistShortcutChange(kind)
+                    }
                 }
-                .buttonStyle(.plain)
-                .help("Clear shortcut")
             }
         }
+    }
+
+    @ViewBuilder
+    func shortcutControlButton(
+        systemName: String,
+        isEnabled: Bool,
+        helpText: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: systemName)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundColor(.white.opacity(isEnabled ? 0.5 : 0.22))
+                .frame(width: 18, height: 18)
+                .background(Color.white.opacity(isEnabled ? 0.1 : 0.04))
+                .cornerRadius(4)
+        }
+        .buttonStyle(.plain)
+        .disabled(!isEnabled)
+        .help(helpText)
+        .accessibilityLabel(helpText)
     }
 
     func loadSavedShortcuts() async {
@@ -698,6 +728,7 @@ extension SettingsView {
             await onboardingManager.setCommentShortcut(commentShortcut.toConfig)
         }
 
+        recordShortcutDefaultStateMetric(for: kind)
         MenuBarManager.shared?.reloadShortcuts()
     }
 

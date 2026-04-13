@@ -13,20 +13,85 @@ public struct SegmentRedactionTarget: Sendable, Equatable {
     }
 }
 
-public struct SegmentRedactionRecoveryAction: Sendable, Equatable {
+public struct SegmentFrameRedaction: Sendable, Equatable {
+    public let frameID: Int64
+    public let frameIndex: Int
+    public let targets: [SegmentRedactionTarget]
+
+    public init(frameID: Int64, frameIndex: Int, targets: [SegmentRedactionTarget]) {
+        self.frameID = frameID
+        self.frameIndex = frameIndex
+        self.targets = targets
+    }
+}
+
+public enum SegmentRewriteOperation: String, Sendable, Codable, Equatable {
+    case partialRewrite
+    case wholeVideoDelete
+}
+
+public struct SegmentRewritePlan: Sendable, Equatable {
+    public let operation: SegmentRewriteOperation
+    public let blackFrameIndexes: Set<Int>
+    public let redactions: [SegmentFrameRedaction]
+
+    public init(
+        operation: SegmentRewriteOperation = .partialRewrite,
+        blackFrameIndexes: Set<Int> = [],
+        redactions: [SegmentFrameRedaction] = []
+    ) {
+        self.operation = operation
+        self.blackFrameIndexes = blackFrameIndexes
+        self.redactions = redactions
+    }
+
+    public var hasBlackFrameRewrites: Bool {
+        !blackFrameIndexes.isEmpty
+    }
+
+    public var hasRedactionTargets: Bool {
+        !redactions.isEmpty
+    }
+
+    public var redactionFrameIDs: [Int64] {
+        redactions.map(\.frameID)
+    }
+
+    public func redactionTargets(forFrameIndex frameIndex: Int) -> [SegmentRedactionTarget] {
+        Array(
+            redactions
+                .lazy
+                .filter { $0.frameIndex == frameIndex }
+                .flatMap(\.targets)
+        )
+    }
+
+    public var deletesWholeVideo: Bool {
+        operation == .wholeVideoDelete
+    }
+
+    public var hasAnyRewrite: Bool {
+        deletesWholeVideo || hasBlackFrameRewrites || hasRedactionTargets
+    }
+}
+
+public struct SegmentRewriteRecoveryAction: Sendable, Equatable {
     public enum Mode: String, Sendable {
         case rollbackToPending
-        case markCompleted
+        case finalizeCommitted
     }
 
     public let mode: Mode
+    public let operation: SegmentRewriteOperation
     public let segmentID: VideoSegmentID
 
     public init(
         mode: Mode,
+        operation: SegmentRewriteOperation,
         segmentID: VideoSegmentID
     ) {
         self.mode = mode
+        self.operation = operation
         self.segmentID = segmentID
     }
 }
@@ -72,19 +137,18 @@ public protocol StorageProtocol: Actor {
         fallbackFrameIndex: Int
     ) async throws -> CapturedFrame?
 
-    /// Rewrite finalized segment bytes for phrase-redaction protection.
-    func rewriteSegmentForRedaction(
+    /// Apply a generic post-capture rewrite/delete mutation to a finalized segment.
+    func applySegmentRewrite(
         segmentID: VideoSegmentID,
-        frameIDs: [Int64],
-        targetsByFrameIndex: [Int: [SegmentRedactionTarget]],
-        secret: String
+        plan: SegmentRewritePlan,
+        secret: String?
     ) async throws
 
-    /// Recover interrupted phrase-redaction rewrites discovered on disk.
-    func recoverInterruptedSegmentRedactions() async throws -> [SegmentRedactionRecoveryAction]
+    /// Recover interrupted segment mutations discovered on disk.
+    func recoverInterruptedSegmentRewrites() async throws -> [SegmentRewriteRecoveryAction]
 
     /// Remove on-disk recovery artifacts once DB reconciliation succeeds.
-    func finishInterruptedSegmentRedactionRecovery(segmentID: VideoSegmentID) async throws
+    func finishInterruptedSegmentRewriteRecovery(segmentID: VideoSegmentID) async throws
 
     /// Check if a video file has valid timestamps (first frame dts=0)
     /// Returns false if the video was not properly finalized (crash recovery case)
@@ -165,7 +229,9 @@ public struct VideoEncoderConfig: Sendable {
     /// Target bitrate in bits per second (nil = auto)
     public let targetBitrate: Int?
 
-    /// Keyframe interval in frames
+    /// Keyframe interval in frames.
+    /// Storage guardrail: do not shorten this casually. A longer GOP is intentional here because
+    /// it materially improves storage efficiency for continuous screen capture.
     public let keyframeInterval: Int
 
     /// Whether to use hardware encoding
@@ -177,7 +243,7 @@ public struct VideoEncoderConfig: Sendable {
     public init(
         codec: VideoCodec = .hevc,
         targetBitrate: Int? = nil,
-        keyframeInterval: Int = 30,  // Keyframe every 30 frames, enables P/B-frame compression
+        keyframeInterval: Int = 30,  // Storage guardrail: keep this long for compression efficiency unless storage cost is intentionally being traded away.
         useHardwareEncoder: Bool = true,
         quality: Float = 0.5
     ) {

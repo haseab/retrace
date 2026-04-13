@@ -3,11 +3,13 @@ import CoreGraphics
 import Shared
 import Database
 import Storage
+import Search
 import SQLCipher
 
 /// Unified data adapter that owns connections directly and runs SQL
 /// Seamlessly blends data from Retrace (native) and Rewind (encrypted) databases
 public actor DataAdapter {
+    private static let memoryLedgerSegmentCacheTag = "app.dataAdapter.segmentCache"
 
     /// High-frequency function words that should not use prefix expansion.
     /// These still participate in MATCH, but as exact token matches.
@@ -22,28 +24,18 @@ public actor DataAdapter {
     ]
 
     private static let searchDedupeLookbackWindow = 3
-    private static let searchDedupeSameTextMaxXDelta: Double = 0.10
-    private static let searchDedupeDifferentTextMaxXDelta: Double = 0.01
-    private static let searchDedupeScrollShiftMinWidthRatio: Double = 0.99
-    private static let searchDedupeScrollShiftMinHeightRatio: Double = 0.8
-    private static let searchDedupeSameTextMinWidthRatio: Double = 0.92
-    private static let searchDedupeSameTextMinHeightRatio: Double = 0.8
+    private static let searchDedupeDifferentPositionMinAxisDelta: Double = 0.25
     private static let searchAllRawBatchSize = 150
-    private static let currentFrameDocSegmentSQL = """
-        (
-            SELECT frameId, MAX(docid) AS docid
-            FROM doc_segment
-            WHERE frameId IS NOT NULL
-            GROUP BY frameId
-        )
-        """
+    private static let queryTokenizer = QueryTokenizer()
 
     // MARK: - Connections
 
     private let retraceConnection: DatabaseConnection
+    private let retraceReadConnectionPool: SQLiteReadConnectionPool
     private let retraceConfig: DatabaseConfig
 
     private var rewindConnection: DatabaseConnection?
+    private var rewindSearchConnectionPool: SQLiteReadConnectionPool?
     private var rewindConfig: DatabaseConfig?
     private var cutoffDate: Date?
 
@@ -80,11 +72,13 @@ public actor DataAdapter {
 
     public init(
         retraceConnection: DatabaseConnection,
+        retraceReadConnectionPool: SQLiteReadConnectionPool,
         retraceConfig: DatabaseConfig,
         retraceImageExtractor: ImageExtractor,
         database: DatabaseManager
     ) {
         self.retraceConnection = retraceConnection
+        self.retraceReadConnectionPool = retraceReadConnectionPool
         self.retraceConfig = retraceConfig
         self.retraceImageExtractor = retraceImageExtractor
         self.database = database
@@ -95,12 +89,15 @@ public actor DataAdapter {
         connection: DatabaseConnection,
         config: DatabaseConfig,
         imageExtractor: ImageExtractor,
-        cutoffDate: Date
+        cutoffDate: Date,
+        searchConnectionPool: SQLiteReadConnectionPool? = nil
     ) {
         self.rewindConnection = connection
+        self.rewindSearchConnectionPool = searchConnectionPool
         self.rewindConfig = config
         self.rewindImageExtractor = imageExtractor
         self.cutoffDate = cutoffDate
+        updateSegmentCacheLedger()
         Log.info("[DataAdapter] Rewind source configured with cutoff \(cutoffDate)", category: .app)
     }
 
@@ -118,15 +115,18 @@ public actor DataAdapter {
     }
 
     /// Disconnect Rewind data source (clears connection without deleting data)
-    public func disconnectRewind() {
+    public func disconnectRewind() async {
         guard rewindConnection != nil else {
             Log.info("[DataAdapter] No Rewind source to disconnect", category: .app)
             return
         }
+        await rewindSearchConnectionPool?.close()
         self.rewindConnection = nil
+        self.rewindSearchConnectionPool = nil
         self.rewindConfig = nil
         self.rewindImageExtractor = nil
         self.cutoffDate = nil
+        updateSegmentCacheLedger()
         Log.info("[DataAdapter] Rewind source disconnected", category: .app)
     }
 
@@ -138,7 +138,7 @@ public actor DataAdapter {
             .purgeFrameExtractionCaches(reason: reason)
     }
 
-    private func decodeStoredPoint(_ rawValue: String?) -> (x: Double, y: Double)? {
+    private static func decodeStoredPoint(_ rawValue: String?) -> (x: Double, y: Double)? {
         guard let rawValue else {
             return nil
         }
@@ -170,6 +170,10 @@ public actor DataAdapter {
     public func shutdown() async {
         isInitialized = false
         cachedHiddenTagId = nil
+        await rewindSearchConnectionPool?.close()
+        rewindSearchConnectionPool = nil
+        segmentCache.removeAll()
+        updateSegmentCacheLedger()
         Log.info("[DataAdapter] Shutdown complete", category: .app)
     }
 
@@ -180,6 +184,35 @@ public actor DataAdapter {
             return retraceConfig
         }
         return retraceConfig.withMinimumDate(cutoffDate)
+    }
+
+    private var hasRewindReadSource: Bool {
+        rewindConnection != nil && rewindConfig != nil
+    }
+
+    private func withNativeRead<T>(
+        operation: String,
+        _ body: @escaping @Sendable (DatabaseConnection, DatabaseConfig) throws -> T
+    ) async throws -> T {
+        let config = effectiveRetraceConfig
+        return try await retraceReadConnectionPool.withConnection(operation: operation) { connection in
+            try body(connection, config)
+        }
+    }
+
+    private func withRewindRead<T>(
+        operation: String,
+        _ body: @escaping @Sendable (DatabaseConnection, DatabaseConfig) throws -> T
+    ) async throws -> T {
+        guard let rewindConnection, let rewindConfig else {
+            throw DataAdapterError.sourceNotAvailable(.rewind)
+        }
+        if let rewindSearchConnectionPool {
+            return try await rewindSearchConnectionPool.withConnection(operation: operation) { connection in
+                try body(connection, rewindConfig)
+            }
+        }
+        return try body(rewindConnection, rewindConfig)
     }
 
     private func connectionForTimestamp(_ timestamp: Date) -> (DatabaseConnection, DatabaseConfig) {
@@ -269,6 +302,31 @@ public actor DataAdapter {
         return ("(" + clauses.joined(separator: " AND ") + ")", bindValues)
     }
 
+    private static func buildSegmentOverlapBoundaryClause(
+        config: DatabaseConfig,
+        startColumnName: String,
+        endColumnName: String
+    ) -> (clause: String?, bindValues: [Date]) {
+        var clauses: [String] = []
+        var bindValues: [Date] = []
+
+        if let minimumDate = config.minimumDate {
+            clauses.append("\(endColumnName) >= ?")
+            bindValues.append(minimumDate)
+        }
+
+        if let cutoffDate = config.cutoffDate {
+            clauses.append("\(startColumnName) < ?")
+            bindValues.append(cutoffDate)
+        }
+
+        guard !clauses.isEmpty else {
+            return (nil, [])
+        }
+
+        return ("(" + clauses.joined(separator: " AND ") + ")", bindValues)
+    }
+
     private func hasDateRangeIntersectingRewind(_ ranges: [DateRangeCriterion]) -> Bool {
         guard let cutoffDate else { return true }
         guard !ranges.isEmpty else { return true }
@@ -287,8 +345,6 @@ public actor DataAdapter {
             throw DataAdapterError.notInitialized
         }
 
-        let retraceConfig = effectiveRetraceConfig
-
         // Use filtered query when filters are provided (always applies hidden filter by default)
         if let filters = filters {
             return try await getFramesInRangeWithFilters(from: startDate, to: endDate, limit: limit, filters: filters)
@@ -298,9 +354,18 @@ public actor DataAdapter {
         var allFrames: [FrameWithVideoInfo] = []
 
         // Query Rewind if timestamp is before cutoff
-        if let cutoff = cutoffDate, let rewind = rewindConnection, let config = rewindConfig, startDate < cutoff {
+        if let cutoff = cutoffDate, startDate < cutoff, hasRewindReadSource {
             let effectiveEnd = min(endDate, cutoff)
-            let frames = try queryFramesWithVideoInfo(from: startDate, to: effectiveEnd, limit: limit, connection: rewind, config: config, filters: nil)
+            let frames = try await withRewindRead(operation: "data_adapter.frames.range.rewind") { connection, config in
+                try Self.queryFramesWithVideoInfo(
+                    from: startDate,
+                    to: effectiveEnd,
+                    limit: limit,
+                    connection: connection,
+                    config: config,
+                    filters: nil
+                )
+            }
             allFrames.append(contentsOf: frames)
         }
 
@@ -310,7 +375,17 @@ public actor DataAdapter {
             retraceStart = max(startDate, cutoff)
         }
         if retraceStart < endDate {
-            let frames = try queryFramesWithVideoInfo(from: retraceStart, to: endDate, limit: limit, connection: retraceConnection, config: retraceConfig, filters: nil)
+            let queryStart = retraceStart
+            let frames = try await withNativeRead(operation: "data_adapter.frames.range.native") { connection, config in
+                try Self.queryFramesWithVideoInfo(
+                    from: queryStart,
+                    to: endDate,
+                    limit: limit,
+                    connection: connection,
+                    config: config,
+                    filters: nil
+                )
+            }
             allFrames.append(contentsOf: frames)
         }
 
@@ -324,7 +399,7 @@ public actor DataAdapter {
     private func getFramesInRangeWithFilters(from startDate: Date, to endDate: Date, limit: Int, filters: FilterCriteria) async throws -> [FrameWithVideoInfo] {
         var allFrames: [FrameWithVideoInfo] = []
         var remaining = limit
-        let retraceConfig = effectiveRetraceConfig
+        let hiddenTagId = cachedHiddenTagId
 
         // Check if we should exclude sources based on source filter
         let excludeRetrace = filters.selectedSources?.contains(.rewind) == true &&
@@ -340,60 +415,68 @@ public actor DataAdapter {
             return startDate < cutoff
         }()
 
-        func queryRetraceIfNeeded() throws {
+        func queryRetraceIfNeeded() async throws {
             guard remaining > 0, !excludeRetrace else { return }
             var retraceStart = startDate
             if let cutoff = cutoffDate {
                 retraceStart = max(startDate, cutoff)
             }
             guard retraceStart < endDate else { return }
+            let queryStart = retraceStart
+            let requestedLimit = remaining
 
-            let retraceFrames = try queryFramesInRangeWithFiltersOptimized(
-                from: retraceStart,
-                to: endDate,
-                limit: remaining,
-                connection: retraceConnection,
-                config: retraceConfig,
-                filters: filters,
-                isRewindDatabase: false
-            )
+            let retraceFrames = try await withNativeRead(operation: "data_adapter.frames.range.filtered.native") { connection, config in
+                try Self.queryFramesInRangeWithFiltersOptimized(
+                    from: queryStart,
+                    to: endDate,
+                    limit: requestedLimit,
+                    connection: connection,
+                    config: config,
+                    filters: filters,
+                    hiddenTagId: hiddenTagId,
+                    isRewindDatabase: false
+                )
+            }
             allFrames.append(contentsOf: retraceFrames)
             remaining -= retraceFrames.count
         }
 
-        func queryRewindIfNeeded() throws {
+        func queryRewindIfNeeded() async throws {
             guard remaining > 0,
                   !excludeRewind,
                   !hasRetraceOnlyFilters,
                   let cutoff = cutoffDate,
-                  let rewind = rewindConnection,
-                  let config = rewindConfig,
+                  hasRewindReadSource,
                   startDate < cutoff else {
                 return
             }
 
             let effectiveEnd = min(endDate, cutoff)
             guard startDate < effectiveEnd else { return }
+            let requestedLimit = remaining
 
-            let rewindFrames = try queryFramesInRangeWithFiltersOptimized(
-                from: startDate,
-                to: effectiveEnd,
-                limit: remaining,
-                connection: rewind,
-                config: config,
-                filters: filters,
-                isRewindDatabase: true
-            )
+            let rewindFrames = try await withRewindRead(operation: "data_adapter.frames.range.filtered.rewind") { connection, config in
+                try Self.queryFramesInRangeWithFiltersOptimized(
+                    from: startDate,
+                    to: effectiveEnd,
+                    limit: requestedLimit,
+                    connection: connection,
+                    config: config,
+                    filters: filters,
+                    hiddenTagId: hiddenTagId,
+                    isRewindDatabase: true
+                )
+            }
             allFrames.append(contentsOf: rewindFrames)
             remaining -= rewindFrames.count
         }
 
         if shouldPreferRewindFirst {
-            try queryRewindIfNeeded()
-            try queryRetraceIfNeeded()
+            try await queryRewindIfNeeded()
+            try await queryRetraceIfNeeded()
         } else {
-            try queryRetraceIfNeeded()
-            try queryRewindIfNeeded()
+            try await queryRetraceIfNeeded()
+            try await queryRewindIfNeeded()
         }
 
         // Sort by timestamp ascending (oldest first)
@@ -413,8 +496,6 @@ public actor DataAdapter {
             throw DataAdapterError.notInitialized
         }
 
-        let retraceConfig = effectiveRetraceConfig
-
         // Use filtered query when filters are provided (always applies hidden filter by default)
         if let filters = filters {
             return try await getMostRecentFramesWithFilters(limit: limit, filters: filters)
@@ -424,12 +505,26 @@ public actor DataAdapter {
         var allFrames: [FrameWithVideoInfo] = []
 
         // Query Retrace
-        let retraceFrames = try queryMostRecentFramesWithVideoInfo(limit: limit, connection: retraceConnection, config: retraceConfig, filters: nil)
+        let retraceFrames = try await withNativeRead(operation: "data_adapter.frames.most_recent.native") { connection, config in
+            try Self.queryMostRecentFramesWithVideoInfo(
+                limit: limit,
+                connection: connection,
+                config: config,
+                filters: nil
+            )
+        }
         allFrames.append(contentsOf: retraceFrames)
 
         // Query Rewind
-        if let rewind = rewindConnection, let config = rewindConfig {
-            let rewindFrames = try queryMostRecentFramesWithVideoInfo(limit: limit, connection: rewind, config: config, filters: nil)
+        if hasRewindReadSource {
+            let rewindFrames = try await withRewindRead(operation: "data_adapter.frames.most_recent.rewind") { connection, config in
+                try Self.queryMostRecentFramesWithVideoInfo(
+                    limit: limit,
+                    connection: connection,
+                    config: config,
+                    filters: nil
+                )
+            }
             allFrames.append(contentsOf: rewindFrames)
         }
 
@@ -442,7 +537,7 @@ public actor DataAdapter {
     private func getMostRecentFramesWithFilters(limit: Int, filters: FilterCriteria) async throws -> [FrameWithVideoInfo] {
         var allFrames: [FrameWithVideoInfo] = []
         var remaining = limit
-        let retraceConfig = effectiveRetraceConfig
+        let hiddenTagId = cachedHiddenTagId
 
         // Check if we should exclude sources based on source filter
         let excludeRetrace = filters.selectedSources?.contains(.rewind) == true &&
@@ -452,13 +547,16 @@ public actor DataAdapter {
 
         // Step 1: Try Retrace first (unless excluded)
         if !excludeRetrace {
-            let retraceFrames = try queryMostRecentFramesWithFiltersOptimized(
-                limit: limit,
-                connection: retraceConnection,
-                config: retraceConfig,
-                filters: filters,
-                isRewindDatabase: false
-            )
+            let retraceFrames = try await withNativeRead(operation: "data_adapter.frames.most_recent.filtered.native") { connection, config in
+                try Self.queryMostRecentFramesWithFiltersOptimized(
+                    limit: limit,
+                    connection: connection,
+                    config: config,
+                    filters: filters,
+                    hiddenTagId: hiddenTagId,
+                    isRewindDatabase: false
+                )
+            }
             allFrames.append(contentsOf: retraceFrames)
             remaining = limit - retraceFrames.count
             Log.debug("[Filter] Got \(retraceFrames.count) frames from Retrace, need \(remaining) more", category: .database)
@@ -470,14 +568,18 @@ public actor DataAdapter {
         let hasRetraceOnlyFilters = requiresRetraceOnly(filters)
         let effectiveDateRanges = filters.effectiveDateRanges
         let hasRewindDateOverlap = hasDateRangeIntersectingRewind(effectiveDateRanges)
-        if remaining > 0, !excludeRewind, !hasRetraceOnlyFilters, hasRewindDateOverlap, let rewind = rewindConnection, let config = rewindConfig {
-            let rewindFrames = try queryMostRecentFramesWithFiltersOptimized(
-                limit: remaining,
-                connection: rewind,
-                config: config,
-                filters: filters,
-                isRewindDatabase: true
-            )
+        if remaining > 0, !excludeRewind, !hasRetraceOnlyFilters, hasRewindDateOverlap, hasRewindReadSource {
+            let requestedLimit = remaining
+            let rewindFrames = try await withRewindRead(operation: "data_adapter.frames.most_recent.filtered.rewind") { connection, config in
+                try Self.queryMostRecentFramesWithFiltersOptimized(
+                    limit: requestedLimit,
+                    connection: connection,
+                    config: config,
+                    filters: filters,
+                    hiddenTagId: hiddenTagId,
+                    isRewindDatabase: true
+                )
+            }
             allFrames.append(contentsOf: rewindFrames)
             Log.debug("[Filter] Got \(rewindFrames.count) frames from Rewind", category: .database)
         } else if !hasRewindDateOverlap, let cutoffDate {
@@ -501,8 +603,6 @@ public actor DataAdapter {
             throw DataAdapterError.notInitialized
         }
 
-        let retraceConfig = effectiveRetraceConfig
-
         // Use filtered query when filters are provided (always applies hidden filter by default)
         if let filters = filters {
             return try await getFramesBeforeWithFilters(timestamp: timestamp, limit: limit, filters: filters)
@@ -512,14 +612,30 @@ public actor DataAdapter {
         var allFrames: [FrameWithVideoInfo] = []
 
         // Query Rewind
-        if let rewind = rewindConnection, let config = rewindConfig {
+        if hasRewindReadSource {
             let effectiveTimestamp = cutoffDate != nil ? min(timestamp, cutoffDate!) : timestamp
-            let frames = try queryFramesWithVideoInfoBefore(timestamp: effectiveTimestamp, limit: limit, connection: rewind, config: config, filters: nil)
+            let frames = try await withRewindRead(operation: "data_adapter.frames.before.rewind") { connection, config in
+                try Self.queryFramesWithVideoInfoBefore(
+                    timestamp: effectiveTimestamp,
+                    limit: limit,
+                    connection: connection,
+                    config: config,
+                    filters: nil
+                )
+            }
             allFrames.append(contentsOf: frames)
         }
 
         // Query Retrace
-        let retraceFrames = try queryFramesWithVideoInfoBefore(timestamp: timestamp, limit: limit, connection: retraceConnection, config: retraceConfig, filters: nil)
+        let retraceFrames = try await withNativeRead(operation: "data_adapter.frames.before.native") { connection, config in
+            try Self.queryFramesWithVideoInfoBefore(
+                timestamp: timestamp,
+                limit: limit,
+                connection: connection,
+                config: config,
+                filters: nil
+            )
+        }
         allFrames.append(contentsOf: retraceFrames)
 
         // Sort by timestamp descending (newest first) and take top N
@@ -532,7 +648,7 @@ public actor DataAdapter {
     private func getFramesBeforeWithFilters(timestamp: Date, limit: Int, filters: FilterCriteria) async throws -> [FrameWithVideoInfo] {
         var allFrames: [FrameWithVideoInfo] = []
         var remaining = limit
-        let retraceConfig = effectiveRetraceConfig
+        let hiddenTagId = cachedHiddenTagId
 
         // Check if we should exclude sources based on source filter
         let excludeRetrace = filters.selectedSources?.contains(.rewind) == true &&
@@ -547,47 +663,54 @@ public actor DataAdapter {
             return timestamp < cutoff
         }()
 
-        func queryRetraceIfNeeded() throws {
+        func queryRetraceIfNeeded() async throws {
             guard remaining > 0, !excludeRetrace else { return }
-            let retraceFrames = try queryFramesBeforeWithFiltersOptimized(
-                timestamp: timestamp,
-                limit: remaining,
-                connection: retraceConnection,
-                config: retraceConfig,
-                filters: filters,
-                isRewindDatabase: false
-            )
+            let requestedLimit = remaining
+            let retraceFrames = try await withNativeRead(operation: "data_adapter.frames.before.filtered.native") { connection, config in
+                try Self.queryFramesBeforeWithFiltersOptimized(
+                    timestamp: timestamp,
+                    limit: requestedLimit,
+                    connection: connection,
+                    config: config,
+                    filters: filters,
+                    hiddenTagId: hiddenTagId,
+                    isRewindDatabase: false
+                )
+            }
             allFrames.append(contentsOf: retraceFrames)
             remaining -= retraceFrames.count
         }
 
-        func queryRewindIfNeeded() throws {
+        func queryRewindIfNeeded() async throws {
             guard remaining > 0,
                   !excludeRewind,
                   !hasRetraceOnlyFilters,
-                  let rewind = rewindConnection,
-                  let config = rewindConfig else {
+                  hasRewindReadSource else {
                 return
             }
             let effectiveTimestamp = cutoffDate != nil ? min(timestamp, cutoffDate!) : timestamp
-            let rewindFrames = try queryFramesBeforeWithFiltersOptimized(
-                timestamp: effectiveTimestamp,
-                limit: remaining,
-                connection: rewind,
-                config: config,
-                filters: filters,
-                isRewindDatabase: true
-            )
+            let requestedLimit = remaining
+            let rewindFrames = try await withRewindRead(operation: "data_adapter.frames.before.filtered.rewind") { connection, config in
+                try Self.queryFramesBeforeWithFiltersOptimized(
+                    timestamp: effectiveTimestamp,
+                    limit: requestedLimit,
+                    connection: connection,
+                    config: config,
+                    filters: filters,
+                    hiddenTagId: hiddenTagId,
+                    isRewindDatabase: true
+                )
+            }
             allFrames.append(contentsOf: rewindFrames)
             remaining -= rewindFrames.count
         }
 
         if shouldPreferRewindFirst {
-            try queryRewindIfNeeded()
-            try queryRetraceIfNeeded()
+            try await queryRewindIfNeeded()
+            try await queryRetraceIfNeeded()
         } else {
-            try queryRetraceIfNeeded()
-            try queryRewindIfNeeded()
+            try await queryRetraceIfNeeded()
+            try await queryRewindIfNeeded()
         }
 
         // Sort by timestamp descending (newest first)
@@ -607,8 +730,6 @@ public actor DataAdapter {
             throw DataAdapterError.notInitialized
         }
 
-        let retraceConfig = effectiveRetraceConfig
-
         // Use filtered query when filters are provided (always applies hidden filter by default)
         if let filters = filters {
             return try await getFramesAfterWithFilters(timestamp: timestamp, limit: limit, filters: filters)
@@ -618,13 +739,29 @@ public actor DataAdapter {
         var allFrames: [FrameWithVideoInfo] = []
 
         // Query Rewind (respecting cutoff)
-        if let cutoff = cutoffDate, let rewind = rewindConnection, let config = rewindConfig, timestamp < cutoff {
-            let frames = try queryFramesWithVideoInfoAfter(timestamp: timestamp, limit: limit, connection: rewind, config: config, filters: nil)
+        if let cutoff = cutoffDate, timestamp < cutoff, hasRewindReadSource {
+            let frames = try await withRewindRead(operation: "data_adapter.frames.after.rewind") { connection, config in
+                try Self.queryFramesWithVideoInfoAfter(
+                    timestamp: timestamp,
+                    limit: limit,
+                    connection: connection,
+                    config: config,
+                    filters: nil
+                )
+            }
             allFrames.append(contentsOf: frames)
         }
 
         // Query Retrace
-        let retraceFrames = try queryFramesWithVideoInfoAfter(timestamp: timestamp, limit: limit, connection: retraceConnection, config: retraceConfig, filters: nil)
+        let retraceFrames = try await withNativeRead(operation: "data_adapter.frames.after.native") { connection, config in
+            try Self.queryFramesWithVideoInfoAfter(
+                timestamp: timestamp,
+                limit: limit,
+                connection: connection,
+                config: config,
+                filters: nil
+            )
+        }
         allFrames.append(contentsOf: retraceFrames)
 
         // Sort by timestamp ascending (oldest first) and take top N
@@ -637,7 +774,7 @@ public actor DataAdapter {
     private func getFramesAfterWithFilters(timestamp: Date, limit: Int, filters: FilterCriteria) async throws -> [FrameWithVideoInfo] {
         var allFrames: [FrameWithVideoInfo] = []
         var remaining = limit
-        let retraceConfig = effectiveRetraceConfig
+        let hiddenTagId = cachedHiddenTagId
 
         // Check if we should exclude sources based on source filter
         let excludeRetrace = filters.selectedSources?.contains(.rewind) == true &&
@@ -652,49 +789,56 @@ public actor DataAdapter {
             return timestamp < cutoff
         }()
 
-        func queryRetraceIfNeeded() throws {
+        func queryRetraceIfNeeded() async throws {
             guard remaining > 0, !excludeRetrace else { return }
-            let retraceFrames = try queryFramesAfterWithFiltersOptimized(
-                timestamp: timestamp,
-                limit: remaining,
-                connection: retraceConnection,
-                config: retraceConfig,
-                filters: filters,
-                isRewindDatabase: false
-            )
+            let requestedLimit = remaining
+            let retraceFrames = try await withNativeRead(operation: "data_adapter.frames.after.filtered.native") { connection, config in
+                try Self.queryFramesAfterWithFiltersOptimized(
+                    timestamp: timestamp,
+                    limit: requestedLimit,
+                    connection: connection,
+                    config: config,
+                    filters: filters,
+                    hiddenTagId: hiddenTagId,
+                    isRewindDatabase: false
+                )
+            }
             allFrames.append(contentsOf: retraceFrames)
             remaining -= retraceFrames.count
         }
 
-        func queryRewindIfNeeded() throws {
+        func queryRewindIfNeeded() async throws {
             guard remaining > 0,
                   !excludeRewind,
                   !hasRetraceOnlyFilters,
                   let cutoff = cutoffDate,
-                  let rewind = rewindConnection,
-                  let config = rewindConfig,
+                  hasRewindReadSource,
                   timestamp < cutoff else {
                 return
             }
 
-            let rewindFrames = try queryFramesAfterWithFiltersOptimized(
-                timestamp: timestamp,
-                limit: remaining,
-                connection: rewind,
-                config: config,
-                filters: filters,
-                isRewindDatabase: true
-            )
+            let requestedLimit = remaining
+            let rewindFrames = try await withRewindRead(operation: "data_adapter.frames.after.filtered.rewind") { connection, config in
+                try Self.queryFramesAfterWithFiltersOptimized(
+                    timestamp: timestamp,
+                    limit: requestedLimit,
+                    connection: connection,
+                    config: config,
+                    filters: filters,
+                    hiddenTagId: hiddenTagId,
+                    isRewindDatabase: true
+                )
+            }
             allFrames.append(contentsOf: rewindFrames)
             remaining -= rewindFrames.count
         }
 
         if shouldPreferRewindFirst {
-            try queryRewindIfNeeded()
-            try queryRetraceIfNeeded()
+            try await queryRewindIfNeeded()
+            try await queryRetraceIfNeeded()
         } else {
-            try queryRetraceIfNeeded()
-            try queryRewindIfNeeded()
+            try await queryRetraceIfNeeded()
+            try await queryRewindIfNeeded()
         }
 
         // Sort by timestamp ascending (oldest first)
@@ -714,16 +858,21 @@ public actor DataAdapter {
             throw DataAdapterError.notInitialized
         }
 
-        let retraceConfig = effectiveRetraceConfig
-
         // Try Retrace first (more likely for recent frames)
-        if let frame = try queryFrameWithVideoInfoByID(id: id, connection: retraceConnection, config: retraceConfig) {
+        if let frame = try await withNativeRead(
+            operation: "data_adapter.frame.by_id.native",
+            { connection, config in
+                try Self.queryFrameWithVideoInfoByID(id: id, connection: connection, config: config)
+            }
+        ) {
             return frame
         }
 
         // Try Rewind if available
-        if let rewind = rewindConnection, let config = rewindConfig {
-            return try queryFrameWithVideoInfoByID(id: id, connection: rewind, config: config)
+        if hasRewindReadSource {
+            return try await withRewindRead(operation: "data_adapter.frame.by_id.rewind") { connection, config in
+                try Self.queryFrameWithVideoInfoByID(id: id, connection: connection, config: config)
+            }
         }
 
         return nil
@@ -858,8 +1007,6 @@ public actor DataAdapter {
             throw DataAdapterError.notInitialized
         }
 
-        let retraceConfig = effectiveRetraceConfig
-
         let cacheKey = SegmentCacheKey(startDate: startDate, endDate: endDate)
 
         // Check cache
@@ -868,14 +1015,22 @@ public actor DataAdapter {
                 return cached.segments
             }
             segmentCache.removeValue(forKey: cacheKey)
+            updateSegmentCacheLedger()
         }
 
         var allSegments: [Segment] = []
 
         // Query Rewind
-        if let cutoff = cutoffDate, let rewind = rewindConnection, let config = rewindConfig, startDate < cutoff {
+        if let cutoff = cutoffDate, startDate < cutoff, hasRewindReadSource {
             let effectiveEnd = min(endDate, cutoff)
-            let segments = try querySegments(from: startDate, to: effectiveEnd, connection: rewind, config: config)
+            let segments = try await withRewindRead(operation: "data_adapter.segments.rewind") { connection, config in
+                try Self.querySegments(
+                    from: startDate,
+                    to: effectiveEnd,
+                    connection: connection,
+                    config: config
+                )
+            }
             allSegments.append(contentsOf: segments)
         }
 
@@ -885,7 +1040,15 @@ public actor DataAdapter {
             retraceStart = max(startDate, cutoff)
         }
         if retraceStart < endDate {
-            let segments = try querySegments(from: retraceStart, to: endDate, connection: retraceConnection, config: retraceConfig)
+            let queryStart = retraceStart
+            let segments = try await withNativeRead(operation: "data_adapter.segments.native") { connection, config in
+                try Self.querySegments(
+                    from: queryStart,
+                    to: endDate,
+                    connection: connection,
+                    config: config
+                )
+            }
             allSegments.append(contentsOf: segments)
         }
 
@@ -894,12 +1057,50 @@ public actor DataAdapter {
 
         // Cache
         segmentCache[cacheKey] = SegmentCacheEntry(segments: allSegments, timestamp: Date())
+        updateSegmentCacheLedger()
         return allSegments
     }
 
     /// Invalidate the segment cache
     public func invalidateSessionCache() {
         segmentCache.removeAll()
+        updateSegmentCacheLedger()
+    }
+
+    private func updateSegmentCacheLedger() {
+        MemoryLedger.set(
+            tag: Self.memoryLedgerSegmentCacheTag,
+            bytes: Self.estimatedSegmentCacheBytes(segmentCache),
+            count: segmentCache.count,
+            unit: "windows",
+            function: "app.dataAdapter",
+            kind: "segment-cache",
+            note: "estimated"
+        )
+    }
+
+    private static func estimatedSegmentCacheBytes(_ cache: [SegmentCacheKey: SegmentCacheEntry]) -> Int64 {
+        cache.reduce(into: Int64(0)) { total, element in
+            total += Int64(MemoryLayout<SegmentCacheKey>.stride + MemoryLayout<SegmentCacheEntry>.stride)
+            total += estimatedSegmentArrayBytes(element.value.segments)
+        }
+    }
+
+    private static func estimatedSegmentArrayBytes(_ segments: [Segment]) -> Int64 {
+        segments.reduce(into: Int64(MemoryLayout<Segment>.stride * segments.count)) { total, segment in
+            total += estimatedStringBytes(segment.bundleID)
+            total += estimatedOptionalStringBytes(segment.windowName)
+            total += estimatedOptionalStringBytes(segment.browserUrl)
+        }
+    }
+
+    private static func estimatedOptionalStringBytes(_ string: String?) -> Int64 {
+        guard let string else { return 0 }
+        return estimatedStringBytes(string)
+    }
+
+    private static func estimatedStringBytes(_ string: String) -> Int64 {
+        Int64(MemoryLayout<String>.stride + string.utf8.count)
     }
 
     // MARK: - OCR Nodes
@@ -932,29 +1133,44 @@ public actor DataAdapter {
 
     // MARK: - App Discovery
 
-    /// Get all distinct apps from all data sources
-    /// Get distinct app bundle IDs from the database
-    /// Caller is responsible for resolving names (use AppNameResolver.shared.resolveAll)
-    public func getDistinctAppBundleIDs() async throws -> [String] {
+    /// Get distinct app bundle IDs from the configured data sources.
+    /// When `source` is `nil`, returns the union across all connected sources.
+    /// Caller is responsible for resolving names (use AppNameResolver.shared.resolveAll).
+    public func getDistinctAppBundleIDs(source: FrameSource? = nil) async throws -> [String] {
         guard isInitialized else {
             throw DataAdapterError.notInitialized
         }
 
-        let startTime = CFAbsoluteTimeGetCurrent()
-        var bundleIDs = Set<String>()
+        switch source {
+        case .native:
+            return try await withNativeRead(operation: "data_adapter.distinct_apps.native") { connection, config in
+                try Self.queryDistinctApps(connection: connection, config: config)
+            }
+        case .rewind:
+            guard hasRewindReadSource else {
+                return []
+            }
+            return try await withRewindRead(operation: "data_adapter.distinct_apps.rewind") { connection, config in
+                try Self.queryDistinctApps(connection: connection, config: config)
+            }
+        case nil:
+            var bundleIDs = Set<String>()
 
-        if let rewind = rewindConnection, let config = rewindConfig {
-            let queryStart = CFAbsoluteTimeGetCurrent()
-            bundleIDs.formUnion(try queryDistinctApps(connection: rewind, config: config))
-            Log.debug("[DataAdapter] Rewind query took \(Int((CFAbsoluteTimeGetCurrent() - queryStart) * 1000))ms, found \(bundleIDs.count) bundle IDs", category: .database)
+            if hasRewindReadSource {
+                let rewindBundleIDs = try await withRewindRead(operation: "data_adapter.distinct_apps.rewind") { connection, config in
+                    try Self.queryDistinctApps(connection: connection, config: config)
+                }
+                bundleIDs.formUnion(rewindBundleIDs)
+            }
+
+            let retraceBundleIDs = try await withNativeRead(operation: "data_adapter.distinct_apps.native") { connection, config in
+                try Self.queryDistinctApps(connection: connection, config: config)
+            }
+            bundleIDs.formUnion(retraceBundleIDs)
+            return Array(bundleIDs).sorted()
+        case .screenMemory, .timeScroll, .pensieve, .unknown:
+            return []
         }
-
-        let queryStart = CFAbsoluteTimeGetCurrent()
-        bundleIDs.formUnion(try queryDistinctApps(connection: retraceConnection, config: effectiveRetraceConfig))
-        Log.debug("[DataAdapter] Retrace query took \(Int((CFAbsoluteTimeGetCurrent() - queryStart) * 1000))ms, found \(bundleIDs.count) bundle IDs", category: .database)
-
-        Log.debug("[DataAdapter] getDistinctAppBundleIDs total: \(Int((CFAbsoluteTimeGetCurrent() - startTime) * 1000))ms", category: .database)
-        return Array(bundleIDs).sorted()
     }
 
     // MARK: - URL Bounding Box Detection
@@ -980,18 +1196,12 @@ public actor DataAdapter {
             throw DataAdapterError.notInitialized
         }
 
-        Log.info(
-            "[DataAdapter] Search started: query='\(query.text)', mode=\(query.mode), limit=\(query.limit), appFilter=\(query.filters.appBundleIDs ?? []), startDate=\(String(describing: query.filters.startDate)), endDate=\(String(describing: query.filters.endDate)), dateRanges=\(query.filters.effectiveDateRanges)",
-            category: .app
-        )
-
         let startTime = Date()
         let hiddenTagId = cachedHiddenTagId
         let retraceOnlySearchFilters = requiresRetraceOnly(query.filters)
-        let retraceConfig = effectiveRetraceConfig
         let retraceCursor = query.cursor?.native
         let rewindCursor = query.cursor?.rewind
-        let hasRewindSource = !retraceOnlySearchFilters && rewindConnection != nil && rewindConfig != nil
+        let hasRewindSource = !retraceOnlySearchFilters && hasRewindReadSource
         let isOldestFirstAll = query.mode == .all && query.sortOrder == .oldestFirst
 
         // Cursor-aware source skipping:
@@ -1008,68 +1218,77 @@ public actor DataAdapter {
             rewindCursor == nil &&
             hasRewindSource
 
-        let emptyResults = SearchResults(query: query, results: [], totalCount: 0, searchTimeMs: 0)
+        let emptyResults = SearchResults(query: query, results: [], searchTimeMs: 0)
 
-        var retraceTask: Task<SearchResults, Error>?
-        var retraceStart: Date?
-        if shouldSkipRetrace {
-            Log.debug("[DataAdapter] Retrace exhausted for this pagination flow; skipping Retrace query", category: .app)
-        } else {
-            retraceStart = Date()
-            retraceTask = Task.detached(priority: .userInitiated) { [query, retraceConnection, retraceConfig, hiddenTagId, retraceCursor] in
-                try Self.searchConnection(
-                    query: query,
-                    connection: retraceConnection,
-                    config: retraceConfig,
-                    source: .native,
-                    sourceCursor: retraceCursor,
-                    hiddenTagId: hiddenTagId
-                )
+        let shouldSearchRetrace = !shouldSkipRetrace
+        let shouldSearchRewind = hasRewindSource && !shouldSkipRewind
+
+        enum SourceSearchBranch: Sendable {
+            case retrace
+            case rewind
+        }
+
+        struct SourceSearchOutcome: Sendable {
+            let source: SourceSearchBranch
+            let results: SearchResults
+        }
+
+        func shouldTreatSourceSearchFailureAsEmpty(_ error: Error, source: SourceSearchBranch) -> Bool {
+            switch error {
+            case is CancellationError:
+                Log.debug("[DataAdapter] \(source) search task cancelled", category: .app)
+                return true
+            case DataAdapterError.sourceNotAvailable:
+                Log.info("[DataAdapter] \(source) search source unavailable: \(error)", category: .app)
+                return true
+            default:
+                return false
             }
         }
 
-        var rewindTask: Task<SearchResults, Error>?
-        var rewindStart: Date?
-        if hasRewindSource {
-            if shouldSkipRewind {
-                Log.debug("[DataAdapter] Rewind exhausted for oldest-first pagination flow; skipping Rewind query", category: .app)
-            } else if let rewind = rewindConnection, let config = rewindConfig {
-                rewindStart = Date()
-                rewindTask = Task.detached(priority: .userInitiated) { [query, rewind, config, hiddenTagId, rewindCursor] in
+        func executeRetraceSearch() async throws -> SourceSearchOutcome {
+            do {
+                let results = try await withNativeRead(operation: "data_adapter.search.native") { connection, config in
                     try Self.searchConnection(
                         query: query,
-                        connection: rewind,
+                        connection: connection,
+                        config: config,
+                        source: .native,
+                        sourceCursor: retraceCursor,
+                        hiddenTagId: hiddenTagId
+                    )
+                }
+                return SourceSearchOutcome(source: .retrace, results: results)
+            } catch {
+                if shouldTreatSourceSearchFailureAsEmpty(error, source: .retrace) {
+                    return SourceSearchOutcome(source: .retrace, results: emptyResults)
+                }
+
+                Log.error("[DataAdapter] Retrace search failed", category: .app, error: error)
+                throw error
+            }
+        }
+
+        func executeRewindSearch() async throws -> SourceSearchOutcome {
+            do {
+                let results = try await withRewindRead(operation: "data_adapter.search.rewind") { connection, config in
+                    try Self.searchConnection(
+                        query: query,
+                        connection: connection,
                         config: config,
                         source: .rewind,
                         sourceCursor: rewindCursor,
                         hiddenTagId: hiddenTagId
                     )
                 }
-            }
-        } else if retraceOnlySearchFilters {
-            Log.debug("[DataAdapter] Rewind disabled by Retrace-only filters", category: .app)
-        }
-
-        func resolveSourceResult(
-            _ task: Task<SearchResults, Error>?,
-            sourceLabel: String,
-            startedAt: Date?
-        ) async -> SearchResults {
-            guard let task else { return emptyResults }
-
-            do {
-                let results = try await task.value
-                if let startedAt {
-                    let elapsed = Int(Date().timeIntervalSince(startedAt) * 1000)
-                    Log.info("[DataAdapter] \(sourceLabel) search completed in \(elapsed)ms, found \(results.results.count) results", category: .app)
-                }
-                return results
-            } catch is CancellationError {
-                Log.debug("[DataAdapter] \(sourceLabel) search task cancelled", category: .app)
-                return emptyResults
+                return SourceSearchOutcome(source: .rewind, results: results)
             } catch {
-                Log.warning("[DataAdapter] \(sourceLabel) search failed: \(error)", category: .app)
-                return emptyResults
+                if shouldTreatSourceSearchFailureAsEmpty(error, source: .rewind) {
+                    return SourceSearchOutcome(source: .rewind, results: emptyResults)
+                }
+
+                Log.error("[DataAdapter] Rewind search failed", category: .app, error: error)
+                throw error
             }
         }
 
@@ -1077,109 +1296,131 @@ public actor DataAdapter {
             Int(Date().timeIntervalSince(startTime) * 1000)
         }
 
-        if isOldestFirstAll {
-            // Oldest-first policy:
-            // 1) query both sources concurrently
-            // 2) prefer Rewind whenever it has rows
-            // 3) fallback to Retrace only when Rewind page is empty
-            let rewindResults = await resolveSourceResult(
-                rewindTask,
-                sourceLabel: "Rewind",
-                startedAt: rewindStart
-            )
+        return try await withThrowingTaskGroup(
+            of: SourceSearchOutcome.self,
+            returning: SearchResults.self
+        ) { group in
+            if shouldSearchRetrace {
+                group.addTask {
+                    try await executeRetraceSearch()
+                }
+            }
+            if shouldSearchRewind {
+                group.addTask {
+                    try await executeRewindSearch()
+                }
+            }
 
-            if !rewindResults.results.isEmpty {
-                retraceTask?.cancel()
+            var retraceResults = emptyResults
+            var rewindResults = emptyResults
+            var retraceResolved = !shouldSearchRetrace
+            var rewindResolved = !shouldSearchRewind
 
-                let pageResults = rewindResults.results
-                let nextCursor: SearchPageCursor? = {
-                    if let nextRewind = rewindResults.nextCursor?.rewind {
-                        return SearchPageCursor(native: retraceCursor, rewind: nextRewind)
-                    }
-                    // Rewind exhausted: keep cursor object so next page probes Retrace.
-                    return SearchPageCursor(native: retraceCursor, rewind: nil)
-                }()
+            func oldestFirstResult() -> SearchResults? {
+                guard rewindResolved else { return nil }
+
+                if !rewindResults.results.isEmpty {
+                    group.cancelAll()
+
+                    let pageResults = rewindResults.results
+                    let nextCursor: SearchPageCursor? = {
+                        if let nextRewind = rewindResults.nextCursor?.rewind {
+                            return SearchPageCursor(native: retraceCursor, rewind: nextRewind)
+                        }
+                        // Rewind exhausted: keep cursor object so next page probes Retrace.
+                        return SearchPageCursor(native: retraceCursor, rewind: nil)
+                    }()
+
+                    return SearchResults(
+                        query: query,
+                        results: pageResults,
+                        searchTimeMs: searchTimeMs(),
+                        nextCursor: nextCursor
+                    )
+                }
+
+                guard retraceResolved else { return nil }
+
+                let pageResults = retraceResults.results
+                let nextCursor = retraceResults.nextCursor?.native.map {
+                    SearchPageCursor(native: $0, rewind: nil)
+                }
 
                 return SearchResults(
                     query: query,
                     results: pageResults,
-                    totalCount: rewindResults.totalCount,
                     searchTimeMs: searchTimeMs(),
                     nextCursor: nextCursor
                 )
             }
 
-            let retraceResults = await resolveSourceResult(
-                retraceTask,
-                sourceLabel: "Retrace",
-                startedAt: retraceStart
-            )
+            func newestFirstResult() -> SearchResults? {
+                guard retraceResolved else { return nil }
 
-            let pageResults = retraceResults.results
-            let nextCursor = retraceResults.nextCursor?.native.map {
-                SearchPageCursor(native: $0, rewind: nil)
+                if !retraceResults.results.isEmpty {
+                    group.cancelAll()
+
+                    let pageResults = retraceResults.results
+                    let nextCursor: SearchPageCursor? = {
+                        if let nextNative = retraceResults.nextCursor?.native {
+                            return SearchPageCursor(native: nextNative, rewind: rewindCursor)
+                        }
+                        if hasRewindSource {
+                            // Retrace exhausted: switch to Rewind probe on next page.
+                            return SearchPageCursor(native: nil, rewind: rewindCursor)
+                        }
+                        return nil
+                    }()
+
+                    return SearchResults(
+                        query: query,
+                        results: pageResults,
+                        searchTimeMs: searchTimeMs(),
+                        nextCursor: nextCursor
+                    )
+                }
+
+                guard rewindResolved else { return nil }
+
+                let pageResults = rewindResults.results
+                let nextCursor = rewindResults.nextCursor?.rewind.map {
+                    SearchPageCursor(native: nil, rewind: $0)
+                }
+
+                return SearchResults(
+                    query: query,
+                    results: pageResults,
+                    searchTimeMs: searchTimeMs(),
+                    nextCursor: nextCursor
+                )
             }
 
-            return SearchResults(
-                query: query,
-                results: pageResults,
-                totalCount: retraceResults.totalCount,
-                searchTimeMs: searchTimeMs(),
-                nextCursor: nextCursor
-            )
-        }
-
-        // Newest-first policy:
-        // 1) query both sources concurrently
-        // 2) always use Retrace page when non-empty
-        // 3) fallback to Rewind only when Retrace page is empty
-        let retraceResults = await resolveSourceResult(
-            retraceTask,
-            sourceLabel: "Retrace",
-            startedAt: retraceStart
-        )
-
-        if !retraceResults.results.isEmpty {
-            rewindTask?.cancel()
-
-            let pageResults = retraceResults.results
-            let nextCursor: SearchPageCursor? = {
-                if let nextNative = retraceResults.nextCursor?.native {
-                    return SearchPageCursor(native: nextNative, rewind: rewindCursor)
+            while let outcome = try await group.next() {
+                switch outcome.source {
+                case .retrace:
+                    retraceResults = outcome.results
+                    retraceResolved = true
+                case .rewind:
+                    rewindResults = outcome.results
+                    rewindResolved = true
                 }
-                if hasRewindSource {
-                    // Retrace exhausted: switch to Rewind probe on next page.
-                    return SearchPageCursor(native: nil, rewind: rewindCursor)
+
+                if isOldestFirstAll, let result = oldestFirstResult() {
+                    return result
                 }
-                return nil
-            }()
+                if !isOldestFirstAll, let result = newestFirstResult() {
+                    return result
+                }
+            }
 
-            return SearchResults(
-                query: query,
-                results: pageResults,
-                totalCount: retraceResults.totalCount,
-                searchTimeMs: searchTimeMs(),
-                nextCursor: nextCursor
-            )
+            if isOldestFirstAll, let result = oldestFirstResult() {
+                return result
+            }
+            if let result = newestFirstResult() {
+                return result
+            }
+            return SearchResults(query: query, results: [], searchTimeMs: searchTimeMs())
         }
-
-        let rewindResults = await resolveSourceResult(
-            rewindTask,
-            sourceLabel: "Rewind",
-            startedAt: rewindStart
-        )
-        let pageResults = rewindResults.results
-        let nextCursor = rewindResults.nextCursor?.rewind.map {
-            SearchPageCursor(native: nil, rewind: $0)
-        }
-
-        return SearchResults(
-            query: query,
-            results: pageResults,
-            totalCount: rewindResults.totalCount,
-            searchTimeMs: searchTimeMs(),
-            nextCursor: nextCursor
-        )
     }
 
     // MARK: - Deletion
@@ -1229,7 +1470,10 @@ public actor DataAdapter {
             : (retraceConnection, retraceConfig)
 
         // Find frame by timestamp
-        let sql = "SELECT id FROM frame WHERE createdAt = ? LIMIT 1;"
+        let visibilityClause = frameSource == .rewind
+            ? ""
+            : " AND (rewritePurpose IS NULL OR rewritePurpose != 'deletion')"
+        let sql = "SELECT id FROM frame WHERE createdAt = ?\(visibilityClause) LIMIT 1;"
         guard let statement = try? connection.prepare(sql: sql) else {
             throw DataAdapterError.frameNotFound
         }
@@ -1270,7 +1514,84 @@ public actor DataAdapter {
 
     // MARK: - Private SQL Query Methods
 
-    private func queryFramesWithVideoInfo(
+    private struct FrameWithVideoProjection {
+        let encodedAtColumn: String
+        let processingStatusColumn: String
+        let redactionReasonColumn: String
+        let captureTriggerColumn: String
+        let mousePositionColumn: String
+        let scrollPositionColumn: String
+        let videoCurrentTimeColumn: String
+    }
+
+    private static func frameWithVideoProjection(
+        source: FrameSource,
+        tableAlias: String
+    ) -> FrameWithVideoProjection {
+        if source == .rewind {
+            return FrameWithVideoProjection(
+                encodedAtColumn: "NULL as encodedAt",
+                processingStatusColumn: "-1 as processingStatus",
+                redactionReasonColumn: "NULL as redactionReason",
+                captureTriggerColumn: "NULL as captureTrigger",
+                mousePositionColumn: "NULL",
+                scrollPositionColumn: "NULL",
+                videoCurrentTimeColumn: "NULL"
+            )
+        }
+
+        return FrameWithVideoProjection(
+            encodedAtColumn: "\(tableAlias).encodedAt",
+            processingStatusColumn: "\(tableAlias).processingStatus",
+            redactionReasonColumn: "\(tableAlias).redactionReason",
+            captureTriggerColumn: "\(tableAlias).capture_trigger",
+            mousePositionColumn: "\(tableAlias).mousePosition",
+            scrollPositionColumn: "\(tableAlias).scrollPosition",
+            videoCurrentTimeColumn: "\(tableAlias).videoCurrentTime"
+        )
+    }
+
+    private static func frameWithVideoSubqueryProjection(source: FrameSource) -> FrameWithVideoProjection {
+        if source == .rewind {
+            return FrameWithVideoProjection(
+                encodedAtColumn: "NULL as encodedAt",
+                processingStatusColumn: "-1 as processingStatus",
+                redactionReasonColumn: "NULL as redactionReason",
+                captureTriggerColumn: "NULL as captureTrigger",
+                mousePositionColumn: "NULL as mousePosition",
+                scrollPositionColumn: "NULL as scrollPosition",
+                videoCurrentTimeColumn: "NULL as videoCurrentTime"
+            )
+        }
+
+        return FrameWithVideoProjection(
+            encodedAtColumn: "encodedAt",
+            processingStatusColumn: "processingStatus",
+            redactionReasonColumn: "redactionReason",
+            captureTriggerColumn: "capture_trigger",
+            mousePositionColumn: "mousePosition",
+            scrollPositionColumn: "scrollPosition",
+            videoCurrentTimeColumn: "videoCurrentTime"
+        )
+    }
+
+    private static func videoInfoProjection(
+        source: FrameSource,
+        frameAlias: String,
+        videoAlias: String
+    ) -> String {
+        if source == .rewind {
+            return "\(videoAlias).path, \(videoAlias).frameRate, \(videoAlias).width, \(videoAlias).height, 0 as videoProcessingState, NULL as videoFileSize, NULL as videoFrameCount, NULL as videoReencodedAt"
+        }
+
+        return """
+            \(videoAlias).path, \(videoAlias).frameRate, \(videoAlias).width, \(videoAlias).height,
+            \(videoAlias).processingState as videoProcessingState, \(videoAlias).fileSize as videoFileSize, \(videoAlias).frameCount as videoFrameCount,
+            (SELECT MAX(fr.rewrittenAt) FROM frame fr WHERE fr.videoId = \(frameAlias).videoId) as videoReencodedAt
+            """
+    }
+
+    private static func queryFramesWithVideoInfo(
         from startDate: Date,
         to endDate: Date,
         limit: Int,
@@ -1284,12 +1605,18 @@ public actor DataAdapter {
 
         // Build WHERE clause based on filters
         var whereClauses = ["f.createdAt >= ?", "f.createdAt <= ?"]
+        if let visibilityClause = Self.nativeVisibleFrameClause(
+            frameAlias: "f",
+            isRewindDatabase: config.source == .rewind
+        ) {
+            whereClauses.append(visibilityClause)
+        }
         var bindIndex = 3 // 1 and 2 are for timestamps
 
         // App filter (include or exclude mode)
         if let apps = filters?.selectedApps, !apps.isEmpty {
             let filterMode = filters?.appFilterMode ?? .include
-            whereClauses.append(buildAppFilterClause(apps: apps, mode: filterMode))
+            whereClauses.append(Self.buildAppFilterClause(apps: apps, mode: filterMode))
         }
 
         // Tag filter - need to join with segment_tag
@@ -1305,9 +1632,7 @@ public actor DataAdapter {
 
         let whereClause = whereClauses.joined(separator: " AND ")
 
-        // Rewind database doesn't have processingStatus column
-        let processingStatusColumn = config.source == .rewind ? "-1 as processingStatus" : "f.processingStatus"
-        let redactionReasonColumn = config.source == .rewind ? "NULL as redactionReason" : "f.redactionReason"
+        let projection = Self.frameWithVideoProjection(source: config.source, tableAlias: "f")
 
         let sql = """
             SELECT
@@ -1316,19 +1641,17 @@ public actor DataAdapter {
                 f.segmentId,
                 f.videoId,
                 f.videoFrameIndex,
-                f.encodingStatus,
-                \(processingStatusColumn),
-                \(redactionReasonColumn),
+                \(projection.encodedAtColumn),
+                \(projection.processingStatusColumn),
+                \(projection.redactionReasonColumn),
+                \(projection.captureTriggerColumn),
                 s.bundleID,
                 s.windowName,
                 s.browserUrl,
-                \(config.source == .rewind ? "NULL" : "f.mousePosition"),
-                \(config.source == .rewind ? "NULL" : "f.scrollPosition"),
-                \(config.source == .rewind ? "NULL" : "f.videoCurrentTime"),
-                v.path,
-                v.frameRate,
-                v.width,
-                v.height
+                \(projection.mousePositionColumn),
+                \(projection.scrollPositionColumn),
+                \(projection.videoCurrentTimeColumn),
+                \(Self.videoInfoProjection(source: config.source, frameAlias: "f", videoAlias: "v"))
             FROM frame f
             LEFT JOIN segment s ON f.segmentId = s.id
             \(tagJoin)
@@ -1364,7 +1687,7 @@ public actor DataAdapter {
 
         var frames: [FrameWithVideoInfo] = []
         while sqlite3_step(statement) == SQLITE_ROW {
-            if let frameWithVideo = try? parseFrameWithVideoInfo(statement: statement, config: config) {
+            if let frameWithVideo = try? Self.parseFrameWithVideoInfo(statement: statement, config: config) {
                 frames.append(frameWithVideo)
             }
         }
@@ -1373,7 +1696,7 @@ public actor DataAdapter {
     }
 
     /// Fast unfiltered query - uses subquery to limit before join
-    private func queryMostRecentFramesWithVideoInfo(
+    private static func queryMostRecentFramesWithVideoInfo(
         limit: Int,
         connection: DatabaseConnection,
         config: DatabaseConfig,
@@ -1383,21 +1706,30 @@ public actor DataAdapter {
             return []
         }
 
-        // Rewind database doesn't have processingStatus column
-        let processingStatusColumn = config.source == .rewind ? "-1 as processingStatus" : "f.processingStatus"
-        let redactionReasonColumn = config.source == .rewind ? "NULL as redactionReason" : "f.redactionReason"
-        let subqueryProcessingStatus = config.source == .rewind ? "-1 as processingStatus" : "processingStatus"
-        let subqueryRedactionReason = config.source == .rewind ? "NULL as redactionReason" : "redactionReason"
-        let subqueryVideoCurrentTime = config.source == .rewind ? "NULL as videoCurrentTime" : "videoCurrentTime"
+        let projection = Self.frameWithVideoProjection(source: config.source, tableAlias: "f")
+        let subqueryProjection = Self.frameWithVideoSubqueryProjection(source: config.source)
         let boundaryFilter = Self.buildSourceBoundaryClause(config: config, columnName: "createdAt")
-        let boundaryWhereClause = boundaryFilter.clause.map { "WHERE \($0)" } ?? ""
+        var subqueryWhereClauses: [String] = []
+        if let visibilityClause = Self.nativeVisibleFrameClause(
+            frameAlias: nil,
+            isRewindDatabase: config.source == .rewind
+        ) {
+            subqueryWhereClauses.append(visibilityClause)
+        }
+        if let boundaryClause = boundaryFilter.clause {
+            subqueryWhereClauses.append(boundaryClause)
+        }
+        let boundaryWhereClause = subqueryWhereClauses.isEmpty
+            ? ""
+            : "WHERE " + subqueryWhereClauses.joined(separator: " AND ")
 
         let sql = """
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
-                   s.bundleID, s.windowName, s.browserUrl, \(config.source == .rewind ? "NULL" : "f.mousePosition"), \(config.source == .rewind ? "NULL" : "f.scrollPosition"), \(config.source == .rewind ? "NULL" : "f.videoCurrentTime"),
-                   v.path, v.frameRate, v.width, v.height
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, \(projection.encodedAtColumn), \(projection.processingStatusColumn), \(projection.redactionReasonColumn),
+                   \(projection.captureTriggerColumn),
+                   s.bundleID, s.windowName, s.browserUrl, \(projection.mousePositionColumn), \(projection.scrollPositionColumn), \(projection.videoCurrentTimeColumn),
+                   \(Self.videoInfoProjection(source: config.source, frameAlias: "f", videoAlias: "v"))
             FROM (
-                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, \(subqueryProcessingStatus), \(subqueryRedactionReason), \(config.source == .rewind ? "NULL as mousePosition" : "mousePosition"), \(config.source == .rewind ? "NULL as scrollPosition" : "scrollPosition"), \(subqueryVideoCurrentTime)
+                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, \(subqueryProjection.encodedAtColumn), \(subqueryProjection.processingStatusColumn), \(subqueryProjection.redactionReasonColumn), \(subqueryProjection.captureTriggerColumn), \(subqueryProjection.mousePositionColumn), \(subqueryProjection.scrollPositionColumn), \(subqueryProjection.videoCurrentTimeColumn)
                 FROM frame
                 \(boundaryWhereClause)
                 ORDER BY createdAt DESC
@@ -1421,7 +1753,7 @@ public actor DataAdapter {
 
         var frames: [FrameWithVideoInfo] = []
         while sqlite3_step(statement) == SQLITE_ROW {
-            if let frameWithVideo = try? parseFrameWithVideoInfo(statement: statement, config: config) {
+            if let frameWithVideo = try? Self.parseFrameWithVideoInfo(statement: statement, config: config) {
                 frames.append(frameWithVideo)
             }
         }
@@ -1430,40 +1762,14 @@ public actor DataAdapter {
     }
 
     /// Optimized filtered query - joins first to use bundleID index, then filters
-    private func queryMostRecentFramesWithFiltersOptimized(
+    private static func queryMostRecentFramesWithFiltersOptimized(
         limit: Int,
         connection: DatabaseConnection,
         config: DatabaseConfig,
         filters: FilterCriteria,
+        hiddenTagId: Int64?,
         isRewindDatabase: Bool = false
     ) throws -> [FrameWithVideoInfo] {
-        var whereClauses: [String] = []
-        var bindIndex = 1
-
-        // Build tag filter including hidden filter logic
-        // Note: Rewind database doesn't have segment_tag table, so skip tag filters for Rewind
-        var tagsToFilter = Set<Int64>()
-        let shouldApplyTagFilters = !isRewindDatabase
-
-        if shouldApplyTagFilters {
-            tagsToFilter = filters.selectedTags ?? Set<Int64>()
-
-            // Apply hidden filter logic
-            if let hiddenTagId = cachedHiddenTagId {
-                switch filters.hiddenFilter {
-                case .hide:
-                    // Exclude hidden: We'll use NOT EXISTS clause below
-                    break
-                case .onlyHidden:
-                    // Only show hidden: Set tags to only hidden tag
-                    tagsToFilter = [hiddenTagId]
-                case .showAll:
-                    // Show all: Don't modify tag filter
-                    break
-                }
-            }
-        }
-
         // Window/browser metadata filters support encoded include/exclude term sets.
         let windowNameFilter = Self.decodeMetadataStringFilter(filters.windowNameFilter)
         let browserUrlFilter = Self.decodeMetadataStringFilter(filters.browserUrlFilter)
@@ -1471,142 +1777,48 @@ public actor DataAdapter {
         let hasSelectedTagFilters = filters.selectedTags != nil && !filters.selectedTags!.isEmpty
         let hasBrowserUrlFilter = browserUrlFilter.hasActiveFilters
         let hasSegmentMetadataFilter = hasBrowserUrlFilter || hasWindowNameFilter
-        var metadataBindValues: [Any] = []
 
         // Sparse metadata filters are often selective; use a segment-first query shape so SQLite doesn't
         // scan the full frame table just to satisfy ORDER BY createdAt LIMIT N.
         if hasSegmentMetadataFilter && !hasSelectedTagFilters && filters.hiddenFilter != .onlyHidden {
-            return try queryMostRecentFramesWithSegmentMetadataFilterSegmentFirst(
+            return try Self.queryMostRecentFramesWithSegmentMetadataFilterSegmentFirst(
                 limit: limit,
                 connection: connection,
                 config: config,
                 filters: filters,
+                hiddenTagId: hiddenTagId,
                 isRewindDatabase: isRewindDatabase
             )
         }
 
-        // Build CTE for tag filtering (filter tags first in subquery, then join to frames)
-        let tagCTE: String
-        let tagJoin: String
-        let hasTagFilter = !tagsToFilter.isEmpty
-        let tagFilterMode = filters.tagFilterMode
-
-        if hasTagFilter {
-            let tagPlaceholders = tagsToFilter.map { _ in "?" }.joined(separator: ", ")
-            if tagFilterMode == .include {
-                // Include mode: Show only segments WITH selected tags
-                tagCTE = """
-                    tagged_segments AS (
-                        SELECT DISTINCT segmentId
-                        FROM segment_tag
-                        WHERE tagId IN (\(tagPlaceholders))
-                    )
-                    """
-                tagJoin = "INNER JOIN tagged_segments ts ON f.segmentId = ts.segmentId"
-            } else {
-                // Exclude mode: Show segments WITHOUT selected tags (via NOT EXISTS in WHERE)
-                tagCTE = ""
-                tagJoin = ""
-            }
-        } else {
-            tagCTE = ""
-            tagJoin = ""
-        }
-
-        // Combine CTEs (only tag CTE now, window name uses direct WHERE clause)
-        let combinedCTE = tagCTE.isEmpty ? "" : "WITH " + tagCTE
-
-        // App filter - uses index on segment.bundleID (include or exclude mode)
-        if let apps = filters.selectedApps, !apps.isEmpty {
-            whereClauses.append(buildAppFilterClause(apps: apps, mode: filters.appFilterMode))
-        }
-
-        Self.appendMetadataStringFilter(
-            columnName: "s.browserUrl",
-            parsedFilter: browserUrlFilter,
-            whereConditions: &whereClauses,
-            bindValues: &metadataBindValues
+        let filterComponents = Self.buildFrameFilterQueryComponents(
+            filters: filters,
+            config: config,
+            hiddenTagId: hiddenTagId,
+            isRewindDatabase: isRewindDatabase
         )
-        Self.appendMetadataStringFilter(
-            columnName: "s.windowName",
-            parsedFilter: windowNameFilter,
-            whereConditions: &whereClauses,
-            bindValues: &metadataBindValues
-        )
+        let whereClause = filterComponents.whereClauses.isEmpty
+            ? ""
+            : "WHERE " + filterComponents.whereClauses.joined(separator: " AND ")
 
-        let dateRangeFilter = Self.buildDateRangeUnionClause(
-            ranges: filters.effectiveDateRanges,
-            columnName: "f.createdAt"
-        )
-        if let dateRangeClause = dateRangeFilter.clause {
-            whereClauses.append(dateRangeClause)
-        }
-        let sourceBoundaryFilter = Self.buildSourceBoundaryClause(config: config, columnName: "f.createdAt")
-        if let sourceBoundaryClause = sourceBoundaryFilter.clause {
-            whereClauses.append(sourceBoundaryClause)
-        }
-
-        // Tag exclude filter: Exclude segments that have any of the selected tags
-        if hasTagFilter && tagFilterMode == .exclude {
-            let tagPlaceholders = tagsToFilter.map { _ in "?" }.joined(separator: ", ")
-            whereClauses.append("""
-                NOT EXISTS (
-                    SELECT 1 FROM segment_tag st_exclude
-                    WHERE st_exclude.segmentId = f.segmentId
-                    AND st_exclude.tagId IN (\(tagPlaceholders))
-                )
-                """)
-        }
-
-        // Hidden filter: Exclude segments with hidden tag (when .hide mode)
-        // Only apply for Retrace database (Rewind doesn't have segment_tag)
-        if shouldApplyTagFilters && filters.hiddenFilter == .hide, cachedHiddenTagId != nil {
-            whereClauses.append("""
-                NOT EXISTS (
-                    SELECT 1 FROM segment_tag st_hidden
-                    WHERE st_hidden.segmentId = f.segmentId
-                    AND st_hidden.tagId = ?
-                )
-                """)
-        }
-
-        if let commentClause = Self.buildCommentFilterClause(
-            filters.commentFilter,
-            isRewindDatabase: isRewindDatabase,
-            segmentIDExpression: "f.segmentId"
-        ) {
-            whereClauses.append(commentClause)
-        }
-
-        let whereClause = whereClauses.isEmpty ? "" : "WHERE " + whereClauses.joined(separator: " AND ")
-
-        // Rewind database doesn't have processingStatus column
-        let processingStatusColumn = config.source == .rewind ? "-1 as processingStatus" : "f.processingStatus"
-        let redactionReasonColumn = config.source == .rewind ? "NULL as redactionReason" : "f.redactionReason"
+        // Normalize native-only frame columns across Retrace and Rewind.
+        let projection = Self.frameWithVideoProjection(source: config.source, tableAlias: "f")
 
         // CTE filters tags first (small set), then joins with frames using segmentId index
         let sql = """
-            \(combinedCTE)
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
-                   s.bundleID, s.windowName, s.browserUrl, \(config.source == .rewind ? "NULL" : "f.mousePosition"), \(config.source == .rewind ? "NULL" : "f.scrollPosition"), \(config.source == .rewind ? "NULL" : "f.videoCurrentTime"),
-                   v.path, v.frameRate, v.width, v.height
+            \(filterComponents.combinedCTE)
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, \(projection.encodedAtColumn), \(projection.processingStatusColumn), \(projection.redactionReasonColumn),
+                   \(projection.captureTriggerColumn),
+                   s.bundleID, s.windowName, s.browserUrl, \(projection.mousePositionColumn), \(projection.scrollPositionColumn), \(projection.videoCurrentTimeColumn),
+                   \(Self.videoInfoProjection(source: config.source, frameAlias: "f", videoAlias: "v"))
             FROM frame f
             INNER JOIN segment s ON f.segmentId = s.id
-            \(tagJoin)
+            \(filterComponents.tagJoin)
             LEFT JOIN video v ON f.videoId = v.id
             \(whereClause)
             ORDER BY f.createdAt DESC
             LIMIT ?
             """
-
-        Log.debug("[Filter] ====== QUERY DEBUG START ======", category: .database)
-        Log.debug("[Filter] Query SQL:\n\(sql)", category: .database)
-        Log.debug("[Filter] Apps filter: \(filters.selectedApps ?? []), mode: \(filters.appFilterMode.rawValue)", category: .database)
-        Log.debug("[Filter] Tags to filter: \(tagsToFilter), mode: \(tagFilterMode.rawValue)", category: .database)
-        Log.debug("[Filter] Hidden filter: \(filters.hiddenFilter.rawValue), cachedHiddenTagId: \(String(describing: cachedHiddenTagId))", category: .database)
-        Log.debug("[Filter] Window name filter: \(filters.windowNameFilter ?? "nil")", category: .database)
-        Log.debug("[Filter] Browser URL filter: \(filters.browserUrlFilter ?? "nil")", category: .database)
-        Log.debug("[Filter] Date ranges: \(filters.effectiveDateRanges)", category: .database)
 
         let statement: OpaquePointer?
         do {
@@ -1624,66 +1836,38 @@ public actor DataAdapter {
         }
         defer { connection.finalize(stmt) }
 
-        // Bind tag IDs (they appear in the CTE) - ONLY for include mode
-        if hasTagFilter && tagFilterMode == .include {
-            for (index, tagId) in tagsToFilter.enumerated() {
-                Log.debug("[Filter] Binding tagId \(tagId) at index \(bindIndex + index)", category: .database)
-                sqlite3_bind_int64(stmt, Int32(bindIndex + index), tagId)
-            }
-            bindIndex += tagsToFilter.count
-        }
-
-        // Bind app bundle IDs
-        if let apps = filters.selectedApps, !apps.isEmpty {
-            for (index, app) in apps.enumerated() {
-                Log.debug("[Filter] Binding app '\(app)' at index \(bindIndex + index)", category: .database)
-                sqlite3_bind_text(stmt, Int32(bindIndex + index), (app as NSString).utf8String, -1, nil)
-            }
-            bindIndex += apps.count
-        }
-
-        for metadataValue in metadataBindValues {
-            if let stringValue = metadataValue as? String {
-                Log.debug("[Filter] Binding metadata pattern '\(stringValue)' at index \(bindIndex)", category: .database)
-                sqlite3_bind_text(stmt, Int32(bindIndex), (stringValue as NSString).utf8String, -1, nil)
-                bindIndex += 1
-            }
-        }
-
-        // Bind date range union
-        for date in dateRangeFilter.bindValues {
-            Log.debug("[Filter] Binding date bound at index \(bindIndex)", category: .database)
-            config.bindDate(date, to: stmt, at: Int32(bindIndex))
+        var bindIndex: Int32 = 1
+        for tagId in filterComponents.includedTagIDs {
+            sqlite3_bind_int64(stmt, bindIndex, tagId)
             bindIndex += 1
         }
-
-        for date in sourceBoundaryFilter.bindValues {
-            Log.debug("[Filter] Binding source boundary at index \(bindIndex)", category: .database)
-            config.bindDate(date, to: stmt, at: Int32(bindIndex))
+        for app in filterComponents.appBundleIDs {
+            sqlite3_bind_text(stmt, bindIndex, (app as NSString).utf8String, -1, nil)
             bindIndex += 1
         }
-
-        // Bind tag IDs for exclude mode (NOT EXISTS in WHERE clause)
-        if hasTagFilter && tagFilterMode == .exclude {
-            for (index, tagId) in tagsToFilter.enumerated() {
-                Log.debug("[Filter] Binding exclude tagId \(tagId) at index \(bindIndex + index)", category: .database)
-                sqlite3_bind_int64(stmt, Int32(bindIndex + index), tagId)
-            }
-            bindIndex += tagsToFilter.count
+        for stringValue in filterComponents.metadataBindValues {
+            sqlite3_bind_text(stmt, bindIndex, (stringValue as NSString).utf8String, -1, nil)
+            bindIndex += 1
         }
-
-        // Bind hidden tag ID for NOT EXISTS clause (if applicable)
-        // Only bind for Retrace database (Rewind doesn't have segment_tag)
-        if shouldApplyTagFilters && filters.hiddenFilter == .hide, let hiddenTagId = cachedHiddenTagId {
-            Log.debug("[Filter] Binding hiddenTagId \(hiddenTagId) at index \(bindIndex)", category: .database)
-            sqlite3_bind_int64(stmt, Int32(bindIndex), hiddenTagId)
+        for date in filterComponents.dateRangeBounds {
+            config.bindDate(date, to: stmt, at: bindIndex)
+            bindIndex += 1
+        }
+        for date in filterComponents.sourceBoundaryBounds {
+            config.bindDate(date, to: stmt, at: bindIndex)
+            bindIndex += 1
+        }
+        for tagId in filterComponents.excludedTagIDs {
+            sqlite3_bind_int64(stmt, bindIndex, tagId)
+            bindIndex += 1
+        }
+        if let hiddenTagID = filterComponents.hiddenTagID {
+            sqlite3_bind_int64(stmt, bindIndex, hiddenTagID)
             bindIndex += 1
         }
 
         // Bind limit
-        Log.debug("[Filter] Binding limit \(limit) at index \(bindIndex)", category: .database)
-        sqlite3_bind_int(stmt, Int32(bindIndex), Int32(limit))
-        Log.debug("[Filter] ====== QUERY DEBUG END ======", category: .database)
+        sqlite3_bind_int(stmt, bindIndex, Int32(limit))
 
         var frames: [FrameWithVideoInfo] = []
         var stepCount = 0
@@ -1691,7 +1875,7 @@ public actor DataAdapter {
 
         while stepResult == SQLITE_ROW {
             stepCount += 1
-            if let frameWithVideo = try? parseFrameWithVideoInfo(statement: stmt, config: config) {
+            if let frameWithVideo = try? Self.parseFrameWithVideoInfo(statement: stmt, config: config) {
                 frames.append(frameWithVideo)
             }
             stepResult = sqlite3_step(stmt)
@@ -1701,18 +1885,17 @@ public actor DataAdapter {
             Log.error("[Filter] sqlite3_step error code: \(stepResult)", category: .database)
         }
 
-        Log.debug("[Filter] Query returned \(frames.count) frames (stepped \(stepCount) times)", category: .database)
-
         return frames
     }
 
     /// Specialized most-recent query for window name/browser URL filters.
     /// Uses a segment-first subquery to avoid scanning frame.createdAt across the full table.
-    private func queryMostRecentFramesWithSegmentMetadataFilterSegmentFirst(
+    private static func queryMostRecentFramesWithSegmentMetadataFilterSegmentFirst(
         limit: Int,
         connection: DatabaseConnection,
         config: DatabaseConfig,
         filters: FilterCriteria,
+        hiddenTagId: Int64?,
         isRewindDatabase: Bool
     ) throws -> [FrameWithVideoInfo] {
         let windowNameFilter = Self.decodeMetadataStringFilter(filters.windowNameFilter)
@@ -1725,10 +1908,17 @@ public actor DataAdapter {
 
         var segmentWhereClauses: [String] = []
         var whereClauses: [String] = []
-        var segmentMetadataBindValues: [Any] = []
+        var segmentMetadataBindValues: [String] = []
+
+        if let visibilityClause = Self.nativeVisibleFrameClause(
+            frameAlias: "f",
+            isRewindDatabase: isRewindDatabase
+        ) {
+            whereClauses.append(visibilityClause)
+        }
 
         if let apps = filters.selectedApps, !apps.isEmpty {
-            segmentWhereClauses.append(buildAppFilterClause(apps: apps, mode: filters.appFilterMode, tableAlias: "s2"))
+            segmentWhereClauses.append(Self.buildAppFilterClause(apps: apps, mode: filters.appFilterMode, tableAlias: "s2"))
         }
 
         Self.appendMetadataStringFilter(
@@ -1766,7 +1956,7 @@ public actor DataAdapter {
         }
 
         // Rewind database doesn't have segment_tag; hidden filter only applies on Retrace.
-        if !isRewindDatabase, filters.hiddenFilter == .hide, cachedHiddenTagId != nil {
+        if !isRewindDatabase, filters.hiddenFilter == .hide, hiddenTagId != nil {
             whereClauses.append("""
                 NOT EXISTS (
                     SELECT 1 FROM segment_tag st_hidden
@@ -1786,13 +1976,13 @@ public actor DataAdapter {
 
         let whereClause = whereClauses.joined(separator: " AND ")
 
-        let processingStatusColumn = config.source == .rewind ? "-1 as processingStatus" : "f.processingStatus"
-        let redactionReasonColumn = config.source == .rewind ? "NULL as redactionReason" : "f.redactionReason"
+        let projection = Self.frameWithVideoProjection(source: config.source, tableAlias: "f")
 
         let sql = """
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
-                   s.bundleID, s.windowName, s.browserUrl, \(config.source == .rewind ? "NULL" : "f.mousePosition"), \(config.source == .rewind ? "NULL" : "f.scrollPosition"), \(config.source == .rewind ? "NULL" : "f.videoCurrentTime"),
-                   v.path, v.frameRate, v.width, v.height
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, \(projection.encodedAtColumn), \(projection.processingStatusColumn), \(projection.redactionReasonColumn),
+                   \(projection.captureTriggerColumn),
+                   s.bundleID, s.windowName, s.browserUrl, \(projection.mousePositionColumn), \(projection.scrollPositionColumn), \(projection.videoCurrentTimeColumn),
+                   \(Self.videoInfoProjection(source: config.source, frameAlias: "f", videoAlias: "v"))
             FROM frame f
             INNER JOIN segment s ON f.segmentId = s.id
             LEFT JOIN video v ON f.videoId = v.id
@@ -1813,11 +2003,9 @@ public actor DataAdapter {
             bindIndex += apps.count
         }
 
-        for metadataValue in segmentMetadataBindValues {
-            if let stringValue = metadataValue as? String {
-                sqlite3_bind_text(statement, Int32(bindIndex), (stringValue as NSString).utf8String, -1, nil)
-                bindIndex += 1
-            }
+        for stringValue in segmentMetadataBindValues {
+            sqlite3_bind_text(statement, Int32(bindIndex), (stringValue as NSString).utf8String, -1, nil)
+            bindIndex += 1
         }
 
         for date in dateRangeFilter.bindValues {
@@ -1830,7 +2018,7 @@ public actor DataAdapter {
             bindIndex += 1
         }
 
-        if !isRewindDatabase, filters.hiddenFilter == .hide, let hiddenTagId = cachedHiddenTagId {
+        if !isRewindDatabase, filters.hiddenFilter == .hide, let hiddenTagId {
             sqlite3_bind_int64(statement, Int32(bindIndex), hiddenTagId)
             bindIndex += 1
         }
@@ -1839,7 +2027,7 @@ public actor DataAdapter {
 
         var frames: [FrameWithVideoInfo] = []
         while sqlite3_step(statement) == SQLITE_ROW {
-            if let frameWithVideo = try? parseFrameWithVideoInfo(statement: statement, config: config) {
+            if let frameWithVideo = try? Self.parseFrameWithVideoInfo(statement: statement, config: config) {
                 frames.append(frameWithVideo)
             }
         }
@@ -1848,160 +2036,39 @@ public actor DataAdapter {
     }
 
     /// Optimized filtered query for frames before timestamp - joins first to use bundleID index
-    private func queryFramesBeforeWithFiltersOptimized(
+    private static func queryFramesBeforeWithFiltersOptimized(
         timestamp: Date,
         limit: Int,
         connection: DatabaseConnection,
         config: DatabaseConfig,
         filters: FilterCriteria,
+        hiddenTagId: Int64?,
         isRewindDatabase: Bool = false
     ) throws -> [FrameWithVideoInfo] {
         let effectiveTimestamp = config.applyCutoff(to: timestamp)
-        let sourceBoundaryFilter = Self.buildSourceBoundaryClause(config: config, columnName: "f.createdAt")
-
         var whereClauses = ["f.createdAt < ?"]
-        var bindIndex = 1
-
-        // Build tag filter including hidden filter logic
-        // Note: Rewind database doesn't have segment_tag table, so skip tag filters for Rewind
-        var tagsToFilter = Set<Int64>()
-        let shouldApplyTagFilters = !isRewindDatabase
-
-        if shouldApplyTagFilters {
-            tagsToFilter = filters.selectedTags ?? Set<Int64>()
-
-            // Apply hidden filter logic
-            if let hiddenTagId = cachedHiddenTagId {
-                switch filters.hiddenFilter {
-                case .hide:
-                    // Exclude hidden: We'll use NOT EXISTS clause below
-                    break
-                case .onlyHidden:
-                    // Only show hidden: Set tags to only hidden tag
-                    tagsToFilter = [hiddenTagId]
-                case .showAll:
-                    // Show all: Don't modify tag filter
-                    break
-                }
-            }
-        }
-
-        let windowNameFilter = Self.decodeMetadataStringFilter(filters.windowNameFilter)
-        let browserUrlFilter = Self.decodeMetadataStringFilter(filters.browserUrlFilter)
-        var metadataBindValues: [Any] = []
-
-        // Build CTE for tag filtering (filter tags first in subquery, then join to frames)
-        let tagCTE: String
-        let tagJoin: String
-        let hasTagFilter = !tagsToFilter.isEmpty
-        let tagFilterMode = filters.tagFilterMode
-
-        if hasTagFilter {
-            let tagPlaceholders = tagsToFilter.map { _ in "?" }.joined(separator: ", ")
-            if tagFilterMode == .include {
-                // Include mode: Show only segments WITH selected tags
-                tagCTE = """
-                    tagged_segments AS (
-                        SELECT DISTINCT segmentId
-                        FROM segment_tag
-                        WHERE tagId IN (\(tagPlaceholders))
-                    )
-                    """
-                tagJoin = "INNER JOIN tagged_segments ts ON f.segmentId = ts.segmentId"
-                // Update bindIndex to account for tag parameters in CTE
-                bindIndex += tagsToFilter.count
-            } else {
-                // Exclude mode: Show segments WITHOUT selected tags (via NOT EXISTS in WHERE)
-                tagCTE = ""
-                tagJoin = ""
-            }
-        } else {
-            tagCTE = ""
-            tagJoin = ""
-        }
-
-        // Combine CTEs (only tag CTE now, window name uses direct WHERE clause)
-        let combinedCTE = tagCTE.isEmpty ? "" : "WITH " + tagCTE
-
-        // Now bind timestamp (after tag IDs in CTE, if any)
-        bindIndex += 1
-
-        // App filter - uses index on segment.bundleID (include or exclude mode)
-        if let apps = filters.selectedApps, !apps.isEmpty {
-            whereClauses.append(buildAppFilterClause(apps: apps, mode: filters.appFilterMode))
-        }
-
-        Self.appendMetadataStringFilter(
-            columnName: "s.browserUrl",
-            parsedFilter: browserUrlFilter,
-            whereConditions: &whereClauses,
-            bindValues: &metadataBindValues
+        let filterComponents = Self.buildFrameFilterQueryComponents(
+            filters: filters,
+            config: config,
+            hiddenTagId: hiddenTagId,
+            isRewindDatabase: isRewindDatabase
         )
-        Self.appendMetadataStringFilter(
-            columnName: "s.windowName",
-            parsedFilter: windowNameFilter,
-            whereConditions: &whereClauses,
-            bindValues: &metadataBindValues
-        )
-
-        let dateRangeFilter = Self.buildDateRangeUnionClause(
-            ranges: filters.effectiveDateRanges,
-            columnName: "f.createdAt"
-        )
-        if let dateRangeClause = dateRangeFilter.clause {
-            whereClauses.append(dateRangeClause)
-        }
-        if let sourceBoundaryClause = sourceBoundaryFilter.clause {
-            whereClauses.append(sourceBoundaryClause)
-        }
-
-        // Tag exclude filter: Exclude segments that have any of the selected tags
-        if hasTagFilter && tagFilterMode == .exclude {
-            let tagPlaceholders = tagsToFilter.map { _ in "?" }.joined(separator: ", ")
-            whereClauses.append("""
-                NOT EXISTS (
-                    SELECT 1 FROM segment_tag st_exclude
-                    WHERE st_exclude.segmentId = f.segmentId
-                    AND st_exclude.tagId IN (\(tagPlaceholders))
-                )
-                """)
-        }
-
-        // Hidden filter: Exclude segments with hidden tag (when .hide mode)
-        // Only apply for Retrace database (Rewind doesn't have segment_tag)
-        if shouldApplyTagFilters && filters.hiddenFilter == .hide, cachedHiddenTagId != nil {
-            whereClauses.append("""
-                NOT EXISTS (
-                    SELECT 1 FROM segment_tag st_hidden
-                    WHERE st_hidden.segmentId = f.segmentId
-                    AND st_hidden.tagId = ?
-                )
-                """)
-        }
-
-        if let commentClause = Self.buildCommentFilterClause(
-            filters.commentFilter,
-            isRewindDatabase: isRewindDatabase,
-            segmentIDExpression: "f.segmentId"
-        ) {
-            whereClauses.append(commentClause)
-        }
-
+        whereClauses.append(contentsOf: filterComponents.whereClauses)
         let whereClause = whereClauses.joined(separator: " AND ")
 
-        // Rewind database doesn't have processingStatus column
-        let processingStatusColumn = config.source == .rewind ? "-1 as processingStatus" : "f.processingStatus"
-        let redactionReasonColumn = config.source == .rewind ? "NULL as redactionReason" : "f.redactionReason"
+        // Normalize native-only frame columns across Retrace and Rewind.
+        let projection = Self.frameWithVideoProjection(source: config.source, tableAlias: "f")
 
         // CTE filters tags first (small set), then joins with frames using segmentId index
         let sql = """
-            \(combinedCTE)
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
-                   s.bundleID, s.windowName, s.browserUrl, \(config.source == .rewind ? "NULL" : "f.mousePosition"), \(config.source == .rewind ? "NULL" : "f.scrollPosition"), \(config.source == .rewind ? "NULL" : "f.videoCurrentTime"),
-                   v.path, v.frameRate, v.width, v.height
+            \(filterComponents.combinedCTE)
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, \(projection.encodedAtColumn), \(projection.processingStatusColumn), \(projection.redactionReasonColumn),
+                   \(projection.captureTriggerColumn),
+                   s.bundleID, s.windowName, s.browserUrl, \(projection.mousePositionColumn), \(projection.scrollPositionColumn), \(projection.videoCurrentTimeColumn),
+                   \(Self.videoInfoProjection(source: config.source, frameAlias: "f", videoAlias: "v"))
             FROM frame f
             INNER JOIN segment s ON f.segmentId = s.id
-            \(tagJoin)
+            \(filterComponents.tagJoin)
             LEFT JOIN video v ON f.videoId = v.id
             WHERE \(whereClause)
             ORDER BY f.createdAt DESC
@@ -2011,67 +2078,30 @@ public actor DataAdapter {
         guard let statement = try? connection.prepare(sql: sql) else { return [] }
         defer { connection.finalize(statement) }
 
-        var currentBindIndex = 1
-
-        // Bind tag IDs (they appear in the CTE) - ONLY for include mode
-        if hasTagFilter && tagFilterMode == .include {
-            for (index, tagId) in tagsToFilter.enumerated() {
-                sqlite3_bind_int64(statement, Int32(currentBindIndex + index), tagId)
-            }
-            currentBindIndex += tagsToFilter.count
-        }
+        var currentBindIndex: Int32 = 1
+        currentBindIndex = Self.bindFrameFilterCTEValues(
+            filterComponents,
+            to: statement,
+            startingAt: currentBindIndex
+        )
 
         // Bind timestamp
         config.bindDate(effectiveTimestamp, to: statement, at: Int32(currentBindIndex))
         currentBindIndex += 1
 
-        // Bind app bundle IDs
-        if let apps = filters.selectedApps, !apps.isEmpty {
-            for (index, app) in apps.enumerated() {
-                sqlite3_bind_text(statement, Int32(currentBindIndex + index), (app as NSString).utf8String, -1, nil)
-            }
-            currentBindIndex += apps.count
-        }
-
-        for metadataValue in metadataBindValues {
-            if let stringValue = metadataValue as? String {
-                sqlite3_bind_text(statement, Int32(currentBindIndex), (stringValue as NSString).utf8String, -1, nil)
-                currentBindIndex += 1
-            }
-        }
-
-        // Bind date range union
-        for date in dateRangeFilter.bindValues {
-            config.bindDate(date, to: statement, at: Int32(currentBindIndex))
-            currentBindIndex += 1
-        }
-
-        for date in sourceBoundaryFilter.bindValues {
-            config.bindDate(date, to: statement, at: Int32(currentBindIndex))
-            currentBindIndex += 1
-        }
-
-        // Bind tag IDs for exclude mode (NOT EXISTS in WHERE clause)
-        if hasTagFilter && tagFilterMode == .exclude {
-            for (index, tagId) in tagsToFilter.enumerated() {
-                sqlite3_bind_int64(statement, Int32(currentBindIndex + index), tagId)
-            }
-            currentBindIndex += tagsToFilter.count
-        }
-
-        // Bind hidden tag ID for NOT EXISTS clause (if applicable)
-        // Only bind for Retrace database (Rewind doesn't have segment_tag)
-        if shouldApplyTagFilters && filters.hiddenFilter == .hide, let hiddenTagId = cachedHiddenTagId {
-            sqlite3_bind_int64(statement, Int32(currentBindIndex), hiddenTagId)
-            currentBindIndex += 1
-        }
+        currentBindIndex = Self.bindFrameFilterWhereValues(
+            filterComponents,
+            to: statement,
+            config: config,
+            startingAt: currentBindIndex
+        )
 
         // Bind limit
         sqlite3_bind_int(statement, Int32(currentBindIndex), Int32(limit))
 
         var frames: [FrameWithVideoInfo] = []
         while sqlite3_step(statement) == SQLITE_ROW {
-            if let frameWithVideo = try? parseFrameWithVideoInfo(statement: statement, config: config) {
+            if let frameWithVideo = try? Self.parseFrameWithVideoInfo(statement: statement, config: config) {
                 frames.append(frameWithVideo)
             }
         }
@@ -2080,154 +2110,38 @@ public actor DataAdapter {
     }
 
     /// Optimized filtered query for frames after timestamp - joins first to use bundleID index
-    private func queryFramesAfterWithFiltersOptimized(
+    private static func queryFramesAfterWithFiltersOptimized(
         timestamp: Date,
         limit: Int,
         connection: DatabaseConnection,
         config: DatabaseConfig,
         filters: FilterCriteria,
+        hiddenTagId: Int64?,
         isRewindDatabase: Bool = false
     ) throws -> [FrameWithVideoInfo] {
         var whereClauses = ["f.createdAt > ?"]
-        var bindIndex = 1
-        let sourceBoundaryFilter = Self.buildSourceBoundaryClause(config: config, columnName: "f.createdAt")
-
-        // Build tag filter including hidden filter logic
-        // Note: Rewind database doesn't have segment_tag table, so skip tag filters for Rewind
-        var tagsToFilter = Set<Int64>()
-        let shouldApplyTagFilters = !isRewindDatabase
-
-        if shouldApplyTagFilters {
-            tagsToFilter = filters.selectedTags ?? Set<Int64>()
-
-            // Apply hidden filter logic
-            if let hiddenTagId = cachedHiddenTagId {
-                switch filters.hiddenFilter {
-                case .hide:
-                    break
-                case .onlyHidden:
-                    tagsToFilter = [hiddenTagId]
-                case .showAll:
-                    break
-                }
-            }
-        }
-
-        let windowNameFilter = Self.decodeMetadataStringFilter(filters.windowNameFilter)
-        let browserUrlFilter = Self.decodeMetadataStringFilter(filters.browserUrlFilter)
-        var metadataBindValues: [Any] = []
-
-        // Build CTE for tag filtering (filter tags first in subquery, then join to frames)
-        let tagCTE: String
-        let tagJoin: String
-        let hasTagFilter = !tagsToFilter.isEmpty
-        let tagFilterMode = filters.tagFilterMode
-
-        if hasTagFilter {
-            let tagPlaceholders = tagsToFilter.map { _ in "?" }.joined(separator: ", ")
-            if tagFilterMode == .include {
-                // Include mode: Show only segments WITH selected tags
-                tagCTE = """
-                    tagged_segments AS (
-                        SELECT DISTINCT segmentId
-                        FROM segment_tag
-                        WHERE tagId IN (\(tagPlaceholders))
-                    )
-                    """
-                tagJoin = "INNER JOIN tagged_segments ts ON f.segmentId = ts.segmentId"
-                bindIndex += tagsToFilter.count
-            } else {
-                // Exclude mode: Show segments WITHOUT selected tags (via NOT EXISTS in WHERE)
-                tagCTE = ""
-                tagJoin = ""
-            }
-        } else {
-            tagCTE = ""
-            tagJoin = ""
-        }
-
-        // Combine CTEs (only tag CTE now, window name uses direct WHERE clause)
-        let combinedCTE = tagCTE.isEmpty ? "" : "WITH " + tagCTE
-
-        // Now bind timestamp (after tag IDs in CTE, if any)
-        bindIndex += 1
-
-        // App filter - uses index on segment.bundleID (include or exclude mode)
-        if let apps = filters.selectedApps, !apps.isEmpty {
-            whereClauses.append(buildAppFilterClause(apps: apps, mode: filters.appFilterMode))
-        }
-
-        Self.appendMetadataStringFilter(
-            columnName: "s.browserUrl",
-            parsedFilter: browserUrlFilter,
-            whereConditions: &whereClauses,
-            bindValues: &metadataBindValues
+        let filterComponents = Self.buildFrameFilterQueryComponents(
+            filters: filters,
+            config: config,
+            hiddenTagId: hiddenTagId,
+            isRewindDatabase: isRewindDatabase
         )
-        Self.appendMetadataStringFilter(
-            columnName: "s.windowName",
-            parsedFilter: windowNameFilter,
-            whereConditions: &whereClauses,
-            bindValues: &metadataBindValues
-        )
-
-        let dateRangeFilter = Self.buildDateRangeUnionClause(
-            ranges: filters.effectiveDateRanges,
-            columnName: "f.createdAt"
-        )
-        if let dateRangeClause = dateRangeFilter.clause {
-            whereClauses.append(dateRangeClause)
-        }
-        if let sourceBoundaryClause = sourceBoundaryFilter.clause {
-            whereClauses.append(sourceBoundaryClause)
-        }
-
-        // Tag exclude filter: Exclude segments that have any of the selected tags
-        if hasTagFilter && tagFilterMode == .exclude {
-            let tagPlaceholders = tagsToFilter.map { _ in "?" }.joined(separator: ", ")
-            whereClauses.append("""
-                NOT EXISTS (
-                    SELECT 1 FROM segment_tag st_exclude
-                    WHERE st_exclude.segmentId = f.segmentId
-                    AND st_exclude.tagId IN (\(tagPlaceholders))
-                )
-                """)
-        }
-
-        // Hidden filter: Exclude segments with hidden tag (when .hide mode)
-        // Only apply for Retrace database (Rewind doesn't have segment_tag)
-        if shouldApplyTagFilters && filters.hiddenFilter == .hide, cachedHiddenTagId != nil {
-            whereClauses.append("""
-                NOT EXISTS (
-                    SELECT 1 FROM segment_tag st_hidden
-                    WHERE st_hidden.segmentId = f.segmentId
-                    AND st_hidden.tagId = ?
-                )
-                """)
-        }
-
-        if let commentClause = Self.buildCommentFilterClause(
-            filters.commentFilter,
-            isRewindDatabase: isRewindDatabase,
-            segmentIDExpression: "f.segmentId"
-        ) {
-            whereClauses.append(commentClause)
-        }
-
+        whereClauses.append(contentsOf: filterComponents.whereClauses)
         let whereClause = whereClauses.joined(separator: " AND ")
 
-        // Rewind database doesn't have processingStatus column
-        let processingStatusColumn = config.source == .rewind ? "-1 as processingStatus" : "f.processingStatus"
-        let redactionReasonColumn = config.source == .rewind ? "NULL as redactionReason" : "f.redactionReason"
+        // Normalize native-only frame columns across Retrace and Rewind.
+        let projection = Self.frameWithVideoProjection(source: config.source, tableAlias: "f")
 
         // CTE filters tags first (small set), then joins with frames using segmentId index
         let sql = """
-            \(combinedCTE)
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
-                   s.bundleID, s.windowName, s.browserUrl, \(config.source == .rewind ? "NULL" : "f.mousePosition"), \(config.source == .rewind ? "NULL" : "f.scrollPosition"), \(config.source == .rewind ? "NULL" : "f.videoCurrentTime"),
-                   v.path, v.frameRate, v.width, v.height
+            \(filterComponents.combinedCTE)
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, \(projection.encodedAtColumn), \(projection.processingStatusColumn), \(projection.redactionReasonColumn),
+                   \(projection.captureTriggerColumn),
+                   s.bundleID, s.windowName, s.browserUrl, \(projection.mousePositionColumn), \(projection.scrollPositionColumn), \(projection.videoCurrentTimeColumn),
+                   \(Self.videoInfoProjection(source: config.source, frameAlias: "f", videoAlias: "v"))
             FROM frame f
             INNER JOIN segment s ON f.segmentId = s.id
-            \(tagJoin)
+            \(filterComponents.tagJoin)
             LEFT JOIN video v ON f.videoId = v.id
             WHERE \(whereClause)
             ORDER BY f.createdAt ASC
@@ -2237,67 +2151,30 @@ public actor DataAdapter {
         guard let statement = try? connection.prepare(sql: sql) else { return [] }
         defer { connection.finalize(statement) }
 
-        var currentBindIndex = 1
-
-        // Bind tag IDs (they appear in the CTE) - ONLY for include mode
-        if hasTagFilter && tagFilterMode == .include {
-            for (index, tagId) in tagsToFilter.enumerated() {
-                sqlite3_bind_int64(statement, Int32(currentBindIndex + index), tagId)
-            }
-            currentBindIndex += tagsToFilter.count
-        }
+        var currentBindIndex: Int32 = 1
+        currentBindIndex = Self.bindFrameFilterCTEValues(
+            filterComponents,
+            to: statement,
+            startingAt: currentBindIndex
+        )
 
         // Bind timestamp
         config.bindDate(timestamp, to: statement, at: Int32(currentBindIndex))
         currentBindIndex += 1
 
-        // Bind app bundle IDs
-        if let apps = filters.selectedApps, !apps.isEmpty {
-            for (index, app) in apps.enumerated() {
-                sqlite3_bind_text(statement, Int32(currentBindIndex + index), (app as NSString).utf8String, -1, nil)
-            }
-            currentBindIndex += apps.count
-        }
-
-        for metadataValue in metadataBindValues {
-            if let stringValue = metadataValue as? String {
-                sqlite3_bind_text(statement, Int32(currentBindIndex), (stringValue as NSString).utf8String, -1, nil)
-                currentBindIndex += 1
-            }
-        }
-
-        // Bind date range union
-        for date in dateRangeFilter.bindValues {
-            config.bindDate(date, to: statement, at: Int32(currentBindIndex))
-            currentBindIndex += 1
-        }
-
-        for date in sourceBoundaryFilter.bindValues {
-            config.bindDate(date, to: statement, at: Int32(currentBindIndex))
-            currentBindIndex += 1
-        }
-
-        // Bind tag IDs for exclude mode (NOT EXISTS in WHERE clause)
-        if hasTagFilter && tagFilterMode == .exclude {
-            for (index, tagId) in tagsToFilter.enumerated() {
-                sqlite3_bind_int64(statement, Int32(currentBindIndex + index), tagId)
-            }
-            currentBindIndex += tagsToFilter.count
-        }
-
-        // Bind hidden tag ID for NOT EXISTS clause (if applicable)
-        // Only bind for Retrace database (Rewind doesn't have segment_tag)
-        if shouldApplyTagFilters && filters.hiddenFilter == .hide, let hiddenTagId = cachedHiddenTagId {
-            sqlite3_bind_int64(statement, Int32(currentBindIndex), hiddenTagId)
-            currentBindIndex += 1
-        }
+        currentBindIndex = Self.bindFrameFilterWhereValues(
+            filterComponents,
+            to: statement,
+            config: config,
+            startingAt: currentBindIndex
+        )
 
         // Bind limit
         sqlite3_bind_int(statement, Int32(currentBindIndex), Int32(limit))
 
         var frames: [FrameWithVideoInfo] = []
         while sqlite3_step(statement) == SQLITE_ROW {
-            if let frameWithVideo = try? parseFrameWithVideoInfo(statement: statement, config: config) {
+            if let frameWithVideo = try? Self.parseFrameWithVideoInfo(statement: statement, config: config) {
                 frames.append(frameWithVideo)
             }
         }
@@ -2306,13 +2183,14 @@ public actor DataAdapter {
     }
 
     /// Optimized filtered query for date range - joins first to use bundleID index
-    private func queryFramesInRangeWithFiltersOptimized(
+    private static func queryFramesInRangeWithFiltersOptimized(
         from startDate: Date,
         to endDate: Date,
         limit: Int,
         connection: DatabaseConnection,
         config: DatabaseConfig,
         filters: FilterCriteria,
+        hiddenTagId: Int64?,
         isRewindDatabase: Bool = false
     ) throws -> [FrameWithVideoInfo] {
         let effectiveStartDate = config.applyLowerBound(to: startDate)
@@ -2320,139 +2198,29 @@ public actor DataAdapter {
         guard effectiveStartDate < effectiveEndDate else { return [] }
 
         var whereClauses = ["f.createdAt >= ?", "f.createdAt <= ?"]
-        var bindIndex = 1
-
-        // Build tag filter including hidden filter logic
-        var tagsToFilter = Set<Int64>()
-        let shouldApplyTagFilters = !isRewindDatabase
-        if shouldApplyTagFilters {
-            tagsToFilter = filters.selectedTags ?? Set<Int64>()
-
-            // Apply hidden filter logic
-            if let hiddenTagId = cachedHiddenTagId {
-                switch filters.hiddenFilter {
-                case .hide:
-                    break
-                case .onlyHidden:
-                    tagsToFilter = [hiddenTagId]
-                case .showAll:
-                    break
-                }
-            }
-        }
-
-        let windowNameFilter = Self.decodeMetadataStringFilter(filters.windowNameFilter)
-        let browserUrlFilter = Self.decodeMetadataStringFilter(filters.browserUrlFilter)
-        var metadataBindValues: [Any] = []
-
-        // Build CTE for tag filtering (filter tags first in subquery, then join to frames)
-        let tagCTE: String
-        let tagJoin: String
-        let hasTagFilter = !tagsToFilter.isEmpty
-        let tagFilterMode = filters.tagFilterMode
-
-        if hasTagFilter {
-            let tagPlaceholders = tagsToFilter.map { _ in "?" }.joined(separator: ", ")
-            if tagFilterMode == .include {
-                // Include mode: Show only segments WITH selected tags
-                tagCTE = """
-                    tagged_segments AS (
-                        SELECT DISTINCT segmentId
-                        FROM segment_tag
-                        WHERE tagId IN (\(tagPlaceholders))
-                    )
-                    """
-                tagJoin = "INNER JOIN tagged_segments ts ON f.segmentId = ts.segmentId"
-                bindIndex += tagsToFilter.count
-            } else {
-                // Exclude mode: Show segments WITHOUT selected tags (via NOT EXISTS in WHERE)
-                tagCTE = ""
-                tagJoin = ""
-            }
-        } else {
-            tagCTE = ""
-            tagJoin = ""
-        }
-
-        // Combine CTEs (only tag CTE now, window name uses direct WHERE clause)
-        let combinedCTE = tagCTE.isEmpty ? "" : "WITH " + tagCTE
-
-        // Now bind timestamps (after tag IDs in CTE, if any)
-        bindIndex += 2  // For startDate and endDate
-
-        // App filter - uses index on segment.bundleID (include or exclude mode)
-        if let apps = filters.selectedApps, !apps.isEmpty {
-            whereClauses.append(buildAppFilterClause(apps: apps, mode: filters.appFilterMode))
-        }
-
-        Self.appendMetadataStringFilter(
-            columnName: "s.browserUrl",
-            parsedFilter: browserUrlFilter,
-            whereConditions: &whereClauses,
-            bindValues: &metadataBindValues
-        )
-        Self.appendMetadataStringFilter(
-            columnName: "s.windowName",
-            parsedFilter: windowNameFilter,
-            whereConditions: &whereClauses,
-            bindValues: &metadataBindValues
-        )
-
-        let dateRangeFilter = Self.buildDateRangeUnionClause(
-            ranges: filters.effectiveDateRanges,
-            columnName: "f.createdAt"
-        )
-        if let dateRangeClause = dateRangeFilter.clause {
-            whereClauses.append(dateRangeClause)
-        }
-
-        // Tag exclude filter: Exclude segments that have any of the selected tags
-        if hasTagFilter && tagFilterMode == .exclude {
-            let tagPlaceholders = tagsToFilter.map { _ in "?" }.joined(separator: ", ")
-            whereClauses.append("""
-                NOT EXISTS (
-                    SELECT 1 FROM segment_tag st_exclude
-                    WHERE st_exclude.segmentId = f.segmentId
-                    AND st_exclude.tagId IN (\(tagPlaceholders))
-                )
-                """)
-        }
-
-        // Hidden filter: Exclude segments with hidden tag (when .hide mode)
-        // Skip for Rewind database - it doesn't have segment_tag table
-        if shouldApplyTagFilters && filters.hiddenFilter == .hide, cachedHiddenTagId != nil {
-            whereClauses.append("""
-                NOT EXISTS (
-                    SELECT 1 FROM segment_tag st_hidden
-                    WHERE st_hidden.segmentId = f.segmentId
-                    AND st_hidden.tagId = ?
-                )
-                """)
-        }
-
-        if let commentClause = Self.buildCommentFilterClause(
-            filters.commentFilter,
+        let filterComponents = Self.buildFrameFilterQueryComponents(
+            filters: filters,
+            config: config,
+            hiddenTagId: hiddenTagId,
             isRewindDatabase: isRewindDatabase,
-            segmentIDExpression: "f.segmentId"
-        ) {
-            whereClauses.append(commentClause)
-        }
-
+            includeSourceBoundary: false
+        )
+        whereClauses.append(contentsOf: filterComponents.whereClauses)
         let whereClause = whereClauses.joined(separator: " AND ")
 
-        // Rewind database doesn't have processingStatus column
-        let processingStatusColumn = config.source == .rewind ? "-1 as processingStatus" : "f.processingStatus"
-        let redactionReasonColumn = config.source == .rewind ? "NULL as redactionReason" : "f.redactionReason"
+        // Normalize native-only frame columns across Retrace and Rewind.
+        let projection = Self.frameWithVideoProjection(source: config.source, tableAlias: "f")
 
         // CTE filters tags first (small set), then joins with frames using segmentId index
         let sql = """
-            \(combinedCTE)
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
-                   s.bundleID, s.windowName, s.browserUrl, \(config.source == .rewind ? "NULL" : "f.mousePosition"), \(config.source == .rewind ? "NULL" : "f.scrollPosition"), \(config.source == .rewind ? "NULL" : "f.videoCurrentTime"),
-                   v.path, v.frameRate, v.width, v.height
+            \(filterComponents.combinedCTE)
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, \(projection.encodedAtColumn), \(projection.processingStatusColumn), \(projection.redactionReasonColumn),
+                   \(projection.captureTriggerColumn),
+                   s.bundleID, s.windowName, s.browserUrl, \(projection.mousePositionColumn), \(projection.scrollPositionColumn), \(projection.videoCurrentTimeColumn),
+                   \(Self.videoInfoProjection(source: config.source, frameAlias: "f", videoAlias: "v"))
             FROM frame f
             INNER JOIN segment s ON f.segmentId = s.id
-            \(tagJoin)
+            \(filterComponents.tagJoin)
             LEFT JOIN video v ON f.videoId = v.id
             WHERE \(whereClause)
             ORDER BY f.createdAt ASC
@@ -2464,15 +2232,12 @@ public actor DataAdapter {
         }
         defer { connection.finalize(statement) }
 
-        var currentBindIndex = 1
-
-        // Bind tag IDs (they appear in the CTE) - ONLY for include mode
-        if hasTagFilter && tagFilterMode == .include {
-            for (index, tagId) in tagsToFilter.enumerated() {
-                sqlite3_bind_int64(statement, Int32(currentBindIndex + index), tagId)
-            }
-            currentBindIndex += tagsToFilter.count
-        }
+        var currentBindIndex: Int32 = 1
+        currentBindIndex = Self.bindFrameFilterCTEValues(
+            filterComponents,
+            to: statement,
+            startingAt: currentBindIndex
+        )
 
         // Bind timestamps
         config.bindDate(effectiveStartDate, to: statement, at: Int32(currentBindIndex))
@@ -2480,47 +2245,19 @@ public actor DataAdapter {
         config.bindDate(effectiveEndDate, to: statement, at: Int32(currentBindIndex))
         currentBindIndex += 1
 
-        // Bind app bundle IDs
-        if let apps = filters.selectedApps, !apps.isEmpty {
-            for (index, app) in apps.enumerated() {
-                sqlite3_bind_text(statement, Int32(currentBindIndex + index), (app as NSString).utf8String, -1, nil)
-            }
-            currentBindIndex += apps.count
-        }
-
-        for metadataValue in metadataBindValues {
-            if let stringValue = metadataValue as? String {
-                sqlite3_bind_text(statement, Int32(currentBindIndex), (stringValue as NSString).utf8String, -1, nil)
-                currentBindIndex += 1
-            }
-        }
-
-        for date in dateRangeFilter.bindValues {
-            config.bindDate(date, to: statement, at: Int32(currentBindIndex))
-            currentBindIndex += 1
-        }
-
-        // Bind tag IDs for exclude mode (NOT EXISTS in WHERE clause)
-        if hasTagFilter && tagFilterMode == .exclude {
-            for (index, tagId) in tagsToFilter.enumerated() {
-                sqlite3_bind_int64(statement, Int32(currentBindIndex + index), tagId)
-            }
-            currentBindIndex += tagsToFilter.count
-        }
-
-        // Bind hidden tag ID for NOT EXISTS clause (if applicable)
-        // Skip for Rewind database - it doesn't have segment_tag table
-        if shouldApplyTagFilters && filters.hiddenFilter == .hide, let hiddenTagId = cachedHiddenTagId {
-            sqlite3_bind_int64(statement, Int32(currentBindIndex), hiddenTagId)
-            currentBindIndex += 1
-        }
+        currentBindIndex = Self.bindFrameFilterWhereValues(
+            filterComponents,
+            to: statement,
+            config: config,
+            startingAt: currentBindIndex
+        )
 
         // Bind limit
         sqlite3_bind_int(statement, Int32(currentBindIndex), Int32(limit))
 
         var frames: [FrameWithVideoInfo] = []
         while sqlite3_step(statement) == SQLITE_ROW {
-            if let frameWithVideo = try? parseFrameWithVideoInfo(statement: statement, config: config) {
+            if let frameWithVideo = try? Self.parseFrameWithVideoInfo(statement: statement, config: config) {
                 frames.append(frameWithVideo)
             }
         }
@@ -2528,7 +2265,7 @@ public actor DataAdapter {
         return frames
     }
 
-    private func queryFramesWithVideoInfoBefore(
+    private static func queryFramesWithVideoInfoBefore(
         timestamp: Date,
         limit: Int,
         connection: DatabaseConnection,
@@ -2540,12 +2277,18 @@ public actor DataAdapter {
 
         // Build WHERE clause based on filters
         var whereClauses = ["createdAt < ?"]
+        if let visibilityClause = Self.nativeVisibleFrameClause(
+            frameAlias: nil,
+            isRewindDatabase: config.source == .rewind
+        ) {
+            whereClauses.append(visibilityClause)
+        }
         var bindIndex = 2 // 1 is for timestamp
 
         // App filter (include or exclude mode)
         if let apps = filters?.selectedApps, !apps.isEmpty {
             let filterMode = filters?.appFilterMode ?? .include
-            whereClauses.append(buildAppFilterClause(apps: apps, mode: filterMode))
+            whereClauses.append(Self.buildAppFilterClause(apps: apps, mode: filterMode))
         }
 
         // Tag filter - need to join with segment_tag
@@ -2565,19 +2308,17 @@ public actor DataAdapter {
 
         let whereClause = whereClauses.joined(separator: " AND ")
 
-        // Rewind database doesn't have processingStatus column
-        let processingStatusColumn = config.source == .rewind ? "-1 as processingStatus" : "f.processingStatus"
-        let redactionReasonColumn = config.source == .rewind ? "NULL as redactionReason" : "f.redactionReason"
-        let subqueryProcessingStatus = config.source == .rewind ? "-1 as processingStatus" : "processingStatus"
-        let subqueryRedactionReason = config.source == .rewind ? "NULL as redactionReason" : "redactionReason"
-        let subqueryVideoCurrentTime = config.source == .rewind ? "NULL as videoCurrentTime" : "videoCurrentTime"
+        // Normalize native-only frame columns across Retrace and Rewind.
+        let projection = Self.frameWithVideoProjection(source: config.source, tableAlias: "f")
+        let subqueryProjection = Self.frameWithVideoSubqueryProjection(source: config.source)
 
         let sql = """
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
-                   s.bundleID, s.windowName, s.browserUrl, \(config.source == .rewind ? "NULL" : "f.mousePosition"), \(config.source == .rewind ? "NULL" : "f.scrollPosition"), \(config.source == .rewind ? "NULL" : "f.videoCurrentTime"),
-                   v.path, v.frameRate, v.width, v.height
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, \(projection.encodedAtColumn), \(projection.processingStatusColumn), \(projection.redactionReasonColumn),
+                   \(projection.captureTriggerColumn),
+                   s.bundleID, s.windowName, s.browserUrl, \(projection.mousePositionColumn), \(projection.scrollPositionColumn), \(projection.videoCurrentTimeColumn),
+                   \(Self.videoInfoProjection(source: config.source, frameAlias: "f", videoAlias: "v"))
             FROM (
-                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, \(subqueryProcessingStatus), \(subqueryRedactionReason), \(config.source == .rewind ? "NULL as mousePosition" : "mousePosition"), \(config.source == .rewind ? "NULL as scrollPosition" : "scrollPosition"), \(subqueryVideoCurrentTime)
+                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, \(subqueryProjection.encodedAtColumn), \(subqueryProjection.processingStatusColumn), \(subqueryProjection.redactionReasonColumn), \(subqueryProjection.captureTriggerColumn), \(subqueryProjection.mousePositionColumn), \(subqueryProjection.scrollPositionColumn), \(subqueryProjection.videoCurrentTimeColumn)
                 FROM frame
                 WHERE \(whereClause)
                 ORDER BY createdAt DESC
@@ -2621,7 +2362,7 @@ public actor DataAdapter {
 
         var frames: [FrameWithVideoInfo] = []
         while sqlite3_step(statement) == SQLITE_ROW {
-            if let frameWithVideo = try? parseFrameWithVideoInfo(statement: statement, config: config) {
+            if let frameWithVideo = try? Self.parseFrameWithVideoInfo(statement: statement, config: config) {
                 frames.append(frameWithVideo)
             }
         }
@@ -2629,7 +2370,7 @@ public actor DataAdapter {
         return frames
     }
 
-    private func queryFramesWithVideoInfoAfter(
+    private static func queryFramesWithVideoInfoAfter(
         timestamp: Date,
         limit: Int,
         connection: DatabaseConnection,
@@ -2640,12 +2381,18 @@ public actor DataAdapter {
 
         // Build WHERE clause based on filters
         var whereClauses = ["createdAt > ?"]
+        if let visibilityClause = Self.nativeVisibleFrameClause(
+            frameAlias: nil,
+            isRewindDatabase: config.source == .rewind
+        ) {
+            whereClauses.append(visibilityClause)
+        }
         var bindIndex = 2 // 1 is for timestamp
 
         // App filter (include or exclude mode)
         if let apps = filters?.selectedApps, !apps.isEmpty {
             let filterMode = filters?.appFilterMode ?? .include
-            whereClauses.append(buildAppFilterClause(apps: apps, mode: filterMode))
+            whereClauses.append(Self.buildAppFilterClause(apps: apps, mode: filterMode))
         }
 
         // Tag filter - need to join with segment_tag
@@ -2665,19 +2412,17 @@ public actor DataAdapter {
 
         let whereClause = whereClauses.joined(separator: " AND ")
 
-        // Rewind database doesn't have processingStatus column
-        let processingStatusColumn = config.source == .rewind ? "-1 as processingStatus" : "f.processingStatus"
-        let redactionReasonColumn = config.source == .rewind ? "NULL as redactionReason" : "f.redactionReason"
-        let subqueryProcessingStatus = config.source == .rewind ? "-1 as processingStatus" : "processingStatus"
-        let subqueryRedactionReason = config.source == .rewind ? "NULL as redactionReason" : "redactionReason"
-        let subqueryVideoCurrentTime = config.source == .rewind ? "NULL as videoCurrentTime" : "videoCurrentTime"
+        // Normalize native-only frame columns across Retrace and Rewind.
+        let projection = Self.frameWithVideoProjection(source: config.source, tableAlias: "f")
+        let subqueryProjection = Self.frameWithVideoSubqueryProjection(source: config.source)
 
         let sql = """
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
-                   s.bundleID, s.windowName, s.browserUrl, \(config.source == .rewind ? "NULL" : "f.mousePosition"), \(config.source == .rewind ? "NULL" : "f.scrollPosition"), \(config.source == .rewind ? "NULL" : "f.videoCurrentTime"),
-                   v.path, v.frameRate, v.width, v.height
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, \(projection.encodedAtColumn), \(projection.processingStatusColumn), \(projection.redactionReasonColumn),
+                   \(projection.captureTriggerColumn),
+                   s.bundleID, s.windowName, s.browserUrl, \(projection.mousePositionColumn), \(projection.scrollPositionColumn), \(projection.videoCurrentTimeColumn),
+                   \(Self.videoInfoProjection(source: config.source, frameAlias: "f", videoAlias: "v"))
             FROM (
-                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, \(subqueryProcessingStatus), \(subqueryRedactionReason), \(config.source == .rewind ? "NULL as mousePosition" : "mousePosition"), \(config.source == .rewind ? "NULL as scrollPosition" : "scrollPosition"), \(subqueryVideoCurrentTime)
+                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, \(subqueryProjection.encodedAtColumn), \(subqueryProjection.processingStatusColumn), \(subqueryProjection.redactionReasonColumn), \(subqueryProjection.captureTriggerColumn), \(subqueryProjection.mousePositionColumn), \(subqueryProjection.scrollPositionColumn), \(subqueryProjection.videoCurrentTimeColumn)
                 FROM frame
                 WHERE \(whereClause)
                 ORDER BY createdAt ASC
@@ -2721,7 +2466,7 @@ public actor DataAdapter {
 
         var frames: [FrameWithVideoInfo] = []
         while sqlite3_step(statement) == SQLITE_ROW {
-            if let frameWithVideo = try? parseFrameWithVideoInfo(statement: statement, config: config) {
+            if let frameWithVideo = try? Self.parseFrameWithVideoInfo(statement: statement, config: config) {
                 frames.append(frameWithVideo)
             }
         }
@@ -2729,26 +2474,30 @@ public actor DataAdapter {
         return frames
     }
 
-    private func queryFrameWithVideoInfoByID(
+    private static func queryFrameWithVideoInfoByID(
         id: FrameID,
         connection: DatabaseConnection,
         config: DatabaseConfig
     ) throws -> FrameWithVideoInfo? {
-        // Rewind database doesn't have processingStatus column
-        let processingStatusColumn = config.source == .rewind ? "-1 as processingStatus" : "f.processingStatus"
-        let redactionReasonColumn = config.source == .rewind ? "NULL as redactionReason" : "f.redactionReason"
+        // Normalize native-only frame columns across Retrace and Rewind.
+        let projection = Self.frameWithVideoProjection(source: config.source, tableAlias: "f")
 
         let sourceBoundaryFilter = Self.buildSourceBoundaryClause(config: config, columnName: "f.createdAt")
         let boundaryClause = sourceBoundaryFilter.clause.map { " AND \($0)" } ?? ""
+        let visibilityClause = Self.nativeVisibleFrameClause(
+            frameAlias: "f",
+            isRewindDatabase: config.source == .rewind
+        ).map { " AND \($0)" } ?? ""
 
         let sql = """
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
-                   s.bundleID, s.windowName, s.browserUrl, \(config.source == .rewind ? "NULL" : "f.mousePosition"), \(config.source == .rewind ? "NULL" : "f.scrollPosition"), \(config.source == .rewind ? "NULL" : "f.videoCurrentTime"),
-                   v.path, v.frameRate, v.width, v.height
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, \(projection.encodedAtColumn), \(projection.processingStatusColumn), \(projection.redactionReasonColumn),
+                   \(projection.captureTriggerColumn),
+                   s.bundleID, s.windowName, s.browserUrl, \(projection.mousePositionColumn), \(projection.scrollPositionColumn), \(projection.videoCurrentTimeColumn),
+                   \(Self.videoInfoProjection(source: config.source, frameAlias: "f", videoAlias: "v"))
             FROM frame f
             LEFT JOIN segment s ON f.segmentId = s.id
             LEFT JOIN video v ON f.videoId = v.id
-            WHERE f.id = ?\(boundaryClause)
+            WHERE f.id = ?\(visibilityClause)\(boundaryClause)
             """
 
         guard let statement = try? connection.prepare(sql: sql) else { return nil }
@@ -2763,7 +2512,7 @@ public actor DataAdapter {
 
         guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
 
-        return try parseFrameWithVideoInfo(statement: statement, config: config)
+        return try Self.parseFrameWithVideoInfo(statement: statement, config: config)
     }
 
     private func getFrameVideoInfo(
@@ -2774,11 +2523,17 @@ public actor DataAdapter {
     ) throws -> FrameVideoInfo? {
         guard config.contains(timestamp) else { return nil }
 
+        let visibilityClause = Self.nativeVisibleFrameClause(
+            frameAlias: "f",
+            isRewindDatabase: config.source == .rewind
+        ).map { " AND \($0)" } ?? ""
+
         let sql = """
             SELECT v.id, v.path, v.width, v.height, v.frameRate, f.videoFrameIndex
             FROM frame f
             LEFT JOIN video v ON f.videoId = v.id
             WHERE f.createdAt = ?
+            \(visibilityClause)
             LIMIT 1;
             """
 
@@ -2789,7 +2544,7 @@ public actor DataAdapter {
 
         guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
 
-        guard let relativePath = getTextOrNil(statement, 1) else { return nil }
+        guard let relativePath = Self.getTextOrNil(statement, 1) else { return nil }
 
         let width = Int(sqlite3_column_int(statement, 2))
         let height = Int(sqlite3_column_int(statement, 3))
@@ -2807,7 +2562,7 @@ public actor DataAdapter {
         )
     }
 
-    private func querySegments(
+    private static func querySegments(
         from startDate: Date,
         to endDate: Date,
         connection: DatabaseConnection,
@@ -2828,7 +2583,7 @@ public actor DataAdapter {
 
         var segments: [Segment] = []
         while sqlite3_step(statement) == SQLITE_ROW {
-            if let segment = try? parseSegment(statement: statement, config: config) {
+            if let segment = try? Self.parseSegment(statement: statement, config: config) {
                 segments.append(segment)
             }
         }
@@ -2840,7 +2595,11 @@ public actor DataAdapter {
         guard config.contains(timestamp) else { return [] }
 
         // First find the frame ID
-        let frameSql = "SELECT id FROM frame WHERE createdAt = ? LIMIT 1;"
+        let visibilityClause = Self.nativeVisibleFrameClause(
+            frameAlias: nil,
+            isRewindDatabase: config.source == .rewind
+        ).map { " AND \($0)" } ?? ""
+        let frameSql = "SELECT id FROM frame WHERE createdAt = ?\(visibilityClause) LIMIT 1;"
         guard let frameStatement = try? connection.prepare(sql: frameSql) else { return [] }
         defer { connection.finalize(frameStatement) }
 
@@ -2870,6 +2629,10 @@ public actor DataAdapter {
                 """
             encryptedTextColumn = "n.encryptedText as encryptedText"
         }
+        let visibilityClause = Self.nativeVisibleFrameClause(
+            frameAlias: "f",
+            isRewindDatabase: config.source == .rewind
+        ).map { " AND \($0)" } ?? ""
         let sql = """
             SELECT
                 n.id,
@@ -2885,9 +2648,11 @@ public actor DataAdapter {
                 \(encryptedTextColumn),
                 n.frameId
             FROM node n
+            JOIN frame f ON f.id = n.frameId
             LEFT JOIN doc_segment ds ON n.frameId = ds.frameId
             LEFT JOIN searchRanking_content sc ON ds.docid = sc.id
             WHERE n.frameId = ?
+            \(visibilityClause)
             ORDER BY n.nodeOrder ASC;
             """
 
@@ -2906,13 +2671,16 @@ public actor DataAdapter {
         return nodes
     }
 
-    private func queryDistinctApps(connection: DatabaseConnection, config: DatabaseConfig) throws -> [String] {
-        let sourceBoundaryFilter = Self.buildSourceBoundaryClause(config: config, columnName: "f.createdAt")
+    private static func queryDistinctApps(connection: DatabaseConnection, config: DatabaseConfig) throws -> [String] {
+        let sourceBoundaryFilter = Self.buildSegmentOverlapBoundaryClause(
+            config: config,
+            startColumnName: "s.startDate",
+            endColumnName: "s.endDate"
+        )
         let boundaryClause = sourceBoundaryFilter.clause.map { " AND \($0)" } ?? ""
         let sql = """
             SELECT DISTINCT s.bundleID
             FROM segment s
-            JOIN frame f ON f.segmentId = s.id
             WHERE s.bundleID IS NOT NULL AND s.bundleID != ''\(boundaryClause)
             LIMIT 100;
             """
@@ -2939,11 +2707,16 @@ public actor DataAdapter {
         guard config.contains(timestamp) else { return nil }
 
         // Get frameId and browserUrl
+        let visibilityClause = Self.nativeVisibleFrameClause(
+            frameAlias: "f",
+            isRewindDatabase: config.source == .rewind
+        ).map { " AND \($0)" } ?? ""
         let frameSQL = """
             SELECT f.id, s.browserUrl
             FROM frame f
             LEFT JOIN segment s ON f.segmentId = s.id
             WHERE f.createdAt = ?
+            \(visibilityClause)
             LIMIT 1;
             """
 
@@ -3174,19 +2947,14 @@ public actor DataAdapter {
     ) throws -> SearchResults {
         let startTime = Date()
         let ftsQueryComponents = parseFTSQueryComponents(query.text)
-        let rawFTSQuery = buildFTSQuery(ftsQueryComponents)
         let ftsQuery = scopeToSearchableTextColumns(ftsQueryComponents)
         let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
         let redactionReasonColumn = source == .rewind ? "NULL as redaction_reason" : "f.redactionReason as redaction_reason"
+        let captureTriggerColumn = source == .rewind ? "NULL as capture_trigger" : "f.capture_trigger as capture_trigger"
         let normalizedOffset = max(0, query.offset)
         let rankCursor = decodeRelevantCursor(sourceCursor)
         let rawBatchLimit = max(query.limit, Self.searchAllRawBatchSize)
         let batchOffset: Int? = rankCursor == nil ? normalizedOffset : nil
-
-        Log.info(
-            "[DataAdapter.searchRelevant] Starting: rawFTSQuery='\(rawFTSQuery)', scopedFTSQuery='\(ftsQuery)', source=\(source), appFilter=\(query.filters.appBundleIDs ?? []), windowNameFilter=\(query.filters.windowNameFilter ?? "nil"), browserUrlFilter=\(query.filters.browserUrlFilter ?? "nil"), hasCursor=\(rankCursor != nil)",
-            category: .app
-        )
 
         // Build WHERE conditions for the batch query (filters applied after FTS subquery).
         var outerWhereConditions: [String] = []
@@ -3204,6 +2972,12 @@ public actor DataAdapter {
         if let sourceBoundaryClause = sourceBoundaryFilter.clause {
             outerWhereConditions.append(sourceBoundaryClause)
             outerBindValues.append(contentsOf: sourceBoundaryFilter.bindValues.map(config.formatDate))
+        }
+        if let visibilityClause = Self.nativeVisibleFrameClause(
+            frameAlias: "f",
+            isRewindDatabase: source == .rewind
+        ) {
+            outerWhereConditions.append(visibilityClause)
         }
 
         // App include filter
@@ -3310,8 +3084,7 @@ public actor DataAdapter {
             cursorConditions.append("(r.rank > ? OR (r.rank = ? AND f.id > ?))")
         }
 
-        let dedupeTokens = parseSearchDedupeTokens(query.text)
-        let highlightTerms = dedupeTokens.map(\.matchingTerm).filter { !$0.isEmpty }
+        let highlightTerms = parseSearchDedupeTokens(query.text).map(\.matchingTerm).filter { !$0.isEmpty }
         let visibleNodeTextSQL = isRewind
             ? "SUBSTR(COALESCE(sc.c0, '') || COALESCE(sc.c1, ''), n.textOffset + 1, n.textLength)"
             : """
@@ -3336,6 +3109,7 @@ public actor DataAdapter {
             let videoPath: String?
             let videoFrameRate: Double?
             let redactionReason: String?
+            let captureTrigger: FrameCaptureTrigger?
             let appBundleID: String?
             let windowName: String?
             let browserUrl: String?
@@ -3371,13 +3145,14 @@ public actor DataAdapter {
                     v.path AS video_path,
                     v.frameRate AS video_frame_rate,
                     \(redactionReasonColumn),
+                    \(captureTriggerColumn),
                     s.bundleID AS bundle_id,
                     s.windowName AS window_name,
                     s.browserUrl AS browser_url,
                     r.rank AS rank,
                     r.docid AS docid
                 FROM ranked r
-                JOIN \(Self.currentFrameDocSegmentSQL) ds ON r.docid = ds.docid
+                JOIN doc_segment ds ON r.docid = ds.docid
                 JOIN frame f ON ds.frameId = f.id
                 JOIN segment s ON f.segmentId = s.id
                 LEFT JOIN video v ON v.id = f.videoId
@@ -3411,14 +3186,14 @@ public actor DataAdapter {
                     ) AS node_text_signature,
                     ROW_NUMBER() OVER (
                         PARTITION BY b.frame_id, b.docid
-                        ORDER BY n.nodeOrder ASC
+                        ORDER BY n.nodeOrder DESC
                     ) AS rn
                 FROM batch b
                 JOIN node n ON n.frameId = b.frame_id
                 JOIN searchRanking_content sc ON sc.id = b.docid
                 WHERE \(highlightMatchClause)
             ),
-            first_node AS MATERIALIZED (
+            selected_node AS MATERIALIZED (
                 SELECT
                     frame_id,
                     docid,
@@ -3441,6 +3216,7 @@ public actor DataAdapter {
                 b.video_path,
                 b.video_frame_rate,
                 b.redaction_reason,
+                b.capture_trigger,
                 b.bundle_id,
                 b.window_name,
                 b.browser_url,
@@ -3454,14 +3230,12 @@ public actor DataAdapter {
                 fn.node_height,
                 fn.node_text_signature
             FROM batch b
-            LEFT JOIN first_node fn ON fn.frame_id = b.frame_id AND fn.docid = b.docid
+            LEFT JOIN selected_node fn ON fn.frame_id = b.frame_id AND fn.docid = b.docid
             ORDER BY b.rank ASC, b.frame_id ASC
             """
 
-        Log.info("[DataAdapter.searchRelevant] SQL: \(sql.replacingOccurrences(of: "\n", with: " "))", category: .app)
-
         guard let statement = try? connection.prepare(sql: sql) else {
-            return SearchResults(query: query, results: [], totalCount: 0, searchTimeMs: 0)
+            return SearchResults(query: query, results: [], searchTimeMs: 0)
         }
         defer { connection.finalize(statement) }
 
@@ -3520,26 +3294,29 @@ public actor DataAdapter {
                 return sqlite3_column_double(statement, 6)
             }()
             let redactionReason = sqlite3_column_text(statement, 7).map { String(cString: $0) }
-            let appBundleID = sqlite3_column_text(statement, 8).map { String(cString: $0) }
-            let windowName = sqlite3_column_text(statement, 9).map { String(cString: $0) }
-            let browserUrl = sqlite3_column_text(statement, 10).map { String(cString: $0) }
-            let rank = sqlite3_column_double(statement, 11)
-            let docID = sqlite3_column_int64(statement, 12)
+            let captureTrigger = sqlite3_column_text(statement, 8)
+                .map { String(cString: $0) }
+                .flatMap(FrameCaptureTrigger.init(rawValue:))
+            let appBundleID = sqlite3_column_text(statement, 9).map { String(cString: $0) }
+            let windowName = sqlite3_column_text(statement, 10).map { String(cString: $0) }
+            let browserUrl = sqlite3_column_text(statement, 11).map { String(cString: $0) }
+            let rank = sqlite3_column_double(statement, 12)
+            let docID = sqlite3_column_int64(statement, 13)
 
             let highlightNode: SearchResult.HighlightNode?
-            if sqlite3_column_type(statement, 13) != SQLITE_NULL {
+            if sqlite3_column_type(statement, 14) != SQLITE_NULL {
                 highlightNode = SearchResult.HighlightNode(
-                    nodeID: sqlite3_column_int64(statement, 13),
-                    nodeOrder: Int(sqlite3_column_int(statement, 14)),
-                    x: sqlite3_column_double(statement, 15),
-                    y: sqlite3_column_double(statement, 16),
-                    width: sqlite3_column_double(statement, 17),
-                    height: sqlite3_column_double(statement, 18)
+                    nodeID: sqlite3_column_int64(statement, 14),
+                    nodeOrder: Int(sqlite3_column_int(statement, 15)),
+                    x: sqlite3_column_double(statement, 16),
+                    y: sqlite3_column_double(statement, 17),
+                    width: sqlite3_column_double(statement, 18),
+                    height: sqlite3_column_double(statement, 19)
                 )
             } else {
                 highlightNode = nil
             }
-            let highlightTextSignature = sqlite3_column_text(statement, 19).map { String(cString: $0) }
+            let highlightTextSignature = sqlite3_column_text(statement, 20).map { String(cString: $0) }
 
             batch.append(
                 RelevantSearchRow(
@@ -3551,6 +3328,7 @@ public actor DataAdapter {
                     videoPath: videoPath,
                     videoFrameRate: videoFrameRate,
                     redactionReason: redactionReason,
+                    captureTrigger: captureTrigger,
                     appBundleID: appBundleID,
                     windowName: windowName,
                     browserUrl: browserUrl,
@@ -3564,56 +3342,25 @@ public actor DataAdapter {
 
         let sourceRowsFetched = batch.count
         var dedupedRows: [RelevantSearchRow] = []
-        var recentAnchors: [SearchDedupeMatchBox] = []
-        var recentWindowNameSignatures: [String] = []
-        var droppedByPosition = 0
-        var droppedByWindowName = 0
+        var recentAcceptedCandidates: [SearchDedupeCandidate] = []
 
         for row in batch {
-            let currentWindowNameSignature = normalizedWindowNameSignature(row.windowName)
-            if let highlightNode = row.highlightNode {
-                let currentAnchor = SearchDedupeMatchBox(
-                    label: "highlight",
-                    textSignature: normalizedSearchDedupeTextSignature(row.highlightTextSignature) ?? "",
-                    nodeOrder: highlightNode.nodeOrder,
-                    xBin: quantizedNodeBin(highlightNode.x),
-                    yBin: quantizedNodeBin(highlightNode.y),
-                    wBin: max(1, quantizedNodeBin(highlightNode.width)),
-                    hBin: max(1, quantizedNodeBin(highlightNode.height))
-                )
-                if recentAnchors.contains(where: { areConsecutiveDedupeBoxesSimilar($0, currentAnchor) }) {
-                    droppedByPosition += 1
-                    continue
-                }
-                recentAnchors.append(currentAnchor)
-                if recentAnchors.count > Self.searchDedupeLookbackWindow {
-                    recentAnchors.removeFirst(recentAnchors.count - Self.searchDedupeLookbackWindow)
-                }
-            } else {
-                recentAnchors.removeAll(keepingCapacity: true)
-            }
-
-            if let currentWindowNameSignature,
-               recentWindowNameSignatures.contains(where: { areConsecutiveWindowNamesSimilar($0, currentWindowNameSignature) }) {
-                droppedByWindowName += 1
+            let currentCandidate = makeSearchDedupeCandidate(
+                highlightTextSignature: row.highlightTextSignature,
+                highlightNode: row.highlightNode
+            )
+            if shouldDeduplicateSearchResult(currentCandidate, recentAccepted: recentAcceptedCandidates) {
                 continue
             }
 
             dedupedRows.append(row)
-            if let currentWindowNameSignature {
-                recentWindowNameSignatures.append(currentWindowNameSignature)
-                if recentWindowNameSignatures.count > Self.searchDedupeLookbackWindow {
-                    recentWindowNameSignatures.removeFirst(recentWindowNameSignatures.count - Self.searchDedupeLookbackWindow)
-                }
-            } else {
-                recentWindowNameSignatures.removeAll(keepingCapacity: true)
+            recentAcceptedCandidates.append(currentCandidate)
+            if recentAcceptedCandidates.count > Self.searchDedupeLookbackWindow {
+                recentAcceptedCandidates.removeFirst(
+                    recentAcceptedCandidates.count - Self.searchDedupeLookbackWindow
+                )
             }
         }
-
-        Log.info(
-            "[DataAdapter.searchRelevant] Deduped single batch: tokens=\(dedupeTokens.count), lookback=\(Self.searchDedupeLookbackWindow), rawBatchLimit=\(rawBatchLimit), fetchedRows=\(sourceRowsFetched), keptRows=\(dedupedRows.count), droppedByPosition=\(droppedByPosition), droppedByWindowName=\(droppedByWindowName), offset=\(normalizedOffset), hasCursor=\(rankCursor != nil)",
-            category: .app
-        )
 
         let nextSourceCursor: SearchSourceCursor?
         if sourceRowsFetched == rawBatchLimit, let lastFetched = batch.last {
@@ -3632,26 +3379,9 @@ public actor DataAdapter {
             return SearchPageCursor(native: nextSourceCursor)
         }()
 
-        let lowerBound = rankCursor == nil ? (normalizedOffset + dedupedRows.count) : dedupedRows.count
-        let effectiveTotalCount: Int
-        if sourceRowsFetched < rawBatchLimit, rankCursor == nil {
-            effectiveTotalCount = lowerBound
-        } else {
-            let filteredTotalCount = getSearchTotalCount(
-                ftsQuery: ftsQuery,
-                connection: connection,
-                whereConditions: outerWhereConditions,
-                bindValues: outerBindValues,
-                tagJoin: tagJoin,
-                tagJoinBindValues: tagJoinBindValues
-            )
-            effectiveTotalCount = max(filteredTotalCount, lowerBound)
-        }
-
         guard !dedupedRows.isEmpty else {
             let elapsed = Int(Date().timeIntervalSince(startTime) * 1000)
-            Log.info("[DataAdapter.searchRelevant] Completed in \(elapsed)ms, found 0 results", category: .app)
-            return SearchResults(query: query, results: [], totalCount: effectiveTotalCount, searchTimeMs: elapsed, nextCursor: nextCursor)
+            return SearchResults(query: query, results: [], searchTimeMs: elapsed, nextCursor: nextCursor)
         }
 
         let results = dedupedRows.map { row in
@@ -3668,6 +3398,7 @@ public actor DataAdapter {
                     windowName: row.windowName,
                     browserURL: row.browserUrl,
                     redactionReason: row.redactionReason,
+                    captureTrigger: row.captureTrigger,
                     displayID: 0
                 ),
                 segmentID: AppSegmentID(value: row.segmentId),
@@ -3681,12 +3412,10 @@ public actor DataAdapter {
         }
 
         let totalElapsed = Int(Date().timeIntervalSince(startTime) * 1000)
-        Log.info("[DataAdapter.searchRelevant] Completed in \(totalElapsed)ms, found \(results.count) results", category: .app)
 
         return SearchResults(
             query: query,
             results: results,
-            totalCount: effectiveTotalCount,
             searchTimeMs: totalElapsed,
             nextCursor: nextCursor
         )
@@ -3702,10 +3431,10 @@ public actor DataAdapter {
     ) throws -> SearchResults {
         let startTime = Date()
         let ftsQueryComponents = parseFTSQueryComponents(query.text)
-        let rawFTSQuery = buildFTSQuery(ftsQueryComponents)
         let ftsQuery = scopeToSearchableTextColumns(ftsQueryComponents)
         let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
         let redactionReasonColumn = source == .rewind ? "NULL as redaction_reason" : "f.redactionReason as redaction_reason"
+        let captureTriggerColumn = source == .rewind ? "NULL as capture_trigger" : "f.capture_trigger as capture_trigger"
         let normalizedOffset = max(0, query.offset)
 
         // Build WHERE conditions for outer query
@@ -3724,6 +3453,12 @@ public actor DataAdapter {
         if let sourceBoundaryClause = sourceBoundaryFilter.clause {
             whereConditions.append(sourceBoundaryClause)
             bindValues.append(contentsOf: sourceBoundaryFilter.bindValues.map(config.formatDate))
+        }
+        if let visibilityClause = Self.nativeVisibleFrameClause(
+            frameAlias: "f",
+            isRewindDatabase: source == .rewind
+        ) {
+            whereConditions.append(visibilityClause)
         }
 
         // App include filter
@@ -3864,8 +3599,7 @@ public actor DataAdapter {
         // The no-filter fast path limits candidate docids before joining frames.
         // If this stays DESC unconditionally, oldest-first can never surface old matches.
         let ftsCandidateOrderClause = query.sortOrder == .newestFirst ? "DESC" : "ASC"
-        let dedupeTokens = parseSearchDedupeTokens(query.text)
-        let highlightTerms = dedupeTokens.map(\.matchingTerm).filter { !$0.isEmpty }
+        let highlightTerms = parseSearchDedupeTokens(query.text).map(\.matchingTerm).filter { !$0.isEmpty }
 
         struct FrameSearchRow {
             let frameId: Int64
@@ -3876,6 +3610,7 @@ public actor DataAdapter {
             let videoPath: String?
             let videoFrameRate: Double?
             let redactionReason: String?
+            let captureTrigger: FrameCaptureTrigger?
             let appBundleID: String?
             let windowName: String?
             let browserUrl: String?
@@ -3904,7 +3639,7 @@ public actor DataAdapter {
             }.joined(separator: " OR ")
         }()
 
-        func fetchFrameBatch(limit: Int, offset: Int?, cursor: FrameCursor?) -> [FrameSearchRow] {
+        func fetchFrameBatch(limit: Int, offset: Int?, cursor: FrameCursor?) throws -> [FrameSearchRow] {
             let isOffsetQuery = offset != nil
             let canUseRewindDocIDFastPath = useRewindDocIDFastPath && cursor == nil
 
@@ -3943,12 +3678,13 @@ public actor DataAdapter {
                         v.path AS video_path,
                         v.frameRate AS video_frame_rate,
                         \(redactionReasonColumn),
+                        \(captureTriggerColumn),
                         s.bundleID AS bundle_id,
                         s.windowName AS window_name,
                         s.browserUrl AS browser_url,
                         d.docid AS docid
                     FROM fts_docs d
-                    JOIN \(Self.currentFrameDocSegmentSQL) ds ON ds.docid = d.docid
+                    JOIN doc_segment ds ON ds.docid = d.docid
                     JOIN frame f ON f.id = ds.frameId
                     JOIN segment s ON s.id = f.segmentId
                     LEFT JOIN video v ON v.id = f.videoId
@@ -3974,12 +3710,13 @@ public actor DataAdapter {
                         v.path AS video_path,
                         v.frameRate AS video_frame_rate,
                         \(redactionReasonColumn),
+                        \(captureTriggerColumn),
                         s.bundleID AS bundle_id,
                         s.windowName AS window_name,
                         s.browserUrl AS browser_url,
                         ds.docid AS docid
                     FROM fts_matches fts
-                    JOIN \(Self.currentFrameDocSegmentSQL) ds ON fts.docid = ds.docid
+                    JOIN doc_segment ds ON fts.docid = ds.docid
                     JOIN frame f ON ds.frameId = f.id
                     JOIN segment s ON f.segmentId = s.id
                     LEFT JOIN video v ON v.id = f.videoId
@@ -4018,11 +3755,12 @@ public actor DataAdapter {
                         v.path AS video_path,
                         v.frameRate AS video_frame_rate,
                         \(redactionReasonColumn),
+                        \(captureTriggerColumn),
                         s.bundleID AS bundle_id,
                         s.windowName AS window_name,
                         s.browserUrl AS browser_url,
                         ds.docid AS docid
-                    FROM \(Self.currentFrameDocSegmentSQL) ds
+                    FROM doc_segment ds
                     JOIN frame f ON ds.frameId = f.id
                     JOIN segment s ON s.id = f.segmentId
                     LEFT JOIN video v ON v.id = f.videoId
@@ -4067,14 +3805,14 @@ public actor DataAdapter {
                         ) AS node_text_signature,
                         ROW_NUMBER() OVER (
                             PARTITION BY b.frame_id, b.docid
-                            ORDER BY n.nodeOrder ASC
+                            ORDER BY n.nodeOrder DESC
                         ) AS rn
                     FROM batch b
                     JOIN node n ON n.frameId = b.frame_id
                     JOIN searchRanking_content sc ON sc.id = b.docid
                     WHERE \(highlightMatchClause)
                 ),
-                first_node AS MATERIALIZED (
+                selected_node AS MATERIALIZED (
                     SELECT
                         frame_id,
                         docid,
@@ -4097,6 +3835,7 @@ public actor DataAdapter {
                     b.video_path,
                     b.video_frame_rate,
                     b.redaction_reason,
+                    b.capture_trigger,
                     b.bundle_id,
                     b.window_name,
                     b.browser_url,
@@ -4109,13 +3848,15 @@ public actor DataAdapter {
                     fn.node_height,
                     fn.node_text_signature
                 FROM batch b
-                LEFT JOIN first_node fn ON fn.frame_id = b.frame_id AND fn.docid = b.docid
+                LEFT JOIN selected_node fn ON fn.frame_id = b.frame_id AND fn.docid = b.docid
                 ORDER BY b.timestamp \(sortOrderClause), b.frame_id \(sortOrderClause)
                 """
 
-            guard let statement = try? connection.prepare(sql: sql) else {
-                Log.error("[DataAdapter.searchAll] Failed to prepare SQL statement", category: .app)
-                return []
+            guard let statement = try connection.prepare(sql: sql) else {
+                throw DatabaseConnectionError.statementPreparationFailed(
+                    sql: sql,
+                    error: "Prepared statement was nil"
+                )
             }
             defer { connection.finalize(statement) }
 
@@ -4148,19 +3889,22 @@ public actor DataAdapter {
                     return sqlite3_column_double(statement, 6)
                 }()
                 let redactionReason = sqlite3_column_text(statement, 7).map { String(cString: $0) }
-                let appBundleID = sqlite3_column_text(statement, 8).map { String(cString: $0) }
-                let windowName = sqlite3_column_text(statement, 9).map { String(cString: $0) }
-                let browserUrl = sqlite3_column_text(statement, 10).map { String(cString: $0) }
-                let docID = sqlite3_column_int64(statement, 11)
+                let captureTrigger = sqlite3_column_text(statement, 8)
+                    .map { String(cString: $0) }
+                    .flatMap(FrameCaptureTrigger.init(rawValue:))
+                let appBundleID = sqlite3_column_text(statement, 9).map { String(cString: $0) }
+                let windowName = sqlite3_column_text(statement, 10).map { String(cString: $0) }
+                let browserUrl = sqlite3_column_text(statement, 11).map { String(cString: $0) }
+                let docID = sqlite3_column_int64(statement, 12)
 
                 let highlightNode: SearchResult.HighlightNode?
-                if sqlite3_column_type(statement, 12) != SQLITE_NULL {
-                    let nodeID = sqlite3_column_int64(statement, 12)
-                    let nodeOrder = Int(sqlite3_column_int(statement, 13))
-                    let x = sqlite3_column_double(statement, 14)
-                    let y = sqlite3_column_double(statement, 15)
-                    let width = sqlite3_column_double(statement, 16)
-                    let height = sqlite3_column_double(statement, 17)
+                if sqlite3_column_type(statement, 13) != SQLITE_NULL {
+                    let nodeID = sqlite3_column_int64(statement, 13)
+                    let nodeOrder = Int(sqlite3_column_int(statement, 14))
+                    let x = sqlite3_column_double(statement, 15)
+                    let y = sqlite3_column_double(statement, 16)
+                    let width = sqlite3_column_double(statement, 17)
+                    let height = sqlite3_column_double(statement, 18)
                     highlightNode = SearchResult.HighlightNode(
                         nodeID: nodeID,
                         nodeOrder: nodeOrder,
@@ -4172,7 +3916,7 @@ public actor DataAdapter {
                 } else {
                     highlightNode = nil
                 }
-                let highlightTextSignature = sqlite3_column_text(statement, 18).map { String(cString: $0) }
+                let highlightTextSignature = sqlite3_column_text(statement, 19).map { String(cString: $0) }
 
                 batchRows.append(
                     FrameSearchRow(
@@ -4184,6 +3928,7 @@ public actor DataAdapter {
                         videoPath: videoPath,
                         videoFrameRate: videoFrameRate,
                         redactionReason: redactionReason,
+                        captureTrigger: captureTrigger,
                         appBundleID: appBundleID,
                         windowName: windowName,
                         browserUrl: browserUrl,
@@ -4197,69 +3942,32 @@ public actor DataAdapter {
             return batchRows
         }
 
-        var frameResults: [FrameSearchRow] = []
-        let queryStepStartTime = Date()
         let frameCursor = sourceCursor.map { FrameCursor(timestamp: $0.timestamp, frameId: $0.frameID) }
         let batchFetchLimit = max(query.limit, Self.searchAllRawBatchSize)
         let batchOffset: Int? = frameCursor == nil ? normalizedOffset : nil
-        let batch = fetchFrameBatch(limit: batchFetchLimit, offset: batchOffset, cursor: frameCursor)
+        let batch = try fetchFrameBatch(limit: batchFetchLimit, offset: batchOffset, cursor: frameCursor)
         let sourceRowsFetched = batch.count
         var dedupedRows: [FrameSearchRow] = []
-        var recentAnchors: [SearchDedupeMatchBox] = []
-        var recentWindowNameSignatures: [String] = []
-        var droppedByPosition = 0
-        var droppedByWindowName = 0
+        var recentAcceptedCandidates: [SearchDedupeCandidate] = []
 
         for row in batch {
-            let currentWindowNameSignature = normalizedWindowNameSignature(row.windowName)
-            if let highlightNode = row.highlightNode {
-                let currentAnchor = SearchDedupeMatchBox(
-                    label: "highlight",
-                    textSignature: normalizedSearchDedupeTextSignature(row.highlightTextSignature) ?? "",
-                    nodeOrder: highlightNode.nodeOrder,
-                    xBin: quantizedNodeBin(highlightNode.x),
-                    yBin: quantizedNodeBin(highlightNode.y),
-                    wBin: max(1, quantizedNodeBin(highlightNode.width)),
-                    hBin: max(1, quantizedNodeBin(highlightNode.height))
-                )
-                if recentAnchors.contains(where: { areConsecutiveDedupeBoxesSimilar($0, currentAnchor) }) {
-                    droppedByPosition += 1
-                    continue
-                }
-                recentAnchors.append(currentAnchor)
-                if recentAnchors.count > Self.searchDedupeLookbackWindow {
-                    recentAnchors.removeFirst(recentAnchors.count - Self.searchDedupeLookbackWindow)
-                }
-            } else {
-                // No highlight node available; keep row and reset positional streak.
-                recentAnchors.removeAll(keepingCapacity: true)
-            }
-
-            if let currentWindowNameSignature,
-               recentWindowNameSignatures.contains(where: { areConsecutiveWindowNamesSimilar($0, currentWindowNameSignature) }) {
-                droppedByWindowName += 1
+            let currentCandidate = makeSearchDedupeCandidate(
+                highlightTextSignature: row.highlightTextSignature,
+                highlightNode: row.highlightNode
+            )
+            if shouldDeduplicateSearchResult(currentCandidate, recentAccepted: recentAcceptedCandidates) {
                 continue
             }
 
             dedupedRows.append(row)
-            if let currentWindowNameSignature {
-                recentWindowNameSignatures.append(currentWindowNameSignature)
-                if recentWindowNameSignatures.count > Self.searchDedupeLookbackWindow {
-                    recentWindowNameSignatures.removeFirst(recentWindowNameSignatures.count - Self.searchDedupeLookbackWindow)
-                }
-            } else {
-                recentWindowNameSignatures.removeAll(keepingCapacity: true)
+            recentAcceptedCandidates.append(currentCandidate)
+            if recentAcceptedCandidates.count > Self.searchDedupeLookbackWindow {
+                recentAcceptedCandidates.removeFirst(
+                    recentAcceptedCandidates.count - Self.searchDedupeLookbackWindow
+                )
             }
         }
-
-        frameResults = dedupedRows
-        Log.info(
-            "[DataAdapter.searchAll] Deduped \(query.sortOrder.rawValue) single batch: tokens=\(dedupeTokens.count), lookback=\(Self.searchDedupeLookbackWindow), rawBatchLimit=\(batchFetchLimit), fetchedRows=\(sourceRowsFetched), keptRows=\(dedupedRows.count), droppedByPosition=\(droppedByPosition), droppedByWindowName=\(droppedByWindowName), returnedRows=\(frameResults.count), offset=\(normalizedOffset), limit=\(query.limit)",
-            category: .app
-        )
-
-        let queryElapsed = Int(Date().timeIntervalSince(queryStepStartTime) * 1000)
-        Log.info("[DataAdapter.searchAll] SQL+dedupe executed in \(queryElapsed)ms, found \(frameResults.count) frames, source: \(source)", category: .app)
+        let frameResults = dedupedRows
 
         let nextSourceCursor: SearchSourceCursor?
         if sourceRowsFetched == batchFetchLimit, let lastFetched = batch.last {
@@ -4275,25 +3983,9 @@ public actor DataAdapter {
             return SearchPageCursor(native: nextSourceCursor)
         }()
 
-        let lowerBound = normalizedOffset + frameResults.count
-        let effectiveTotalCount: Int
-        if sourceRowsFetched < batchFetchLimit, frameCursor == nil {
-            effectiveTotalCount = lowerBound
-        } else {
-            let filteredTotalCount = getSearchTotalCount(
-                ftsQuery: ftsQuery,
-                connection: connection,
-                whereConditions: whereConditions,
-                bindValues: bindValues,
-                tagJoin: tagJoin,
-                tagJoinBindValues: tagJoinBindValues
-            )
-            effectiveTotalCount = max(filteredTotalCount, lowerBound)
-        }
-
         guard !frameResults.isEmpty else {
             let elapsed = Int(Date().timeIntervalSince(startTime) * 1000)
-            return SearchResults(query: query, results: [], totalCount: effectiveTotalCount, searchTimeMs: elapsed, nextCursor: nextCursor)
+            return SearchResults(query: query, results: [], searchTimeMs: elapsed, nextCursor: nextCursor)
         }
 
         var results: [SearchResult] = []
@@ -4316,6 +4008,7 @@ public actor DataAdapter {
                     windowName: windowName,
                     browserURL: browserUrl,
                     redactionReason: frame.redactionReason,
+                    captureTrigger: frame.captureTrigger,
                     displayID: 0
                 ),
                 segmentID: AppSegmentID(value: frame.segmentId),
@@ -4331,7 +4024,7 @@ public actor DataAdapter {
         }
 
         let elapsed = Int(Date().timeIntervalSince(startTime) * 1000)
-        return SearchResults(query: query, results: results, totalCount: effectiveTotalCount, searchTimeMs: elapsed, nextCursor: nextCursor)
+        return SearchResults(query: query, results: results, searchTimeMs: elapsed, nextCursor: nextCursor)
     }
 
     private struct FTSQueryComponents {
@@ -4340,103 +4033,28 @@ public actor DataAdapter {
     }
 
     private static func parseFTSQueryComponents(_ text: String) -> FTSQueryComponents {
-        let tokens = tokenizeSearchQuery(text)
         var includeParts: [String] = []
         var excludeTerms: [String] = []
 
-        for token in tokens {
-            if token == "-" {
+        for token in Self.queryTokenizer.tokenize(text) {
+            let sanitized = token.sanitizedText
+            guard !sanitized.isEmpty else {
                 continue
             }
 
-            if token.hasPrefix("-") && token.count > 1 {
-                let rawExcluded = String(token.dropFirst())
-                if rawExcluded.hasPrefix("\""), rawExcluded.hasSuffix("\""), rawExcluded.count > 1 {
-                    let phrase = sanitizeFTSTerm(String(rawExcluded.dropFirst().dropLast()))
-                    if !phrase.isEmpty {
-                        excludeTerms.append("\"\(phrase)\"")
-                    }
-                } else {
-                    let term = sanitizeFTSTerm(rawExcluded)
-                    if !term.isEmpty {
-                        excludeTerms.append("\"\(term)\"")
-                    }
-                }
+            switch token.kind {
+            case .ignoredShellOption:
                 continue
-            }
-
-            if token.hasPrefix("\""), token.hasSuffix("\""), token.count > 1 {
-                let phrase = sanitizeFTSTerm(String(token.dropFirst().dropLast()))
-                if !phrase.isEmpty {
-                    includeParts.append("\"\(phrase)\"")
-                }
-            } else {
-                let term = sanitizeFTSTerm(token)
-                if !term.isEmpty {
-                    includeParts.append(formatUnquotedTerm(term))
-                }
+            case .excludedTerm, .excludedPhrase:
+                excludeTerms.append("\"\(sanitized)\"")
+            case .phrase:
+                includeParts.append("\"\(sanitized)\"")
+            case .term:
+                includeParts.append(formatUnquotedTerm(sanitized))
             }
         }
 
         return FTSQueryComponents(includeParts: includeParts, excludeTerms: excludeTerms)
-    }
-
-    private static func buildFTSQuery(_ text: String) -> String {
-        buildFTSQuery(parseFTSQueryComponents(text))
-    }
-
-    private static func buildFTSQuery(_ components: FTSQueryComponents) -> String {
-        // Exclusion-only queries are invalid in FTS syntax (`NOT x` cannot stand alone).
-        // Keep this path deterministic and return no rows.
-        guard !components.includeParts.isEmpty else {
-            return "\"__retrace_no_match__\""
-        }
-
-        let excludeParts = components.excludeTerms.map { "NOT \($0)" }
-        return (components.includeParts + excludeParts).joined(separator: " ")
-    }
-
-    /// Tokenize query while preserving quoted phrases and handling `-"phrase"` as one token.
-    private static func tokenizeSearchQuery(_ query: String) -> [String] {
-        var tokens: [String] = []
-        var current = ""
-        var inQuotes = false
-
-        for char in query {
-            if char == "\"" {
-                if inQuotes {
-                    current.append(char)
-                    tokens.append(current)
-                    current = ""
-                    inQuotes = false
-                } else {
-                    if current == "-" {
-                        current.append(char)
-                        inQuotes = true
-                        continue
-                    }
-                    if !current.isEmpty {
-                        tokens.append(current)
-                        current = ""
-                    }
-                    current.append(char)
-                    inQuotes = true
-                }
-            } else if char.isWhitespace && !inQuotes {
-                if !current.isEmpty {
-                    tokens.append(current)
-                    current = ""
-                }
-            } else {
-                current.append(char)
-            }
-        }
-
-        if !current.isEmpty {
-            tokens.append(current)
-        }
-
-        return tokens
     }
 
     /// Restrict FTS MATCH to content columns only (exclude window title metadata).
@@ -4516,7 +4134,7 @@ public actor DataAdapter {
         columnName: String,
         parsedFilter: ParsedMetadataStringFilter,
         whereConditions: inout [String],
-        bindValues: inout [Any]
+        bindValues: inout [String]
     ) {
         for term in parsedFilter.includeTerms {
             guard let predicate = metadataStringFilterPredicate(columnName: columnName, term: term, negate: false) else {
@@ -4533,6 +4151,22 @@ public actor DataAdapter {
             whereConditions.append("(\(predicate.clause))")
             bindValues.append(contentsOf: predicate.bindValues)
         }
+    }
+
+    private static func appendMetadataStringFilter(
+        columnName: String,
+        parsedFilter: ParsedMetadataStringFilter,
+        whereConditions: inout [String],
+        bindValues: inout [Any]
+    ) {
+        var stringBindValues: [String] = []
+        appendMetadataStringFilter(
+            columnName: columnName,
+            parsedFilter: parsedFilter,
+            whereConditions: &whereConditions,
+            bindValues: &stringBindValues
+        )
+        bindValues.append(contentsOf: stringBindValues)
     }
 
     private static func metadataStringFilterPredicate(
@@ -4607,15 +4241,6 @@ public actor DataAdapter {
         return collapsed.isEmpty ? nil : collapsed
     }
 
-    /// Remove characters that have special meaning in FTS query syntax.
-    private static func sanitizeFTSTerm(_ text: String) -> String {
-        text
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .replacingOccurrences(of: "\"", with: "")
-            .replacingOccurrences(of: "*", with: "")
-            .replacingOccurrences(of: ":", with: "")
-    }
-
     /// For unquoted terms, avoid prefix expansion on stopwords and very short tokens.
     /// This keeps terms like "a" as exact-token matches instead of broad "a*" prefix matches.
     private static func formatUnquotedTerm(_ term: String) -> String {
@@ -4680,90 +4305,75 @@ public actor DataAdapter {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalizedQuery.isEmpty else { return [] }
 
-        var tokens: [SearchDedupeToken] = []
+        var dedupeTokens: [SearchDedupeToken] = []
         var seenKeys = Set<String>()
 
         func appendToken(_ token: SearchDedupeToken) {
             if seenKeys.insert(token.dedupeKey).inserted {
-                tokens.append(token)
+                dedupeTokens.append(token)
             }
         }
 
-        for token in tokenizeSearchQuery(normalizedQuery) {
-            if token == "-" {
-                continue
-            }
+        for token in Self.queryTokenizer.tokenize(normalizedQuery) {
+            let sanitized = token.sanitizedText
+            guard !sanitized.isEmpty else { continue }
 
-            if token.hasPrefix("-"), token.count > 1 {
-                // Excluded query terms should not drive highlight matching / dedupe anchors.
+            switch token.kind {
+            case .excludedTerm, .excludedPhrase, .ignoredShellOption:
                 continue
+            case .phrase:
+                appendToken(.phrase(sanitized))
+            case .term:
+                let mode: SearchDedupeTermMatchMode = shouldUseExactMatch(sanitized) ? .exactWord : .wordPrefix
+                appendToken(.term(sanitized, mode: mode))
             }
-
-            if token.hasPrefix("\""), token.hasSuffix("\""), token.count > 1 {
-                let phrase = sanitizeFTSTerm(String(token.dropFirst().dropLast()))
-                if !phrase.isEmpty {
-                    appendToken(.phrase(phrase))
-                }
-                continue
-            }
-
-            let term = sanitizeFTSTerm(token)
-            guard !term.isEmpty else { continue }
-            let mode: SearchDedupeTermMatchMode = shouldUseExactMatch(term) ? .exactWord : .wordPrefix
-            appendToken(.term(term, mode: mode))
         }
 
-        return tokens
+        return dedupeTokens
     }
 
-    private struct SearchDedupeMatchBox: Hashable {
-        let label: String
-        let textSignature: String
-        let nodeOrder: Int
-        let xBin: Int
-        let yBin: Int
-        let wBin: Int
-        let hBin: Int
-
-        var minX: Double { Double(xBin) / 1000.0 }
-        var minY: Double { Double(yBin) / 1000.0 }
-        var width: Double { max(0.0, Double(wBin) / 1000.0) }
-        var height: Double { max(0.0, Double(hBin) / 1000.0) }
-        var maxX: Double { minX + width }
-        var maxY: Double { minY + height }
-        var centerX: Double { minX + (width / 2.0) }
-        var centerY: Double { minY + (height / 2.0) }
+    private struct SearchDedupeCandidate: Equatable {
+        let highlightTextSignature: String?
+        let highlightPosition: CGPoint?
     }
 
-    private static func areConsecutiveDedupeBoxesSimilar(
-        _ lhs: SearchDedupeMatchBox,
-        _ rhs: SearchDedupeMatchBox
+    private static func makeSearchDedupeCandidate(
+        highlightTextSignature: String?,
+        highlightNode: SearchResult.HighlightNode?
+    ) -> SearchDedupeCandidate {
+        SearchDedupeCandidate(
+            highlightTextSignature: normalizedSearchDedupeTextSignature(highlightTextSignature),
+            highlightPosition: highlightNode.map { CGPoint(x: $0.x, y: $0.y) }
+        )
+    }
+
+    private static func shouldDeduplicateSearchResult(
+        _ current: SearchDedupeCandidate,
+        recentAccepted: [SearchDedupeCandidate]
     ) -> Bool {
-        guard lhs.label == rhs.label else {
+        guard let currentHighlightTextSignature = current.highlightTextSignature,
+              let currentHighlightPosition = current.highlightPosition else {
             return false
         }
 
-        let widthRatio = ratioSimilarity(lhs.width, rhs.width)
-        let heightRatio = ratioSimilarity(lhs.height, rhs.height)
-        let sameText = !lhs.textSignature.isEmpty && lhs.textSignature == rhs.textSignature
-        let minWidthRatio = sameText ? Self.searchDedupeSameTextMinWidthRatio : Self.searchDedupeScrollShiftMinWidthRatio
-        let minHeightRatio = sameText ? Self.searchDedupeSameTextMinHeightRatio : Self.searchDedupeScrollShiftMinHeightRatio
-        let maxXDelta = sameText ? Self.searchDedupeSameTextMaxXDelta : Self.searchDedupeDifferentTextMaxXDelta
+        for previous in recentAccepted.suffix(Self.searchDedupeLookbackWindow) {
+            guard previous.highlightTextSignature == currentHighlightTextSignature,
+                  let previousHighlightPosition = previous.highlightPosition else {
+                continue
+            }
 
-        let xCenterDelta = abs(lhs.centerX - rhs.centerX)
-        if xCenterDelta <= maxXDelta &&
-            widthRatio >= minWidthRatio &&
-            heightRatio >= minHeightRatio {
-            return true
+            let xDelta = abs(previousHighlightPosition.x - currentHighlightPosition.x)
+            let yDelta = abs(previousHighlightPosition.y - currentHighlightPosition.y)
+            let isMeaningfullyDifferentPosition =
+                xDelta >= Self.searchDedupeDifferentPositionMinAxisDelta &&
+                yDelta >= Self.searchDedupeDifferentPositionMinAxisDelta
+
+            if !isMeaningfullyDifferentPosition {
+                return true
+            }
         }
 
         return false
-    }
-
-    private static func ratioSimilarity(_ lhs: Double, _ rhs: Double) -> Double {
-        let maxValue = max(lhs, rhs)
-        guard maxValue > 0.0 else { return 0.0 }
-        return min(lhs, rhs) / maxValue
     }
 
     private static func normalizedSearchDedupeTextSignature(_ text: String?) -> String? {
@@ -4774,44 +4384,13 @@ public actor DataAdapter {
             return nil
         }
 
+        let boundaryTrimSet = CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters)
         let normalized = raw
             .split(whereSeparator: { $0.isWhitespace })
             .joined(separator: " ")
+            .trimmingCharacters(in: boundaryTrimSet)
 
         return normalized.isEmpty ? nil : normalized
-    }
-
-    private static func normalizedWindowNameSignature(_ windowName: String?) -> String? {
-        guard let raw = windowName?
-            .lowercased()
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-              !raw.isEmpty else {
-            return nil
-        }
-
-        var normalized = ""
-        normalized.reserveCapacity(raw.count)
-
-        for scalar in raw.unicodeScalars {
-            if CharacterSet.letters.contains(scalar) {
-                normalized.unicodeScalars.append(scalar)
-            }
-        }
-
-        return normalized.isEmpty ? nil : normalized
-    }
-
-    private static func areConsecutiveWindowNamesSimilar(
-        _ lhs: String?,
-        _ rhs: String?
-    ) -> Bool {
-        guard let lhs, let rhs else { return false }
-        guard !lhs.isEmpty, !rhs.isEmpty else { return false }
-        return lhs == rhs
-    }
-
-    private static func quantizedNodeBin(_ value: Double) -> Int {
-        Int((value * 1000.0).rounded())
     }
 
     /// Relevant-mode cursor encoding.
@@ -4831,10 +4410,246 @@ public actor DataAdapter {
 
     /// Build SQL clause for app filtering (IN or NOT IN based on filter mode)
     /// Returns the SQL clause like "s.bundleID IN (?, ?, ?)" or "s.bundleID NOT IN (?, ?, ?)"
-    private func buildAppFilterClause(apps: Set<String>, mode: AppFilterMode, tableAlias: String = "s") -> String {
+    private static func buildAppFilterClause(apps: Set<String>, mode: AppFilterMode, tableAlias: String = "s") -> String {
         let placeholders = apps.map { _ in "?" }.joined(separator: ", ")
         let operator_ = mode == .include ? "IN" : "NOT IN"
         return "\(tableAlias).bundleID \(operator_) (\(placeholders))"
+    }
+
+    private static func nativeVisibleFrameClause(
+        frameAlias: String? = "f",
+        isRewindDatabase: Bool
+    ) -> String? {
+        guard !isRewindDatabase else { return nil }
+        let prefix = frameAlias.map { "\($0)." } ?? ""
+        return "(\(prefix)rewritePurpose IS NULL OR \(prefix)rewritePurpose != 'deletion')"
+    }
+
+    private struct FrameFilterQueryComponents {
+        let combinedCTE: String
+        let tagJoin: String
+        let whereClauses: [String]
+        let includedTagIDs: [Int64]
+        let appBundleIDs: [String]
+        let metadataBindValues: [String]
+        let dateRangeBounds: [Date]
+        let sourceBoundaryBounds: [Date]
+        let excludedTagIDs: [Int64]
+        let hiddenTagID: Int64?
+    }
+
+    private static func buildFrameFilterQueryComponents(
+        filters: FilterCriteria,
+        config: DatabaseConfig,
+        hiddenTagId: Int64?,
+        isRewindDatabase: Bool,
+        includeSourceBoundary: Bool = true
+    ) -> FrameFilterQueryComponents {
+        let shouldApplyTagFilters = !isRewindDatabase
+        let orderedTagIDs = resolvedOrderedTagIDs(
+            filters: filters,
+            hiddenTagId: hiddenTagId,
+            shouldApplyTagFilters: shouldApplyTagFilters
+        )
+        let appBundleIDs = filters.selectedApps?.sorted() ?? []
+        let windowNameFilter = Self.decodeMetadataStringFilter(filters.windowNameFilter)
+        let browserUrlFilter = Self.decodeMetadataStringFilter(filters.browserUrlFilter)
+
+        let tagFilterMode = filters.tagFilterMode
+        let hasTagFilter = !orderedTagIDs.isEmpty
+        let includedTagIDs: [Int64]
+        let excludedTagIDs: [Int64]
+        let combinedCTE: String
+        let tagJoin: String
+
+        if hasTagFilter, tagFilterMode == .include {
+            let tagPlaceholders = orderedTagIDs.map { _ in "?" }.joined(separator: ", ")
+            combinedCTE = """
+                WITH tagged_segments AS (
+                    SELECT DISTINCT segmentId
+                    FROM segment_tag
+                    WHERE tagId IN (\(tagPlaceholders))
+                )
+                """
+            tagJoin = "INNER JOIN tagged_segments ts ON f.segmentId = ts.segmentId"
+            includedTagIDs = orderedTagIDs
+            excludedTagIDs = []
+        } else {
+            combinedCTE = ""
+            tagJoin = ""
+            includedTagIDs = []
+            excludedTagIDs = hasTagFilter && tagFilterMode == .exclude ? orderedTagIDs : []
+        }
+
+        var whereClauses: [String] = []
+        var metadataBindValues: [String] = []
+
+        if let visibilityClause = Self.nativeVisibleFrameClause(
+            frameAlias: "f",
+            isRewindDatabase: isRewindDatabase
+        ) {
+            whereClauses.append(visibilityClause)
+        }
+
+        if !appBundleIDs.isEmpty {
+            whereClauses.append(Self.buildAppFilterClause(apps: Set(appBundleIDs), mode: filters.appFilterMode))
+        }
+
+        Self.appendMetadataStringFilter(
+            columnName: "s.browserUrl",
+            parsedFilter: browserUrlFilter,
+            whereConditions: &whereClauses,
+            bindValues: &metadataBindValues
+        )
+        Self.appendMetadataStringFilter(
+            columnName: "s.windowName",
+            parsedFilter: windowNameFilter,
+            whereConditions: &whereClauses,
+            bindValues: &metadataBindValues
+        )
+
+        let dateRangeFilter = Self.buildDateRangeUnionClause(
+            ranges: filters.effectiveDateRanges,
+            columnName: "f.createdAt"
+        )
+        if let dateRangeClause = dateRangeFilter.clause {
+            whereClauses.append(dateRangeClause)
+        }
+
+        let sourceBoundaryBounds: [Date]
+        if includeSourceBoundary {
+            let sourceBoundaryFilter = Self.buildSourceBoundaryClause(config: config, columnName: "f.createdAt")
+            if let sourceBoundaryClause = sourceBoundaryFilter.clause {
+                whereClauses.append(sourceBoundaryClause)
+            }
+            sourceBoundaryBounds = sourceBoundaryFilter.bindValues
+        } else {
+            sourceBoundaryBounds = []
+        }
+
+        if !excludedTagIDs.isEmpty {
+            let tagPlaceholders = excludedTagIDs.map { _ in "?" }.joined(separator: ", ")
+            whereClauses.append("""
+                NOT EXISTS (
+                    SELECT 1 FROM segment_tag st_exclude
+                    WHERE st_exclude.segmentId = f.segmentId
+                    AND st_exclude.tagId IN (\(tagPlaceholders))
+                )
+                """)
+        }
+
+        let hiddenTagID: Int64?
+        if shouldApplyTagFilters, filters.hiddenFilter == .hide, let hiddenTagId {
+            whereClauses.append("""
+                NOT EXISTS (
+                    SELECT 1 FROM segment_tag st_hidden
+                    WHERE st_hidden.segmentId = f.segmentId
+                    AND st_hidden.tagId = ?
+                )
+                """)
+            hiddenTagID = hiddenTagId
+        } else {
+            hiddenTagID = nil
+        }
+
+        if let commentClause = Self.buildCommentFilterClause(
+            filters.commentFilter,
+            isRewindDatabase: isRewindDatabase,
+            segmentIDExpression: "f.segmentId"
+        ) {
+            whereClauses.append(commentClause)
+        }
+
+        return FrameFilterQueryComponents(
+            combinedCTE: combinedCTE,
+            tagJoin: tagJoin,
+            whereClauses: whereClauses,
+            includedTagIDs: includedTagIDs,
+            appBundleIDs: appBundleIDs,
+            metadataBindValues: metadataBindValues,
+            dateRangeBounds: dateRangeFilter.bindValues,
+            sourceBoundaryBounds: sourceBoundaryBounds,
+            excludedTagIDs: excludedTagIDs,
+            hiddenTagID: hiddenTagID
+        )
+    }
+
+    private static func resolvedOrderedTagIDs(
+        filters: FilterCriteria,
+        hiddenTagId: Int64?,
+        shouldApplyTagFilters: Bool
+    ) -> [Int64] {
+        guard shouldApplyTagFilters else { return [] }
+
+        var tagsToFilter = filters.selectedTags ?? Set<Int64>()
+        if let hiddenTagId {
+            switch filters.hiddenFilter {
+            case .hide:
+                break
+            case .onlyHidden:
+                tagsToFilter = [hiddenTagId]
+            case .showAll:
+                break
+            }
+        }
+
+        return tagsToFilter.sorted()
+    }
+
+    @discardableResult
+    private static func bindFrameFilterCTEValues(
+        _ components: FrameFilterQueryComponents,
+        to statement: OpaquePointer,
+        startingAt bindIndex: Int32
+    ) -> Int32 {
+        var currentBindIndex = bindIndex
+        for tagId in components.includedTagIDs {
+            sqlite3_bind_int64(statement, currentBindIndex, tagId)
+            currentBindIndex += 1
+        }
+        return currentBindIndex
+    }
+
+    @discardableResult
+    private static func bindFrameFilterWhereValues(
+        _ components: FrameFilterQueryComponents,
+        to statement: OpaquePointer,
+        config: DatabaseConfig,
+        startingAt bindIndex: Int32
+    ) -> Int32 {
+        var currentBindIndex = bindIndex
+
+        for app in components.appBundleIDs {
+            sqlite3_bind_text(statement, currentBindIndex, (app as NSString).utf8String, -1, nil)
+            currentBindIndex += 1
+        }
+
+        for stringValue in components.metadataBindValues {
+            sqlite3_bind_text(statement, currentBindIndex, (stringValue as NSString).utf8String, -1, nil)
+            currentBindIndex += 1
+        }
+
+        for date in components.dateRangeBounds {
+            config.bindDate(date, to: statement, at: currentBindIndex)
+            currentBindIndex += 1
+        }
+
+        for date in components.sourceBoundaryBounds {
+            config.bindDate(date, to: statement, at: currentBindIndex)
+            currentBindIndex += 1
+        }
+
+        for tagId in components.excludedTagIDs {
+            sqlite3_bind_int64(statement, currentBindIndex, tagId)
+            currentBindIndex += 1
+        }
+
+        if let hiddenTagID = components.hiddenTagID {
+            sqlite3_bind_int64(statement, currentBindIndex, hiddenTagID)
+            currentBindIndex += 1
+        }
+
+        return currentBindIndex
     }
 
     /// Build SQL clause for comment-presence filtering.
@@ -4872,83 +4687,6 @@ public actor DataAdapter {
         }
     }
 
-    private static func getSearchTotalCount(
-        ftsQuery: String,
-        connection: DatabaseConnection,
-        whereConditions: [String],
-        bindValues: [Any],
-        tagJoin: String,
-        tagJoinBindValues: [Int64]
-    ) -> Int {
-        let trimmedTagJoin = tagJoin.trimmingCharacters(in: .whitespacesAndNewlines)
-        if whereConditions.isEmpty, trimmedTagJoin.isEmpty, tagJoinBindValues.isEmpty {
-            let countSQL = """
-                SELECT COUNT(*)
-                FROM searchRanking
-                WHERE searchRanking MATCH ?
-            """
-
-            guard let countStmt = try? connection.prepare(sql: countSQL) else { return 0 }
-            defer { connection.finalize(countStmt) }
-
-            let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-            sqlite3_bind_text(countStmt, 1, ftsQuery, -1, SQLITE_TRANSIENT)
-
-            if sqlite3_step(countStmt) == SQLITE_ROW {
-                return Int(sqlite3_column_int(countStmt, 0))
-            }
-            return 0
-        }
-
-        let whereClause = whereConditions.isEmpty ? "" : "WHERE " + whereConditions.joined(separator: " AND ")
-        let countSQL = """
-            WITH fts_matches AS MATERIALIZED (
-                SELECT rowid AS docid
-                FROM searchRanking
-                WHERE searchRanking MATCH ?
-            )
-            SELECT COUNT(DISTINCT f.id)
-            FROM fts_matches fts
-            JOIN \(Self.currentFrameDocSegmentSQL) ds ON fts.docid = ds.docid
-            JOIN frame f ON ds.frameId = f.id
-            JOIN segment s ON f.segmentId = s.id
-            \(tagJoin)
-            \(whereClause)
-        """
-
-        guard let countStmt = try? connection.prepare(sql: countSQL) else { return 0 }
-        defer { connection.finalize(countStmt) }
-
-        let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-        var bindIndex: Int32 = 1
-        sqlite3_bind_text(countStmt, bindIndex, ftsQuery, -1, SQLITE_TRANSIENT)
-        bindIndex += 1
-
-        for tagID in tagJoinBindValues {
-            sqlite3_bind_int64(countStmt, bindIndex, tagID)
-            bindIndex += 1
-        }
-
-        for value in bindValues {
-            if let stringValue = value as? String {
-                sqlite3_bind_text(countStmt, bindIndex, stringValue, -1, SQLITE_TRANSIENT)
-            } else if let int64Value = value as? Int64 {
-                sqlite3_bind_int64(countStmt, bindIndex, int64Value)
-            } else if let intValue = value as? Int {
-                sqlite3_bind_int64(countStmt, bindIndex, Int64(intValue))
-            } else {
-                sqlite3_bind_null(countStmt, bindIndex)
-            }
-            bindIndex += 1
-        }
-
-        if sqlite3_step(countStmt) == SQLITE_ROW {
-            return Int(sqlite3_column_int(countStmt, 0))
-        }
-
-        return 0
-    }
-
     private func deleteFrames(frameIDs: [FrameID], connection: DatabaseConnection) throws {
         guard !frameIDs.isEmpty else { return }
         guard let db = connection.getConnection() else {
@@ -4959,7 +4697,7 @@ public actor DataAdapter {
 
     // MARK: - Row Parsing
 
-    private func parseFrameWithVideoInfo(statement: OpaquePointer, config: DatabaseConfig) throws -> FrameWithVideoInfo {
+    private static func parseFrameWithVideoInfo(statement: OpaquePointer, config: DatabaseConfig) throws -> FrameWithVideoInfo {
         let id = FrameID(value: sqlite3_column_int64(statement, 0))
 
         guard let timestamp = config.parseDate(from: statement, column: 1) else {
@@ -4970,23 +4708,26 @@ public actor DataAdapter {
         let videoID = VideoSegmentID(value: sqlite3_column_int64(statement, 3))
         let videoFrameIndex = Int(sqlite3_column_int(statement, 4))
 
-        let encodingStatusText = sqlite3_column_text(statement, 5)
-        let encodingStatusString = encodingStatusText != nil ? String(cString: encodingStatusText!) : "pending"
-        let encodingStatus = EncodingStatus(rawValue: encodingStatusString) ?? .pending
+        let encodedAt = config.parseDate(from: statement, column: 5)
         let processingStatus = Int(sqlite3_column_int(statement, 6))
 
-        let redactionReason = getTextOrNil(statement, 7)
-        let bundleID = getTextOrNil(statement, 8) ?? ""
-        let windowName = getTextOrNil(statement, 9)
-        let browserUrl = getTextOrNil(statement, 10)
-        let mousePosition = decodeStoredPoint(getTextOrNil(statement, 11))
-        let scrollY = decodeStoredPoint(getTextOrNil(statement, 12))?.y
-        let videoCurrentTime = sqlite3_column_type(statement, 13) != SQLITE_NULL ? sqlite3_column_double(statement, 13) : nil
+        let redactionReason = Self.getTextOrNil(statement, 7)
+        let captureTrigger = Self.getTextOrNil(statement, 8).flatMap(FrameCaptureTrigger.init(rawValue:))
+        let bundleID = Self.getTextOrNil(statement, 9) ?? ""
+        let windowName = Self.getTextOrNil(statement, 10)
+        let browserUrl = Self.getTextOrNil(statement, 11)
+        let mousePosition = Self.decodeStoredPoint(Self.getTextOrNil(statement, 12))
+        let scrollY = Self.decodeStoredPoint(Self.getTextOrNil(statement, 13))?.y
+        let videoCurrentTime = sqlite3_column_type(statement, 14) != SQLITE_NULL ? sqlite3_column_double(statement, 14) : nil
 
-        let videoPath = getTextOrNil(statement, 14)
-        let frameRate = sqlite3_column_type(statement, 15) != SQLITE_NULL ? sqlite3_column_double(statement, 15) : nil
-        let width = sqlite3_column_type(statement, 16) != SQLITE_NULL ? Int(sqlite3_column_int(statement, 16)) : nil
-        let height = sqlite3_column_type(statement, 17) != SQLITE_NULL ? Int(sqlite3_column_int(statement, 17)) : nil
+        let videoPath = Self.getTextOrNil(statement, 15)
+        let frameRate = sqlite3_column_type(statement, 16) != SQLITE_NULL ? sqlite3_column_double(statement, 16) : nil
+        let width = sqlite3_column_type(statement, 17) != SQLITE_NULL ? Int(sqlite3_column_int(statement, 17)) : nil
+        let height = sqlite3_column_type(statement, 18) != SQLITE_NULL ? Int(sqlite3_column_int(statement, 18)) : nil
+        let videoProcessingState = sqlite3_column_type(statement, 19) != SQLITE_NULL ? Int(sqlite3_column_int(statement, 19)) : 0
+        let fileSizeBytes = sqlite3_column_type(statement, 20) != SQLITE_NULL ? sqlite3_column_int64(statement, 20) : nil
+        let frameCount = sqlite3_column_type(statement, 21) != SQLITE_NULL ? Int(sqlite3_column_int(statement, 21)) : nil
+        let videoReencodedAt = config.parseDate(from: statement, column: 22)
 
         let metadata = FrameMetadata(
             appBundleID: bundleID.isEmpty ? nil : bundleID,
@@ -4994,6 +4735,7 @@ public actor DataAdapter {
             windowName: windowName,
             browserURL: browserUrl,
             redactionReason: redactionReason,
+            captureTrigger: captureTrigger,
             displayID: 0,
             mousePosition: mousePosition.map { CGPoint(x: $0.x, y: $0.y) }
         )
@@ -5004,7 +4746,7 @@ public actor DataAdapter {
             segmentID: segmentID,
             videoID: videoID,
             frameIndexInSegment: videoFrameIndex,
-            encodingStatus: encodingStatus,
+            encodedAt: encodedAt,
             metadata: metadata,
             source: config.source
         )
@@ -5017,7 +4759,11 @@ public actor DataAdapter {
                 frameIndex: videoFrameIndex,
                 frameRate: rate,
                 width: w,
-                height: h
+                height: h,
+                isVideoFinalized: videoProcessingState == 0,
+                videoReencodedAt: videoReencodedAt,
+                fileSizeBytes: fileSizeBytes,
+                frameCount: frameCount
             )
         } else {
             videoInfo = nil
@@ -5032,17 +4778,17 @@ public actor DataAdapter {
         )
     }
 
-    private func parseSegment(statement: OpaquePointer, config: DatabaseConfig) throws -> Segment {
+    private static func parseSegment(statement: OpaquePointer, config: DatabaseConfig) throws -> Segment {
         let id = SegmentID(value: sqlite3_column_int64(statement, 0))
-        let bundleID = getTextOrNil(statement, 1) ?? ""
+        let bundleID = Self.getTextOrNil(statement, 1) ?? ""
 
         guard let startDate = config.parseDate(from: statement, column: 2),
               let endDate = config.parseDate(from: statement, column: 3) else {
             throw DataAdapterError.parseFailed
         }
 
-        let windowName = getTextOrNil(statement, 4)
-        let browserUrl = getTextOrNil(statement, 5)
+        let windowName = Self.getTextOrNil(statement, 4)
+        let browserUrl = Self.getTextOrNil(statement, 5)
         let type = Int(sqlite3_column_int(statement, 6))
 
         return Segment(
@@ -5085,7 +4831,7 @@ public actor DataAdapter {
         )
     }
 
-    private func getTextOrNil(_ statement: OpaquePointer, _ column: Int32) -> String? {
+    private static func getTextOrNil(_ statement: OpaquePointer, _ column: Int32) -> String? {
         guard sqlite3_column_type(statement, column) != SQLITE_NULL else { return nil }
         guard let cString = sqlite3_column_text(statement, column) else { return nil }
         return String(cString: cString)
@@ -5093,21 +4839,76 @@ public actor DataAdapter {
 
     // MARK: - Combined Statistics (Retrace + Rewind)
 
-    /// Get distinct dates that have frames from both Retrace and Rewind sources
-    /// Returns dates sorted in descending order (newest first)
-    public func getDistinctDates() throws -> [Date] {
+    /// Get distinct dates that have frames from both Retrace and Rewind sources.
+    /// When active filters are provided, only dates matching those filters are returned.
+    /// Returns dates sorted in descending order (newest first).
+    public func getDistinctDates(filters: FilterCriteria? = nil) async throws -> [Date] {
+        if let filters, filters.hasActiveFilters {
+            return try await getDistinctDatesWithFilters(filters)
+        }
+
         var allDates = Set<Date>()
         let calendar = Calendar.current
 
         // Get dates from Retrace
-        let retraceDates = try queryDistinctDates(connection: retraceConnection, config: effectiveRetraceConfig)
+        let retraceDates = try await withNativeRead(operation: "data_adapter.distinct_dates.native") { connection, config in
+            try Self.queryDistinctDates(connection: connection, config: config)
+        }
         for date in retraceDates {
             allDates.insert(calendar.startOfDay(for: date))
         }
 
         // Get dates from Rewind if connected
-        if let rewind = rewindConnection, let config = rewindConfig {
-            let rewindDates = try queryDistinctDates(connection: rewind, config: config)
+        if hasRewindReadSource {
+            let rewindDates = try await withRewindRead(operation: "data_adapter.distinct_dates.rewind") { connection, config in
+                try Self.queryDistinctDates(connection: connection, config: config)
+            }
+            for date in rewindDates {
+                allDates.insert(calendar.startOfDay(for: date))
+            }
+        }
+
+        return Array(allDates).sorted { $0 > $1 }
+    }
+
+    private func getDistinctDatesWithFilters(_ filters: FilterCriteria) async throws -> [Date] {
+        var allDates = Set<Date>()
+        let calendar = Calendar.current
+        let hiddenTagId = cachedHiddenTagId
+
+        let excludeRetrace = filters.selectedSources?.contains(.rewind) == true &&
+            filters.selectedSources?.contains(.native) == false
+        let excludeRewind = filters.selectedSources?.contains(.native) == true &&
+            filters.selectedSources?.contains(.rewind) == false
+        let hasRetraceOnlyFilters = requiresRetraceOnly(filters)
+        let effectiveDateRanges = filters.effectiveDateRanges
+        let hasRewindDateOverlap = hasDateRangeIntersectingRewind(effectiveDateRanges)
+
+        if !excludeRetrace {
+            let retraceDates = try await withNativeRead(operation: "data_adapter.distinct_dates.filtered.native") { connection, config in
+                try Self.queryDistinctDatesWithFilters(
+                    connection: connection,
+                    config: config,
+                    filters: filters,
+                    hiddenTagId: hiddenTagId,
+                    isRewindDatabase: false
+                )
+            }
+            for date in retraceDates {
+                allDates.insert(calendar.startOfDay(for: date))
+            }
+        }
+
+        if !excludeRewind, !hasRetraceOnlyFilters, hasRewindDateOverlap, hasRewindReadSource {
+            let rewindDates = try await withRewindRead(operation: "data_adapter.distinct_dates.filtered.rewind") { connection, config in
+                try Self.queryDistinctDatesWithFilters(
+                    connection: connection,
+                    config: config,
+                    filters: filters,
+                    hiddenTagId: hiddenTagId,
+                    isRewindDatabase: true
+                )
+            }
             for date in rewindDates {
                 allDates.insert(calendar.startOfDay(for: date))
             }
@@ -5117,9 +4918,19 @@ public actor DataAdapter {
     }
 
     /// Query distinct dates from a specific connection
-    private func queryDistinctDates(connection: DatabaseConnection, config: DatabaseConfig) throws -> [Date] {
+    private static func queryDistinctDates(connection: DatabaseConnection, config: DatabaseConfig) throws -> [Date] {
         let sourceBoundaryFilter = Self.buildSourceBoundaryClause(config: config, columnName: "createdAt")
-        let whereClause = sourceBoundaryFilter.clause.map { "WHERE \($0)" } ?? ""
+        var whereClauses: [String] = []
+        if let visibilityClause = Self.nativeVisibleFrameClause(
+            frameAlias: nil,
+            isRewindDatabase: config.source == .rewind
+        ) {
+            whereClauses.append(visibilityClause)
+        }
+        if let boundaryClause = sourceBoundaryFilter.clause {
+            whereClauses.append(boundaryClause)
+        }
+        let whereClause = whereClauses.isEmpty ? "" : "WHERE " + whereClauses.joined(separator: " AND ")
 
         let sql: String
         if config.dateFormatter == nil {
@@ -5160,6 +4971,64 @@ public actor DataAdapter {
         return dates
     }
 
+    private static func queryDistinctDatesWithFilters(
+        connection: DatabaseConnection,
+        config: DatabaseConfig,
+        filters: FilterCriteria,
+        hiddenTagId: Int64?,
+        isRewindDatabase: Bool
+    ) throws -> [Date] {
+        let groupExpression = config.dateFormatter == nil
+            ? "date(f.createdAt / 1000, 'unixepoch', 'localtime')"
+            : "date(f.createdAt, 'localtime')"
+        let filterComponents = Self.buildFrameFilterQueryComponents(
+            filters: filters,
+            config: config,
+            hiddenTagId: hiddenTagId,
+            isRewindDatabase: isRewindDatabase
+        )
+        let whereClause = filterComponents.whereClauses.isEmpty
+            ? ""
+            : "WHERE " + filterComponents.whereClauses.joined(separator: " AND ")
+
+        let sql = """
+            \(filterComponents.combinedCTE)
+            SELECT MIN(f.createdAt) AS dayTimestamp
+            FROM frame f
+            INNER JOIN segment s ON f.segmentId = s.id
+            \(filterComponents.tagJoin)
+            \(whereClause)
+            GROUP BY \(groupExpression)
+            ORDER BY dayTimestamp DESC
+            """
+
+        guard let statement = try? connection.prepare(sql: sql) else {
+            return []
+        }
+        defer { connection.finalize(statement) }
+
+        var bindIndex: Int32 = 1
+        bindIndex = Self.bindFrameFilterCTEValues(
+            filterComponents,
+            to: statement,
+            startingAt: bindIndex
+        )
+        _ = Self.bindFrameFilterWhereValues(
+            filterComponents,
+            to: statement,
+            config: config,
+            startingAt: bindIndex
+        )
+
+        var dates: [Date] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard let date = config.parseDate(from: statement, column: 0) else { continue }
+            dates.append(date)
+        }
+
+        return dates
+    }
+
     /// Check if Rewind source is connected
     public var isRewindConnected: Bool {
         rewindConnection != nil
@@ -5169,7 +5038,7 @@ public actor DataAdapter {
     public func getRewindDistinctDates() throws -> [Date] {
         guard let rewind = rewindConnection else { return [] }
         guard let config = rewindConfig else { return [] }
-        return try queryDistinctDates(connection: rewind, config: config)
+        return try Self.queryDistinctDates(connection: rewind, config: config)
     }
 
     /// Get Rewind storage root path for storage calculations (returns nil if Rewind not connected)
@@ -5180,9 +5049,14 @@ public actor DataAdapter {
 
     // MARK: - Calendar Hours Query
 
-    /// Get distinct hours for a specific date that have frames
-    /// Queries both databases and merges results to show all available hours
-    public func getDistinctHoursForDate(_ date: Date) throws -> [Date] {
+    /// Get distinct hours for a specific date that have frames.
+    /// When active filters are provided, only hours matching those filters are returned.
+    /// Queries both databases and merges results to show all available hours.
+    public func getDistinctHoursForDate(_ date: Date, filters: FilterCriteria? = nil) async throws -> [Date] {
+        if let filters, filters.hasActiveFilters {
+            return try await getDistinctHoursForDateWithFilters(date, filters: filters)
+        }
+
         let calendar = Calendar.current
         let startOfDay = calendar.startOfDay(for: date)
         let endOfDay = calendar.date(byAdding: .day, value: 1, to: startOfDay)!
@@ -5190,22 +5064,26 @@ public actor DataAdapter {
         var allHours = Set<Date>()
 
         // Query Retrace database
-        let retraceHours = try queryDistinctHoursRetrace(
-            connection: retraceConnection,
-            config: effectiveRetraceConfig,
-            startOfDay: startOfDay,
-            endOfDay: endOfDay
-        )
-        allHours.formUnion(retraceHours)
-
-        // Query Rewind database if connected
-        if let rewind = rewindConnection, let config = rewindConfig {
-            let rewindHours = try queryDistinctHoursRewind(
-                connection: rewind,
+        let retraceHours = try await withNativeRead(operation: "data_adapter.distinct_hours.native") { connection, config in
+            try Self.queryDistinctHoursRetrace(
+                connection: connection,
                 config: config,
                 startOfDay: startOfDay,
                 endOfDay: endOfDay
             )
+        }
+        allHours.formUnion(retraceHours)
+
+        // Query Rewind database if connected
+        if hasRewindReadSource {
+            let rewindHours = try await withRewindRead(operation: "data_adapter.distinct_hours.rewind") { connection, config in
+                try Self.queryDistinctHoursRewind(
+                    connection: connection,
+                    config: config,
+                    startOfDay: startOfDay,
+                    endOfDay: endOfDay
+                )
+            }
             allHours.formUnion(rewindHours)
         }
 
@@ -5213,10 +5091,53 @@ public actor DataAdapter {
         return Array(allHours).sorted()
     }
 
+    private func getDistinctHoursForDateWithFilters(_ date: Date, filters: FilterCriteria) async throws -> [Date] {
+        var allHours = Set<Date>()
+        let hiddenTagId = cachedHiddenTagId
+
+        let excludeRetrace = filters.selectedSources?.contains(.rewind) == true &&
+            filters.selectedSources?.contains(.native) == false
+        let excludeRewind = filters.selectedSources?.contains(.native) == true &&
+            filters.selectedSources?.contains(.rewind) == false
+        let hasRetraceOnlyFilters = requiresRetraceOnly(filters)
+        let effectiveDateRanges = filters.effectiveDateRanges
+        let hasRewindDateOverlap = hasDateRangeIntersectingRewind(effectiveDateRanges)
+
+        if !excludeRetrace {
+            let retraceHours = try await withNativeRead(operation: "data_adapter.distinct_hours.filtered.native") { connection, config in
+                try Self.queryDistinctHoursForDateWithFilters(
+                    connection: connection,
+                    config: config,
+                    date: date,
+                    filters: filters,
+                    hiddenTagId: hiddenTagId,
+                    isRewindDatabase: false
+                )
+            }
+            allHours.formUnion(retraceHours)
+        }
+
+        if !excludeRewind, !hasRetraceOnlyFilters, hasRewindDateOverlap, hasRewindReadSource {
+            let rewindHours = try await withRewindRead(operation: "data_adapter.distinct_hours.filtered.rewind") { connection, config in
+                try Self.queryDistinctHoursForDateWithFilters(
+                    connection: connection,
+                    config: config,
+                    date: date,
+                    filters: filters,
+                    hiddenTagId: hiddenTagId,
+                    isRewindDatabase: true
+                )
+            }
+            allHours.formUnion(rewindHours)
+        }
+
+        return Array(allHours).sorted()
+    }
+
     /// Query distinct hours from Retrace database (INTEGER timestamps in milliseconds)
     /// Returns the actual first frame timestamp for each hour (not normalized to :00:00)
     /// so that navigation can find frames around that time
-    private func queryDistinctHoursRetrace(
+    private static func queryDistinctHoursRetrace(
         connection: DatabaseConnection,
         config: DatabaseConfig,
         startOfDay: Date,
@@ -5228,11 +5149,15 @@ public actor DataAdapter {
 
         let startMs = Int64(effectiveStartOfDay.timeIntervalSince1970 * 1000)
         let endMs = Int64(effectiveEndOfDay.timeIntervalSince1970 * 1000)
+        let visibilityClause = Self.nativeVisibleFrameClause(
+            frameAlias: nil,
+            isRewindDatabase: false
+        ) ?? "1 = 1"
 
         let sql = """
             SELECT MIN(createdAt) as hourTimestamp
             FROM frame
-            WHERE createdAt >= ? AND createdAt < ?
+            WHERE createdAt >= ? AND createdAt < ? AND \(visibilityClause)
             GROUP BY strftime('%H', createdAt / 1000, 'unixepoch', 'localtime')
             ORDER BY hourTimestamp ASC
             """
@@ -5259,7 +5184,7 @@ public actor DataAdapter {
     /// Query distinct hours from Rewind database (TEXT ISO8601 timestamps)
     /// Returns the actual first frame timestamp for each hour (not normalized to :00:00)
     /// so that navigation can find frames around that time
-    private func queryDistinctHoursRewind(
+    private static func queryDistinctHoursRewind(
         connection: DatabaseConnection,
         config: DatabaseConfig,
         startOfDay: Date,
@@ -5309,6 +5234,75 @@ public actor DataAdapter {
         }
 
         return hours
+    }
+
+    private static func queryDistinctHoursForDateWithFilters(
+        connection: DatabaseConnection,
+        config: DatabaseConfig,
+        date: Date,
+        filters: FilterCriteria,
+        hiddenTagId: Int64?,
+        isRewindDatabase: Bool
+    ) throws -> [Date] {
+        let calendar = Calendar.current
+        let startOfDay = calendar.startOfDay(for: date)
+        guard let endOfDay = calendar.date(byAdding: .day, value: 1, to: startOfDay) else {
+            return []
+        }
+
+        let groupExpression = config.dateFormatter == nil
+            ? "strftime('%H', f.createdAt / 1000, 'unixepoch', 'localtime')"
+            : "strftime('%H', f.createdAt, 'localtime')"
+        let filterComponents = Self.buildFrameFilterQueryComponents(
+            filters: filters,
+            config: config,
+            hiddenTagId: hiddenTagId,
+            isRewindDatabase: isRewindDatabase
+        )
+        var whereClauses = filterComponents.whereClauses
+        whereClauses.append("f.createdAt >= ?")
+        whereClauses.append("f.createdAt < ?")
+        let whereClause = "WHERE " + whereClauses.joined(separator: " AND ")
+
+        let sql = """
+            \(filterComponents.combinedCTE)
+            SELECT MIN(f.createdAt) AS hourTimestamp
+            FROM frame f
+            INNER JOIN segment s ON f.segmentId = s.id
+            \(filterComponents.tagJoin)
+            \(whereClause)
+            GROUP BY \(groupExpression)
+            ORDER BY hourTimestamp ASC
+            """
+
+        guard let statement = try? connection.prepare(sql: sql) else {
+            return []
+        }
+        defer { connection.finalize(statement) }
+
+        var bindIndex: Int32 = 1
+        bindIndex = Self.bindFrameFilterCTEValues(
+            filterComponents,
+            to: statement,
+            startingAt: bindIndex
+        )
+        bindIndex = Self.bindFrameFilterWhereValues(
+            filterComponents,
+            to: statement,
+            config: config,
+            startingAt: bindIndex
+        )
+        config.bindDate(startOfDay, to: statement, at: bindIndex)
+        bindIndex += 1
+        config.bindDate(endOfDay, to: statement, at: bindIndex)
+
+        var timestamps: [Date] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard let timestamp = config.parseDate(from: statement, column: 0) else { continue }
+            timestamps.append(timestamp)
+        }
+
+        return timestamps
     }
 }
 

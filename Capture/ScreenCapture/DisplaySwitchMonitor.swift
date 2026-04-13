@@ -15,6 +15,7 @@ actor DisplaySwitchMonitor {
     private var axObserver: AXObserver?
     private var observedApp: NSRunningApplication?
     private var refWrapper: DisplaySwitchMonitorRef?
+    private var nextWindowChangeEventID: UInt64 = 0
 
     /// Callback when display switch is detected
     nonisolated(unsafe) var onDisplaySwitch: (@Sendable (UInt32, UInt32) async -> Void)?
@@ -24,7 +25,7 @@ actor DisplaySwitchMonitor {
 
     /// Callback when active window changes (app switch or window focus change within app)
     /// Fires for immediate capture when captureOnWindowChange is enabled
-    nonisolated(unsafe) var onWindowChange: (@Sendable () async -> Void)?
+    nonisolated(unsafe) var onWindowChange: (@Sendable (WindowChangeEvent) async -> Void)?
 
     // MARK: - Initialization
 
@@ -46,10 +47,19 @@ actor DisplaySwitchMonitor {
             await self.setupAXObserverForFrontmostApp()
 
             // Observe when user switches to a different application
-            for await _ in center.notifications(named: NSWorkspace.didActivateApplicationNotification) {
+            for await notification in center.notifications(named: NSWorkspace.didActivateApplicationNotification) {
+                let activatedApp = Self.applicationSnapshot(
+                    notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+                )
+                let frontmostApp = Self.applicationSnapshot(NSWorkspace.shared.frontmostApplication)
+                let event = await self.makeWindowChangeEvent(
+                    source: .appActivation,
+                    activatedApp: activatedApp,
+                    workspaceFrontmostApp: frontmostApp
+                )
                 // Notify window change for immediate capture (app switch)
                 if let callback = self.onWindowChange {
-                    await callback()
+                    await callback(event)
                 }
                 await self.checkForDisplaySwitch()
                 // Re-setup AX observer for the new frontmost app
@@ -130,8 +140,6 @@ actor DisplaySwitchMonitor {
 
         self.axObserver = observer
         self.observedApp = app
-
-        Log.debug("[DisplaySwitchMonitor] AX observer set up for \(app.localizedName ?? "unknown")", category: .capture)
     }
 
     /// Remove the current AX observer
@@ -161,9 +169,17 @@ actor DisplaySwitchMonitor {
             return
         }
 
+        let frontmostApp = await MainActor.run {
+            Self.applicationSnapshot(NSWorkspace.shared.frontmostApplication)
+        }
+        let event = makeWindowChangeEvent(
+            source: .axActivation,
+            activatedApp: nil,
+            workspaceFrontmostApp: frontmostApp
+        )
         // Notify window change for immediate capture
         if let callback = onWindowChange {
-            await callback()
+            await callback(event)
         }
         // Then check for display switch
         await checkForDisplaySwitch()
@@ -198,6 +214,38 @@ actor DisplaySwitchMonitor {
     /// Get current display ID
     func getCurrentDisplayID() -> UInt32? {
         currentDisplayID
+    }
+
+    private func makeWindowChangeEvent(
+        source: WindowChangeEventSource,
+        activatedApp: CaptureAppSnapshot?,
+        workspaceFrontmostApp: CaptureAppSnapshot?
+    ) -> WindowChangeEvent {
+        nextWindowChangeEventID += 1
+        return WindowChangeEvent(
+            id: nextWindowChangeEventID,
+            source: source,
+            observedAt: Date(),
+            activatedApp: activatedApp,
+            workspaceFrontmostApp: workspaceFrontmostApp
+        )
+    }
+
+    @MainActor
+    private static func applicationSnapshot(_ app: NSRunningApplication?) -> CaptureAppSnapshot? {
+        guard let app else { return nil }
+
+        let name = app.localizedName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let bundleID = app.bundleIdentifier?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return CaptureAppSnapshot(
+            name: name?.isEmpty == false ? name : nil,
+            bundleID: bundleID?.isEmpty == false ? bundleID : nil,
+            pid: app.processIdentifier
+        )
+    }
+
+    private static func windowChangeEventDescription(_ event: WindowChangeEvent) -> String {
+        "id=\(event.id) source=\(event.source.rawValue) observedAt=\(Log.timestamp(from: event.observedAt)) activated=\(event.activatedApp?.logDescription ?? "nil") frontmost=\(event.workspaceFrontmostApp?.logDescription ?? "nil")"
     }
 }
 

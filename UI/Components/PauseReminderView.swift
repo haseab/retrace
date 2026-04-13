@@ -7,6 +7,7 @@ public struct PauseReminderView: View {
 
     // MARK: - Properties
 
+    let title: String
     let onResumeCapturing: () -> Void
     let onRemindMeLater: () -> Void
     let onEditIntervalInSettings: () -> Void
@@ -40,7 +41,7 @@ public struct PauseReminderView: View {
             // Main content
             VStack(spacing: 16) {
                 // Status text
-                Text("Retrace is paused.")
+                Text(title)
                     .font(.retraceCalloutMedium)
                     .foregroundColor(.white)
 
@@ -110,6 +111,7 @@ struct PauseReminderView_Previews: PreviewProvider {
                 HStack {
                     Spacer()
                     PauseReminderView(
+                        title: "Retrace is paused.",
                         onResumeCapturing: {},
                         onRemindMeLater: {},
                         onEditIntervalInSettings: {},

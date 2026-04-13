@@ -148,12 +148,20 @@ retrace/
 ├── App/                         # Main application coordinator
 │   ├── AppCoordinator.swift     # Central coordinator (orchestrates all modules)
 │   ├── DataAdapter.swift        # Data layer adapter (DB queries, transformations)
+│   ├── FeedbackRecentMetricSupport.swift # Shared feedback-export metric models and sanitization helpers
 │   ├── ServiceContainer.swift   # Dependency injection container
 │   ├── AppLifecycle.swift       # App lifecycle management
 │   ├── ModelManager.swift       # Model management
 │   ├── OnboardingManager.swift  # First-run onboarding flow
 │   ├── RetentionManager.swift   # Data retention policies
 │   └── Tests/
+│       ├── FeedbackRecentMetricSupportTests.swift # Feedback-export metric sanitization coverage
+│       ├── InPageURLCaptureRoutingTests.swift
+│       ├── MasterKeyManagerTests.swift
+│       ├── ServiceContainerRewindCutoffTests.swift # Rewind cutoff defaults and latest-frame probe coverage
+│       ├── TestLogger.swift
+│       ├── TimelineStillDiskWriterTests.swift
+│       └── UnexpectedRecordingStopHeuristicTests.swift # Unexpected-stop watchdog heuristic coverage
 │
 └── UI/                          # SwiftUI interface
     ├── AGENTS.md
@@ -163,7 +171,9 @@ retrace/
     ├── CrashRecoverySupport/    # Shared crash-recovery support code for app + helper targets
     ├── LaunchAgents/            # Embedded SMAppService launch-agent plists
     ├── Components/              # Reusable UI components (MenuBarManager, HotkeyManager, etc.)
-    │   └── MasterKeyRedactionFlowCoordinator.swift # Shared missing-master-key prompt/recovery coordinator
+    │   ├── MasterKeyRedactionFlowCoordinator.swift # Shared missing-master-key prompt/recovery coordinator
+    │   ├── HoverLatchedScrollMonitor.swift # Shared nested-scroll latch helper for hover-routed inner scroll regions
+    │   └── ProcessMonitorModels.swift # System Monitor snapshot/models + ranking helpers
     ├── ViewModels/              # View models (Dashboard, Search, Timeline, Feedback, Settings)
     │   └── Settings/            # Settings-specific view models and extracted helper logic
     ├── Views/
@@ -173,7 +183,7 @@ retrace/
     │   ├── Settings/            # Settings shell, support components, and extracted section/action files
     │   │   └── Sections/        # Concern-split settings sections, verification flows, and shared actions
     │   ├── Onboarding/          # Onboarding flow
-    │   └── Feedback/            # Feedback form & submission
+    │   └── Feedback/            # Feedback form, diagnostics presentation, and submission/export helpers
     └── Tests/
         ├── Dashboard/           # Dashboard-specific XCTestCase files
         ├── MenuBar/             # Menu bar XCTestCase files
@@ -232,7 +242,9 @@ retrace/
 - **Test locations**: `{Module}/Tests/`
 - **Test against protocols** - Not implementations
 - **Mock dependencies** - Using protocol conformance
+- **Do not widen tiny fixes into test work by default** - Single-line fixes, constant/default/threshold changes, disabling a debug guardrail, log-only changes, copy edits, formatting, and straightforward wiring corrections usually should not get new tests unless they add new branching logic or there is a clear regression case worth locking down
 - **Do not add contrived tests for insignificant or non-behavioral edits** - Skip tests for copy tweaks, comments, formatting, tiny visual polish, mechanical renames, or other changes where no meaningful behavioral assertion exists
+- **Prefer existing verification for narrow fixes** - For small changes, run the closest existing targeted tests or build checks first; add a new test only when it materially reduces recurrence risk
 - **If tests are skipped, say why briefly** - Note that the change is insignificant or not behaviorally testable
 
 ### ⚠️ CRITICAL: Test with REAL Input Data, Not Fake Structures
@@ -429,6 +441,7 @@ Then check which path actually executes and fix the right code.
 - Write tests BEFORE implementation when the change has meaningful, behaviorally testable impact
 - Test against protocols, not implementations
 - Cover edge cases thoroughly when behavior changes
+- Do not treat every behavior-affecting tweak as a new-test trigger; one-line fixes and config/default/threshold flips should usually rely on existing coverage unless the bug has a stable reproducer or the new test is obviously high-value
 - Do not add contrived tests for insignificant or non-behavioral edits
 - All relevant tests must pass before submitting changes
 
@@ -473,4 +486,4 @@ Then check which path actually executes and fix the right code.
 
 ---
 
-_This file follows the AGENTS.md standard for AI agent guidance. Last updated: 2026-03-24_
+_This file follows the AGENTS.md standard for AI agent guidance. Last updated: 2026-04-04_

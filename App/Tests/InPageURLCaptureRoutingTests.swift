@@ -149,54 +149,6 @@ final class SegmentUsageAlignmentTests: XCTestCase {
     }
 }
 
-final class ServiceContainerRewindCutoffTests: XCTestCase {
-    func testStoredRewindCutoffDateReturnsPersistedValue() {
-        let suiteName = "io.retrace.app.tests.rewindCutoff.\(UUID().uuidString)"
-        guard let defaults = UserDefaults(suiteName: suiteName) else {
-            XCTFail("Failed to create isolated defaults suite")
-            return
-        }
-        defer { defaults.removePersistentDomain(forName: suiteName) }
-
-        let storedDate = Date(timeIntervalSince1970: 1_772_934_400.123)
-        defaults.set(storedDate, forKey: "rewindCutoffDate")
-
-        XCTAssertEqual(ServiceContainer.storedRewindCutoffDate(in: defaults), storedDate)
-    }
-
-    func testDefaultRewindCutoffDateUsesDecember20_2025AtLocalMidnightForCalendar() {
-        var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = TimeZone(identifier: "America/Los_Angeles")!
-
-        let cutoffDate = ServiceContainer.defaultRewindCutoffDate(calendar: calendar)
-        let components = calendar.dateComponents([.year, .month, .day, .hour, .minute, .second], from: cutoffDate)
-
-        XCTAssertEqual(components.year, 2025)
-        XCTAssertEqual(components.month, 12)
-        XCTAssertEqual(components.day, 20)
-        XCTAssertEqual(components.hour, 0)
-        XCTAssertEqual(components.minute, 0)
-        XCTAssertEqual(components.second, 0)
-    }
-
-    func testRewindCutoffDateFallsBackToDefaultWhenUnset() {
-        let suiteName = "io.retrace.app.tests.rewindCutoff.\(UUID().uuidString)"
-        guard let defaults = UserDefaults(suiteName: suiteName) else {
-            XCTFail("Failed to create isolated defaults suite")
-            return
-        }
-        defer { defaults.removePersistentDomain(forName: suiteName) }
-
-        var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
-
-        XCTAssertEqual(
-            ServiceContainer.rewindCutoffDate(in: defaults, calendar: calendar),
-            ServiceContainer.defaultRewindCutoffDate(calendar: calendar)
-        )
-    }
-}
-
 final class DBStorageSnapshotLoggingTests: XCTestCase {
     func testDBStorageSnapshotDeltaSummaryUsesSameDayDelta() {
         let currentDay = Date(timeIntervalSince1970: 1_773_744_000)
@@ -303,7 +255,6 @@ final class DBStorageSnapshotEstimateTests: XCTestCase {
                 segmentID: AppSegmentID(value: segmentID),
                 videoID: VideoSegmentID(value: videoID),
                 frameIndexInSegment: 0,
-                encodingStatus: .success,
                 metadata: .empty,
                 source: .native
             )
@@ -391,6 +342,35 @@ final class DBStorageSnapshotEstimateTests: XCTestCase {
 }
 
 final class DataAdapterRewindBoundaryTests: XCTestCase {
+    private final class BrokenDatabaseConnection: DatabaseConnection, @unchecked Sendable {
+        func getConnection() -> OpaquePointer? {
+            nil
+        }
+
+        func prepare(sql: String) throws -> OpaquePointer? {
+            throw DatabaseConnectionError.notConnected
+        }
+
+        @discardableResult
+        func execute(sql: String) throws -> Int {
+            throw DatabaseConnectionError.notConnected
+        }
+
+        func beginTransaction() throws {
+            throw DatabaseConnectionError.notConnected
+        }
+
+        func commit() throws {
+            throw DatabaseConnectionError.notConnected
+        }
+
+        func rollback() throws {
+            throw DatabaseConnectionError.notConnected
+        }
+
+        func finalize(_ statement: OpaquePointer?) {}
+    }
+
     private struct StubImageExtractor: ImageExtractor {
         enum StubError: Error {
             case notImplemented
@@ -411,7 +391,15 @@ final class DataAdapterRewindBoundaryTests: XCTestCase {
         let rewindDatabase: DatabaseManager
     }
 
-    private func makeFixture(cutoffDate: Date) async throws -> AdapterFixture {
+    private struct SeededFrame {
+        let frameID: FrameID
+        let segmentID: Int64
+    }
+
+    private func makeFixture(
+        cutoffDate: Date,
+        retraceReadConnectionPool: SQLiteReadConnectionPool? = nil
+    ) async throws -> AdapterFixture {
         let retraceDatabase = DatabaseManager(
             databasePath: "file:retrace_boundary_\(UUID().uuidString)?mode=memory&cache=private"
         )
@@ -430,8 +418,13 @@ final class DataAdapterRewindBoundaryTests: XCTestCase {
 
         let retraceConnection = SQLiteConnection(db: retracePointer)
         let rewindConnection = SQLiteConnection(db: rewindPointer)
+        let activeRetraceReadConnectionPool = retraceReadConnectionPool ?? SQLiteReadConnectionPool(
+            label: "test_retrace_search",
+            sharedConnection: retraceConnection
+        )
         let adapter = DataAdapter(
             retraceConnection: retraceConnection,
+            retraceReadConnectionPool: activeRetraceReadConnectionPool,
             retraceConfig: .retrace(),
             retraceImageExtractor: StubImageExtractor(),
             database: retraceDatabase
@@ -462,13 +455,15 @@ final class DataAdapterRewindBoundaryTests: XCTestCase {
         return calendar.date(from: DateComponents(year: 2026, month: 1, day: 15, hour: 0, minute: 0, second: 0))!
     }
 
-    private func seedFrame(
+    private func seedFrameRecord(
         in database: DatabaseManager,
         timestamp: Date,
         bundleID: String,
         text: String,
-        source: FrameSource
-    ) async throws -> FrameID {
+        source: FrameSource,
+        windowName: String = "Window",
+        browserURL: String? = nil
+    ) async throws -> SeededFrame {
         let videoID = try await database.insertVideoSegment(
             VideoSegment(
                 id: VideoSegmentID(value: 0),
@@ -487,8 +482,8 @@ final class DataAdapterRewindBoundaryTests: XCTestCase {
             bundleID: bundleID,
             startDate: timestamp,
             endDate: timestamp.addingTimeInterval(60),
-            windowName: "Window",
-            browserUrl: nil,
+            windowName: windowName,
+            browserUrl: browserURL,
             type: 0
         )
 
@@ -499,11 +494,11 @@ final class DataAdapterRewindBoundaryTests: XCTestCase {
                 segmentID: AppSegmentID(value: segmentID),
                 videoID: VideoSegmentID(value: videoID),
                 frameIndexInSegment: 0,
-                encodingStatus: .success,
                 metadata: FrameMetadata(
                     appBundleID: bundleID,
                     appName: bundleID,
-                    windowName: "Window"
+                    windowName: windowName,
+                    browserURL: browserURL
                 ),
                 source: source
             )
@@ -512,12 +507,35 @@ final class DataAdapterRewindBoundaryTests: XCTestCase {
         _ = try await database.indexFrameText(
             mainText: text,
             chromeText: nil,
-            windowTitle: "Window",
+            windowTitle: windowName,
             segmentId: segmentID,
             frameId: frameID
         )
 
-        return FrameID(value: frameID)
+        return SeededFrame(
+            frameID: FrameID(value: frameID),
+            segmentID: segmentID
+        )
+    }
+
+    private func seedFrame(
+        in database: DatabaseManager,
+        timestamp: Date,
+        bundleID: String,
+        text: String,
+        source: FrameSource,
+        windowName: String = "Window",
+        browserURL: String? = nil
+    ) async throws -> FrameID {
+        try await seedFrameRecord(
+            in: database,
+            timestamp: timestamp,
+            bundleID: bundleID,
+            text: text,
+            source: source,
+            windowName: windowName,
+            browserURL: browserURL
+        ).frameID
     }
 
     private func close(_ fixture: AdapterFixture) async throws {
@@ -560,6 +578,104 @@ final class DataAdapterRewindBoundaryTests: XCTestCase {
         return sqlite3_column_int64(statement, 0)
     }
 
+    private func decodeMetricMetadata(_ metadata: String?) throws -> [String: Any] {
+        let json = try XCTUnwrap(metadata)
+        let data = try XCTUnwrap(json.data(using: .utf8))
+        return try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+    }
+
+    @discardableResult
+    private func executeUpdate(
+        db: OpaquePointer,
+        sql: String,
+        bind: ((OpaquePointer) -> Void)? = nil
+    ) throws -> Int64 {
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            XCTFail("Failed to prepare SQL: \(sql)")
+            return 0
+        }
+
+        if let bind, let statement {
+            bind(statement)
+        }
+
+        guard sqlite3_step(statement) == SQLITE_DONE else {
+            XCTFail("Expected update to finish for SQL: \(sql)")
+            return 0
+        }
+
+        return sqlite3_last_insert_rowid(db)
+    }
+
+    private func calendar() -> Calendar {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone.current
+        return calendar
+    }
+
+    private func tagID(named name: String, in database: DatabaseManager) async throws -> Int64 {
+        try await withConnection(database) { db in
+            _ = try executeUpdate(
+                db: db,
+                sql: "INSERT OR IGNORE INTO tag (name) VALUES (?);",
+                bind: { sqlite3_bind_text($0, 1, (name as NSString).utf8String, -1, nil) }
+            )
+            return try fetchInt64(
+                db: db,
+                sql: "SELECT id FROM tag WHERE name = ?;",
+                bind: { sqlite3_bind_text($0, 1, (name as NSString).utf8String, -1, nil) }
+            )
+        }
+    }
+
+    private func attachTag(named name: String, to segmentID: Int64, in database: DatabaseManager) async throws {
+        let tagID = try await tagID(named: name, in: database)
+        try await withConnection(database) { db in
+            _ = try executeUpdate(
+                db: db,
+                sql: "INSERT OR IGNORE INTO segment_tag (segmentId, tagId) VALUES (?, ?);",
+                bind: {
+                    sqlite3_bind_int64($0, 1, segmentID)
+                    sqlite3_bind_int64($0, 2, tagID)
+                }
+            )
+        }
+    }
+
+    private func addComment(to segmentID: Int64, in database: DatabaseManager, body: String = "comment") async throws {
+        try await withConnection(database) { db in
+            let commentID = try executeUpdate(
+                db: db,
+                sql: """
+                    INSERT INTO segment_comment (body, author, attachmentsJson)
+                    VALUES (?, 'test', '[]');
+                    """,
+                bind: { sqlite3_bind_text($0, 1, (body as NSString).utf8String, -1, nil) }
+            )
+            _ = try executeUpdate(
+                db: db,
+                sql: "INSERT INTO segment_comment_link (commentId, segmentId) VALUES (?, ?);",
+                bind: {
+                    sqlite3_bind_int64($0, 1, commentID)
+                    sqlite3_bind_int64($0, 2, segmentID)
+                }
+            )
+        }
+    }
+
+    private func normalizedDays(_ dates: [Date]) -> Set<Date> {
+        let currentCalendar = calendar()
+        return Set(dates.map { currentCalendar.startOfDay(for: $0) })
+    }
+
+    private func hourValues(_ dates: [Date]) -> Set<Int> {
+        let currentCalendar = calendar()
+        return Set(dates.map { currentCalendar.component(.hour, from: $0) })
+    }
+
     func testMostRecentFramesExcludeRetraceFramesBeforeCutoff() async throws {
         let cutoffDate = makeCutoffDate()
         let fixture = try await makeFixture(cutoffDate: cutoffDate)
@@ -599,6 +715,168 @@ final class DataAdapterRewindBoundaryTests: XCTestCase {
         XCTAssertTrue(resultKeys.contains("rewind:\(preCutoffRewindFrame.value)"))
     }
 
+    func testDeletionHiddenNativeFramesAreExcludedFromTimelineAndDirectLookups() async throws {
+        let cutoffDate = makeCutoffDate()
+        let fixture = try await makeFixture(cutoffDate: cutoffDate)
+        defer {
+            Task {
+                try? await self.close(fixture)
+            }
+        }
+
+        let timestamp = cutoffDate.addingTimeInterval(3_600)
+        let seeded = try await seedFrameRecord(
+            in: fixture.retraceDatabase,
+            timestamp: timestamp,
+            bundleID: "com.retrace.hidden",
+            text: "hidden native frame",
+            source: .native,
+            browserURL: "https://example.com/hidden"
+        )
+        try await fixture.retraceDatabase.insertNodes(
+            frameID: seeded.frameID,
+            nodes: [(
+                textOffset: 0,
+                textLength: 6,
+                bounds: CGRect(x: 10, y: 10, width: 120, height: 24),
+                windowIndex: nil
+            )],
+            encryptedTexts: [:],
+            frameWidth: 1_000,
+            frameHeight: 1_000
+        )
+        try await fixture.retraceDatabase.updateFrameProcessingStatus(
+            frameID: seeded.frameID.value,
+            status: 5,
+            rewritePurpose: "deletion"
+        )
+
+        let recentFrames = try await fixture.adapter.getMostRecentFrames(limit: 10)
+        let frameLookup = try await fixture.adapter.getFrameWithVideoInfoByID(id: seeded.frameID)
+        let nodesByTimestamp = try await fixture.adapter.getAllOCRNodes(
+            timestamp: timestamp,
+            source: .native
+        )
+        let nodesByID = try await fixture.adapter.getAllOCRNodes(
+            frameID: seeded.frameID,
+            source: .native
+        )
+
+        XCTAssertFalse(recentFrames.contains { $0.id == seeded.frameID && $0.source == .native })
+        XCTAssertNil(frameLookup)
+        XCTAssertTrue(nodesByTimestamp.isEmpty)
+        XCTAssertTrue(nodesByID.isEmpty)
+    }
+
+    func testMostRecentFramesTreatInactiveFiltersSameAsNilFilters() async throws {
+        let cutoffDate = makeCutoffDate()
+        let fixture = try await makeFixture(cutoffDate: cutoffDate)
+        defer {
+            Task {
+                try? await self.close(fixture)
+            }
+        }
+
+        let nativeFrame = try await seedFrame(
+            in: fixture.retraceDatabase,
+            timestamp: cutoffDate.addingTimeInterval(3600),
+            bundleID: "com.retrace.filtered.native",
+            text: "native frame after cutoff",
+            source: .native
+        )
+        let rewindFrame = try await seedFrame(
+            in: fixture.rewindDatabase,
+            timestamp: cutoffDate.addingTimeInterval(-1800),
+            bundleID: "com.rewind.filtered",
+            text: "rewind frame before cutoff",
+            source: .rewind
+        )
+
+        let baseline = try await fixture.adapter.getMostRecentFrames(limit: 10)
+        let inactiveFilterResults = try await fixture.adapter.getMostRecentFrames(
+            limit: 10,
+            filters: FilterCriteria()
+        )
+
+        let baselineKeys = baseline.map { "\($0.source.rawValue):\($0.id.value)" }
+        let inactiveFilterKeys = inactiveFilterResults.map { "\($0.source.rawValue):\($0.id.value)" }
+
+        XCTAssertEqual(baselineKeys, inactiveFilterKeys)
+        XCTAssertEqual(
+            baselineKeys,
+            ["native:\(nativeFrame.value)", "rewind:\(rewindFrame.value)"]
+        )
+    }
+
+    func testTimelineReadsTreatInactiveFiltersSameAsNilFilters() async throws {
+        let cutoffDate = makeCutoffDate()
+        let fixture = try await makeFixture(cutoffDate: cutoffDate)
+        defer {
+            Task {
+                try? await self.close(fixture)
+            }
+        }
+
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone.current
+        let dayOne = calendar.date(from: DateComponents(year: 2026, month: 2, day: 5, hour: 0, minute: 0, second: 0))!
+
+        let firstFrameID = try await seedFrame(
+            in: fixture.retraceDatabase,
+            timestamp: dayOne.addingTimeInterval(8 * 3600),
+            bundleID: "com.retrace.filtered.one",
+            text: "first filtered frame",
+            source: .native
+        )
+        let secondFrameID = try await seedFrame(
+            in: fixture.retraceDatabase,
+            timestamp: dayOne.addingTimeInterval(12 * 3600),
+            bundleID: "com.retrace.filtered.two",
+            text: "second filtered frame",
+            source: .native
+        )
+
+        let filters = FilterCriteria()
+
+        let baselineRange = try await fixture.adapter.getFramesWithVideoInfo(
+            from: dayOne,
+            to: dayOne.addingTimeInterval(86399),
+            limit: 10
+        )
+        let inactiveFilterRange = try await fixture.adapter.getFramesWithVideoInfo(
+            from: dayOne,
+            to: dayOne.addingTimeInterval(86399),
+            limit: 10,
+            filters: filters
+        )
+        XCTAssertEqual(baselineRange.map(\.frame.id.value), inactiveFilterRange.map(\.frame.id.value))
+        XCTAssertEqual(inactiveFilterRange.map(\.frame.id.value), [firstFrameID.value, secondFrameID.value])
+
+        let baselineBefore = try await fixture.adapter.getFramesWithVideoInfoBefore(
+            timestamp: dayOne.addingTimeInterval(10 * 3600),
+            limit: 10
+        )
+        let inactiveFilterBefore = try await fixture.adapter.getFramesWithVideoInfoBefore(
+            timestamp: dayOne.addingTimeInterval(10 * 3600),
+            limit: 10,
+            filters: filters
+        )
+        XCTAssertEqual(baselineBefore.map(\.frame.id.value), inactiveFilterBefore.map(\.frame.id.value))
+        XCTAssertEqual(inactiveFilterBefore.map(\.frame.id.value), [firstFrameID.value])
+
+        let baselineAfter = try await fixture.adapter.getFramesWithVideoInfoAfter(
+            timestamp: dayOne.addingTimeInterval(10 * 3600),
+            limit: 10
+        )
+        let inactiveFilterAfter = try await fixture.adapter.getFramesWithVideoInfoAfter(
+            timestamp: dayOne.addingTimeInterval(10 * 3600),
+            limit: 10,
+            filters: filters
+        )
+        XCTAssertEqual(baselineAfter.map(\.frame.id.value), inactiveFilterAfter.map(\.frame.id.value))
+        XCTAssertEqual(inactiveFilterAfter.map(\.frame.id.value), [secondFrameID.value])
+    }
+
     func testSearchExcludesRetraceMatchesBeforeCutoff() async throws {
         let cutoffDate = makeCutoffDate()
         let fixture = try await makeFixture(cutoffDate: cutoffDate)
@@ -630,6 +908,230 @@ final class DataAdapterRewindBoundaryTests: XCTestCase {
         XCTAssertTrue(resultKeys.contains("rewind:\(preCutoffRewindFrame.value)"))
         XCTAssertEqual(results.results.count, 1)
         XCTAssertEqual(results.results.first?.source, .rewind)
+    }
+
+    func testSearchIgnoresShellFlagsInCommandLikeQuery() async throws {
+        let cutoffDate = makeCutoffDate()
+        let fixture = try await makeFixture(cutoffDate: cutoffDate)
+        defer {
+            Task {
+                try? await self.close(fixture)
+            }
+        }
+
+        let command = #"osascript -e 'tell application "Codex" to hide' -e 'tell application "Retrace" to activate' -e 'delay 1'"#
+        let frameID = try await seedFrame(
+            in: fixture.retraceDatabase,
+            timestamp: cutoffDate.addingTimeInterval(3600),
+            bundleID: "com.apple.Terminal",
+            text: command,
+            source: .native
+        )
+
+        let results = try await fixture.adapter.search(query: SearchQuery(text: command))
+
+        XCTAssertTrue(results.results.contains(where: { $0.id.value == frameID.value && $0.source == .native }))
+    }
+
+    func testSearchStillTreatsPlainDashTermsAsExclusions() async throws {
+        let cutoffDate = makeCutoffDate()
+        let fixture = try await makeFixture(cutoffDate: cutoffDate)
+        defer {
+            Task {
+                try? await self.close(fixture)
+            }
+        }
+
+        let excludedFrameID = try await seedFrame(
+            in: fixture.retraceDatabase,
+            timestamp: cutoffDate.addingTimeInterval(3600),
+            bundleID: "com.apple.Terminal",
+            text: "swift java",
+            source: .native
+        )
+        let includedFrameID = try await seedFrame(
+            in: fixture.retraceDatabase,
+            timestamp: cutoffDate.addingTimeInterval(7200),
+            bundleID: "com.apple.Terminal",
+            text: "swift objc",
+            source: .native
+        )
+
+        let results = try await fixture.adapter.search(query: SearchQuery(text: "swift -java"))
+        let resultIDs = Set(results.results.map(\.id.value))
+
+        XCTAssertFalse(resultIDs.contains(excludedFrameID.value))
+        XCTAssertTrue(resultIDs.contains(includedFrameID.value))
+    }
+
+    func testSearchUsesLastMatchingNodeForThumbnailPreviewAcrossModes() async throws {
+        let cutoffDate = makeCutoffDate()
+        let fixture = try await makeFixture(cutoffDate: cutoffDate)
+        defer {
+            Task {
+                try? await self.close(fixture)
+            }
+        }
+
+        let timestamp = cutoffDate.addingTimeInterval(3600)
+        let seeded = try await seedFrameRecord(
+            in: fixture.retraceDatabase,
+            timestamp: timestamp,
+            bundleID: "com.retrace.search",
+            text: "alpha beta alpha",
+            source: .native
+        )
+        try await fixture.retraceDatabase.insertNodes(
+            frameID: seeded.frameID,
+            nodes: [
+                (textOffset: 0, textLength: 5, bounds: CGRect(x: 10, y: 10, width: 120, height: 24), windowIndex: nil),
+                (textOffset: 6, textLength: 4, bounds: CGRect(x: 160, y: 10, width: 120, height: 24), windowIndex: nil),
+                (textOffset: 11, textLength: 5, bounds: CGRect(x: 310, y: 10, width: 120, height: 24), windowIndex: nil)
+            ],
+            frameWidth: 1_000,
+            frameHeight: 1_000
+        )
+
+        let allResults = try await fixture.adapter.search(query: SearchQuery(text: "alpha", mode: .all))
+        let relevantResults = try await fixture.adapter.search(query: SearchQuery(text: "alpha", mode: .relevant))
+
+        let allResult = try XCTUnwrap(allResults.results.first)
+        let relevantResult = try XCTUnwrap(relevantResults.results.first)
+
+        XCTAssertEqual(allResults.results.count, 1)
+        XCTAssertEqual(relevantResults.results.count, 1)
+        XCTAssertEqual(allResult.highlightNode?.nodeOrder, 2)
+        XCTAssertEqual(relevantResult.highlightNode?.nodeOrder, 2)
+    }
+
+    func testSearchDeduplicatesSameTextWhenOnlyOneAxisMovesFarEnough() async throws {
+        let cutoffDate = makeCutoffDate()
+        let fixture = try await makeFixture(cutoffDate: cutoffDate)
+        defer {
+            Task {
+                try? await self.close(fixture)
+            }
+        }
+
+        let first = try await seedFrameRecord(
+            in: fixture.retraceDatabase,
+            timestamp: cutoffDate.addingTimeInterval(3600),
+            bundleID: "com.retrace.search",
+            text: "alpha",
+            source: .native
+        )
+        let second = try await seedFrameRecord(
+            in: fixture.retraceDatabase,
+            timestamp: cutoffDate.addingTimeInterval(3660),
+            bundleID: "com.retrace.search",
+            text: "alpha",
+            source: .native
+        )
+
+        try await fixture.retraceDatabase.insertNodes(
+            frameID: first.frameID,
+            nodes: [
+                (textOffset: 0, textLength: 5, bounds: CGRect(x: 10, y: 10, width: 120, height: 24), windowIndex: nil)
+            ],
+            frameWidth: 1_000,
+            frameHeight: 1_000
+        )
+        try await fixture.retraceDatabase.insertNodes(
+            frameID: second.frameID,
+            nodes: [
+                (textOffset: 0, textLength: 5, bounds: CGRect(x: 10, y: 340, width: 120, height: 24), windowIndex: nil)
+            ],
+            frameWidth: 1_000,
+            frameHeight: 1_000
+        )
+
+        let results = try await fixture.adapter.search(
+            query: SearchQuery(text: "alpha", mode: .all, sortOrder: .oldestFirst)
+        )
+
+        XCTAssertEqual(results.results.map(\.id.value), [first.frameID.value])
+    }
+
+    func testSearchKeepsSameTextWhenBothAxesMoveFarEnough() async throws {
+        let cutoffDate = makeCutoffDate()
+        let fixture = try await makeFixture(cutoffDate: cutoffDate)
+        defer {
+            Task {
+                try? await self.close(fixture)
+            }
+        }
+
+        let first = try await seedFrameRecord(
+            in: fixture.retraceDatabase,
+            timestamp: cutoffDate.addingTimeInterval(3600),
+            bundleID: "com.retrace.search",
+            text: "alpha",
+            source: .native
+        )
+        let second = try await seedFrameRecord(
+            in: fixture.retraceDatabase,
+            timestamp: cutoffDate.addingTimeInterval(3660),
+            bundleID: "com.retrace.search",
+            text: "alpha",
+            source: .native
+        )
+
+        try await fixture.retraceDatabase.insertNodes(
+            frameID: first.frameID,
+            nodes: [
+                (textOffset: 0, textLength: 5, bounds: CGRect(x: 10, y: 10, width: 120, height: 24), windowIndex: nil)
+            ],
+            frameWidth: 1_000,
+            frameHeight: 1_000
+        )
+        try await fixture.retraceDatabase.insertNodes(
+            frameID: second.frameID,
+            nodes: [
+                (textOffset: 0, textLength: 5, bounds: CGRect(x: 340, y: 340, width: 120, height: 24), windowIndex: nil)
+            ],
+            frameWidth: 1_000,
+            frameHeight: 1_000
+        )
+
+        let results = try await fixture.adapter.search(
+            query: SearchQuery(text: "alpha", mode: .all, sortOrder: .oldestFirst)
+        )
+
+        XCTAssertEqual(results.results.map(\.id.value), [first.frameID.value, second.frameID.value])
+    }
+
+    func testSearchThrowsWhenNativeSourceFailsUnexpectedlyAndRewindHasNoMatches() async throws {
+        let cutoffDate = makeCutoffDate()
+        let brokenRetracePool = SQLiteReadConnectionPool(
+            label: "broken_retrace_search",
+            sharedConnection: BrokenDatabaseConnection()
+        )
+        let fixture = try await makeFixture(
+            cutoffDate: cutoffDate,
+            retraceReadConnectionPool: brokenRetracePool
+        )
+        defer {
+            Task {
+                try? await self.close(fixture)
+            }
+        }
+
+        _ = try await seedFrame(
+            in: fixture.rewindDatabase,
+            timestamp: cutoffDate.addingTimeInterval(-1800),
+            bundleID: "com.rewind.nomatch",
+            text: "completely different content",
+            source: .rewind
+        )
+
+        do {
+            _ = try await fixture.adapter.search(query: SearchQuery(text: "needle"))
+            XCTFail("Expected unexpected native search failure to be surfaced")
+        } catch DatabaseConnectionError.notConnected {
+            // Expected: unexpected source failures should no longer be converted into empty results.
+        } catch {
+            XCTFail("Expected notConnected, got \(error)")
+        }
     }
 
     func testDistinctDatesExcludePreCutoffRetraceDates() async throws {
@@ -706,6 +1208,296 @@ final class DataAdapterRewindBoundaryTests: XCTestCase {
         XCTAssertEqual(hourValues, [10])
     }
 
+    func testFilteredDistinctDatesRespectActiveAppFilter() async throws {
+        let cutoffDate = makeCutoffDate()
+        let fixture = try await makeFixture(cutoffDate: cutoffDate)
+        defer {
+            Task {
+                try? await self.close(fixture)
+            }
+        }
+
+        let matchingTimestamp = cutoffDate.addingTimeInterval(86400 * 2 + 9 * 3600)
+        let nonMatchingTimestamp = cutoffDate.addingTimeInterval(86400 * 4 + 11 * 3600)
+
+        _ = try await seedFrame(
+            in: fixture.retraceDatabase,
+            timestamp: matchingTimestamp,
+            bundleID: "com.apple.Safari",
+            text: "matching app",
+            source: .native
+        )
+        _ = try await seedFrame(
+            in: fixture.retraceDatabase,
+            timestamp: nonMatchingTimestamp,
+            bundleID: "com.apple.Terminal",
+            text: "non matching app",
+            source: .native
+        )
+
+        let filters = FilterCriteria(selectedApps: ["com.apple.Safari"])
+        let dates = try await fixture.adapter.getDistinctDates(filters: filters)
+
+        XCTAssertEqual(normalizedDays(dates), [calendar().startOfDay(for: matchingTimestamp)])
+    }
+
+    func testFilteredDistinctHoursRespectActiveAppFilter() async throws {
+        let cutoffDate = makeCutoffDate()
+        let fixture = try await makeFixture(cutoffDate: cutoffDate)
+        defer {
+            Task {
+                try? await self.close(fixture)
+            }
+        }
+
+        let day = cutoffDate.addingTimeInterval(86400 * 2)
+        _ = try await seedFrame(
+            in: fixture.retraceDatabase,
+            timestamp: day.addingTimeInterval(9 * 3600),
+            bundleID: "com.apple.Safari",
+            text: "matching morning",
+            source: .native
+        )
+        _ = try await seedFrame(
+            in: fixture.retraceDatabase,
+            timestamp: day.addingTimeInterval(10 * 3600),
+            bundleID: "com.apple.Terminal",
+            text: "non matching hour",
+            source: .native
+        )
+        _ = try await seedFrame(
+            in: fixture.retraceDatabase,
+            timestamp: day.addingTimeInterval(15 * 3600),
+            bundleID: "com.apple.Safari",
+            text: "matching afternoon",
+            source: .native
+        )
+
+        let filters = FilterCriteria(selectedApps: ["com.apple.Safari"])
+        let hours = try await fixture.adapter.getDistinctHoursForDate(day, filters: filters)
+
+        XCTAssertEqual(hourValues(hours), [9, 15])
+    }
+
+    func testFilteredDistinctCalendarRespectsMetadataFilterAndSourceSelection() async throws {
+        let cutoffDate = makeCutoffDate()
+        let fixture = try await makeFixture(cutoffDate: cutoffDate)
+        defer {
+            Task {
+                try? await self.close(fixture)
+            }
+        }
+
+        let rewindDay = cutoffDate.addingTimeInterval(-86400 * 2)
+        let nativeDay = cutoffDate.addingTimeInterval(86400 * 2)
+
+        _ = try await seedFrame(
+            in: fixture.rewindDatabase,
+            timestamp: rewindDay.addingTimeInterval(10 * 3600),
+            bundleID: "com.apple.Safari",
+            text: "matching rewind url",
+            source: .rewind,
+            windowName: "Daily Notes",
+            browserURL: "https://docs.example.com/matching"
+        )
+        _ = try await seedFrame(
+            in: fixture.rewindDatabase,
+            timestamp: rewindDay.addingTimeInterval(12 * 3600),
+            bundleID: "com.apple.Safari",
+            text: "non matching rewind url",
+            source: .rewind,
+            windowName: "Other Window",
+            browserURL: "https://docs.example.com/other"
+        )
+        _ = try await seedFrame(
+            in: fixture.retraceDatabase,
+            timestamp: nativeDay.addingTimeInterval(9 * 3600),
+            bundleID: "com.apple.Safari",
+            text: "matching native url",
+            source: .native,
+            windowName: "Daily Notes",
+            browserURL: "https://docs.example.com/matching"
+        )
+
+        let filters = FilterCriteria(
+            selectedSources: [.rewind],
+            browserUrlFilter: "matching"
+        )
+
+        let dates = try await fixture.adapter.getDistinctDates(filters: filters)
+        XCTAssertEqual(normalizedDays(dates), [calendar().startOfDay(for: rewindDay)])
+
+        let hours = try await fixture.adapter.getDistinctHoursForDate(rewindDay, filters: filters)
+        XCTAssertEqual(hourValues(hours), [10])
+    }
+
+    func testFilteredDistinctCalendarRespectsSelectedTagsAndSkipsRewind() async throws {
+        let cutoffDate = makeCutoffDate()
+        let fixture = try await makeFixture(cutoffDate: cutoffDate)
+        defer {
+            Task {
+                try? await self.close(fixture)
+            }
+        }
+
+        let tagged = try await seedFrameRecord(
+            in: fixture.retraceDatabase,
+            timestamp: cutoffDate.addingTimeInterval(86400 * 2 + 8 * 3600),
+            bundleID: "com.apple.Safari",
+            text: "tagged native frame",
+            source: .native
+        )
+        _ = try await seedFrameRecord(
+            in: fixture.retraceDatabase,
+            timestamp: cutoffDate.addingTimeInterval(86400 * 2 + 9 * 3600),
+            bundleID: "com.apple.Safari",
+            text: "untagged native frame",
+            source: .native
+        )
+        _ = try await seedFrameRecord(
+            in: fixture.rewindDatabase,
+            timestamp: cutoffDate.addingTimeInterval(-86400 + 10 * 3600),
+            bundleID: "com.apple.Safari",
+            text: "rewind frame",
+            source: .rewind
+        )
+
+        try await attachTag(named: "focus", to: tagged.segmentID, in: fixture.retraceDatabase)
+        let focusTagID = try await tagID(named: "focus", in: fixture.retraceDatabase)
+        let filters = FilterCriteria(selectedTags: [focusTagID])
+
+        let dates = try await fixture.adapter.getDistinctDates(filters: filters)
+        XCTAssertEqual(normalizedDays(dates), [calendar().startOfDay(for: cutoffDate.addingTimeInterval(86400 * 2))])
+
+        let hours = try await fixture.adapter.getDistinctHoursForDate(
+            cutoffDate.addingTimeInterval(86400 * 2),
+            filters: filters
+        )
+        XCTAssertEqual(hourValues(hours), [8])
+    }
+
+    func testFilteredDistinctCalendarRespectsOnlyHiddenFilter() async throws {
+        let cutoffDate = makeCutoffDate()
+        let fixture = try await makeFixture(cutoffDate: cutoffDate)
+        defer {
+            Task {
+                try? await self.close(fixture)
+            }
+        }
+
+        let hidden = try await seedFrameRecord(
+            in: fixture.retraceDatabase,
+            timestamp: cutoffDate.addingTimeInterval(86400 * 3 + 7 * 3600),
+            bundleID: "com.apple.Safari",
+            text: "hidden native frame",
+            source: .native
+        )
+        _ = try await seedFrameRecord(
+            in: fixture.retraceDatabase,
+            timestamp: cutoffDate.addingTimeInterval(86400 * 3 + 11 * 3600),
+            bundleID: "com.apple.Safari",
+            text: "visible native frame",
+            source: .native
+        )
+        _ = try await seedFrameRecord(
+            in: fixture.rewindDatabase,
+            timestamp: cutoffDate.addingTimeInterval(-86400 * 2 + 9 * 3600),
+            bundleID: "com.apple.Safari",
+            text: "rewind frame",
+            source: .rewind
+        )
+
+        try await attachTag(named: "hidden", to: hidden.segmentID, in: fixture.retraceDatabase)
+        let filters = FilterCriteria(hiddenFilter: .onlyHidden)
+
+        let hiddenDay = cutoffDate.addingTimeInterval(86400 * 3)
+        let dates = try await fixture.adapter.getDistinctDates(filters: filters)
+        XCTAssertEqual(normalizedDays(dates), [calendar().startOfDay(for: hiddenDay)])
+
+        let hours = try await fixture.adapter.getDistinctHoursForDate(hiddenDay, filters: filters)
+        XCTAssertEqual(hourValues(hours), [7])
+    }
+
+    func testFilteredDistinctCalendarRespectsCommentsOnlyFilter() async throws {
+        let cutoffDate = makeCutoffDate()
+        let fixture = try await makeFixture(cutoffDate: cutoffDate)
+        defer {
+            Task {
+                try? await self.close(fixture)
+            }
+        }
+
+        let commented = try await seedFrameRecord(
+            in: fixture.retraceDatabase,
+            timestamp: cutoffDate.addingTimeInterval(86400 * 4 + 9 * 3600),
+            bundleID: "com.apple.Safari",
+            text: "commented native frame",
+            source: .native
+        )
+        _ = try await seedFrameRecord(
+            in: fixture.retraceDatabase,
+            timestamp: cutoffDate.addingTimeInterval(86400 * 4 + 13 * 3600),
+            bundleID: "com.apple.Safari",
+            text: "plain native frame",
+            source: .native
+        )
+        _ = try await seedFrameRecord(
+            in: fixture.rewindDatabase,
+            timestamp: cutoffDate.addingTimeInterval(-86400 + 9 * 3600),
+            bundleID: "com.apple.Safari",
+            text: "rewind frame",
+            source: .rewind
+        )
+
+        try await addComment(to: commented.segmentID, in: fixture.retraceDatabase)
+        let filters = FilterCriteria(commentFilter: .commentsOnly)
+        let commentDay = cutoffDate.addingTimeInterval(86400 * 4)
+
+        let dates = try await fixture.adapter.getDistinctDates(filters: filters)
+        XCTAssertEqual(normalizedDays(dates), [calendar().startOfDay(for: commentDay)])
+
+        let hours = try await fixture.adapter.getDistinctHoursForDate(commentDay, filters: filters)
+        XCTAssertEqual(hourValues(hours), [9])
+    }
+
+    func testFilteredDistinctDatesSkipRewindWhenDateRangeStartsAfterCutoff() async throws {
+        let cutoffDate = makeCutoffDate()
+        let fixture = try await makeFixture(cutoffDate: cutoffDate)
+        defer {
+            Task {
+                try? await self.close(fixture)
+            }
+        }
+
+        let nativeTimestamp = cutoffDate.addingTimeInterval(86400 * 2 + 14 * 3600)
+        _ = try await seedFrame(
+            in: fixture.retraceDatabase,
+            timestamp: nativeTimestamp,
+            bundleID: "com.apple.Safari",
+            text: "post cutoff native frame",
+            source: .native
+        )
+        _ = try await seedFrame(
+            in: fixture.rewindDatabase,
+            timestamp: cutoffDate.addingTimeInterval(-86400 * 2 + 10 * 3600),
+            bundleID: "com.apple.Safari",
+            text: "pre cutoff rewind frame",
+            source: .rewind
+        )
+
+        let filters = FilterCriteria(
+            dateRanges: [
+                DateRangeCriterion(
+                    start: cutoffDate.addingTimeInterval(3600),
+                    end: cutoffDate.addingTimeInterval(86400 * 3)
+                )
+            ]
+        )
+
+        let dates = try await fixture.adapter.getDistinctDates(filters: filters)
+        XCTAssertEqual(normalizedDays(dates), [calendar().startOfDay(for: nativeTimestamp)])
+    }
+
     func testDistinctAppBundleIDsExcludePreCutoffRetraceApps() async throws {
         let cutoffDate = makeCutoffDate()
         let fixture = try await makeFixture(cutoffDate: cutoffDate)
@@ -742,6 +1534,71 @@ final class DataAdapterRewindBoundaryTests: XCTestCase {
         XCTAssertFalse(bundleIDs.contains("com.retrace.old"))
         XCTAssertTrue(bundleIDs.contains("com.retrace.new"))
         XCTAssertTrue(bundleIDs.contains("com.rewind.old"))
+    }
+
+    func testDistinctAppBundleIDsForNativeSourceExcludeRewindApps() async throws {
+        let cutoffDate = makeCutoffDate()
+        let fixture = try await makeFixture(cutoffDate: cutoffDate)
+        defer {
+            Task {
+                try? await self.close(fixture)
+            }
+        }
+
+        _ = try await seedFrame(
+            in: fixture.retraceDatabase,
+            timestamp: cutoffDate.addingTimeInterval(7200),
+            bundleID: "com.retrace.new",
+            text: "native new",
+            source: .native
+        )
+        _ = try await seedFrame(
+            in: fixture.retraceDatabase,
+            timestamp: cutoffDate.addingTimeInterval(-7200),
+            bundleID: "com.retrace.old",
+            text: "native old",
+            source: .native
+        )
+        _ = try await seedFrame(
+            in: fixture.rewindDatabase,
+            timestamp: cutoffDate.addingTimeInterval(-3600),
+            bundleID: "com.rewind.old",
+            text: "rewind old",
+            source: .rewind
+        )
+
+        let bundleIDs = try await fixture.adapter.getDistinctAppBundleIDs(source: .native)
+
+        XCTAssertEqual(bundleIDs, ["com.retrace.new"])
+    }
+
+    func testDistinctAppBundleIDsForRewindSourceExcludeRetraceApps() async throws {
+        let cutoffDate = makeCutoffDate()
+        let fixture = try await makeFixture(cutoffDate: cutoffDate)
+        defer {
+            Task {
+                try? await self.close(fixture)
+            }
+        }
+
+        _ = try await seedFrame(
+            in: fixture.retraceDatabase,
+            timestamp: cutoffDate.addingTimeInterval(7200),
+            bundleID: "com.retrace.new",
+            text: "native new",
+            source: .native
+        )
+        _ = try await seedFrame(
+            in: fixture.rewindDatabase,
+            timestamp: cutoffDate.addingTimeInterval(-3600),
+            bundleID: "com.rewind.old",
+            text: "rewind old",
+            source: .rewind
+        )
+
+        let bundleIDs = try await fixture.adapter.getDistinctAppBundleIDs(source: .rewind)
+
+        XCTAssertEqual(bundleIDs, ["com.rewind.old"])
     }
 
     func testDeleteFrameRemovesFTSRowsForNativeSource() async throws {
@@ -1467,7 +2324,6 @@ final class CrashRecoveryStartupTests: XCTestCase {
                     segmentID: AppSegmentID(value: segmentID),
                     videoID: VideoSegmentID(value: insertedVideoID),
                     frameIndexInSegment: 0,
-                    encodingStatus: .success,
                     metadata: .empty,
                     source: .native
                 )
@@ -1617,6 +2473,293 @@ final class OCRReprocessSafetyTests: XCTestCase {
         } catch {
             try? await services.shutdown()
             try? FileManager.default.removeItem(at: storageRoot)
+            throw error
+        }
+    }
+}
+
+final class FrameDeletionSemanticsTests: XCTestCase {
+    private func makeServices(storageRoot: URL) -> ServiceContainer {
+        let crashReportDirectory = storageRoot.appendingPathComponent("crash_reports", isDirectory: true).path
+        return ServiceContainer(
+            databasePath: storageRoot.appendingPathComponent("retrace.db").path,
+            storageConfig: StorageConfig(
+                storageRootPath: storageRoot.path,
+                retentionDays: nil,
+                maxStorageGB: nil,
+                segmentDurationSeconds: 300
+            ),
+            storageCrashReportDirectory: crashReportDirectory
+        )
+    }
+
+    private func makeCapturedFrame(timestamp: Date) -> CapturedFrame {
+        CapturedFrame(
+            timestamp: timestamp,
+            imageData: Data(repeating: 0xAB, count: 32 * 8),
+            width: 8,
+            height: 8,
+            bytesPerRow: 32,
+            metadata: FrameMetadata(
+                appBundleID: "com.apple.Safari",
+                appName: "Safari",
+                windowName: "Window",
+                browserURL: "https://example.com",
+                displayID: 1
+            )
+        )
+    }
+
+    private func seedVideoBackedFrame(
+        services: ServiceContainer,
+        timestamp: Date
+    ) async throws -> (frameID: FrameID, videoID: Int64, segmentPath: String) {
+        let storage = await services.storage
+        let database = await services.database
+        let capturedFrame = makeCapturedFrame(timestamp: timestamp)
+
+        let writer = try await storage.createSegmentWriter()
+        try await writer.appendFrame(capturedFrame)
+        let segment = try await writer.finalize()
+
+        let databaseVideoID = try await database.insertVideoSegment(
+            VideoSegment(
+                id: segment.id,
+                startTime: segment.startTime,
+                endTime: segment.endTime,
+                frameCount: segment.frameCount,
+                fileSizeBytes: segment.fileSizeBytes,
+                relativePath: segment.relativePath,
+                width: segment.width,
+                height: segment.height,
+                source: .native
+            )
+        )
+        try await database.markVideoFinalized(
+            id: databaseVideoID,
+            frameCount: segment.frameCount,
+            fileSize: segment.fileSizeBytes
+        )
+
+        let appSegmentID = try await database.insertSegment(
+            bundleID: "com.apple.Safari",
+            startDate: timestamp,
+            endDate: timestamp,
+            windowName: "Delete Test",
+            browserUrl: "https://example.com",
+            type: 0
+        )
+        let frameIDValue = try await database.insertFrame(
+            FrameReference(
+                id: FrameID(value: 0),
+                timestamp: timestamp,
+                segmentID: AppSegmentID(value: appSegmentID),
+                videoID: VideoSegmentID(value: databaseVideoID),
+                frameIndexInSegment: 0,
+                metadata: capturedFrame.metadata,
+                source: .native
+            )
+        )
+        try await database.updateFrameProcessingStatus(frameID: frameIDValue, status: 2)
+
+        let storageDirectory = await storage.getStorageDirectory()
+
+        return (
+            frameID: FrameID(value: frameIDValue),
+            videoID: databaseVideoID,
+            segmentPath: storageDirectory.appendingPathComponent(segment.relativePath).path
+        )
+    }
+
+    private func withConnection<T>(
+        _ database: DatabaseManager,
+        _ body: (OpaquePointer) throws -> T
+    ) async throws -> T {
+        let connection = await database.getConnection()
+        let db = try XCTUnwrap(connection)
+        return try body(db)
+    }
+
+    private func fetchInt64(
+        db: OpaquePointer,
+        sql: String,
+        bind: ((OpaquePointer) -> Void)? = nil
+    ) throws -> Int64 {
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            XCTFail("Failed to prepare SQL: \(sql)")
+            return 0
+        }
+
+        if let bind {
+            bind(statement!)
+        }
+
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            XCTFail("Failed to step SQL: \(sql)")
+            return 0
+        }
+
+        return sqlite3_column_int64(statement, 0)
+    }
+
+    private func decodeMetricMetadata(_ metadata: String?) throws -> [String: Any] {
+        let json = try XCTUnwrap(metadata)
+        let data = try XCTUnwrap(json.data(using: .utf8))
+        return try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+    }
+
+    func testDeleteFrameReturnsQueuedResultWhileTimelineVisible() async throws {
+        let storageRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("FrameDeletionQueued_\(UUID().uuidString)", isDirectory: true)
+        let services = makeServices(storageRoot: storageRoot)
+        let coordinator = AppCoordinator(services: services)
+        let timestamp = Date(timeIntervalSince1970: 1_775_300_000)
+
+        try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: storageRoot) }
+
+        do {
+            try await services.initialize()
+            let seeded = try await seedVideoBackedFrame(services: services, timestamp: timestamp)
+            let database = await services.database
+
+            await coordinator.setTimelineVisible(true)
+            let result = try await coordinator.deleteFrame(
+                frameID: seeded.frameID,
+                timestamp: timestamp,
+                source: .native,
+                metricSource: "frame_delete_test"
+            )
+
+            XCTAssertEqual(result, FrameDeletionResult(completedFrames: 0, queuedFrames: 1))
+
+            let visibleFrameIDs = try await database.getVisibleNativeFrameIDsNewerThan(
+                timestamp.addingTimeInterval(-1)
+            )
+            XCTAssertFalse(visibleFrameIDs.contains(seeded.frameID.value))
+
+            let pendingJobs = try await database.getPendingFrameDeletionJobs(
+                videoID: seeded.videoID,
+                includeInProgressJobs: true,
+                includeRetryableFailures: true
+            )
+            XCTAssertEqual(pendingJobs.map(\.frameID), [seeded.frameID.value])
+
+            let frameCount = try await withConnection(database) { db in
+                try fetchInt64(
+                    db: db,
+                    sql: "SELECT COUNT(*) FROM frame WHERE id = ?;",
+                    bind: { sqlite3_bind_int64($0, 1, seeded.frameID.value) }
+                )
+            }
+            XCTAssertEqual(frameCount, 1)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: seeded.segmentPath))
+
+            try await services.shutdown()
+        } catch {
+            try? await services.shutdown()
+            throw error
+        }
+    }
+
+    func testDeleteFrameReturnsCompletedResultAfterWholeVideoRewrite() async throws {
+        let storageRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("FrameDeletionCompleted_\(UUID().uuidString)", isDirectory: true)
+        let services = makeServices(storageRoot: storageRoot)
+        let coordinator = AppCoordinator(services: services)
+        let timestamp = Date(timeIntervalSince1970: 1_775_300_100)
+
+        try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: storageRoot) }
+
+        do {
+            try await services.initialize()
+            let seeded = try await seedVideoBackedFrame(services: services, timestamp: timestamp)
+            let database = await services.database
+
+            let result = try await coordinator.deleteFrame(
+                frameID: seeded.frameID,
+                timestamp: timestamp,
+                source: .native
+            )
+
+            XCTAssertEqual(result, FrameDeletionResult(completedFrames: 1, queuedFrames: 0))
+
+            let pendingJobs = try await database.getPendingFrameDeletionJobs(
+                videoID: seeded.videoID,
+                includeInProgressJobs: true,
+                includeRetryableFailures: true
+            )
+            XCTAssertTrue(pendingJobs.isEmpty)
+
+            let frameCount = try await withConnection(database) { db in
+                try fetchInt64(
+                    db: db,
+                    sql: "SELECT COUNT(*) FROM frame WHERE id = ?;",
+                    bind: { sqlite3_bind_int64($0, 1, seeded.frameID.value) }
+                )
+            }
+            XCTAssertEqual(frameCount, 0)
+            let deletedVideo = try await database.getVideoSegment(id: VideoSegmentID(value: seeded.videoID))
+            XCTAssertNil(deletedVideo)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: seeded.segmentPath))
+
+            let recentMetricEvents = try await database.getRecentMetricEvents(limit: 5)
+            let metricEvent = try XCTUnwrap(
+                recentMetricEvents.first { $0.metricType == .frameDeleted }
+            )
+            let metricMetadata = try decodeMetricMetadata(metricEvent.metadata)
+            XCTAssertEqual(metricMetadata["source"] as? String, "frame_delete")
+            XCTAssertEqual(metricMetadata["dataSource"] as? String, "native")
+            XCTAssertEqual((metricMetadata["frameID"] as? NSNumber)?.int64Value, seeded.frameID.value)
+            XCTAssertEqual((metricMetadata["completedFrames"] as? NSNumber)?.intValue, 1)
+            XCTAssertEqual((metricMetadata["queuedFrames"] as? NSNumber)?.intValue, 0)
+
+            try await services.shutdown()
+        } catch {
+            try? await services.shutdown()
+            throw error
+        }
+    }
+
+    func testDeleteRecentDataRecordsSegmentDeletedMetric() async throws {
+        let storageRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("FrameDeletionQuickDelete_\(UUID().uuidString)", isDirectory: true)
+        let services = makeServices(storageRoot: storageRoot)
+        let coordinator = AppCoordinator(services: services)
+        let timestamp = Date(timeIntervalSince1970: 1_775_300_200)
+
+        try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: storageRoot) }
+
+        do {
+            try await services.initialize()
+            _ = try await seedVideoBackedFrame(services: services, timestamp: timestamp)
+            let database = await services.database
+
+            let result = try await coordinator.deleteRecentData(
+                newerThan: timestamp.addingTimeInterval(-1),
+                metricSource: "quick_delete_test"
+            )
+
+            XCTAssertEqual(result, FrameDeletionResult(completedFrames: 1, queuedFrames: 0))
+
+            let recentMetricEvents = try await database.getRecentMetricEvents(limit: 5)
+            let metricEvent = try XCTUnwrap(
+                recentMetricEvents.first { $0.metricType == .segmentDeleted }
+            )
+            let metricMetadata = try decodeMetricMetadata(metricEvent.metadata)
+            XCTAssertEqual(metricMetadata["source"] as? String, "quick_delete_test")
+            XCTAssertEqual((metricMetadata["frameCount"] as? NSNumber)?.intValue, 1)
+            XCTAssertEqual((metricMetadata["completedFrames"] as? NSNumber)?.intValue, 1)
+            XCTAssertEqual((metricMetadata["queuedFrames"] as? NSNumber)?.intValue, 0)
+
+            try await services.shutdown()
+        } catch {
+            try? await services.shutdown()
             throw error
         }
     }

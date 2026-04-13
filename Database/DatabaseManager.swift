@@ -132,6 +132,126 @@ public struct PendingNodeRedactionJob: Sendable, Equatable {
     }
 }
 
+public struct PendingFrameDeletionJob: Sendable, Equatable {
+    public let frameID: Int64
+    public let videoID: Int64
+    public let frameIndex: Int
+
+    public init(frameID: Int64, videoID: Int64, frameIndex: Int) {
+        self.frameID = frameID
+        self.videoID = videoID
+        self.frameIndex = frameIndex
+    }
+}
+
+public struct NativeFrameDeletionResult: Sendable, Equatable {
+    public let immediatelyDeletedFrameIDs: [Int64]
+    public let scheduledJobs: [PendingFrameDeletionJob]
+
+    public init(
+        immediatelyDeletedFrameIDs: [Int64],
+        scheduledJobs: [PendingFrameDeletionJob]
+    ) {
+        self.immediatelyDeletedFrameIDs = immediatelyDeletedFrameIDs
+        self.scheduledJobs = scheduledJobs
+    }
+
+    public var affectedFrameIDs: [Int64] {
+        immediatelyDeletedFrameIDs + scheduledJobs.map(\.frameID)
+    }
+
+    public var affectedFrameCount: Int {
+        affectedFrameIDs.count
+    }
+}
+
+public struct VideoFrameDeletion: Sendable, Equatable {
+    public let frameID: Int64
+    public let frameIndex: Int
+
+    public init(frameID: Int64, frameIndex: Int) {
+        self.frameID = frameID
+        self.frameIndex = frameIndex
+    }
+}
+
+public struct VideoFrameRedaction: Sendable, Equatable {
+    public let frameID: Int64
+    public let frameIndex: Int
+    public let targets: [SegmentRedactionTarget]
+
+    public init(frameID: Int64, frameIndex: Int, targets: [SegmentRedactionTarget]) {
+        self.frameID = frameID
+        self.frameIndex = frameIndex
+        self.targets = targets
+    }
+}
+
+public struct VideoRewritePlan: Sendable, Equatable {
+    public let videoID: Int64
+    public let operation: SegmentRewriteOperation
+    public let deletions: [VideoFrameDeletion]
+    public let redactions: [VideoFrameRedaction]
+
+    public init(
+        videoID: Int64,
+        operation: SegmentRewriteOperation = .partialRewrite,
+        deletions: [VideoFrameDeletion] = [],
+        redactions: [VideoFrameRedaction] = []
+    ) {
+        self.videoID = videoID
+        self.operation = operation
+        self.deletions = deletions
+        self.redactions = redactions
+    }
+
+    public var hasDeletionTargets: Bool {
+        !deletions.isEmpty
+    }
+
+    public var hasRedactionTargets: Bool {
+        !redactions.isEmpty
+    }
+
+    public var deletesWholeVideo: Bool {
+        operation == .wholeVideoDelete
+    }
+
+    public var hasAnyRewrite: Bool {
+        deletesWholeVideo || hasDeletionTargets || hasRedactionTargets
+    }
+
+    public var deletionFrameIDs: [Int64] {
+        deletions.map(\.frameID)
+    }
+
+    public var redactionFrameIDs: [Int64] {
+        redactions.map(\.frameID)
+    }
+
+    public var blackFrameIndexes: Set<Int> {
+        Set(deletions.map(\.frameIndex))
+    }
+
+    public var segmentRewritePlan: SegmentRewritePlan {
+        SegmentRewritePlan(
+            operation: operation,
+            blackFrameIndexes: blackFrameIndexes,
+            redactions: redactions.map {
+                SegmentFrameRedaction(
+                    frameID: $0.frameID,
+                    frameIndex: $0.frameIndex,
+                    targets: $0.targets
+                )
+            }
+        )
+    }
+
+    public func droppingRedactions() -> Self {
+        Self(videoID: videoID, operation: operation, deletions: deletions, redactions: [])
+    }
+}
+
 public struct LinkedSegmentComment: Sendable, Equatable {
     public let comment: SegmentComment
     public let preferredSegmentID: SegmentID
@@ -158,8 +278,10 @@ public actor DatabaseManager: DatabaseProtocol {
     // MARK: - Properties
 
     private var db: OpaquePointer?
+    nonisolated public let readConnectionPool: SQLiteReadConnectionPool
     private let databasePath: String
     private let storageRootPath: String
+    private let inMemorySharedConnection: SharedSQLiteConnection?
     private var isInitialized = false
     private var dbActorOperationSequence: UInt64 = 0
     private var dbActorOperationStack: [(id: UInt64, name: String, startedAt: CFAbsoluteTime)] = []
@@ -239,17 +361,50 @@ public actor DatabaseManager: DatabaseProtocol {
         return try block(db)
     }
 
+    private func executeImmediateSQL(_ sql: String, db: OpaquePointer) throws {
+        guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+    }
+
     // MARK: - Initialization
 
     public init(databasePath: String, storageRootPath: String = AppPaths.expandedStorageRoot) {
+        if Self.isInMemoryDatabasePath(databasePath) {
+            let sharedConnection = SharedSQLiteConnection()
+            self.readConnectionPool = SQLiteReadConnectionPool(
+                label: "retrace",
+                sharedConnection: sharedConnection
+            )
+            self.inMemorySharedConnection = sharedConnection
+        } else {
+            self.readConnectionPool = SQLiteReadConnectionPool(
+                label: "retrace",
+                connectionFactory: {
+                    try SQLiteReadOnlyConnectionFactory.makeRetraceConnection(databasePath: databasePath)
+                }
+            )
+            self.inMemorySharedConnection = nil
+        }
+
         self.databasePath = databasePath
         self.storageRootPath = NSString(string: storageRootPath).expandingTildeInPath
     }
 
     /// Convenience initializer for in-memory database (testing)
     public init() {
+        let sharedConnection = SharedSQLiteConnection()
+        self.readConnectionPool = SQLiteReadConnectionPool(
+            label: "retrace",
+            sharedConnection: sharedConnection
+        )
+        self.inMemorySharedConnection = sharedConnection
         self.databasePath = ":memory:"
         self.storageRootPath = AppPaths.expandedStorageRoot
+    }
+
+    private nonisolated static func isInMemoryDatabasePath(_ databasePath: String) -> Bool {
+        databasePath == ":memory:" || databasePath.contains("mode=memory")
     }
 
     // MARK: - Lifecycle
@@ -290,6 +445,7 @@ public actor DatabaseManager: DatabaseProtocol {
             Log.critical("[DatabaseManager] Failed to open database at: \(expandedPath) - \(errorMsg)", category: .database)
             throw DatabaseError.connectionFailed(underlying: errorMsg)
         }
+        inMemorySharedConnection?.setConnection(db)
         Log.debug("[DatabaseManager] Database opened successfully", category: .database)
         SQLiteRuntimeDiagnostics.log(label: "DatabaseManager/open", db: db)
 
@@ -328,6 +484,8 @@ public actor DatabaseManager: DatabaseProtocol {
     public func close() async throws {
         guard let db = db else { return }
 
+        await readConnectionPool.close()
+
         // Checkpoint WAL before closing (if not in-memory)
         let isInMemory = databasePath == ":memory:" || databasePath.contains("mode=memory")
         if !isInMemory {
@@ -347,6 +505,7 @@ public actor DatabaseManager: DatabaseProtocol {
         }
 
         self.db = nil
+        inMemorySharedConnection?.setConnection(nil)
         isInitialized = false
         Log.info("[DatabaseManager] Database closed", category: .database)
     }
@@ -971,44 +1130,47 @@ public actor DatabaseManager: DatabaseProtocol {
         )
     }
 
-    public func getAppUsageStats(
+    private nonisolated func withDashboardReadConnection<T>(
+        operation: String,
+        _ body: @escaping @Sendable (OpaquePointer) throws -> T
+    ) async throws -> T {
+        try await readConnectionPool.withConnection(operation: operation) { connection in
+            guard let db = connection.getConnection() else {
+                throw DatabaseError.connectionFailed(underlying: "Read connection unavailable")
+            }
+            return try body(db)
+        }
+    }
+
+    nonisolated public func getAppUsageStats(
         from startDate: Date,
         to endDate: Date
     ) async throws -> [(bundleID: String, duration: TimeInterval, uniqueItemCount: Int)] {
-        let startedAt = CFAbsoluteTimeGetCurrent()
-        do {
-            let results = try withTracedDatabaseOperation("get_app_usage_stats") { db in
-                try AppSegmentQueries.getAppUsageStats(db: db, from: startDate, to: endDate)
-            }
-            let elapsedMs = (CFAbsoluteTimeGetCurrent() - startedAt) * 1000
-            Log.recordLatency(
-                "dashboard.path.database_manager.get_app_usage_stats_ms",
-                valueMs: elapsedMs,
-                category: .database,
-                summaryEvery: 10,
-                warningThresholdMs: 800,
-                criticalThresholdMs: 2500
+        try await withDashboardReadConnection(operation: "get_app_usage_stats") { db in
+            try AppSegmentQueries.getAppUsageStats(
+                db: db,
+                from: startDate,
+                to: endDate
             )
-            return results
-        } catch {
-            let elapsedMs = (CFAbsoluteTimeGetCurrent() - startedAt) * 1000
-            Log.error(
-                "[DASHBOARD-PATH][DatabaseManager] getAppUsageStats failed range=[\(Log.timestamp(from: startDate)) -> \(Log.timestamp(from: endDate))] after \(String(format: "%.1f", elapsedMs))ms: \(error)",
-                category: .database
-            )
-            throw error
         }
     }
 
     public func getWindowUsageForApp(
         bundleID: String,
         from startDate: Date,
-        to endDate: Date
-    ) async throws -> [(windowName: String?, isWebsite: Bool, duration: TimeInterval, tabCount: Int?)] {
+        to endDate: Date,
+        limit: Int? = nil
+    ) async throws -> [(windowName: String?, isWebsite: Bool, duration: TimeInterval, tabCount: Int?, totalCount: Int, totalDuration: TimeInterval)] {
         guard let db = db else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
-        return try AppSegmentQueries.getWindowUsageForApp(db: db, bundleID: bundleID, from: startDate, to: endDate)
+        return try AppSegmentQueries.getWindowUsageForApp(
+            db: db,
+            bundleID: bundleID,
+            from: startDate,
+            to: endDate,
+            limit: limit
+        )
     }
 
     public func getBrowserTabUsage(
@@ -2150,13 +2312,7 @@ public actor DatabaseManager: DatabaseProtocol {
         guard !attachments.isEmpty else { return }
 
         for attachment in attachments {
-            let rawPath = attachment.filePath
-            let resolvedPath: String
-            if rawPath.hasPrefix("/") || rawPath.hasPrefix("~") {
-                resolvedPath = NSString(string: rawPath).expandingTildeInPath
-            } else {
-                resolvedPath = (storageRootPath as NSString).appendingPathComponent(rawPath)
-            }
+            let resolvedPath = resolveStoragePath(forStoredPath: attachment.filePath)
 
             guard FileManager.default.fileExists(atPath: resolvedPath) else {
                 continue
@@ -2167,6 +2323,33 @@ public actor DatabaseManager: DatabaseProtocol {
             } catch {
                 Log.warning("[DB] Failed to remove attachment file at \(resolvedPath): \(error.localizedDescription)", category: .database)
             }
+        }
+    }
+
+    private func resolveStoragePath(forStoredPath storedPath: String) -> String {
+        if storedPath.hasPrefix("/") || storedPath.hasPrefix("~") {
+            return NSString(string: storedPath).expandingTildeInPath
+        }
+
+        return (storageRootPath as NSString).appendingPathComponent(storedPath)
+    }
+
+    private func refreshedFileSizeOnDisk(forStoredPath storedPath: String) -> Int64? {
+        let resolvedPath = resolveStoragePath(forStoredPath: storedPath)
+
+        guard FileManager.default.fileExists(atPath: resolvedPath) else {
+            return nil
+        }
+
+        do {
+            let attributes = try FileManager.default.attributesOfItem(atPath: resolvedPath)
+            return (attributes[.size] as? NSNumber)?.int64Value
+        } catch {
+            Log.warning(
+                "[DB] Failed to read rewritten video size at \(resolvedPath): \(error.localizedDescription)",
+                category: .database
+            )
+            return nil
         }
     }
 
@@ -2281,6 +2464,493 @@ public actor DatabaseManager: DatabaseProtocol {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
         try FTSQueries.deleteForFrame(db: db, frameId: frameId)
+    }
+
+    public func getPendingFrameDeletionJobs(
+        videoID: Int64,
+        includeInProgressJobs: Bool = false,
+        includeRetryableFailures: Bool = false
+    ) async throws -> [PendingFrameDeletionJob] {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let pendingStatuses = includeInProgressJobs ? [5, 6] : [5]
+        let includedStatuses = includeRetryableFailures
+            ? Array(Set(pendingStatuses + [8])).sorted()
+            : pendingStatuses
+        let statusFilter = includedStatuses.count == 1
+            ? "processingStatus = \(includedStatuses[0])"
+            : "processingStatus IN (\(includedStatuses.map(String.init).joined(separator: ", ")))"
+        let sql = """
+            SELECT id, videoId, videoFrameIndex
+            FROM frame
+            WHERE videoId = ?
+              AND \(statusFilter)
+              AND rewritePurpose = 'deletion'
+            ORDER BY videoFrameIndex ASC, id ASC;
+            """
+
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        sqlite3_bind_int64(statement, 1, videoID)
+
+        var jobs: [PendingFrameDeletionJob] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            jobs.append(
+                PendingFrameDeletionJob(
+                    frameID: sqlite3_column_int64(statement, 0),
+                    videoID: sqlite3_column_int64(statement, 1),
+                    frameIndex: Int(sqlite3_column_int(statement, 2))
+                )
+            )
+        }
+
+        return jobs
+    }
+
+    public func getVideoIDsWithPendingRewrites(
+        includeRetryableFailures: Bool = false
+    ) async throws -> [Int64] {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let statuses = includeRetryableFailures ? [5, 6, 8] : [5, 6]
+        let sql = """
+            SELECT DISTINCT videoId
+            FROM frame
+            WHERE videoId IS NOT NULL
+              AND processingStatus IN (\(statuses.map(String.init).joined(separator: ", ")))
+              AND rewritePurpose IN ('redaction', 'deletion')
+            ORDER BY videoId ASC;
+            """
+
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        var videoIDs: [Int64] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            videoIDs.append(sqlite3_column_int64(statement, 0))
+        }
+
+        return videoIDs
+    }
+
+    public func buildVideoRewritePlan(
+        videoID: Int64,
+        includeInProgressJobs: Bool = false,
+        includeRetryableFailures: Bool = false
+    ) async throws -> VideoRewritePlan? {
+        let deletionJobs = try await getPendingFrameDeletionJobs(
+            videoID: videoID,
+            includeInProgressJobs: includeInProgressJobs,
+            includeRetryableFailures: includeRetryableFailures
+        )
+        let deletions = deletionJobs.map {
+            VideoFrameDeletion(frameID: $0.frameID, frameIndex: $0.frameIndex)
+        }
+        let deletionFrameIDs = Set(deletions.map(\.frameID))
+
+        let redactionJobs = try await getPendingNodeRedactionJobs(
+            videoID: videoID,
+            includeInProgressJobs: includeInProgressJobs,
+            includeRetryableFailures: includeRetryableFailures
+        )
+
+        var redactionTargetsByFrameID: [Int64: (frameIndex: Int, targets: [SegmentRedactionTarget])] = [:]
+        var seenTargets: Set<String> = []
+
+        for job in redactionJobs {
+            guard !deletionFrameIDs.contains(job.frameID) else { continue }
+            let targetKey = "\(job.frameID)|\(job.nodeID)"
+            guard seenTargets.insert(targetKey).inserted else { continue }
+            redactionTargetsByFrameID[job.frameID, default: (job.frameIndex, [])].targets.append(
+                SegmentRedactionTarget(
+                    frameID: job.frameID,
+                    nodeID: job.nodeID,
+                    normalizedRect: job.normalizedRect
+                )
+            )
+        }
+
+        let redactions = redactionTargetsByFrameID
+            .map { frameID, value in
+                VideoFrameRedaction(
+                    frameID: frameID,
+                    frameIndex: value.frameIndex,
+                    targets: value.targets
+                )
+            }
+            .sorted {
+                if $0.frameIndex == $1.frameIndex {
+                    return $0.frameID < $1.frameID
+                }
+                return $0.frameIndex < $1.frameIndex
+            }
+
+        guard !deletions.isEmpty || !redactions.isEmpty else {
+            return nil
+        }
+
+        let visibleFrameCount = try withTracedDatabaseOperation("get_visible_frame_count_for_video_rewrite") { db in
+            let sql = """
+                SELECT COUNT(*)
+                FROM frame
+                WHERE videoId = ?
+                  AND (rewritePurpose IS NULL OR rewritePurpose != 'deletion');
+                """
+            var statement: OpaquePointer?
+            defer { sqlite3_finalize(statement) }
+
+            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+                throw DatabaseError.queryFailed(
+                    query: sql,
+                    underlying: String(cString: sqlite3_errmsg(db))
+                )
+            }
+
+            sqlite3_bind_int64(statement, 1, videoID)
+            guard sqlite3_step(statement) == SQLITE_ROW else { return 0 }
+            return Int(sqlite3_column_int(statement, 0))
+        }
+
+        return VideoRewritePlan(
+            videoID: videoID,
+            operation: !deletions.isEmpty && visibleFrameCount == 0 ? .wholeVideoDelete : .partialRewrite,
+            deletions: deletions,
+            redactions: redactions
+        )
+    }
+
+    public func deleteOrScheduleNativeFramesForDeletion(
+        frameIDs: [Int64]
+    ) async throws -> NativeFrameDeletionResult {
+        let uniqueFrameIDs = Array(Set(frameIDs)).sorted()
+        guard !uniqueFrameIDs.isEmpty else {
+            return NativeFrameDeletionResult(
+                immediatelyDeletedFrameIDs: [],
+                scheduledJobs: []
+            )
+        }
+
+        return try withTracedDatabaseOperation("delete_or_schedule_native_frames_for_deletion_by_id") { db in
+            let placeholders = uniqueFrameIDs.map { _ in "?" }.joined(separator: ", ")
+            let selectSQL = """
+                SELECT id, videoId, videoFrameIndex
+                FROM frame
+                WHERE id IN (\(placeholders))
+                ORDER BY COALESCE(videoId, 0) ASC, videoFrameIndex ASC, id ASC;
+                """
+
+            return try executeNativeFrameDeletion(
+                db: db,
+                selectSQL: selectSQL
+            ) { statement in
+                for (index, frameID) in uniqueFrameIDs.enumerated() {
+                    sqlite3_bind_int64(statement, Int32(index + 1), frameID)
+                }
+            }
+        }
+    }
+
+    public func deleteOrScheduleNativeFramesForDeletion(
+        newerThan date: Date
+    ) async throws -> NativeFrameDeletionResult {
+        return try withTracedDatabaseOperation("delete_or_schedule_native_frames_for_deletion_by_date") { db in
+            let selectSQL = """
+                SELECT id, videoId, videoFrameIndex
+                FROM frame
+                WHERE createdAt > ?
+                  AND (rewritePurpose IS NULL OR rewritePurpose != 'deletion')
+                ORDER BY COALESCE(videoId, 0) ASC, createdAt ASC, videoFrameIndex ASC, id ASC;
+                """
+
+            return try executeNativeFrameDeletion(
+                db: db,
+                selectSQL: selectSQL
+            ) { statement in
+                sqlite3_bind_int64(statement, 1, Schema.dateToTimestamp(date))
+            }
+        }
+    }
+
+    private func executeNativeFrameDeletion(
+        db: OpaquePointer,
+        selectSQL: String,
+        bindSelection: (OpaquePointer) -> Void
+    ) throws -> NativeFrameDeletionResult {
+        var transactionOpen = false
+        do {
+            try executeImmediateSQL("BEGIN IMMEDIATE TRANSACTION;", db: db)
+            transactionOpen = true
+
+            var selectStatement: OpaquePointer?
+            defer { sqlite3_finalize(selectStatement) }
+            guard sqlite3_prepare_v2(db, selectSQL, -1, &selectStatement, nil) == SQLITE_OK else {
+                throw DatabaseError.queryFailed(query: selectSQL, underlying: String(cString: sqlite3_errmsg(db)))
+            }
+
+            bindSelection(selectStatement!)
+
+            var immediatelyDeletedFrameIDs: [Int64] = []
+            var scheduledJobs: [PendingFrameDeletionJob] = []
+            while sqlite3_step(selectStatement) == SQLITE_ROW {
+                let frameID = sqlite3_column_int64(selectStatement, 0)
+                if sqlite3_column_type(selectStatement, 1) == SQLITE_NULL {
+                    immediatelyDeletedFrameIDs.append(frameID)
+                    continue
+                }
+
+                scheduledJobs.append(
+                    PendingFrameDeletionJob(
+                        frameID: frameID,
+                        videoID: sqlite3_column_int64(selectStatement, 1),
+                        frameIndex: Int(sqlite3_column_int(selectStatement, 2))
+                    )
+                )
+            }
+
+            if !immediatelyDeletedFrameIDs.isEmpty {
+                _ = try FrameQueries.delete(
+                    db: db,
+                    frameIDs: immediatelyDeletedFrameIDs.map { FrameID(value: $0) }
+                )
+            }
+
+            try markFramesPendingDeletion(
+                db: db,
+                frameIDs: scheduledJobs.map(\.frameID)
+            )
+
+            try executeImmediateSQL("COMMIT;", db: db)
+            transactionOpen = false
+            return NativeFrameDeletionResult(
+                immediatelyDeletedFrameIDs: immediatelyDeletedFrameIDs,
+                scheduledJobs: scheduledJobs
+            )
+        } catch {
+            if transactionOpen {
+                try? executeImmediateSQL("ROLLBACK;", db: db)
+            }
+            throw error
+        }
+    }
+
+    private func markFramesPendingDeletion(
+        db: OpaquePointer,
+        frameIDs: [Int64]
+    ) throws {
+        guard !frameIDs.isEmpty else { return }
+
+        let placeholders = frameIDs.map { _ in "?" }.joined(separator: ", ")
+        let deleteQueueSQL = "DELETE FROM processing_queue WHERE frameId IN (\(placeholders));"
+        let updateSQL = """
+            UPDATE frame
+            SET processingStatus = 5,
+                rewritePurpose = 'deletion'
+            WHERE id IN (\(placeholders));
+            """
+
+        var deleteQueueStatement: OpaquePointer?
+        defer { sqlite3_finalize(deleteQueueStatement) }
+        guard sqlite3_prepare_v2(db, deleteQueueSQL, -1, &deleteQueueStatement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: deleteQueueSQL, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+        for (index, frameID) in frameIDs.enumerated() {
+            sqlite3_bind_int64(deleteQueueStatement, Int32(index + 1), frameID)
+        }
+        guard sqlite3_step(deleteQueueStatement) == SQLITE_DONE else {
+            throw DatabaseError.queryFailed(query: deleteQueueSQL, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+
+        var updateStatement: OpaquePointer?
+        defer { sqlite3_finalize(updateStatement) }
+        guard sqlite3_prepare_v2(db, updateSQL, -1, &updateStatement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: updateSQL, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+        for (index, frameID) in frameIDs.enumerated() {
+            sqlite3_bind_int64(updateStatement, Int32(index + 1), frameID)
+        }
+        guard sqlite3_step(updateStatement) == SQLITE_DONE else {
+            throw DatabaseError.queryFailed(query: updateSQL, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+    }
+
+    public func getVisibleNativeFrameIDsNewerThan(_ date: Date) async throws -> [Int64] {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let sql = """
+            SELECT id
+            FROM frame
+            WHERE createdAt > ?
+              AND (rewritePurpose IS NULL OR rewritePurpose != 'deletion')
+            ORDER BY createdAt ASC, id ASC;
+            """
+
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        sqlite3_bind_int64(statement, 1, Schema.dateToTimestamp(date))
+
+        var frameIDs: [Int64] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            frameIDs.append(sqlite3_column_int64(statement, 0))
+        }
+
+        return frameIDs
+    }
+
+    public func finalizeVideoRewrite(_ plan: VideoRewritePlan) async throws {
+        try withTracedDatabaseOperation("finalize_video_mutation") { db in
+            var transactionOpen = false
+            do {
+                try executeImmediateSQL("BEGIN IMMEDIATE TRANSACTION;", db: db)
+                transactionOpen = true
+
+                let deletionFrameIDs: [Int64]
+                if plan.deletesWholeVideo {
+                    let sql = """
+                        SELECT id
+                        FROM frame
+                        WHERE videoId = ?
+                          AND rewritePurpose = 'deletion'
+                        ORDER BY id ASC;
+                        """
+                    var statement: OpaquePointer?
+                    defer { sqlite3_finalize(statement) }
+
+                    guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+                        throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+                    }
+                    sqlite3_bind_int64(statement, 1, plan.videoID)
+
+                    var collectedIDs: [Int64] = []
+                    while sqlite3_step(statement) == SQLITE_ROW {
+                        collectedIDs.append(sqlite3_column_int64(statement, 0))
+                    }
+                    deletionFrameIDs = collectedIDs
+                } else {
+                    deletionFrameIDs = plan.deletionFrameIDs
+                }
+
+                if !deletionFrameIDs.isEmpty {
+                    _ = try FrameQueries.delete(
+                        db: db,
+                        frameIDs: deletionFrameIDs.map { FrameID(value: $0) }
+                    )
+                }
+
+                if !plan.redactionFrameIDs.isEmpty {
+                    let placeholders = plan.redactionFrameIDs.map { _ in "?" }.joined(separator: ", ")
+                    let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+                    let sql = """
+                        UPDATE frame
+                        SET processingStatus = 7,
+                            rewrittenAt = \(nowMs),
+                            rewritePurpose = 'redaction'
+                        WHERE id IN (\(placeholders))
+                          AND COALESCE(rewritePurpose, 'redaction') = 'redaction';
+                        """
+                    var statement: OpaquePointer?
+                    defer { sqlite3_finalize(statement) }
+                    guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+                        throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+                    }
+                    for (index, frameID) in plan.redactionFrameIDs.enumerated() {
+                        sqlite3_bind_int64(statement, Int32(index + 1), frameID)
+                    }
+                    guard sqlite3_step(statement) == SQLITE_DONE else {
+                        throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+                    }
+                }
+
+                if plan.deletesWholeVideo {
+                    let sql = "DELETE FROM video WHERE id = ?;"
+                    var statement: OpaquePointer?
+                    defer { sqlite3_finalize(statement) }
+                    guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+                        throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+                    }
+                    sqlite3_bind_int64(statement, 1, plan.videoID)
+                    guard sqlite3_step(statement) == SQLITE_DONE else {
+                        throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+                    }
+                } else if let segment = try SegmentQueries.getByID(db: db, id: VideoSegmentID(value: plan.videoID)),
+                          let refreshedFileSize = refreshedFileSizeOnDisk(forStoredPath: segment.relativePath) {
+                    try SegmentQueries.update(
+                        db: db,
+                        id: plan.videoID,
+                        width: segment.width,
+                        height: segment.height,
+                        fileSize: refreshedFileSize
+                    )
+                }
+
+                try executeImmediateSQL("COMMIT;", db: db)
+                transactionOpen = false
+            } catch {
+                if transactionOpen {
+                    try? executeImmediateSQL("ROLLBACK;", db: db)
+                }
+                throw error
+            }
+        }
+    }
+
+    public func resetVideoRewritePlanToPending(_ plan: VideoRewritePlan) async throws {
+        try withTracedDatabaseOperation("reset_video_mutation_plan_to_pending") { db in
+            func update(_ frameIDs: [Int64], purpose: String) throws {
+                guard !frameIDs.isEmpty else { return }
+                let placeholders = frameIDs.map { _ in "?" }.joined(separator: ", ")
+                let sql = """
+                    UPDATE frame
+                    SET processingStatus = 5,
+                        rewritePurpose = ?
+                    WHERE id IN (\(placeholders));
+                    """
+                var statement: OpaquePointer?
+                defer { sqlite3_finalize(statement) }
+                guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+                    throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+                }
+                let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+                sqlite3_bind_text(statement, 1, purpose, -1, transient)
+                for (index, frameID) in frameIDs.enumerated() {
+                    sqlite3_bind_int64(statement, Int32(index + 2), frameID)
+                }
+                guard sqlite3_step(statement) == SQLITE_DONE else {
+                    throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+                }
+            }
+
+            try update(plan.deletionFrameIDs, purpose: "deletion")
+            try update(plan.redactionFrameIDs, purpose: "redaction")
+        }
     }
 
     public func getPendingNodeRedactionJobs(
@@ -2493,6 +3163,33 @@ public actor DatabaseManager: DatabaseProtocol {
         return sqlite3_step(statement) == SQLITE_ROW
     }
 
+    public func isVideoFinalized(videoID: Int64) async throws -> Bool {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let sql = """
+            SELECT processingState
+            FROM video
+            WHERE id = ?
+            LIMIT 1;
+            """
+
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        sqlite3_bind_int64(statement, 1, videoID)
+        guard sqlite3_step(statement) == SQLITE_ROW else { return false }
+        return sqlite3_column_int(statement, 0) == 0
+    }
+
     // MARK: - Daily Metrics Operations
 
     /// Record a single metric event (timeline open, search, text copy)
@@ -2546,38 +3243,31 @@ public actor DatabaseManager: DatabaseProtocol {
         )
     }
 
+    public func getRecentMetricEvents(
+        limit: Int,
+        excluding metricTypes: Set<DailyMetricsQueries.MetricType> = []
+    ) async throws -> [DailyMetricsQueries.RecentEvent] {
+        try withTracedDatabaseOperation("get_recent_metric_events") { db in
+            try DailyMetricsQueries.getRecentEvents(
+                db: db,
+                limit: limit,
+                excluding: metricTypes
+            )
+        }
+    }
+
     /// Get daily screen time totals (for graphs)
     /// Returns array of (date, totalSeconds) tuples sorted by date ascending
-    public func getDailyScreenTime(
+    nonisolated public func getDailyScreenTime(
         from startDate: Date,
         to endDate: Date
     ) async throws -> [(date: Date, value: Int64)] {
-        let startedAt = CFAbsoluteTimeGetCurrent()
-        do {
-            let results = try withTracedDatabaseOperation("get_daily_screen_time") { db in
-                try AppSegmentQueries.getDailyScreenTime(
-                    db: db,
-                    from: startDate,
-                    to: endDate
-                )
-            }
-            let elapsedMs = (CFAbsoluteTimeGetCurrent() - startedAt) * 1000
-            Log.recordLatency(
-                "dashboard.path.database_manager.get_daily_screen_time_ms",
-                valueMs: elapsedMs,
-                category: .database,
-                summaryEvery: 10,
-                warningThresholdMs: 1200,
-                criticalThresholdMs: 5000
+        try await withDashboardReadConnection(operation: "get_daily_screen_time") { db in
+            try AppSegmentQueries.getDailyScreenTime(
+                db: db,
+                from: startDate,
+                to: endDate
             )
-            return results
-        } catch {
-            let elapsedMs = (CFAbsoluteTimeGetCurrent() - startedAt) * 1000
-            Log.error(
-                "[DASHBOARD-PATH][DatabaseManager] getDailyScreenTime failed range=[\(Log.timestamp(from: startDate)) -> \(Log.timestamp(from: endDate))] after \(String(format: "%.1f", elapsedMs))ms: \(error)",
-                category: .database
-            )
-            throw error
         }
     }
 
@@ -2637,15 +3327,11 @@ public actor DatabaseManager: DatabaseProtocol {
         }
     }
 
-    /// Read daily DB/WAL size snapshots for the requested local-date range.
-    public func getDBStorageSnapshots(
+    private static func readDBStorageSnapshots(
+        db: OpaquePointer,
         from startDate: Date,
         to endDate: Date
-    ) async throws -> [(date: Date, dbBytes: Int64, walBytes: Int64, sampledAt: Date)] {
-        guard let db = db else {
-            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
-        }
-
+    ) throws -> [(date: Date, dbBytes: Int64, walBytes: Int64, sampledAt: Date)] {
         let sql = """
             SELECT local_day, db_bytes, wal_bytes, sampled_at
             FROM db_storage_snapshot
@@ -2683,6 +3369,20 @@ public actor DatabaseManager: DatabaseProtocol {
         }
 
         return snapshots
+    }
+
+    /// Read daily DB/WAL size snapshots for the requested local-date range.
+    nonisolated public func getDBStorageSnapshots(
+        from startDate: Date,
+        to endDate: Date
+    ) async throws -> [(date: Date, dbBytes: Int64, walBytes: Int64, sampledAt: Date)] {
+        try await withDashboardReadConnection(operation: "get_db_storage_snapshots") { db in
+            try Self.readDBStorageSnapshots(
+                db: db,
+                from: startDate,
+                to: endDate
+            )
+        }
     }
 
     // MARK: - Statistics
@@ -3301,54 +4001,108 @@ public actor DatabaseManager: DatabaseProtocol {
     }
 
     /// Dequeue the next frame for processing (highest priority, oldest first)
-    /// Only dequeues frames with processingStatus = 0 (pending)
+    /// Atomically removes it from the queue and marks processingStatus = 1.
     /// Returns tuple of (queueID, frameID, retryCount) or nil if queue is empty
     public func dequeueFrameForProcessing() async throws -> (queueID: Int64, frameID: Int64, retryCount: Int)? {
-        guard let db = db else {
-            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        try withTracedDatabaseOperation("dequeue_frame_for_processing") { db in
+            var transactionOpen = false
+            do {
+                try executeImmediateSQL("BEGIN IMMEDIATE TRANSACTION;", db: db)
+                transactionOpen = true
+
+                // Get highest priority item where frame still has processingStatus = 0.
+                let selectSql = """
+                    SELECT pq.id, pq.frameId, pq.retryCount
+                    FROM processing_queue pq
+                    INNER JOIN frame f ON pq.frameId = f.id
+                    WHERE f.processingStatus = 0
+                    ORDER BY pq.priority DESC, pq.enqueuedAt ASC
+                    LIMIT 1;
+                """
+
+                let selection: (queueID: Int64, frameID: Int64, retryCount: Int)?
+                do {
+                    var selectStmt: OpaquePointer?
+                    defer { sqlite3_finalize(selectStmt) }
+
+                    guard sqlite3_prepare_v2(db, selectSql, -1, &selectStmt, nil) == SQLITE_OK else {
+                        throw DatabaseError.queryFailed(query: selectSql, underlying: String(cString: sqlite3_errmsg(db)))
+                    }
+
+                    guard sqlite3_step(selectStmt) == SQLITE_ROW else {
+                        selection = nil
+                        try executeImmediateSQL("COMMIT;", db: db)
+                        transactionOpen = false
+                        return nil
+                    }
+
+                    selection = (
+                        queueID: sqlite3_column_int64(selectStmt, 0),
+                        frameID: sqlite3_column_int64(selectStmt, 1),
+                        retryCount: Int(sqlite3_column_int(selectStmt, 2))
+                    )
+                }
+
+                guard let selection else {
+                    return nil
+                }
+
+                let updateSql = "UPDATE frame SET processingStatus = 1 WHERE id = ? AND processingStatus = 0;"
+                do {
+                    var updateStmt: OpaquePointer?
+                    defer { sqlite3_finalize(updateStmt) }
+
+                    guard sqlite3_prepare_v2(db, updateSql, -1, &updateStmt, nil) == SQLITE_OK else {
+                        throw DatabaseError.queryFailed(query: updateSql, underlying: String(cString: sqlite3_errmsg(db)))
+                    }
+
+                    sqlite3_bind_int64(updateStmt, 1, selection.frameID)
+
+                    guard sqlite3_step(updateStmt) == SQLITE_DONE else {
+                        throw DatabaseError.queryFailed(query: updateSql, underlying: String(cString: sqlite3_errmsg(db)))
+                    }
+
+                    guard sqlite3_changes(db) == 1 else {
+                        throw DatabaseError.queryFailed(
+                            query: updateSql,
+                            underlying: "Frame \(selection.frameID) was not pending during dequeue"
+                        )
+                    }
+                }
+
+                let deleteSql = "DELETE FROM processing_queue WHERE id = ?;"
+                do {
+                    var deleteStmt: OpaquePointer?
+                    defer { sqlite3_finalize(deleteStmt) }
+
+                    guard sqlite3_prepare_v2(db, deleteSql, -1, &deleteStmt, nil) == SQLITE_OK else {
+                        throw DatabaseError.queryFailed(query: deleteSql, underlying: String(cString: sqlite3_errmsg(db)))
+                    }
+
+                    sqlite3_bind_int64(deleteStmt, 1, selection.queueID)
+
+                    guard sqlite3_step(deleteStmt) == SQLITE_DONE else {
+                        throw DatabaseError.queryFailed(query: deleteSql, underlying: String(cString: sqlite3_errmsg(db)))
+                    }
+
+                    guard sqlite3_changes(db) == 1 else {
+                        throw DatabaseError.queryFailed(
+                            query: deleteSql,
+                            underlying: "Queue row \(selection.queueID) disappeared during dequeue"
+                        )
+                    }
+                }
+
+                try executeImmediateSQL("COMMIT;", db: db)
+                transactionOpen = false
+                return selection
+            } catch {
+                if transactionOpen {
+                    try? executeImmediateSQL("ROLLBACK;", db: db)
+                }
+                throw error
+            }
         }
-
-        // Get highest priority item where frame still has processingStatus = 0
-        let selectSql = """
-            SELECT pq.id, pq.frameId, pq.retryCount
-            FROM processing_queue pq
-            INNER JOIN frame f ON pq.frameId = f.id
-            WHERE f.processingStatus = 0
-            ORDER BY pq.priority DESC, pq.enqueuedAt ASC
-            LIMIT 1;
-        """
-
-        var selectStmt: OpaquePointer?
-        defer { sqlite3_finalize(selectStmt) }
-
-        guard sqlite3_prepare_v2(db, selectSql, -1, &selectStmt, nil) == SQLITE_OK else {
-            throw DatabaseError.queryFailed(query: selectSql, underlying: String(cString: sqlite3_errmsg(db)))
-        }
-
-        guard sqlite3_step(selectStmt) == SQLITE_ROW else {
-            return nil // Queue empty
-        }
-
-        let queueID = sqlite3_column_int64(selectStmt, 0)
-        let frameID = sqlite3_column_int64(selectStmt, 1)
-        let retryCount = Int(sqlite3_column_int(selectStmt, 2))
-
-        // Delete from queue
-        let deleteSql = "DELETE FROM processing_queue WHERE id = ?;"
-        var deleteStmt: OpaquePointer?
-        defer { sqlite3_finalize(deleteStmt) }
-
-        guard sqlite3_prepare_v2(db, deleteSql, -1, &deleteStmt, nil) == SQLITE_OK else {
-            throw DatabaseError.queryFailed(query: deleteSql, underlying: String(cString: sqlite3_errmsg(db)))
-        }
-
-        sqlite3_bind_int64(deleteStmt, 1, queueID)
-
-        guard sqlite3_step(deleteStmt) == SQLITE_DONE else {
-            throw DatabaseError.queryFailed(query: deleteSql, underlying: String(cString: sqlite3_errmsg(db)))
-        }
-
-        return (queueID: queueID, frameID: frameID, retryCount: retryCount)
     }
 
     /// Get the current processing queue depth
@@ -3490,6 +4244,17 @@ public actor DatabaseManager: DatabaseProtocol {
         )
     }
 
+    /// Get count of frames encoded/readable per minute for the last N minutes.
+    /// Returns dictionary of [minuteOffset: count] where offset 0 = current minute.
+    public func getFramesEncodedPerMinute(lastMinutes: Int) async throws -> [Int: Int] {
+        try await getFrameCountsPerMinute(
+            lastMinutes: lastMinutes,
+            timestampColumn: "encodedAt",
+            extraWhereClause: "",
+            logLabel: "encoded"
+        )
+    }
+
     /// Get count of frames rewritten per minute for the last N minutes.
     /// Returns dictionary of [minuteOffset: count] where offset 0 = current minute.
     public func getFramesRewrittenPerMinute(lastMinutes: Int) async throws -> [Int: Int] {
@@ -3507,10 +4272,6 @@ public actor DatabaseManager: DatabaseProtocol {
         extraWhereClause: String,
         logLabel: String
     ) async throws -> [Int: Int] {
-        guard let db = db else {
-            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
-        }
-
         // Query frames by timestampColumn (stored as INTEGER Unix timestamp in milliseconds)
         // Use clean minute boundaries (floor to start of minute) for consistent bucketing
         // e.g., 17:05:23 becomes minute key for 17:05:00
@@ -3518,35 +4279,38 @@ public actor DatabaseManager: DatabaseProtocol {
         let currentMinuteMs = (nowMs / 60000) * 60000  // Floor to start of current minute
         let cutoffMs = currentMinuteMs - Int64(lastMinutes * 60 * 1000)
 
-        // Group by which minute bucket the frame was processed in
-        // minuteOffset 0 = current minute (e.g., 17:05:00 to 17:05:59)
-        // minuteOffset 1 = previous minute (e.g., 17:04:00 to 17:04:59)
+        // Group by minute bucket only; ordering is unnecessary because callers merge into dictionaries.
         let sql = """
             SELECT
-                CAST((\(currentMinuteMs) - (\(timestampColumn) / 60000) * 60000) / 60000 AS INTEGER) as minuteOffset,
+                CAST((?1 - ((\(timestampColumn) / 60000) * 60000)) / 60000 AS INTEGER) AS minuteOffset,
                 COUNT(*) as count
             FROM frame
             WHERE \(timestampColumn) IS NOT NULL
-              AND \(timestampColumn) >= \(cutoffMs)
+              AND \(timestampColumn) >= ?2
               \(extraWhereClause)
             GROUP BY minuteOffset
-            ORDER BY minuteOffset ASC;
         """
 
-        var stmt: OpaquePointer?
-        defer { sqlite3_finalize(stmt) }
+        let result = try withTracedDatabaseOperation("get_frames_\(logLabel)_per_minute", warningMs: 250) { db in
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
 
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
-        }
-
-        var result: [Int: Int] = [:]
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            let minuteOffset = Int(sqlite3_column_int(stmt, 0))
-            let count = Int(sqlite3_column_int(stmt, 1))
-            if minuteOffset >= 0 && minuteOffset < lastMinutes {
-                result[minuteOffset] = count
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
             }
+
+            sqlite3_bind_int64(stmt, 1, currentMinuteMs)
+            sqlite3_bind_int64(stmt, 2, cutoffMs)
+
+            var result: [Int: Int] = [:]
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                let minuteOffset = Int(sqlite3_column_int(stmt, 0))
+                let count = Int(sqlite3_column_int(stmt, 1))
+                if minuteOffset >= 0 && minuteOffset < lastMinutes {
+                    result[minuteOffset] = count
+                }
+            }
+            return result
         }
 
         Log.debug(
@@ -3609,9 +4373,15 @@ public actor DatabaseManager: DatabaseProtocol {
             if status == 2 {
                 let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
                 if shouldBindRewritePurpose {
-                    sql = "UPDATE frame SET processingStatus = ?, processedAt = \(nowMs), rewritePurpose = ? WHERE id = ?;"
+                    sql = "UPDATE frame SET processingStatus = ?, processedAt = \(nowMs), rewritePurpose = ? WHERE id = ? AND (rewritePurpose IS NULL OR rewritePurpose != 'deletion');"
                 } else {
-                    sql = "UPDATE frame SET processingStatus = ?, processedAt = \(nowMs) WHERE id = ?;"
+                    sql = "UPDATE frame SET processingStatus = ?, processedAt = \(nowMs) WHERE id = ? AND (rewritePurpose IS NULL OR rewritePurpose != 'deletion');"
+                }
+            } else if !isRewriteStatus {
+                if shouldBindRewritePurpose {
+                    sql = "UPDATE frame SET processingStatus = ?, rewritePurpose = ? WHERE id = ? AND (rewritePurpose IS NULL OR rewritePurpose != 'deletion');"
+                } else {
+                    sql = "UPDATE frame SET processingStatus = ? WHERE id = ? AND (rewritePurpose IS NULL OR rewritePurpose != 'deletion');"
                 }
             } else if status == 7 {
                 let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
@@ -3682,8 +4452,9 @@ public actor DatabaseManager: DatabaseProtocol {
     /// Called when frame is confirmed to be written to video file
     public func markFrameReadable(frameID: Int64) async throws {
         try withTracedDatabaseOperation("mark_frame_readable") { db in
+            let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
             // Only update if status is 4 (not yet readable)
-            let sql = "UPDATE frame SET processingStatus = 0 WHERE id = ? AND processingStatus = 4;"
+            let sql = "UPDATE frame SET processingStatus = 0, encodedAt = \(nowMs) WHERE id = ? AND processingStatus = 4;"
             var stmt: OpaquePointer?
             defer { sqlite3_finalize(stmt) }
 
@@ -3697,6 +4468,71 @@ public actor DatabaseManager: DatabaseProtocol {
                 throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
             }
         }
+    }
+
+    /// Count frames that are still waiting to become readable from the active video writer.
+    public func getUnreadableFrameCount() async throws -> Int {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let sql = "SELECT COUNT(*) FROM frame WHERE processingStatus = 4;"
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return 0 }
+        return Int(sqlite3_column_int64(stmt, 0))
+    }
+
+    /// Count recently created frames that are still waiting to become readable from disk.
+    /// This is used as a short-lived encoding buffer backlog signal, not a durable queue length.
+    public func getUnreadableFrameCount(withinLastMinutes windowMinutes: Int) async throws -> Int {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let clampedWindowMinutes = max(windowMinutes, 1)
+        let cutoffMs = Int64(Date().timeIntervalSince1970 * 1000) - Int64(clampedWindowMinutes * 60 * 1000)
+        let sql = """
+            SELECT COUNT(*)
+            FROM frame
+            WHERE processingStatus = 4
+              AND createdAt >= ?;
+            """
+
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+
+        sqlite3_bind_int64(stmt, 1, cutoffMs)
+
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return 0 }
+        return Int(sqlite3_column_int64(stmt, 0))
+    }
+
+    /// Count frames that have already been confirmed readable from the video file.
+    public func getEncodedFrameCount() async throws -> Int {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let sql = "SELECT COUNT(*) FROM frame WHERE encodedAt IS NOT NULL;"
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return 0 }
+        return Int(sqlite3_column_int64(stmt, 0))
     }
 
     /// Get processing status for multiple frames in a single query
@@ -3807,9 +4643,14 @@ public actor DatabaseManager: DatabaseProtocol {
     public func getPendingFrameIDsNotInQueue(limit: Int = 1000) async throws -> [Int64] {
         return try withTracedDatabaseOperation("get_pending_frame_ids_not_in_queue") { db in
             let sql = """
-                SELECT f.id FROM frame f
-                LEFT JOIN processing_queue pq ON f.id = pq.frameId
-                WHERE f.processingStatus = 0 AND pq.frameId IS NULL
+                SELECT f.id
+                FROM frame f
+                WHERE f.processingStatus = 0
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM processing_queue pq
+                      WHERE pq.frameId = f.id
+                  )
                 ORDER BY f.id DESC
                 LIMIT ?;
             """
@@ -3833,27 +4674,30 @@ public actor DatabaseManager: DatabaseProtocol {
 
     /// Count frames with pending status (processingStatus=0) that are NOT in the processing queue
     public func countPendingFramesNotInQueue() async throws -> Int {
-        guard let db = db else {
-            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        return try withTracedDatabaseOperation("count_pending_frames_not_in_queue") { db in
+            let sql = """
+                SELECT COUNT(*)
+                FROM frame f
+                WHERE f.processingStatus = 0
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM processing_queue pq
+                      WHERE pq.frameId = f.id
+                  );
+            """
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+            }
+
+            guard sqlite3_step(stmt) == SQLITE_ROW else {
+                return 0
+            }
+
+            return Int(sqlite3_column_int(stmt, 0))
         }
-
-        let sql = """
-            SELECT COUNT(*) FROM frame f
-            LEFT JOIN processing_queue pq ON f.id = pq.frameId
-            WHERE f.processingStatus = 0 AND pq.frameId IS NULL;
-        """
-        var stmt: OpaquePointer?
-        defer { sqlite3_finalize(stmt) }
-
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
-        }
-
-        guard sqlite3_step(stmt) == SQLITE_ROW else {
-            return 0
-        }
-
-        return Int(sqlite3_column_int(stmt, 0))
     }
 
     // MARK: - Schema Inspection

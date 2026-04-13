@@ -32,15 +32,19 @@ public class TimelineWindowController: NSObject {
     private var localEventMonitor: Any?
     private var mouseEventMonitor: Any?  // Debug monitor for shift-drag investigation
     private var timelineViewModel: SimpleTimelineViewModel?
+    private var pendingTimelineViewModelWaiters: [CheckedContinuation<SimpleTimelineViewModel, Never>] = []
     private var hostingView: NSView?
     private var deferredHostingViewDetachTask: Task<Void, Never>?
     private var tapeShowAnimationTask: Task<Void, Never>?
     private var liveModeCaptureTask: Task<Void, Never>?
     private var windowFadeInTask: Task<Void, Never>?
+    private var deferredSearchOverlayRestoreTask: Task<Void, Never>?
+    private var shouldRestoreSearchOverlayAfterNextShow = false
     private var windowFadeInGeneration: UInt64 = 0
     private var workspaceActivationObserver: Any?
     private let hideCompletionCoordinator = HideCompletionCoordinator()
     private var isHiding = false
+    private var presentationState: PresentationState = .hidden
     /// Ignore scroll-wheel input for a short grace period after opening in live mode.
     /// This prevents residual trackpad momentum from immediately exiting live mode.
     private var suppressLiveScrollUntil: CFAbsoluteTime = 0
@@ -69,10 +73,14 @@ public class TimelineWindowController: NSObject {
     private var lastHiddenAt: Date?
 
     /// Whether the timeline overlay is currently visible
-    public private(set) var isVisible = false
+    public var isVisible: Bool {
+        presentationState.isVisibleToClients
+    }
 
     /// Shared hidden-state cache expiry used by timeline and search-state invalidation.
-    static let hiddenStateCacheExpirationSeconds: TimeInterval = 60
+    nonisolated static let hiddenStateCacheExpirationSeconds: TimeInterval = 60
+    /// Show the Cmd+Z recovery hint only for a short window after cache expiry actually snaps away from history.
+    nonisolated static let positionRecoveryHintGracePeriodSeconds: TimeInterval = 60
     /// Reopen policy: when playhead is within this many latest loaded frames, open in live mode immediately.
     /// This only applies when the newest loaded frame is still recent.
     private static let instantLiveReopenFrameThreshold: Int = 3
@@ -85,6 +93,10 @@ public class TimelineWindowController: NSObject {
     private static let nearLiveReopenExpirationSeconds: TimeInterval = 10
     /// Delay before detaching hosting view after hide to keep rapid reopen seamless.
     private static let hostingViewDetachDelay: Duration = .milliseconds(350)
+    /// Delay preserved spotlight overlay reopen until after live-mode presentation settles.
+    private static let liveSearchOverlayRestoreDelayMs = 180
+    /// Small delay after the historical fade completes so the search pops after the reveal.
+    private static let historicalSearchOverlayRestoreDelayMs = 80
 
     /// Monotonic counter for deeplink search invocations (debug tracing).
     private var deeplinkSearchInvocationCounter = 0
@@ -177,6 +189,56 @@ public class TimelineWindowController: NSObject {
         case vertical
     }
 
+    enum PresentationState: String {
+        case hidden
+        case showing
+        case visible
+        case hiding
+
+        var isVisibleToClients: Bool {
+            switch self {
+            case .hidden:
+                return false
+            case .showing, .visible, .hiding:
+                return true
+            }
+        }
+    }
+
+    enum ToggleAction: Equatable {
+        case show
+        case hide
+    }
+
+    enum SearchOverlayShortcutAction: Equatable {
+        case open
+        case focusField
+        case close
+    }
+
+    enum SearchResultNavigationDirection: Equatable {
+        case previous
+        case next
+    }
+
+    private struct VisibilitySnapshot {
+        let windowExists: Bool
+        let windowVisible: Bool
+        let windowMiniaturized: Bool
+        let windowAlphaValue: CGFloat
+        let appHidden: Bool
+
+        var isActuallyVisible: Bool {
+            TimelineWindowController.isActuallyVisible(
+                windowExists: windowExists,
+                windowVisible: windowVisible,
+                windowMiniaturized: windowMiniaturized,
+                windowAlphaValue: windowAlphaValue,
+                appHidden: appHidden
+            )
+        }
+    }
+
     nonisolated static func shouldCaptureFocusRestoreTarget(frontmostProcessID: pid_t?, currentProcessID: pid_t) -> Bool {
         guard let frontmostProcessID else { return false }
         return frontmostProcessID != currentProcessID
@@ -210,8 +272,84 @@ public class TimelineWindowController: NSObject {
         return activatedProcessID != currentProcessID
     }
 
-    nonisolated static func shouldToggleSearchOverlayFromShortcut(isActivelyScrolling: Bool) -> Bool {
-        !isActivelyScrolling
+    nonisolated static func shouldToggleSearchOverlayFromShortcut(
+        isActivelyScrolling: Bool,
+        isSettledAtAbsoluteTimelineBoundary: Bool = false
+    ) -> Bool {
+        !isActivelyScrolling || isSettledAtAbsoluteTimelineBoundary
+    }
+
+    nonisolated static func shouldShowPositionRecoveryHintOnReopen(
+        hiddenElapsedSeconds: TimeInterval,
+        didSnapToNewest: Bool
+    ) -> Bool {
+        guard didSnapToNewest, hiddenElapsedSeconds.isFinite else { return false }
+        guard hiddenElapsedSeconds > hiddenStateCacheExpirationSeconds else { return false }
+        return hiddenElapsedSeconds <= hiddenStateCacheExpirationSeconds + positionRecoveryHintGracePeriodSeconds
+    }
+
+    nonisolated static func searchOverlayShortcutAction(
+        isSearchOverlayVisible: Bool,
+        shouldRefocusSearchFieldBeforeClose: Bool
+    ) -> SearchOverlayShortcutAction {
+        guard isSearchOverlayVisible else { return .open }
+        return shouldRefocusSearchFieldBeforeClose ? .focusField : .close
+    }
+
+    nonisolated static func isActuallyVisible(
+        windowExists: Bool,
+        windowVisible: Bool,
+        windowMiniaturized: Bool,
+        windowAlphaValue: CGFloat,
+        appHidden: Bool
+    ) -> Bool {
+        windowExists &&
+            windowVisible &&
+            !windowMiniaturized &&
+            windowAlphaValue > 0.01 &&
+            !appHidden
+    }
+
+    nonisolated static func reconciledPresentationState(
+        currentState: PresentationState,
+        windowExists: Bool,
+        isActuallyVisible: Bool
+    ) -> PresentationState {
+        switch currentState {
+        case .hidden:
+            return isActuallyVisible ? .visible : .hidden
+        case .showing:
+            if isActuallyVisible {
+                return .visible
+            }
+            return windowExists ? .showing : .hidden
+        case .visible:
+            return isActuallyVisible ? .visible : .hidden
+        case .hiding:
+            return isActuallyVisible ? .hiding : .hidden
+        }
+    }
+
+    nonisolated static func toggleAction(
+        presentationState: PresentationState,
+        isActuallyVisible: Bool
+    ) -> ToggleAction {
+        let effectiveState: PresentationState
+        switch presentationState {
+        case .visible where !isActuallyVisible:
+            effectiveState = .hidden
+        case .hidden where isActuallyVisible:
+            effectiveState = .visible
+        default:
+            effectiveState = presentationState
+        }
+
+        switch effectiveState {
+        case .hidden, .hiding:
+            return .show
+        case .showing, .visible:
+            return .hide
+        }
     }
 
     nonisolated private static func withEmergencyTapState<T>(
@@ -263,6 +401,20 @@ public class TimelineWindowController: NSObject {
         return keyCode == 13 || key == "w"
     }
 
+    nonisolated static func shouldDeferCommandAToTextInput(
+        isTextFieldActive: Bool,
+        isSearchOverlayVisible: Bool,
+        isFilterPanelVisible: Bool,
+        isDateSearchActive: Bool,
+        isCommentSubmenuVisible: Bool
+    ) -> Bool {
+        isTextFieldActive ||
+            isSearchOverlayVisible ||
+            isFilterPanelVisible ||
+            isDateSearchActive ||
+            isCommentSubmenuVisible
+    }
+
     nonisolated static func shouldNavigateTimelineBackward(
         keyCode: UInt16,
         charactersIgnoringModifiers: String?,
@@ -289,6 +441,28 @@ public class TimelineWindowController: NSObject {
 
         let key = charactersIgnoringModifiers?.lowercased()
         return keyCode == 124 || key == "k" || key == ";"
+    }
+
+    nonisolated static func searchResultNavigationDirection(
+        keyCode: UInt16,
+        modifiers: NSEvent.ModifierFlags,
+        isSearchResultHighlightVisible: Bool
+    ) -> SearchResultNavigationDirection? {
+        guard isSearchResultHighlightVisible else { return nil }
+
+        let normalizedModifiers = modifiers.intersection([.command, .shift, .option, .control])
+        guard normalizedModifiers == [.command, .shift] else {
+            return nil
+        }
+
+        switch keyCode {
+        case 123:
+            return .previous
+        case 124:
+            return .next
+        default:
+            return nil
+        }
     }
 
     private func shouldHandleTimelineKeyboardShortcuts() -> Bool {
@@ -330,6 +504,147 @@ public class TimelineWindowController: NSObject {
         self.workspaceActivationObserver = nil
     }
 
+    private var currentVisibilitySnapshot: VisibilitySnapshot {
+        VisibilitySnapshot(
+            windowExists: window != nil,
+            windowVisible: window?.isVisible ?? false,
+            windowMiniaturized: window?.isMiniaturized ?? false,
+            windowAlphaValue: window?.alphaValue ?? 0,
+            appHidden: NSApp.isHidden
+        )
+    }
+
+    private var isActuallyVisible: Bool {
+        currentVisibilitySnapshot.isActuallyVisible
+    }
+
+    private func reconcileVisibilityState(reason: String) {
+        let snapshot = currentVisibilitySnapshot
+        let previousState = presentationState
+        let reconciledState = Self.reconciledPresentationState(
+            currentState: previousState,
+            windowExists: snapshot.windowExists,
+            isActuallyVisible: snapshot.isActuallyVisible
+        )
+
+        guard reconciledState != previousState else { return }
+        presentationState = reconciledState
+
+        if reconciledState == .visible {
+            Self.setEmergencyTimelineVisible(true)
+            startObservingApplicationActivation()
+        } else if reconciledState == .hidden {
+            Self.setEmergencyTimelineVisible(false)
+            stopObservingApplicationActivation()
+        }
+
+        Log.info(
+            "[TimelineVisibility] reconciled reason=\(reason) from=\(previousState.rawValue) to=\(reconciledState.rawValue) actualVisible=\(snapshot.isActuallyVisible) windowExists=\(snapshot.windowExists) windowVisible=\(snapshot.windowVisible) windowMini=\(snapshot.windowMiniaturized) windowAlpha=\(String(format: "%.2f", snapshot.windowAlphaValue)) appHidden=\(snapshot.appHidden)",
+            category: .ui
+        )
+
+        guard previousState == .visible, reconciledState == .hidden, !isHiding else {
+            return
+        }
+
+        synchronizeHiddenStateAfterExternalDismissal(reason: reason, force: true)
+    }
+
+    private func recordVisibleSessionMetricsIfNeeded() {
+        guard let startTime = sessionStartTime, let coordinator = coordinator else { return }
+
+        let durationMs = Int64(Date().timeIntervalSince(startTime) * 1000)
+        DashboardViewModel.recordTimelineSession(coordinator: coordinator, durationMs: durationMs)
+
+        if sessionScrubDistance > 0 {
+            DashboardViewModel.recordScrubDistance(coordinator: coordinator, distancePixels: sessionScrubDistance)
+        }
+
+        sessionStartTime = nil
+        sessionScrubDistance = 0
+    }
+
+    private func dismissTransientTimelineUIForHide() {
+        tapeShowAnimationTask?.cancel()
+        guard let viewModel = timelineViewModel else { return }
+
+        withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+            viewModel.isTapeHidden = true
+        }
+        // Abort in-flight search work now that the timeline is dismissing.
+        viewModel.searchViewModel.cancelSearch()
+        // Ensure right-click menus don't persist across timeline sessions.
+        viewModel.dismissContextMenu()
+        viewModel.dismissTimelineContextMenu()
+        viewModel.clearTimelineTapeRightClickHint(animated: false)
+
+        // Dismiss any open overlays (filter panel, date search, etc.)
+        if viewModel.isFilterPanelVisible {
+            viewModel.dismissFilterPanel()
+        }
+        if viewModel.isCalendarPickerVisible {
+            viewModel.closeCalendarPicker()
+        }
+        if viewModel.isDateSearchActive {
+            viewModel.closeDateSearch()
+        }
+        if viewModel.isSearchOverlayVisible {
+            // Preserve overlay state across timeline toggle, but do not keep the
+            // spotlight view mounted during the next timeline-open animation.
+            viewModel.searchViewModel.requestDismissRecentEntriesPopoverByUser()
+            viewModel.searchViewModel.suppressRecentEntriesForNextOverlayOpen()
+            shouldRestoreSearchOverlayAfterNextShow = true
+            viewModel.isSearchOverlayVisible = false
+        }
+        if viewModel.isInFrameSearchVisible ||
+            !viewModel.inFrameSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            viewModel.closeInFrameSearch(clearQuery: true)
+        }
+    }
+
+    private func prepareForHiddenStateTransition(reason: String) {
+        stopObservingApplicationActivation()
+        cancelWindowFadeIn(reason: reason)
+        if deferredSearchOverlayRestoreTask != nil {
+            shouldRestoreSearchOverlayAfterNextShow = true
+        }
+        cancelDeferredSearchOverlayRestore()
+        liveModeCaptureTask?.cancel()
+        liveModeCaptureTask = nil
+        recordVisibleSessionMetricsIfNeeded()
+        dismissTransientTimelineUIForHide()
+        removeEventMonitors()
+    }
+
+    private func synchronizeHiddenStateAfterExternalDismissal(
+        reason: String,
+        force: Bool = false,
+        restorePreviousFocus: Bool = false
+    ) {
+        let snapshot = currentVisibilitySnapshot
+        let needsSynchronization = force ||
+            presentationState != .hidden ||
+            snapshot.windowVisible
+        guard needsSynchronization else { return }
+        guard !isHiding else { return }
+
+        Log.warning(
+            "[TimelineVisibility] synchronizing hidden state after external dismissal reason=\(reason) state=\(presentationState.rawValue) windowExists=\(snapshot.windowExists) windowVisible=\(snapshot.windowVisible) windowMini=\(snapshot.windowMiniaturized) windowAlpha=\(String(format: "%.2f", snapshot.windowAlphaValue)) appHidden=\(snapshot.appHidden)",
+            category: .ui
+        )
+
+        prepareForHiddenStateTransition(reason: "external-dismissal.\(reason)")
+        applyHiddenState(
+            restorePreviousFocus: restorePreviousFocus,
+            hideRequestedAt: nil,
+            reason: "external-dismissal.\(reason)"
+        )
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.finishHideTransitionCleanup()
+        }
+    }
+
     private func dismissForActivatedApplication(_ activatedApplication: NSRunningApplication?) {
         guard isVisible, !isHiding else { return }
         stopObservingApplicationActivation()
@@ -347,17 +662,20 @@ public class TimelineWindowController: NSObject {
     }
 
     func hideAndWait(restorePreviousFocus: Bool = true) async -> Bool {
+        reconcileVisibilityState(reason: "hideAndWait")
         if isHiding {
             return await hideCompletionCoordinator.wait()
         }
 
         guard isVisible else { return true }
         guard window != nil else {
-            Log.warning(
-                "[TimelineToggle] Cannot await hide completion because the timeline window is missing while marked visible",
-                category: .ui
-            )
-            return false
+            return await withCheckedContinuation { continuation in
+                hideCompletionCoordinator.append(continuation)
+                synchronizeHiddenStateAfterExternalDismissal(
+                    reason: "hideAndWaitMissingWindow",
+                    restorePreviousFocus: restorePreviousFocus
+                )
+            }
         }
 
         return await withCheckedContinuation { continuation in
@@ -380,10 +698,6 @@ public class TimelineWindowController: NSObject {
         focusRestoreTarget = FocusRestoreTarget(
             processIdentifier: frontmost.processIdentifier,
             bundleIdentifier: frontmost.bundleIdentifier
-        )
-        Log.debug(
-            "[TIMELINE-FOCUS] Captured restore target pid=\(frontmost.processIdentifier) bundleID=\(frontmost.bundleIdentifier ?? "nil")",
-            category: .ui
         )
     }
 
@@ -408,17 +722,7 @@ public class TimelineWindowController: NSObject {
 
         let hideElapsedMs = hideRequestedAt.map { (CFAbsoluteTimeGetCurrent() - $0) * 1000 }
         guard let app = NSRunningApplication(processIdentifier: target.processIdentifier),
-              !app.isTerminated else {
-            if let hideElapsedMs {
-                Log.debug(
-                    "[TIMELINE-FOCUS] Skip restore: prior app no longer running pid=\(target.processIdentifier) afterHide=\(String(format: "%.1f", hideElapsedMs))ms",
-                    category: .ui
-                )
-            } else {
-                Log.debug("[TIMELINE-FOCUS] Skip restore: prior app no longer running pid=\(target.processIdentifier)", category: .ui)
-            }
-            return
-        }
+              !app.isTerminated else { return }
 
         if let hideElapsedMs {
             Log.recordLatency(
@@ -429,30 +733,70 @@ public class TimelineWindowController: NSObject {
                 warningThresholdMs: 350,
                 criticalThresholdMs: 700
             )
-            Log.info(
-                "[TIMELINE-FOCUS] Restoring app focus pid=\(target.processIdentifier) bundleID=\(target.bundleIdentifier ?? "nil") afterHide=\(String(format: "%.1f", hideElapsedMs))ms",
-                category: .ui
-            )
-        } else {
-            Log.info(
-                "[TIMELINE-FOCUS] Restoring app focus pid=\(target.processIdentifier) bundleID=\(target.bundleIdentifier ?? "nil")",
-                category: .ui
+        }
+
+        _ = app.activate(options: [.activateIgnoringOtherApps])
+    }
+
+    private func applyHiddenState(
+        restorePreviousFocus: Bool,
+        hideRequestedAt: CFAbsoluteTime?,
+        reason _: String
+    ) {
+        let wasHidingToShowDashboard = isHidingToShowDashboard
+        isHiding = false
+
+        // Only hide dashboard if it wasn't the active window before timeline opened
+        // AND we're not hiding specifically to show the dashboard/settings.
+        if dashboardWasKeyWindow != true,
+           !wasHidingToShowDashboard,
+           DashboardWindowController.shared.window?.attachedSheet == nil {
+            DashboardWindowController.shared.hide()
+        }
+        isHidingToShowDashboard = false
+
+        if let window {
+            // Ignore mouse events while hidden to prevent blocking clicks on other windows.
+            window.ignoresMouseEvents = true
+            window.orderOut(nil)
+        }
+        presentationState = .hidden
+        Self.setEmergencyTimelineVisible(false)
+        lastHiddenAt = Date()
+        suppressLiveScrollUntil = 0
+
+        if let hideRequestedAt {
+            let hideElapsedMs = (CFAbsoluteTimeGetCurrent() - hideRequestedAt) * 1000
+            Log.recordLatency(
+                "timeline.hide.window_hidden_ms",
+                valueMs: hideElapsedMs,
+                category: .ui,
+                summaryEvery: 10,
+                warningThresholdMs: 300,
+                criticalThresholdMs: 600
             )
         }
 
-        if !app.activate(options: [.activateIgnoringOtherApps]) {
-            if let hideElapsedMs {
-                Log.warning(
-                    "[TIMELINE-FOCUS] Failed to restore app focus pid=\(target.processIdentifier) bundleID=\(target.bundleIdentifier ?? "nil") afterHide=\(String(format: "%.1f", hideElapsedMs))ms",
-                    category: .ui
-                )
-            } else {
-                Log.warning(
-                    "[TIMELINE-FOCUS] Failed to restore app focus pid=\(target.processIdentifier) bundleID=\(target.bundleIdentifier ?? "nil")",
-                    category: .ui
-                )
-            }
+        restoreFocusIfNeeded(
+            requestedRestore: restorePreviousFocus,
+            wasHidingToShowDashboard: wasHidingToShowDashboard,
+            hideRequestedAt: hideRequestedAt
+        )
+    }
+
+    private func finishHideTransitionCleanup() async {
+        // Mark timeline hidden before post-hide refresh so frame reads can use relaxed timing.
+        if let coordinator {
+            await coordinator.setTimelineVisible(false)
         }
+
+        hideCompletionCoordinator.resumeAll(hidden: true)
+
+        await compactHiddenPresentationState()
+
+        onClose?()
+        TimelineScaleFactor.resetCache()
+        NotificationCenter.default.post(name: .timelineDidClose, object: nil)
     }
 
     // MARK: - Initialization
@@ -668,12 +1012,10 @@ public class TimelineWindowController: NSObject {
 
     /// Load the current timeline shortcut from UserDefaults
     private func loadTimelineShortcut() -> ShortcutConfig {
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
-        guard let data = defaults.data(forKey: Self.timelineShortcutKey),
-              let config = try? JSONDecoder().decode(ShortcutConfig.self, from: data) else {
-            return .defaultTimeline
-        }
-        return config
+        OnboardingManager.loadShortcutConfig(
+            forKey: Self.timelineShortcutKey,
+            fallback: .defaultTimeline
+        )
     }
 
     // MARK: - Configuration
@@ -694,6 +1036,12 @@ public class TimelineWindowController: NSObject {
             self,
             selector: #selector(handleDisplayChange(_:)),
             name: .activeDisplayDidChange,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleApplicationDidHide(_:)),
+            name: NSApplication.didHideNotification,
             object: nil
         )
 
@@ -726,6 +1074,7 @@ public class TimelineWindowController: NSObject {
 
     /// Handle toggle dashboard notification - if timeline is visible, hide it first
     @objc private func handleToggleDashboard(_ notification: Notification) {
+        reconcileVisibilityState(reason: "toggleDashboardNotification")
         guard isVisible else { return }
         // Timeline is visible, so hide it properly before showing dashboard
         hideToShowDashboard()
@@ -733,6 +1082,7 @@ public class TimelineWindowController: NSObject {
 
     /// Handle open settings notification - if timeline is visible, hide it first
     @objc private func handleOpenSettings(_ notification: Notification) {
+        reconcileVisibilityState(reason: "openSettingsNotification")
         guard isVisible else { return }
         // Timeline is visible, so hide it properly before showing settings
         hideToShowDashboard()
@@ -743,57 +1093,49 @@ public class TimelineWindowController: NSObject {
         moveWindowToMouseScreen()
     }
 
+    @objc private func handleApplicationDidHide(_ notification: Notification) {
+        guard isVisible else { return }
+        synchronizeHiddenStateAfterExternalDismissal(reason: "applicationDidHide")
+    }
+
     // MARK: - Pre-rendering
 
     /// Prepare a metadata-only timeline state at startup.
     /// The hidden window/view hierarchy is no longer kept alive; we only warm the view model.
     public func prepareWindow() {
-        let prepareStartTime = CFAbsoluteTimeGetCurrent()
-        Log.info("[TIMELINE-PRERENDER] 🚀 prepareWindow() started", category: .ui)
+        guard let coordinator = coordinator else { return }
 
-        guard let coordinator = coordinator else {
-            Log.info("[TIMELINE-PRERENDER] ⚠️ prepareWindow() skipped - no coordinator", category: .ui)
-            return
-        }
-
-        if isPrepared, timelineViewModel != nil {
-            Log.info("[TIMELINE-PRERENDER] ⚠️ prepareWindow() skipped - metadata already prepared", category: .ui)
-            return
-        }
+        if isPrepared, timelineViewModel != nil { return }
 
         let viewModel = ensurePreparedViewModel(coordinator: coordinator)
         viewModel.isTapeHidden = true
-        Log.info(
-            "[TIMELINE-PRERENDER] 📊 Headless view model prepared, elapsed=\(String(format: "%.3f", (CFAbsoluteTimeGetCurrent() - prepareStartTime) * 1000))ms",
-            category: .ui
-        )
 
         // Load the most recent frame data in the background
         Task { @MainActor in
             await viewModel.loadMostRecentFrame(refreshPresentation: false)
-            Log.info("[TIMELINE-PRERENDER] 📊 Frame data loaded, total elapsed=\(String(format: "%.3f", (CFAbsoluteTimeGetCurrent() - prepareStartTime) * 1000))ms", category: .ui)
         }
 
         isPrepared = true
-        Log.info("[TIMELINE-PRERENDER] ✅ prepareWindow() completed, total=\(String(format: "%.3f", (CFAbsoluteTimeGetCurrent() - prepareStartTime) * 1000))ms", category: .ui)
     }
 
     // MARK: - Show/Hide
 
 	    /// Show the timeline overlay on the current screen
     public func show() {
+        reconcileVisibilityState(reason: "show")
         cancelDeferredHostingViewDetach()
         cancelWindowFadeIn(reason: "show")
+        cancelDeferredSearchOverlayRestore()
 
         // If we're in the middle of hiding, cancel the animation and snap back to visible
         if isHiding, let window = window {
             isHiding = false
+            presentationState = .visible
             // Cancel any running animation by setting duration to 0
             NSAnimationContext.runAnimationGroup({ context in
                 context.duration = 0
                 window.animator().alphaValue = 1
             })
-            isVisible = true
             Self.setEmergencyTimelineVisible(true)
             hideCompletionCoordinator.resumeAll(hidden: false)
             startObservingApplicationActivation()
@@ -803,10 +1145,6 @@ public class TimelineWindowController: NSObject {
         guard !isVisible, let coordinator = coordinator else {
             return
         }
-        Log.info(
-            "[TimelineToggle] show requested isVisible=\(isVisible) searchOverlayVisible=\(timelineViewModel?.isSearchOverlayVisible ?? false)",
-            category: .ui
-        )
         let showStartTime = CFAbsoluteTimeGetCurrent()
         liveModeCaptureTask?.cancel()
         liveModeCaptureTask = nil
@@ -817,6 +1155,8 @@ public class TimelineWindowController: NSObject {
         var shouldRefreshPreparedMetadataOnShow = false
         var navigateToNewestOnShowRefresh = true
         var allowNearLiveAutoAdvanceOnShowRefresh = true
+        var shouldShowPositionRecoveryHintOnShow = false
+        var positionRecoveryHintHiddenElapsedSeconds: TimeInterval?
 
         if let viewModel = timelineViewModel {
             let framesFromNewestBefore = max(0, viewModel.frames.count - 1 - viewModel.currentIndex)
@@ -841,39 +1181,34 @@ public class TimelineWindowController: NSObject {
                 ((instantEligible && instantLiveExpiryElapsed) || (nearEligible && nearLiveExpiryElapsed))
             let shouldSnapToNewestOnShow = cacheExpired || shouldAutoAdvanceNearLive
             let shouldClearSearchForReopenPolicy = shouldSnapToNewestOnShow
-            let hiddenLabel = hiddenElapsedSeconds.isFinite ? String(format: "%.1f", hiddenElapsedSeconds) : "inf"
-
-            let snapReason: String
-            if cacheExpired {
-                snapReason = "cache_expired"
-            } else if instantEligible && instantLiveExpiryElapsed {
-                snapReason = "instant_near_edge"
-            } else if nearEligible && nearLiveExpiryElapsed {
-                snapReason = "near_live_expired"
-            } else {
-                snapReason = "none"
-            }
 
             if shouldClearSearchForReopenPolicy {
                 let searchViewModel = viewModel.searchViewModel
                 if searchViewModel.hasResults || !searchViewModel.searchQuery.isEmpty {
-                    Log.info(
-                        "[TIMELINE-REOPEN] Clearing search state before show (reason=\(snapReason))",
-                        category: .ui
-                    )
                     searchViewModel.clearSearchResults()
                 }
             }
 
             if shouldSnapToNewestOnShow, !viewModel.frames.isEmpty {
                 let newestIndex = max(0, viewModel.frames.count - 1)
-                let oldIndex = viewModel.currentIndex
-                if oldIndex != newestIndex {
-                    viewModel.currentIndex = newestIndex
-                    Log.info(
-                        "[TIMELINE-REOPEN] snapOnShow oldIndex=\(oldIndex) newIndex=\(newestIndex) reason=\(snapReason)",
-                        category: .ui
-                    )
+                let didSnapToNewest: Bool
+                if cacheExpired {
+                    didSnapToNewest = viewModel.applyCacheBustReopenSnapToNewest(newestIndex: newestIndex)
+                } else {
+                    if viewModel.currentIndex != newestIndex {
+                        viewModel.currentIndex = newestIndex
+                        didSnapToNewest = true
+                    } else {
+                        didSnapToNewest = false
+                    }
+                }
+
+                shouldShowPositionRecoveryHintOnShow = Self.shouldShowPositionRecoveryHintOnReopen(
+                    hiddenElapsedSeconds: hiddenElapsedSeconds,
+                    didSnapToNewest: didSnapToNewest && cacheExpired
+                )
+                if shouldShowPositionRecoveryHintOnShow {
+                    positionRecoveryHintHiddenElapsedSeconds = hiddenElapsedSeconds
                 }
             }
 
@@ -881,14 +1216,8 @@ public class TimelineWindowController: NSObject {
             navigateToNewestOnShowRefresh = shouldSnapToNewestOnShow
             allowNearLiveAutoAdvanceOnShowRefresh = shouldAutoAdvanceNearLive || cacheExpired
 
-            let framesFromNewestAfter = max(0, viewModel.frames.count - 1 - viewModel.currentIndex)
             shouldUseLiveMode = loadedTapeIsRecent &&
                 viewModel.isNearLatestLoadedFrame(within: Self.instantLiveReopenFrameThreshold)
-
-            Log.info(
-                "[TIMELINE-REOPEN] hidden=\(hiddenLabel)s framesFromNewestBefore=\(framesFromNewestBefore) framesFromNewestAfter=\(framesFromNewestAfter) loadedTapeIsRecent=\(loadedTapeIsRecent) instantEligible=\(instantEligible) instantExpiryElapsed=\(instantLiveExpiryElapsed) nearEligible=\(nearEligible) nearExpiryElapsed=\(nearLiveExpiryElapsed) cacheExpired=\(cacheExpired) hasActiveFilters=\(hasActiveFilters) shouldSnapOnShow=\(shouldSnapToNewestOnShow) liveModeOnShow=\(shouldUseLiveMode)",
-                category: .ui
-            )
         }
 
         // Remember if dashboard was the key window before we take over
@@ -915,19 +1244,15 @@ public class TimelineWindowController: NSObject {
             viewModel.isTapeHidden = true
             tapeShowAnimationTask?.cancel()
 
-            // Log cache state
-            if let lastHidden = lastHiddenAt {
-                let elapsed = Date().timeIntervalSince(lastHidden)
-                Log.info("[TIMELINE-SHOW] Using headless prepared state (hidden \(Int(elapsed))s ago)", category: .ui)
-            } else {
-                Log.info("[TIMELINE-SHOW] First show after headless prerender", category: .ui)
-            }
-
             showPreparedWindow(
                 coordinator: coordinator,
                 openPath: "prepared_headless",
                 showStartTime: showStartTime
             )
+            if shouldShowPositionRecoveryHintOnShow,
+               let hiddenElapsedSeconds = positionRecoveryHintHiddenElapsedSeconds {
+                viewModel.showPositionRecoveryHint(hiddenElapsedSeconds: hiddenElapsedSeconds)
+            }
             startLiveModeCaptureIfNeeded(shouldUseLiveMode: shouldUseLiveMode, viewModel: viewModel)
             if shouldRefreshPreparedMetadataOnShow {
                 refreshTimelineMetadataOnShow(
@@ -940,9 +1265,8 @@ public class TimelineWindowController: NSObject {
         }
 
         // Fallback: Create presentation and view model from scratch (prerender disabled or unavailable).
-        Log.info("[TIMELINE-SHOW] ⚠️ Using FALLBACK path - creating new window and viewModel from scratch", category: .ui)
         let viewModel = SimpleTimelineViewModel(coordinator: coordinator)
-        self.timelineViewModel = viewModel
+        setTimelineViewModel(viewModel)
         prepareLiveModeState(shouldUseLiveMode: shouldUseLiveMode, viewModel: viewModel)
         viewModel.isTapeHidden = true
         tapeShowAnimationTask?.cancel()
@@ -978,12 +1302,6 @@ public class TimelineWindowController: NSObject {
         timelineViewModel?.isTapeHidden = true
         tapeShowAnimationTask?.cancel()
 
-        // Log current view model state before showing
-        if let viewModel = timelineViewModel {
-            let currentVideoInfo = viewModel.currentVideoInfo
-            Log.info("[TIMELINE-SHOW] 🎬 About to show window - currentIndex=\(viewModel.currentIndex), frames.count=\(viewModel.frames.count), videoPath=\(currentVideoInfo?.videoPath.suffix(30) ?? "nil"), frameIndex=\(currentVideoInfo?.frameIndex ?? -1)", category: .ui)
-        }
-
         // Force video reload BEFORE showing window to avoid flicker
         // This ensures AVPlayer loads fresh video data with any new frames
         // Skip this when in live mode since we're showing a live screenshot instead
@@ -1013,17 +1331,17 @@ public class TimelineWindowController: NSObject {
             viewModel.dismissTimelineContextMenu()
         }
 
-        Log.info("[TIMELINE-SHOW] 🚀 WINDOW BECOMING VISIBLE NOW (makeKeyAndOrderFront)", category: .ui)
         // Re-assert Space behavior before each open so cached windows always
         // materialize on the currently active Desktop.
         window.collectionBehavior.remove(.canJoinAllSpaces)
         window.collectionBehavior.insert(.moveToActiveSpace)
         // Mark visible before activation to avoid activation-time dashboard reveal
         // races that can switch Spaces on some machines.
-        isVisible = true
+        presentationState = .showing
         Self.setEmergencyTimelineVisible(true)  // For emergency escape tap
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
+        presentationState = .visible
         startObservingApplicationActivation()
         if let hostingView = hostingView {
             DispatchQueue.main.async { [weak hostingView] in
@@ -1053,6 +1371,13 @@ public class TimelineWindowController: NSObject {
             scheduleHistoricalFadeIn(window: window, viewModel: viewModel)
         }
 
+        if isLive, let viewModel = timelineViewModel {
+            scheduleDeferredSearchOverlayRestoreIfNeeded(
+                viewModel: viewModel,
+                isLiveMode: isLive
+            )
+        }
+
         // Trigger tape slide-up animation (Cmd+H style)
         tapeShowAnimationTask = Task { @MainActor in
             await Task.yield()
@@ -1076,39 +1401,65 @@ public class TimelineWindowController: NSObject {
         // Track session start time for duration metrics
         sessionStartTime = Date()
         sessionScrubDistance = 0  // Reset scrub distance for new session
+        timelineViewModel?.resetVisibleSessionScrubTracking()
 
         // Post notification so menu bar can hide recording indicator
         NotificationCenter.default.post(name: .timelineDidOpen, object: nil)
 
     }
 
-    /// Hide the timeline overlay
-    public func hide(restorePreviousFocus: Bool = true) {
-        guard isVisible, let window = window, !isHiding else { return }
+    private func cancelDeferredSearchOverlayRestore() {
+        deferredSearchOverlayRestoreTask?.cancel()
+        deferredSearchOverlayRestoreTask = nil
+    }
+
+    private static func preservedSearchOverlayRestoreDelayMs(isLiveMode: Bool) -> Int {
+        isLiveMode ? liveSearchOverlayRestoreDelayMs : historicalSearchOverlayRestoreDelayMs
+    }
+
+    private func scheduleDeferredSearchOverlayRestoreIfNeeded(
+        viewModel: SimpleTimelineViewModel,
+        isLiveMode: Bool
+    ) {
+        guard shouldRestoreSearchOverlayAfterNextShow else {
+            return
+        }
+
+        shouldRestoreSearchOverlayAfterNextShow = false
+        cancelDeferredSearchOverlayRestore()
+        let delayMs = Self.preservedSearchOverlayRestoreDelayMs(isLiveMode: isLiveMode)
         Log.info(
-            "[TimelineToggle] hide requested restorePreviousFocus=\(restorePreviousFocus) searchOverlayVisible=\(timelineViewModel?.isSearchOverlayVisible ?? false)",
+            "[TimelineSearchOverlay] queued preserved overlay restore delayMs=\(delayMs) isLiveMode=\(isLiveMode)",
             category: .ui
         )
-        let hideRequestStartedAt = CFAbsoluteTimeGetCurrent()
-        isHiding = true
-        stopObservingApplicationActivation()
-        cancelWindowFadeIn(reason: "hide")
-        liveModeCaptureTask?.cancel()
-        liveModeCaptureTask = nil
 
-        // Record timeline session duration (only if > 3 seconds)
-        if let startTime = sessionStartTime, let coordinator = coordinator {
-            let durationMs = Int64(Date().timeIntervalSince(startTime) * 1000)
-            DashboardViewModel.recordTimelineSession(coordinator: coordinator, durationMs: durationMs)
-
-            // Record scrub distance metric
-            if sessionScrubDistance > 0 {
-                DashboardViewModel.recordScrubDistance(coordinator: coordinator, distancePixels: sessionScrubDistance)
+        deferredSearchOverlayRestoreTask = Task { @MainActor [weak self, weak viewModel] in
+            try? await Task.sleep(for: .milliseconds(delayMs), clock: .continuous)
+            guard let self, let viewModel else { return }
+            defer { self.deferredSearchOverlayRestoreTask = nil }
+            guard !Task.isCancelled,
+                  self.isVisible,
+                  !self.isHiding,
+                  self.timelineViewModel === viewModel else {
+                return
             }
 
-            sessionStartTime = nil
-            sessionScrubDistance = 0  // Reset scrub distance for next session
+            Log.info(
+                "[TimelineSearchOverlay] restoring preserved overlay after timeline reveal delayMs=\(delayMs)",
+                category: .ui
+            )
+            viewModel.isSearchOverlayVisible = true
         }
+    }
+
+    /// Hide the timeline overlay
+    public func hide(restorePreviousFocus: Bool = true) {
+        reconcileVisibilityState(reason: "hide")
+        guard isVisible, let window = window, !isHiding else { return }
+        let hideRequestStartedAt = CFAbsoluteTimeGetCurrent()
+        isHiding = true
+        presentationState = .hiding
+        prepareForHiddenStateTransition(reason: "hide")
 
         // Don't save position on hide - window stays in memory
         // Position is only saved on app termination (see savePositionForTermination)
@@ -1119,47 +1470,6 @@ public class TimelineWindowController: NSObject {
             window.animator().alphaValue = window.alphaValue  // Snap to current value
         })
 
-        tapeShowAnimationTask?.cancel()
-        if let viewModel = timelineViewModel {
-            withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-                viewModel.isTapeHidden = true
-            }
-            // Abort in-flight search work now that the timeline is dismissing.
-            viewModel.searchViewModel.cancelSearch()
-            // Ensure right-click menus don't persist across timeline sessions.
-            viewModel.dismissContextMenu()
-            viewModel.dismissTimelineContextMenu()
-
-            // Dismiss any open overlays (filter panel, date search, etc.)
-            if viewModel.isFilterPanelVisible {
-                viewModel.dismissFilterPanel()
-            }
-            if viewModel.isCalendarPickerVisible {
-                viewModel.isCalendarPickerVisible = false
-                viewModel.hoursWithFrames = []
-                viewModel.selectedCalendarDate = nil
-                viewModel.calendarKeyboardFocus = .dateGrid
-                viewModel.selectedCalendarHour = nil
-            }
-            if viewModel.isDateSearchActive {
-                viewModel.closeDateSearch()
-            }
-            if viewModel.isSearchOverlayVisible {
-                // Keep the search overlay/search bar state across timeline toggle.
-                // Simulate clicking the recent-entries header "x" on toggle-off, then
-                // suppress recent entries on next overlay presentation.
-                viewModel.searchViewModel.requestDismissRecentEntriesPopoverByUser()
-                viewModel.searchViewModel.suppressRecentEntriesForNextOverlayOpen()
-            }
-            if viewModel.isInFrameSearchVisible ||
-                !viewModel.inFrameSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                viewModel.closeInFrameSearch(clearQuery: true)
-            }
-        }
-
-        // Remove event monitors
-        removeEventMonitors()
-
         // Animate out
         NSAnimationContext.runAnimationGroup({ context in
             context.duration = 0.25
@@ -1168,64 +1478,12 @@ public class TimelineWindowController: NSObject {
         }, completionHandler: { [weak self] in
             Task { @MainActor [weak self] in
                 guard let self else { return }
-
-                let wasHidingToShowDashboard = self.isHidingToShowDashboard
-                self.isHiding = false
-                // Only hide dashboard if it wasn't the active window before timeline opened
-                // AND we're not hiding specifically to show the dashboard/settings
-                // This prevents hiding the dashboard when user had it focused and just opened/closed timeline
-                // Also don't hide if a modal sheet (feedback form, etc.) is attached
-                if self.dashboardWasKeyWindow != true,
-                   !wasHidingToShowDashboard,
-                   DashboardWindowController.shared.window?.attachedSheet == nil {
-                    DashboardWindowController.shared.hide()
-                }
-                // Reset the flag after use
-                self.isHidingToShowDashboard = false
-
-                // Hide window but keep it around for instant re-show
-                // This is the key optimization - we don't destroy the window or view model
-                // CRITICAL: Ignore mouse events while hidden to prevent blocking clicks on other windows
-                window.ignoresMouseEvents = true
-                window.orderOut(nil)
-                self.isVisible = false
-                Self.setEmergencyTimelineVisible(false)  // For emergency escape tap
-                self.lastHiddenAt = Date()
-                self.suppressLiveScrollUntil = 0
-                let hideElapsedMs = (CFAbsoluteTimeGetCurrent() - hideRequestStartedAt) * 1000
-                Log.recordLatency(
-                    "timeline.hide.window_hidden_ms",
-                    valueMs: hideElapsedMs,
-                    category: .ui,
-                    summaryEvery: 10,
-                    warningThresholdMs: 300,
-                    criticalThresholdMs: 600
+                self.applyHiddenState(
+                    restorePreviousFocus: restorePreviousFocus,
+                    hideRequestedAt: hideRequestStartedAt,
+                    reason: "hide"
                 )
-                Log.info(
-                    "[TimelineToggle] window hidden after \(String(format: "%.1f", hideElapsedMs))ms",
-                    category: .ui
-                )
-                self.restoreFocusIfNeeded(
-                    requestedRestore: restorePreviousFocus,
-                    wasHidingToShowDashboard: wasHidingToShowDashboard,
-                    hideRequestedAt: hideRequestStartedAt
-                )
-                // Mark timeline hidden before post-hide refresh so frame reads can use relaxed timing.
-                if let coordinator = self.coordinator {
-                    await coordinator.setTimelineVisible(false)
-                }
-
-                self.hideCompletionCoordinator.resumeAll(hidden: true)
-
-                await self.compactHiddenPresentationState()
-
-                self.onClose?()
-
-                // Reset the cached scale factor so it recalculates for next window
-                TimelineScaleFactor.resetCache()
-
-                // Post notification so menu bar can restore recording indicator
-                NotificationCenter.default.post(name: .timelineDidClose, object: nil)
+                await self.finishHideTransitionCleanup()
             }
         })
     }
@@ -1375,13 +1633,11 @@ public class TimelineWindowController: NSObject {
 
     /// Save state for cross-session persistence (call on app termination)
     public func saveStateForTermination() {
-        Log.info("[TIMELINE-PRERENDER] 💾 saveStateForTermination() called", category: .ui)
         timelineViewModel?.saveState()
     }
 
     /// Completely destroy the pre-rendered window (call when memory pressure is high or app is terminating)
     public func destroyPreparedWindow() {
-        Log.info("[TIMELINE-PRERENDER] 🗑️ destroyPreparedWindow() called", category: .ui)
         // Save state before destroying for cross-session persistence
         timelineViewModel?.saveState()
         timelineViewModel?.compactPresentationState(reason: "destroyPreparedWindow", purgeDiskFrameBuffer: true)
@@ -1409,8 +1665,6 @@ public class TimelineWindowController: NSObject {
             )
             // Reset zoom region state on hide.
             viewModel.exitZoomRegion()
-        } else {
-            Log.warning("[TimelineToggle] Missing timeline view model during hide compaction", category: .ui)
         }
 
         // Always detach any mounted presentation and purge decode caches, even if the
@@ -1442,7 +1696,7 @@ public class TimelineWindowController: NSObject {
         }
 
         let viewModel = SimpleTimelineViewModel(coordinator: coordinator)
-        timelineViewModel = viewModel
+        setTimelineViewModel(viewModel)
         isPrepared = true
         return viewModel
     }
@@ -1497,9 +1751,13 @@ public class TimelineWindowController: NSObject {
     private func destroyMountedPresentation() {
         cancelDeferredHostingViewDetach()
         cancelWindowFadeIn(reason: "destroyMountedPresentation")
+        cancelDeferredSearchOverlayRestore()
         liveModeCaptureTask?.cancel()
         liveModeCaptureTask = nil
         stopObservingApplicationActivation()
+        isHiding = false
+        presentationState = .hidden
+        Self.setEmergencyTimelineVisible(false)
         timelineViewModel?.setPresentationWorkEnabled(false, reason: "destroyMountedPresentation")
 
         window?.orderOut(nil)
@@ -1510,11 +1768,13 @@ public class TimelineWindowController: NSObject {
 
     /// Toggle timeline visibility
     public func toggle() {
-        Log.info(
-            "[TimelineToggle] toggle invoked currentlyVisible=\(isVisible) searchOverlayVisible=\(timelineViewModel?.isSearchOverlayVisible ?? false)",
-            category: .ui
+        reconcileVisibilityState(reason: "toggle")
+        let actualVisible = isActuallyVisible
+        let action = Self.toggleAction(
+            presentationState: presentationState,
+            isActuallyVisible: actualVisible
         )
-        if isVisible {
+        if action == .hide {
             hide()
         } else {
             show()
@@ -1556,21 +1816,81 @@ public class TimelineWindowController: NSObject {
 
         Task { @MainActor [weak self] in
             guard let self else { return }
-
-            // Wait briefly for the pre-rendered view model to be ready on first launch.
-            var attempts = 0
-            while self.timelineViewModel == nil && attempts < 20 {
-                try? await Task.sleep(for: .nanoseconds(Int64(50_000_000)), clock: .continuous) // 50ms
-                attempts += 1
-            }
-
-            guard let viewModel = self.timelineViewModel else {
-                Log.warning("[DeeplinkSearch] Invocation #\(invocationID) failed - timeline view model unavailable", category: .ui)
+            guard self.coordinator != nil else {
+                Log.warning("[DeeplinkSearch] Invocation #\(invocationID) failed - timeline coordinator unavailable", category: .ui)
                 return
             }
+            let viewModel = await self.awaitTimelineViewModelReady()
 
             Log.info("[DeeplinkSearch] Invocation #\(invocationID) applying deeplink payload", category: .ui)
             viewModel.applySearchDeeplink(query: query, appBundleID: appBundleID, source: source)
+        }
+    }
+
+    /// Show the timeline and open the spotlight search overlay, preserving any existing search state.
+    public func showSearchOverlay(
+        source: String = "unknown",
+        recentEntriesRevealDelay: TimeInterval = 0.3
+    ) {
+        Log.info(
+            "[TimelineSearchOverlay] showSearchOverlay source=\(source) isVisible=\(isVisible) searchOverlayVisible=\(timelineViewModel?.isSearchOverlayVisible ?? false)",
+            category: .ui
+        )
+        show()
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard self.coordinator != nil else {
+                Log.warning(
+                    "[TimelineSearchOverlay] Failed to open search overlay because the timeline coordinator is unavailable source=\(source)",
+                    category: .ui
+                )
+                return
+            }
+            let viewModel = await self.awaitTimelineViewModelReady()
+
+            _ = Self.presentSearchOverlay(
+                on: viewModel,
+                coordinator: self.coordinator,
+                recentEntriesRevealDelay: recentEntriesRevealDelay
+            )
+        }
+    }
+
+    @MainActor
+    private func awaitTimelineViewModelReady() async -> SimpleTimelineViewModel {
+        if let timelineViewModel {
+            return timelineViewModel
+        }
+
+        return await withCheckedContinuation { continuation in
+            pendingTimelineViewModelWaiters.append(continuation)
+        }
+    }
+
+    @discardableResult
+    static func presentSearchOverlay(
+        on viewModel: SimpleTimelineViewModel,
+        coordinator: AppCoordinator?,
+        recentEntriesRevealDelay: TimeInterval = 0.3
+    ) -> Bool {
+        let wasVisible = viewModel.isSearchOverlayVisible
+        viewModel.openSearchOverlay(recentEntriesRevealDelay: recentEntriesRevealDelay)
+
+        if !wasVisible, let coordinator {
+            DashboardViewModel.recordSearchDialogOpen(coordinator: coordinator)
+        }
+
+        return !wasVisible
+    }
+
+    private func setTimelineViewModel(_ viewModel: SimpleTimelineViewModel) {
+        timelineViewModel = viewModel
+
+        let waiters = pendingTimelineViewModelWaiters
+        pendingTimelineViewModelWaiters.removeAll(keepingCapacity: false)
+        for waiter in waiters {
+            waiter.resume(returning: viewModel)
         }
     }
 
@@ -1868,6 +2188,7 @@ public class TimelineWindowController: NSObject {
     /// Prepare the window invisibly without showing it yet
     /// Used by showWithFilter to load data before revealing
     private func prepareWindowInvisibly() {
+        reconcileVisibilityState(reason: "prepareWindowInvisibly")
         guard !isVisible, let coordinator = coordinator else { return }
         captureFocusRestoreTarget()
 
@@ -1926,10 +2247,12 @@ public class TimelineWindowController: NSObject {
         window.collectionBehavior.insert(.moveToActiveSpace)
         // Mark visible before activation to avoid activation-time dashboard reveal
         // races that can switch Spaces on some machines.
-        isVisible = true
+        presentationState = .showing
         Self.setEmergencyTimelineVisible(true)
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
+        presentationState = .visible
+        startObservingApplicationActivation()
         if let hostingView = hostingView {
             DispatchQueue.main.async { [weak hostingView] in
                 hostingView?.layoutSubtreeIfNeeded()
@@ -1994,6 +2317,11 @@ public class TimelineWindowController: NSObject {
                 window.animator().alphaValue = 1
             })
 
+            self.scheduleDeferredSearchOverlayRestoreIfNeeded(
+                viewModel: viewModel,
+                isLiveMode: false
+            )
+
             if self.windowFadeInGeneration == generation {
                 self.windowFadeInTask = nil
             }
@@ -2010,6 +2338,7 @@ public class TimelineWindowController: NSObject {
             backing: .buffered,
             defer: false
         )
+        window.delegate = self
 
         // Configure window properties
         window.level = .screenSaver
@@ -2039,6 +2368,22 @@ public class TimelineWindowController: NSObject {
     }
 
     // MARK: - Event Monitoring
+
+}
+
+// MARK: - NSWindowDelegate
+
+extension TimelineWindowController: NSWindowDelegate {
+    public func windowWillClose(_ notification: Notification) {
+        guard let closedWindow = notification.object as? NSWindow, closedWindow === window else {
+            return
+        }
+        synchronizeHiddenStateAfterExternalDismissal(reason: "windowWillClose")
+    }
+}
+
+@MainActor
+extension TimelineWindowController {
 
     private func setupEventMonitors() {
         // Monitor for mouse events to handle click-drag scrubbing on the timeline tape
@@ -2100,7 +2445,7 @@ public class TimelineWindowController: NSObject {
                                     if !viewModel.isActivelyScrolling {
                                         viewModel.isActivelyScrolling = true
                                         viewModel.dismissContextMenu()
-                                        viewModel.dismissTimelineContextMenu()
+                                        viewModel.dismissTimelineContextMenu(reason: .scroll)
                                     }
                                 }
                             }
@@ -2339,13 +2684,16 @@ public class TimelineWindowController: NSObject {
                 }
 
                 // Cmd+A to select all (handle before system can intercept)
-                // But let it pass through when a dialog with text input is active
+                // But let active text inputs and input-owning overlays keep standard select-all behavior.
                 if event.keyCode == 0 && modifiers == [.command] {
-                    if let viewModel = self?.timelineViewModel,
-                       (viewModel.isSearchOverlayVisible ||
-                        viewModel.isFilterPanelVisible ||
-                        viewModel.isDateSearchActive ||
-                        viewModel.showCommentSubmenu) {
+                    let shouldDeferToTextInput = Self.shouldDeferCommandAToTextInput(
+                        isTextFieldActive: isTextFieldActive,
+                        isSearchOverlayVisible: self?.timelineViewModel?.isSearchOverlayVisible ?? false,
+                        isFilterPanelVisible: self?.timelineViewModel?.isFilterPanelVisible ?? false,
+                        isDateSearchActive: self?.timelineViewModel?.isDateSearchActive ?? false,
+                        isCommentSubmenuVisible: self?.timelineViewModel?.showCommentSubmenu ?? false
+                    )
+                    if shouldDeferToTextInput {
                         return event // Let the text field handle Cmd+A
                     }
                     _ = self?.handleKeyEvent(event)
@@ -2536,11 +2884,7 @@ public class TimelineWindowController: NSObject {
                 // If calendar picker is showing, close it first with animation
                 if viewModel.isCalendarPickerVisible {
                     withAnimation(.spring(response: 0.25, dampingFraction: 0.9)) {
-                        viewModel.isCalendarPickerVisible = false
-                        viewModel.hoursWithFrames = []
-                        viewModel.selectedCalendarDate = nil
-                        viewModel.calendarKeyboardFocus = .dateGrid
-                        viewModel.selectedCalendarHour = nil
+                        viewModel.closeCalendarPicker()
                     }
                     return true
                 }
@@ -2580,6 +2924,10 @@ public class TimelineWindowController: NSObject {
                         searchViewModel.clearAllFilters()
                         searchViewModel.resetSearchOrderToDefault()
                         searchViewModel.requestOverlayCollapse()
+                        return true
+                    }
+                    if searchViewModel.shouldRefocusSearchFieldOnEscape {
+                        searchViewModel.requestSearchFieldFocus(selectAll: true)
                         return true
                     }
 
@@ -2688,21 +3036,33 @@ public class TimelineWindowController: NSObject {
         if event.keyCode == 40 && modifiers == [.command] { // K key with Command
             recordShortcut("cmd+k")
             if let viewModel = timelineViewModel {
-                guard Self.shouldToggleSearchOverlayFromShortcut(isActivelyScrolling: viewModel.isActivelyScrolling) else {
+                guard Self.shouldToggleSearchOverlayFromShortcut(
+                    isActivelyScrolling: viewModel.isActivelyScrolling,
+                    isSettledAtAbsoluteTimelineBoundary: viewModel.isSettledAtAbsoluteTimelineBoundary
+                ) else {
                     Log.info("[TimelineShortcut] Cmd+K ignored while scroll is active", category: .ui)
                     return true
                 }
                 let wasVisible = viewModel.isSearchOverlayVisible
+                let action = Self.searchOverlayShortcutAction(
+                    isSearchOverlayVisible: wasVisible,
+                    shouldRefocusSearchFieldBeforeClose: viewModel.searchViewModel.shouldRefocusSearchFieldOnEscape
+                )
                 Log.info(
-                    "[TimelineShortcut] Cmd+K wasVisible=\(wasVisible) queryEmpty=\(viewModel.searchViewModel.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)",
+                    "[TimelineShortcut] Cmd+K action=\(String(describing: action)) wasVisible=\(wasVisible) fieldFocused=\(viewModel.searchViewModel.isSearchFieldFocused) queryEmpty=\(viewModel.searchViewModel.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)",
                     category: .ui
                 )
-                viewModel.toggleSearchOverlay(recentEntriesRevealDelayOnOpen: 0.3)
-                // Record search dialog open metric when opening
-                if !wasVisible {
-                    if let coordinator = coordinator {
-                        DashboardViewModel.recordSearchDialogOpen(coordinator: coordinator)
-                    }
+                switch action {
+                case .focusField:
+                    viewModel.searchViewModel.requestSearchFieldFocus(selectAll: true)
+                case .close:
+                    viewModel.closeSearchOverlay()
+                case .open:
+                    _ = Self.presentSearchOverlay(
+                        on: viewModel,
+                        coordinator: coordinator,
+                        recentEntriesRevealDelay: 0.3
+                    )
                 }
             }
             return true
@@ -2775,16 +3135,27 @@ public class TimelineWindowController: NSObject {
         }
 
         // Cmd+A to select all text on the frame
-        // Skip when a dialog with text input is active - let the text field handle it
+        // Skip when text editing owns the shortcut.
         if event.keyCode == 0 && modifiers == [.command] { // A key with Command
-            if let viewModel = timelineViewModel {
-                // Don't intercept when dialogs with text inputs are open
-                if viewModel.isSearchOverlayVisible ||
-                    viewModel.isFilterPanelVisible ||
-                    viewModel.isDateSearchActive ||
-                    viewModel.showCommentSubmenu {
-                    return false // Let the text field handle Cmd+A
+            let isTextFieldActive: Bool = {
+                guard let window,
+                      let firstResponder = window.firstResponder else {
+                    return false
                 }
+                return firstResponder is NSTextView || firstResponder is NSTextField
+            }()
+
+            if Self.shouldDeferCommandAToTextInput(
+                isTextFieldActive: isTextFieldActive,
+                isSearchOverlayVisible: timelineViewModel?.isSearchOverlayVisible ?? false,
+                isFilterPanelVisible: timelineViewModel?.isFilterPanelVisible ?? false,
+                isDateSearchActive: timelineViewModel?.isDateSearchActive ?? false,
+                isCommentSubmenuVisible: timelineViewModel?.showCommentSubmenu ?? false
+            ) {
+                return false // Let the text field handle Cmd+A
+            }
+
+            if let viewModel = timelineViewModel {
                 recordShortcut("cmd+a")
                 viewModel.selectAllText()
                 return true
@@ -2979,6 +3350,28 @@ public class TimelineWindowController: NSObject {
         // Skip when a search filter dropdown is open (e.g., DateFilterPopover uses arrow keys for calendar navigation)
         if let viewModel = timelineViewModel, viewModel.searchViewModel.isDropdownOpen, (event.keyCode == 123 || event.keyCode == 124 || event.keyCode == 125 || event.keyCode == 126) {
             return false
+        }
+        if let viewModel = timelineViewModel,
+           let direction = Self.searchResultNavigationDirection(
+               keyCode: event.keyCode,
+               modifiers: modifiers,
+               isSearchResultHighlightVisible: viewModel.searchResultHighlightNavigationState != nil
+           ) {
+            let shortcut: String
+            switch direction {
+            case .previous:
+                shortcut = "cmd+shift+left"
+            case .next:
+                shortcut = "cmd+shift+right"
+            }
+            recordShortcut(shortcut)
+            Task { @MainActor in
+                await viewModel.navigateToAdjacentSearchResult(
+                    offset: direction == .previous ? -1 : 1,
+                    trigger: .keyboard
+                )
+            }
+            return true
         }
         // Cmd+Left: jump to the start of the previous consecutive timeline block
         if event.keyCode == 123 && modifiers == [.command] {
@@ -3384,16 +3777,7 @@ public class TimelineWindowController: NSObject {
 
     private func copyCurrentFrameImage() {
         guard let viewModel = timelineViewModel else { return }
-        getCurrentFrameImage(viewModel: viewModel) { [weak self] image in
-            guard let image = image else { return }
-            let pasteboard = NSPasteboard.general
-            pasteboard.clearContents()
-            pasteboard.writeObjects([image])
-            viewModel.showToast("Image copied")
-            if let coordinator = self?.coordinator {
-                DashboardViewModel.recordImageCopy(coordinator: coordinator, frameID: viewModel.currentFrame?.id.value)
-            }
-        }
+        viewModel.copyCurrentFrameImageToClipboard()
     }
 
     private func saveCurrentFrameImage() {
@@ -3475,6 +3859,12 @@ public class TimelineWindowController: NSObject {
         }
 
         let asset = AVURLAsset(url: url)
+        let directDecodeBytes = UIDirectFrameDecodeMemoryLedger.begin(
+            tag: UIDirectFrameDecodeMemoryLedger.timelineWindowGeneratorTag,
+            function: "ui.timeline.window_actions",
+            reason: "ui.timeline.window_frame_decode",
+            videoInfo: videoInfo
+        )
         let imageGenerator = AVAssetImageGenerator(asset: asset)
         imageGenerator.appliesPreferredTrackTransform = true
         imageGenerator.requestedTimeToleranceBefore = .zero
@@ -3484,6 +3874,11 @@ public class TimelineWindowController: NSObject {
 
         imageGenerator.generateCGImagesAsynchronously(forTimes: [NSValue(time: time)]) { _, cgImage, _, _, _ in
             DispatchQueue.main.async {
+                UIDirectFrameDecodeMemoryLedger.end(
+                    tag: UIDirectFrameDecodeMemoryLedger.timelineWindowGeneratorTag,
+                    reason: "ui.timeline.window_frame_decode",
+                    bytes: directDecodeBytes
+                )
                 if let cgImage = cgImage {
                     let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
                     completion(nsImage)

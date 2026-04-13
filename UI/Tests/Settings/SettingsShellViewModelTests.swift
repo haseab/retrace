@@ -16,9 +16,11 @@ final class SettingsShellViewModelTests: XCTestCase {
     func testSearchResultsMatchKeywordsAndTitles() {
         let ocrResults = SettingsShellViewModel.searchResults(for: "ocr")
         let shortcutResults = SettingsShellViewModel.searchResults(for: "shortcut")
+        let captureAnimationResults = SettingsShellViewModel.searchResults(for: "capture animation")
 
         XCTAssertTrue(ocrResults.contains(where: { $0.id == "power.ocrProcessing" }))
         XCTAssertTrue(shortcutResults.contains(where: { $0.id == "general.shortcuts" }))
+        XCTAssertTrue(captureAnimationResults.contains(where: { $0.id == "capture.menuBarIcon" }))
     }
 
     func testScheduleSettingsSearchResetClearsQueryAfterDelay() async {

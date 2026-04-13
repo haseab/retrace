@@ -64,20 +64,25 @@ extension SettingsView {
     // MARK: - Retention Exclusion Data Loading
 
     func loadRetentionExclusionData() {
-        // Load installed apps
-        let installed = AppNameResolver.shared.getInstalledApps()
-        let installedBundleIDs = Set(installed.map { $0.bundleID })
-        installedAppsForRetention = installed.map { (bundleID: $0.bundleID, name: $0.name) }
-
-        // Load other apps from database (apps that were recorded but aren't currently installed)
         Task {
+            let installed = await Task.detached(priority: .utility) {
+                AppNameResolver.shared.getInstalledApps()
+            }.value
+            let installedBundleIDs = Set(installed.map { $0.bundleID })
+
+            await MainActor.run {
+                installedAppsForRetention = installed.map { (bundleID: $0.bundleID, name: $0.name) }
+            }
+
+            // Load other apps from database (apps that were recorded but aren't currently installed)
             do {
                 let historyBundleIDs = try await coordinatorWrapper.coordinator.getDistinctAppBundleIDs()
                 let otherBundleIDs = historyBundleIDs.filter { !installedBundleIDs.contains($0) }
-                let resolvedApps = AppNameResolver.shared.resolveAll(bundleIDs: otherBundleIDs)
-                let other = resolvedApps.map { appInfo in
-                    (bundleID: appInfo.bundleID, name: appInfo.name)
-                }
+                let other = await Task.detached(priority: .utility) {
+                    AppNameResolver.shared.resolveAll(bundleIDs: otherBundleIDs).map { appInfo in
+                        (bundleID: appInfo.bundleID, name: appInfo.name)
+                    }
+                }.value
 
                 await MainActor.run {
                     otherAppsForRetention = other

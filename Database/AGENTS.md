@@ -9,6 +9,8 @@ You are responsible for the **Database** module of Retrace. Your job is to imple
 ```
 Database/
 ├── DatabaseManager.swift      # Main DatabaseProtocol implementation
+├── DatabaseConnection.swift   # SQLite/SQLCipher connection wrappers + shared errors
+├── ReadConnectionSupport.swift # Read-only connection factory, pool, and in-memory shared-connection bridge
 ├── FTSManager.swift           # FTSProtocol implementation
 ├── Schema.swift               # Table definitions
 ├── Migrations/
@@ -27,14 +29,24 @@ Database/
 │   ├── V12_FrameMetadata.swift
 │   ├── V13_RemoveInPageURLRects.swift
 │   ├── V14_DBStorageSnapshot.swift
-│   └── V15_NodeRedactionFlag.swift
+│   ├── V15_NodeRedactionFlag.swift
+│   ├── V16_ProcessingQueueFrameIDIndex.swift
+│   ├── V17_FrameCaptureTrigger.swift
+│   ├── V18_DailyMetricsRecencyIndex.swift
+│   └── V19_FrameEncodedAt.swift
 ├── Queries/
 │   ├── FrameQueries.swift     # Frame CRUD operations
 │   ├── SegmentQueries.swift   # Segment CRUD operations
 │   └── DocumentQueries.swift  # Document/FTS operations
 └── Tests/
+    ├── AsyncQueuePipelineTests.swift
     ├── DatabaseManagerTests.swift
-    └── FTSManagerTests.swift
+    ├── EdgeCaseTests.swift
+    ├── FTSManagerTests.swift
+    ├── IntegrationTests.swift
+    ├── OCRPipelineTests.swift
+    ├── QueryBuilderTests.swift
+    └── TestLogger.swift
 ```
 
 ## Protocols You Must Implement
@@ -410,10 +422,10 @@ CREATE TABLE encoding_queue (
 **Why?**: Encoding can be slow on Intel Macs. Async processing prevents blocking capture thread.
 
 **Workflow**:
-1. Frame captured → insert into `frames` with `encoding_status='pending'`
-2. Add job to `encoding_queue` with priority
-3. Background worker picks up job, encodes, updates status to 'success'
-4. On failure, increment `retry_count` and requeue
+1. Frame captured → insert into `frame` with `processingStatus = 4` ("not yet readable")
+2. Video writer flushes enough media for the frame to become readable from disk
+3. `markFrameReadable` transitions `processingStatus` to `0` and records `encodedAt`
+4. OCR/rewrite work continues via the processing queue
 
 #### 3. `deletion_queue` - Async Cleanup
 
@@ -451,27 +463,25 @@ ALTER TABLE segments ADD COLUMN source TEXT DEFAULT 'native';
 
 **Why?**: Multi-monitor setups have different resolutions. Need to know dimensions for proper video playback and timeline scrubbing.
 
-#### `frames` - Added Encoding Status and Session Link
+#### `frame` - Added Readable-Timing Metadata
 
 ```sql
-ALTER TABLE frames ADD COLUMN encoding_status TEXT DEFAULT 'pending';
-ALTER TABLE frames ADD COLUMN session_id TEXT REFERENCES app_sessions(id) ON DELETE SET NULL;
-ALTER TABLE frames ADD COLUMN source TEXT DEFAULT 'native';
+ALTER TABLE frame ADD COLUMN encodedAt INTEGER;
 ```
 
-- `encoding_status`: Track async encoding pipeline state
-- `session_id`: Link frame to app session for efficient grouping
-- `source`: Distinguish native captures from imported data (`'native'`, `'rewind'`, `'screen_memory'`, etc.)
+- `encodedAt`: Record when a frame became readable from the encoded video file
 
 **Note**: Removed `duration_ms` - it was always 2000ms (fixed capture rate). Can derive from timestamp gaps if needed.
 
 ### Migration Strategy
 
-Existing databases (V1/V2) will automatically upgrade via migrations:
-- V2: Add `source` column (for third-party import support)
-- V3: Add dimensions, encoding_status, session_id, new tables
+Existing databases upgrade forward in migration order. Recent frame-pipeline migrations include:
+- V15: rewrite/protected-text metadata
+- V17: `capture_trigger`
+- V18: `daily_metrics` recency index
+- V19: `encodedAt`
 
-New installations get V3 schema immediately (no migrations needed).
+New installations get the current schema plus all migrations applied during initialization.
 
 ### Indexes
 
@@ -489,9 +499,11 @@ CREATE INDEX idx_encoding_queue_status ON encoding_queue(status, priority DESC);
 CREATE INDEX idx_deletion_queue_type ON deletion_queue(entity_type);
 
 -- Frames (updated)
-CREATE INDEX idx_frames_session ON frames(session_id);
-CREATE INDEX idx_frames_encoding_status ON frames(encoding_status);
-CREATE INDEX idx_frames_source ON frames(source);
+CREATE INDEX index_frame_on_createdat ON frame(createdAt);
+CREATE INDEX index_frame_on_isstarred_createdat ON frame(isStarred, createdAt);
+CREATE INDEX index_frame_on_segmentid_createdat ON frame(segmentId, createdAt);
+CREATE INDEX index_frame_on_videoid ON frame(videoId);
+CREATE INDEX idx_frame_encoded_at ON frame(encodedAt) WHERE encodedAt IS NOT NULL;
 ```
 
 ### Junction Tables - Critical at 40GB+ Scale

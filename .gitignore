@@ -113,6 +113,9 @@ fix_triangles.py
 # DMG creation script (contains credentials)
 scripts/create-dmg.sh
 
+# Maintainer-only release automation (contains machine-specific paths)
+scripts/release.sh
+
 # Release artifacts
 releases/
 local/

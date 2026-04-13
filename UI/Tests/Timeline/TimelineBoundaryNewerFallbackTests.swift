@@ -7,7 +7,7 @@ import App
 
 @MainActor
 final class TimelineBoundaryNewerFallbackTests: XCTestCase {
-    func testLoadNewerFramesFallsBackToNearestQueryAfterEmptyWindowedProbe() async {
+    func testLoadNewerFramesFallsBackToNearestQueryAfterEmptyWindowedProbeWithoutMovingSelection() async {
         let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
         let baseDate = Date(timeIntervalSince1970: 1_700_500_000)
         var recordedWindowCalls: [(from: Date, to: Date, limit: Int, reason: String)] = []
@@ -72,7 +72,8 @@ final class TimelineBoundaryNewerFallbackTests: XCTestCase {
         XCTAssertEqual(viewModel.frames.count, 4)
         XCTAssertEqual(viewModel.frames[2].frame.id.value, 22)
         XCTAssertEqual(viewModel.frames[3].frame.id.value, 23)
-        XCTAssertEqual(viewModel.currentIndex, 3)
+        XCTAssertEqual(viewModel.currentIndex, 1)
+        XCTAssertEqual(viewModel.currentTimelineFrame?.frame.id.value, 21)
 
         let paginationState = viewModel.test_boundaryPaginationState()
         XCTAssertTrue(paginationState.hasMoreNewer)
@@ -121,6 +122,60 @@ final class TimelineBoundaryNewerFallbackTests: XCTestCase {
         XCTAssertEqual(viewModel.frames.count, 37)
         XCTAssertEqual(viewModel.currentIndex, 1)
         XCTAssertEqual(viewModel.currentTimelineFrame?.frame.id.value, 31)
+    }
+
+    func testLoadNewerFramesDropsStaleResultWhenFiltersChangeMidFetch() async {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let baseDate = Date(timeIntervalSince1970: 1_700_610_000)
+        var windowCallCount = 0
+
+        viewModel.frames = [
+            makeTimelineFrame(
+                id: 30,
+                timestamp: baseDate,
+                frameIndex: 0,
+                bundleID: "com.apple.Safari"
+            ),
+            makeTimelineFrame(
+                id: 31,
+                timestamp: baseDate.addingTimeInterval(1),
+                frameIndex: 1,
+                bundleID: "com.apple.Safari"
+            )
+        ]
+        viewModel.currentIndex = 1
+        viewModel.filterCriteria = FilterCriteria()
+        viewModel.test_setBoundaryPaginationState(hasMoreOlder: false, hasMoreNewer: true)
+        viewModel.test_updateWindowBoundaries()
+
+        viewModel.test_windowFetchHooks.getFramesWithVideoInfo = { _, _, limit, _, reason in
+            windowCallCount += 1
+            XCTAssertEqual(limit, 35)
+            XCTAssertTrue(reason.contains("loadNewerFrames.reason=test"))
+
+            // Simulate filter toggle while query is in flight.
+            viewModel.filterCriteria = FilterCriteria(selectedApps: ["com.apple.Terminal"])
+
+            return [
+                self.makeFrameWithVideoInfo(
+                    id: 40,
+                    timestamp: baseDate.addingTimeInterval(30),
+                    frameIndex: 2,
+                    bundleID: "com.apple.Terminal"
+                )
+            ]
+        }
+
+        await viewModel.test_loadNewerFrames()
+
+        XCTAssertEqual(windowCallCount, 1)
+        XCTAssertEqual(viewModel.frames.count, 2)
+        XCTAssertEqual(viewModel.frames.first?.frame.id.value, 30)
+        XCTAssertEqual(viewModel.frames.last?.frame.id.value, 31)
+
+        let paginationState = viewModel.test_boundaryPaginationState()
+        XCTAssertTrue(paginationState.hasMoreNewer)
+        XCTAssertFalse(paginationState.hasReachedAbsoluteEnd)
     }
 
     private func makeTimelineFrame(

@@ -47,4 +47,14 @@ final class SystemMonitorOCRBacklogAttributionTests: XCTestCase {
 
         XCTAssertFalse(viewModel.shouldShowOCRBacklogAttribution)
     }
+
+    func testRewriteStatusBadgeIsIdleWhenOnlyBacklogExists() {
+        let viewModel = SystemMonitorViewModel(coordinator: AppCoordinator())
+        viewModel.rewriteQueueDepth = 12
+        viewModel.rewritePendingCount = 12
+        viewModel.rewriteProcessingCount = 0
+
+        XCTAssertEqual(viewModel.rewriteStatusBadgeText, "Idle")
+        XCTAssertEqual(viewModel.rewriteStatusColor, .gray)
+    }
 }

@@ -25,7 +25,6 @@ struct AppInfoProvider: Sendable {
         preferredDisplayID: CGDirectDisplayID? = nil
     ) async -> FrameMetadata {
         let displayID = preferredDisplayID ?? CGMainDisplayID()
-
         // Prefer top-most visible window metadata from CGWindowList to keep app/window
         // context aligned with the captured pixels, especially during rapid app switches.
         if let visibleWindow = getTopVisibleWindowContext(preferredDisplayID: preferredDisplayID) {
@@ -51,13 +50,14 @@ struct AppInfoProvider: Sendable {
                 windowName: windowName
             )
 
-            return FrameMetadata(
+            let metadata = FrameMetadata(
                 appBundleID: bundleID,
                 appName: appName,
                 windowName: windowName,
                 browserURL: browserURL,
                 displayID: displayID
             )
+            return metadata
         }
 
         // Fallback to NSWorkspace frontmost app if no qualifying on-screen window was found.
@@ -89,13 +89,14 @@ struct AppInfoProvider: Sendable {
             windowName: windowName
         )
 
-        return FrameMetadata(
+        let metadata = FrameMetadata(
             appBundleID: bundleID,
             appName: appName,
             windowName: windowName,
             browserURL: browserURL,
             displayID: displayID
         )
+        return metadata
     }
 
     // MARK: - Private Helpers
@@ -284,7 +285,6 @@ struct AppInfoProvider: Sendable {
 
         return nil
     }
-
     /// Check if accessibility permissions are granted
     /// Uses the central PermissionMonitor for consistent checking
     static func hasAccessibilityPermission() -> Bool {

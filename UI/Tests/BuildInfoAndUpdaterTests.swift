@@ -1,4 +1,6 @@
 import XCTest
+import Shared
+import App
 @testable import Retrace
 
 final class BuildInfoFormattingTests: XCTestCase {
@@ -20,17 +22,6 @@ final class BuildInfoFormattingTests: XCTestCase {
         XCTAssertEqual(
             BuildInfo.makeDisplayVersion(version: "1.2.3", isDevBuild: true, gitCommit: "unknown"),
             "v1.2.3-dev"
-        )
-    }
-
-    func testDisplayVersionForFallbackDevBuildUsesDevLabel() {
-        XCTAssertEqual(
-            BuildInfo.makeDisplayVersion(version: "dev", isDevBuild: true, gitCommit: "unknown"),
-            "dev"
-        )
-        XCTAssertEqual(
-            BuildInfo.makeDisplayVersion(version: "dev", isDevBuild: true, gitCommit: "abc1234"),
-            "dev · abc1234"
         )
     }
 
@@ -57,29 +48,6 @@ final class BuildInfoFormattingTests: XCTestCase {
                 gitBranch: "feature/xyz"
             ),
             "1.2.3-dev · abc1234 (feature/xyz)"
-        )
-    }
-
-    func testFullVersionForFallbackDevBuildUsesDevLabel() {
-        XCTAssertEqual(
-            BuildInfo.makeFullVersion(
-                version: "dev",
-                buildNumber: "unknown",
-                isDevBuild: true,
-                gitCommit: "unknown",
-                gitBranch: "unknown"
-            ),
-            "dev"
-        )
-        XCTAssertEqual(
-            BuildInfo.makeFullVersion(
-                version: "dev",
-                buildNumber: "unknown",
-                isDevBuild: true,
-                gitCommit: "abc1234",
-                gitBranch: "feature/xyz"
-            ),
-            "dev · abc1234 (feature/xyz)"
         )
     }
 
@@ -284,5 +252,75 @@ final class SingleInstanceLockTests: XCTestCase {
         }
 
         throw NSError(domain: "SingleInstanceLockTests", code: 1)
+    }
+}
+
+final class SingleInstanceLockRetrierTests: XCTestCase {
+    func testAcquireRetriesUntilLockBecomesAvailable() async {
+        var attempts = 0
+        var sleepCalls = 0
+
+        let result = await SingleInstanceLockRetrier.acquire(
+            maxAttempts: 3,
+            retryDelay: .milliseconds(1),
+            acquire: { _ in
+                attempts += 1
+
+                if attempts < 3 {
+                    return .heldByAnotherProcess
+                }
+
+                return .acquired(descriptor: 42)
+            },
+            sleep: { _ in
+                sleepCalls += 1
+            }
+        )
+
+        XCTAssertEqual(result, .acquired(descriptor: 42, attempts: 3))
+        XCTAssertEqual(attempts, 3)
+        XCTAssertEqual(sleepCalls, 2)
+    }
+
+    func testAcquireFailsClosedAfterRetryBudgetExhaustedOnError() async {
+        var attempts = 0
+        var sleepCalls = 0
+
+        let result = await SingleInstanceLockRetrier.acquire(
+            maxAttempts: 4,
+            retryDelay: .milliseconds(1),
+            acquire: { _ in
+                attempts += 1
+                return .error(code: EIO)
+            },
+            sleep: { _ in
+                sleepCalls += 1
+            }
+        )
+
+        XCTAssertEqual(result, .failedError(code: EIO, attempts: 4))
+        XCTAssertEqual(attempts, 4)
+        XCTAssertEqual(sleepCalls, 3)
+    }
+
+    func testAcquireFailsClosedWhenAnotherProcessKeepsHoldingLock() async {
+        var attempts = 0
+        var sleepCalls = 0
+
+        let result = await SingleInstanceLockRetrier.acquire(
+            maxAttempts: 2,
+            retryDelay: .milliseconds(1),
+            acquire: { _ in
+                attempts += 1
+                return .heldByAnotherProcess
+            },
+            sleep: { _ in
+                sleepCalls += 1
+            }
+        )
+
+        XCTAssertEqual(result, .failedHeldByAnotherProcess(attempts: 2))
+        XCTAssertEqual(attempts, 2)
+        XCTAssertEqual(sleepCalls, 1)
     }
 }

@@ -252,6 +252,45 @@ final class BrowserURLAppleScriptCoordinatorTests: XCTestCase {
         XCTAssertEqual(snapshot.callCount, 1)
     }
 
+    func testCacheTTLOverrideSurvivesCleanupBeyondDefaultTTL() async {
+        let probe = RunnerProbe()
+        let coordinator = BrowserURLAppleScriptCoordinator(
+            cacheTTLSeconds: 0.02,
+            runner: { _, _, _, timeoutSeconds, isBootstrapTimeout, _ in
+                await probe.recordCall(timeoutSeconds: timeoutSeconds, isBootstrapTimeout: isBootstrapTimeout)
+                return BrowserURLAppleScriptResult(
+                    output: "https://example.com/ttl-prune-test",
+                    completedWithoutTimeout: true
+                )
+            }
+        )
+
+        let first = await coordinator.execute(
+            source: "tell application \"Arc\" to return \"https://example.com/ttl-prune-test\"",
+            browserBundleID: "company.thebrowser.Browser",
+            pid: 1990,
+            scriptLabel: "ttl-prune-1",
+            cacheTTLOverrideSeconds: 0.2
+        )
+        XCTAssertEqual(first.output, "https://example.com/ttl-prune-test")
+        XCTAssertFalse(first.returnedFromCache)
+
+        try? await Task.sleep(for: .milliseconds(80), clock: .continuous)
+
+        let second = await coordinator.execute(
+            source: "tell application \"Arc\" to return \"https://example.com/ttl-prune-test\"",
+            browserBundleID: "company.thebrowser.Browser",
+            pid: 1990,
+            scriptLabel: "ttl-prune-2",
+            cacheTTLOverrideSeconds: 0.2
+        )
+        XCTAssertEqual(second.output, "https://example.com/ttl-prune-test")
+        XCTAssertTrue(second.returnedFromCache)
+
+        let snapshot = await probe.snapshot()
+        XCTAssertEqual(snapshot.callCount, 1)
+    }
+
     func testWindowCacheKeySeparatesCacheEntriesForSameBundleAndPID() async {
         let probe = RunnerProbe()
         let coordinator = BrowserURLAppleScriptCoordinator(
@@ -284,6 +323,92 @@ final class BrowserURLAppleScriptCoordinatorTests: XCTestCase {
         )
         XCTAssertEqual(second.output, "https://example.com/window-sensitive")
         XCTAssertFalse(second.returnedFromCache)
+
+        let snapshot = await probe.snapshot()
+        XCTAssertEqual(snapshot.callCount, 2)
+    }
+
+    func testExpiredCacheEntryRerunsAfterTTL() async {
+        let probe = RunnerProbe()
+        let coordinator = BrowserURLAppleScriptCoordinator(
+            cacheTTLSeconds: 0.02,
+            runner: { _, _, _, timeoutSeconds, isBootstrapTimeout, _ in
+                await probe.recordCall(timeoutSeconds: timeoutSeconds, isBootstrapTimeout: isBootstrapTimeout)
+                return BrowserURLAppleScriptResult(
+                    output: "https://example.com/ttl-expiry",
+                    completedWithoutTimeout: true
+                )
+            }
+        )
+
+        let first = await coordinator.execute(
+            source: "tell application \"Arc\" to return \"https://example.com/ttl-expiry\"",
+            browserBundleID: "company.thebrowser.Browser",
+            pid: 1001
+        )
+        XCTAssertFalse(first.returnedFromCache)
+
+        try? await Task.sleep(for: .milliseconds(40), clock: .continuous)
+
+        let second = await coordinator.execute(
+            source: "tell application \"Arc\" to return \"https://example.com/ttl-expiry\"",
+            browserBundleID: "company.thebrowser.Browser",
+            pid: 1001
+        )
+        XCTAssertFalse(second.returnedFromCache)
+
+        let snapshot = await probe.snapshot()
+        XCTAssertEqual(snapshot.callCount, 2)
+    }
+
+    func testExpiredCooldownAllowsRetry() async {
+        let probe = RunnerProbe()
+        actor TimeoutState {
+            private var attempt = 0
+
+            func nextResult() -> BrowserURLAppleScriptResult {
+                attempt += 1
+                if attempt == 1 {
+                    return BrowserURLAppleScriptResult(didTimeOut: true)
+                }
+                return BrowserURLAppleScriptResult(
+                    output: "https://example.com/retry",
+                    completedWithoutTimeout: true
+                )
+            }
+        }
+        let state = TimeoutState()
+        let coordinator = BrowserURLAppleScriptCoordinator(
+            timeoutBaseBackoffSeconds: 0.02,
+            runner: { _, _, _, timeoutSeconds, isBootstrapTimeout, _ in
+                await probe.recordCall(timeoutSeconds: timeoutSeconds, isBootstrapTimeout: isBootstrapTimeout)
+                return await state.nextResult()
+            }
+        )
+
+        let first = await coordinator.execute(
+            source: "tell application \"Arc\" to return \"https://example.com/retry\"",
+            browserBundleID: "company.thebrowser.Browser",
+            pid: 2001
+        )
+        XCTAssertTrue(first.didTimeOut)
+
+        let immediateRetry = await coordinator.execute(
+            source: "tell application \"Arc\" to return \"https://example.com/retry\"",
+            browserBundleID: "company.thebrowser.Browser",
+            pid: 2001
+        )
+        XCTAssertTrue(immediateRetry.skippedByCooldown)
+
+        try? await Task.sleep(for: .milliseconds(40), clock: .continuous)
+
+        let retried = await coordinator.execute(
+            source: "tell application \"Arc\" to return \"https://example.com/retry\"",
+            browserBundleID: "company.thebrowser.Browser",
+            pid: 2001
+        )
+        XCTAssertEqual(retried.output, "https://example.com/retry")
+        XCTAssertFalse(retried.skippedByCooldown)
 
         let snapshot = await probe.snapshot()
         XCTAssertEqual(snapshot.callCount, 2)

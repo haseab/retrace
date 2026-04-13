@@ -62,6 +62,7 @@ public struct OnboardingView: View {
     private static let timelineShortcutKey = "timelineShortcutConfig"
     private static let dashboardShortcutKey = "dashboardShortcutConfig"
     private static let automationPreflightStatusesKey = "onboardingAutomationPreflightStatuses.v1"
+    private static let rewindCutoffLatestFramePaddingSeconds: TimeInterval = 1.0
     private static let automationPreflightUserAllowTimeoutSeconds: TimeInterval = 60.0
     private static let automationPreflightBackgroundTimeoutSeconds: TimeInterval = 3.0
     private static let automationPreflightRecheckIntervalSeconds: TimeInterval = 4.0
@@ -125,30 +126,26 @@ public struct OnboardingView: View {
             "org.mozilla.firefoxbeta",
             "org.mozilla.firefoxdeveloperedition",
             "org.mozilla.nightly":
-            return "Firefox does not support in-page URL extraction in Retrace."
+            return "Firefox does not support in-page URL extraction."
         case "com.openai.atlas":
-            return "ChatGPT Atlas does not support in-page URL extraction in Retrace."
+            return "ChatGPT Atlas does not support in-page URL extraction."
         default:
-            return "This app does not support in-page URL extraction in Retrace."
+            return "This app does not support in-page URL extraction."
         }
     }
     // Load saved shortcuts or use defaults
     private static func loadTimelineShortcut() -> ShortcutConfig {
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
-        guard let data = defaults.data(forKey: timelineShortcutKey),
-              let config = try? JSONDecoder().decode(ShortcutConfig.self, from: data) else {
-            return .defaultTimeline
-        }
-        return config
+        OnboardingManager.loadShortcutConfig(
+            forKey: timelineShortcutKey,
+            fallback: .defaultTimeline
+        )
     }
 
     private static func loadDashboardShortcut() -> ShortcutConfig {
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
-        guard let data = defaults.data(forKey: dashboardShortcutKey),
-              let config = try? JSONDecoder().decode(ShortcutConfig.self, from: data) else {
-            return .defaultDashboard
-        }
-        return config
+        OnboardingManager.loadShortcutConfig(
+            forKey: dashboardShortcutKey,
+            fallback: .defaultDashboard
+        )
     }
 
     @State private var currentStep: Int = UserDefaults.standard.integer(forKey: OnboardingView.onboardingStepKey).clamped(to: 1...10) == 0 ? 1 : UserDefaults.standard.integer(forKey: OnboardingView.onboardingStepKey).clamped(to: 1...10)
@@ -193,6 +190,7 @@ public struct OnboardingView: View {
     @State private var hasRewindData: Bool? = nil
     @State private var wantsRewindData: Bool? = (UserDefaults(suiteName: "io.retrace.app") ?? .standard).object(forKey: "useRewindData") as? Bool
     @State private var rewindDataSizeGB: Double? = nil
+    @State private var detectedRewindCutoffDate: Date? = nil
 
     // Keyboard shortcuts - initialized from saved values or defaults
     @State private var timelineShortcut = ShortcutKey(from: Self.loadTimelineShortcut())
@@ -212,6 +210,11 @@ public struct OnboardingView: View {
 
     private let totalSteps = 10
 
+    static func resetPersistedProgressForDebug(defaults: UserDefaults = .standard) {
+        defaults.removeObject(forKey: Self.onboardingStepKey)
+        defaults.removeObject(forKey: Self.automationPreflightStatusesKey)
+    }
+
     // MARK: - Body
 
     public var body: some View {
@@ -221,7 +224,7 @@ public struct OnboardingView: View {
                 Color.retraceBackground
 
                 // Dashboard-style ambient glow background
-                onboardingAmbientBackground
+                onboardingAmbientBackground(animated: currentStep == 1)
             }
             .ignoresSafeArea()
 
@@ -266,6 +269,11 @@ public struct OnboardingView: View {
         .onChange(of: currentStep) { newStep in
             // Save the current step so user can resume if they quit
             UserDefaults.standard.set(newStep, forKey: Self.onboardingStepKey)
+            if newStep == 8 {
+                Task { @MainActor in
+                    await refreshActiveGlobalShortcuts()
+                }
+            }
         }
     }
 
@@ -275,16 +283,7 @@ public struct OnboardingView: View {
         HStack {
             // Back button (hidden on step 1)
             if currentStep > 1 {
-                Button(action: {
-                    withAnimation {
-                        // Skip Rewind data step (7) when going back if no Rewind data exists
-                        if currentStep == 8 && hasRewindData != true {
-                            currentStep = 6
-                        } else {
-                            currentStep -= 1
-                        }
-                    }
-                }) {
+                Button(action: goToPreviousOnboardingStep) {
                     HStack(spacing: .spacingS) {
                         Image(systemName: "chevron.left")
                         Text("Back")
@@ -356,7 +355,9 @@ public struct OnboardingView: View {
                     Task {
                         try? await coordinator.startPipeline()
                     }
-                    MenuBarManager.shared?.reloadShortcuts()
+                    Task { @MainActor in
+                        await refreshActiveGlobalShortcuts()
+                    }
                     withAnimation { currentStep = 5 }
                 }) {
                     Text("Continue")
@@ -394,12 +395,7 @@ public struct OnboardingView: View {
         case 6:
             // Launch at login - save setting and continue
             // Skip Rewind data step (7) if no Rewind data exists
-            Button(action: {
-                setLaunchAtLogin(enabled: launchAtLogin)
-                let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
-                defaults.set(launchAtLogin, forKey: "launchAtLogin")
-                withAnimation { currentStep = hasRewindData == true ? 7 : 8 }
-            }) {
+            Button(action: continueFromLaunchAtLoginStep) {
                 Text("Continue")
                     .font(.retraceHeadline)
                     .foregroundColor(.white)
@@ -415,17 +411,17 @@ public struct OnboardingView: View {
 
         case 7:
             // Rewind data - requires selection if data exists
-            Button(action: {
-                let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
-                defaults.set(wantsRewindData == true, forKey: "useRewindData")
-                withAnimation { currentStep = 8 }
-            }) {
+            Button(action: continueFromRewindStep) {
                 Text("Continue")
                     .font(.retraceHeadline)
                     .foregroundColor(.white)
                     .padding(.horizontal, .spacingL)
                     .padding(.vertical, .spacingM)
-                    .background((hasRewindData == false || wantsRewindData != nil) ? onboardingButtonColor : Color.retraceSecondaryColor)
+                    .background(
+                        hasRewindData == false || wantsRewindData != nil
+                            ? onboardingButtonColor
+                            : Color.retraceSecondaryColor
+                    )
                     .cornerRadius(.cornerRadiusM)
             }
             .buttonStyle(.plain)
@@ -438,6 +434,7 @@ public struct OnboardingView: View {
                     // Save shortcuts to UserDefaults (full config with key + modifiers)
                     await coordinator.onboardingManager.setTimelineShortcut(timelineShortcut.toConfig)
                     await coordinator.onboardingManager.setDashboardShortcut(dashboardShortcut.toConfig)
+                    await refreshActiveGlobalShortcuts()
                 }
                 withAnimation { currentStep = 9 }
             }) {
@@ -471,10 +468,13 @@ public struct OnboardingView: View {
                 UserDefaults.standard.removeObject(forKey: Self.onboardingStepKey)
                 Task {
                     await coordinator.onboardingManager.markOnboardingCompleted()
+                    await refreshActiveGlobalShortcuts()
+                    await MainActor.run {
+                        onComplete()
+                    }
                     // Register Rewind data source if user opted in during onboarding
                     try? await coordinator.registerRewindSourceIfEnabled()
                 }
-                onComplete()
             }) {
                 Text("Finish")
                     .font(.retraceHeadline)
@@ -559,7 +559,7 @@ public struct OnboardingView: View {
                 .font(.retraceDisplay2)
                 .foregroundColor(.retracePrimary)
 
-            Text("Remember everything.")
+            Text("Remember anything.")
                 .font(.retraceBody)
                 .foregroundColor(.retraceSecondary)
                 .multilineTextAlignment(.center)
@@ -583,6 +583,103 @@ public struct OnboardingView: View {
 
     private func advanceFromWelcomeStep() {
         withAnimation { currentStep = 2 }
+    }
+
+    private func goToPreviousOnboardingStep() {
+        withAnimation {
+            switch currentStep {
+            case 8:
+                if hasRewindData != true {
+                    currentStep = 6
+                } else {
+                    currentStep = 7
+                }
+            default:
+                currentStep -= 1
+            }
+        }
+    }
+
+    private func continueFromLaunchAtLoginStep() {
+        setLaunchAtLogin(enabled: launchAtLogin)
+        settingsStore.set(launchAtLogin, forKey: "launchAtLogin")
+
+        withAnimation {
+            currentStep = hasRewindData == true ? 7 : 8
+        }
+    }
+
+    private func continueFromRewindStep() {
+        let useRewindData = wantsRewindData == true
+        settingsStore.set(useRewindData, forKey: "useRewindData")
+
+        guard useRewindData else {
+            withAnimation { currentStep = 8 }
+            return
+        }
+
+        Task {
+            if let cutoffDate = await automaticOnboardingRewindCutoffDate() {
+                persistAutomaticOnboardingRewindCutoffDate(cutoffDate)
+            }
+
+            await MainActor.run {
+                withAnimation { currentStep = 8 }
+            }
+        }
+    }
+
+    private func automaticOnboardingRewindCutoffDate() async -> Date? {
+#if DEBUG
+        return nil
+#else
+        if let detectedRewindCutoffDate {
+            return clampedRewindCutoffDate(detectedRewindCutoffDate)
+        }
+
+        guard let latestFrameDate = await coordinator.latestRewindFrameDate() else {
+            return nil
+        }
+
+        return clampedRewindCutoffDate(
+            latestFrameDate.addingTimeInterval(Self.rewindCutoffLatestFramePaddingSeconds)
+        )
+#endif
+    }
+
+    private func persistAutomaticOnboardingRewindCutoffDate(_ cutoffDate: Date) {
+        settingsStore.set(cutoffDate, forKey: rewindCutoffDateDefaultsKey)
+        recordRewindCutoffMetric(cutoffDate)
+        Log.info("[OnboardingView] Auto-applied Rewind cutoff date during onboarding: \(cutoffDate)", category: .ui)
+    }
+
+    private func recordRewindCutoffMetric(_ cutoffDate: Date) {
+        Task {
+            let payload: [String: Any] = [
+                "cutoffTimestampMs": Int64(cutoffDate.timeIntervalSince1970 * 1000)
+            ]
+            guard JSONSerialization.isValidJSONObject(payload),
+                  let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
+                  let metadata = String(data: data, encoding: .utf8) else {
+                return
+            }
+
+            try? await coordinator.recordMetricEvent(
+                metricType: .rewindCutoffDateUpdated,
+                metadata: metadata
+            )
+        }
+    }
+
+    private func clampedRewindCutoffDate(_ date: Date) -> Date {
+        min(date, maximumSelectableRewindCutoffDate)
+    }
+
+    private var maximumSelectableRewindCutoffDate: Date {
+        let calendar = Calendar.current
+        let now = Date()
+        let startOfTomorrow = calendar.date(byAdding: .day, value: 1, to: calendar.startOfDay(for: now)) ?? now
+        return startOfTomorrow.addingTimeInterval(-1)
     }
 
     // MARK: - Step 3: Core Permissions
@@ -681,7 +778,7 @@ public struct OnboardingView: View {
             stopAutomationWorkspaceObservation()
             cancelAllAutomationPreflightIconLoads()
         }
-        .alert("Allow All Apps?", isPresented: $showBulkAllowAllConfirmation) {
+        .alert("Launch and Allow All Apps?", isPresented: $showBulkAllowAllConfirmation) {
             Button("Cancel", role: .cancel) {}
             Button("Continue") {
                 Task {
@@ -841,7 +938,7 @@ public struct OnboardingView: View {
                                 HStack(spacing: .spacingXS) {
                                     ProgressView()
                                         .controlSize(.small)
-                                    Text("Allowing...")
+                                    Text("Launching and Allowing...")
                                 }
                                 .font(.retraceCaption)
                                 .foregroundColor(.white)
@@ -851,7 +948,7 @@ public struct OnboardingView: View {
                                 .cornerRadius(.cornerRadiusM)
                                 .frame(height: 28)
                             } else {
-                                Text("Allow All")
+                                Text("Launch and Allow All")
                                     .font(.retraceCaption)
                                     .foregroundColor(.white)
                                     .padding(.horizontal, .spacingM)
@@ -1024,7 +1121,7 @@ public struct OnboardingView: View {
 
             Spacer()
 
-            Text("Not supported")
+            Text("Does not support")
                 .font(.retraceCaption2)
                 .foregroundColor(.retraceSecondary)
                 .padding(.horizontal, .spacingS)
@@ -1936,7 +2033,7 @@ public struct OnboardingView: View {
                         Task {
                             await coordinator.onboardingManager.setTimelineShortcut(newShortcut.toConfig)
                             // Reload shortcuts and re-register hotkeys so the new shortcut works immediately
-                            MenuBarManager.shared?.reloadShortcuts()
+                            await refreshActiveGlobalShortcuts()
                         }
                     }
                 )
@@ -1954,7 +2051,7 @@ public struct OnboardingView: View {
                         Task {
                             await coordinator.onboardingManager.setDashboardShortcut(newShortcut.toConfig)
                             // Reload shortcuts and re-register hotkeys so the new shortcut works immediately
-                            MenuBarManager.shared?.reloadShortcuts()
+                            await refreshActiveGlobalShortcuts()
                         }
                     }
                 )
@@ -2400,69 +2497,361 @@ public struct OnboardingView: View {
     // MARK: - Helper Views
 
     /// Dashboard-style ambient background with blue glow orbs
-    private var onboardingAmbientBackground: some View {
+    @ViewBuilder
+    private func onboardingAmbientBackground(animated: Bool) -> some View {
         // Blue theme colors (matching dashboard)
         let ambientGlowColor = Color(red: 14/255, green: 42/255, blue: 104/255)  // Deeper blue orb: #0e2a68
 
-        return GeometryReader { geometry in
-            ZStack {
-                // Primary accent orb (top-left) - uses theme color
-                Circle()
-                    .fill(
-                        RadialGradient(
-                            colors: [Color.retraceAccent.opacity(0.10), Color.clear],
-                            center: .center,
-                            startRadius: 0,
-                            endRadius: 300
-                        )
+        GeometryReader { geometry in
+            if animated {
+                TimelineView(.animation(minimumInterval: 1.0 / 24.0)) { timeline in
+                    onboardingAmbientBackgroundLayer(
+                        in: geometry.size,
+                        ambientGlowColor: ambientGlowColor,
+                        time: timeline.date.timeIntervalSinceReferenceDate,
+                        animated: true
                     )
-                    .frame(width: 600, height: 600)
-                    .offset(x: -200, y: -100)
-                    .blur(radius: 60)
-
-                // Secondary orb (top-left) - theme glow color
-                Circle()
-                    .fill(
-                        RadialGradient(
-                            colors: [ambientGlowColor.opacity(0.3), Color.clear],
-                            center: .center,
-                            startRadius: 0,
-                            endRadius: 250
-                        )
-                    )
-                    .frame(width: 500, height: 500)
-                    .offset(x: -150, y: -50)
-                    .blur(radius: 50)
-
-                // Top edge glow
-                Rectangle()
-                    .fill(
-                        LinearGradient(
-                            colors: [ambientGlowColor.opacity(0.6), Color.clear],
-                            startPoint: .top,
-                            endPoint: .bottom
-                        )
-                    )
-                    .frame(height: 150)
-                    .frame(maxWidth: .infinity)
-                    .position(x: geometry.size.width / 2, y: 0)
-                    .blur(radius: 30)
-
-                // Bottom-right corner glow
-                Circle()
-                    .fill(
-                        RadialGradient(
-                            colors: [ambientGlowColor.opacity(0.5), Color.clear],
-                            center: .center,
-                            startRadius: 0,
-                            endRadius: 400
-                        )
-                    )
-                    .frame(width: 800, height: 800)
-                    .position(x: geometry.size.width, y: geometry.size.height)
-                    .blur(radius: 80)
+                }
+            } else {
+                onboardingAmbientBackgroundLayer(
+                    in: geometry.size,
+                    ambientGlowColor: ambientGlowColor,
+                    time: 0,
+                    animated: false
+                )
             }
         }
+    }
+
+    private func onboardingAmbientBackgroundLayer(
+        in size: CGSize,
+        ambientGlowColor: Color,
+        time: TimeInterval,
+        animated: Bool
+    ) -> some View {
+        let orbSurfaceOpacity = 0.74
+        let orbDiameter: CGFloat = 820
+        let orbEndRadius: CGFloat = 390
+        let orbBlurRadius: CGFloat = 56
+        let horizontalOvershoot = max(size.width * 0.85, 560)
+        let upperLowerOvershoot = max(size.height * 0.18, 110)
+        let midlineJitter = max(size.height * 0.12, 84)
+
+        let primaryCenter = linearOrbCenter(
+            time: time,
+            animated: animated,
+            start: CGPoint(x: -horizontalOvershoot, y: size.height * 0.12),
+            end: CGPoint(x: size.width + horizontalOvershoot, y: size.height * 0.38),
+            duration: 18.0,
+            phase: 0.02,
+            seed: 11,
+            jitterX: 140,
+            jitterY: upperLowerOvershoot
+        )
+        let secondaryCenter = linearOrbCenter(
+            time: time,
+            animated: animated,
+            start: CGPoint(x: size.width + horizontalOvershoot, y: size.height * 0.82),
+            end: CGPoint(x: -horizontalOvershoot, y: size.height * 0.50),
+            duration: 22.0,
+            phase: 0.38,
+            seed: 23,
+            jitterX: 130,
+            jitterY: midlineJitter
+        )
+        let highlightCenter = linearOrbCenter(
+            time: time,
+            animated: animated,
+            start: CGPoint(x: -horizontalOvershoot, y: size.height * 0.88),
+            end: CGPoint(x: size.width + horizontalOvershoot, y: size.height * 0.14),
+            duration: 15.25,
+            phase: 0.61,
+            seed: 37,
+            jitterX: 120,
+            jitterY: upperLowerOvershoot
+        )
+        let upperRightCenter = linearOrbCenter(
+            time: time,
+            animated: animated,
+            start: CGPoint(x: size.width + horizontalOvershoot, y: size.height * 0.08),
+            end: CGPoint(x: -horizontalOvershoot, y: size.height * 0.26),
+            duration: 19.5,
+            phase: 0.24,
+            seed: 41,
+            jitterX: 125,
+            jitterY: upperLowerOvershoot
+        )
+        let lowerBandCenter = linearOrbCenter(
+            time: time,
+            animated: animated,
+            start: CGPoint(x: -horizontalOvershoot, y: size.height * 0.66),
+            end: CGPoint(x: size.width + horizontalOvershoot, y: size.height * 0.86),
+            duration: 17.2,
+            phase: 0.79,
+            seed: 53,
+            jitterX: 135,
+            jitterY: midlineJitter
+        )
+        let middleBandCenter = linearOrbCenter(
+            time: time,
+            animated: animated,
+            start: CGPoint(x: size.width + horizontalOvershoot, y: size.height * 0.44),
+            end: CGPoint(x: -horizontalOvershoot, y: size.height * 0.58),
+            duration: 20.8,
+            phase: 0.14,
+            seed: 67,
+            jitterX: 110,
+            jitterY: midlineJitter
+        )
+        let upperSweepCenter = linearOrbCenter(
+            time: time,
+            animated: animated,
+            start: CGPoint(x: -horizontalOvershoot, y: size.height * 0.04),
+            end: CGPoint(x: size.width + horizontalOvershoot, y: size.height * 0.24),
+            duration: 24.0,
+            phase: 0.47,
+            seed: 71,
+            jitterX: 120,
+            jitterY: upperLowerOvershoot
+        )
+        let lowerReverseCenter = linearOrbCenter(
+            time: time,
+            animated: animated,
+            start: CGPoint(x: size.width + horizontalOvershoot, y: size.height * 0.94),
+            end: CGPoint(x: -horizontalOvershoot, y: size.height * 0.72),
+            duration: 16.4,
+            phase: 0.89,
+            seed: 83,
+            jitterX: 125,
+            jitterY: midlineJitter
+        )
+        let upperLeadCenter = linearOrbCenter(
+            time: time,
+            animated: animated,
+            start: CGPoint(x: -horizontalOvershoot, y: size.height * 0.20),
+            end: CGPoint(x: size.width + horizontalOvershoot, y: size.height * 0.30),
+            duration: 20.2,
+            phase: 0.08,
+            seed: 97,
+            jitterX: 110,
+            jitterY: upperLowerOvershoot
+        )
+        let centerSweepCenter = linearOrbCenter(
+            time: time,
+            animated: animated,
+            start: CGPoint(x: -horizontalOvershoot, y: size.height * 0.36),
+            end: CGPoint(x: size.width + horizontalOvershoot, y: size.height * 0.60),
+            duration: 21.6,
+            phase: 0.31,
+            seed: 107,
+            jitterX: 120,
+            jitterY: midlineJitter
+        )
+        let midReverseCenter = linearOrbCenter(
+            time: time,
+            animated: animated,
+            start: CGPoint(x: size.width + horizontalOvershoot, y: size.height * 0.32),
+            end: CGPoint(x: -horizontalOvershoot, y: size.height * 0.16),
+            duration: 18.9,
+            phase: 0.55,
+            seed: 113,
+            jitterX: 115,
+            jitterY: upperLowerOvershoot
+        )
+        let lowerLiftCenter = linearOrbCenter(
+            time: time,
+            animated: animated,
+            start: CGPoint(x: -horizontalOvershoot, y: size.height * 0.78),
+            end: CGPoint(x: size.width + horizontalOvershoot, y: size.height * 0.58),
+            duration: 23.0,
+            phase: 0.72,
+            seed: 131,
+            jitterX: 125,
+            jitterY: midlineJitter
+        )
+
+        return ZStack {
+            // Static wash so the background never feels empty between passes.
+            Rectangle()
+                .fill(
+                    LinearGradient(
+                        colors: [ambientGlowColor.opacity(0.15), Color.clear],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                )
+                .frame(height: 180)
+                .frame(maxWidth: .infinity)
+                .position(x: size.width / 2, y: 0)
+                .blur(radius: 36)
+
+            // Large accent orb crossing left-to-right.
+            Circle()
+                .fill(onboardingOrbGradient(color: .retraceAccent, endRadius: orbEndRadius))
+                .frame(width: orbDiameter, height: orbDiameter)
+                .position(primaryCenter)
+                .blur(radius: orbBlurRadius)
+                .blendMode(.screen)
+                .opacity(orbSurfaceOpacity)
+
+            // Blue orb crossing right-to-left on a separate line.
+            Circle()
+                .fill(onboardingOrbGradient(color: ambientGlowColor, endRadius: orbEndRadius))
+                .frame(width: orbDiameter, height: orbDiameter)
+                .position(secondaryCenter)
+                .blur(radius: orbBlurRadius)
+                .blendMode(.screen)
+                .opacity(orbSurfaceOpacity)
+
+            Circle()
+                .fill(onboardingOrbGradient(color: ambientGlowColor, endRadius: orbEndRadius))
+                .frame(width: orbDiameter, height: orbDiameter)
+                .position(midReverseCenter)
+                .blur(radius: orbBlurRadius)
+                .blendMode(.screen)
+                .opacity(orbSurfaceOpacity)
+
+            // Additional orbs sweep through the field at the same visual weight.
+            Circle()
+                .fill(onboardingOrbGradient(color: .retraceAccent, endRadius: orbEndRadius))
+                .frame(width: orbDiameter, height: orbDiameter)
+                .position(highlightCenter)
+                .blur(radius: orbBlurRadius)
+                .blendMode(.screen)
+                .opacity(orbSurfaceOpacity)
+
+            Circle()
+                .fill(onboardingOrbGradient(color: .retraceAccent, endRadius: orbEndRadius))
+                .frame(width: orbDiameter, height: orbDiameter)
+                .position(upperLeadCenter)
+                .blur(radius: orbBlurRadius)
+                .blendMode(.screen)
+                .opacity(orbSurfaceOpacity)
+
+            Circle()
+                .fill(onboardingOrbGradient(color: ambientGlowColor, endRadius: orbEndRadius))
+                .frame(width: orbDiameter, height: orbDiameter)
+                .position(upperRightCenter)
+                .blur(radius: orbBlurRadius)
+                .blendMode(.screen)
+                .opacity(orbSurfaceOpacity)
+
+            Circle()
+                .fill(onboardingOrbGradient(color: .retraceAccent, endRadius: orbEndRadius))
+                .frame(width: orbDiameter, height: orbDiameter)
+                .position(lowerBandCenter)
+                .blur(radius: orbBlurRadius)
+                .blendMode(.screen)
+                .opacity(orbSurfaceOpacity)
+
+            Circle()
+                .fill(onboardingOrbGradient(color: ambientGlowColor, endRadius: orbEndRadius))
+                .frame(width: orbDiameter, height: orbDiameter)
+                .position(middleBandCenter)
+                .blur(radius: orbBlurRadius)
+                .blendMode(.screen)
+                .opacity(orbSurfaceOpacity)
+
+            Circle()
+                .fill(onboardingOrbGradient(color: ambientGlowColor, endRadius: orbEndRadius))
+                .frame(width: orbDiameter, height: orbDiameter)
+                .position(centerSweepCenter)
+                .blur(radius: orbBlurRadius)
+                .blendMode(.screen)
+                .opacity(orbSurfaceOpacity)
+
+            Circle()
+                .fill(onboardingOrbGradient(color: .retraceAccent, endRadius: orbEndRadius))
+                .frame(width: orbDiameter, height: orbDiameter)
+                .position(upperSweepCenter)
+                .blur(radius: orbBlurRadius)
+                .blendMode(.screen)
+                .opacity(orbSurfaceOpacity)
+
+            Circle()
+                .fill(onboardingOrbGradient(color: ambientGlowColor, endRadius: orbEndRadius))
+                .frame(width: orbDiameter, height: orbDiameter)
+                .position(lowerReverseCenter)
+                .blur(radius: orbBlurRadius)
+                .blendMode(.screen)
+                .opacity(orbSurfaceOpacity)
+
+            Circle()
+                .fill(onboardingOrbGradient(color: .retraceAccent, endRadius: orbEndRadius))
+                .frame(width: orbDiameter, height: orbDiameter)
+                .position(lowerLiftCenter)
+                .blur(radius: orbBlurRadius)
+                .blendMode(.screen)
+                .opacity(orbSurfaceOpacity)
+        }
+    }
+
+    private func onboardingOrbGradient(color: Color, endRadius: CGFloat) -> RadialGradient {
+        RadialGradient(
+            gradient: Gradient(stops: [
+                .init(color: Color.white.opacity(0.12), location: 0.0),
+                .init(color: color.opacity(0.11), location: 0.18),
+                .init(color: color.opacity(0.06), location: 0.58),
+                .init(color: Color.clear, location: 1.0),
+            ]),
+            center: .center,
+            startRadius: 0,
+            endRadius: endRadius
+        )
+    }
+
+    private func linearOrbCenter(
+        time: TimeInterval,
+        animated: Bool,
+        start: CGPoint,
+        end: CGPoint,
+        duration: Double,
+        phase: Double,
+        seed: Double,
+        jitterX: CGFloat,
+        jitterY: CGFloat
+    ) -> CGPoint {
+        guard animated else { return start }
+
+        let cycleProgress = (time / duration) + phase
+        let cycle = floor(cycleProgress)
+        let progress = cycleProgress - cycle
+
+        let adjustedStart = jitteredOrbPoint(
+            base: start,
+            seed: seed + (cycle * 11),
+            maxXOffset: jitterX,
+            maxYOffset: jitterY
+        )
+        let adjustedEnd = jitteredOrbPoint(
+            base: end,
+            seed: seed + 97 + (cycle * 17),
+            maxXOffset: jitterX,
+            maxYOffset: jitterY
+        )
+
+        return CGPoint(
+            x: adjustedStart.x + ((adjustedEnd.x - adjustedStart.x) * progress),
+            y: adjustedStart.y + ((adjustedEnd.y - adjustedStart.y) * progress)
+        )
+    }
+
+    private func jitteredOrbPoint(
+        base: CGPoint,
+        seed: Double,
+        maxXOffset: CGFloat,
+        maxYOffset: CGFloat
+    ) -> CGPoint {
+        CGPoint(
+            x: base.x + (seededSignedRandom(seed: seed) * maxXOffset),
+            y: base.y + (seededSignedRandom(seed: seed + 1) * maxYOffset)
+        )
+    }
+
+    private func seededSignedRandom(seed: Double) -> CGFloat {
+        let rawValue = sin((seed * 12.9898) + 78.233) * 43_758.5453
+        let normalized = rawValue - floor(rawValue)
+        return CGFloat((normalized * 2) - 1)
     }
 
     private var retraceLogo: some View {
@@ -2488,23 +2877,13 @@ public struct OnboardingView: View {
         }
     }
 
-    /// Rewind-style double arrow icon (⏪) matching the app's color scheme
+    /// Rewind logo rendered from the original SVG path with onboarding-specific styling.
     private var rewindIcon: some View {
         GeometryReader { geometry in
             let size = min(geometry.size.width, geometry.size.height)
-            let centerX = size / 2
-            let centerY = size / 2
-            let arrowHeight = size * 0.45
-            let arrowWidth = size * 0.28
-            let gap = size * 0.02  // Small gap between arrows
-            let leftOffset = size * 0.08  // Shift arrows to the left
-
-            // Total width of both arrows + gap, centered around centerX, then shifted left
-            let totalWidth = arrowWidth * 2 + gap
-            let startX = centerX - totalWidth / 2 - leftOffset
+            let logoOffsetX = -size * 0.045
 
             ZStack {
-                // Background circle with gradient
                 Circle()
                     .fill(
                         LinearGradient(
@@ -2513,28 +2892,15 @@ public struct OnboardingView: View {
                             endPoint: .bottomTrailing
                         )
                     )
+                    .overlay(
+                        Circle()
+                            .strokeBorder(Color.white.opacity(0.08), lineWidth: 1)
+                    )
 
-                // Left arrow (first rewind arrow)
-                Path { path in
-                    let tipX = startX
-                    let baseX = tipX + arrowWidth
-                    path.move(to: CGPoint(x: tipX, y: centerY))
-                    path.addLine(to: CGPoint(x: baseX, y: centerY - arrowHeight / 2))
-                    path.addLine(to: CGPoint(x: baseX, y: centerY + arrowHeight / 2))
-                    path.closeSubpath()
-                }
-                .fill(Color.retraceAccent)
-
-                // Right arrow (second rewind arrow)
-                Path { path in
-                    let tipX = startX + arrowWidth + gap
-                    let baseX = tipX + arrowWidth
-                    path.move(to: CGPoint(x: tipX, y: centerY))
-                    path.addLine(to: CGPoint(x: baseX, y: centerY - arrowHeight / 2))
-                    path.addLine(to: CGPoint(x: baseX, y: centerY + arrowHeight / 2))
-                    path.closeSubpath()
-                }
-                .fill(Color.retraceAccent)
+                RewindLogoIcon(color: .white)
+                    .frame(width: size * 0.72, height: size * 0.44)
+                    .offset(x: logoOffsetX)
+                    .shadow(color: Color.white.opacity(0.14), radius: 10, y: 1)
             }
         }
     }
@@ -2543,19 +2909,9 @@ public struct OnboardingView: View {
     private var rewindIconMuted: some View {
         GeometryReader { geometry in
             let size = min(geometry.size.width, geometry.size.height)
-            let centerX = size / 2
-            let centerY = size / 2
-            let arrowHeight = size * 0.45
-            let arrowWidth = size * 0.28
-            let gap = size * 0.02  // Small gap between arrows
-            let leftOffset = size * 0.08  // Shift arrows to the left
-
-            // Total width of both arrows + gap, centered around centerX, then shifted left
-            let totalWidth = arrowWidth * 2 + gap
-            let startX = centerX - totalWidth / 2 - leftOffset
+            let logoOffsetX = -size * 0.045
 
             ZStack {
-                // Background circle with muted gradient
                 Circle()
                     .fill(
                         LinearGradient(
@@ -2564,28 +2920,14 @@ public struct OnboardingView: View {
                             endPoint: .bottomTrailing
                         )
                     )
+                    .overlay(
+                        Circle()
+                            .strokeBorder(Color.white.opacity(0.06), lineWidth: 1)
+                    )
 
-                // Left arrow (first rewind arrow) - muted
-                Path { path in
-                    let tipX = startX
-                    let baseX = tipX + arrowWidth
-                    path.move(to: CGPoint(x: tipX, y: centerY))
-                    path.addLine(to: CGPoint(x: baseX, y: centerY - arrowHeight / 2))
-                    path.addLine(to: CGPoint(x: baseX, y: centerY + arrowHeight / 2))
-                    path.closeSubpath()
-                }
-                .fill(Color.retraceSecondary)
-
-                // Right arrow (second rewind arrow) - muted
-                Path { path in
-                    let tipX = startX + arrowWidth + gap
-                    let baseX = tipX + arrowWidth
-                    path.move(to: CGPoint(x: tipX, y: centerY))
-                    path.addLine(to: CGPoint(x: baseX, y: centerY - arrowHeight / 2))
-                    path.addLine(to: CGPoint(x: baseX, y: centerY + arrowHeight / 2))
-                    path.closeSubpath()
-                }
-                .fill(Color.retraceSecondary)
+                RewindLogoIcon(color: .white.opacity(0.4))
+                    .frame(width: size * 0.72, height: size * 0.44)
+                    .offset(x: logoOffsetX)
             }
         }
     }
@@ -2701,6 +3043,14 @@ public struct OnboardingView: View {
                 }
             }
         }
+    }
+
+    @MainActor
+    private func refreshActiveGlobalShortcuts() async {
+        if let menuBarManager = MenuBarManager.shared {
+            await menuBarManager.reloadShortcutsNow()
+        }
+        HotkeyManager.shared.retrySetupIfNeeded()
     }
 
     // MARK: - Permission Monitoring
@@ -4520,22 +4870,42 @@ public struct OnboardingView: View {
     // MARK: - Rewind Data Detection
 
     private func detectRewindData() async {
-        // Check for Rewind memoryVault folder
         let memoryVaultPath = AppPaths.expandedRewindStorageRoot
-        let fileManager = FileManager.default
+        let scanResult = await Task.detached(priority: .utility) { () -> (exists: Bool, sizeGB: Double?) in
+            let fileManager = FileManager.default
+            guard fileManager.fileExists(atPath: memoryVaultPath) else {
+                return (false, nil)
+            }
+            return (true, Self.calculateFolderSizeGB(atPath: memoryVaultPath))
+        }.value
 
-        if fileManager.fileExists(atPath: memoryVaultPath) {
-            // Found Rewind data
+        if !scanResult.exists {
+            await MainActor.run {
+                hasRewindData = false
+                rewindDataSizeGB = nil
+                detectedRewindCutoffDate = nil
+            }
+            return
+        }
+
+        await MainActor.run {
             hasRewindData = true
-            // Calculate folder size
-            rewindDataSizeGB = calculateFolderSizeGB(atPath: memoryVaultPath)
-        } else {
-            // No Rewind data found - skip the step entirely
-            hasRewindData = false
+            rewindDataSizeGB = scanResult.sizeGB
+        }
+
+        let latestFrameDate = await coordinator.latestRewindFrameDate()
+        let suggestedCutoffDate = latestFrameDate.map {
+            clampedRewindCutoffDate(
+                $0.addingTimeInterval(Self.rewindCutoffLatestFramePaddingSeconds)
+            )
+        }
+
+        await MainActor.run {
+            detectedRewindCutoffDate = suggestedCutoffDate
         }
     }
 
-    private func calculateFolderSizeGB(atPath path: String) -> Double {
+    nonisolated private static func calculateFolderSizeGB(atPath path: String) -> Double {
         let fileManager = FileManager.default
         var totalSize: Int64 = 0
 

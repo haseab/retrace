@@ -46,7 +46,6 @@ final class EdgeCaseTests: XCTestCase {
             segmentID: frame.segmentID,
             videoID: frame.videoID,
             frameIndexInSegment: frame.frameIndexInSegment,
-            encodingStatus: frame.encodingStatus,
             metadata: frame.metadata,
             source: frame.source
         )
@@ -158,7 +157,6 @@ final class EdgeCaseTests: XCTestCase {
             segmentID: AppSegmentID(value: appSegmentID),
             videoID: storedVideoID,
             frameIndexInSegment: 0,
-            encodingStatus: .success,
             metadata: FrameMetadata(
                 appBundleID: nil,
                 appName: nil,
@@ -208,7 +206,6 @@ final class EdgeCaseTests: XCTestCase {
             segmentID: AppSegmentID(value: appSegmentID),
             videoID: storedVideoID,
             frameIndexInSegment: 0,
-            encodingStatus: .success,
             metadata: FrameMetadata(
                 appBundleID: "com.example.app",
                 appName: "Example",
@@ -255,7 +252,6 @@ final class EdgeCaseTests: XCTestCase {
             segmentID: AppSegmentID(value: appSegmentID),
             videoID: storedVideoID,
             frameIndexInSegment: 0,
-            encodingStatus: .success,
             metadata: .empty,
             source: .native
         ))
@@ -358,7 +354,6 @@ final class EdgeCaseTests: XCTestCase {
             segmentID: AppSegmentID(value: appSegmentID),
             videoID: storedVideoID,
             frameIndexInSegment: 0,
-            encodingStatus: .success,
             metadata: .empty,
             source: .native
         ))
@@ -406,7 +401,6 @@ final class EdgeCaseTests: XCTestCase {
             segmentID: AppSegmentID(value: appSegmentID),
             videoID: storedVideoID,
             frameIndexInSegment: 0,
-            encodingStatus: .success,
             metadata: .empty,
             source: .native
         ))
@@ -454,7 +448,6 @@ final class EdgeCaseTests: XCTestCase {
             segmentID: AppSegmentID(value: appSegmentID),
             videoID: storedVideoID,
             frameIndexInSegment: 0,
-            encodingStatus: .success,
             metadata: .empty,
             source: .native
         ))
@@ -499,7 +492,6 @@ final class EdgeCaseTests: XCTestCase {
             segmentID: AppSegmentID(value: appSegmentID),
             videoID: storedVideoID,
             frameIndexInSegment: 0,
-            encodingStatus: .success,
             metadata: FrameMetadata(appBundleID: "com.test.app"),
             source: .native
         ))
@@ -552,7 +544,6 @@ final class EdgeCaseTests: XCTestCase {
             segmentID: AppSegmentID(value: appSegmentID),
             videoID: storedVideoID,
             frameIndexInSegment: 0,
-            encodingStatus: .success,
             metadata: FrameMetadata(
                 appBundleID: "com.example.app",
                 appName: "日本語アプリ",  // Japanese
@@ -598,7 +589,6 @@ final class EdgeCaseTests: XCTestCase {
             segmentID: AppSegmentID(value: appSegmentID),
             videoID: storedVideoID,
             frameIndexInSegment: 0,
-            encodingStatus: .success,
             metadata: .empty,
             source: .native
         ))
@@ -651,7 +641,6 @@ final class EdgeCaseTests: XCTestCase {
             segmentID: AppSegmentID(value: appSegmentID),
             videoID: storedVideoID,
             frameIndexInSegment: 0,
-            encodingStatus: .success,
             metadata: FrameMetadata(
                 appBundleID: "com.example.app",
                 appName: "App with 'single' quotes",
@@ -696,7 +685,6 @@ final class EdgeCaseTests: XCTestCase {
             segmentID: AppSegmentID(value: appSegmentID),
             videoID: storedVideoID,
             frameIndexInSegment: 0,
-            encodingStatus: .success,
             metadata: .empty,
             source: .native
         ))
@@ -755,7 +743,6 @@ final class EdgeCaseTests: XCTestCase {
             segmentID: AppSegmentID(value: appSegmentID),
             videoID: storedVideoID,
             frameIndexInSegment: 0,
-            encodingStatus: .success,
             metadata: .empty,
             source: .native
         ))
@@ -765,7 +752,6 @@ final class EdgeCaseTests: XCTestCase {
             segmentID: AppSegmentID(value: appSegmentID),
             videoID: storedVideoID,
             frameIndexInSegment: 1,
-            encodingStatus: .success,
             metadata: .empty,
             source: .native
         ))
@@ -814,7 +800,6 @@ final class EdgeCaseTests: XCTestCase {
             segmentID: AppSegmentID(value: appSegmentID),
             videoID: storedVideoID,
             frameIndexInSegment: 0,
-            encodingStatus: .success,
             metadata: .empty,
             source: .native
         ))
@@ -824,7 +809,6 @@ final class EdgeCaseTests: XCTestCase {
             segmentID: AppSegmentID(value: appSegmentID),
             videoID: storedVideoID,
             frameIndexInSegment: 1,
-            encodingStatus: .success,
             metadata: .empty,
             source: .native
         ))
@@ -872,7 +856,6 @@ final class EdgeCaseTests: XCTestCase {
             segmentID: AppSegmentID(value: appSegmentID),
             videoID: storedVideoID,
             frameIndexInSegment: 0,
-            encodingStatus: .success,
             metadata: .empty,
             source: .native
         ))
@@ -960,7 +943,6 @@ final class EdgeCaseTests: XCTestCase {
             segmentID: AppSegmentID(value: appSegmentID),
             videoID: storedVideoID,
             frameIndexInSegment: 0,
-            encodingStatus: .success,
             metadata: .empty,
             source: .native
         )
@@ -972,7 +954,6 @@ final class EdgeCaseTests: XCTestCase {
             segmentID: AppSegmentID(value: appSegmentID),
             videoID: storedVideoID,
             frameIndexInSegment: 1,
-            encodingStatus: .success,
             metadata: .empty,
             source: .native
         )
@@ -1015,7 +996,6 @@ final class EdgeCaseTests: XCTestCase {
             segmentID: AppSegmentID(value: appSegmentID),
             videoID: storedVideoID,
             frameIndexInSegment: 0,
-            encodingStatus: .success,
             metadata: .empty,
             source: .native
         ))

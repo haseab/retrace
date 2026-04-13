@@ -674,8 +674,12 @@ extension SettingsView {
             } catch {
                 Log.error("[SettingsView] Failed to load apps for OCR filter: \(error)", category: .ui)
                 // Fallback to installed apps if database query fails
-                let installed = AppNameResolver.shared.getInstalledApps()
-                installedAppsForOCR = installed.map { (bundleID: $0.bundleID, name: $0.name) }
+                let installed = await Task.detached(priority: .utility) {
+                    AppNameResolver.shared.getInstalledApps()
+                }.value
+                await MainActor.run {
+                    installedAppsForOCR = installed.map { (bundleID: $0.bundleID, name: $0.name) }
+                }
             }
         }
     }

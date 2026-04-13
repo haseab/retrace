@@ -9,10 +9,26 @@ import Shared
 /// Owner: DATABASE agent
 public enum DailyMetricsQueries {
 
+    public struct RecentEvent: Sendable, Equatable {
+        public let metricType: MetricType
+        public let timestamp: Date
+        public let metadata: String?
+
+        public init(
+            metricType: MetricType,
+            timestamp: Date,
+            metadata: String?
+        ) {
+            self.metricType = metricType
+            self.timestamp = timestamp
+            self.metadata = metadata
+        }
+    }
+
     // MARK: - Metric Types
 
     /// Standard metric type identifiers
-    public enum MetricType: String {
+    public enum MetricType: String, Sendable {
         case timelineOpens = "timeline_opens"
         case searches = "searches"
         case textCopies = "text_copies"
@@ -22,8 +38,8 @@ public enum DailyMetricsQueries {
         case imageSaves = "image_saves"
         case deeplinkCopies = "deeplink_copies"
         case timelineSessionDuration = "timeline_session_duration"  // metadata: duration in ms
-        case filteredSearchQuery = "filtered_search_query"  // metadata: JSON {query, filters}
-        case timelineFilterQuery = "timeline_filter_query"  // metadata: JSON {bundleID, windowName, browserUrl, startDate, endDate}
+        case filteredSearchQuery = "filtered_search_query"  // metadata: JSON {queryLength, filterCount}
+        case timelineFilterQuery = "timeline_filter_query"  // metadata: JSON {hasAppFilter, hasWindowFilter, hasURLFilter, hasStartDate, hasEndDate}
         case scrubDistance = "scrub_distance"  // metadata: distance in pixels per session
         case searchDialogOpens = "search_dialog_opens"
         case timelineAutoDismissed = "timeline_auto_dismissed"  // metadata: JSON {trigger: "app_activation", activatedBundleID?}
@@ -37,7 +53,6 @@ public enum DailyMetricsQueries {
         case keyboardShortcut = "keyboard_shortcut"  // metadata: shortcut identifier (e.g. "cmd+c", "cmd+f")
         case dateSearchSubmitted = "date_search_submitted"
         case dateSearchOutcome = "date_search_outcome"
-
         // Timeline tagging/comments/playback metrics
         case segmentHide = "segment_hide"
         case segmentUnhide = "segment_unhide"
@@ -63,9 +78,9 @@ public enum DailyMetricsQueries {
         case recordingAutoResumed = "recording_auto_resumed"
         case systemMonitorOpened = "system_monitor_opened"
         case helpOpened = "help_opened"  // metadata: JSON {source}
+        case timelinePositionRecoveryHintAction = "timeline_position_recovery_hint_action"  // metadata: JSON {action, source, seconds?}
         case settingsSearchOpened = "settings_search_opened"
         case dockIconVisibilityToggle = "dock_icon_visibility_toggle"  // metadata: JSON {enabled, source}
-        case dockMenuAction = "dock_menu_action"  // metadata: JSON {action, source}
         case redactionRulesUpdated = "redaction_rules_updated"
         case masterKeyFlow = "master_key_flow"  // metadata: JSON {action, source, ...}
         case phraseLevelRedactionRulesUpdated = "phrase_level_redaction_rules_updated"
@@ -75,6 +90,7 @@ public enum DailyMetricsQueries {
         case systemMonitorSettingsOpened = "system_monitor_settings_opened"
         case systemMonitorOpenPowerOCRCard = "system_monitor_open_power_ocr_card"
         case systemMonitorOpenPowerOCRPriority = "system_monitor_open_power_ocr_priority"
+        case systemMonitorMemoryLogToggle = "system_monitor_memory_log_toggle"
         case inPageURLCollectionToggle = "in_page_url_collection_toggle"
         case mousePositionCaptureToggle = "mouse_position_capture_toggle"
         case mouseMovementDeduplicationToggle = "mouse_movement_deduplication_toggle"
@@ -92,10 +108,14 @@ public enum DailyMetricsQueries {
         case feedbackReportExport = "feedback_report_export"  // metadata: JSON {outcome, source, feedbackType, includeLogs, includeScreenshot, exportedFileCount}
         case watchdogCrashBannerAction = "watchdog_crash_banner_action"  // metadata: JSON {action, fileName, reportAgeSeconds}
         case walFailureBannerAction = "wal_failure_banner_action"  // metadata: JSON {action, fileName, reportAgeSeconds}
+        case unexpectedRecordingStopAction = "unexpected_recording_stop_action"  // metadata: JSON {action, reason, ...}
         case storageHealthBannerAction = "storage_health_banner_action"  // metadata: JSON {action, severity, availableGB, shouldStop}
         case crashRecoveryApprovalBannerAction = "crash_recovery_approval_banner_action"  // metadata: JSON {action, status}
         case debugWatchdogHangTriggered = "debug_watchdog_hang_triggered"
+        case debugCaptureInterruptionTriggered = "debug_capture_interruption_triggered"
+        case debugEncodingInterruptionTriggered = "debug_encoding_interruption_triggered"
         case debugForcedTerminationTriggered = "debug_forced_termination_triggered"
+        case debugOnboardingRelaunchTriggered = "debug_onboarding_relaunch_triggered"
         case developerSettingToggle = "developer_setting_toggle"  // metadata: JSON {source, settingKey, isEnabled}
         case debugCrashTriggered = "debug_crash_triggered"
         case crashAutoRestart = "crash_auto_restart"  // metadata: JSON {source}
@@ -104,6 +124,7 @@ public enum DailyMetricsQueries {
         // Delete actions
         case frameDeleted = "frame_deleted"
         case segmentDeleted = "segment_deleted"
+        case videoRewriteOutcome = "video_rewrite_outcome"
     }
 
     // MARK: - Insert
@@ -237,6 +258,74 @@ public enum DailyMetricsQueries {
         }
 
         return sqlite3_column_int64(statement, 0)
+    }
+
+    static func getRecentEvents(
+        db: OpaquePointer,
+        limit: Int,
+        excluding excludedMetricTypes: Set<MetricType> = []
+    ) throws -> [RecentEvent] {
+        let boundedLimit = max(0, limit)
+        guard boundedLimit > 0 else { return [] }
+        let excludedMetricTypeRawValues = excludedMetricTypes
+            .map(\.rawValue)
+            .sorted()
+        let exclusionClause = excludedMetricTypeRawValues.isEmpty
+            ? ""
+            : "WHERE metricType NOT IN (\(Array(repeating: "?", count: excludedMetricTypeRawValues.count).joined(separator: ", ")))"
+
+        let sql = """
+            SELECT metricType, timestamp, metadata
+            FROM daily_metrics
+            \(exclusionClause)
+            ORDER BY timestamp DESC, id DESC
+            LIMIT ?
+            """
+
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        var bindIndex: Int32 = 1
+        for metricTypeRawValue in excludedMetricTypeRawValues {
+            sqlite3_bind_text(statement, bindIndex, metricTypeRawValue, -1, SQLITE_TRANSIENT)
+            bindIndex += 1
+        }
+
+        sqlite3_bind_int(statement, bindIndex, Int32(boundedLimit))
+
+        var results: [RecentEvent] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard let metricTypeText = sqlite3_column_text(statement, 0) else {
+                continue
+            }
+
+            let metricTypeRawValue = String(cString: metricTypeText)
+            guard let metricType = MetricType(rawValue: metricTypeRawValue) else {
+                continue
+            }
+
+            let timestampMs = sqlite3_column_int64(statement, 1)
+            let timestamp = Date(timeIntervalSince1970: Double(timestampMs) / 1000)
+            let metadata = sqlite3_column_text(statement, 2).map { String(cString: $0) }
+
+            results.append(
+                RecentEvent(
+                    metricType: metricType,
+                    timestamp: timestamp,
+                    metadata: metadata
+                )
+            )
+        }
+
+        return results.reversed()
     }
 
     // MARK: - Helpers

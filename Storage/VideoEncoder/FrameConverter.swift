@@ -6,6 +6,13 @@ import Shared
 /// Converts CapturedFrame raw BGRA bytes into CVPixelBuffer.
 enum FrameConverter {
     static func createPixelBuffer(from frame: CapturedFrame) throws -> CVPixelBuffer {
+        try createPixelBuffer(from: frame, pool: nil)
+    }
+
+    static func createPixelBuffer(
+        from frame: CapturedFrame,
+        pool: CVPixelBufferPool?
+    ) throws -> CVPixelBuffer {
         guard frame.width > 0, frame.height > 0 else {
             throw StorageModuleError.encodingFailed(underlying: "Invalid frame dimensions: \(frame.width)x\(frame.height)")
         }
@@ -28,22 +35,28 @@ enum FrameConverter {
             )
         }
 
-        var pixelBuffer: CVPixelBuffer?
-        let attrs: [String: Any] = [
-            kCVPixelBufferCGImageCompatibilityKey as String: true,
-            kCVPixelBufferCGBitmapContextCompatibilityKey as String: true
-        ]
+        let buffer: CVPixelBuffer
+        if let pool, let pooledBuffer = try makePixelBuffer(from: pool) {
+            buffer = pooledBuffer
+        } else {
+            var pixelBuffer: CVPixelBuffer?
+            let attrs: [String: Any] = [
+                kCVPixelBufferCGImageCompatibilityKey as String: true,
+                kCVPixelBufferCGBitmapContextCompatibilityKey as String: true
+            ]
 
-        let status = CVPixelBufferCreate(
-            kCFAllocatorDefault,
-            frame.width,
-            frame.height,
-            kCVPixelFormatType_32BGRA,
-            attrs as CFDictionary,
-            &pixelBuffer
-        )
-        guard status == kCVReturnSuccess, let buffer = pixelBuffer else {
-            throw StorageModuleError.encodingFailed(underlying: "CVPixelBufferCreate failed: \(status)")
+            let status = CVPixelBufferCreate(
+                kCFAllocatorDefault,
+                frame.width,
+                frame.height,
+                kCVPixelFormatType_32BGRA,
+                attrs as CFDictionary,
+                &pixelBuffer
+            )
+            guard status == kCVReturnSuccess, let createdBuffer = pixelBuffer else {
+                throw StorageModuleError.encodingFailed(underlying: "CVPixelBufferCreate failed: \(status)")
+            }
+            buffer = createdBuffer
         }
 
         CVPixelBufferLockBaseAddress(buffer, [])
@@ -103,5 +116,18 @@ enum FrameConverter {
         }
 
         return buffer
+    }
+
+    private static func makePixelBuffer(from pool: CVPixelBufferPool) throws -> CVPixelBuffer? {
+        var pixelBuffer: CVPixelBuffer?
+        let status = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pixelBuffer)
+        switch status {
+        case kCVReturnSuccess:
+            return pixelBuffer
+        case kCVReturnWouldExceedAllocationThreshold:
+            return nil
+        default:
+            throw StorageModuleError.encodingFailed(underlying: "CVPixelBufferPoolCreatePixelBuffer failed: \(status)")
+        }
     }
 }
