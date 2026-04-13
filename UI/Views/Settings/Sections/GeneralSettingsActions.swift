@@ -277,20 +277,93 @@ extension SettingsView {
     }
 
     private static let intervalOnlyBaselineLowGBAtTwoSeconds = 8.0
-    private static let intervalOnlyBaselineHighGBAtTwoSeconds = 15.0
+    private static let intervalOnlyBaselineHighGBAtTwoSeconds = 13.0
+    static let deduplicationThresholdSliderStep = 0.0005
+    private static let keepFramesOnMouseMovementStorageMultiplier = 1.15
+
+    // Empirical frame-keep curve for the similarity threshold slider, normalized so the
+    // default 99.85% threshold remains the 1.0x storage baseline for the 2s timer-only
+    // estimate. Values through 99.80% come from the observed log sweep; 99.95% and 100%
+    // use the anchored keep-count examples selected for the settings estimate.
+    private static let deduplicationStorageMultiplierBaselineFrameCount = 18_016.0
+    private static let deduplicationStorageMultiplierPoints: [(threshold: Double, multiplier: Double)] = [
+        (threshold: 0.9800, multiplier: 16_295.0 / deduplicationStorageMultiplierBaselineFrameCount),
+        (threshold: 0.9805, multiplier: 16_306.0 / deduplicationStorageMultiplierBaselineFrameCount),
+        (threshold: 0.9810, multiplier: 16_317.0 / deduplicationStorageMultiplierBaselineFrameCount),
+        (threshold: 0.9815, multiplier: 16_328.0 / deduplicationStorageMultiplierBaselineFrameCount),
+        (threshold: 0.9820, multiplier: 16_337.0 / deduplicationStorageMultiplierBaselineFrameCount),
+        (threshold: 0.9825, multiplier: 16_353.0 / deduplicationStorageMultiplierBaselineFrameCount),
+        (threshold: 0.9830, multiplier: 16_362.0 / deduplicationStorageMultiplierBaselineFrameCount),
+        (threshold: 0.9835, multiplier: 16_382.0 / deduplicationStorageMultiplierBaselineFrameCount),
+        (threshold: 0.9840, multiplier: 16_391.0 / deduplicationStorageMultiplierBaselineFrameCount),
+        (threshold: 0.9845, multiplier: 16_401.0 / deduplicationStorageMultiplierBaselineFrameCount),
+        (threshold: 0.9850, multiplier: 16_411.0 / deduplicationStorageMultiplierBaselineFrameCount),
+        (threshold: 0.9855, multiplier: 16_424.0 / deduplicationStorageMultiplierBaselineFrameCount),
+        (threshold: 0.9860, multiplier: 16_436.0 / deduplicationStorageMultiplierBaselineFrameCount),
+        (threshold: 0.9865, multiplier: 16_458.0 / deduplicationStorageMultiplierBaselineFrameCount),
+        (threshold: 0.9870, multiplier: 16_469.0 / deduplicationStorageMultiplierBaselineFrameCount),
+        (threshold: 0.9875, multiplier: 16_479.0 / deduplicationStorageMultiplierBaselineFrameCount),
+        (threshold: 0.9880, multiplier: 16_500.0 / deduplicationStorageMultiplierBaselineFrameCount),
+        (threshold: 0.9885, multiplier: 16_510.0 / deduplicationStorageMultiplierBaselineFrameCount),
+        (threshold: 0.9890, multiplier: 16_546.0 / deduplicationStorageMultiplierBaselineFrameCount),
+        (threshold: 0.9895, multiplier: 16_573.0 / deduplicationStorageMultiplierBaselineFrameCount),
+        (threshold: 0.9900, multiplier: 16_588.0 / deduplicationStorageMultiplierBaselineFrameCount),
+        (threshold: 0.9905, multiplier: 16_599.0 / deduplicationStorageMultiplierBaselineFrameCount),
+        (threshold: 0.9910, multiplier: 16_617.0 / deduplicationStorageMultiplierBaselineFrameCount),
+        (threshold: 0.9915, multiplier: 16_637.0 / deduplicationStorageMultiplierBaselineFrameCount),
+        (threshold: 0.9920, multiplier: 16_655.0 / deduplicationStorageMultiplierBaselineFrameCount),
+        (threshold: 0.9925, multiplier: 16_667.0 / deduplicationStorageMultiplierBaselineFrameCount),
+        (threshold: 0.9930, multiplier: 16_688.0 / deduplicationStorageMultiplierBaselineFrameCount),
+        (threshold: 0.9935, multiplier: 16_707.0 / deduplicationStorageMultiplierBaselineFrameCount),
+        (threshold: 0.9940, multiplier: 16_726.0 / deduplicationStorageMultiplierBaselineFrameCount),
+        (threshold: 0.9945, multiplier: 16_739.0 / deduplicationStorageMultiplierBaselineFrameCount),
+        (threshold: 0.9950, multiplier: 16_757.0 / deduplicationStorageMultiplierBaselineFrameCount),
+        (threshold: 0.9955, multiplier: 16_776.0 / deduplicationStorageMultiplierBaselineFrameCount),
+        (threshold: 0.9960, multiplier: 16_804.0 / deduplicationStorageMultiplierBaselineFrameCount),
+        (threshold: 0.9965, multiplier: 16_837.0 / deduplicationStorageMultiplierBaselineFrameCount),
+        (threshold: 0.9970, multiplier: 16_872.0 / deduplicationStorageMultiplierBaselineFrameCount),
+        (threshold: 0.9975, multiplier: 16_915.0 / deduplicationStorageMultiplierBaselineFrameCount),
+        (threshold: 0.9980, multiplier: 17_002.0 / deduplicationStorageMultiplierBaselineFrameCount),
+        (threshold: 0.9985, multiplier: 1.0),
+        (threshold: 0.9995, multiplier: 23_610.0 / deduplicationStorageMultiplierBaselineFrameCount),
+        (threshold: 1.0000, multiplier: 25_916.0 / deduplicationStorageMultiplierBaselineFrameCount),
+    ]
 
     // Observed trigger split across tracked provenance days after capture_trigger rollout.
-    // We apply this split to a range where interval captures account for 50-75% of total
-    // captures at the 2s baseline, producing a low/high event-driven storage range instead
-    // of a single weighted midpoint.
+    // Window-change uses the observed low/high range from that split. Mouse-click keeps the
+    // same low-side estimate but uses a product-calibrated 6.5 GB/month upper bound.
     private static let mouseClickEventShare = 0.6394960927384343
     private static let windowChangeEventShare = 0.36050390726156567
     private static let minimumIntervalCaptureShare = 0.50
     private static let maximumIntervalCaptureShare = 0.75
+    private static let calibratedMouseClickHighGBAtTwoSeconds = 6.5
 
     private static func storageOverheadMultiplier(intervalCaptureShare: Double) -> Double {
         guard intervalCaptureShare > 0 else { return 0 }
         return (1.0 - intervalCaptureShare) / intervalCaptureShare
+    }
+
+    private static func deduplicationStorageMultiplier(for deduplicationThreshold: Double) -> Double {
+        let normalizedThreshold = min(max(deduplicationThreshold, 0.98), 1.0)
+        guard let firstPoint = deduplicationStorageMultiplierPoints.first else { return 1.0 }
+        guard let lastPoint = deduplicationStorageMultiplierPoints.last else { return firstPoint.multiplier }
+
+        if normalizedThreshold <= firstPoint.threshold {
+            return firstPoint.multiplier
+        }
+
+        for index in 0..<(deduplicationStorageMultiplierPoints.count - 1) {
+            let lower = deduplicationStorageMultiplierPoints[index]
+            let upper = deduplicationStorageMultiplierPoints[index + 1]
+            guard normalizedThreshold <= upper.threshold else { continue }
+
+            let span = upper.threshold - lower.threshold
+            guard span > 0 else { return upper.multiplier }
+            let t = (normalizedThreshold - lower.threshold) / span
+            return lower.multiplier + t * (upper.multiplier - lower.multiplier)
+        }
+
+        return lastPoint.multiplier
     }
 
     static func eventDrivenCaptureStorageHeuristicGB(
@@ -314,15 +387,21 @@ extension SettingsView {
 
         if captureOnMouseClick {
             lowGB += intervalOnlyBaselineLowGBAtTwoSeconds * lowExtraMultiplier * mouseClickEventShare
-            highGB += intervalOnlyBaselineHighGBAtTwoSeconds * highExtraMultiplier * mouseClickEventShare
+            highGB += calibratedMouseClickHighGBAtTwoSeconds
         }
 
         return (lowGB, highGB)
     }
 
-    private static func formatStorageEstimate(lowGB: Double, highGB: Double) -> String {
+    private static func sanitizedStorageEstimateRange(lowGB: Double, highGB: Double) -> StorageEstimateRange {
         let sanitizedLowGB = max(lowGB, 0)
         let sanitizedHighGB = max(highGB, sanitizedLowGB)
+        return StorageEstimateRange(lowGB: sanitizedLowGB, highGB: sanitizedHighGB)
+    }
+
+    private static func formatStorageEstimate(range: StorageEstimateRange) -> String {
+        let sanitizedLowGB = range.lowGB
+        let sanitizedHighGB = range.highGB
         let lowStr = String(format: "%.1f", sanitizedLowGB)
         let highStr = String(format: "%.1f", sanitizedHighGB)
 
@@ -332,17 +411,44 @@ extension SettingsView {
             return "Estimated: ~\(lowStr) GB per month"
         }
 
-        return "Estimated: ~\(lowStr)-\(highStr) GB per month"
+        return "Estimated: ~\(lowStr) to \(highStr) GB per month"
     }
 
     static func captureStorageEstimateText(
         videoQuality: Double,
         captureIntervalSeconds: Double,
         captureOnWindowChange: Bool,
-        captureOnMouseClick: Bool
+        captureOnMouseClick: Bool,
+        deduplicationThreshold: Double = CaptureConfig.defaultDeduplicationThreshold,
+        keepFramesOnMouseMovement: Bool = false
     ) -> String {
+        let range = captureStorageEstimateRange(
+            videoQuality: videoQuality,
+            captureIntervalSeconds: captureIntervalSeconds,
+            captureOnWindowChange: captureOnWindowChange,
+            captureOnMouseClick: captureOnMouseClick,
+            deduplicationThreshold: deduplicationThreshold,
+            keepFramesOnMouseMovement: keepFramesOnMouseMovement
+        )
+        return Self.formatStorageEstimate(range: range)
+    }
+
+    static func captureStorageEstimateRange(
+        videoQuality: Double,
+        captureIntervalSeconds: Double,
+        captureOnWindowChange: Bool,
+        captureOnMouseClick: Bool,
+        deduplicationThreshold: Double = CaptureConfig.defaultDeduplicationThreshold,
+        keepFramesOnMouseMovement: Bool = false
+    ) -> StorageEstimateRange {
         let qualityMultiplier = Self.videoQualityMultiplier(for: normalizedVideoQuality(videoQuality))
         let intervalMultiplier = Self.captureIntervalMultiplier(for: captureIntervalSeconds)
+        let deduplicationMultiplier = Self.deduplicationStorageMultiplier(
+            for: deduplicationThreshold
+        )
+        let mouseMovementMultiplier = keepFramesOnMouseMovement
+            ? Self.keepFramesOnMouseMovementStorageMultiplier
+            : 1.0
         let eventDrivenHeuristic = Self.eventDrivenCaptureStorageHeuristicGB(
             captureOnWindowChange: captureOnWindowChange,
             captureOnMouseClick: captureOnMouseClick
@@ -350,25 +456,59 @@ extension SettingsView {
 
         let baselineLowGB = (intervalOnlyBaselineLowGBAtTwoSeconds * intervalMultiplier) + eventDrivenHeuristic.lowGB
         let baselineHighGB = (intervalOnlyBaselineHighGBAtTwoSeconds * intervalMultiplier) + eventDrivenHeuristic.highGB
-        let lowGB = baselineLowGB * qualityMultiplier
-        let highGB = baselineHighGB * qualityMultiplier
-        return Self.formatStorageEstimate(lowGB: lowGB, highGB: highGB)
+        let lowGB = baselineLowGB * qualityMultiplier * deduplicationMultiplier * mouseMovementMultiplier
+        let highGB = baselineHighGB * qualityMultiplier * deduplicationMultiplier * mouseMovementMultiplier
+        return Self.sanitizedStorageEstimateRange(lowGB: lowGB, highGB: highGB)
     }
 
     /// Estimated storage per month based on video quality and capture interval settings.
-    /// Reference: 50% quality at 2s interval ≈ 8-15 GB/month before event-driven uplift.
+    /// Reference: 50% quality at 2s interval ≈ 8-13 GB/month before event-driven uplift.
     var videoQualityEstimateText: String {
         Self.captureStorageEstimateText(
             videoQuality: videoQuality,
             captureIntervalSeconds: captureIntervalSeconds,
             captureOnWindowChange: captureOnWindowChange,
-            captureOnMouseClick: captureOnMouseClick
+            captureOnMouseClick: captureOnMouseClick,
+            deduplicationThreshold: deduplicationThreshold,
+            keepFramesOnMouseMovement: effectiveMousePositionStorageMultiplierEnabled
         )
     }
 
-    /// Estimated storage for capture interval section (same calculation)
-    var captureIntervalEstimateText: String {
-        videoQualityEstimateText
+    var storageEstimateValueText: String {
+        videoQualityEstimateText.replacingOccurrences(of: "Estimated: ", with: "")
+    }
+
+    var storageEstimateRange: StorageEstimateRange {
+        Self.captureStorageEstimateRange(
+            videoQuality: videoQuality,
+            captureIntervalSeconds: captureIntervalSeconds,
+            captureOnWindowChange: captureOnWindowChange,
+            captureOnMouseClick: captureOnMouseClick,
+            deduplicationThreshold: deduplicationThreshold,
+            keepFramesOnMouseMovement: effectiveMousePositionStorageMultiplierEnabled
+        )
+    }
+
+    static func shouldApplyMousePositionStorageMultiplier(captureMousePosition: Bool) -> Bool {
+        captureMousePosition
+    }
+
+    var effectiveMousePositionStorageMultiplierEnabled: Bool {
+        Self.shouldApplyMousePositionStorageMultiplier(captureMousePosition: captureMousePosition)
+    }
+
+    static func storageEstimateDeltaDirection(
+        previous: StorageEstimateRange,
+        current: StorageEstimateRange
+    ) -> StorageEstimateDeltaDirection? {
+        let delta = current.midpointGB - previous.midpointGB
+        if delta > 0.0001 {
+            return .increase
+        }
+        if delta < -0.0001 {
+            return .decrease
+        }
+        return nil
     }
 
     var deduplicationThresholdDisplayText: String {

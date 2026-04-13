@@ -20,6 +20,20 @@ public struct SettingsView: View {
         case comment
     }
 
+    struct StorageEstimateRange: Equatable {
+        let lowGB: Double
+        let highGB: Double
+
+        var midpointGB: Double {
+            (lowGB + highGB) / 2.0
+        }
+    }
+
+    enum StorageEstimateDeltaDirection: Equatable {
+        case increase
+        case decrease
+    }
+
     // MARK: - Properties
 
     /// Optional initial tab to open (passed from parent when navigating to specific section)
@@ -87,6 +101,8 @@ public struct SettingsView: View {
     @State var lastNonZeroCaptureIntervalSeconds = SettingsDefaults.captureIntervalSeconds
     @State var isProgrammaticCaptureIntervalChange = false
     @State var isProgrammaticWindowChangeCaptureToggleChange = false
+    @State var lastObservedStorageEstimateRange: StorageEstimateRange?
+    @State var storageEstimateDeltaDirection: StorageEstimateDeltaDirection?
 
     // MARK: Storage Settings
     @AppStorage("retentionDays", store: settingsStore) var retentionDays: Int = SettingsDefaults.retentionDays

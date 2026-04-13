@@ -185,8 +185,6 @@ extension SettingsView {
                             captureSettings
                         case .storage:
                             storageSettings
-                        case .exportData:
-                            exportDataSettings
                         case .privacy:
                             privacySettings
                         case .power:
@@ -198,19 +196,60 @@ extension SettingsView {
                         }
                     }
                     .padding(.horizontal, 32)
-                    .padding(.bottom, 32)
+                    .padding(.bottom, shellViewModel.selectedTab == .capture ? 108 : 32)
+                }
+            }
+            .overlay(alignment: .bottomTrailing) {
+                if shellViewModel.selectedTab == .capture {
+                    floatingStorageEstimateCard(
+                        valueText: storageEstimateValueText,
+                        deltaDirection: storageEstimateDeltaDirection
+                    )
+                        .padding(.trailing, 32)
+                        .padding(.bottom, 18)
+                        .allowsHitTesting(false)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
             }
             .onAppear {
+                synchronizeStorageEstimateTrackingIfNeeded()
                 scrollToPendingTarget(using: proxy)
             }
             .onChange(of: shellViewModel.selectedTab) { _ in
+                synchronizeStorageEstimateTrackingIfNeeded()
                 scrollToPendingTarget(using: proxy)
             }
             .onChange(of: shellViewModel.pendingScrollTargetID) { _ in
                 scrollToPendingTarget(using: proxy)
             }
+            .onChange(of: storageEstimateRange) { newRange in
+                guard shellViewModel.selectedTab == .capture else {
+                    lastObservedStorageEstimateRange = newRange
+                    storageEstimateDeltaDirection = nil
+                    return
+                }
+
+                if let previousRange = lastObservedStorageEstimateRange {
+                    storageEstimateDeltaDirection = Self.storageEstimateDeltaDirection(
+                        previous: previousRange,
+                        current: newRange
+                    )
+                }
+                lastObservedStorageEstimateRange = newRange
+            }
+            .animation(.easeInOut(duration: 0.2), value: shellViewModel.selectedTab)
+            .animation(.easeInOut(duration: 0.18), value: storageEstimateDeltaDirection)
         }
+    }
+
+    func synchronizeStorageEstimateTrackingIfNeeded() {
+        guard shellViewModel.selectedTab == .capture else {
+            storageEstimateDeltaDirection = nil
+            return
+        }
+
+        lastObservedStorageEstimateRange = storageEstimateRange
+        storageEstimateDeltaDirection = nil
     }
 
     func requestNavigation(to targetID: String) {

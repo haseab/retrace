@@ -295,11 +295,8 @@ extension SettingsView {
                             .font(.retraceCalloutMedium)
                                 .foregroundColor(.retracePrimary)
                             if useRewindData {
-                                (Text("Only applies to Retrace data, not Rewind data. To remove Rewind data, go to ")
-                                    .foregroundColor(.retraceSecondary) +
-                                Text("Export & Data")
-                                    .foregroundColor(.retraceAccent)
-                                    .underline())
+                                Text("Only applies to Retrace data, not Rewind data.")
+                                    .foregroundColor(.retraceSecondary)
                                     .font(.retraceCaption)
                             }
                         }

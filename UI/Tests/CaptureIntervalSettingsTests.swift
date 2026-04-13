@@ -145,9 +145,10 @@ final class CaptureIntervalSettingsTests: XCTestCase {
                 videoQuality: 0.5,
                 captureIntervalSeconds: 2,
                 captureOnWindowChange: false,
-                captureOnMouseClick: false
+                captureOnMouseClick: false,
+                deduplicationThreshold: 0.9985
             ),
-            "Estimated: ~8.0-15.0 GB per month"
+            "Estimated: ~8.0 to 13.0 GB per month"
         )
     }
 
@@ -157,9 +158,10 @@ final class CaptureIntervalSettingsTests: XCTestCase {
                 videoQuality: 1.0,
                 captureIntervalSeconds: 2,
                 captureOnWindowChange: false,
-                captureOnMouseClick: false
+                captureOnMouseClick: false,
+                deduplicationThreshold: 0.9985
             ),
-            "Estimated: ~61.1-114.5 GB per month"
+            "Estimated: ~61.1 to 99.3 GB per month"
         )
     }
 
@@ -169,10 +171,95 @@ final class CaptureIntervalSettingsTests: XCTestCase {
                 videoQuality: 0.7,
                 captureIntervalSeconds: 2,
                 captureOnWindowChange: false,
-                captureOnMouseClick: false
+                captureOnMouseClick: false,
+                deduplicationThreshold: 0.9985
             ),
-            "Estimated: ~10.5-19.7 GB per month"
+            "Estimated: ~10.5 to 17.1 GB per month"
         )
+    }
+
+    func testCaptureStorageEstimateUsesHundredPercentSimilarityAsKeepEveryFrameMultiplier() {
+        XCTAssertEqual(
+            SettingsView.captureStorageEstimateText(
+                videoQuality: 0.5,
+                captureIntervalSeconds: 2,
+                captureOnWindowChange: false,
+                captureOnMouseClick: false,
+                deduplicationThreshold: 1.0
+            ),
+            "Estimated: ~11.5 to 18.7 GB per month"
+        )
+    }
+
+    func testCaptureStorageEstimateUsesNinetyNinePointNinetyFiveSimilarityAnchor() {
+        XCTAssertEqual(
+            SettingsView.captureStorageEstimateText(
+                videoQuality: 0.5,
+                captureIntervalSeconds: 2,
+                captureOnWindowChange: false,
+                captureOnMouseClick: false,
+                deduplicationThreshold: 0.9995
+            ),
+            "Estimated: ~10.5 to 17.0 GB per month"
+        )
+    }
+
+    func testCaptureStorageEstimateAppliesMouseMovementMultiplierWhenEnabled() {
+        XCTAssertEqual(
+            SettingsView.captureStorageEstimateText(
+                videoQuality: 0.5,
+                captureIntervalSeconds: 2,
+                captureOnWindowChange: false,
+                captureOnMouseClick: false,
+                deduplicationThreshold: 0.9985,
+                keepFramesOnMouseMovement: true
+            ),
+            "Estimated: ~9.2 to 14.9 GB per month"
+        )
+    }
+
+    func testCaptureMousePositionDirectlyControlsStorageMultiplier() {
+        XCTAssertFalse(
+            SettingsView.shouldApplyMousePositionStorageMultiplier(captureMousePosition: false)
+        )
+        XCTAssertTrue(
+            SettingsView.shouldApplyMousePositionStorageMultiplier(captureMousePosition: true)
+        )
+    }
+
+    func testStorageEstimateDeltaDirectionTracksIncreaseAndDecrease() {
+        let baseline = SettingsView.captureStorageEstimateRange(
+            videoQuality: 0.5,
+            captureIntervalSeconds: 2,
+            captureOnWindowChange: false,
+            captureOnMouseClick: false,
+            deduplicationThreshold: 0.9985,
+            keepFramesOnMouseMovement: false
+        )
+        let increased = SettingsView.captureStorageEstimateRange(
+            videoQuality: 0.5,
+            captureIntervalSeconds: 2,
+            captureOnWindowChange: false,
+            captureOnMouseClick: false,
+            deduplicationThreshold: 0.9985,
+            keepFramesOnMouseMovement: true
+        )
+
+        XCTAssertEqual(
+            SettingsView.storageEstimateDeltaDirection(previous: baseline, current: increased),
+            .increase
+        )
+        XCTAssertEqual(
+            SettingsView.storageEstimateDeltaDirection(previous: increased, current: baseline),
+            .decrease
+        )
+        XCTAssertNil(
+            SettingsView.storageEstimateDeltaDirection(previous: baseline, current: baseline)
+        )
+    }
+
+    func testDeduplicationThresholdSliderUsesFiveBasisPointPercentSteps() {
+        XCTAssertEqual(SettingsView.deduplicationThresholdSliderStep, 0.0005, accuracy: 0.000_000_1)
     }
 
     func testEventDrivenCaptureStorageHeuristicUsesObservedWindowChangeAndClickShares() {
@@ -181,14 +268,14 @@ final class CaptureIntervalSettingsTests: XCTestCase {
             captureOnMouseClick: false
         )
         XCTAssertEqual(windowChangeOnly.lowGB, 0.9613437527, accuracy: 0.0001)
-        XCTAssertEqual(windowChangeOnly.highGB, 5.4075586089, accuracy: 0.0001)
+        XCTAssertEqual(windowChangeOnly.highGB, 4.6865507944, accuracy: 0.0001)
 
         let mouseClickOnly = SettingsView.eventDrivenCaptureStorageHeuristicGB(
             captureOnWindowChange: false,
             captureOnMouseClick: true
         )
         XCTAssertEqual(mouseClickOnly.lowGB, 1.7053229140, accuracy: 0.0001)
-        XCTAssertEqual(mouseClickOnly.highGB, 9.5924413911, accuracy: 0.0001)
+        XCTAssertEqual(mouseClickOnly.highGB, 6.5, accuracy: 0.0001)
     }
 
     func testCaptureStorageEstimateIncludesEventDrivenHeuristicsWhenIntervalIsOff() {
@@ -197,9 +284,10 @@ final class CaptureIntervalSettingsTests: XCTestCase {
                 videoQuality: 0.5,
                 captureIntervalSeconds: 0,
                 captureOnWindowChange: true,
-                captureOnMouseClick: true
+                captureOnMouseClick: true,
+                deduplicationThreshold: 0.9985
             ),
-            "Estimated: ~2.7-15.0 GB per month"
+            "Estimated: ~2.7 to 11.2 GB per month"
         )
     }
 
@@ -209,9 +297,10 @@ final class CaptureIntervalSettingsTests: XCTestCase {
                 videoQuality: 0.5,
                 captureIntervalSeconds: 2,
                 captureOnWindowChange: true,
-                captureOnMouseClick: true
+                captureOnMouseClick: true,
+                deduplicationThreshold: 0.9985
             ),
-            "Estimated: ~10.7-30.0 GB per month"
+            "Estimated: ~10.7 to 24.2 GB per month"
         )
     }
 
@@ -221,9 +310,10 @@ final class CaptureIntervalSettingsTests: XCTestCase {
                 videoQuality: 0.4,
                 captureIntervalSeconds: 2,
                 captureOnWindowChange: true,
-                captureOnMouseClick: true
+                captureOnMouseClick: true,
+                deduplicationThreshold: 0.9985
             ),
-            "Estimated: ~9.0-25.4 GB per month"
+            "Estimated: ~9.0 to 20.5 GB per month"
         )
     }
 
@@ -233,13 +323,15 @@ final class CaptureIntervalSettingsTests: XCTestCase {
                 videoQuality: -5,
                 captureIntervalSeconds: 2,
                 captureOnWindowChange: false,
-                captureOnMouseClick: false
+                captureOnMouseClick: false,
+                deduplicationThreshold: 0.9985
             ),
             SettingsView.captureStorageEstimateText(
                 videoQuality: 0,
                 captureIntervalSeconds: 2,
                 captureOnWindowChange: false,
-                captureOnMouseClick: false
+                captureOnMouseClick: false,
+                deduplicationThreshold: 0.9985
             )
         )
         XCTAssertEqual(
@@ -247,13 +339,15 @@ final class CaptureIntervalSettingsTests: XCTestCase {
                 videoQuality: 5,
                 captureIntervalSeconds: 2,
                 captureOnWindowChange: false,
-                captureOnMouseClick: false
+                captureOnMouseClick: false,
+                deduplicationThreshold: 0.9985
             ),
             SettingsView.captureStorageEstimateText(
                 videoQuality: 1,
                 captureIntervalSeconds: 2,
                 captureOnWindowChange: false,
-                captureOnMouseClick: false
+                captureOnMouseClick: false,
+                deduplicationThreshold: 0.9985
             )
         )
     }
