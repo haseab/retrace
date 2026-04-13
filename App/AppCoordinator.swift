@@ -296,9 +296,6 @@ public actor AppCoordinator {
     private var crashRecoveryTask: Task<Bool, Error>?
     private var hasCompletedCrashRecoverySinceLaunch = false
 
-    /// Whether the screen is currently asleep (set by AppDelegate on sleep/wake transitions)
-    public var isScreenAsleep: Bool = false
-
     // Periodic task to finalize orphaned videos (processingState stuck at 1)
     private var orphanedVideoCleanupTask: Task<Void, Never>?
     private var dbStorageSnapshotTask: Task<Void, Never>?
@@ -884,15 +881,13 @@ public actor AppCoordinator {
         let pauseOnBattery = snapshot.pauseOnBattery
         let pauseOnLowPowerMode = snapshot.pauseOnLowPowerMode
         let processingLevel = min(max(snapshot.processingLevel, 1), 5)
+        let powerSource = PowerStateMonitor.shared.getCurrentPowerSource()
 
-        // Auto-boost to Max when screen is asleep, on AC, and battery > 80%
+        // Optionally override the selected OCR level to Max whenever the Mac is on AC power.
         var effectiveProcessingLevel = processingLevel
-        if snapshot.autoMaxOCR && isScreenAsleep {
-            let batteryInfo = PowerStateMonitor.shared.getBatteryInfo()
-            if batteryInfo.isOnAC && (batteryInfo.level ?? 100) > 80 {
-                effectiveProcessingLevel = 5
-                Log.info("[AppCoordinator] Auto Max OCR active — boosting to level 5 (screen asleep, on AC, battery \(batteryInfo.level.map { "\($0)%" } ?? "N/A"))", category: .app)
-            }
+        if snapshot.autoMaxOCR && powerSource == .ac {
+            effectiveProcessingLevel = 5
+            Log.info("[AppCoordinator] Plugged-in Max OCR active — boosting to level 5", category: .app)
         }
 
         // Parse app filter mode and filtered apps
@@ -930,8 +925,6 @@ public actor AppCoordinator {
             Log.info("[AppCoordinator] No filtered apps configured or failed to parse", category: .app)
         }
 
-        // Get current power source
-        let powerSource = PowerStateMonitor.shared.getCurrentPowerSource()
         let isLowPowerModeEnabled = ProcessInfo.processInfo.isLowPowerModeEnabled
 
         // Derive priority, FPS limit, and worker count from processing level

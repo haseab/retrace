@@ -42,25 +42,6 @@ public final class PowerStateMonitor: @unchecked Sendable {
         getCurrentPowerSource() == .battery
     }
 
-    /// Get battery level and AC status. Returns nil level for desktops (always AC).
-    public func getBatteryInfo() -> (level: Int?, isOnAC: Bool) {
-        guard let snapshot = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
-              let sources = IOPSCopyPowerSourcesList(snapshot)?.takeRetainedValue() as? [CFTypeRef],
-              !sources.isEmpty else {
-            // Desktop Mac (no battery) - always AC, no level
-            return (level: nil, isOnAC: true)
-        }
-
-        for source in sources {
-            if let info = IOPSGetPowerSourceDescription(snapshot, source)?.takeUnretainedValue() as? [String: Any] {
-                let level = info[kIOPSCurrentCapacityKey] as? Int
-                let state = info[kIOPSPowerSourceStateKey] as? String
-                let isOnAC = state == kIOPSACPowerValue
-                return (level: level, isOnAC: isOnAC)
-            }
-        }
-        return (level: nil, isOnAC: true)
-    }
 }
 
 // MARK: - OCR App Filter Mode

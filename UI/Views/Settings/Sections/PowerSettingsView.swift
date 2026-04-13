@@ -195,6 +195,10 @@ extension SettingsView {
     var powerEfficiencyCard: some View {
         ModernSettingsCard(title: "Processing Speed", icon: "gauge.with.dots.needle.33percent") {
                     VStack(alignment: .leading, spacing: 16) {
+                        if autoMaxOCR {
+                            pluggedInMaxPriorityStatusCard
+                        }
+
                         VStack(alignment: .leading, spacing: 14) {
                             HStack {
                                 Text("OCR Priority")
@@ -213,12 +217,20 @@ extension SettingsView {
                             // 5-level discrete slider: Efficiency (1) to Max (5)
                             ModernSlider(
                                 value: Binding(
-                                    get: { Double(ocrProcessingLevel) },
+                                    get: { Double(effectiveOCRProcessingLevel) },
                                     set: { ocrProcessingLevel = Int($0) }
                                 ),
                                 range: 1...5,
                                 step: 1
                             )
+                                .disabled(isPluggedInMaxPriorityActive)
+                                .opacity(isPluggedInMaxPriorityActive ? 0.45 : 1.0)
+                                .overlay {
+                                    if isPluggedInMaxPriorityActive {
+                                        RoundedRectangle(cornerRadius: 8)
+                                            .fill(Color.black.opacity(0.14))
+                                    }
+                                }
                                 .onChange(of: ocrProcessingLevel) { _ in
                                     notifyPowerSettingsChanged()
                                 }
@@ -297,8 +309,8 @@ extension SettingsView {
                             .background(Color.retraceBorder)
 
                         ModernToggleRow(
-                            title: "Auto Max when idle & charging",
-                            subtitle: "Boost to Max when screen is off, plugged in, and battery over 80%",
+                            title: "Set to Max Priority when Plugged In",
+                            subtitle: "Temporarily overrides your OCR processing level to Max whenever your Mac is connected to power",
                             isOn: $autoMaxOCR
                         )
                         .onChange(of: autoMaxOCR) { _ in
@@ -433,7 +445,63 @@ extension SettingsView {
         .cornerRadius(10)
     }
 
+    @ViewBuilder
+    var pluggedInMaxPriorityStatusCard: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: isPluggedInMaxPriorityActive ? "bolt.fill" : "bolt")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundColor(isPluggedInMaxPriorityActive ? .orange : .retraceSecondary)
+                .frame(width: 18)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(isPluggedInMaxPriorityActive ? "Currently processing at Max" : "Not currently processing at Max")
+                    .font(.retraceCaption2Medium)
+                    .foregroundColor(.retracePrimary)
+                Text(
+                    isPluggedInMaxPriorityActive
+                        ? "Your Mac is connected to power, so OCR is temporarily using Max. Your saved unplugged priority is \(savedProcessingLevelDisplayText)."
+                        : "This override is enabled, but your Mac is not connected to power. OCR is currently using your saved \(savedProcessingLevelDisplayText) priority."
+                )
+                .font(.retraceCaption2)
+                .foregroundColor(.retraceSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(isPluggedInMaxPriorityActive ? Color.orange.opacity(0.12) : Color.retraceCard)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10)
+                        .stroke(
+                            isPluggedInMaxPriorityActive ? Color.orange.opacity(0.35) : Color.retraceBorder,
+                            lineWidth: 1
+                        )
+                )
+        )
+    }
+
+    var isPluggedInMaxPriorityActive: Bool {
+        autoMaxOCR && currentPowerSource == .ac
+    }
+
+    var effectiveOCRProcessingLevel: Int {
+        isPluggedInMaxPriorityActive ? 5 : ocrProcessingLevel
+    }
+
     var processingLevelDisplayText: String {
+        switch effectiveOCRProcessingLevel {
+        case 1: return "Efficiency"
+        case 2: return "Light"
+        case 3: return "Balanced"
+        case 4: return "Performance"
+        case 5: return "Max"
+        default: return "Balanced"
+        }
+    }
+
+    var savedProcessingLevelDisplayText: String {
         switch ocrProcessingLevel {
         case 1: return "Efficiency"
         case 2: return "Light"
@@ -445,7 +513,7 @@ extension SettingsView {
     }
 
     var processingLevelColor: Color {
-        switch ocrProcessingLevel {
+        switch effectiveOCRProcessingLevel {
         case 1: return .green
         case 2: return .green
         case 3: return .retraceAccent
@@ -456,7 +524,7 @@ extension SettingsView {
     }
 
     var processingLevelSummary: String {
-        switch ocrProcessingLevel {
+        switch effectiveOCRProcessingLevel {
         case 1: return "Low CPU, always running"
         case 2: return "Low CPU, mostly running"
         case 3: return "Moderate bursts, some idle"
@@ -473,7 +541,7 @@ extension SettingsView {
     /// CPU usage profile pattern for each level
     /// Values represent relative CPU intensity (0–1) over time slices
     var cpuProfilePattern: [CGFloat] {
-        switch ocrProcessingLevel {
+        switch effectiveOCRProcessingLevel {
         case 1: // Constant low hum, never stops
             return [0.18, 0.20, 0.19, 0.18, 0.20, 0.19, 0.18, 0.20, 0.19, 0.18, 0.20, 0.19, 0.18, 0.20, 0.19, 0.18, 0.20, 0.19, 0.18, 0.20, 0.19, 0.18, 0.20, 0.19]
         case 2: // Low steady with occasional tiny dips
@@ -541,7 +609,7 @@ extension SettingsView {
     }
 
     var processingLevelBullets: [String] {
-        switch ocrProcessingLevel {
+        switch effectiveOCRProcessingLevel {
         case 1: return [
             "~0.5 frames/sec  ·  70–90% CPU",
             "Low CPU but always running — the queue will grow and never catch up",
