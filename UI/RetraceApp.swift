@@ -1739,6 +1739,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         isHandlingSystemWake = true
         wasRecordingBeforeSleep = false
         defer { isHandlingSystemWake = false }
+        schedulePowerSettingsApply()
 
         if await wrapper.coordinator.isCapturing() {
             await wrapper.refreshStatus()

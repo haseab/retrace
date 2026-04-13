@@ -100,6 +100,7 @@ public struct OCRPowerSettingsSnapshot: Sendable {
     public let processingLevel: Int
     public let appFilterModeRaw: String
     public let filteredAppsJSON: String
+    public let autoMaxOCR: Bool
 
     public init(
         ocrEnabled: Bool,
@@ -107,7 +108,8 @@ public struct OCRPowerSettingsSnapshot: Sendable {
         pauseOnLowPowerMode: Bool,
         processingLevel: Int,
         appFilterModeRaw: String,
-        filteredAppsJSON: String
+        filteredAppsJSON: String,
+        autoMaxOCR: Bool = false
     ) {
         self.ocrEnabled = ocrEnabled
         self.pauseOnBattery = pauseOnBattery
@@ -115,6 +117,7 @@ public struct OCRPowerSettingsSnapshot: Sendable {
         self.processingLevel = processingLevel
         self.appFilterModeRaw = appFilterModeRaw
         self.filteredAppsJSON = filteredAppsJSON
+        self.autoMaxOCR = autoMaxOCR
     }
 
     public static func fromDefaults(
@@ -126,7 +129,8 @@ public struct OCRPowerSettingsSnapshot: Sendable {
             pauseOnLowPowerMode: defaults.bool(forKey: "ocrPauseInLowPowerMode"),
             processingLevel: (defaults.object(forKey: "ocrProcessingLevel") as? NSNumber)?.intValue ?? 3,
             appFilterModeRaw: defaults.string(forKey: "ocrAppFilterMode") ?? "all",
-            filteredAppsJSON: defaults.string(forKey: "ocrFilteredApps") ?? ""
+            filteredAppsJSON: defaults.string(forKey: "ocrFilteredApps") ?? "",
+            autoMaxOCR: defaults.bool(forKey: "autoMaxOCR")
         )
     }
 }
@@ -1323,6 +1327,14 @@ public actor AppCoordinator {
         let pauseOnBattery = snapshot.pauseOnBattery
         let pauseOnLowPowerMode = snapshot.pauseOnLowPowerMode
         let processingLevel = min(max(snapshot.processingLevel, 1), 5)
+        let powerSource = PowerStateMonitor.shared.getCurrentPowerSource()
+
+        // Optionally override the selected OCR level to Max whenever the Mac is on AC power.
+        var effectiveProcessingLevel = processingLevel
+        if snapshot.autoMaxOCR && powerSource == .ac {
+            effectiveProcessingLevel = 5
+            Log.info("[AppCoordinator] Plugged-in Max OCR active — boosting to level 5", category: .app)
+        }
 
         // Parse app filter mode and filtered apps
         let filterModeRaw = snapshot.appFilterModeRaw
@@ -1359,8 +1371,6 @@ public actor AppCoordinator {
             Log.info("[AppCoordinator] No filtered apps configured or failed to parse", category: .app)
         }
 
-        // Get current power source
-        let powerSource = PowerStateMonitor.shared.getCurrentPowerSource()
         let isLowPowerModeEnabled = ProcessInfo.processInfo.isLowPowerModeEnabled
 
         // Derive priority, FPS limit, and worker count from processing level
@@ -1372,7 +1382,7 @@ public actor AppCoordinator {
         let taskPriority: TaskPriority
         let maxFPS: Double
         let workerCount: Int
-        switch processingLevel {
+        switch effectiveProcessingLevel {
         case 1:
             taskPriority = .background; maxFPS = 0.5; workerCount = 1
         case 2:

@@ -103,6 +103,7 @@ enum SettingsDefaults {
     static let ocrProcessingLevel: Int = 3
     static let ocrAppFilterMode: OCRAppFilterMode = .allApps
     static let ocrFilteredApps = ""
+    static let autoMaxOCR = false
 }
 
 enum DashboardAppUsageViewModeSetting: String, CaseIterable {
