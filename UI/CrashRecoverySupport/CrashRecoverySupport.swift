@@ -409,4 +409,5 @@ public enum CrashRecoverySupport {
     func arm(reply: @escaping () -> Void)
     func prepareForExpectedExit(reply: @escaping () -> Void)
     func prepareForRelaunch(targetAppPath: String?, reply: @escaping () -> Void)
+    func captureWatchdogHangSample(trigger: String, reply: @escaping (String?) -> Void)
 }

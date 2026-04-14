@@ -4,12 +4,20 @@ import Foundation
 import ServiceManagement
 import Shared
 
+private let sharedCrashRecoveryWorker = CrashRecoveryWorker()
+// Keep the caller-side timeout tight so watchdog recovery is not blocked for minutes
+// if the helper never replies. Leave a small buffer above the helper's sample timeout.
+private let watchdogHangSampleTimeoutMs: UInt64 = 6_000
+
 private actor CrashRecoveryWorker {
     private let service = SMAppService.agent(plistName: CrashRecoverySupport.launchAgentPlistName)
     private var connection: NSXPCConnection?
+    private var connectionID: ObjectIdentifier?
     private var armTask: Task<CrashRecoverySupport.Status, Never>?
     private var suppressReconnect = false
     private var unavailableReason: CrashRecoverySupport.Status.UnavailableReason?
+    private var inFlightHangSampleCount = 0
+    private var reconnectDeferredUntilHangSampleCompletes = false
 
 #if DEBUG
     private var testBundledHelperProxy: CrashRecoveryHelperXPCProtocol?
@@ -35,6 +43,7 @@ private actor CrashRecoveryWorker {
             disconnect()
             suppressReconnect = false
             unavailableReason = nil
+            reconnectDeferredUntilHangSampleCompletes = false
             return refreshStatus()
         }
 
@@ -98,6 +107,38 @@ private actor CrashRecoveryWorker {
         }
 
         return (acknowledged: acknowledged, status: refreshStatus())
+    }
+
+    func captureWatchdogHangSample(
+        trigger: String,
+        timeoutMs: UInt64 = watchdogHangSampleTimeoutMs
+    ) async -> String? {
+        guard let proxy = ensureProxyConnection() else {
+            Log.warning("[CrashRecovery] Helper hang sample unavailable: no XPC proxy", category: .app)
+            return nil
+        }
+        inFlightHangSampleCount += 1
+
+        let samplePath = await CrashRecoveryManager.helperWatchdogHangSample(
+            trigger,
+            via: proxy,
+            timeoutMs: timeoutMs
+        )
+        let shouldReconnect = finishHangSampleRequest()
+
+        if samplePath == nil {
+            Log.warning("[CrashRecovery] Helper hang sample request timed out or failed", category: .app)
+        }
+
+        if shouldReconnect {
+            Log.warning(
+                "[CrashRecovery] Re-arming helper after deferred connection loss during hang sample trigger=\(trigger)",
+                category: .app
+            )
+            await rearmAfterDeferredHangSampleLoss()
+        }
+
+        return samplePath
     }
 
     func retryActivationAfterApprovalChange() async -> CrashRecoverySupport.Status {
@@ -309,21 +350,23 @@ private actor CrashRecoveryWorker {
             machServiceName: CrashRecoverySupport.machServiceName,
             options: []
         )
+        let newConnectionID = ObjectIdentifier(newConnection)
         newConnection.remoteObjectInterface = NSXPCInterface(
             with: CrashRecoveryHelperXPCProtocol.self
         )
         newConnection.interruptionHandler = { [weak self] in
             Task {
-                await self?.handleConnectionLoss(reason: "interrupted")
+                await self?.handleConnectionLoss(connectionID: newConnectionID, reason: "interrupted")
             }
         }
         newConnection.invalidationHandler = { [weak self] in
             Task {
-                await self?.handleConnectionLoss(reason: "invalidated")
+                await self?.handleConnectionLoss(connectionID: newConnectionID, reason: "invalidated")
             }
         }
         newConnection.resume()
         connection = newConnection
+        connectionID = newConnectionID
 
         return remoteProxy()
     }
@@ -342,15 +385,24 @@ private actor CrashRecoveryWorker {
 #endif
         let currentConnection = connection
         connection = nil
+        connectionID = nil
         currentConnection?.interruptionHandler = nil
         currentConnection?.invalidationHandler = nil
         currentConnection?.invalidate()
     }
 
-    private func handleConnectionLoss(reason: String) async {
+    private func handleConnectionLoss(connectionID lostConnectionID: ObjectIdentifier, reason: String) async {
+        guard connectionID == lostConnectionID else { return }
+
+        await processCurrentConnectionLoss(reason: reason)
+    }
+
+    private func processCurrentConnectionLoss(reason: String) async {
         connection = nil
+        connectionID = nil
 
         guard !suppressReconnect else {
+            reconnectDeferredUntilHangSampleCompletes = false
             Log.info(
                 "[CrashRecovery] Helper connection \(reason) during intentional shutdown",
                 category: .app
@@ -358,11 +410,49 @@ private actor CrashRecoveryWorker {
             return
         }
 
-        guard currentLaunchTarget()?.isAppBundle == true else {
+        if inFlightHangSampleCount > 0 {
+            reconnectDeferredUntilHangSampleCompletes = true
+            Log.warning(
+                "[CrashRecovery] Helper connection \(reason) while hang sample is in flight; deferring re-arm",
+                category: .app
+            )
             return
         }
 
+        guard currentLaunchTarget()?.isAppBundle == true else {
+            reconnectDeferredUntilHangSampleCompletes = false
+            return
+        }
+
+        reconnectDeferredUntilHangSampleCompletes = false
         Log.warning("[CrashRecovery] Helper connection \(reason); attempting to re-arm", category: .app)
+        _ = await armAtLaunch()
+    }
+
+    private func finishHangSampleRequest() -> Bool {
+        if inFlightHangSampleCount > 0 {
+            inFlightHangSampleCount -= 1
+        }
+
+        let shouldReconnect = reconnectDeferredUntilHangSampleCompletes &&
+            inFlightHangSampleCount == 0 &&
+            suppressReconnect == false &&
+            currentLaunchTarget()?.isAppBundle == true
+
+        if inFlightHangSampleCount == 0 {
+            reconnectDeferredUntilHangSampleCompletes = false
+        }
+
+        return shouldReconnect
+    }
+
+    private func rearmAfterDeferredHangSampleLoss() async {
+#if DEBUG
+        if testBundledHelperProxy != nil {
+            _ = await armConnection()
+            return
+        }
+#endif
         _ = await armAtLaunch()
     }
 
@@ -385,14 +475,21 @@ private actor CrashRecoveryWorker {
         testDisconnectSuppressionDefaults = defaults
         testLaunchTarget = launchTarget
         connection = nil
+        connectionID = nil
         armTask = nil
         suppressReconnect = false
         unavailableReason = nil
+        inFlightHangSampleCount = 0
+        reconnectDeferredUntilHangSampleCompletes = false
         disconnectCallCount = 0
     }
 
     func testDisconnectCallCount() -> Int {
         disconnectCallCount
+    }
+
+    func simulateConnectionLossForTesting(reason: String) async {
+        await processCurrentConnectionLoss(reason: reason)
     }
 #endif
 }
@@ -422,7 +519,7 @@ final class CrashRecoveryManager: ObservableObject {
     }
 
     private init(
-        worker: CrashRecoveryWorker = CrashRecoveryWorker(),
+        worker: CrashRecoveryWorker = sharedCrashRecoveryWorker,
         launchSource: CrashRecoverySupport.RelaunchSource? = CrashRecoverySupport.consumeCrashRecoveryLaunchSource()
     ) {
         self.worker = worker
@@ -464,7 +561,21 @@ final class CrashRecoveryManager: ObservableObject {
         userFacingStatus = await worker.retryActivationAfterApprovalChange()
     }
 
-    static func helperAcknowledged(
+    func captureWatchdogHangSample(
+        trigger: String,
+        timeoutMs: UInt64 = watchdogHangSampleTimeoutMs
+    ) async -> String? {
+        await worker.captureWatchdogHangSample(trigger: trigger, timeoutMs: timeoutMs)
+    }
+
+    nonisolated static func captureWatchdogHangSample(
+        trigger: String,
+        timeoutMs: UInt64 = watchdogHangSampleTimeoutMs
+    ) async -> String? {
+        await sharedCrashRecoveryWorker.captureWatchdogHangSample(trigger: trigger, timeoutMs: timeoutMs)
+    }
+
+    nonisolated static func helperAcknowledged(
         _ disposition: CrashRecoverySupport.SessionDisposition,
         via proxy: CrashRecoveryHelperXPCProtocol,
         timeoutMs: UInt64 = 800
@@ -487,15 +598,39 @@ final class CrashRecoveryManager: ObservableObject {
         }
     }
 
-    private static func invoke(
+    nonisolated static func helperWatchdogHangSample(
+        _ trigger: String,
+        via proxy: CrashRecoveryHelperXPCProtocol,
+        timeoutMs: UInt64 = watchdogHangSampleTimeoutMs
+    ) async -> String? {
+        await invoke(timeoutMs: timeoutMs, defaultValue: nil as String?) { reply in
+            proxy.captureWatchdogHangSample(trigger: trigger) { outputPath in
+                reply(outputPath)
+            }
+        }
+    }
+
+    private nonisolated static func invoke(
         timeoutMs: UInt64 = 800,
         _ body: @escaping (@escaping () -> Void) -> Void
     ) async -> Bool {
+        await invoke(timeoutMs: timeoutMs, defaultValue: false as Bool) { reply in
+            body {
+                reply(true)
+            }
+        }
+    }
+
+    private nonisolated static func invoke<T: Sendable>(
+        timeoutMs: UInt64,
+        defaultValue: T,
+        _ body: @escaping (@escaping (T) -> Void) -> Void
+    ) async -> T {
         await withCheckedContinuation { continuation in
             let lock = NSLock()
             var finished = false
 
-            func finish(_ result: Bool) {
+            func finish(_ result: T) {
                 lock.lock()
                 defer { lock.unlock() }
                 guard !finished else { return }
@@ -503,13 +638,11 @@ final class CrashRecoveryManager: ObservableObject {
                 continuation.resume(returning: result)
             }
 
-            body {
-                finish(true)
-            }
+            body { result in finish(result) }
 
             Task {
                 try? await Task.sleep(for: .milliseconds(timeoutMs))
-                finish(false)
+                finish(defaultValue)
             }
         }
     }
@@ -536,6 +669,10 @@ final class CrashRecoveryManager: ObservableObject {
 
     func testDisconnectCallCount() async -> Int {
         await worker.testDisconnectCallCount()
+    }
+
+    func simulateHelperConnectionLossForTesting(reason: String) async {
+        await worker.simulateConnectionLossForTesting(reason: reason)
     }
 #endif
 }

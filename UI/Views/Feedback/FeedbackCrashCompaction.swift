@@ -27,6 +27,10 @@ extension FeedbackService {
                 let body = trimEmptyLines(section.body)
                 guard !body.isEmpty else { continue }
                 sections.append(([section.heading] + body).joined(separator: "\n"))
+            case "HELPER WATCHDOG SAMPLE":
+                if let compacted = compactHelperWatchdogSampleSection(section.body) {
+                    sections.append(([section.heading] + compacted).joined(separator: "\n"))
+                }
             case "MAIN THREAD ACTIVITY":
                 if let compacted = compactEmergencyCrashActivitySection(section.body) {
                     sections.append((["--- MAIN THREAD ACTIVITY (COMPACTED) ---"] + compacted).joined(separator: "\n"))
@@ -441,6 +445,43 @@ extension FeedbackService {
                     compacted.append(contentsOf: compactedSnapshot)
                 }
             }
+        }
+
+        let nonEmptyCompacted = trimEmptyLines(compacted)
+        return nonEmptyCompacted.isEmpty ? nil : nonEmptyCompacted
+    }
+
+    private static func compactHelperWatchdogSampleSection(_ body: [String]) -> [String]? {
+        let trimmedBody = trimEmptyLines(body)
+        guard !trimmedBody.isEmpty else {
+            return nil
+        }
+
+        let compacted = trimmedBody.compactMap { line -> String? in
+            let trimmedLine = line.trimmingCharacters(in: .whitespaces)
+            if trimmedLine == "Binary Images:" {
+                return nil
+            }
+            if trimmedLine.range(of: #"^0x[0-9A-Fa-f]+\s*-\s*0x[0-9A-Fa-f]+"#, options: .regularExpression) != nil {
+                return nil
+            }
+
+            var sanitized = line.replacingOccurrences(
+                of: #"(?:file://)?/(?:[^/\s]+/)*[^/\s]+"#,
+                with: "[redacted-path]",
+                options: .regularExpression
+            )
+            sanitized = sanitized.replacingOccurrences(
+                of: #"^(\s*(?:\+?\d+|\d+)\s+)\S+(\s+0x[0-9A-Fa-f]+.*)$"#,
+                with: "$1[redacted-image]$2",
+                options: .regularExpression
+            )
+            sanitized = sanitized.replacingOccurrences(
+                of: #"\((in|from) [^)]+\)"#,
+                with: "($1 [redacted-image])",
+                options: .regularExpression
+            )
+            return sanitized
         }
 
         let nonEmptyCompacted = trimEmptyLines(compacted)

@@ -67,9 +67,29 @@ rm -rf "$APP_BUNDLE"
 mkdir -p "$APP_BUNDLE/Contents/MacOS"
 mkdir -p "$APP_BUNDLE/Contents/Resources"
 mkdir -p "$APP_BUNDLE/Contents/Frameworks"
+mkdir -p "$APP_BUNDLE/Contents/Library/Helpers"
+mkdir -p "$APP_BUNDLE/Contents/Library/LaunchAgents"
 
 # Copy executable
 cp "$BUILD_DIR/Retrace" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
+
+# Copy bundled crash recovery helper assets used by the app's launch agent flow.
+CRASH_RECOVERY_HELPER="$BUILD_DIR/RetraceCrashRecoveryHelper"
+CRASH_RECOVERY_PLIST="UI/LaunchAgents/io.retrace.app.crash-recovery.plist"
+
+if [ ! -f "$CRASH_RECOVERY_HELPER" ]; then
+    echo "❌ Crash recovery helper not found at $CRASH_RECOVERY_HELPER"
+    exit 1
+fi
+
+if [ ! -f "$CRASH_RECOVERY_PLIST" ]; then
+    echo "❌ Crash recovery launch agent plist not found at $CRASH_RECOVERY_PLIST"
+    exit 1
+fi
+
+cp "$CRASH_RECOVERY_HELPER" "$APP_BUNDLE/Contents/Library/Helpers/RetraceCrashRecoveryHelper"
+cp "$CRASH_RECOVERY_PLIST" \
+    "$APP_BUNDLE/Contents/Library/LaunchAgents/io.retrace.app.crash-recovery.plist"
 
 # Add rpath so the app finds embedded frameworks when run from .app bundle
 install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP_BUNDLE/Contents/MacOS/$APP_NAME" 2>/dev/null || true
@@ -119,6 +139,11 @@ echo "✍️  Signing app bundle..."
 for fw in "$APP_BUNDLE/Contents/Frameworks/"*.framework; do
     [ -d "$fw" ] && codesign --force --sign - "$fw"
 done
+
+# Sign nested helper executables before the containing app.
+if [ -f "$APP_BUNDLE/Contents/Library/Helpers/RetraceCrashRecoveryHelper" ]; then
+    codesign --force --sign - "$APP_BUNDLE/Contents/Library/Helpers/RetraceCrashRecoveryHelper"
+fi
 
 # Sign the app bundle with ad-hoc signature and entitlements
 codesign --force --deep --sign - --entitlements "UI/Retrace.entitlements" "$APP_BUNDLE"

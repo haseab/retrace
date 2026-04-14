@@ -38,7 +38,12 @@ public enum EmergencyDiagnostics {
     /// - Parameter trigger: A short label describing what triggered the capture (e.g. "triple_escape", "hang_detected")
     /// - Returns: The file path of the written report, or nil on failure.
     @discardableResult
-    public static func capture(trigger: String) -> String? {
+    public static func capture(
+        trigger: String,
+        supplementalReportPaths: [String] = [],
+        cleanupSupplementalReports: Bool = false,
+        directory: String? = nil
+    ) -> String? {
         let timestamp = currentTimestamp()
 
         var report = ""
@@ -70,7 +75,12 @@ public enum EmergencyDiagnostics {
         report += Thread.callStackSymbols.joined(separator: "\n")
         report += "\n"
 
-        return writeReport(trigger: trigger, body: report, timestamp: timestamp)
+        report += appendSupplementalReports(
+            atPaths: supplementalReportPaths,
+            cleanupAfterRead: cleanupSupplementalReports
+        )
+
+        return writeReport(trigger: trigger, body: report, timestamp: timestamp, directory: directory)
     }
 
     /// Write a caller-provided emergency report into the shared crash report directory.
@@ -308,6 +318,39 @@ public enum EmergencyDiagnostics {
     }
 
     // MARK: - Helpers
+
+    private static func appendSupplementalReports(
+        atPaths paths: [String],
+        cleanupAfterRead: Bool
+    ) -> String {
+        guard !paths.isEmpty else { return "" }
+
+        var merged = ""
+        let fileManager = FileManager.default
+
+        for path in paths where !path.isEmpty {
+            defer {
+                if cleanupAfterRead {
+                    try? fileManager.removeItem(atPath: path)
+                }
+            }
+
+            guard let contents = try? String(contentsOfFile: path, encoding: .utf8),
+                  !contents.isEmpty else {
+                merged += "\n--- HELPER WATCHDOG SAMPLE ---\n"
+                merged += "(Helper watchdog sample artifact was unavailable)\n"
+                continue
+            }
+
+            merged += "\n--- HELPER WATCHDOG SAMPLE ---\n"
+            merged += contents
+            if !contents.hasSuffix("\n") {
+                merged += "\n"
+            }
+        }
+
+        return merged
+    }
 
     private static func currentTimestamp() -> String {
         let now = Date()
