@@ -299,8 +299,25 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Check if another instance is already running. Relaunches still need to
         // reacquire the lock during handoff, but fresh launches should decide immediately.
         let isRelaunch = UserDefaults.standard.bool(forKey: "isRelaunching")
+        let restartDebuggingSession = CrashRecoverySupport.beginRestartDebuggingSession()
+        let launchTargetDescription: String
+        switch CrashRecoverySupport.currentLaunchTarget() {
+        case .appBundle(let url):
+            launchTargetDescription = "appBundle(\(url.path))"
+        case .executable(let url):
+            launchTargetDescription = "executable(\(url.path))"
+        case nil:
+            launchTargetDescription = "nil"
+        }
+        Log.info(
+            CrashRecoverySupport.restartDebuggingTagged("[AppDelegate] applicationDidFinishLaunching mode=\(isRelaunch ? "relaunch" : "fresh") launchedFromCrashRecovery=\(CrashRecoveryManager.shared.launchedFromCrashRecovery) crashRecoverySource=\(CrashRecoveryManager.shared.recoveryLaunchSource?.rawValue ?? "nil") launchTarget=\(launchTargetDescription) uptimeS=\(Int(ProcessInfo.processInfo.systemUptime.rounded())) reusedPendingSession=\(restartDebuggingSession.reusedPendingSession)"),
+            category: .app
+        )
         if isRelaunch {
-            Log.info("[AppDelegate] App relaunched successfully", category: .app)
+            Log.info(
+                CrashRecoverySupport.restartDebuggingTagged("[AppDelegate] App relaunched successfully"),
+                category: .app
+            )
             UserDefaults.standard.removeObject(forKey: "isRelaunching")
             Task { @MainActor in
                 let singleInstanceLockResult = await self.acquireSingleInstanceLock(
@@ -984,6 +1001,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         isTerminationFlushInProgress = true
         Self.isApplicationTerminating = true
+        let pendingRestartDebuggingSession = CrashRecoverySupport.markRestartDebuggingPendingForNextLaunch()
+        Log.info(
+            CrashRecoverySupport.restartDebuggingTagged("[AppDelegate] Beginning termination flush launchedFromCrashRecovery=\(CrashRecoveryManager.shared.launchedFromCrashRecovery) crashRecoverySource=\(CrashRecoveryManager.shared.recoveryLaunchSource?.rawValue ?? "nil") pendingSession=\(pendingRestartDebuggingSession)"),
+            category: .app
+        )
 
         // Save timeline state (filters, search) for cross-session persistence.
         TimelineWindowController.shared.saveStateForTermination()

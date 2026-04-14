@@ -5,6 +5,10 @@ import Shared
 
 /// Utility for relaunching the app
 enum AppRelaunch {
+    private static func tagged(_ message: String) -> String {
+        CrashRecoverySupport.restartDebuggingTagged(message)
+    }
+
     private static let applicationsPath = "/Applications/Retrace.app"
     private static let terminalApplicationName = "Terminal"
 
@@ -101,8 +105,9 @@ enum AppRelaunch {
     ) {
         let normalizedPath = path.trimmingCharacters(in: .whitespacesAndNewlines)
         let launchMode = launchMode(forPath: normalizedPath)
+        let pendingRestartDebuggingSession = CrashRecoverySupport.markRestartDebuggingPendingForNextLaunch()
         Log.info(
-            "[AppRelaunch] Relaunching from: \(normalizedPath) mode=\(launchMode.rawValue) crashRecovery=\(markAsCrashRecovery)",
+            tagged("[AppRelaunch] Relaunching from: \(normalizedPath) mode=\(launchMode.rawValue) crashRecovery=\(markAsCrashRecovery) pendingSession=\(pendingRestartDebuggingSession)"),
             category: .app
         )
 
@@ -123,7 +128,7 @@ enum AppRelaunch {
             )
         } catch {
             Log.error(
-                "[AppRelaunch] Failed to prepare launch target for \(normalizedPath): \(error)",
+                tagged("[AppRelaunch] Failed to prepare launch target for \(normalizedPath): \(error)"),
                 category: .app
             )
             UserDefaults.standard.removeObject(forKey: "isRelaunching")
@@ -137,7 +142,7 @@ enum AppRelaunch {
                 let helperPrepared = await CrashRecoveryManager.shared
                     .requestIntentionalRelaunch(targetAppPath: normalizedPath)
                 if helperPrepared {
-                    Log.info("[AppRelaunch] Relaunch handed off to crash recovery helper", category: .app)
+                    Log.info(tagged("[AppRelaunch] Relaunch handed off to crash recovery helper"), category: .app)
                     Darwin.exit(0)
                 } else {
                     fallbackShellRelaunch(
@@ -305,7 +310,7 @@ enum AppRelaunch {
 
         do {
             try task.run()
-            Log.info("[AppRelaunch] Terminating for relaunch via shell fallback", category: .app)
+            Log.info(tagged("[AppRelaunch] Terminating for relaunch via shell fallback"), category: .app)
             Darwin.exit(0)
         } catch {
             if preparedHelperSuppression {
@@ -314,7 +319,7 @@ enum AppRelaunch {
             if markAsCrashRecovery {
                 _ = CrashRecoverySupport.clearPendingCrashRecoveryLaunchSource()
             }
-            Log.error("[AppRelaunch] Failed to start fallback launch script: \(error)", category: .app)
+            Log.error(tagged("[AppRelaunch] Failed to start fallback launch script: \(error)"), category: .app)
             UserDefaults.standard.removeObject(forKey: "isRelaunching")
         }
     }

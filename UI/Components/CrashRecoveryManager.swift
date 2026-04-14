@@ -9,7 +9,71 @@ private let sharedCrashRecoveryWorker = CrashRecoveryWorker()
 // if the helper never replies. Leave a small buffer above the helper's sample timeout.
 private let watchdogHangSampleTimeoutMs: UInt64 = 6_000
 
+private func crashRecoveryServiceStatusDescription(_ status: SMAppService.Status) -> String {
+    switch status {
+    case .enabled:
+        return "enabled"
+    case .requiresApproval:
+        return "requiresApproval"
+    case .notRegistered:
+        return "notRegistered"
+    case .notFound:
+        return "notFound"
+    @unknown default:
+        return "unknown"
+    }
+}
+
+private func crashRecoveryLaunchTargetDescription(
+    _ target: CrashRecoverySupport.LaunchTarget?
+) -> String {
+    guard let target else { return "nil" }
+
+    switch target {
+    case .appBundle(let url):
+        return "appBundle(\(url.path))"
+    case .executable(let url):
+        return "executable(\(url.path))"
+    }
+}
+
+private func crashRecoveryUnavailableReasonDescription(
+    _ reason: CrashRecoverySupport.Status.UnavailableReason?
+) -> String {
+    guard let reason else { return "nil" }
+
+    switch reason {
+    case .registrationFailed:
+        return "registrationFailed"
+    case .helperArmFailed:
+        return "helperArmFailed"
+    }
+}
+
+private func crashRecoverySessionDispositionDescription(
+    _ disposition: CrashRecoverySupport.SessionDisposition
+) -> String {
+    switch disposition {
+    case .idle:
+        return "idle"
+    case .armed:
+        return "armed"
+    case .expectedExit:
+        return "expectedExit"
+    case .relaunch(let targetAppPath):
+        return "relaunch(\(targetAppPath ?? "nil"))"
+    }
+}
+
+private func crashRecoveryTagged(_ message: String) -> String {
+    CrashRecoverySupport.restartDebuggingTagged(message)
+}
+
 private actor CrashRecoveryWorker {
+    private static let armRetryAttempts = 12
+    private static let armRetryDelayMs: UInt64 = 5_000
+    private static let armAcknowledgementTimeoutMs: UInt64 = 800
+
     private let service = SMAppService.agent(plistName: CrashRecoverySupport.launchAgentPlistName)
     private var connection: NSXPCConnection?
     private var connectionID: ObjectIdentifier?
@@ -18,11 +82,16 @@ private actor CrashRecoveryWorker {
     private var unavailableReason: CrashRecoverySupport.Status.UnavailableReason?
     private var inFlightHangSampleCount = 0
     private var reconnectDeferredUntilHangSampleCompletes = false
+    private var lastHelperXPCErrorSummary: String?
+    private var lastHelperXPCErrorAt: Date?
 
 #if DEBUG
     private var testBundledHelperProxy: CrashRecoveryHelperXPCProtocol?
     private var testDisconnectSuppressionDefaults: UserDefaults?
     private var testLaunchTarget: CrashRecoverySupport.LaunchTarget?
+    private var testArmRetryAttempts: Int?
+    private var testArmRetryDelayMs: UInt64?
+    private var testArmAcknowledgementTimeoutMs: UInt64?
     private var disconnectCallCount = 0
 #endif
 
@@ -35,9 +104,15 @@ private actor CrashRecoveryWorker {
     }
 
     func armAtLaunch() async -> CrashRecoverySupport.Status {
-        guard let launchTarget = currentLaunchTarget(), launchTarget.isAppBundle else {
+        let launchTarget = currentLaunchTarget()
+        Log.info(
+            crashRecoveryTagged("[CrashRecovery] armAtLaunch launchTarget=\(crashRecoveryLaunchTargetDescription(launchTarget)) serviceStatus=\(crashRecoveryServiceStatusDescription(service.status)) retryAttempts=\(configuredArmRetryAttempts) retryDelayMs=\(configuredArmRetryDelayMs) ackTimeoutMs=\(configuredArmAcknowledgementTimeoutMs) uptimeS=\(Int(ProcessInfo.processInfo.systemUptime.rounded()))"),
+            category: .app
+        )
+
+        guard let launchTarget, launchTarget.isAppBundle else {
             Log.info(
-                "[CrashRecovery] Skipping launch-agent arm because the current launch target is not an app bundle",
+                crashRecoveryTagged("[CrashRecovery] Skipping launch-agent arm because the current launch target is not an app bundle"),
                 category: .app
             )
             disconnect()
@@ -51,11 +126,12 @@ private actor CrashRecoveryWorker {
     }
 
     func prepareForExpectedExit() async -> CrashRecoverySupport.Status {
-        if let armTask {
-            _ = await armTask.value
-        }
-
+        Log.info(
+            crashRecoveryTagged("[CrashRecovery] prepareForExpectedExit launchTarget=\(crashRecoveryLaunchTargetDescription(currentLaunchTarget())) serviceStatus=\(crashRecoveryServiceStatusDescription(service.status)) hasConnection=\(connection != nil) suppressReconnect=\(suppressReconnect)"),
+            category: .app
+        )
         suppressReconnect = true
+        cancelInFlightArmSequence()
 
         guard currentLaunchTarget()?.isAppBundle == true else {
             return refreshStatus()
@@ -66,10 +142,17 @@ private actor CrashRecoveryWorker {
             return refreshStatus()
         }
 
-        let acknowledged = await CrashRecoveryManager.helperAcknowledged(.expectedExit, via: proxy)
+        let acknowledgementStart = Date()
+        clearRecentHelperXPCError()
+        let disposition: CrashRecoverySupport.SessionDisposition = .expectedExit
+        let acknowledged = await CrashRecoveryManager.helperAcknowledged(disposition, via: proxy)
+        Log.info(
+            crashRecoveryTagged("[CrashRecovery] Expected-exit handoff acknowledged=\(acknowledged) serviceStatus=\(crashRecoveryServiceStatusDescription(service.status)) failureReason=\(helperAckFailureReason(since: acknowledgementStart))"),
+            category: .app
+        )
         guard acknowledged else {
             Log.warning(
-                "[CrashRecovery] Helper did not acknowledge expected-exit handoff; installing disconnect suppression",
+                crashRecoveryTagged("[CrashRecovery] Helper did not acknowledge expected-exit handoff; installing disconnect suppression"),
                 category: .app
             )
             _ = storeDisconnectSuppression()
@@ -82,11 +165,12 @@ private actor CrashRecoveryWorker {
     func requestIntentionalRelaunch(
         targetAppPath: String? = nil
     ) async -> (acknowledged: Bool, status: CrashRecoverySupport.Status) {
-        if let armTask {
-            _ = await armTask.value
-        }
-
+        Log.info(
+            crashRecoveryTagged("[CrashRecovery] requestIntentionalRelaunch targetAppPath=\(targetAppPath ?? "nil") launchTarget=\(crashRecoveryLaunchTargetDescription(currentLaunchTarget())) serviceStatus=\(crashRecoveryServiceStatusDescription(service.status))"),
+            category: .app
+        )
         suppressReconnect = true
+        cancelInFlightArmSequence()
 
         guard currentLaunchTarget()?.isAppBundle == true else {
             let status = refreshStatus()
@@ -98,12 +182,18 @@ private actor CrashRecoveryWorker {
             return (acknowledged: false, status: status)
         }
 
+        let acknowledgementStart = Date()
+        clearRecentHelperXPCError()
+        let disposition = CrashRecoverySupport.SessionDisposition.relaunch(targetAppPath)
         let acknowledged = await CrashRecoveryManager.helperAcknowledged(
-            .relaunch(targetAppPath),
+            disposition,
             via: proxy
         )
         if !acknowledged {
-            Log.warning("[CrashRecovery] Helper did not acknowledge relaunch handoff", category: .app)
+            Log.warning(
+                crashRecoveryTagged("[CrashRecovery] Helper did not acknowledge relaunch handoff failureReason=\(helperAckFailureReason(since: acknowledgementStart))"),
+                category: .app
+            )
         }
 
         return (acknowledged: acknowledged, status: refreshStatus())
@@ -142,22 +232,19 @@ private actor CrashRecoveryWorker {
     }
 
     func retryActivationAfterApprovalChange() async -> CrashRecoverySupport.Status {
-        if let armTask {
-            _ = await armTask.value
-        }
-
         guard let launchTarget = currentLaunchTarget(), launchTarget.isAppBundle else {
             return refreshStatus()
         }
 
         guard refreshStatus() != .requiresApproval else {
             Log.info(
-                "[CrashRecovery] Retry skipped because launch agent approval is still pending",
+                crashRecoveryTagged("[CrashRecovery] Retry skipped because launch agent approval is still pending"),
                 category: .app
             )
             return refreshStatus()
         }
 
+        cancelInFlightArmSequence()
         disconnect()
         suppressReconnect = false
         unavailableReason = nil
@@ -181,49 +268,94 @@ private actor CrashRecoveryWorker {
     private func performArmSequence(
         for launchTarget: CrashRecoverySupport.LaunchTarget
     ) async -> CrashRecoverySupport.Status {
+        Log.info(
+            crashRecoveryTagged("[CrashRecovery] Starting arm sequence launchTarget=\(crashRecoveryLaunchTargetDescription(launchTarget)) serviceStatus=\(crashRecoveryServiceStatusDescription(service.status)) unavailableReason=\(crashRecoveryUnavailableReasonDescription(unavailableReason))"),
+            category: .app
+        )
         do {
             try ensureServiceRegistered(for: launchTarget)
         } catch {
             unavailableReason = .registrationFailed
-            Log.error("[CrashRecovery] Failed to register launch agent: \(error)", category: .app)
+            Log.error(crashRecoveryTagged("[CrashRecovery] Failed to register launch agent: \(error)"), category: .app)
             return refreshStatus()
         }
 
-        var armed = await armConnection()
-        if !armed,
-           CrashRecoverySupport.shouldAttemptRegistrationRecoveryAfterArmFailure(
-               serviceStatus: service.status
-           ) {
+        let retryAttempts = max(1, configuredArmRetryAttempts)
+        let retryDelayMs = configuredArmRetryDelayMs
+        var attemptedRegistrationRefresh = false
+
+        for attempt in 1...retryAttempts {
+            Log.info(
+                crashRecoveryTagged("[CrashRecovery] Arm attempt \(attempt)/\(retryAttempts) begin serviceStatus=\(crashRecoveryServiceStatusDescription(service.status)) hasConnection=\(connection != nil) attemptedRegistrationRefresh=\(attemptedRegistrationRefresh)"),
+                category: .app
+            )
+            let armed = await armConnection(timeoutMs: configuredArmAcknowledgementTimeoutMs)
+            Log.info(
+                crashRecoveryTagged("[CrashRecovery] Arm attempt \(attempt)/\(retryAttempts) end acknowledged=\(armed) serviceStatus=\(crashRecoveryServiceStatusDescription(service.status))"),
+                category: .app
+            )
+            if Task.isCancelled {
+                disconnect()
+                unavailableReason = nil
+                return refreshStatus()
+            }
+
+            if armed {
+                unavailableReason = nil
+                _ = clearDisconnectSuppressionAfterSuccessfulArm()
+                if attempt > 1 {
+                    Log.info(
+                        crashRecoveryTagged("[CrashRecovery] Crash recovery helper armed via launch agent after \(attempt) attempts"),
+                        category: .app
+                    )
+                } else {
+                    Log.info(crashRecoveryTagged("[CrashRecovery] Crash recovery helper armed via launch agent"), category: .app)
+                }
+                return refreshStatus()
+            }
+
+            if !attemptedRegistrationRefresh,
+               CrashRecoverySupport.shouldAttemptRegistrationRecoveryAfterArmFailure(
+                   serviceStatus: service.status
+               ) {
+                attemptedRegistrationRefresh = true
+                Log.warning(
+                    crashRecoveryTagged("[CrashRecovery] Initial helper arm failed; refreshing launch agent registration"),
+                    category: .app
+                )
+
+                do {
+                    try forceServiceRegistrationRefresh(for: launchTarget)
+                } catch {
+                    disconnect()
+                    unavailableReason = .registrationFailed
+                    Log.error(
+                        crashRecoveryTagged("[CrashRecovery] Failed to refresh launch agent registration: \(error)"),
+                        category: .app
+                    )
+                    return refreshStatus()
+                }
+            }
+
+            disconnect()
+            guard attempt < retryAttempts else { break }
+
             Log.warning(
-                "[CrashRecovery] Initial helper arm failed; refreshing launch agent registration",
+                crashRecoveryTagged("[CrashRecovery] Helper arm attempt \(attempt) failed; retrying in \(retryDelayMs) ms"),
                 category: .app
             )
 
             do {
-                try forceServiceRegistrationRefresh(for: launchTarget)
-                disconnect()
-                armed = await armConnection()
+                try await Task.sleep(for: .milliseconds(Int64(retryDelayMs)), clock: .continuous)
             } catch {
-                disconnect()
-                unavailableReason = .registrationFailed
-                Log.error(
-                    "[CrashRecovery] Failed to refresh launch agent registration: \(error)",
-                    category: .app
-                )
+                unavailableReason = nil
                 return refreshStatus()
             }
         }
 
-        if armed {
-            unavailableReason = nil
-            _ = clearDisconnectSuppressionAfterSuccessfulArm()
-            Log.info("[CrashRecovery] Crash recovery helper armed via launch agent", category: .app)
-            return refreshStatus()
-        }
-
         disconnect()
         unavailableReason = .helperArmFailed
-        Log.error("[CrashRecovery] Failed to arm crash recovery helper via launch agent", category: .app)
+        Log.error(crashRecoveryTagged("[CrashRecovery] Failed to arm crash recovery helper via launch agent"), category: .app)
         return refreshStatus()
     }
 
@@ -242,6 +374,10 @@ private actor CrashRecoveryWorker {
             currentLaunchTargetPath: currentLaunchTargetPath,
             status: service.status
         )
+        Log.info(
+            crashRecoveryTagged("[CrashRecovery] ensureServiceRegistered serviceStatus=\(crashRecoveryServiceStatusDescription(service.status)) needsRefresh=\(needsRefresh) storedBuild=\(storedBuild ?? "nil") currentBuild=\(currentBuild) storedLaunchTargetPath=\(storedLaunchTargetPath ?? "nil") currentLaunchTargetPath=\(currentLaunchTargetPath)"),
+            category: .app
+        )
 
         if needsRefresh {
             if service.status == .enabled || service.status == .requiresApproval {
@@ -249,7 +385,7 @@ private actor CrashRecoveryWorker {
                     try service.unregister()
                 } catch {
                     Log.warning(
-                        "[CrashRecovery] Ignoring unregister failure during refresh: \(error)",
+                        crashRecoveryTagged("[CrashRecovery] Ignoring unregister failure during refresh: \(error)"),
                         category: .app
                     )
                 }
@@ -257,6 +393,10 @@ private actor CrashRecoveryWorker {
 
             do {
                 try service.register()
+                Log.info(
+                    crashRecoveryTagged("[CrashRecovery] Launch agent register succeeded serviceStatus=\(crashRecoveryServiceStatusDescription(service.status)) launchTarget=\(currentLaunchTargetPath)"),
+                    category: .app
+                )
                 defaults.set(currentBuild, forKey: CrashRecoverySupport.registeredBuildKey)
                 defaults.set(
                     currentLaunchTargetPath,
@@ -264,6 +404,10 @@ private actor CrashRecoveryWorker {
                 )
             } catch {
                 if service.status == .enabled || service.status == .requiresApproval {
+                    Log.warning(
+                        crashRecoveryTagged("[CrashRecovery] Launch agent register threw but service status is \(crashRecoveryServiceStatusDescription(service.status)); preserving registration metadata"),
+                        category: .app
+                    )
                     defaults.set(currentBuild, forKey: CrashRecoverySupport.registeredBuildKey)
                     defaults.set(
                         currentLaunchTargetPath,
@@ -277,19 +421,38 @@ private actor CrashRecoveryWorker {
 
         if service.status == .requiresApproval {
             Log.warning(
-                "[CrashRecovery] Launch agent requires approval in System Settings",
+                crashRecoveryTagged("[CrashRecovery] Launch agent requires approval in System Settings"),
                 category: .app
             )
         }
     }
 
-    private func armConnection() async -> Bool {
+    private func armConnection(timeoutMs: UInt64) async -> Bool {
         suppressReconnect = false
+        let acknowledgementStart = Date()
+        clearRecentHelperXPCError()
+        Log.info(
+            crashRecoveryTagged("[CrashRecovery] armConnection begin timeoutMs=\(timeoutMs) serviceStatus=\(crashRecoveryServiceStatusDescription(service.status)) hasConnection=\(connection != nil)"),
+            category: .app
+        )
         guard let proxy = ensureProxyConnection() else {
+            Log.warning(
+                crashRecoveryTagged("[CrashRecovery] armConnection failed before acknowledgement because helper proxy was unavailable"),
+                category: .app
+            )
             return false
         }
 
-        return await CrashRecoveryManager.helperAcknowledged(.armed, via: proxy)
+        let acknowledged = await CrashRecoveryManager.helperAcknowledged(
+            .armed,
+            via: proxy,
+            timeoutMs: timeoutMs
+        )
+        Log.info(
+            crashRecoveryTagged("[CrashRecovery] armConnection end acknowledged=\(acknowledged) serviceStatus=\(crashRecoveryServiceStatusDescription(service.status)) failureReason=\(helperAckFailureReason(since: acknowledgementStart))"),
+            category: .app
+        )
+        return acknowledged
     }
 
     private func forceServiceRegistrationRefresh(
@@ -298,19 +461,27 @@ private actor CrashRecoveryWorker {
         let defaults = UserDefaults.standard
         let currentBuild = CrashRecoverySupport.currentBuildIdentifier()
         let currentLaunchTargetPath = launchTarget.path
+        Log.warning(
+            crashRecoveryTagged("[CrashRecovery] Forcing launch agent registration refresh serviceStatus=\(crashRecoveryServiceStatusDescription(service.status)) currentBuild=\(currentBuild) launchTarget=\(currentLaunchTargetPath)"),
+            category: .app
+        )
 
         if service.status == .enabled || service.status == .requiresApproval {
             do {
                 try service.unregister()
             } catch {
                 Log.warning(
-                    "[CrashRecovery] Ignoring unregister failure during forced refresh: \(error)",
+                    crashRecoveryTagged("[CrashRecovery] Ignoring unregister failure during forced refresh: \(error)"),
                     category: .app
                 )
             }
         }
 
         try service.register()
+        Log.info(
+            crashRecoveryTagged("[CrashRecovery] Forced launch agent registration succeeded serviceStatus=\(crashRecoveryServiceStatusDescription(service.status)) launchTarget=\(currentLaunchTargetPath)"),
+            category: .app
+        )
         defaults.set(currentBuild, forKey: CrashRecoverySupport.registeredBuildKey)
         defaults.set(
             currentLaunchTargetPath,
@@ -343,9 +514,17 @@ private actor CrashRecoveryWorker {
         }
 #endif
         if let proxy = remoteProxy() {
+            Log.debug(
+                crashRecoveryTagged("[CrashRecovery] Reusing existing helper XPC connection serviceStatus=\(crashRecoveryServiceStatusDescription(service.status))"),
+                category: .app
+            )
             return proxy
         }
 
+        Log.info(
+            crashRecoveryTagged("[CrashRecovery] Creating helper XPC connection machService=\(CrashRecoverySupport.machServiceName) serviceStatus=\(crashRecoveryServiceStatusDescription(service.status))"),
+            category: .app
+        )
         let newConnection = NSXPCConnection(
             machServiceName: CrashRecoverySupport.machServiceName,
             options: []
@@ -367,6 +546,10 @@ private actor CrashRecoveryWorker {
         newConnection.resume()
         connection = newConnection
         connectionID = newConnectionID
+        Log.info(
+            crashRecoveryTagged("[CrashRecovery] Helper XPC connection resumed machService=\(CrashRecoverySupport.machServiceName)"),
+            category: .app
+        )
 
         return remoteProxy()
     }
@@ -375,7 +558,9 @@ private actor CrashRecoveryWorker {
         guard let connection else { return nil }
 
         return connection.remoteObjectProxyWithErrorHandler { error in
-            Log.error("[CrashRecovery] Helper XPC error: \(error)", category: .app)
+            Task {
+                await self.recordHelperXPCError(error)
+            }
         } as? CrashRecoveryHelperXPCProtocol
     }
 
@@ -391,6 +576,12 @@ private actor CrashRecoveryWorker {
         currentConnection?.invalidate()
     }
 
+    private func cancelInFlightArmSequence() {
+        let currentArmTask = armTask
+        armTask = nil
+        currentArmTask?.cancel()
+    }
+
     private func handleConnectionLoss(connectionID lostConnectionID: ObjectIdentifier, reason: String) async {
         guard connectionID == lostConnectionID else { return }
 
@@ -400,11 +591,15 @@ private actor CrashRecoveryWorker {
     private func processCurrentConnectionLoss(reason: String) async {
         connection = nil
         connectionID = nil
+        Log.warning(
+            crashRecoveryTagged("[CrashRecovery] Helper connection loss reason=\(reason) suppressReconnect=\(suppressReconnect) launchTarget=\(crashRecoveryLaunchTargetDescription(currentLaunchTarget())) serviceStatus=\(crashRecoveryServiceStatusDescription(service.status)) armTaskInFlight=\(armTask != nil)"),
+            category: .app
+        )
 
         guard !suppressReconnect else {
             reconnectDeferredUntilHangSampleCompletes = false
             Log.info(
-                "[CrashRecovery] Helper connection \(reason) during intentional shutdown",
+                crashRecoveryTagged("[CrashRecovery] Helper connection \(reason) during intentional shutdown"),
                 category: .app
             )
             return
@@ -419,13 +614,15 @@ private actor CrashRecoveryWorker {
             return
         }
 
+        reconnectDeferredUntilHangSampleCompletes = false
         guard currentLaunchTarget()?.isAppBundle == true else {
-            reconnectDeferredUntilHangSampleCompletes = false
             return
         }
 
-        reconnectDeferredUntilHangSampleCompletes = false
-        Log.warning("[CrashRecovery] Helper connection \(reason); attempting to re-arm", category: .app)
+        Log.warning(
+            crashRecoveryTagged("[CrashRecovery] Helper connection \(reason); attempting to re-arm"),
+            category: .app
+        )
         _ = await armAtLaunch()
     }
 
@@ -449,13 +646,33 @@ private actor CrashRecoveryWorker {
     private func rearmAfterDeferredHangSampleLoss() async {
 #if DEBUG
         if testBundledHelperProxy != nil {
-            _ = await armConnection()
+            _ = await armConnection(timeoutMs: configuredArmAcknowledgementTimeoutMs)
             return
         }
 #endif
         _ = await armAtLaunch()
     }
 
+    private func recordHelperXPCError(_ error: Error) async {
+        let summary = error.localizedDescription
+        lastHelperXPCErrorSummary = summary
+        lastHelperXPCErrorAt = Date()
+        Log.error(crashRecoveryTagged("[CrashRecovery] Helper XPC error: \(error)"), category: .app)
+    }
+
+    private func clearRecentHelperXPCError() {
+        lastHelperXPCErrorSummary = nil
+        lastHelperXPCErrorAt = nil
+    }
+
+    private func helperAckFailureReason(since startDate: Date) -> String {
+        guard let lastHelperXPCErrorAt,
+              lastHelperXPCErrorAt >= startDate else {
+            return "timeout_waiting_for_reply"
+        }
+
+        return "recent_xpc_error(\(lastHelperXPCErrorSummary ?? "unknown"))"
+    }
     private func currentLaunchTarget() -> CrashRecoverySupport.LaunchTarget? {
 #if DEBUG
         if let testLaunchTarget {
@@ -465,15 +682,45 @@ private actor CrashRecoveryWorker {
         return CrashRecoverySupport.currentLaunchTarget()
     }
 
+    private var configuredArmRetryAttempts: Int {
+#if DEBUG
+        max(1, testArmRetryAttempts ?? Self.armRetryAttempts)
+#else
+        Self.armRetryAttempts
+#endif
+    }
+
+    private var configuredArmRetryDelayMs: UInt64 {
+#if DEBUG
+        testArmRetryDelayMs ?? Self.armRetryDelayMs
+#else
+        Self.armRetryDelayMs
+#endif
+    }
+
+    private var configuredArmAcknowledgementTimeoutMs: UInt64 {
+#if DEBUG
+        testArmAcknowledgementTimeoutMs ?? Self.armAcknowledgementTimeoutMs
+#else
+        Self.armAcknowledgementTimeoutMs
+#endif
+    }
+
 #if DEBUG
     func configureForTesting(
         proxy: CrashRecoveryHelperXPCProtocol,
         defaults: UserDefaults? = nil,
-        launchTarget: CrashRecoverySupport.LaunchTarget
+        launchTarget: CrashRecoverySupport.LaunchTarget,
+        armRetryAttempts: Int? = nil,
+        armRetryDelayMs: UInt64? = nil,
+        armAcknowledgementTimeoutMs: UInt64? = nil
     ) {
         testBundledHelperProxy = proxy
         testDisconnectSuppressionDefaults = defaults
         testLaunchTarget = launchTarget
+        testArmRetryAttempts = armRetryAttempts
+        testArmRetryDelayMs = armRetryDelayMs
+        testArmAcknowledgementTimeoutMs = armAcknowledgementTimeoutMs
         connection = nil
         connectionID = nil
         armTask = nil
@@ -481,6 +728,8 @@ private actor CrashRecoveryWorker {
         unavailableReason = nil
         inFlightHangSampleCount = 0
         reconnectDeferredUntilHangSampleCompletes = false
+        lastHelperXPCErrorSummary = nil
+        lastHelperXPCErrorAt = nil
         disconnectCallCount = 0
     }
 
@@ -536,6 +785,10 @@ final class CrashRecoveryManager: ObservableObject {
     func armAtLaunch() {
         Task { @MainActor [weak self] in
             guard let self else { return }
+            Log.info(
+                crashRecoveryTagged("[CrashRecovery] App-side armAtLaunch launchedFromCrashRecovery=\(self.launchedFromCrashRecovery) source=\(self.launchSource?.rawValue ?? "nil") initialUserFacingStatus=\(String(describing: self.userFacingStatus))"),
+                category: .app
+            )
             self.userFacingStatus = await self.worker.armAtLaunch()
         }
     }
@@ -584,7 +837,7 @@ final class CrashRecoveryManager: ObservableObject {
             return false
         }
 
-        return await invoke(timeoutMs: timeoutMs) { reply in
+        let acknowledged = await invoke(timeoutMs: timeoutMs) { reply in
             switch disposition {
             case .idle:
                 reply()
@@ -596,6 +849,13 @@ final class CrashRecoveryManager: ObservableObject {
                 proxy.prepareForRelaunch(targetAppPath: targetAppPath, reply: reply)
             }
         }
+        if !acknowledged {
+            Log.warning(
+                crashRecoveryTagged("[CrashRecovery] Helper acknowledgement timed out disposition=\(crashRecoverySessionDispositionDescription(disposition)) timeoutMs=\(timeoutMs)"),
+                category: .app
+            )
+        }
+        return acknowledged
     }
 
     nonisolated static func helperWatchdogHangSample(

@@ -1,9 +1,40 @@
 import CrashRecoverySupport
+import Darwin
 import Dispatch
 import Foundation
 import OSLog
 
 private let helperLogger = Logger(subsystem: "io.retrace.app", category: "CrashRecoveryHelper")
+
+private func helperDispositionDescription(_ disposition: CrashRecoverySupport.SessionDisposition) -> String {
+    switch disposition {
+    case .idle:
+        return "idle"
+    case .armed:
+        return "armed"
+    case .expectedExit:
+        return "expectedExit"
+    case .relaunch(let targetAppPath):
+        return "relaunch(\(targetAppPath ?? "nil"))"
+    }
+}
+
+private func helperDisconnectSuppressionDescription(
+    _ snapshot: CrashRecoverySupport.DisconnectSuppressionSnapshot
+) -> String {
+    let ageDescription: String
+    if let ageSeconds = snapshot.ageSeconds {
+        ageDescription = String(format: "%.3f", ageSeconds)
+    } else {
+        ageDescription = "nil"
+    }
+
+    return "exists=\(snapshot.exists) ageSeconds=\(ageDescription) withinWindow=\(snapshot.withinWindow)"
+}
+
+private func helperTagged(_ message: String) -> String {
+    CrashRecoverySupport.restartDebuggingTagged(message)
+}
 
 private final class CrashRecoveryHelperService: NSObject, NSXPCListenerDelegate, CrashRecoveryHelperXPCProtocol {
     private struct HangCaptureRequest {
@@ -27,6 +58,9 @@ private final class CrashRecoveryHelperService: NSObject, NSXPCListenerDelegate,
     private var inFlightHangCaptureCount = 0
 
     func run() {
+        NSLog(
+            helperTagged("[CrashRecoveryHelper] Starting listener pid=\(getpid()) executable=\(CommandLine.arguments.first ?? "unknown")")
+        )
         listener.delegate = self
         listener.resume()
         dispatchMain()
@@ -35,7 +69,7 @@ private final class CrashRecoveryHelperService: NSObject, NSXPCListenerDelegate,
     func listener(_ listener: NSXPCListener, shouldAcceptNewConnection newConnection: NSXPCConnection) -> Bool {
         let newConnectionID = ObjectIdentifier(newConnection)
         var connectionsToInvalidate: [NSXPCConnection] = []
-
+        let previousDisposition: CrashRecoverySupport.SessionDisposition
         newConnection.exportedInterface = NSXPCInterface(with: CrashRecoveryHelperXPCProtocol.self)
         newConnection.exportedObject = self
         newConnection.interruptionHandler = { [weak self] in
@@ -46,8 +80,9 @@ private final class CrashRecoveryHelperService: NSObject, NSXPCListenerDelegate,
         }
 
         stateLock.lock()
-        if let currentConnection = connection, let currentConnectionID = connectionID {
-            if inFlightHangCaptureCount > 0 {
+        previousDisposition = disposition
+        if let currentConnection = connection {
+            if let currentConnectionID = connectionID, inFlightHangCaptureCount > 0 {
                 deferredInvalidationConnections[currentConnectionID] = currentConnection
             } else {
                 connectionsToInvalidate.append(currentConnection)
@@ -63,6 +98,9 @@ private final class CrashRecoveryHelperService: NSObject, NSXPCListenerDelegate,
             staleConnection.invalidate()
         }
         newConnection.resume()
+        NSLog(
+            helperTagged("[CrashRecoveryHelper] Accepted app connection pid=\(newConnection.processIdentifier) previousDisposition=\(helperDispositionDescription(previousDisposition))")
+        )
         return true
     }
 
@@ -70,6 +108,7 @@ private final class CrashRecoveryHelperService: NSObject, NSXPCListenerDelegate,
         stateLock.lock()
         disposition = .armed
         stateLock.unlock()
+        NSLog(helperTagged("[CrashRecoveryHelper] Received arm request"))
         reply()
     }
 
@@ -77,6 +116,7 @@ private final class CrashRecoveryHelperService: NSObject, NSXPCListenerDelegate,
         stateLock.lock()
         disposition = .expectedExit
         stateLock.unlock()
+        NSLog(helperTagged("[CrashRecoveryHelper] Received expected-exit handoff"))
         reply()
     }
 
@@ -84,6 +124,7 @@ private final class CrashRecoveryHelperService: NSObject, NSXPCListenerDelegate,
         stateLock.lock()
         disposition = .relaunch(targetAppPath)
         stateLock.unlock()
+        NSLog(helperTagged("[CrashRecoveryHelper] Received relaunch handoff targetAppPath=\(targetAppPath ?? "nil")"))
         reply()
     }
 
@@ -147,14 +188,22 @@ private final class CrashRecoveryHelperService: NSObject, NSXPCListenerDelegate,
         disposition = .idle
         stateLock.unlock()
 
-        let disconnectSuppressed = CrashRecoverySupport.consumeDisconnectSuppression()
+        let suppressionSnapshot = CrashRecoverySupport.consumeDisconnectSuppressionDetails()
+        let disconnectSuppressed = suppressionSnapshot.withinWindow
+        NSLog(
+            helperTagged("[CrashRecoveryHelper] Connection lost event=\(event) disposition=\(helperDispositionDescription(currentDisposition)) disconnectSuppression=\(helperDisconnectSuppressionDescription(suppressionSnapshot))")
+        )
         guard let launchParameters = currentDisposition.disconnectLaunchParameters(
             disconnectSuppressed: disconnectSuppressed
         ) else {
             if disconnectSuppressed || currentDisposition == .expectedExit {
-                NSLog("[CrashRecoveryHelper] App disconnected after expected exit; keeping helper resident")
+                NSLog(
+                    helperTagged("[CrashRecoveryHelper] No relaunch action event=\(event) disposition=\(helperDispositionDescription(currentDisposition)); keeping helper resident")
+                )
             } else {
-                NSLog("[CrashRecoveryHelper] Ignoring \(event) with idle disposition")
+                NSLog(
+                    helperTagged("[CrashRecoveryHelper] No relaunch action event=\(event) disposition=\(helperDispositionDescription(currentDisposition))")
+                )
             }
             return
         }
@@ -163,14 +212,16 @@ private final class CrashRecoveryHelperService: NSObject, NSXPCListenerDelegate,
             guard shouldAttemptCrashAutoRelaunch() else {
                 return
             }
-            NSLog("[CrashRecoveryHelper] App disconnected unexpectedly; relaunching")
+            NSLog(
+                helperTagged("[CrashRecoveryHelper] App disconnected unexpectedly; relaunching targetAppPath=\(launchParameters.targetAppPath ?? "nil")")
+            )
             relaunchApp(
                 targetAppPath: launchParameters.targetAppPath,
                 markAsCrashRecovery: true,
                 source: .crashRecoveryHelper
             )
         } else {
-            NSLog("[CrashRecoveryHelper] App requested relaunch; reopening target")
+            NSLog(helperTagged("[CrashRecoveryHelper] App requested relaunch; reopening target"))
             relaunchApp(
                 targetAppPath: launchParameters.targetAppPath,
                 markAsCrashRecovery: false,
@@ -184,11 +235,15 @@ private final class CrashRecoveryHelperService: NSObject, NSXPCListenerDelegate,
         markAsCrashRecovery: Bool,
         source: CrashRecoverySupport.RelaunchSource?
     ) {
+        let pendingSessionID = CrashRecoverySupport.markRestartDebuggingPendingForNextLaunch()
         guard let target = resolveTarget(explicitPath: targetAppPath) else {
-            NSLog("[CrashRecoveryHelper] Unable to resolve launch target for relaunch")
+            NSLog(helperTagged("[CrashRecoveryHelper] Unable to resolve launch target for relaunch pendingSession=\(pendingSessionID)"))
             return
         }
 
+        NSLog(
+            helperTagged("[CrashRecoveryHelper] Resolved relaunch target path=\(target.path) markAsCrashRecovery=\(markAsCrashRecovery) source=\(source?.rawValue ?? "nil") pendingSession=\(pendingSessionID)")
+        )
         launch(target: target, markAsCrashRecovery: markAsCrashRecovery, source: source)
     }
 
@@ -418,23 +473,26 @@ private func launch(
     do {
         try process.run()
         NSLog(
-            "[CrashRecoveryHelper] Requested relaunch via \(relaunchProcess.executablePath) \(relaunchProcess.arguments.joined(separator: " "))"
+            helperTagged("[CrashRecoveryHelper] Requested relaunch via \(relaunchProcess.executablePath) \(relaunchProcess.arguments.joined(separator: " "))")
         )
     } catch {
         if markAsCrashRecovery {
             _ = CrashRecoverySupport.clearPendingCrashRecoveryLaunchSource()
         }
         NSLog(
-            "[CrashRecoveryHelper] Failed to start relaunch via \(relaunchProcess.executablePath): \(error.localizedDescription)"
+            helperTagged("[CrashRecoveryHelper] Failed to start relaunch via \(relaunchProcess.executablePath): \(error.localizedDescription)")
         )
     }
 }
 
 private func shouldAttemptCrashAutoRelaunch() -> Bool {
     let decision = CrashRecoverySupport.evaluateAndRecordCrashAutoRestart()
+    NSLog(
+        helperTagged("[CrashRecoveryHelper] Auto-restart decision shouldRelaunch=\(decision.shouldRelaunch) recentCount=\(decision.recentCount)")
+    )
     guard decision.shouldRelaunch else {
         NSLog(
-            "[CrashRecoveryHelper] Auto-restart suppressed to prevent restart loop (\(decision.recentCount) restarts in last 5 minutes)"
+            helperTagged("[CrashRecoveryHelper] Auto-restart suppressed to prevent restart loop (\(decision.recentCount) restarts in last 5 minutes)")
         )
         return false
     }

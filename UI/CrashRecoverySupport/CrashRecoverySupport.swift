@@ -81,6 +81,28 @@ public enum CrashRecoverySupport {
         }
     }
 
+    public struct DisconnectSuppressionSnapshot: Equatable {
+        public let exists: Bool
+        public let ageSeconds: TimeInterval?
+        public let withinWindow: Bool
+
+        public init(exists: Bool, ageSeconds: TimeInterval?, withinWindow: Bool) {
+            self.exists = exists
+            self.ageSeconds = ageSeconds
+            self.withinWindow = withinWindow
+        }
+    }
+
+    public struct RestartDebuggingSessionState: Equatable {
+        public let sessionID: String
+        public let reusedPendingSession: Bool
+
+        public init(sessionID: String, reusedPendingSession: Bool) {
+            self.sessionID = sessionID
+            self.reusedPendingSession = reusedPendingSession
+        }
+    }
+
     public static let launchAgentLabel = "io.retrace.app.crash-recovery"
     public static let launchAgentPlistName = "io.retrace.app.crash-recovery.plist"
     public static let machServiceName = launchAgentLabel
@@ -89,6 +111,8 @@ public enum CrashRecoverySupport {
     public static let registeredBuildKey = "crashRecoveryRegisteredBuild"
     public static let registeredLaunchTargetPathKey = "crashRecoveryRegisteredLaunchTargetPath"
     public static let preferencesSuiteName = "io.retrace.app"
+    public static let restartDebuggingLabelName = "restartDebugging"
+    public static let restartDebuggingPendingMaxAgeSeconds: TimeInterval = 15 * 60
     public static let disconnectSuppressionMaxAgeSeconds: TimeInterval = 20
     public static let crashAutoRestartWindowSeconds: TimeInterval = 5 * 60
     public static let maxCrashAutoRestartsPerWindow = 2
@@ -96,7 +120,80 @@ public enum CrashRecoverySupport {
     private static let disconnectSuppressionCreatedAtKey = "crashRecoveryDisconnectSuppressionCreatedAtMs"
     private static let crashAutoRestartTimestampsKey = "crashRecoveryAutoRestartTimestamps"
     private static let pendingCrashRecoveryLaunchSourceKey = "crashRecoveryPendingLaunchSource"
+    private static let restartDebuggingActiveSessionKey = "restartDebuggingActiveSession"
+    private static let restartDebuggingPendingSessionKey = "restartDebuggingPendingSession"
+    private static let restartDebuggingPendingCreatedAtKey = "restartDebuggingPendingCreatedAtMs"
     private static let crashAutoRestartLock = NSLock()
+
+    public static func beginRestartDebuggingSession(
+        now: Date = Date(),
+        defaults: UserDefaults? = nil
+    ) -> RestartDebuggingSessionState {
+        let defaults = defaults ?? crashRecoveryDefaults()
+        let reusedPendingSession: Bool
+        let sessionID: String
+
+        if let pendingSessionID = validPendingRestartDebuggingSession(now: now, defaults: defaults) {
+            sessionID = pendingSessionID
+            reusedPendingSession = true
+            _ = clearRestartDebuggingPending(defaults: defaults)
+        } else {
+            sessionID = makeRestartDebuggingSessionID()
+            reusedPendingSession = false
+        }
+
+        defaults.set(sessionID, forKey: restartDebuggingActiveSessionKey)
+        defaults.synchronize()
+        return RestartDebuggingSessionState(
+            sessionID: sessionID,
+            reusedPendingSession: reusedPendingSession
+        )
+    }
+
+    public static func currentRestartDebuggingSessionID(
+        defaults: UserDefaults? = nil
+    ) -> String? {
+        let defaults = defaults ?? crashRecoveryDefaults()
+        return defaults.string(forKey: restartDebuggingActiveSessionKey)
+    }
+
+    @discardableResult
+    public static func markRestartDebuggingPendingForNextLaunch(
+        now: Date = Date(),
+        defaults: UserDefaults? = nil
+    ) -> String {
+        let defaults = defaults ?? crashRecoveryDefaults()
+        let sessionID = currentRestartDebuggingSessionID(defaults: defaults) ?? makeRestartDebuggingSessionID()
+        defaults.set(sessionID, forKey: restartDebuggingActiveSessionKey)
+        defaults.set(sessionID, forKey: restartDebuggingPendingSessionKey)
+        defaults.set(Int64(now.timeIntervalSince1970 * 1000), forKey: restartDebuggingPendingCreatedAtKey)
+        defaults.synchronize()
+        return sessionID
+    }
+
+    @discardableResult
+    public static func clearRestartDebuggingPending(
+        defaults: UserDefaults? = nil
+    ) -> Bool {
+        let defaults = defaults ?? crashRecoveryDefaults()
+        defaults.removeObject(forKey: restartDebuggingPendingSessionKey)
+        defaults.removeObject(forKey: restartDebuggingPendingCreatedAtKey)
+        return defaults.synchronize()
+    }
+
+    public static func restartDebuggingLogLabel(
+        defaults: UserDefaults? = nil
+    ) -> String {
+        let sessionID = currentRestartDebuggingSessionID(defaults: defaults) ?? "none"
+        return "label=\(restartDebuggingLabelName) session=\(sessionID)"
+    }
+
+    public static func restartDebuggingTagged(
+        _ message: String,
+        defaults: UserDefaults? = nil
+    ) -> String {
+        "\(restartDebuggingLogLabel(defaults: defaults)) \(message)"
+    }
 
     public static func launchedFromCrashRecovery(arguments: [String] = CommandLine.arguments) -> Bool {
         arguments.contains(crashRecoveryLaunchArgument)
@@ -293,13 +390,11 @@ public enum CrashRecoverySupport {
         maxAge: TimeInterval = disconnectSuppressionMaxAgeSeconds,
         defaults: UserDefaults? = nil
     ) -> Bool {
-        let defaults = defaults ?? crashRecoveryDefaults()
-        let createdAtMs = (defaults.object(forKey: disconnectSuppressionCreatedAtKey) as? NSNumber)?.doubleValue
-        guard let createdAtMs else { return false }
-
-        let createdAt = Date(timeIntervalSince1970: createdAtMs / 1000)
-        let ageSeconds = now.timeIntervalSince(createdAt)
-        return ageSeconds >= -5 && ageSeconds <= maxAge
+        disconnectSuppressionSnapshot(
+            now: now,
+            maxAge: maxAge,
+            defaults: defaults
+        ).withinWindow
     }
 
     @discardableResult
@@ -316,10 +411,26 @@ public enum CrashRecoverySupport {
         maxAge: TimeInterval = disconnectSuppressionMaxAgeSeconds,
         defaults: UserDefaults? = nil
     ) -> Bool {
+        consumeDisconnectSuppressionDetails(
+            now: now,
+            maxAge: maxAge,
+            defaults: defaults
+        ).withinWindow
+    }
+
+    public static func consumeDisconnectSuppressionDetails(
+        now: Date = Date(),
+        maxAge: TimeInterval = disconnectSuppressionMaxAgeSeconds,
+        defaults: UserDefaults? = nil
+    ) -> DisconnectSuppressionSnapshot {
         let defaults = defaults ?? crashRecoveryDefaults()
-        let suppressed = loadDisconnectSuppression(now: now, maxAge: maxAge, defaults: defaults)
+        let snapshot = disconnectSuppressionSnapshot(
+            now: now,
+            maxAge: maxAge,
+            defaults: defaults
+        )
         _ = clearDisconnectSuppression(defaults: defaults)
-        return suppressed
+        return snapshot
     }
 
     public static func evaluateAndRecordCrashAutoRestart(
@@ -382,6 +493,54 @@ public enum CrashRecoverySupport {
 
     private static func crashRecoveryDefaults() -> UserDefaults {
         UserDefaults(suiteName: preferencesSuiteName) ?? .standard
+    }
+
+    private static func validPendingRestartDebuggingSession(
+        now: Date = Date(),
+        defaults: UserDefaults
+    ) -> String? {
+        guard let sessionID = defaults.string(forKey: restartDebuggingPendingSessionKey),
+              let createdAtMs = (defaults.object(forKey: restartDebuggingPendingCreatedAtKey) as? NSNumber)?
+                .doubleValue else {
+            return nil
+        }
+
+        let createdAt = Date(timeIntervalSince1970: createdAtMs / 1000)
+        let ageSeconds = now.timeIntervalSince(createdAt)
+        guard ageSeconds >= -5, ageSeconds <= restartDebuggingPendingMaxAgeSeconds else {
+            _ = clearRestartDebuggingPending(defaults: defaults)
+            return nil
+        }
+
+        return sessionID
+    }
+
+    private static func makeRestartDebuggingSessionID() -> String {
+        String(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(12)).lowercased()
+    }
+
+    public static func disconnectSuppressionSnapshot(
+        now: Date = Date(),
+        maxAge: TimeInterval = disconnectSuppressionMaxAgeSeconds,
+        defaults: UserDefaults? = nil
+    ) -> DisconnectSuppressionSnapshot {
+        let defaults = defaults ?? crashRecoveryDefaults()
+        let createdAtMs = (defaults.object(forKey: disconnectSuppressionCreatedAtKey) as? NSNumber)?.doubleValue
+        guard let createdAtMs else {
+            return DisconnectSuppressionSnapshot(
+                exists: false,
+                ageSeconds: nil,
+                withinWindow: false
+            )
+        }
+
+        let createdAt = Date(timeIntervalSince1970: createdAtMs / 1000)
+        let ageSeconds = now.timeIntervalSince(createdAt)
+        return DisconnectSuppressionSnapshot(
+            exists: true,
+            ageSeconds: ageSeconds,
+            withinWindow: ageSeconds >= -5 && ageSeconds <= maxAge
+        )
     }
 
     private static func consumePendingCrashRecoveryLaunchSource(
