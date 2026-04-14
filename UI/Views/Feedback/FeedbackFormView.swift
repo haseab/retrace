@@ -777,14 +777,15 @@ public struct FeedbackFormView: View {
                 .buttonStyle(.plain)
             }
 
-            // Compact summary - single line
-            HStack(spacing: 12) {
-                diagnosticChip(icon: "app.badge", text: "Version")
-                diagnosticChip(icon: "desktopcomputer", text: "Device")
-                diagnosticChip(icon: "cylinder", text: "Stats")
-                diagnosticChip(icon: "memorychip", text: "Memory")
-                if viewModel.includesLogsInDiagnostics {
-                    diagnosticChip(icon: "doc.text", text: "Logs")
+            if viewModel.includesLogsInDiagnostics || viewModel.hasSelectedDiagnosticSections {
+                HStack(spacing: 12) {
+                    diagnosticChip(icon: "app.badge", text: "Version")
+                    diagnosticChip(icon: "desktopcomputer", text: "Device")
+                    diagnosticChip(icon: "cylinder", text: "Stats")
+                    diagnosticChip(icon: "memorychip", text: "Memory")
+                    if viewModel.includesLogsInDiagnostics {
+                        diagnosticChip(icon: "doc.text", text: "Logs")
+                    }
                 }
             }
 
@@ -792,8 +793,12 @@ public struct FeedbackFormView: View {
                 Text("Bug reports include recent logs plus a hierarchical Retrace memory summary from the system monitor sampler.")
                     .font(.system(size: 10))
                     .foregroundColor(.retraceSecondary.opacity(0.72))
+            } else if viewModel.hasSelectedDiagnosticSections {
+                Text("Optional diagnostics are selected for this message. Expand details to exclude anything you don't want to share.")
+                    .font(.system(size: 10))
+                    .foregroundColor(.retraceSecondary.opacity(0.72))
             } else {
-                Text("Retrace also attaches a local app and system snapshot for support. Expand details to exclude anything you don't want to share.")
+                Text("Feature requests and questions send only your written message and any screenshot by default. Expand details to opt in to diagnostics.")
                     .font(.system(size: 10))
                     .foregroundColor(.retraceSecondary.opacity(0.72))
             }

@@ -110,8 +110,6 @@ public final class FeedbackViewModel: ObservableObject {
     private let minimumUploadDisplaySeconds: TimeInterval = 8.0
     private let uploadProgressRampSeconds: TimeInterval = 8.0
     private let recentMetricEventLimit = 100
-    private static let defaultDiagnosticSections = Set(DiagnosticInfo.SectionID.allCases)
-
     // MARK: - Computed Properties
 
     public var canSubmit: Bool {
@@ -240,6 +238,7 @@ public final class FeedbackViewModel: ObservableObject {
             feedbackType = launchContext.feedbackType
             description = launchContext.prefilledDescription ?? ""
         }
+        resetDiagnosticSectionSelection()
         // Don't load diagnostics on init - load lazily when needed
     }
 
@@ -919,7 +918,18 @@ public final class FeedbackViewModel: ObservableObject {
     }
 
     private func resetDiagnosticSectionSelection() {
-        includedDiagnosticSections = Self.defaultDiagnosticSections
+        includedDiagnosticSections = Self.defaultDiagnosticSections(for: feedbackType)
+    }
+
+    private static func defaultDiagnosticSections(
+        for type: FeedbackType
+    ) -> Set<DiagnosticInfo.SectionID> {
+        switch type {
+        case .bug:
+            return Set(DiagnosticInfo.SectionID.allCases)
+        case .feature, .question:
+            return []
+        }
     }
 
     private var orderedDiagnosticSectionIDs: [DiagnosticInfo.SectionID] {
