@@ -1986,6 +1986,11 @@ public class SimpleTimelineViewModel: ObservableObject {
         currentTimelineFrame?.frame
     }
 
+    var currentFrameHasInMemoryJPEGCache: Bool {
+        guard let frameID = currentTimelineFrame?.frame.id else { return false }
+        return hasInMemoryJPEGFrameData(frameID: frameID)
+    }
+
     public var selectedCommentTargetTimelineFrame: TimelineFrame? {
         guard let index = selectedCommentTargetIndex else {
             return nil
@@ -2404,6 +2409,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     private static let diskFrameBufferInactivityTTLSeconds: TimeInterval = 60
     private static let diskFrameBufferUnindexedPruneAgeSeconds: TimeInterval = 20 * 60
     nonisolated private static let diskFrameBufferFilenameExtension = "jpg"
+    private static let inMemoryJPEGFrameCacheCountLimit = 192
     private static let diskFrameBufferMemoryLogIntervalNs: UInt64 = 5_000_000_000
     nonisolated private static let memoryLedgerSummaryIntervalSeconds: TimeInterval = 30
     nonisolated private static let memoryLedgerDiskBufferTag = "ui.timeline.diskFrameBuffer"
@@ -2432,6 +2438,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     private var pendingCacheExpansionQueue: [CacheMoreFrameDescriptor] = []
     private var pendingCacheExpansionReadIndex = 0
     private var queuedOrInFlightCacheExpansionFrameIDs: Set<FrameID> = []
+    private let inMemoryJPEGFrameCache = SimpleTimelineViewModel.makeInMemoryJPEGFrameCache()
     private var cacheMoreOlderEdgeArmed = true
     private var cacheMoreNewerEdgeArmed = true
     private var diskFrameBufferInactivityCleanupTask: Task<Void, Never>?
@@ -2468,6 +2475,12 @@ public class SimpleTimelineViewModel: ObservableObject {
     private struct UnavailableFrameFallbackCandidate: Sendable {
         let frameID: FrameID
         let index: Int
+    }
+
+    private static func makeInMemoryJPEGFrameCache() -> NSCache<NSNumber, NSData> {
+        let cache = NSCache<NSNumber, NSData>()
+        cache.countLimit = inMemoryJPEGFrameCacheCountLimit
+        return cache
     }
 
     /// App quick-filter latency trace payload carried across async reload/boundary paths.
@@ -3111,6 +3124,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         var removedFromIndex = 0
         var removedFromDisk = 0
         var preservedExternal = 0
+        removeInMemoryJPEGFrameData(frameIDs)
         for frameID in frameIDs {
             if let entry = diskFrameBufferIndex.removeValue(forKey: frameID) {
                 removedFromIndex += 1
@@ -3139,6 +3153,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         cancelForegroundFrameLoad(reason: "clearDiskFrameBuffer.\(reason)")
         cancelCacheExpansion(reason: "clearDiskFrameBuffer.\(reason)")
         hotWindowRange = nil
+        inMemoryJPEGFrameCache.removeAllObjects()
         resetCacheMoreEdgeHysteresis()
         let indexedBefore = diskFrameBufferIndex.count
         var removedIndexedFiles = 0
@@ -3343,6 +3358,13 @@ public class SimpleTimelineViewModel: ObservableObject {
         let existingEntry = diskFrameBufferIndex[frameID]
         let fileURL = existingEntry?.fileURL ?? diskFrameBufferURL(for: frameID)
 
+        if let cachedData = cachedInMemoryJPEGFrameData(frameID: frameID) {
+            if existingEntry != nil {
+                touchDiskFrameBufferEntry(frameID)
+            }
+            return cachedData
+        }
+
         guard FileManager.default.fileExists(atPath: fileURL.path) else {
             if existingEntry != nil {
                 removeDiskFrameBufferEntries([frameID], reason: "read missing file")
@@ -3367,6 +3389,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                 )
             }
 
+            storeInMemoryJPEGFrameData(data, frameID: frameID)
             return data
         } catch {
             removeDiskFrameBufferEntries([frameID], reason: "read failure")
@@ -3394,9 +3417,38 @@ public class SimpleTimelineViewModel: ObservableObject {
                 origin: .timelineManaged
             )
             diskFrameBufferIndex[frameID] = entry
+            storeInMemoryJPEGFrameData(data, frameID: frameID)
 
         } catch {
             Log.warning("[Timeline-DiskBuffer] Failed to write frame \(frameID.value) to disk buffer: \(error)", category: .ui)
+        }
+    }
+
+    private func inMemoryJPEGFrameCacheKey(for frameID: FrameID) -> NSNumber {
+        NSNumber(value: frameID.value)
+    }
+
+    private func cachedInMemoryJPEGFrameData(frameID: FrameID) -> Data? {
+        guard let data = inMemoryJPEGFrameCache.object(forKey: inMemoryJPEGFrameCacheKey(for: frameID)) else {
+            return nil
+        }
+        return data as Data
+    }
+
+    private func hasInMemoryJPEGFrameData(frameID: FrameID) -> Bool {
+        inMemoryJPEGFrameCache.object(forKey: inMemoryJPEGFrameCacheKey(for: frameID)) != nil
+    }
+
+    private func storeInMemoryJPEGFrameData(_ data: Data, frameID: FrameID) {
+        inMemoryJPEGFrameCache.setObject(
+            data as NSData,
+            forKey: inMemoryJPEGFrameCacheKey(for: frameID)
+        )
+    }
+
+    private func removeInMemoryJPEGFrameData(_ frameIDs: [FrameID]) {
+        for frameID in frameIDs {
+            inMemoryJPEGFrameCache.removeObject(forKey: inMemoryJPEGFrameCacheKey(for: frameID))
         }
     }
 
@@ -7439,6 +7491,12 @@ public class SimpleTimelineViewModel: ObservableObject {
             return
         }
 
+        if isActivelyScrolling,
+           hasInMemoryJPEGFrameData(frameID: nextTimelineFrame.frame.id),
+           waitingFallbackImage != nil {
+            return
+        }
+
         guard waitingFallbackImageFrameID == previousFrameID else {
             clearWaitingFallbackImage()
             return
@@ -7486,6 +7544,11 @@ public class SimpleTimelineViewModel: ObservableObject {
     func markVideoPresentationReady(frameID: FrameID) {
         guard pendingVideoPresentationFrameID == frameID else { return }
         guard currentTimelineFrame?.frame.id == frameID else { return }
+        if isActivelyScrolling,
+           currentFrameStillDisplayMode != .none,
+           hasInMemoryJPEGFrameData(frameID: frameID) {
+            return
+        }
         isPendingVideoPresentationReady = true
         clearWaitingFallbackImage()
     }

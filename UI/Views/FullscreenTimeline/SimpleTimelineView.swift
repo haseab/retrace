@@ -6299,6 +6299,10 @@ struct DebugFrameIDBadge: View {
                             .foregroundColor(.white.opacity(0.5))
                     }
 
+                    Text("Memory JPEG: \(viewModel.currentFrameHasInMemoryJPEGCache ? "yes" : "no")")
+                        .font(.retraceMonoSmall)
+                        .foregroundColor(viewModel.currentFrameHasInMemoryJPEGCache ? .green.opacity(0.85) : .white.opacity(0.7))
+
                     // Debug: Show video frame index being requested
                     if let videoInfo = viewModel.currentVideoInfo {
                         Text("VidIdx: \(videoInfo.frameIndex)")
