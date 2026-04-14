@@ -10,6 +10,8 @@ import SQLCipher
 /// Seamlessly blends data from Retrace (native) and Rewind (encrypted) databases
 public actor DataAdapter {
     private static let memoryLedgerSegmentCacheTag = "app.dataAdapter.segmentCache"
+    private static let contiguousVisibleBlockGapThresholdMilliseconds: Int64 = 120_000
+    private static let visibleBlockSearchWindowDuration: TimeInterval = 12 * 60 * 60
 
     /// High-frequency function words that should not use prefix expansion.
     /// These still participate in MATCH, but as exact token matches.
@@ -876,6 +878,64 @@ public actor DataAdapter {
         }
 
         return nil
+    }
+
+    /// Find the boundary frame in the same visible timeline block as the anchor frame.
+    public func getVisibleBlockBoundary(
+        anchorFrame: FrameReference,
+        filters: FilterCriteria,
+        direction: VisibleBlockBoundaryDirection
+    ) async throws -> VisibleBlockBoundaryHit? {
+        guard isInitialized else {
+            throw DataAdapterError.notInitialized
+        }
+
+        if let selectedSources = filters.selectedSources,
+           !selectedSources.contains(anchorFrame.source) {
+            return nil
+        }
+
+        if anchorFrame.source == .rewind && requiresRetraceOnly(filters) {
+            return nil
+        }
+
+        let hiddenTagId = cachedHiddenTagId
+
+        switch anchorFrame.source {
+        case .native:
+            return try await withNativeRead(
+                operation: "data_adapter.frame.visible_block_boundary.\(direction.rawValue).native"
+            ) { connection, config in
+                try Self.queryVisibleBlockBoundaryFrame(
+                    anchorFrameID: anchorFrame.id,
+                    anchorTimestamp: anchorFrame.timestamp,
+                    connection: connection,
+                    config: config,
+                    filters: filters,
+                    hiddenTagId: hiddenTagId,
+                    isRewindDatabase: false,
+                    direction: direction
+                )
+            }
+        case .rewind:
+            guard hasRewindReadSource else { return nil }
+            return try await withRewindRead(
+                operation: "data_adapter.frame.visible_block_boundary.\(direction.rawValue).rewind"
+            ) { connection, config in
+                try Self.queryVisibleBlockBoundaryFrame(
+                    anchorFrameID: anchorFrame.id,
+                    anchorTimestamp: anchorFrame.timestamp,
+                    connection: connection,
+                    config: config,
+                    filters: filters,
+                    hiddenTagId: hiddenTagId,
+                    isRewindDatabase: true,
+                    direction: direction
+                )
+            }
+        case .screenMemory, .timeScroll, .pensieve, .unknown:
+            return nil
+        }
     }
 
     /// Get the most recent frame timestamp
@@ -2513,6 +2573,131 @@ public actor DataAdapter {
         guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
 
         return try Self.parseFrameWithVideoInfo(statement: statement, config: config)
+    }
+
+    private static func queryVisibleBlockBoundaryFrame(
+        anchorFrameID: FrameID,
+        anchorTimestamp: Date,
+        connection: DatabaseConnection,
+        config: DatabaseConfig,
+        filters: FilterCriteria,
+        hiddenTagId: Int64?,
+        isRewindDatabase: Bool,
+        direction: VisibleBlockBoundaryDirection
+    ) throws -> VisibleBlockBoundaryHit? {
+        guard config.contains(anchorTimestamp) else { return nil }
+
+        let filterComponents = Self.buildFrameFilterQueryComponents(
+            filters: filters,
+            config: config,
+            hiddenTagId: hiddenTagId,
+            isRewindDatabase: isRewindDatabase
+        )
+
+        var whereClauses = filterComponents.whereClauses
+        let searchBoundary = anchorTimestamp.addingTimeInterval(
+            direction == .start
+                ? -Self.visibleBlockSearchWindowDuration
+                : Self.visibleBlockSearchWindowDuration
+        )
+        if direction == .start {
+            whereClauses.append("f.createdAt >= ?")
+            whereClauses.append("(f.createdAt < ? OR (f.createdAt = ? AND f.id <= ?))")
+        } else {
+            whereClauses.append("(f.createdAt > ? OR (f.createdAt = ? AND f.id >= ?))")
+            whereClauses.append("f.createdAt <= ?")
+        }
+        let whereClause = "WHERE " + whereClauses.joined(separator: " AND ")
+        let ctePrefix = filterComponents.combinedCTE.isEmpty ? "WITH" : "\(filterComponents.combinedCTE),"
+        let neighborBundleIDColumn = direction == .start ? "prev_bundleID" : "next_bundleID"
+        let neighborCreatedAtColumn = direction == .start ? "prevCreatedAt" : "nextCreatedAt"
+        let windowFunction = direction == .start ? "LAG" : "LEAD"
+        let gapMillisecondsExpression: String
+        if direction == .start {
+            gapMillisecondsExpression =
+                "\(Self.createdAtMillisecondsExpression(columnName: "createdAt", config: config)) - \(Self.createdAtMillisecondsExpression(columnName: neighborCreatedAtColumn, config: config))"
+        } else {
+            gapMillisecondsExpression =
+                "\(Self.createdAtMillisecondsExpression(columnName: neighborCreatedAtColumn, config: config)) - \(Self.createdAtMillisecondsExpression(columnName: "createdAt", config: config))"
+        }
+        let boundaryOrderClause = direction == .start
+            ? "ORDER BY createdAt DESC, id DESC"
+            : "ORDER BY createdAt ASC, id ASC"
+
+        let sql = """
+            \(ctePrefix)
+            filtered_frames AS (
+                SELECT
+                    f.id,
+                    f.createdAt,
+                    s.bundleID,
+                    \(windowFunction)(s.bundleID) OVER (ORDER BY f.createdAt ASC, f.id ASC) AS \(neighborBundleIDColumn),
+                    \(windowFunction)(f.createdAt) OVER (ORDER BY f.createdAt ASC, f.id ASC) AS \(neighborCreatedAtColumn)
+                FROM frame f
+                INNER JOIN segment s ON f.segmentId = s.id
+                \(filterComponents.tagJoin)
+                \(whereClause)
+            ),
+            anchor_frame AS (
+                SELECT 1
+                FROM filtered_frames
+                WHERE id = ?
+                LIMIT 1
+            )
+            SELECT
+                id,
+                createdAt
+            FROM filtered_frames
+            WHERE EXISTS (SELECT 1 FROM anchor_frame)
+              AND (
+                  \(neighborBundleIDColumn) IS NULL
+                  OR \(neighborBundleIDColumn) != bundleID
+                  OR \(gapMillisecondsExpression) >= \(Self.contiguousVisibleBlockGapThresholdMilliseconds)
+              )
+            \(boundaryOrderClause)
+            LIMIT 1
+            """
+
+        guard let statement = try? connection.prepare(sql: sql) else { return nil }
+        defer { connection.finalize(statement) }
+
+        var bindIndex: Int32 = 1
+        bindIndex = Self.bindFrameFilterCTEValues(filterComponents, to: statement, startingAt: bindIndex)
+        bindIndex = Self.bindFrameFilterWhereValues(filterComponents, to: statement, config: config, startingAt: bindIndex)
+        if direction == .start {
+            config.bindDate(searchBoundary, to: statement, at: bindIndex)
+            bindIndex += 1
+            config.bindDate(anchorTimestamp, to: statement, at: bindIndex)
+            bindIndex += 1
+            config.bindDate(anchorTimestamp, to: statement, at: bindIndex)
+            bindIndex += 1
+            sqlite3_bind_int64(statement, bindIndex, anchorFrameID.value)
+            bindIndex += 1
+        } else {
+            config.bindDate(anchorTimestamp, to: statement, at: bindIndex)
+            bindIndex += 1
+            config.bindDate(anchorTimestamp, to: statement, at: bindIndex)
+            bindIndex += 1
+            sqlite3_bind_int64(statement, bindIndex, anchorFrameID.value)
+            bindIndex += 1
+            config.bindDate(searchBoundary, to: statement, at: bindIndex)
+            bindIndex += 1
+        }
+        sqlite3_bind_int64(statement, bindIndex, anchorFrameID.value)
+
+        guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+        return try Self.parseVisibleBlockBoundaryHit(statement: statement, config: config)
+    }
+
+    private static func createdAtMillisecondsExpression(
+        columnName: String,
+        config: DatabaseConfig
+    ) -> String {
+        if config.dateFormatter == nil {
+            return columnName
+        }
+
+        return "CAST((julianday(\(columnName)) - 2440587.5) * 86400000.0 AS INTEGER)"
     }
 
     private func getFrameVideoInfo(
@@ -4775,6 +4960,22 @@ public actor DataAdapter {
             processingStatus: processingStatus,
             videoCurrentTime: videoCurrentTime,
             scrollY: scrollY
+        )
+    }
+
+    private static func parseVisibleBlockBoundaryHit(
+        statement: OpaquePointer,
+        config: DatabaseConfig
+    ) throws -> VisibleBlockBoundaryHit {
+        let frameID = FrameID(value: sqlite3_column_int64(statement, 0))
+
+        guard let timestamp = config.parseDate(from: statement, column: 1) else {
+            throw DataAdapterError.parseFailed
+        }
+
+        return VisibleBlockBoundaryHit(
+            frameID: frameID,
+            timestamp: timestamp
         )
     }
 

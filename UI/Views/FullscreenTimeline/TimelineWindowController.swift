@@ -3375,10 +3375,13 @@ extension TimelineWindowController {
         }
         // Cmd+Left: jump to the start of the previous consecutive timeline block
         if event.keyCode == 123 && modifiers == [.command] {
-            if let viewModel = timelineViewModel, viewModel.navigateToPreviousBlockStart() {
-                recordShortcut("cmd+left")
-                if let coordinator = coordinator {
-                    DashboardViewModel.recordArrowKeyNavigation(coordinator: coordinator, direction: "left")
+            Task { @MainActor [weak self] in
+                guard let self, let viewModel = self.timelineViewModel else { return }
+                if await viewModel.navigateToPreviousBlockStart() {
+                    self.recordShortcut("cmd+left")
+                    if let coordinator = self.coordinator {
+                        DashboardViewModel.recordArrowKeyNavigation(coordinator: coordinator, direction: "left")
+                    }
                 }
             }
             return true // Consume even at boundary to avoid system "bonk" sound
@@ -3403,10 +3406,13 @@ extension TimelineWindowController {
         // Right arrow, K, or ; - navigate to next frame (Option = 3x speed)
         // Cmd+Right: jump to the start of the next consecutive timeline block
         if event.keyCode == 124 && modifiers == [.command] {
-            if let viewModel = timelineViewModel, viewModel.navigateToNextBlockStartOrNewestFrame() {
-                recordShortcut("cmd+right")
-                if let coordinator = coordinator {
-                    DashboardViewModel.recordArrowKeyNavigation(coordinator: coordinator, direction: "right")
+            Task { @MainActor [weak self] in
+                guard let self, let viewModel = self.timelineViewModel else { return }
+                if await viewModel.navigateToNextBlockStartOrNewestFrame() {
+                    self.recordShortcut("cmd+right")
+                    if let coordinator = self.coordinator {
+                        DashboardViewModel.recordArrowKeyNavigation(coordinator: coordinator, direction: "right")
+                    }
                 }
             }
             return true // Consume even at boundary to avoid system "bonk" sound

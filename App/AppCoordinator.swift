@@ -24,6 +24,21 @@ public enum CaptureObservedNotification {
     public static let didObserve = Notification.Name("CaptureObserved")
 }
 
+public enum VisibleBlockBoundaryDirection: String, Sendable {
+    case start
+    case end
+}
+
+public struct VisibleBlockBoundaryHit: Equatable, Sendable {
+    public let frameID: FrameID
+    public let timestamp: Date
+
+    public init(frameID: FrameID, timestamp: Date) {
+        self.frameID = frameID
+        self.timestamp = timestamp
+    }
+}
+
 public enum UnexpectedRecordingStopReason: String, Codable, Sendable {
     case captureStopped = "capture_stopped"
     case encoderMismatch = "encoder_mismatch"
@@ -3375,6 +3390,22 @@ public actor AppCoordinator {
         }
 
         return try await adapter.getFrameWithVideoInfoByID(id: id)
+    }
+
+    public func getVisibleBlockBoundary(
+        anchorFrame: FrameReference,
+        filters: FilterCriteria,
+        direction: VisibleBlockBoundaryDirection
+    ) async throws -> VisibleBlockBoundaryHit? {
+        guard let adapter = await services.dataAdapter else {
+            return nil
+        }
+
+        return try await adapter.getVisibleBlockBoundary(
+            anchorFrame: anchorFrame,
+            filters: filters,
+            direction: direction
+        )
     }
 
     /// Get processing status for multiple frames in a single query

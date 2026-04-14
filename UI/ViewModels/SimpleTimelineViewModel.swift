@@ -2543,6 +2543,8 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// In-flight boundary load tasks. Cancel these when a jump/reload replaces the frame window.
     private var olderBoundaryLoadTask: Task<Void, Never>?
     private var newerBoundaryLoadTask: Task<Void, Never>?
+    private var blockBoundaryLookupTask: Task<Bool, Never>?
+    private var blockBoundaryLookupRequestID: UInt64 = 0
     private var urlBoundingBoxTask: Task<Void, Never>?
     private var ocrNodesLoadTask: Task<Void, Never>?
 
@@ -2661,6 +2663,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         var getFramesWithVideoInfo: ((Date, Date, Int, FilterCriteria, String) async throws -> [FrameWithVideoInfo])?
         var getFramesWithVideoInfoBefore: ((Date, Int, FilterCriteria, String) async throws -> [FrameWithVideoInfo])?
         var getFramesWithVideoInfoAfter: ((Date, Int, FilterCriteria, String) async throws -> [FrameWithVideoInfo])?
+        var getVisibleBlockBoundary: ((FrameReference, FilterCriteria, VisibleBlockBoundaryDirection) async throws -> VisibleBlockBoundaryHit?)?
     }
 
     struct ForegroundFrameLoadTestHooks {
@@ -3939,6 +3942,102 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
     }
 
+    private func fetchVisibleBlockBoundaryLogged(
+        anchorFrame: FrameReference,
+        filters: FilterCriteria,
+        direction: VisibleBlockBoundaryDirection,
+        reason: String
+    ) async throws -> VisibleBlockBoundaryHit? {
+        let tracePrefix = direction == .start ? "block-start" : "block-end"
+        let traceID = nextFetchTraceID(prefix: tracePrefix)
+        let fetchStart = CFAbsoluteTimeGetCurrent()
+        Log.info(
+            "[TIMELINE-FETCH][\(traceID)] START reason='\(reason)' direction=\(direction.rawValue) anchorFrameID=\(anchorFrame.id.value) anchorTimestamp=\(Log.timestamp(from: anchorFrame.timestamp)) source=\(anchorFrame.source.rawValue) filters={\(summarizeFiltersForLog(filters))}",
+            category: .ui
+        )
+
+        do {
+            let targetFrame: VisibleBlockBoundaryHit?
+#if DEBUG
+            if let override = test_windowFetchHooks.getVisibleBlockBoundary {
+                targetFrame = try await override(anchorFrame, filters, direction)
+            } else {
+                targetFrame = try await coordinator.getVisibleBlockBoundary(
+                    anchorFrame: anchorFrame,
+                    filters: filters,
+                    direction: direction
+                )
+            }
+#else
+            targetFrame = try await coordinator.getVisibleBlockBoundary(
+                anchorFrame: anchorFrame,
+                filters: filters,
+                direction: direction
+            )
+#endif
+            let elapsedMs = (CFAbsoluteTimeGetCurrent() - fetchStart) * 1000
+            let frameSummary = targetFrame.map {
+                "frameID=\($0.frameID.value) timestamp=\(Log.timestamp(from: $0.timestamp))"
+            } ?? "frame=nil"
+            Log.info(
+                "[TIMELINE-FETCH][\(traceID)] END reason='\(reason)' direction=\(direction.rawValue) \(frameSummary) elapsed=\(String(format: "%.1f", elapsedMs))ms",
+                category: .ui
+            )
+            return targetFrame
+        } catch {
+            let elapsedMs = (CFAbsoluteTimeGetCurrent() - fetchStart) * 1000
+            Log.error(
+                "[TIMELINE-FETCH][\(traceID)] FAIL reason='\(reason)' after \(String(format: "%.1f", elapsedMs))ms: \(error)",
+                category: .ui
+            )
+            throw error
+        }
+    }
+
+    @discardableResult
+    private func loadNavigationWindowAndNavigate(
+        to frameID: FrameID,
+        targetDate: Date,
+        filters: FilterCriteria,
+        reason: String,
+        clearDiskBufferReason: String,
+        memoryLogContext: String,
+        requestStillCurrent: (() -> Bool)? = nil
+    ) async throws -> Int? {
+        let calendar = Calendar.current
+        let startDate = calendar.date(byAdding: .minute, value: -10, to: targetDate) ?? targetDate
+        let endDate = calendar.date(byAdding: .minute, value: 10, to: targetDate) ?? targetDate
+        let framesWithVideoInfo = try await fetchFramesWithVideoInfoLogged(
+            from: startDate,
+            to: endDate,
+            limit: 1000,
+            filters: filters,
+            reason: reason
+        )
+        guard !Task.isCancelled else { return nil }
+        guard requestStillCurrent?() ?? true else { return nil }
+        guard !framesWithVideoInfo.isEmpty else { return nil }
+        guard requestStillCurrent?() ?? true else { return nil }
+
+        applyNavigationFrameWindow(
+            framesWithVideoInfo,
+            clearDiskBufferReason: clearDiskBufferReason,
+            memoryLogContext: memoryLogContext
+        )
+        clearPositionRecoveryHintForSupersedingNavigation()
+
+        let targetIndex: Int
+        if let exactIndex = frames.firstIndex(where: { $0.frame.id == frameID }) {
+            targetIndex = exactIndex
+        } else {
+            targetIndex = findClosestFrameIndex(to: targetDate)
+        }
+
+        guard requestStillCurrent?() ?? true else { return nil }
+        navigateToFrame(targetIndex)
+        return targetIndex
+    }
+
     private func fetchMostRecentFramesWithVideoInfoLogged(
         limit: Int,
         filters: FilterCriteria,
@@ -4466,18 +4565,36 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     /// Jump to the start of the previous consecutive app block.
-    /// Returns true when navigation occurred, false when already at the oldest block.
+    /// Returns true when navigation completed, false when no navigation occurred.
     @discardableResult
-    public func navigateToPreviousBlockStart() -> Bool {
+    @MainActor
+    public func navigateToPreviousBlockStart() async -> Bool {
         guard !frames.isEmpty else { return false }
         let snapshot = appBlockSnapshot
         let blocks = snapshot.blocks
         guard !blocks.isEmpty else { return false }
-        guard let currentBlockIndex = blockIndexForFrame(currentIndex),
-              currentBlockIndex > 0 else {
+        guard let currentBlockIndex = blockIndexForFrame(currentIndex) else {
             return false
         }
 
+        let currentBlock = blocks[currentBlockIndex]
+        if currentBlockIndex == 0, hasMoreOlder {
+            return await resolveBlockBoundaryFromDatabase(
+                direction: .start,
+                anchorFrame: frames[currentBlock.startIndex].frame,
+                requestedFrameID: frames[currentIndex].frame.id,
+                reason: "navigateToPreviousBlockStart",
+                clearDiskBufferReason: "previous block start navigation",
+                memoryLogContext: "previous block start navigation"
+            )
+        }
+
+        if currentIndex > currentBlock.startIndex {
+            navigateToFrame(currentBlock.startIndex)
+            return true
+        }
+
+        guard currentBlockIndex > 0 else { return false }
         navigateToFrame(blocks[currentBlockIndex - 1].startIndex)
         return true
     }
@@ -4501,9 +4618,10 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Jump to the start of the next consecutive app block.
     /// If already in the newest block, jump to the newest frame.
-    /// Returns true when navigation occurred, false when already at the newest frame.
+    /// Returns true when navigation completed, false when no navigation occurred.
     @discardableResult
-    public func navigateToNextBlockStartOrNewestFrame() -> Bool {
+    @MainActor
+    public func navigateToNextBlockStartOrNewestFrame() async -> Bool {
         guard !frames.isEmpty else { return false }
         let snapshot = appBlockSnapshot
         let blocks = snapshot.blocks
@@ -4517,10 +4635,179 @@ public class SimpleTimelineViewModel: ObservableObject {
             return true
         }
 
+        let currentBlock = blocks[currentBlockIndex]
+        if currentBlockIndex == blocks.count - 1, hasMoreNewer {
+            return await resolveBlockBoundaryFromDatabase(
+                direction: .end,
+                anchorFrame: frames[currentBlock.endIndex].frame,
+                requestedFrameID: frames[currentIndex].frame.id,
+                reason: "navigateToNextBlockStartOrNewestFrame",
+                clearDiskBufferReason: "next block end navigation",
+                memoryLogContext: "next block end navigation"
+            )
+        }
+
         let newestFrameIndex = frames.count - 1
         guard currentIndex < newestFrameIndex else { return false }
         navigateToFrame(newestFrameIndex)
         return true
+    }
+
+    @MainActor
+    private func resolveBlockBoundaryFromDatabase(
+        direction: VisibleBlockBoundaryDirection,
+        anchorFrame: FrameReference,
+        requestedFrameID: FrameID,
+        reason: String,
+        clearDiskBufferReason: String,
+        memoryLogContext: String
+    ) async -> Bool {
+        cancelBlockBoundaryLookup(reason: "restart")
+        blockBoundaryLookupRequestID &+= 1
+        let requestID = blockBoundaryLookupRequestID
+        let requestFilters = filterCriteria
+
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return false }
+            return await self.performBlockBoundaryLookup(
+                requestID: requestID,
+                direction: direction,
+                anchorFrame: anchorFrame,
+                requestedFrameID: requestedFrameID,
+                filters: requestFilters,
+                reason: reason,
+                clearDiskBufferReason: clearDiskBufferReason,
+                memoryLogContext: memoryLogContext
+            )
+        }
+        blockBoundaryLookupTask = task
+
+        let didNavigate = await task.value
+        if blockBoundaryLookupRequestID == requestID {
+            blockBoundaryLookupTask = nil
+        }
+        return didNavigate
+    }
+
+    @MainActor
+    private func isCurrentBlockBoundaryLookup(
+        requestID: UInt64,
+        requestedFrameID: FrameID,
+        filters: FilterCriteria,
+        reason: String
+    ) -> Bool {
+        guard blockBoundaryLookupRequestID == requestID else {
+            Log.info(
+                "[TimelineBlocks] Aborting stale lookup reason=\(reason) staleResult=requestSuperseded requestID=\(requestID) currentRequestID=\(blockBoundaryLookupRequestID)",
+                category: .ui
+            )
+            return false
+        }
+
+        guard filterCriteria == filters else {
+            Log.info(
+                "[TimelineBlocks] Aborting stale lookup reason=\(reason) staleResult=filtersChanged old={\(summarizeFiltersForLog(filters))} current={\(summarizeFiltersForLog(filterCriteria))}",
+                category: .ui
+            )
+            return false
+        }
+
+        guard currentTimelineFrame?.frame.id == requestedFrameID else {
+            Log.info(
+                "[TimelineBlocks] Aborting stale lookup reason=\(reason) staleResult=playheadMoved requestedFrameID=\(requestedFrameID.value) currentFrameID=\(currentTimelineFrame?.frame.id.value ?? -1)",
+                category: .ui
+            )
+            return false
+        }
+
+        return true
+    }
+
+    @MainActor
+    private func navigateToLoadedBlockBoundaryIfNeeded(boundaryFrameID: FrameID) -> Bool {
+        guard let loadedIndex = frames.firstIndex(where: { $0.frame.id == boundaryFrameID }) else {
+            return false
+        }
+        guard loadedIndex != currentIndex else { return false }
+        navigateToFrame(loadedIndex)
+        return true
+    }
+
+    @MainActor
+    private func performBlockBoundaryLookup(
+        requestID: UInt64,
+        direction: VisibleBlockBoundaryDirection,
+        anchorFrame: FrameReference,
+        requestedFrameID: FrameID,
+        filters: FilterCriteria,
+        reason: String,
+        clearDiskBufferReason: String,
+        memoryLogContext: String
+    ) async -> Bool {
+        do {
+            let targetFrame = try await fetchVisibleBlockBoundaryLogged(
+                anchorFrame: anchorFrame,
+                filters: filters,
+                direction: direction,
+                reason: reason
+            )
+
+            guard !Task.isCancelled,
+                  isCurrentBlockBoundaryLookup(
+                      requestID: requestID,
+                      requestedFrameID: requestedFrameID,
+                      filters: filters,
+                      reason: reason
+                  ) else {
+                return false
+            }
+
+            guard let targetFrame else {
+                return navigateToLoadedBlockBoundaryIfNeeded(boundaryFrameID: anchorFrame.id)
+            }
+
+            guard targetFrame.frameID != anchorFrame.id else {
+                return navigateToLoadedBlockBoundaryIfNeeded(boundaryFrameID: anchorFrame.id)
+            }
+
+            if let loadedIndex = frames.firstIndex(where: { $0.frame.id == targetFrame.frameID }) {
+                navigateToFrame(loadedIndex)
+                return true
+            }
+
+            if blockBoundaryLookupRequestID == requestID {
+                blockBoundaryLookupTask = nil
+            }
+
+            setLoadingState(true, reason: "\(reason).lookup")
+            defer {
+                setLoadingState(false, reason: "\(reason).lookup.complete")
+            }
+
+            return try await loadNavigationWindowAndNavigate(
+                to: targetFrame.frameID,
+                targetDate: targetFrame.timestamp,
+                filters: filters,
+                reason: reason,
+                clearDiskBufferReason: clearDiskBufferReason,
+                memoryLogContext: memoryLogContext,
+                requestStillCurrent: { [weak self] in
+                    guard let self else { return false }
+                    return self.isCurrentBlockBoundaryLookup(
+                        requestID: requestID,
+                        requestedFrameID: requestedFrameID,
+                        filters: filters,
+                        reason: reason
+                    )
+                }
+            ) != nil
+        } catch {
+            Log.error(
+                "[TimelineBlocks] Failed to resolve \(direction.rawValue) block boundary: \(error)",
+                category: .ui
+            )
+            return false
+        }
     }
 
     /// Get all unique segment IDs within a visible block, preserving timeline order.
@@ -7587,6 +7874,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     private func resetBoundaryLoads(reason: String) {
         invalidateBoundaryLoadContext(reason: reason)
         cancelBoundaryLoadTasks(reason: reason)
+        cancelBlockBoundaryLookup(reason: reason)
     }
 
     private func cancelBoundaryLoadTasks(reason: String) {
@@ -7607,6 +7895,14 @@ public class SimpleTimelineViewModel: ObservableObject {
                 category: .ui
             )
         }
+    }
+
+    private func cancelBlockBoundaryLookup(reason: String) {
+        guard blockBoundaryLookupTask != nil else { return }
+        blockBoundaryLookupTask?.cancel()
+        blockBoundaryLookupTask = nil
+        blockBoundaryLookupRequestID &+= 1
+        Log.debug("[TimelineBlocks] Cancelled block boundary lookup (\(reason))", category: .ui)
     }
 
     private func resetBoundaryStateForReloadWindow() {
@@ -14416,47 +14712,25 @@ public class SimpleTimelineViewModel: ObservableObject {
             let targetFrame = frameWithVideo.frame
             let targetDate = targetFrame.timestamp
 
-            // Load frames around the target frame's timestamp (±10 minutes window)
-            let calendar = Calendar.current
-            let startDate = calendar.date(byAdding: .minute, value: -10, to: targetDate) ?? targetDate
-            let endDate = calendar.date(byAdding: .minute, value: 10, to: targetDate) ?? targetDate
-
             // Fetch all frames in the window.
             // Linked-comment jumps intentionally ignore hidden filtering so anchored frames remain reachable.
             var jumpFilters = filterCriteria
             if includeHiddenSegments {
                 jumpFilters.hiddenFilter = .showAll
             }
-            let framesWithVideoInfo = try await fetchFramesWithVideoInfoLogged(
-                from: startDate,
-                to: endDate,
-                limit: 1000,
+            guard try await loadNavigationWindowAndNavigate(
+                to: targetFrame.id,
+                targetDate: targetDate,
                 filters: jumpFilters,
-                reason: "searchForFrameID"
-            )
-
-            guard !framesWithVideoInfo.isEmpty else {
+                reason: "searchForFrameID",
+                clearDiskBufferReason: "frame ID search",
+                memoryLogContext: "frame ID search"
+            ) != nil else {
                 if showFailureUI {
                     showErrorWithAutoDismiss("No frames found around frame #\(frameID)")
                     setLoadingState(false, reason: "searchForFrameID.noFramesInWindow")
                 }
                 return false
-            }
-
-            applyNavigationFrameWindow(
-                framesWithVideoInfo,
-                clearDiskBufferReason: "frame ID search",
-                memoryLogContext: "frame ID search"
-            )
-            clearPositionRecoveryHintForSupersedingNavigation()
-
-            // Find the exact frame by ID in our loaded frames
-            if let exactIndex = frames.firstIndex(where: { $0.frame.id.value == frameID }) {
-                currentIndex = exactIndex
-            } else {
-                // Fallback to closest by timestamp
-                let closestIndex = findClosestFrameIndex(to: targetDate)
-                currentIndex = closestIndex
             }
             _ = recordCurrentPositionImmediatelyForUndo(reason: "searchForFrameID.destination")
 
