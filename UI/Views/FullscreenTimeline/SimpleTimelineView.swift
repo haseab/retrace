@@ -386,18 +386,7 @@ public struct SimpleTimelineView: View {
                         }
                         .padding(.horizontal, 28)
                         .padding(.vertical, 18)
-                        .background(
-                            ZStack {
-                                RoundedRectangle(cornerRadius: 16)
-                                    .fill(.ultraThinMaterial)
-                                    .environment(\.colorScheme, .dark)
-                                RoundedRectangle(cornerRadius: 16)
-                                    .fill(Color.black.opacity(0.5))
-                                RoundedRectangle(cornerRadius: 16)
-                                    .stroke(toastAccentColor.opacity(0.35), lineWidth: 1)
-                            }
-                        )
-                        .shadow(color: .black.opacity(0.4), radius: 20, y: 8)
+                        .timelineGlassSurface(.banner, cornerRadius: 16, borderColor: toastAccentColor.opacity(0.35))
                         .scaleEffect(viewModel.toastVisible ? 1.0 : 0.85)
                         .opacity(viewModel.toastVisible ? 1.0 : 0.0)
                         Spacer()
@@ -447,15 +436,7 @@ public struct SimpleTimelineView: View {
                         }
                         .padding(.horizontal, 14)
                         .padding(.vertical, 10)
-                        .background(
-                            RoundedRectangle(cornerRadius: 12)
-                                .fill(Color.black.opacity(0.68))
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 12)
-                                        .stroke(Color.white.opacity(0.18), lineWidth: 1)
-                                )
-                        )
-                        .shadow(color: .black.opacity(0.4), radius: 14, y: 6)
+                        .timelineGlassSurface(.banner, cornerRadius: 12)
                         .padding(.top, max(geometry.safeAreaInsets.top + 18, 56))
                         Spacer()
                     }
@@ -1138,7 +1119,7 @@ public struct SimpleTimelineView: View {
         .padding(.leading, 14 * scale)
         .padding(.trailing, 12 * scale)
         .frame(width: 340 * scale, height: height)
-        .retraceMenuContainer(addPadding: false)
+        .timelineGlassSurface(.panel, cornerRadius: 14 * scale)
         .overlay(
             RoundedRectangle(cornerRadius: 14 * scale)
                 .stroke(
@@ -1209,14 +1190,7 @@ public struct SimpleTimelineView: View {
                 .foregroundColor(isHelpButtonHovering ? .white : .white.opacity(0.8))
                 .frame(width: isHelpButtonHovering ? nil : buttonSize, height: buttonSize)
                 .padding(.horizontal, isHelpButtonHovering ? 20 * scale : 0)
-                .background(
-                    Capsule()
-                        .fill(Color.black.opacity(isHelpButtonHovering ? 0.7 : 0.5))
-                )
-                .overlay(
-                    Capsule()
-                        .stroke(Color.white.opacity(0.2), lineWidth: 0.5)
-                )
+                .timelineGlassSurface(.chip, cornerRadius: buttonSize / 2)
                 .animation(.easeOut(duration: 0.15), value: isHelpButtonHovering)
             }
         }
@@ -1255,14 +1229,7 @@ public struct SimpleTimelineView: View {
                 .foregroundColor(isCloseButtonHovering ? .white : .white.opacity(0.8))
                 .frame(width: isCloseButtonHovering ? nil : buttonSize, height: buttonSize)
                 .padding(.horizontal, isCloseButtonHovering ? 20 * scale : 0)
-                .background(
-                    Capsule()
-                        .fill(Color.black.opacity(isCloseButtonHovering ? 0.7 : 0.5))
-                )
-                .overlay(
-                    Capsule()
-                        .stroke(Color.white.opacity(0.2), lineWidth: 0.5)
-                )
+                .timelineGlassSurface(.chip, cornerRadius: buttonSize / 2)
                 .animation(.easeOut(duration: 0.15), value: isCloseButtonHovering)
             }
         }
@@ -1287,6 +1254,7 @@ public struct SimpleTimelineView: View {
                 .font(.retraceBody)
                 .foregroundColor(.white.opacity(0.7))
         }
+        .allowsHitTesting(false)
     }
 
     // MARK: - Helper Methods
@@ -1355,18 +1323,7 @@ public struct SimpleTimelineView: View {
         .padding(.horizontal, 28)
         .padding(.vertical, 18)
         .fixedSize(horizontal: true, vertical: false)
-        .background(
-            ZStack {
-                RoundedRectangle(cornerRadius: 16)
-                    .fill(.ultraThinMaterial)
-                    .environment(\.colorScheme, .dark)
-                RoundedRectangle(cornerRadius: 16)
-                    .fill(Color.black.opacity(0.5))
-                RoundedRectangle(cornerRadius: 16)
-                    .stroke(accentColor.opacity(0.35), lineWidth: 1)
-            }
-        )
-        .shadow(color: .black.opacity(0.4), radius: 20, y: 8)
+        .timelineGlassSurface(.banner, cornerRadius: 16, borderColor: accentColor.opacity(0.35))
         .padding(.horizontal, 24)
         .allowsHitTesting(false)
     }
@@ -1394,14 +1351,7 @@ struct ResetZoomButton: View {
             .foregroundColor(isHovering ? .white : .white.opacity(0.8))
             .padding(.horizontal, 20 * scale)
             .padding(.vertical, 12 * scale)
-            .background(
-                Capsule()
-                    .fill(Color.black.opacity(isHovering ? 0.7 : 0.5))
-            )
-            .overlay(
-                Capsule()
-                    .stroke(Color.white.opacity(0.2), lineWidth: 0.5)
-            )
+            .timelineGlassSurface(.chip, cornerRadius: 22 * scale)
         }
         .buttonStyle(.plain)
         .onHover { hovering in
@@ -1484,19 +1434,7 @@ struct PeekModeBanner: View {
         }
         .padding(.horizontal, 16 * scale)
         .padding(.vertical, 10 * scale)
-        .background(
-            Capsule()
-                .fill(Color.black.opacity(0.6))
-                .background(
-                    Capsule()
-                        .fill(.ultraThinMaterial)
-                )
-                .clipShape(Capsule())
-        )
-        .overlay(
-            Capsule()
-                .stroke(Color.white.opacity(0.15), lineWidth: 0.5)
-        )
+        .timelineGlassSurface(.banner, cornerRadius: 18 * scale)
     }
 }
 
@@ -5625,15 +5563,7 @@ struct DeleteConfirmationDialog: View {
                 .padding(.top, 8)
             }
             .padding(32)
-            .background(
-                RoundedRectangle(cornerRadius: 16)
-                    .fill(Color(white: 0.15))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 16)
-                            .stroke(Color.white.opacity(0.1), lineWidth: 1)
-                    )
-            )
-            .shadow(color: .black.opacity(0.5), radius: 30, y: 10)
+            .retraceMattePanel(addPadding: false, cornerRadius: 16)
         }
         .transition(.opacity.combined(with: .scale(scale: 0.95)))
         .animation(.spring(response: 0.3, dampingFraction: 0.8), value: true)
@@ -6355,13 +6285,10 @@ struct DebugFrameIDBadge: View {
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 6)
-            .background(
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(Color(white: 0.15).opacity(0.9))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(isHovering ? Color.white.opacity(0.3) : Color.white.opacity(0.15), lineWidth: 0.5)
+            .timelineGlassSurface(
+                .chip,
+                cornerRadius: 8,
+                borderColor: isHovering ? Color.white.opacity(0.3) : Color.white.opacity(0.15)
             )
         }
         .buttonStyle(.plain)
@@ -6477,15 +6404,7 @@ struct DebugBrowserURLWindow: View {
             .frame(maxHeight: 170)
         }
         .frame(width: 720, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 10)
-                .fill(Color(white: 0.1).opacity(0.95))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 10)
-                .stroke(Color.white.opacity(0.2), lineWidth: 0.8)
-        )
-        .shadow(color: .black.opacity(0.4), radius: 20, y: 8)
+        .retraceMattePanel(addPadding: false, cornerRadius: 10)
         .offset(
             x: panelPosition.width + dragOffset.width,
             y: panelPosition.height + dragOffset.height
@@ -6572,14 +6491,7 @@ struct OCRStatusIndicator: View {
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 6)
-            .background(
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(Color(white: 0.15).opacity(0.9))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(statusColor.opacity(0.4), lineWidth: 0.5)
-            )
+            .timelineGlassSurface(.chip, cornerRadius: 8, borderColor: statusColor.opacity(0.4))
             .transition(.opacity.combined(with: .scale(scale: 0.9)))
             .animation(.easeInOut(duration: 0.2), value: viewModel.ocrStatus)
         }
@@ -6739,13 +6651,10 @@ struct DeveloperActionsMenu: View {
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 6)
-            .background(
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(Color(white: 0.15).opacity(0.9))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(isHovering ? Color.orange.opacity(0.5) : Color.white.opacity(0.15), lineWidth: 0.5)
+            .timelineGlassSurface(
+                .chip,
+                cornerRadius: 8,
+                borderColor: isHovering ? Color.orange.opacity(0.5) : Color.white.opacity(0.15)
             )
         }
         .menuStyle(.borderlessButton)
@@ -6941,15 +6850,7 @@ private struct SearchResultNavigationToast: View {
         }
         .padding(.horizontal, 16 * scale)
         .padding(.vertical, 12 * scale)
-        .background(
-            RoundedRectangle(cornerRadius: 18 * scale)
-                .fill(Color.black.opacity(0.72))
-                .shadow(color: .black.opacity(0.28), radius: 16, y: 6)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 18 * scale)
-                .stroke(Color.white.opacity(0.14), lineWidth: 1)
-        )
+        .timelineGlassSurface(.banner, cornerRadius: 18 * scale)
     }
 }
 
@@ -7139,8 +7040,7 @@ private struct TimelineHintBanner<Content: View>: View {
         }
         .padding(.horizontal, horizontalPadding)
         .padding(.vertical, verticalPadding)
-        .background(backgroundShape)
-        .overlay(borderShape)
+        .timelineGlassSurface(.banner, cornerRadius: style.cornerRadius(scale: scale))
     }
 
     private var horizontalPadding: CGFloat {
@@ -7161,29 +7061,15 @@ private struct TimelineHintBanner<Content: View>: View {
         }
     }
 
-    @ViewBuilder
-    private var backgroundShape: some View {
-        switch style {
-        case .capsule:
-            Capsule()
-                .fill(Color.black.opacity(0.72))
-                .shadow(color: .black.opacity(0.28), radius: 16, y: 6)
-        case .card:
-            RoundedRectangle(cornerRadius: 10)
-                .fill(Color(white: 0.2).opacity(0.95))
-                .shadow(color: .black.opacity(0.3), radius: 10, y: 4)
-        }
-    }
+}
 
-    @ViewBuilder
-    private var borderShape: some View {
-        switch style {
+private extension TimelineHintBannerStyle {
+    func cornerRadius(scale: CGFloat) -> CGFloat {
+        switch self {
         case .capsule:
-            Capsule()
-                .stroke(Color.white.opacity(0.14), lineWidth: 1)
+            return 999
         case .card:
-            RoundedRectangle(cornerRadius: 10)
-                .stroke(Color.white.opacity(0.15), lineWidth: 1)
+            return 10
         }
     }
 }
@@ -7249,15 +7135,7 @@ private struct RedactionReasonBanner: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
         .frame(maxWidth: 680)
-        .background(
-            RoundedRectangle(cornerRadius: 10)
-                .fill(Color(white: 0.13).opacity(0.94))
-                .shadow(color: .black.opacity(0.3), radius: 10, y: 4)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 10)
-                .stroke(Color.orange.opacity(0.35), lineWidth: 1)
-        )
+        .timelineGlassSurface(.banner, cornerRadius: 10, borderColor: Color.orange.opacity(0.35))
         .allowsHitTesting(false)
         .help("Current frame is redacted")
     }
@@ -11166,15 +11044,11 @@ struct FilterPanel: View {
             .padding(.bottom, 14)
         }
         .frame(width: 360)
-        .background(
+        .retraceMattePanel(addPadding: false, cornerRadius: 16)
+        .overlay(
             RoundedRectangle(cornerRadius: 16)
-                .fill(Color(white: 0.12))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 16)
-                        .stroke(themeBorderColor, lineWidth: 1)
-                )
+                .stroke(themeBorderColor, lineWidth: 1)
         )
-        .shadow(color: .black.opacity(0.4), radius: 30, y: 15)
         .offset(
             x: panelPosition.width + dragOffset.width,
             y: panelPosition.height + dragOffset.height
@@ -12443,16 +12317,8 @@ struct FilterDropdownOverlay: View {
 
                         // Scroll events are handled at TimelineWindowController level
                         dropdownContent
-                            .background(
-                                RoundedRectangle(cornerRadius: 10)
-                                    .fill(Color(white: 0.12))
-                            )
+                            .retraceMattePanel(addPadding: false, cornerRadius: 10)
                             .clipShape(RoundedRectangle(cornerRadius: 10))
-                            .shadow(color: .black.opacity(0.5), radius: 15, y: 8)
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 10)
-                                    .stroke(Color.white.opacity(0.15), lineWidth: 1)
-                            )
                             .fixedSize()
                             .background(
                                 GeometryReader { geo in

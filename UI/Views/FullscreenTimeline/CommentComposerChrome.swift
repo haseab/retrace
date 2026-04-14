@@ -416,7 +416,7 @@ enum CommentTagPickerStyle {
         case .contextMenu:
             return RetraceMenuStyle.backgroundColor
         case .commentOverlay:
-            return Color.black.opacity(0.96)
+            return RetraceMenuStyle.backgroundColor
         }
     }
 
@@ -425,7 +425,7 @@ enum CommentTagPickerStyle {
         case .contextMenu:
             return Color.white.opacity(0.15)
         case .commentOverlay:
-            return Color.white.opacity(0.18)
+            return RetraceMenuStyle.borderColor
         }
     }
 }

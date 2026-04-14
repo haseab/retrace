@@ -1864,7 +1864,7 @@ struct FloatingDateSearchPanel: View {
     @State private var panelPosition: CGSize = .zero
 
     private var placeholderText: String {
-        "e.g. 8 min ago, next Friday, or yesterday 2pm"
+        "e.g. 8 min ago, last Friday, or yesterday 2pm"
     }
 
     private var isCalendarKeyboardSelected: Bool {

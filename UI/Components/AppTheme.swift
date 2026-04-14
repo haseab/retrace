@@ -1241,6 +1241,110 @@ public struct RetraceMenuStyle {
     public static let appearanceAnimation = Animation.easeOut(duration: 0.15)
 }
 
+// MARK: - Timeline Overlay Surface Families
+
+/// Fullscreen timeline overlays must use one of two families:
+/// glass black for transient HUD chrome, or matte dark gray for owned editors/dialogs.
+public enum RetraceTimelineGlassVariant {
+    case chip
+    case banner
+    case panel
+
+    var fillColor: Color {
+        switch self {
+        case .chip:
+            return Color.black.opacity(0.46)
+        case .banner:
+            return Color.black.opacity(0.56)
+        case .panel:
+            return Color.black.opacity(0.4)
+        }
+    }
+
+    var materialOpacity: Double {
+        switch self {
+        case .chip:
+            return 0.9
+        case .banner:
+            return 1.0
+        case .panel:
+            return 1.0
+        }
+    }
+
+    var borderColor: Color {
+        switch self {
+        case .chip:
+            return Color.white.opacity(0.18)
+        case .banner:
+            return Color.white.opacity(0.16)
+        case .panel:
+            return Color.white.opacity(0.15)
+        }
+    }
+
+    var shadowColor: Color {
+        Color.black.opacity(0.5)
+    }
+
+    var shadowRadius: CGFloat {
+        switch self {
+        case .chip:
+            return 12
+        case .banner:
+            return 20
+        case .panel:
+            return 20
+        }
+    }
+
+    var shadowY: CGFloat {
+        switch self {
+        case .chip:
+            return 5
+        case .banner, .panel:
+            return 10
+        }
+    }
+}
+
+public struct RetraceTimelineGlassSurface: ViewModifier {
+    let variant: RetraceTimelineGlassVariant
+    let cornerRadius: CGFloat
+    let borderColorOverride: Color?
+
+    public func body(content: Content) -> some View {
+        content
+            .background(
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .fill(.ultraThinMaterial.opacity(variant.materialOpacity))
+                    .environment(\.colorScheme, .dark)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                            .fill(variant.fillColor)
+                    )
+                    .shadow(
+                        color: variant.shadowColor,
+                        radius: variant.shadowRadius,
+                        y: variant.shadowY
+                    )
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .stroke(borderColorOverride ?? variant.borderColor, lineWidth: 1)
+            )
+    }
+}
+
+public struct RetraceMattePanelSurface: ViewModifier {
+    let cornerRadius: CGFloat
+    let addPadding: Bool
+
+    public func body(content: Content) -> some View {
+        content.retraceMenuContainer(addPadding: addPadding, cornerRadius: cornerRadius)
+    }
+}
+
 // MARK: - Reusable Menu Components
 
 /// Standardized menu button component
@@ -1401,6 +1505,27 @@ extension View {
         cornerRadius: CGFloat = RetraceMenuStyle.cornerRadius
     ) -> some View {
         self.modifier(RetraceMenuContainer(addPadding: addPadding, cornerRadius: cornerRadius))
+    }
+
+    public func timelineGlassSurface(
+        _ variant: RetraceTimelineGlassVariant,
+        cornerRadius: CGFloat,
+        borderColor: Color? = nil
+    ) -> some View {
+        self.modifier(
+            RetraceTimelineGlassSurface(
+                variant: variant,
+                cornerRadius: cornerRadius,
+                borderColorOverride: borderColor
+            )
+        )
+    }
+
+    public func retraceMattePanel(
+        addPadding: Bool = true,
+        cornerRadius: CGFloat = RetraceMenuStyle.cornerRadius
+    ) -> some View {
+        self.modifier(RetraceMattePanelSurface(cornerRadius: cornerRadius, addPadding: addPadding))
     }
 }
 

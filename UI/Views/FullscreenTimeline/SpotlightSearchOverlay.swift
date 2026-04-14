@@ -180,17 +180,12 @@ public struct SpotlightSearchOverlay: View {
                     }
                 }
                 .frame(width: isExpanded ? panelWidth : collapsedWidth)
-                .background(
-                    RoundedRectangle(cornerRadius: 12)
-                        .fill(Color.black.opacity(0.4))
-                        .background(.ultraThinMaterial)
-                )
+                .timelineGlassSurface(.panel, cornerRadius: 12)
                 .clipShape(RoundedRectangle(cornerRadius: 12))
                 .overlay(
                     RoundedRectangle(cornerRadius: 12)
                         .stroke(Color.white.opacity(isExpanded ? 0 : 0.15), lineWidth: 1)
                 )
-                .shadow(color: Color.black.opacity(0.5), radius: 20, y: 10)
                 .overlay(alignment: .top) {
                     recentEntriesPopover
                         .offset(y: isRecentEntriesPopoverVisible ? 58 : 50)
@@ -835,17 +830,8 @@ public struct SpotlightSearchOverlay: View {
             .padding(.bottom, 10)
         }
         .frame(width: collapsedWidth - 8, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 12)
-                .fill(Color.black.opacity(0.4))
-                .background(.ultraThinMaterial)
-        )
+        .timelineGlassSurface(.panel, cornerRadius: 12)
         .clipShape(RoundedRectangle(cornerRadius: 12))
-        .overlay(
-            RoundedRectangle(cornerRadius: 12)
-                .stroke(Color.white.opacity(0.15), lineWidth: 1)
-        )
-        .shadow(color: Color.black.opacity(0.5), radius: 20, y: 10)
     }
 
     private func recentEntryRelativeTimeText(for entry: SearchViewModel.RecentSearchEntry) -> String {
