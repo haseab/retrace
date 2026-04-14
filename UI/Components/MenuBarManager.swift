@@ -70,6 +70,12 @@ public class MenuBarManager: ObservableObject {
         return max(0, Int(ceil(scheduledResumeDate.timeIntervalSinceNow)))
     }
 
+    public var ghostAppDebugSummary: String {
+        let hasButton = statusItem?.button != nil
+        let isVisible = statusItem?.isVisible ?? false
+        return "menuBarEnabled=\(isMenuBarIconEnabled) hasStatusItem=\(statusItem != nil) hasButton=\(hasButton) isVisible=\(isVisible)"
+    }
+
     struct CaptureFeedbackEventDecision: Equatable {
         let shouldAnimateImmediately: Bool
         let shouldQueueReplay: Bool
@@ -143,11 +149,13 @@ public class MenuBarManager: ObservableObject {
         // Don't create status item if menu bar icon is disabled
         guard isMenuBarIconEnabled else {
             Log.debug("[MenuBarLifecycle] setup skipped: menu bar icon disabled", category: .ui)
+            Log.info("[GhostAppCheck] MenuBarManager.setup skipped \(ghostAppDebugSummary)", category: .ui)
             return
         }
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         Log.debug("[MenuBarLifecycle] status item created", category: .ui)
+        Log.info("[GhostAppCheck] MenuBarManager.setup created status item \(ghostAppDebugSummary)", category: .ui)
 
         if statusItem?.button != nil {
             // Start with icon showing current recording state
@@ -156,6 +164,7 @@ public class MenuBarManager: ObservableObject {
             setupStatusClickMonitors()
         } else {
             Log.error("[MenuBarLifecycle] status item button missing after creation", category: .ui)
+            Log.error("[GhostAppCheck] MenuBarManager.setup missing status item button \(ghostAppDebugSummary)", category: .ui)
         }
 
         // Load shortcuts then setup menu and hotkeys
@@ -1591,8 +1600,11 @@ public class MenuBarManager: ObservableObject {
     public func show() {
         isMenuBarIconEnabled = true
         DispatchQueue.main.async {
+            Log.info("[GhostAppCheck] MenuBarManager.show requested \(self.ghostAppDebugSummary)", category: .ui)
             if self.statusItem == nil {
                 self.setup()
+            } else {
+                Log.info("[GhostAppCheck] MenuBarManager.show reused existing status item \(self.ghostAppDebugSummary)", category: .ui)
             }
         }
     }
@@ -1601,12 +1613,14 @@ public class MenuBarManager: ObservableObject {
     public func hide() {
         isMenuBarIconEnabled = false
         DispatchQueue.main.async {
+            Log.info("[GhostAppCheck] MenuBarManager.hide requested \(self.ghostAppDebugSummary)", category: .ui)
             self.hasPendingCapturePulse = false
             self.teardownStatusClickMonitors()
             if let item = self.statusItem {
                 NSStatusBar.system.removeStatusItem(item)
                 self.statusItem = nil
             }
+            Log.info("[GhostAppCheck] MenuBarManager.hide completed \(self.ghostAppDebugSummary)", category: .ui)
         }
     }
 

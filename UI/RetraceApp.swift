@@ -351,6 +351,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func beginPostSingleInstanceLaunchSetup() {
         TextInputContextMenuAutofillFilter.install()
         setupExternalDashboardRevealObserver()
+        setupGhostAppLoggingObservers()
         installMainMenuIfNeeded(force: true)
         applyDockIconVisibilityPreference()
         finishApplicationLaunch()
@@ -924,6 +925,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         Task { @MainActor in
             Log.info("[LaunchSurface] applicationShouldHandleReopen hasVisibleWindows=\(flag) state=\(launchSurfaceStateSnapshot())", category: .app)
+            logGhostAppCheck("applicationShouldHandleReopen hasVisibleWindows=\(flag)")
             requestDashboardReveal(source: "applicationShouldHandleReopen")
         }
         return true
@@ -935,6 +937,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             CrashRecoveryManager.shared.refreshUserFacingStatus()
             let shouldReveal = shouldRevealDashboardForActivation()
             Log.info("[LaunchSurface] applicationDidBecomeActive shouldReveal=\(shouldReveal) state=\(launchSurfaceStateSnapshot())", category: .app)
+            logGhostAppCheck("applicationDidBecomeActive shouldReveal=\(shouldReveal)")
 
             guard shouldReveal, !isActivationRevealInFlight else { return }
 
@@ -2336,6 +2339,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @MainActor
     private func requestDashboardReveal(source: String) {
+        logGhostAppCheck("requestDashboardReveal start source=\(source)")
         if isInitialized {
             Log.info("[LaunchSurface] requestDashboardReveal source=\(source) before state=\(launchSurfaceStateSnapshot())", category: .app)
 
@@ -2350,6 +2354,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if dashboard.isVisible {
                 dashboard.bringToFront()
                 Log.info("[LaunchSurface] Brought dashboard to front source=\(source) appWasHidden=\(wasHidden) after state=\(launchSurfaceStateSnapshot())", category: .app)
+                logGhostAppCheck("requestDashboardReveal bringToFront source=\(source)")
                 recordLaunchSurfaceRevealMetric(
                     source: source,
                     action: "bring_to_front",
@@ -2359,6 +2364,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             } else {
                 dashboard.show()
                 Log.info("[LaunchSurface] Called dashboard.show source=\(source) appWasHidden=\(wasHidden) after state=\(launchSurfaceStateSnapshot())", category: .app)
+                logGhostAppCheck("requestDashboardReveal show source=\(source)")
                 recordLaunchSurfaceRevealMetric(
                     source: source,
                     action: "show_dashboard",
@@ -2369,6 +2375,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             shouldShowDashboardAfterInitialization = true
             Log.info("[LaunchSurface] Queued dashboard reveal until initialization source=\(source) state=\(launchSurfaceStateSnapshot())", category: .app)
+            logGhostAppCheck("requestDashboardReveal queued source=\(source)")
             recordLaunchSurfaceRevealMetric(
                 source: source,
                 action: "queued_until_initialized",
@@ -2437,10 +2444,90 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         )
     }
 
+    private func setupGhostAppLoggingObservers() {
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleGhostAppDashboardDidClose(_:)),
+            name: .dashboardDidClose,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleGhostAppTimelineDidClose(_:)),
+            name: .timelineDidClose,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleGhostAppApplicationDidHide(_:)),
+            name: NSApplication.didHideNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleGhostAppApplicationDidUnhide(_:)),
+            name: NSApplication.didUnhideNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleGhostAppWindowDidBecomeKey(_:)),
+            name: NSWindow.didBecomeKeyNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleGhostAppWindowWillClose(_:)),
+            name: NSWindow.willCloseNotification,
+            object: nil
+        )
+    }
+
     @objc private func handleExternalDashboardRevealNotification(_ notification: Notification) {
         Task { @MainActor in
             Log.info("[LaunchSurface] Received external dashboard reveal notification state=\(launchSurfaceStateSnapshot())", category: .app)
+            logGhostAppCheck("external dashboard reveal notification")
             requestDashboardReveal(source: "externalDashboardRevealNotification")
+        }
+    }
+
+    @objc private func handleGhostAppDashboardDidClose(_ notification: Notification) {
+        Task { @MainActor in
+            logGhostAppCheck("notification dashboardDidClose")
+        }
+    }
+
+    @objc private func handleGhostAppTimelineDidClose(_ notification: Notification) {
+        Task { @MainActor in
+            logGhostAppCheck("notification timelineDidClose")
+        }
+    }
+
+    @objc private func handleGhostAppApplicationDidHide(_ notification: Notification) {
+        Task { @MainActor in
+            logGhostAppCheck("notification applicationDidHide")
+        }
+    }
+
+    @objc private func handleGhostAppApplicationDidUnhide(_ notification: Notification) {
+        Task { @MainActor in
+            logGhostAppCheck("notification applicationDidUnhide")
+        }
+    }
+
+    @objc private func handleGhostAppWindowDidBecomeKey(_ notification: Notification) {
+        Task { @MainActor in
+            logGhostAppCheck(
+                "notification windowDidBecomeKey window=\(ghostAppWindowDescription(notification.object as? NSWindow))"
+            )
+        }
+    }
+
+    @objc private func handleGhostAppWindowWillClose(_ notification: Notification) {
+        Task { @MainActor in
+            logGhostAppCheck(
+                "notification windowWillClose window=\(ghostAppWindowDescription(notification.object as? NSWindow))"
+            )
         }
     }
 
@@ -2454,6 +2541,25 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let windowMain = window?.isMainWindow ?? false
 
         return "initialized=\(isInitialized) appHidden=\(NSApp.isHidden) appActive=\(NSApp.isActive) dashboardVisible=\(dashboard.isVisible) windowVisible=\(windowVisible) windowKey=\(windowKey) windowMain=\(windowMain) windowMini=\(windowMini)"
+    }
+
+    @MainActor
+    private func ghostAppStateSnapshot() -> String {
+        let menuBarSummary = menuBarManager?.ghostAppDebugSummary ?? MenuBarManager.shared?.ghostAppDebugSummary ?? "menuBarManager=nil"
+        let visibleWindows = NSApp.windows.filter(\.isVisible).map { ghostAppWindowDescription($0) }
+        return "initialized=\(isInitialized) appHidden=\(NSApp.isHidden) appActive=\(NSApp.isActive) terminationDecision=\(isTerminationDecisionInProgress) terminationFlush=\(isTerminationFlushInProgress) dashboardVisible=\(DashboardWindowController.shared.isVisible) timelineVisible=\(TimelineWindowController.shared.isVisible) pauseReminderVisible=\(PauseReminderWindowController.shared.isVisible) quickCommentVisible=\(StandaloneCommentComposerWindowController.shared.isVisible) quickCommentPending=\(StandaloneCommentComposerWindowController.shared.isPresentationPending) systemMonitorVisible=\(SystemMonitorWindowController.shared.isVisible) keyWindow=\(ghostAppWindowDescription(NSApp.keyWindow)) mainWindow=\(ghostAppWindowDescription(NSApp.mainWindow)) visibleWindows=\(visibleWindows) \(menuBarSummary)"
+    }
+
+    @MainActor
+    private func ghostAppWindowDescription(_ window: NSWindow?) -> String {
+        guard let window else { return "nil" }
+        let title = window.title.isEmpty ? "<untitled>" : window.title
+        return "\(type(of: window))(title=\(title),visible=\(window.isVisible),mini=\(window.isMiniaturized),key=\(window.isKeyWindow),main=\(window.isMainWindow),level=\(window.level.rawValue),alpha=\(String(format: "%.2f", window.alphaValue)))"
+    }
+
+    @MainActor
+    private func logGhostAppCheck(_ event: String) {
+        Log.info("[GhostAppCheck] \(event) state=\(ghostAppStateSnapshot())", category: .app)
     }
 
     @MainActor
@@ -2499,6 +2605,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             NotificationCenter.default.removeObserver(lowPowerModeObserver)
             self.lowPowerModeObserver = nil
         }
+        NotificationCenter.default.removeObserver(self)
         DistributedNotificationCenter.default().removeObserver(self)
         ProcessCPUMonitor.shared.stop()
         HotkeyManager.shared.shutdown()

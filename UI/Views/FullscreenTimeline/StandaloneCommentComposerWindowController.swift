@@ -137,6 +137,7 @@ final class StandaloneCommentComposerWindowController: NSObject {
                 self.window = nil
                 self.viewModel = nil
                 self.cleanupPresentationState()
+                Log.info("[GhostAppCheck] quick comment composer hidden appHidden=\(NSApp.isHidden) appActive=\(NSApp.isActive)", category: .ui)
             }
         })
     }

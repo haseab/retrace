@@ -135,6 +135,7 @@ public class PauseReminderWindowController: NSObject, ObservableObject {
             Task { @MainActor [weak self] in
                 window.orderOut(nil)
                 self?.window = nil
+                Log.info("[GhostAppCheck] pause reminder hidden appHidden=\(NSApp.isHidden) appActive=\(NSApp.isActive)", category: .ui)
             }
         })
 
