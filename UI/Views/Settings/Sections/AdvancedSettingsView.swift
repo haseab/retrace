@@ -126,11 +126,7 @@ extension SettingsView {
                 isOn: $enableFrameIDSearch
             )
 
-            ModernToggleRow(
-                title: "Show OCR debug overlay",
-                subtitle: "Display OCR bounding boxes and tile grid in timeline",
-                isOn: $showOCRDebugOverlay
-            )
+            // Temporarily disabled while overlay diffing behavior is under investigation.
 
             Divider()
                 .padding(.vertical, 8)

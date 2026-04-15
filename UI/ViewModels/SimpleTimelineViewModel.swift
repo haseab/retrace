@@ -1188,8 +1188,8 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Whether to show OCR debug overlay (bounding boxes and tile grid) in timeline (read from UserDefaults)
     public var showOCRDebugOverlay: Bool {
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
-        return defaults.bool(forKey: "showOCRDebugOverlay")
+        // Temporarily disabled while overlay diffing behavior is under investigation.
+        false
     }
 
     /// Whether to show video segment boundaries on the timeline tape
