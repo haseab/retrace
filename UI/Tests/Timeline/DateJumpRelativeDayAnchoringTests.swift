@@ -114,8 +114,7 @@ final class DateJumpRelativeDayAnchoringTests: XCTestCase {
     func testDaysAgoPreservesAndAppliesActiveFilters() async {
         let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
         let expectedFilters = FilterCriteria(selectedApps: ["com.apple.Safari"])
-        viewModel.filterCriteria = expectedFilters
-        viewModel.pendingFilterCriteria = expectedFilters
+        viewModel.replaceAppliedAndPendingFilterCriteria(expectedFilters)
 
         var anchorFilters: [FilterCriteria] = []
         var windowFilters: [FilterCriteria] = []
@@ -264,8 +263,7 @@ final class DateJumpRelativeDayAnchoringTests: XCTestCase {
     func testHoursAgoUsesFirstFrameInRecentLookbackWindowWithinActiveFilters() async {
         let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
         let expectedFilters = FilterCriteria(selectedApps: ["com.apple.Safari"])
-        viewModel.filterCriteria = expectedFilters
-        viewModel.pendingFilterCriteria = expectedFilters
+        viewModel.replaceAppliedAndPendingFilterCriteria(expectedFilters)
 
         var sawLookbackAnchorFetch = false
         var sawWindowFetch = false

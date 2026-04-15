@@ -25,7 +25,7 @@ final class DateJumpFrameIDFallbackTests: XCTestCase {
         var cancellables = Set<AnyCancellable>()
         var didAttemptFrameLookup = false
 
-        viewModel.$error
+        viewModel.errorPublisher
             .compactMap { $0 }
             .sink { observedErrors.append($0) }
             .store(in: &cancellables)

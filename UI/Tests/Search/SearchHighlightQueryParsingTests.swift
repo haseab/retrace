@@ -14,8 +14,7 @@ final class SearchHighlightQueryParsingTests: XCTestCase {
             makeNode(id: 2, text: "Create a feature branch"),
             makeNode(id: 3, text: "Feature quickly")
         ]
-        viewModel.searchHighlightQuery = "create a feature"
-        viewModel.isShowingSearchHighlight = true
+        showHighlight("create a feature", on: viewModel)
 
         let matches = viewModel.searchHighlightNodes
 
@@ -31,8 +30,7 @@ final class SearchHighlightQueryParsingTests: XCTestCase {
             makeNode(id: 2, text: "Error handler"),
             makeNode(id: 3, text: "Message handler")
         ]
-        viewModel.searchHighlightQuery = "error message"
-        viewModel.isShowingSearchHighlight = true
+        showHighlight("error message", on: viewModel)
 
         let matches = viewModel.searchHighlightNodes
 
@@ -46,8 +44,7 @@ final class SearchHighlightQueryParsingTests: XCTestCase {
             makeNode(id: 2, text: "Launch checklist"),
             makeNode(id: 3, text: "Status table")
         ]
-        viewModel.searchHighlightQuery = "create a feature, launch"
-        viewModel.isShowingSearchHighlight = true
+        showHighlight("create a feature, launch", on: viewModel)
 
         let matches = viewModel.searchHighlightNodes
 
@@ -62,8 +59,7 @@ final class SearchHighlightQueryParsingTests: XCTestCase {
             makeNode(id: 2, text: "Launch checklist"),
             makeNode(id: 3, text: "Status table")
         ]
-        viewModel.searchHighlightQuery = "  create a feature  ,   launch   "
-        viewModel.isShowingSearchHighlight = true
+        showHighlight("  create a feature  ,   launch   ", on: viewModel)
 
         let matches = viewModel.searchHighlightNodes
 
@@ -78,8 +74,7 @@ final class SearchHighlightQueryParsingTests: XCTestCase {
             makeNode(id: 3, text: "Error", x: 0.10, y: 0.22),
             makeNode(id: 4, text: "handler", x: 0.24, y: 0.23)
         ]
-        viewModel.searchHighlightQuery = "error, message, handler"
-        viewModel.isShowingSearchHighlight = true
+        showHighlight("error, message, handler", on: viewModel)
 
         let lines = viewModel.highlightedSearchTextLines()
 
@@ -91,8 +86,7 @@ final class SearchHighlightQueryParsingTests: XCTestCase {
         viewModel.ocrNodes = [
             makeNode(id: 1, text: "Fatal error occurred")
         ]
-        viewModel.searchHighlightQuery = "error"
-        viewModel.isShowingSearchHighlight = true
+        showHighlight("error", on: viewModel)
 
         let matches = viewModel.searchHighlightNodes
 
@@ -107,8 +101,7 @@ final class SearchHighlightQueryParsingTests: XCTestCase {
         viewModel.ocrNodes = [
             makeNode(id: 1, text: "Fatal error occurred")
         ]
-        viewModel.searchHighlightQuery = "\"error occurred\""
-        viewModel.isShowingSearchHighlight = true
+        showHighlight("\"error occurred\"", on: viewModel)
 
         let matches = viewModel.searchHighlightNodes
 
@@ -147,6 +140,14 @@ final class SearchHighlightQueryParsingTests: XCTestCase {
             width: 0.3,
             height: 0.1,
             text: text
+        )
+    }
+
+    private func showHighlight(_ query: String, on viewModel: SimpleTimelineViewModel) {
+        viewModel.showSearchHighlight(
+            query: query,
+            mode: .matchedTextRanges,
+            delay: 0
         )
     }
 }

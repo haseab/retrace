@@ -28,7 +28,7 @@ final class TimelineBoundaryNewerFallbackTests: XCTestCase {
             )
         ]
         viewModel.currentIndex = 1
-        viewModel.filterCriteria = FilterCriteria()
+        viewModel.setAppliedFilterCriteria(FilterCriteria())
         viewModel.test_setBoundaryPaginationState(hasMoreOlder: false, hasMoreNewer: true)
         viewModel.test_updateWindowBoundaries()
 
@@ -99,7 +99,7 @@ final class TimelineBoundaryNewerFallbackTests: XCTestCase {
             )
         ]
         viewModel.currentIndex = 1
-        viewModel.filterCriteria = FilterCriteria()
+        viewModel.setAppliedFilterCriteria(FilterCriteria())
         viewModel.test_setBoundaryPaginationState(hasMoreOlder: false, hasMoreNewer: true)
         viewModel.test_updateWindowBoundaries()
 
@@ -144,7 +144,7 @@ final class TimelineBoundaryNewerFallbackTests: XCTestCase {
             )
         ]
         viewModel.currentIndex = 1
-        viewModel.filterCriteria = FilterCriteria()
+        viewModel.setAppliedFilterCriteria(FilterCriteria())
         viewModel.test_setBoundaryPaginationState(hasMoreOlder: false, hasMoreNewer: true)
         viewModel.test_updateWindowBoundaries()
 
@@ -154,7 +154,7 @@ final class TimelineBoundaryNewerFallbackTests: XCTestCase {
             XCTAssertTrue(reason.contains("loadNewerFrames.reason=test"))
 
             // Simulate filter toggle while query is in flight.
-            viewModel.filterCriteria = FilterCriteria(selectedApps: ["com.apple.Terminal"])
+            viewModel.setAppliedFilterCriteria(FilterCriteria(selectedApps: ["com.apple.Terminal"]))
 
             return [
                 self.makeFrameWithVideoInfo(

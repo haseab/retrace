@@ -21,7 +21,7 @@ final class TimelineFilteredEmptyStateTests: XCTestCase {
         ]
         viewModel.currentIndex = 0
         viewModel.currentImage = NSImage(size: NSSize(width: 12, height: 12))
-        viewModel.filterCriteria = FilterCriteria(selectedApps: ["com.google.Chrome"])
+        viewModel.setAppliedFilterCriteria(FilterCriteria(selectedApps: ["com.google.Chrome"]))
 
         viewModel.test_refreshFrameDataHooks.getMostRecentFramesWithVideoInfo = { limit, filters in
             XCTAssertGreaterThan(limit, 0)

@@ -11,7 +11,7 @@ Retrace is a local-first screen recording and search application for macOS, insp
 ## Quick Reference
 
 - **Module-Specific Instructions**: Each module has its own `AGENTS.md` file in its directory
-- **Human Documentation**: [README.md](README.md), [CONTRIBUTING.md](CONTRIBUTING.md), and [AI_ISSUE_TEMPLATE.md](AI_ISSUE_TEMPLATE.md)
+- **Human Documentation**: [README.md](README.md), [CONTRIBUTING.md](CONTRIBUTING.md), [AI_ISSUE_TEMPLATE.md](AI_ISSUE_TEMPLATE.md), and [TODO.MD](TODO.MD)
 - **Issue Reporting**: Use `AI_ISSUE_TEMPLATE.md` and `gh issue create --body-file ...` for AI-authored GitHub issues
 - **Bug Fixes by Non-Owners**: If the user is fixing a bug/crash and does not appear to be the repo owner, encourage them to create or link a GitHub issue before making code changes
 - **Technical Audit Docs**: `local/docs/` (includes deep-dive implementation and performance audit notes)
@@ -53,6 +53,7 @@ retrace/
 │   └── ISSUE_TEMPLATE/
 │       └── bug_report.yml       # GitHub bug report form aligned with AI issue template
 ├── AI_ISSUE_TEMPLATE.md         # Canonical markdown template for AI-authored bug reports
+├── TODO.MD                      # Migration plan for refactoring the fullscreen timeline view and view model
 ├── README.md                    # Human-readable project overview
 ├── CONTRIBUTING.md              # Contribution guidelines
 ├── Package.swift                # Swift Package Manager configuration

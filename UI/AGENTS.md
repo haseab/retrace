@@ -9,160 +9,120 @@ You are the **UI** agent responsible for building the SwiftUI interface for Retr
 ```
 UI/
 ├── Assets.xcassets/
-│   ├── AppIcon.appiconset/             # App icon assets
-│   ├── CreatorProfile.imageset/        # Creator profile image shown in onboarding/milestones
-│   ├── InPageURLInstructions.imageset/ # Settings screenshot for Chromium browser in-page URL setup
-│   ├── SafariInPageURLMenu.imageset/   # Safari screenshot: open Develop > Developer Settings
-│   ├── SafariInPageURLToggle.imageset/ # Safari screenshot: enable Allow JavaScript from Apple Events
-│   └── SafariInPageURLAllow.imageset/  # Safari screenshot: confirmation dialog with Allow button
+│   └── ...                             # App assets and onboarding/settings screenshots
 ├── Views/
-│   ├── Timeline/
-│   │   ├── TimelineView.swift           # Main timeline scrubber
-│   │   ├── TimelineBar.swift            # Horizontal scrollable bar
-│   │   ├── FrameThumbnail.swift         # Individual frame preview
-│   │   └── SessionIndicator.swift       # App session markers
 │   ├── FullscreenTimeline/
-│   │   ├── SpotlightSearchOverlay.swift # Primary search overlay UI
-│   │   ├── SearchFilterBar.swift        # Search filters and controls
-│   │   ├── CommentComposerChrome.swift  # Shared header/button/chip/editor chrome for timeline and quick-comment composers
-│   │   ├── CommentContextPreviewCard.swift # Shared context-preview card used by timeline and quick-comment composers
-│   │   ├── StandaloneCommentComposerWindowController.swift # Floating quick-comment window controller
-│   │   └── StandaloneQuickCommentView.swift # Dedicated standalone quick-comment UI
-│   ├── Dashboard/
-│   │   ├── DashboardView.swift          # Main dashboard
-│   │   ├── ChangelogView.swift          # Appcast-powered release notes view
-│   │   ├── AnalyticsCard.swift          # Stats widgets
-│   │   ├── MigrationPanel.swift         # Import UI
-│   │   └── SupportLink.swift            # Twitter/support
-│   ├── Feedback/
-│   │   ├── FeedbackFormView.swift       # Feedback sheet with form, sending, and success states
-│   │   ├── FeedbackDiagnosticsPresentation.swift # Feedback diagnostics section building + readable formatting helpers
-│   │   ├── FeedbackModels.swift         # Feedback launch context, diagnostics, and payload models
-│   │   ├── FeedbackSubmissionExport.swift # Feedback export text/JSON generation + filtered payload builder
-│   │   ├── FeedbackCrashCompaction.swift # Crash-report compaction helpers for feedback exports/submissions
-│   │   ├── FeedbackCompression.swift    # Shared gzip compression utility for feedback payloads/exports
-│   │   ├── FeedbackDiagnosticsCollector.swift # Diagnostic snapshot collection helpers (system/settings/perf/memory summaries)
-│   │   ├── FeedbackLogSnapshotter.swift # Log-tail filtering/grouping/snapshot helpers for feedback diagnostics
-│   │   ├── FeedbackSubmissionTransport.swift # Feedback submission request construction + network transport helpers
-│   │   ├── FeedbackExportIO.swift      # Screenshot capture and feedback diagnostics/report export file I/O
-│   │   └── FeedbackService.swift        # Feedback submission and export implementation
-│   └── Settings/
-│       ├── SettingsView.swift           # Thin settings shell hosting navigation, alerts, and top-level wiring
-│       ├── SettingsSidebar.swift        # Sidebar navigation + content header
-│       ├── SettingsSearchOverlay.swift  # Cmd+K overlay and card routing
-│       ├── SettingsDefaults.swift       # Shared settings defaults + master-key setup support types
-│       ├── SettingsTab.swift            # Tab metadata and reset routing
-│       ├── SettingsSearchEntry.swift    # Search index entry model
-│       ├── SettingsSearchField.swift    # AppKit-backed search field
-│       ├── SettingsShortcutCaptureField.swift # Global shortcut recorder
-│       ├── SettingsCard.swift           # Shared settings card container
-│       ├── ExcludedAppChip.swift        # App exclusion chip
-│       ├── RetentionAppsChip.swift      # Retention app exclusion chip
-│       ├── RetentionTagsChip.swift      # Retention tag exclusion chip
-│       ├── FlowLayout.swift             # Flow layout helper for settings chips
-│       ├── DatabaseSchemaView.swift     # Database schema sheet content
-│       ├── InPageURLInstructionViews.swift # Reusable in-page URL instructions UI
-│       └── Sections/
-│           ├── GeneralSettingsView.swift
-│           ├── GeneralSettingsActions.swift
-│           ├── CaptureSettingsView.swift
-│           ├── CaptureSettingsActions.swift
-│           ├── InPageURLCollectionSettingsView.swift
-│           ├── InPageURLTargetSettingsActions.swift
-│           ├── InPageURLVerificationSettingsActions.swift
-│           ├── InPageURLVerificationScriptActions.swift
-│           ├── StorageSettingsView.swift
-│           ├── ExportDataSettingsView.swift
-│           ├── PrivacySettingsView.swift
-│           ├── PrivacyMasterKeyActions.swift
-│           ├── PrivacySettingsActions.swift
-│           ├── PhraseLevelRedactionSettingsView.swift
-│           ├── PrivateModeAutomationSettingsView.swift
-│           ├── PowerSettingsView.swift
-│           ├── TagManagementSettingsView.swift
-│           ├── AdvancedSettingsView.swift
-│           ├── SettingsFeedbackActions.swift
-│           ├── SettingsUtilityActions.swift
-│           └── SettingsLaunchAndResetActions.swift
+│   │   ├── SimpleTimelineView.swift          # Fullscreen timeline screen shell and frame-surface composition
+│   │   ├── TimelineWindowController.swift    # Window lifecycle, AppKit monitor ownership, and top-level input routing
+│   │   ├── TimelineWindowController+Presentation.swift
+│   │   ├── TimelineWindowController+WindowSetup.swift
+│   │   ├── TimelineWindowController+InputHandling.swift
+│   │   ├── TimelineWindowController+KeyboardShortcuts.swift
+│   │   ├── TimelineWindowController+KeyboardSupport.swift
+│   │   ├── TimelineTapeView.swift            # Tape rendering, playhead controls, date-jump overlays, and tape-local interaction
+│   │   ├── TimelineSegmentContextMenu.swift  # Tape context menu shell, geometry helpers, and shared tag submenu
+│   │   ├── Comment subsystem:
+│   │   │   ├── TimelineCommentSubmenu.swift         # Comment submenu shell
+│   │   │   ├── TimelineCommentAllCommentsHost.swift # All-comments browser host
+│   │   │   ├── TimelineCommentCards.swift           # Comment cards and presentation helpers
+│   │   │   └── CommentMarkdownEditor.swift
+│   │   ├── Filter subsystem:
+│   │   │   ├── TimelineFilterPanel.swift
+│   │   │   ├── TimelineFilterDropdownHost.swift
+│   │   ├── Search/preview shells:
+│   │   │   ├── SpotlightSearchOverlay.swift
+│   │   │   ├── SpotlightSearchOverlay+RecentEntries.swift
+│   │   │   ├── SpotlightSearchOverlay+Results.swift
+│   │   │   ├── SpotlightSearchOverlay+Components.swift
+│   │   │   └── SearchFilterBar.swift
+│   │   └── Quick comment / shared comment chrome:
+│   │       ├── StandaloneQuickCommentView.swift
+│   │       ├── StandaloneCommentComposerWindowController.swift
+│   │       ├── CommentComposerChrome.swift
+│   │       └── CommentContextPreviewCard.swift
+│   ├── Dashboard/                           # Dashboard views and analytics widgets
+│   ├── Feedback/                            # Feedback form, diagnostics, export, and submission
+│   └── Settings/                            # Settings shell, sections, and settings-only components
 ├── CrashRecoveryHelper/
-│   └── main.swift                       # Bundled launch-agent XPC helper supervising unexpected app termination
+│   └── main.swift                           # Bundled launch-agent XPC helper supervising unexpected app termination
 ├── CrashRecoverySupport/
-│   └── CrashRecoverySupport.swift       # Shared crash-recovery constants, disconnect suppression, and XPC protocol
+│   └── CrashRecoverySupport.swift           # Shared crash-recovery constants and XPC protocol
 ├── LaunchAgents/
 │   └── io.retrace.app.crash-recovery.plist # SMAppService launch-agent plist for crash recovery
 ├── Components/
-│   ├── MasterKeyRedactionFlowCoordinator.swift # Shared missing-master-key prompt/recovery coordinator
-│   ├── BoundingBoxOverlay.swift         # Text region highlighting
-│   ├── CrashRecoveryManager.swift       # App-side SMAppService/XPC lifecycle manager
-│   ├── SessionTimeline.swift            # App session visualization
-│   ├── DeeplinkHandler.swift            # URL scheme routing
-│   ├── LaunchMenuRouting.swift          # Shared dashboard/timeline/settings/system-monitor routing and frontmost-window checks for app/status menus
-│   ├── AppMetadataCache.swift           # App name/icon lookup caches and app icon view
-│   ├── FaviconProvider.swift            # Favicon memory+disk cache and favicon view
-│   ├── FocusableTextInputSupport.swift  # Shared AppKit-backed text input wrapper and right-click deferral helpers for borderless UI surfaces
-│   ├── ProcessCPUMonitor.swift          # Shared process CPU+memory sampler + 24h aggregation service
-│   ├── ProcessMemoryCardPresentation.swift # Local presentation controller + row builder for memory monitor card
-│   ├── ProcessMonitorModels.swift       # System Monitor snapshot/models + ranking/build helpers
-│   ├── HoverLatchedScrollMonitor.swift  # Shared nested-scroll latch helper for hover-routed inner scroll regions
-│   ├── ProcessCPUSummaryCard.swift      # System Monitor CPU table/card UI
-│   ├── ProcessMemorySummaryCard.swift   # System Monitor memory table/card UI
-│   ├── RetraceAboutPanel.swift          # Custom About panel content and window factory used by the app menu
-│   └── UIMemoryEstimators.swift         # Shared UI memory-estimation helpers for telemetry
+│   └── ...                                 # Shared UI components, caches, routing, monitoring, and about/metrics helpers
 ├── ViewModels/
-│   ├── SimpleTimelineViewModel.swift    # Fullscreen timeline state, caching, playback, filters, OCR overlays
-│   ├── SearchViewModel.swift
-│   ├── DashboardViewModel.swift
-│   ├── DashboardViewModel+Metrics.swift # Extracted dashboard/timeline/system-monitor metric recording helpers
-│   ├── TimelineMetrics.swift         # Timeline-scoped daily_metrics helpers and shared UI metric recorder glue
-│   ├── TimelineYouTubeLinkSupport.swift # Shared YouTube timestamping + OCR markdown-link extraction helpers for timeline flows
-│   ├── UIMetricsRecorder.swift       # Shared UI metric recording + JSON payload helpers
-│   ├── CrashRecoveryBannerModel.swift   # Dashboard-facing banner state derived from crash recovery manager status
-│   ├── CommentComposerTargetDisplayInfo.swift # Shared display metadata/title logic for timeline and quick-comment composers
-│   ├── FeedbackViewModel.swift          # Feedback form state, diagnostics, export, submission
-│   ├── FeedbackSubmissionProgress.swift # Feedback submission stage copy/progress metadata
-│   ├── QuickCommentComposerViewModel.swift # Standalone quick-comment target, tag, attachment, and submit state
-│   ├── SettingsViewModel.swift
+│   ├── SimpleTimelineViewModel.swift      # Fullscreen timeline coordinator over stores plus inline media/overlay/chrome owners
+│   ├── SimpleTimelineViewModel+SearchPanels.swift # Date search, in-frame search, and search overlay actions
+│   ├── SimpleTimelineViewModel+SelectionHints.swift # Text selection and timeline hint/banner flows
+│   ├── SimpleTimelineViewModel+OCRLive.swift # OCR loading, redaction reveals, polling, and live OCR flows
+│   ├── SimpleTimelineViewModel+ZoomRegion.swift # Zoom-region entry/exit, drag snapshot, and focus-region state
+│   ├── SimpleTimelineViewModel+SelectionGeometry.swift # OCR selection geometry, visible ranges, and selection mapping
+│   ├── SimpleTimelineViewModel+SelectionCopy.swift # Selected-text and zoomed-image copy flows
+│   ├── SimpleTimelineViewModel+SearchHighlight.swift # In-frame search highlight matching and highlight text export
+│   ├── SimpleTimelineViewModel+Hyperlinks.swift # Browser URL actions, hyperlink resolution, and in-page link metrics
+│   ├── SimpleTimelineViewModel+ContextMenus.swift # Timeline/menu state, submenu routing, and context-menu presentation
+│   ├── SimpleTimelineViewModel+FilterPanels.swift # Filter dropdowns, panel state, criteria application, and cache flows
+│   ├── SimpleTimelineViewModel+CalendarDateSearch.swift # Calendar picker, date jump, and frame-ID search flows
+│   ├── SimpleTimelineViewModel+Chrome.swift # Chrome controls, toasts, and error presentation helpers
+│   ├── SimpleTimelineViewModel+Navigation.swift # Navigation, search-result jumps, and input routing
+│   ├── SimpleTimelineViewModel+Diagnostics.swift # Diagnostics, metrics, and memory ledger helpers
+│   ├── SimpleTimelineViewModel+SelectionDeletion.swift # Frame selection, block lookup, and optimistic delete flows
+│   ├── SimpleTimelineViewModel+SegmentCommentsTags.swift # Block comment loading, segment hide/unhide, and tag mutation flows
+│   ├── SimpleTimelineViewModel+CommentWorkflows.swift # Comment composer, attachments, preview, and all-comments timeline flows
+│   ├── SimpleTimelineViewModel+TimelineContextActions.swift # Timeline context-menu delete/filter actions
+│   ├── SimpleTimelineViewModel+Presentation.swift # Frame presentation, overlays, and foreground load decisions
+│   ├── SimpleTimelineViewModel+ComputedProperties.swift # Derived playhead/media/tape computed properties
+│   ├── SimpleTimelineViewModel+AppBlocks.swift # App-block snapshot ownership and tag-indicator snapshot invalidation
+│   ├── SimpleTimelineViewModel+DiskFrameBuffer.swift # Disk frame buffer lifecycle, buffer I/O, and visibility cleanup
+│   ├── SimpleTimelineViewModel+LoadingCoordinator.swift # Loading state, presentation-work gating, and overlay refresh coordination
+│   ├── SimpleTimelineViewModel+FrameFetchQueries.swift # Timeline window fetch logging and pending-delete compensation
+│   ├── SimpleTimelineViewModel+ReloadAndInitialLoad.swift # Data-source reloads, initial load, direct-load, and refresh-window flows
+│   ├── SimpleTimelineViewModel+PresentationState.swift # Current-frame presentation state, reopen fallback, and compacting flows
+│   ├── SimpleTimelineViewModel+ForegroundPresentation.swift # Processing refresh, unavailable-frame fallback, and foreground image loading
+│   ├── SimpleTimelineViewModel+DiskHotWindow.swift # Disk hot-window expansion, cache-more queueing, and cache worker flows
+│   ├── SimpleTimelineViewModel+StateTypes.swift # Timeline config + UI state structs/enums
+│   ├── SimpleTimelineViewModel+StateAccessors.swift # Media/date/chrome/shell accessor layer
+│   ├── SimpleTimelineViewModel+PlaybackAndDateSearch.swift # Playback, tape, and date-jump support
+│   ├── TimelineDateSearchSupport.swift # Natural-language date parsing and bucket/anchor support
+│   ├── TimelineDateSearchTypes.swift # Shared date-search bucket and relative-offset types
+│   ├── TimelineOCRTextLayoutEstimator.swift # OCR text-width estimation for selection and highlight spans
+│   ├── Comment subsystem helpers:
+│   │   └── TimelineCommentsStore.swift    # Comment timeline/search/thread/overlay/tag owner
+│   ├── Filter subsystem helpers:
+│   │   └── TimelineFilterStore.swift      # Filter session/state/support-data/cache owner
+│   ├── Frame-window subsystem helpers:
+│   │   ├── TimelineFrameWindowStore.swift
+│   │   ├── TimelineFrameWindowStateController.swift
+│   │   ├── TimelineFrameWindowStateController+BoundaryLoads.swift
+│   │   ├── TimelineFrameWindowStateController+Mutations.swift
+│   │   ├── TimelineFrameWindowStateController+Trim.swift
+│   │   ├── TimelineFrameWindowTypes.swift
+│   │   ├── TimelineFrameWindowSupport.swift
+│   │   └── TimelineBoundaryPageLoader.swift
+│   ├── TimelineDebugTestHooks.swift       # Timeline-only debug and test seams
+│   ├── Shared UI view models:             # Search, dashboard, metrics, quick comment, feedback, settings
 │   └── Settings/
-│       ├── SettingsShellViewModel.swift
-│       ├── GeneralSettingsViewModel.swift
-│       ├── CaptureSettingsViewModel.swift
-│       ├── InPageURLSettingsViewModel.swift
-│       ├── StorageSettingsViewModel.swift
-│       ├── PrivacySettingsViewModel.swift
-│       ├── PowerSettingsViewModel.swift
-│       ├── TagsSettingsViewModel.swift
-│       └── AdvancedSettingsViewModel.swift
+│       └── ...                            # Settings-specific view models
 └── Tests/
-    ├── BuildInfoAndUpdaterTests.swift    # Build metadata formatting + updater version fallback tests
-    ├── CommentComposerTargetContextTests.swift # Comment-target utilities and quick-comment persisted-preview source coverage
-    ├── CrashRecoverySupportTests.swift   # Crash-recovery bundle resolution and registration policy coverage
-    ├── CrashReportSupportTests.swift     # Dashboard crash/WAL report discovery and launch-context coverage
-    ├── QuitConfirmationPresentationTests.swift # Quit alert anchor-window selection coverage
-    ├── FeedbackExportTests.swift         # Feedback report export formatting coverage
-    ├── FeedbackSubmissionProgressTests.swift # Feedback sending-state sequence coverage
-    ├── HyperlinkMappingTests.swift       # Stored hyperlink row to OCR-node mapping coverage
-    ├── FaviconProviderTests.swift        # Favicon memory-vs-disk cache behavior coverage
-    ├── HyperlinkResolutionTests.swift    # Hyperlink parsing/resolution coverage
-    ├── AppNameResolverInstalledAppsTests.swift # Installed-app scan deduplication coverage
-    ├── SearchViewModelAvailableAppsTests.swift # Search app-list merge/deduplication coverage
-    ├── SpotlightSearchOverlayRecentEntryAppMapTests.swift # Recent entry app-name map deduplication coverage
-    ├── Search/SearchPaginationCancellationTests.swift # Search stale-pagination cancellation coverage on mode/sort changes
-    ├── DashboardAppUsageDateRangeTests.swift # Dashboard app-usage date-range normalization coverage
-    ├── DateRangePresetShortcutTests.swift # Shared date-range preset shortcut mapping and inclusive-range coverage
-    ├── CaptureIntervalSettingsTests.swift # Live capture-interval config update coverage
-    ├── ProcessCPUDisplayMetricsTests.swift # CPU sampler display math and live ranking coverage
-    ├── SearchHighlightTooltipTests.swift # Search highlight tooltip hover/dismiss coverage
-    ├── Dashboard/                        # Dashboard-specific XCTestCase files
-    ├── MenuBar/                          # Menu bar interaction tests
-    ├── Search/                           # Search/deeplink/overlay XCTestCase files
-    ├── Settings/                         # Settings-focused XCTestCase files, including shell/view-model coverage
-    ├── Support/                          # Shared XCTest helpers and support-only tests
-    │   └── FocusableTextInputSupportTests.swift # Borderless text-input keyboard shortcut, right-click deferral, and menu-filter coverage
-    ├── SystemMonitor/                    # System monitor XCTestCase files
-    ├── Timeline/TimelineCopyFeedbackTests.swift # Timeline copy image/text toast feedback coverage
-    ├── Timeline/TimelinePositionRecoveryHintTests.swift # Timeline reopen Cmd+Z recovery hint behavior and policy coverage
-    └── Timeline/                         # Timeline XCTestCase files
+    ├── Timeline/                         # Timeline behavior coverage for comments, filters, frame-window, search/overlay, and menu interactions
+    ├── Search/                           # Search/deeplink/overlay coverage
+    ├── Settings/                         # Settings shell/view-model coverage
+    ├── Dashboard/                        # Dashboard coverage
+    ├── MenuBar/                          # Menu bar interaction coverage
+    ├── SystemMonitor/                    # System monitor coverage
+    └── Support/                          # Shared UI test helpers and support-only tests
 ```
+
+### Fullscreen Timeline Maintenance
+
+- [TODO.MD](/Users/haseab/Desktop/retrace-wt-7/TODO.MD) is the finished architecture summary for the fullscreen timeline area.
+- Keep the fullscreen timeline centered on the existing subsystem owners:
+  - screen shell: [SimpleTimelineView.swift](/Users/haseab/Desktop/retrace-wt-7/UI/Views/FullscreenTimeline/SimpleTimelineView.swift), [TimelineTapeView.swift](/Users/haseab/Desktop/retrace-wt-7/UI/Views/FullscreenTimeline/TimelineTapeView.swift), [TimelineWindowController.swift](/Users/haseab/Desktop/retrace-wt-7/UI/Views/FullscreenTimeline/TimelineWindowController.swift)
+  - stores: [SimpleTimelineViewModel.swift](/Users/haseab/Desktop/retrace-wt-7/UI/ViewModels/SimpleTimelineViewModel.swift), [TimelineCommentsStore.swift](/Users/haseab/Desktop/retrace-wt-7/UI/ViewModels/TimelineCommentsStore.swift), [TimelineFilterStore.swift](/Users/haseab/Desktop/retrace-wt-7/UI/ViewModels/TimelineFilterStore.swift), [TimelineFrameWindowStore.swift](/Users/haseab/Desktop/retrace-wt-7/UI/ViewModels/TimelineFrameWindowStore.swift)
+- Do not add production files under `UI/Views/FullscreenTimeline/` or the timeline area of `UI/ViewModels/` unless the same pass deletes or merges more production files than it adds.
+- Prefer subsystem-level units over micro-files. Do not reintroduce recovery-era support/controller sprawl.
+- Keep state ownership in stores or inline state owners instead of routing it back through ad-hoc VM bridges or giant view-local state bags.
 
 ## Feature Requirements
 

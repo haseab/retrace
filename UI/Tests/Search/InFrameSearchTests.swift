@@ -137,8 +137,10 @@ final class InFrameSearchTests: XCTestCase {
         viewModel.navigateToFrame(2)
         try? await Task.sleep(for: .milliseconds(500), clock: .continuous)
 
-        viewModel.isInLiveMode = true
-        viewModel.liveScreenshot = NSImage(size: NSSize(width: 12, height: 12))
+        viewModel.setLivePresentationState(
+            isActive: true,
+            screenshot: NSImage(size: NSSize(width: 12, height: 12))
+        )
 
         XCTAssertTrue(viewModel.undoToLastStoppedPosition())
         XCTAssertEqual(viewModel.currentIndex, 1)

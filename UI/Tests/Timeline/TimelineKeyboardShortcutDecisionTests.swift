@@ -131,7 +131,7 @@ final class TimelineKeyboardShortcutDecisionTests: XCTestCase {
     func testPresentSearchOverlayOpensWithoutClearingSearchQuery() {
         let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
         viewModel.searchViewModel.searchQuery = "network timeout"
-        viewModel.isSearchOverlayVisible = false
+        viewModel.closeSearchOverlay()
 
         let didOpen = TimelineWindowController.presentSearchOverlay(
             on: viewModel,
@@ -147,7 +147,7 @@ final class TimelineKeyboardShortcutDecisionTests: XCTestCase {
     func testPresentSearchOverlayDoesNotToggleClosedWhenAlreadyVisible() {
         let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
         viewModel.searchViewModel.searchQuery = "crash"
-        viewModel.isSearchOverlayVisible = true
+        viewModel.openSearchOverlay()
 
         let didOpen = TimelineWindowController.presentSearchOverlay(
             on: viewModel,

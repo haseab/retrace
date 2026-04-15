@@ -27,7 +27,7 @@ final class TimelineBoundaryOlderFallbackTests: XCTestCase {
             )
         ]
         viewModel.currentIndex = 1
-        viewModel.filterCriteria = FilterCriteria()
+        viewModel.setAppliedFilterCriteria(FilterCriteria())
         viewModel.test_setBoundaryPaginationState(hasMoreOlder: true, hasMoreNewer: false)
         viewModel.test_updateWindowBoundaries()
 
@@ -101,7 +101,7 @@ final class TimelineBoundaryOlderFallbackTests: XCTestCase {
             )
         ]
         viewModel.currentIndex = 1
-        viewModel.filterCriteria = FilterCriteria()
+        viewModel.setAppliedFilterCriteria(FilterCriteria())
         viewModel.test_setBoundaryPaginationState(hasMoreOlder: true, hasMoreNewer: false)
         viewModel.test_updateWindowBoundaries()
 
@@ -182,7 +182,7 @@ final class TimelineBoundaryOlderFallbackTests: XCTestCase {
             )
         ]
         viewModel.currentIndex = 1
-        viewModel.filterCriteria = FilterCriteria()
+        viewModel.setAppliedFilterCriteria(FilterCriteria())
         viewModel.test_setBoundaryPaginationState(hasMoreOlder: true, hasMoreNewer: false)
         viewModel.test_updateWindowBoundaries()
 

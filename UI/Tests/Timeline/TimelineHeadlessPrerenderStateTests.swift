@@ -748,11 +748,11 @@ final class TimelineHeadlessPrerenderStateTests: XCTestCase {
         viewModel.currentIndex = 1
         viewModel.searchViewModel.searchQuery = "test query"
         viewModel.currentImage = makeSolidImage(size: NSSize(width: 12, height: 12), color: .systemBlue)
-        viewModel.liveScreenshot = makeSolidImage(size: NSSize(width: 10, height: 10), color: .systemGreen)
+        let liveScreenshot = makeSolidImage(size: NSSize(width: 10, height: 10), color: .systemGreen)
+        viewModel.setLivePresentationState(isActive: true, screenshot: liveScreenshot)
         viewModel.shiftDragDisplaySnapshot = makeSolidImage(size: NSSize(width: 6, height: 6), color: .systemOrange)
         viewModel.shiftDragDisplaySnapshotFrameID = 2
         viewModel.forceVideoReload = true
-        viewModel.isInLiveMode = true
         XCTAssertNotNil(viewModel.currentImage)
         XCTAssertNotNil(viewModel.liveScreenshot)
         XCTAssertNotNil(viewModel.shiftDragDisplaySnapshot)

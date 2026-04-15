@@ -30,20 +30,20 @@ final class SearchViewModelAvailableAppsTests: XCTestCase {
         let cacheURL = makeTimelineRewindCacheURL()
         let context = makeRewindCacheContext()
 
-        await SimpleTimelineViewModel.saveCachedRewindAppBundleIDs(
+        await TimelineFilterStore.saveCachedRewindAppBundleIDs(
             ["com.rewind.b", "com.rewind.a", "com.rewind.b"],
             context: context,
             to: cacheURL
         )
 
-        let loadedBundleIDs = await SimpleTimelineViewModel.loadCachedRewindAppBundleIDs(
+        let loadedBundleIDs = await TimelineFilterStore.loadCachedRewindAppBundleIDs(
             matching: context,
             from: cacheURL
         )
 
         XCTAssertEqual(loadedBundleIDs, ["com.rewind.a", "com.rewind.b"])
         XCTAssertTrue(FileManager.default.fileExists(atPath: cacheURL.path))
-        await SimpleTimelineViewModel.removeCachedRewindAppBundleIDs(at: cacheURL)
+        await TimelineFilterStore.removeCachedRewindAppBundleIDs(at: cacheURL)
     }
 
     func testTimelineRewindAppBundleIDsCacheInvalidatesWhenCutoffChanges() async {
@@ -51,13 +51,13 @@ final class SearchViewModelAvailableAppsTests: XCTestCase {
         let cachedContext = makeRewindCacheContext(cutoffDate: Date(timeIntervalSince1970: 100))
         let liveContext = makeRewindCacheContext(cutoffDate: Date(timeIntervalSince1970: 200))
 
-        await SimpleTimelineViewModel.saveCachedRewindAppBundleIDs(
+        await TimelineFilterStore.saveCachedRewindAppBundleIDs(
             ["com.rewind.a"],
             context: cachedContext,
             to: cacheURL
         )
 
-        let loadedBundleIDs = await SimpleTimelineViewModel.loadCachedRewindAppBundleIDs(
+        let loadedBundleIDs = await TimelineFilterStore.loadCachedRewindAppBundleIDs(
             matching: liveContext,
             from: cacheURL
         )
@@ -71,13 +71,13 @@ final class SearchViewModelAvailableAppsTests: XCTestCase {
         let cachedContext = makeRewindCacheContext(effectiveRewindDatabasePath: "/tmp/rewind-a/db-enc.sqlite3")
         let liveContext = makeRewindCacheContext(effectiveRewindDatabasePath: "/tmp/rewind-b/db-enc.sqlite3")
 
-        await SimpleTimelineViewModel.saveCachedRewindAppBundleIDs(
+        await TimelineFilterStore.saveCachedRewindAppBundleIDs(
             ["com.rewind.a"],
             context: cachedContext,
             to: cacheURL
         )
 
-        let loadedBundleIDs = await SimpleTimelineViewModel.loadCachedRewindAppBundleIDs(
+        let loadedBundleIDs = await TimelineFilterStore.loadCachedRewindAppBundleIDs(
             matching: liveContext,
             from: cacheURL
         )
@@ -91,13 +91,13 @@ final class SearchViewModelAvailableAppsTests: XCTestCase {
         let cachedContext = makeRewindCacheContext(useRewindData: true)
         let liveContext = makeRewindCacheContext(useRewindData: false)
 
-        await SimpleTimelineViewModel.saveCachedRewindAppBundleIDs(
+        await TimelineFilterStore.saveCachedRewindAppBundleIDs(
             ["com.rewind.a"],
             context: cachedContext,
             to: cacheURL
         )
 
-        let loadedBundleIDs = await SimpleTimelineViewModel.loadCachedRewindAppBundleIDs(
+        let loadedBundleIDs = await TimelineFilterStore.loadCachedRewindAppBundleIDs(
             matching: liveContext,
             from: cacheURL
         )
@@ -152,7 +152,7 @@ final class SearchViewModelAvailableAppsTests: XCTestCase {
         var rewindContinuation: CheckedContinuation<[String], Never>?
 
         defaults.set(true, forKey: "useRewindData")
-        await SimpleTimelineViewModel.removeCachedRewindAppBundleIDs()
+        await TimelineFilterStore.removeCachedRewindAppBundleIDs()
         defer {
             if let previousUseRewindData {
                 defaults.set(previousUseRewindData, forKey: "useRewindData")
@@ -160,7 +160,7 @@ final class SearchViewModelAvailableAppsTests: XCTestCase {
                 defaults.removeObject(forKey: "useRewindData")
             }
             Task {
-                await SimpleTimelineViewModel.removeCachedRewindAppBundleIDs()
+                await TimelineFilterStore.removeCachedRewindAppBundleIDs()
             }
         }
 
@@ -214,7 +214,7 @@ final class SearchViewModelAvailableAppsTests: XCTestCase {
         cutoffDate: Date = Date(timeIntervalSince1970: 123),
         effectiveRewindDatabasePath: String = "/tmp/rewind/db-enc.sqlite3",
         useRewindData: Bool = true
-    ) -> SimpleTimelineViewModel.RewindAppBundleIDCacheContext {
+    ) -> TimelineRewindAppBundleIDCacheContext {
         .init(
             cutoffDate: cutoffDate,
             effectiveRewindDatabasePath: effectiveRewindDatabasePath,

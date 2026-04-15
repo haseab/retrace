@@ -199,7 +199,7 @@ final class TimelineRefreshTrimRegressionTests: XCTestCase {
         let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
         let baseDate = Date(timeIntervalSince1970: 1_700_100_000)
 
-        viewModel.filterCriteria = FilterCriteria(selectedApps: ["com.google.Chrome"])
+        viewModel.setAppliedFilterCriteria(FilterCriteria(selectedApps: ["com.google.Chrome"]))
         viewModel.frames = (0..<100).map { offset in
             makeTimelineFrame(
                 id: Int64(offset + 1),

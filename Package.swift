@@ -69,7 +69,7 @@ let package = Package(
                 "Tests",
                 "README.md",
                 "AGENTS.md",
-                "PROGRESS.md"
+                "Schema_V1_OLD.swift.bak"
             ]
         ),
         .testTarget(
@@ -77,7 +77,8 @@ let package = Package(
             dependencies: ["Database", "Shared"],
             path: "Database/Tests",
             exclude: [
-                "_future"  // Release 2+ tests
+                "_future",  // Release 2+ tests
+                "SchemaValidationTests.swift.skip"
             ]
             // ⚠️ RELEASE 2 ONLY - Whisper linker settings removed for Release 1
         ),
@@ -91,7 +92,7 @@ let package = Package(
                 "Tests",
                 "README.md",
                 "AGENTS.md",
-                "PROGRESS.md"
+                "ImageExtractor.swift.bak"
             ]
         ),
         .testTarget(
@@ -109,8 +110,7 @@ let package = Package(
             exclude: [
                 "Tests",
                 "README.md",
-                "AGENTS.md",
-                "PROGRESS.md"
+                "AGENTS.md"
             ]
         ),
         .testTarget(
@@ -134,8 +134,7 @@ let package = Package(
             exclude: [
                 "Tests",
                 "README.md",
-                "AGENTS.md",
-                "PROGRESS.md"
+                "AGENTS.md"
             ]
             // ⚠️ RELEASE 2 ONLY - Whisper cSettings and linkerSettings removed for Release 1
             // Re-add Accelerate, CoreML, Metal frameworks when audio transcription is re-enabled
@@ -159,8 +158,7 @@ let package = Package(
                 "Tests",
                 "VectorSearchTODO",  // Exclude vector search implementation
                 "README.md",
-                "AGENTS.md",
-                "PROGRESS.md"
+                "AGENTS.md"
             ]
         ),
         .testTarget(
@@ -179,8 +177,7 @@ let package = Package(
             path: "Migration",
             exclude: [
                 "README.md",
-                "AGENTS.md",
-                "PROGRESS.md"
+                "AGENTS.md"
             ]
         ),
 
@@ -212,6 +209,10 @@ let package = Package(
                 "Shared"
             ],
             path: "App/Tests"
+            ,
+            exclude: [
+                "README.md"
+            ]
             // ⚠️ RELEASE 2 ONLY - Whisper cSettings and linkerSettings removed for Release 1
         ),
 
@@ -247,7 +248,8 @@ let package = Package(
                 "README.md",
                 "AGENTS.md",
                 "Info.plist",
-                "Retrace.entitlements"
+                "Retrace.entitlements",
+                "TIMELINE_OVERLAY_THEMING_PLAN.md"
             ],
             resources: [
                 .process("Assets.xcassets")

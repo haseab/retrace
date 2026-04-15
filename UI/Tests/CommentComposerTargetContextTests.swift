@@ -20,7 +20,7 @@ final class CommentComposerTargetContextTests: XCTestCase {
         var fetchCount = 0
 
         viewModel.frames = [frame]
-        viewModel.timelineContextMenuSegmentIndex = 0
+        viewModel.setTimelineContextMenuAnchorIndex(0)
         viewModel.test_blockCommentsHooks.getCommentsForSegments = { requestedSegmentIDs in
             XCTAssertEqual(requestedSegmentIDs, [segmentID])
             fetchCount += 1
@@ -66,7 +66,7 @@ final class CommentComposerTargetContextTests: XCTestCase {
         var fetchCount = 0
 
         viewModel.frames = [frame]
-        viewModel.timelineContextMenuSegmentIndex = 0
+        viewModel.setTimelineContextMenuAnchorIndex(0)
         viewModel.test_blockCommentsHooks.getCommentsForSegments = { requestedSegmentIDs in
             XCTAssertEqual(requestedSegmentIDs, [segmentID])
             fetchCount += 1
@@ -121,8 +121,8 @@ final class CommentComposerTargetContextTests: XCTestCase {
         var createCount = 0
 
         viewModel.frames = [frame]
-        viewModel.timelineContextMenuSegmentIndex = 0
-        viewModel.newCommentText = insertedComment.body
+        viewModel.setTimelineContextMenuAnchorIndex(0)
+        viewModel.setCommentDraftText(insertedComment.body)
         viewModel.test_blockCommentsHooks.getCommentsForSegments = { requestedSegmentIDs in
             XCTAssertEqual(requestedSegmentIDs, [segmentID])
             fetchCount += 1
@@ -217,11 +217,10 @@ final class CommentComposerTargetContextTests: XCTestCase {
     func testOpenTagSubmenuForSelectedCommentTargetKeepsCommentModalOpen() {
         let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
         viewModel.frames = [makeCommentTargetTimelineFrame()]
-        viewModel.timelineContextMenuSegmentIndex = 0
-        viewModel.selectedFrameIndex = 0
-        viewModel.showCommentSubmenu = true
-        viewModel.showTimelineContextMenu = false
-        viewModel.showTagSubmenu = false
+        viewModel.prepareTimelineContextMenuSelection(index: 0)
+        viewModel.setCommentSubmenuVisible(true)
+        viewModel.setTimelineContextMenuVisible(false)
+        viewModel.setTagSubmenuVisible(false)
 
         viewModel.openTagSubmenuForSelectedCommentTarget()
 
@@ -236,11 +235,10 @@ final class CommentComposerTargetContextTests: XCTestCase {
     func testOpenTagSubmenuForSelectedCommentTargetTogglesClosedWhenAlreadyVisible() {
         let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
         viewModel.frames = [makeCommentTargetTimelineFrame()]
-        viewModel.timelineContextMenuSegmentIndex = 0
-        viewModel.selectedFrameIndex = 0
-        viewModel.showCommentSubmenu = true
-        viewModel.showTimelineContextMenu = false
-        viewModel.showTagSubmenu = true
+        viewModel.prepareTimelineContextMenuSelection(index: 0)
+        viewModel.setCommentSubmenuVisible(true)
+        viewModel.setTimelineContextMenuVisible(false)
+        viewModel.setTagSubmenuVisible(true)
 
         viewModel.openTagSubmenuForSelectedCommentTarget()
 
@@ -605,11 +603,8 @@ final class CommentComposerTargetContextTests: XCTestCase {
     private func makeLinkedSegmentComment(
         _ comment: SegmentComment,
         preferredSegmentID: SegmentID
-    ) -> AppCoordinator.LinkedSegmentComment {
-        AppCoordinator.LinkedSegmentComment(
-            comment: comment,
-            preferredSegmentID: preferredSegmentID
-        )
+    ) -> TimelineLinkedSegmentComment {
+        (comment: comment, preferredSegmentID: preferredSegmentID)
     }
 
     private func timelineDiskBufferFileURL(frameID: FrameID) -> URL {

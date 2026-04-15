@@ -1,5 +1,6 @@
 import XCTest
 import Shared
+import AppKit
 @testable import Processing
 
 // ╔══════════════════════════════════════════════════════════════════════════════╗
@@ -47,6 +48,14 @@ final class AccessibilityTests: XCTestCase {
             throw XCTSkip("Accessibility permission not granted")
         }
 
+        guard let frontApp = NSWorkspace.shared.frontmostApplication else {
+            throw XCTSkip("Interactive-only test. No frontmost application is available in this test environment.")
+        }
+
+        guard let bundleID = frontApp.bundleIdentifier, !bundleID.isEmpty else {
+            throw XCTSkip("Interactive-only test. Frontmost application has no usable bundle ID in this test environment.")
+        }
+
         let appInfo = try await service.getFrontmostAppInfo()
 
         // Verify we got REAL data from a REAL running app
@@ -59,6 +68,14 @@ final class AccessibilityTests: XCTestCase {
         // Only run if we have permission
         guard await service.hasPermission() else {
             throw XCTSkip("Accessibility permission not granted")
+        }
+
+        guard let frontApp = NSWorkspace.shared.frontmostApplication else {
+            throw XCTSkip("Interactive-only test. No frontmost application is available in this test environment.")
+        }
+
+        guard let bundleID = frontApp.bundleIdentifier, !bundleID.isEmpty else {
+            throw XCTSkip("Interactive-only test. Frontmost application has no usable bundle ID in this test environment.")
         }
 
         let result = try await service.getFocusedAppText()

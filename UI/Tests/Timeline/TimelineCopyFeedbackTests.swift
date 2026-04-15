@@ -12,8 +12,7 @@ final class TimelineCopyFeedbackTests: XCTestCase {
             makeNode(id: 1, text: "Alpha", x: 0.10, y: 0.10, width: 0.18, height: 0.08),
             makeNode(id: 2, text: "Beta", x: 0.32, y: 0.10, width: 0.16, height: 0.08)
         ]
-        viewModel.selectionStart = (nodeID: 1, charIndex: 0)
-        viewModel.selectionEnd = (nodeID: 2, charIndex: 4)
+        viewModel.selectAllText()
 
         viewModel.copySelectedText()
 
@@ -38,8 +37,10 @@ final class TimelineCopyFeedbackTests: XCTestCase {
 
     func testCopyCurrentFrameImageShowsToastInLiveMode() {
         let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
-        viewModel.isInLiveMode = true
-        viewModel.liveScreenshot = makeImage(size: NSSize(width: 12, height: 12))
+        viewModel.setLivePresentationState(
+            isActive: true,
+            screenshot: makeImage(size: NSSize(width: 12, height: 12))
+        )
 
         viewModel.copyCurrentFrameImageToClipboard()
 
