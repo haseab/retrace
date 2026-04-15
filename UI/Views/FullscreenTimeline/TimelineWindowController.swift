@@ -37,8 +37,10 @@ public class TimelineWindowController: NSObject {
     private var deferredHostingViewDetachTask: Task<Void, Never>?
     private var tapeShowAnimationTask: Task<Void, Never>?
     private var liveModeCaptureTask: Task<Void, Never>?
+    private var prefetchedLiveScreenshot: NSImage?
     private var windowFadeInTask: Task<Void, Never>?
     private var deferredSearchOverlayRestoreTask: Task<Void, Never>?
+    private var deferredLiveActivationTask: Task<Void, Never>?
     private var shouldRestoreSearchOverlayAfterNextShow = false
     private var windowFadeInGeneration: UInt64 = 0
     private var workspaceActivationObserver: Any?
@@ -95,6 +97,8 @@ public class TimelineWindowController: NSObject {
     private static let hostingViewDetachDelay: Duration = .milliseconds(350)
     /// Delay preserved spotlight overlay reopen until after live-mode presentation settles.
     private static let liveSearchOverlayRestoreDelayMs = 180
+    /// Delay app activation for live opens until the visual transition has settled.
+    private static let liveActivationDelayMs = 180
     /// Small delay after the historical fade completes so the search pops after the reveal.
     private static let historicalSearchOverlayRestoreDelayMs = 80
 
@@ -1126,6 +1130,7 @@ public class TimelineWindowController: NSObject {
         cancelDeferredHostingViewDetach()
         cancelWindowFadeIn(reason: "show")
         cancelDeferredSearchOverlayRestore()
+        cancelDeferredLiveActivation()
 
         // If we're in the middle of hiding, cancel the animation and snap back to visible
         if isHiding, let window = window {
@@ -1145,6 +1150,8 @@ public class TimelineWindowController: NSObject {
         guard !isVisible, let coordinator = coordinator else {
             return
         }
+        Task { @MainActor [weak self] in
+            guard let self, !self.isVisible, self.coordinator === coordinator else { return }
         let showStartTime = CFAbsoluteTimeGetCurrent()
         liveModeCaptureTask?.cancel()
         liveModeCaptureTask = nil
@@ -1232,6 +1239,7 @@ public class TimelineWindowController: NSObject {
 
         // Reset scale factor cache so it recalculates for the current display
         TimelineScaleFactor.resetCache()
+        prefetchedLiveScreenshot = shouldUseLiveMode ? await captureLiveScreenshotAsync() : nil
 
         // Check if we have a prepared metadata state ready
         if isPrepared, let viewModel = timelineViewModel {
@@ -1289,6 +1297,7 @@ public class TimelineWindowController: NSObject {
             navigateToNewest: true,
             allowNearLiveAutoAdvance: true
         )
+        }
     }
 
     /// Show the prepared window with animation and setup event monitors
@@ -1339,7 +1348,9 @@ public class TimelineWindowController: NSObject {
         // races that can switch Spaces on some machines.
         presentationState = .showing
         Self.setEmergencyTimelineVisible(true)  // For emergency escape tap
-        NSApp.activate(ignoringOtherApps: true)
+        if !isLive {
+            NSApp.activate(ignoringOtherApps: true)
+        }
         window.makeKeyAndOrderFront(nil)
         presentationState = .visible
         startObservingApplicationActivation()
@@ -1372,6 +1383,7 @@ public class TimelineWindowController: NSObject {
         }
 
         if isLive, let viewModel = timelineViewModel {
+            scheduleDeferredLiveActivationIfNeeded(viewModel: viewModel)
             scheduleDeferredSearchOverlayRestoreIfNeeded(
                 viewModel: viewModel,
                 isLiveMode: isLive
@@ -1413,6 +1425,11 @@ public class TimelineWindowController: NSObject {
         deferredSearchOverlayRestoreTask = nil
     }
 
+    private func cancelDeferredLiveActivation() {
+        deferredLiveActivationTask?.cancel()
+        deferredLiveActivationTask = nil
+    }
+
     private static func preservedSearchOverlayRestoreDelayMs(isLiveMode: Bool) -> Int {
         isLiveMode ? liveSearchOverlayRestoreDelayMs : historicalSearchOverlayRestoreDelayMs
     }
@@ -1452,6 +1469,26 @@ public class TimelineWindowController: NSObject {
         }
     }
 
+    private func scheduleDeferredLiveActivationIfNeeded(viewModel: SimpleTimelineViewModel) {
+        cancelDeferredLiveActivation()
+        let delayMs = Self.liveActivationDelayMs
+        deferredLiveActivationTask = Task { @MainActor [weak self, weak viewModel] in
+            try? await Task.sleep(for: .milliseconds(delayMs), clock: .continuous)
+            guard let self, let viewModel else { return }
+            defer { self.deferredLiveActivationTask = nil }
+            guard !Task.isCancelled,
+                  self.isVisible,
+                  !self.isHiding,
+                  self.timelineViewModel === viewModel,
+                  viewModel.isInLiveMode else {
+                return
+            }
+
+            NSApp.activate(ignoringOtherApps: true)
+            self.window?.makeKey()
+        }
+    }
+
     /// Hide the timeline overlay
     public func hide(restorePreviousFocus: Bool = true) {
         reconcileVisibilityState(reason: "hide")
@@ -1486,6 +1523,12 @@ public class TimelineWindowController: NSObject {
                 await self.finishHideTransitionCleanup()
             }
         })
+
+        restoreFocusIfNeeded(
+            requestedRestore: restorePreviousFocus,
+            wasHidingToShowDashboard: isHidingToShowDashboard,
+            hideRequestedAt: hideRequestStartedAt
+        )
     }
 
     // MARK: - Timeline Metadata Refresh
@@ -1542,7 +1585,6 @@ public class TimelineWindowController: NSObject {
                 return image
             }
 
-            // Fallback to full display capture when below-window capture is unavailable.
             return CGDisplayCreateImage(screenNumber)
         }
         let cgImage = await captureTask.value
@@ -1569,9 +1611,9 @@ public class TimelineWindowController: NSObject {
     private func prepareLiveModeState(shouldUseLiveMode: Bool, viewModel: SimpleTimelineViewModel) {
         if shouldUseLiveMode {
             // Prime live mode before showing the window so open animation/render path
-            // matches previous behavior while screenshot capture finishes in background.
+            // already has the pre-launch screenshot ready before the panel appears.
             viewModel.isInLiveMode = true
-            viewModel.liveScreenshot = nil
+            viewModel.liveScreenshot = prefetchedLiveScreenshot
         } else {
             viewModel.isInLiveMode = false
             viewModel.liveScreenshot = nil
@@ -1584,6 +1626,15 @@ public class TimelineWindowController: NSObject {
         guard shouldUseLiveMode else {
             viewModel.isInLiveMode = false
             viewModel.liveScreenshot = nil
+            prefetchedLiveScreenshot = nil
+            return
+        }
+
+        if let prefetchedLiveScreenshot {
+            viewModel.isInLiveMode = true
+            viewModel.liveScreenshot = prefetchedLiveScreenshot
+            self.prefetchedLiveScreenshot = nil
+            viewModel.performLiveOCR()
             return
         }
 
@@ -1608,6 +1659,7 @@ public class TimelineWindowController: NSObject {
 
             targetViewModel.isInLiveMode = true
             targetViewModel.liveScreenshot = screenshot
+            self.prefetchedLiveScreenshot = nil
             targetViewModel.performLiveOCR()
         }
     }
@@ -1752,6 +1804,7 @@ public class TimelineWindowController: NSObject {
         cancelDeferredHostingViewDetach()
         cancelWindowFadeIn(reason: "destroyMountedPresentation")
         cancelDeferredSearchOverlayRestore()
+        cancelDeferredLiveActivation()
         liveModeCaptureTask?.cancel()
         liveModeCaptureTask = nil
         stopObservingApplicationActivation()
@@ -2332,9 +2385,9 @@ public class TimelineWindowController: NSObject {
 
     private func createWindow(for screen: NSScreen) -> NSWindow {
         // Use custom window subclass that can become key even when borderless
-        let window = KeyableWindow(
+        let window = KeyablePanel(
             contentRect: screen.frame,
-            styleMask: [.borderless],
+            styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
@@ -2348,6 +2401,7 @@ public class TimelineWindowController: NSObject {
         window.hasShadow = false
         window.ignoresMouseEvents = false
         window.acceptsMouseMovedEvents = true
+        window.hidesOnDeactivate = false
         // Keep timeline opens deterministic across machines/Spaces:
         // move the overlay to the active Desktop at open time instead of
         // relying on "join all Spaces" behavior, which can vary with user settings.
@@ -3960,6 +4014,34 @@ extension Notification.Name {
 /// Custom NSWindow subclass that can become key window even when borderless
 /// This is required for text fields to receive keyboard input properly
 class KeyableWindow: NSWindow {
+    var onEscape: (() -> Void)?
+
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if event.type == .keyDown, modifiers.isEmpty, event.keyCode == 53 {
+            onEscape?()
+            return true
+        }
+
+        return super.performKeyEquivalent(with: event)
+    }
+
+    override func cancelOperation(_ sender: Any?) {
+        if let onEscape {
+            onEscape()
+            return
+        }
+
+        super.cancelOperation(sender)
+    }
+}
+
+/// Non-activating panel variant for the live timeline so the source app keeps
+/// menu-bar ownership during launch.
+class KeyablePanel: NSPanel {
     var onEscape: (() -> Void)?
 
     override var canBecomeKey: Bool { true }
