@@ -10730,6 +10730,13 @@ struct FilterPanel: View {
         return nil
     }
 
+    /// Submit button target for advanced-field keyboard traversal.
+    private var submitActionButtonFocus: ActionButtonFocus? {
+        if hasApplyButton { return .apply }
+        if hasClearButton { return .clear }
+        return nil
+    }
+
     private var clearButtonTitle: String {
         isClearHovered ? "Clear (⌘⌫)" : "Clear"
     }
@@ -11106,12 +11113,15 @@ struct FilterPanel: View {
                     return nil
                 }
 
-                // Handle Enter on Advanced highlight (expand and focus Window Name)
+                // Handle Enter on Advanced highlight (toggle while keeping header selected)
                 if (event.keyCode == 36 || event.keyCode == 76) &&
                     viewModel.activeFilterDropdown == .advanced &&
                     viewModel.advancedFocusedFieldIndex == 0 {
-                    // Enter on highlighted Advanced header → signal expand
-                    viewModel.advancedFocusedFieldIndex = -1  // Signal to expand
+                    // Enter on highlighted Advanced header toggles the section.
+                    // Tab then enters Window Name when the section is open,
+                    // preserving a predictable order:
+                    // header -> window -> browser -> submit.
+                    viewModel.advancedFocusedFieldIndex = -1
                     return nil
                 }
 
@@ -11225,17 +11235,19 @@ struct FilterPanel: View {
                 // Handle Tab while action buttons are focused
                 if let focusedButton = focusedActionButton {
                     if isShiftHeld {
+                        if viewModel.activeFilterDropdown == .advanced {
+                            // Reverse traversal inside Advanced is:
+                            // submit -> browser -> window -> header.
+                            focusedActionButton = nil
+                            viewModel.advancedFocusedFieldIndex = -2
+                            return nil
+                        }
                         if focusedButton == .apply && hasClearButton {
                             focusedActionButton = .clear
                             return nil
                         }
-                        // Shift+Tab from Clear (or Apply when Clear is hidden) -> Browser URL field
-                        // (Advanced section will focus Browser URL on this sentinel value).
+                        // Shift+Tab from Clear (or Apply when Clear is hidden) -> previous focus target.
                         focusedActionButton = nil
-                        if viewModel.activeFilterDropdown == .advanced {
-                            viewModel.advancedFocusedFieldIndex = -2
-                            return nil
-                        }
                     } else {
                         if focusedButton == .clear {
                             if hasApplyButton {
@@ -11266,30 +11278,29 @@ struct FilterPanel: View {
                 if viewModel.activeFilterDropdown == .advanced {
                     let fieldIndex = viewModel.advancedFocusedFieldIndex
                     if fieldIndex == 0 {
-                        // Advanced header is highlighted: Tab goes to action buttons first.
+                        // Advanced header is highlighted: Tab enters the first field.
                         if !isShiftHeld {
-                            viewModel.advancedFocusedFieldIndex = -4
-                            focusedActionButton = leadingActionButtonFocus
+                            focusedActionButton = nil
+                            viewModel.advancedFocusedFieldIndex = 1
                             return nil
                         }
                     } else if !isShiftHeld && fieldIndex == 1 {
-                        // Tab on Window Name → let SwiftUI move focus to Browser URL
-                        return event
+                        // Tab on Window Name -> explicitly focus Browser URL.
+                        viewModel.advancedFocusedFieldIndex = 2
+                        return nil
                     } else if !isShiftHeld && fieldIndex == 2 {
-                        // Tab on Browser URL -> action buttons first (Clear, then Apply).
+                        // Tab on Browser URL -> submit button.
                         viewModel.advancedFocusedFieldIndex = -4
-                        focusedActionButton = leadingActionButtonFocus
+                        focusedActionButton = submitActionButtonFocus
                         return nil
                     } else if isShiftHeld && fieldIndex == 2 {
                         // Shift+Tab on Browser URL -> explicitly focus Window Name.
                         viewModel.advancedFocusedFieldIndex = -3
                         return nil
                     } else if isShiftHeld && fieldIndex == 1 {
-                        // Shift+Tab on Window Name → cycle to Date Range
-                        let nextAnchorFrame = viewModel.filterAnchorFrames[.dateRange] ?? .zero
-                        withAnimation(.easeOut(duration: 0.15)) {
-                            viewModel.showFilterDropdown(.dateRange, anchorFrame: nextAnchorFrame)
-                        }
+                        // Shift+Tab on Window Name -> return to the Advanced header.
+                        focusedActionButton = nil
+                        viewModel.advancedFocusedFieldIndex = 0
                         return nil
                     }
                 }
@@ -11628,7 +11639,7 @@ struct AdvancedFiltersSection: View {
         case windowName
         case browserUrl
     }
-    @FocusState private var focusedField: AdvancedField?
+    @State private var focusedField: AdvancedField?
 
     /// Whether any advanced filter is active
     private var hasActiveAdvancedFilters: Bool {
@@ -11688,14 +11699,15 @@ struct AdvancedFiltersSection: View {
         VStack(alignment: .leading, spacing: 0) {
             // Toggle header
             Button(action: {
+                let willExpand = !isExpanded
                 withAnimation(.easeInOut(duration: 0.2)) {
-                    isExpanded.toggle()
+                    isExpanded = willExpand
                 }
-                if isExpanded {
-                    // Focus window name field when manually expanding
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                        focusedField = .windowName
-                    }
+                focusedField = nil
+                if willExpand {
+                    viewModel.advancedFocusedFieldIndex = 0
+                } else {
+                    viewModel.advancedFocusedFieldIndex = 0
                 }
             }) {
                 HStack {
@@ -11922,12 +11934,15 @@ struct AdvancedFiltersSection: View {
             } else if newValue == 2 {
                 focusedField = .browserUrl
             } else if newValue == -1 && viewModel.activeFilterDropdown == .advanced {
-                // Enter was pressed on the Advanced header — expand and focus Window Name
+                // Enter on the Advanced header toggles the section while keeping
+                // keyboard focus on the header.
+                let willExpand = !isExpanded
                 withAnimation(.easeInOut(duration: 0.2)) {
-                    isExpanded = true
+                    isExpanded = willExpand
                 }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                    focusedField = .windowName
+                focusedField = nil
+                DispatchQueue.main.async {
+                    viewModel.advancedFocusedFieldIndex = 0
                 }
             } else if (newValue == 0 || newValue == -4) && viewModel.activeFilterDropdown == .advanced {
                 // Advanced header (0) or action-button sentinel (-4): clear text-field focus/caret.

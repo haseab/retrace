@@ -1495,10 +1495,6 @@ public struct AdvancedSearchFilterPopover: View {
                     .onHover { hovering in
                         isWindowHovered = hovering
                     }
-                    .contentShape(Rectangle())
-                    .onTapGesture {
-                        focusedField = .windowNameInput
-                    }
 
                     if !windowNameChips.isEmpty {
                         ScrollView(.horizontal, showsIndicators: false) {
@@ -1561,10 +1557,6 @@ public struct AdvancedSearchFilterPopover: View {
                     .onHover { hovering in
                         isBrowserHovered = hovering
                     }
-                    .contentShape(Rectangle())
-                    .onTapGesture {
-                        focusedField = .browserUrlInput
-                    }
 
                     if !browserUrlChips.isEmpty {
                         ScrollView(.horizontal, showsIndicators: false) {
@@ -1595,9 +1587,6 @@ public struct AdvancedSearchFilterPopover: View {
             setBrowserUrlIncludeTerms(browserUrlIncludeTerms)
             setBrowserUrlExcludeTerms(browserUrlExcludeTerms)
             lastFocusedField = focusedField
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                focusedField = .excludeTerms
-            }
             setupArrowKeyMonitor()
         }
         .onChange(of: focusedField) { newValue in

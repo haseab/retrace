@@ -12,6 +12,21 @@ final class FocusableTextField: NSTextField {
     override func mouseDown(with event: NSEvent) {
         onClickCallback?()
         super.mouseDown(with: event)
+        restoreFocusIfNeeded()
+    }
+
+    private func restoreFocusIfNeeded() {
+        guard let window else { return }
+
+        let currentEditor = currentEditor()
+        let isCurrentResponder = window.firstResponder === self || window.firstResponder === currentEditor
+        guard !isCurrentResponder else { return }
+
+        window.makeKeyAndOrderFront(nil)
+        _ = window.makeFirstResponder(self)
+        if window.fieldEditor(false, for: self) == nil {
+            _ = window.fieldEditor(true, for: self)
+        }
     }
 
     override func viewDidMoveToWindow() {
