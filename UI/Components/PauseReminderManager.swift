@@ -161,6 +161,11 @@ public class PauseReminderManager: ObservableObject {
         let hasCompletedOnboarding = await coordinator.onboardingManager.hasCompletedOnboarding
         let isPausedState = MenuBarManager.shared?.isPausedState == true
 
+        Log.debug(
+            "[PauseReminderManager] Reminder interval tick isCapturing=\(isCapturing) wasCapturing=\(wasCapturing) onboardingComplete=\(hasCompletedOnboarding) pausedState=\(isPausedState) reminderVisible=\(shouldShowReminder)",
+            category: .ui
+        )
+
         if !hasCompletedOnboarding {
             if pauseStartTime != nil || reminderTimer != nil || remindLaterTimer != nil || shouldShowReminder {
                 onCaptureResumed()
@@ -288,7 +293,10 @@ public class PauseReminderManager: ObservableObject {
 
         remindLaterRequestedAt = nil
         shouldShowReminder = true
-        Log.debug("[PauseReminderManager] Showing pause reminder", category: .ui)
+        Log.info(
+            "[PauseReminderManager] Showing reminder title=\"\(reminderTitle)\"",
+            category: .ui
+        )
     }
 
     private func rescheduleRemindLaterTimer(
