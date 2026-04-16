@@ -116,7 +116,7 @@ struct StorageHealthBannerState: Equatable {
     let shouldStop: Bool
 
     var signature: String {
-        "\(severity.rawValue)|\(shouldStop)|\(String(format: "%.2f", availableGB))"
+        "\(severity.rawValue)|\(shouldStop)"
     }
 
     var messageText: String {
@@ -138,6 +138,7 @@ struct StorageHealthBannerState: Equatable {
 private enum StorageHealthNotificationNames {
     static let low = Notification.Name("StorageLow")
     static let criticalLow = Notification.Name("StorageCriticalLow")
+    static let healthy = Notification.Name("StorageHealthy")
 }
 
 /// ViewModel for the Dashboard view
@@ -290,6 +291,14 @@ public class DashboardViewModel: ObservableObject {
             .sink { [weak self] notification in
                 Task { @MainActor [weak self] in
                     self?.handleStorageHealthNotification(notification, severity: .critical)
+                }
+            }
+            .store(in: &cancellables)
+
+        center.publisher(for: StorageHealthNotificationNames.healthy)
+            .sink { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.clearStorageHealthBannerAfterRecovery()
                 }
             }
             .store(in: &cancellables)
@@ -564,6 +573,14 @@ public class DashboardViewModel: ObservableObject {
 
         lastTrackedStorageHealthBannerSignature = state.signature
         recordStorageHealthBannerAction("banner_shown", state: state)
+    }
+
+    private func clearStorageHealthBannerAfterRecovery() {
+        if let state = storageHealthBanner {
+            recordStorageHealthBannerAction("auto_cleared", state: state)
+        }
+        storageHealthBanner = nil
+        lastTrackedStorageHealthBannerSignature = nil
     }
 
     nonisolated static func makeCrashFeedbackLaunchContext(

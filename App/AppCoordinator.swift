@@ -1247,8 +1247,11 @@ public actor AppCoordinator {
 
     private func suspendPipelineInfrastructure() async {
         await stopPermissionMonitoring()
-        StorageHealthMonitor.shared.stopMonitoring()
-        stopStorageHealthNotifications()
+        let storageRoot = await services.storage.getStorageDirectory().path
+        StorageHealthMonitor.shared.startMonitoring(
+            storagePath: storageRoot,
+            onCriticalError: nil
+        )
     }
 
     private func finalizePipelineStopped(
@@ -1320,6 +1323,8 @@ public actor AppCoordinator {
         stopDBStorageSnapshotTask()
         await recordDBStorageSnapshot(reason: "shutdown")
         await timelineStillDiskWriter.shutdown()
+        stopStorageHealthNotifications()
+        StorageHealthMonitor.shared.stopMonitoring()
 
         Log.info("Shutting down AppCoordinator...", category: .app)
         try await services.shutdown()
