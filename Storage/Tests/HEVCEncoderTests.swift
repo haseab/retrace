@@ -79,6 +79,19 @@ final class HEVCEncoderTests: XCTestCase {
         XCTAssertEqual(tuning.quality, 0.55, accuracy: 0.0001)
     }
 
+    func testCompressionTuningCapsFiveKNearThirteenMegabitsAtDefaultQuality() {
+        let tuning = HEVCEncoder.compressionTuning(
+            width: 5120,
+            height: 2880,
+            config: .default
+        )
+
+        XCTAssertEqual(tuning.averageBitRate, 13_235_327)
+        XCTAssertEqual(tuning.dataRateLimitBytesPerSecond, 9_926_495)
+        XCTAssertEqual(tuning.quality, 0.4146, accuracy: 0.0001)
+        XCTAssertEqual(tuning.densityBoost, 0.6346, accuracy: 0.0001)
+    }
+
     func testEncodeProducesValidMP4File() async throws {
         let encoder = HEVCEncoder()
         let config = VideoEncoderConfig.default

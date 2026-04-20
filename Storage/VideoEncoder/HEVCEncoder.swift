@@ -282,7 +282,7 @@ public actor HEVCEncoder {
         }
 
         let effectiveBitsPerPixelPerFrame = Double(averageBitRate) / (pixelCount * Double(expectedSourceFrameRate))
-        let effectiveDensityBoost = max(effectiveBitsPerPixelPerFrame / baseBitsPerPixelPerFrame, 1.0)
+        let effectiveDensityBoost = effectiveBitsPerPixelPerFrame / baseBitsPerPixelPerFrame
 
         // Keep a bounded burst cap so reference frames can spend materially more
         // than the segment average without changing the long-GOP structure.
@@ -756,6 +756,12 @@ private extension HEVCEncoder {
     ) -> Double {
         guard pixelCount > 0 else { return 1.0 }
         let densityRatio = sqrt(referencePixelCount / pixelCount)
+
+        if pixelCount >= referencePixelCount {
+            // Above the reference display, scale sublinearly instead of charging a full
+            // linear pixel-count penalty. This keeps 5K captures closer to ~13-14 Mbps.
+            return densityRatio
+        }
 
         // Smaller full-display captures need extra bitrate to preserve dense UI text,
         // but tiny surfaces should not inherit the native-display budget.
