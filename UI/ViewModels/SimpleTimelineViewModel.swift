@@ -15461,8 +15461,12 @@ public class SimpleTimelineViewModel: ObservableObject {
             return .firstFrameInHour
         }
 
+        let hasAbsoluteCalendarDateToken = normalizedRelativeInput.range(
+            of: #"\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2}(?:st|nd|rd|th)?(?:(?:,\s*|\s+)\d{4})?\b|\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b|\b\d{4}-\d{1,2}-\d{1,2}\b"#,
+            options: .regularExpression
+        ) != nil
         let hasCalendarDateToken = normalizedRelativeInput.range(
-            of: #"\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b|\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b"#,
+            of: #"\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b|\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b|\b\d{4}-\d{1,2}-\d{1,2}\b"#,
             options: .regularExpression
         ) != nil
         let hasDayLevelNaturalLanguageToken = normalizedRelativeInput.range(
@@ -15476,10 +15480,22 @@ public class SimpleTimelineViewModel: ObservableObject {
         let hasDateLikeToken = hasCalendarDateToken
             || hasDayLevelNaturalLanguageToken
             || hasDayLevelRelativeOffsetToken
-        let hasExplicitTime = normalizedWithCompactTimes.range(
-            of: #"\b\d{1,2}:\d{2}\b|\b\d{1,2}\s*(am|pm)\b|\b\d{3,4}\s*(am|pm)\b|\bnoon\b|\bmidnight\b"#,
+        let hasMinutePrecisionTime = normalizedWithCompactTimes.range(
+            of: #"\b\d{1,2}:\d{2}\s*(?:am|pm|a|p)?\b"#,
             options: .regularExpression
         ) != nil
+        let hasHourPrecisionTime = normalizedWithCompactTimes.range(
+            of: #"\b\d{1,2}\s*(?:am|pm|a|p)\b|\bnoon\b|\bmidnight\b"#,
+            options: .regularExpression
+        ) != nil
+        let hasExplicitTime = hasMinutePrecisionTime || hasHourPrecisionTime
+
+        // Absolute calendar dates with a soft hour reference like "Apr 16 9pm"
+        // should land on the first frame in that hour. Minute-precision inputs
+        // like "Apr 16 9:00pm" stay exact.
+        if hasAbsoluteCalendarDateToken && hasHourPrecisionTime && !hasMinutePrecisionTime {
+            return .firstFrameInHour
+        }
 
         if hasDateLikeToken && !hasExplicitTime {
             return .firstFrameInDay

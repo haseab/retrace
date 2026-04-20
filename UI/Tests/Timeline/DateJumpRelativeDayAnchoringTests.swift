@@ -803,6 +803,101 @@ final class DateJumpRelativeDayAnchoringTests: XCTestCase {
         XCTAssertEqual(viewModel.currentTimelineFrame?.frame.timestamp, anchoredTimestamp)
     }
 
+    func testAbsoluteCalendarDateWithSoftHourUsesFirstFrameInResolvedHour() async {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let calendar = Calendar.current
+        let targetHour = makeDate(year: 2026, month: 4, day: 16, hour: 21, minute: 0)
+        guard let hourInterval = calendar.dateInterval(of: .hour, for: targetHour) else {
+            XCTFail("Failed to construct expected hour interval")
+            return
+        }
+
+        var anchoredTimestamp: Date?
+        var sawHourAnchorFetch = false
+        var sawWindowFetch = false
+
+        viewModel.test_windowFetchHooks.getFramesWithVideoInfo = { start, end, limit, _, reason in
+            switch reason {
+            case "searchForDate.anchor.firstFrameInHour":
+                sawHourAnchorFetch = true
+                XCTAssertEqual(limit, 1)
+                XCTAssertEqual(start.timeIntervalSince(hourInterval.start), 0, accuracy: 0.01)
+                XCTAssertEqual(end.timeIntervalSince(hourInterval.end), -0.001, accuracy: 0.01)
+                let firstFrameInHour = hourInterval.start.addingTimeInterval(137)
+                anchoredTimestamp = firstFrameInHour
+                return [self.makeFrameWithVideoInfo(id: 7365, timestamp: firstFrameInHour, processingStatus: 4)]
+
+            case "searchForDate":
+                sawWindowFetch = true
+                guard let anchoredTimestamp else {
+                    XCTFail("Expected hour anchor to resolve before window fetch")
+                    return []
+                }
+                XCTAssertEqual(start.timeIntervalSince(anchoredTimestamp), -600, accuracy: 0.01)
+                XCTAssertEqual(end.timeIntervalSince(anchoredTimestamp), 600, accuracy: 0.01)
+                return [self.makeFrameWithVideoInfo(id: 7365, timestamp: anchoredTimestamp, processingStatus: 4)]
+
+            case "loadNewerFrames.reason=searchForDate",
+                 "loadOlderFrames.reason=searchForDate":
+                return []
+
+            default:
+                XCTFail("Unexpected fetch reason: \(reason)")
+                return []
+            }
+        }
+
+        await viewModel.searchForDate("April 16 2026 9pm")
+
+        XCTAssertTrue(sawHourAnchorFetch)
+        XCTAssertTrue(sawWindowFetch)
+        XCTAssertEqual(viewModel.currentTimelineFrame?.frame.id.value, 7365)
+        XCTAssertEqual(viewModel.currentTimelineFrame?.frame.timestamp, anchoredTimestamp)
+    }
+
+    func testAbsoluteCalendarDateWithMinutePrecisionRemainsExact() async {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let expectedTarget = makeDate(year: 2026, month: 4, day: 16, hour: 21, minute: 0)
+
+        var sawAnchorFetch = false
+        var sawWindowFetch = false
+
+        viewModel.test_windowFetchHooks.getFramesWithVideoInfo = { start, end, _, _, reason in
+            switch reason {
+            case "searchForDate.anchor.firstFrameInRelativeLookback",
+                 "searchForDate.anchor.firstFrameInDay",
+                 "searchForDate.anchor.firstFrameInHour",
+                 "searchForDate.anchor.firstFrameInMinute",
+                 "searchForDate.anchor.firstFrameInMonth",
+                 "searchForDate.anchor.firstFrameInYear":
+                sawAnchorFetch = true
+                XCTFail("April 16 2026 9:00pm should remain an exact timestamp search")
+                return []
+
+            case "searchForDate":
+                sawWindowFetch = true
+                XCTAssertEqual(start.timeIntervalSince(expectedTarget), -600, accuracy: 0.01)
+                XCTAssertEqual(end.timeIntervalSince(expectedTarget), 600, accuracy: 0.01)
+                return [self.makeFrameWithVideoInfo(id: 7366, timestamp: expectedTarget, processingStatus: 4)]
+
+            case "loadNewerFrames.reason=searchForDate",
+                 "loadOlderFrames.reason=searchForDate":
+                return []
+
+            default:
+                XCTFail("Unexpected fetch reason: \(reason)")
+                return []
+            }
+        }
+
+        await viewModel.searchForDate("April 16 2026 9:00pm")
+
+        XCTAssertFalse(sawAnchorFetch)
+        XCTAssertTrue(sawWindowFetch)
+        XCTAssertEqual(viewModel.currentTimelineFrame?.frame.id.value, 7366)
+        XCTAssertEqual(viewModel.currentTimelineFrame?.frame.timestamp, expectedTarget)
+    }
+
     private func makeDate(year: Int, month: Int, day: Int, hour: Int, minute: Int) -> Date {
         let calendar = Calendar.current
         let components = DateComponents(
