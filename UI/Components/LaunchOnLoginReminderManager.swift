@@ -4,6 +4,23 @@ import App
 import Shared
 import ServiceManagement
 
+enum CumulativeScreenTimeTracker {
+    static func reconciledCumulativeDuration(
+        storedCumulativeDuration: TimeInterval,
+        incrementalDuration: TimeInterval,
+        liveDatabaseDuration: TimeInterval
+    ) -> TimeInterval {
+        let sanitizedStoredDuration = max(0, storedCumulativeDuration)
+        let sanitizedIncrementalDuration = max(0, incrementalDuration)
+        let sanitizedLiveDatabaseDuration = max(0, liveDatabaseDuration)
+
+        return max(
+            sanitizedStoredDuration + sanitizedIncrementalDuration,
+            sanitizedLiveDatabaseDuration
+        )
+    }
+}
+
 /// Manages the "Launch on Login" reminder that appears after user has 5+ hours of captured screentime
 /// This is a one-time reminder that can be dismissed permanently
 ///
@@ -74,6 +91,7 @@ public class LaunchOnLoginReminderManager: ObservableObject {
         do {
             let lastCountedTimestamp = getLastCountedTimestamp()
             let cumulativeTime = Self.settingsStore.double(forKey: Self.cumulativeScreenTimeKey)
+            let liveDatabaseDuration = try await coordinator.getTotalCapturedDuration()
 
             // Get duration of segments created after the last checkpoint
             let newDuration: TimeInterval
@@ -81,12 +99,16 @@ public class LaunchOnLoginReminderManager: ObservableObject {
                 newDuration = try await coordinator.getCapturedDurationAfter(date: lastTimestamp)
             } else {
                 // First time - count all existing segments
-                newDuration = try await coordinator.getTotalCapturedDuration()
+                newDuration = liveDatabaseDuration
             }
 
-            // Update cumulative time if there's new time
-            if newDuration > 0 {
-                let updatedCumulative = cumulativeTime + newDuration
+            let updatedCumulative = CumulativeScreenTimeTracker.reconciledCumulativeDuration(
+                storedCumulativeDuration: cumulativeTime,
+                incrementalDuration: newDuration,
+                liveDatabaseDuration: liveDatabaseDuration
+            )
+
+            if updatedCumulative > cumulativeTime {
                 Self.settingsStore.set(updatedCumulative, forKey: Self.cumulativeScreenTimeKey)
             }
 

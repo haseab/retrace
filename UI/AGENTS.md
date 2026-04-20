@@ -137,6 +137,7 @@ UI/
     ├── CommentComposerTargetContextTests.swift # Comment-target utilities and quick-comment persisted-preview source coverage
     ├── CrashRecoverySupportTests.swift   # Crash-recovery bundle resolution and registration policy coverage
     ├── CrashReportSupportTests.swift     # Dashboard crash/WAL report discovery and launch-context coverage
+    ├── CumulativeScreenTimeTrackerTests.swift # Persisted screen-time reconciliation coverage for milestone/reminder thresholds
     ├── QuitConfirmationPresentationTests.swift # Quit alert anchor-window selection coverage
     ├── FeedbackExportTests.swift         # Feedback report export formatting coverage
     ├── FeedbackSubmissionProgressTests.swift # Feedback sending-state sequence coverage
