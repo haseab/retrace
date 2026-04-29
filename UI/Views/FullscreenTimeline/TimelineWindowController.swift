@@ -270,10 +270,18 @@ public class TimelineWindowController: NSObject {
     nonisolated static func shouldDismissTimelineForActivatedApplication(
         isTimelineVisible: Bool,
         activatedProcessID: pid_t?,
-        currentProcessID: pid_t
+        currentProcessID: pid_t,
+        timelineDisplayID: CGDirectDisplayID?,
+        activatedWindowDisplayIDs: Set<CGDirectDisplayID>?
     ) -> Bool {
         guard isTimelineVisible, let activatedProcessID else { return false }
-        return activatedProcessID != currentProcessID
+        guard activatedProcessID != currentProcessID else { return false }
+        guard let timelineDisplayID,
+              let activatedWindowDisplayIDs,
+              activatedWindowDisplayIDs.contains(timelineDisplayID) else {
+            return false
+        }
+        return true
     }
 
     nonisolated static func shouldToggleSearchOverlayFromShortcut(
@@ -490,16 +498,133 @@ public class TimelineWindowController: NSObject {
             let activatedApp = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                guard Self.shouldDismissTimelineForActivatedApplication(
-                    isTimelineVisible: self.isVisible,
-                    activatedProcessID: activatedApp?.processIdentifier,
-                    currentProcessID: currentProcessID
-                ) else {
+                let activatedProcessID = activatedApp?.processIdentifier
+                guard self.isVisible,
+                      let activatedProcessID,
+                      activatedProcessID != currentProcessID else {
                     return
                 }
-                self.dismissForActivatedApplication(activatedApp)
+
+                let timelineDisplayID = self.timelineWindowDisplayID
+                let activatedWindowDisplayIDs = await Self.topmostOnScreenWindowDisplayIDs(
+                    forProcessID: activatedProcessID
+                )
+                guard Self.shouldDismissTimelineForActivatedApplication(
+                    isTimelineVisible: self.isVisible,
+                    activatedProcessID: activatedProcessID,
+                    currentProcessID: currentProcessID,
+                    timelineDisplayID: timelineDisplayID,
+                    activatedWindowDisplayIDs: activatedWindowDisplayIDs
+                ) else {
+                    Log.debug(
+                        "[TIMELINE-AUTO-DISMISS] Ignoring activation outside timeline display activatedPID=\(activatedProcessID) activatedBundleID=\(activatedApp?.bundleIdentifier ?? "nil") timelineDisplayID=\(timelineDisplayID.map(String.init) ?? "nil") activatedWindowDisplayIDs=\(Self.displayIDListDescription(activatedWindowDisplayIDs))",
+                        category: .ui
+                    )
+                    return
+                }
+                self.dismissForActivatedApplication(
+                    activatedApp,
+                    timelineDisplayID: timelineDisplayID,
+                    activatedWindowDisplayIDs: activatedWindowDisplayIDs
+                )
             }
         }
+    }
+
+    private var timelineWindowDisplayID: CGDirectDisplayID? {
+        guard let window else { return nil }
+        if let screen = window.screen ?? NSScreen.screens.first(where: { $0.frame.intersects(window.frame) }) {
+            return screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID
+        }
+        return nil
+    }
+
+    private nonisolated static func topmostOnScreenWindowDisplayIDs(
+        forProcessID processID: pid_t
+    ) async -> Set<CGDirectDisplayID>? {
+        await Task.detached(priority: .utility) {
+            topmostOnScreenWindowDisplayIDsSync(forProcessID: processID)
+        }.value
+    }
+
+    private nonisolated static func topmostOnScreenWindowDisplayIDsSync(
+        forProcessID processID: pid_t
+    ) -> Set<CGDirectDisplayID>? {
+        guard let windowInfoList = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements],
+            kCGNullWindowID
+        ) as? [[String: Any]] else {
+            return nil
+        }
+
+        for windowInfo in windowInfoList {
+            guard windowInfoProcessID(windowInfo) == processID,
+                  windowInfoLayer(windowInfo) == 0,
+                  windowInfoAlpha(windowInfo) > 0.01,
+                  windowInfoIsOnScreen(windowInfo),
+                  let bounds = windowInfoBounds(windowInfo),
+                  bounds.width > 1,
+                  bounds.height > 1 else {
+                continue
+            }
+
+            let displayIDs = displayIDs(intersectingWindowBounds: bounds)
+            return displayIDs.isEmpty ? nil : displayIDs
+        }
+
+        return nil
+    }
+
+    private nonisolated static func windowInfoProcessID(_ windowInfo: [String: Any]) -> pid_t? {
+        guard let value = windowInfo[kCGWindowOwnerPID as String] as? NSNumber else { return nil }
+        return pid_t(value.intValue)
+    }
+
+    private nonisolated static func windowInfoLayer(_ windowInfo: [String: Any]) -> Int {
+        (windowInfo[kCGWindowLayer as String] as? NSNumber)?.intValue ?? Int.max
+    }
+
+    private nonisolated static func windowInfoAlpha(_ windowInfo: [String: Any]) -> Double {
+        (windowInfo[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1
+    }
+
+    private nonisolated static func windowInfoIsOnScreen(_ windowInfo: [String: Any]) -> Bool {
+        guard let value = windowInfo[kCGWindowIsOnscreen as String] as? NSNumber else { return true }
+        return value.boolValue
+    }
+
+    private nonisolated static func windowInfoBounds(_ windowInfo: [String: Any]) -> CGRect? {
+        guard let boundsDictionary = windowInfo[kCGWindowBounds as String] as? NSDictionary else {
+            return nil
+        }
+        var bounds = CGRect.zero
+        guard CGRectMakeWithDictionaryRepresentation(boundsDictionary, &bounds) else {
+            return nil
+        }
+        return bounds
+    }
+
+    private nonisolated static func displayIDs(intersectingWindowBounds bounds: CGRect) -> Set<CGDirectDisplayID> {
+        guard bounds.width > 0, bounds.height > 0 else { return [] }
+
+        var displayCount: UInt32 = 0
+        guard CGGetDisplaysWithRect(bounds, 0, nil, &displayCount) == .success,
+              displayCount > 0 else {
+            return []
+        }
+
+        var displays = [CGDirectDisplayID](repeating: 0, count: Int(displayCount))
+        let result = displays.withUnsafeMutableBufferPointer { buffer in
+            CGGetDisplaysWithRect(bounds, displayCount, buffer.baseAddress, &displayCount)
+        }
+        guard result == .success else { return [] }
+
+        return Set(displays.prefix(Int(displayCount)).filter { $0 != 0 })
+    }
+
+    private nonisolated static func displayIDListDescription(_ displayIDs: Set<CGDirectDisplayID>?) -> String {
+        guard let displayIDs else { return "nil" }
+        return "[" + displayIDs.sorted().map(String.init).joined(separator: ",") + "]"
     }
 
     private func stopObservingApplicationActivation() {
@@ -649,7 +774,11 @@ public class TimelineWindowController: NSObject {
         }
     }
 
-    private func dismissForActivatedApplication(_ activatedApplication: NSRunningApplication?) {
+    private func dismissForActivatedApplication(
+        _ activatedApplication: NSRunningApplication?,
+        timelineDisplayID: CGDirectDisplayID?,
+        activatedWindowDisplayIDs: Set<CGDirectDisplayID>?
+    ) {
         guard isVisible, !isHiding else { return }
         stopObservingApplicationActivation()
         if let coordinator {
@@ -659,7 +788,7 @@ public class TimelineWindowController: NSObject {
             )
         }
         Log.info(
-            "[TIMELINE-AUTO-DISMISS] Dismissing timeline trigger=app_activation activatedPID=\(activatedApplication?.processIdentifier ?? -1) activatedBundleID=\(activatedApplication?.bundleIdentifier ?? "nil")",
+            "[TIMELINE-AUTO-DISMISS] Dismissing timeline trigger=app_activation activatedPID=\(activatedApplication?.processIdentifier ?? -1) activatedBundleID=\(activatedApplication?.bundleIdentifier ?? "nil") timelineDisplayID=\(timelineDisplayID.map(String.init) ?? "nil") activatedWindowDisplayIDs=\(Self.displayIDListDescription(activatedWindowDisplayIDs))",
             category: .ui
         )
         hide(restorePreviousFocus: false)
