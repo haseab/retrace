@@ -544,6 +544,7 @@ public actor AppCoordinator {
 
     // Timeline visibility tracking - pause capture when timeline is open
     private var isTimelineVisible = false
+    private var timelineVisibilityGeneration: UInt64 = 0
 
     // Signal to flush pending frames to the OCR queue
     private var shouldFlushPendingFrames = false
@@ -702,7 +703,24 @@ public actor AppCoordinator {
     // MARK: - Timeline Visibility
 
     /// Set whether the timeline is currently visible (pauses frame processing when true)
-    public func setTimelineVisible(_ visible: Bool) async {
+    public func setTimelineVisible(_ visible: Bool, generation: UInt64? = nil) async {
+        guard Self.shouldApplyTimelineVisibilityUpdate(
+            incomingGeneration: generation,
+            currentGeneration: timelineVisibilityGeneration
+        ) else {
+            Log.debug(
+                "[AppCoordinator] Ignoring stale timeline visibility update visible=\(visible) generation=\(generation.map(String.init) ?? "nil") currentGeneration=\(timelineVisibilityGeneration)",
+                category: .app
+            )
+            return
+        }
+
+        if let generation {
+            timelineVisibilityGeneration = generation
+        } else {
+            timelineVisibilityGeneration &+= 1
+        }
+
         isTimelineVisible = visible
         // When timeline becomes visible, signal to flush any buffered frames to OCR queue
         if visible {
@@ -711,6 +729,14 @@ public actor AppCoordinator {
         if let queue = await services.processingQueue {
             await queue.setTimelineVisibleForRewriteScheduling(visible)
         }
+    }
+
+    nonisolated static func shouldApplyTimelineVisibilityUpdate(
+        incomingGeneration: UInt64?,
+        currentGeneration: UInt64
+    ) -> Bool {
+        guard let incomingGeneration else { return true }
+        return incomingGeneration > currentGeneration
     }
 
     public func setTimelineScrubbing(_ scrubbing: Bool) async {

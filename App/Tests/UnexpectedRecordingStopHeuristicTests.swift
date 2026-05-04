@@ -120,4 +120,34 @@ final class UnexpectedRecordingStopHeuristicTests: XCTestCase {
 
         XCTAssertNil(stalledWriter)
     }
+
+    func testTimelineVisibilityGenerationRejectsOlderUpdates() {
+        XCTAssertTrue(
+            AppCoordinator.shouldApplyTimelineVisibilityUpdate(
+                incomingGeneration: 5,
+                currentGeneration: 4
+            )
+        )
+        XCTAssertFalse(
+            AppCoordinator.shouldApplyTimelineVisibilityUpdate(
+                incomingGeneration: 4,
+                currentGeneration: 4
+            )
+        )
+        XCTAssertFalse(
+            AppCoordinator.shouldApplyTimelineVisibilityUpdate(
+                incomingGeneration: 3,
+                currentGeneration: 4
+            )
+        )
+    }
+
+    func testUnversionedTimelineVisibilityUpdatesKeepExistingCompatibility() {
+        XCTAssertTrue(
+            AppCoordinator.shouldApplyTimelineVisibilityUpdate(
+                incomingGeneration: nil,
+                currentGeneration: 4
+            )
+        )
+    }
 }
