@@ -278,7 +278,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let settingsStore = UserDefaults(suiteName: "io.retrace.app") ?? .standard
     private static let devDeeplinkEnvKey = "RETRACE_DEV_DEEPLINK_URL"
     private static let externalDashboardRevealNotification = Notification.Name("io.retrace.app.externalDashboardReveal")
-    private static let quitConfirmationPreferenceKey = "quitConfirmationPreference"
     private static let showDockIconPreferenceKey = "showDockIcon"
     private static let dashboardShortcutDefaultsKey = "dashboardShortcutConfig"
     private static let recordingShortcutDefaultsKey = "recordingShortcutConfig"
@@ -289,11 +288,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private static let singleInstanceLockRetryDelay: Duration = .milliseconds(100)
     nonisolated private static let watchdogSleepSuspensionSeconds: TimeInterval = 12 * 60 * 60
     nonisolated private static let watchdogWakeGracePeriodSeconds: TimeInterval = 60
-    private enum QuitTerminationPreference: String {
-        case ask
-        case quit
-        case runInBackground
-    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Check if another instance is already running. Relaunches still need to
@@ -956,15 +950,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return .terminateLater
         }
 
-        switch terminationPreferenceForCurrentRequest() {
-        case .quit:
+        if bypassQuitConfirmationPromptOnce {
+            bypassQuitConfirmationPromptOnce = false
             beginTerminationFlush()
             return .terminateLater
-        case .runInBackground:
-            runInBackgroundInsteadOfQuitting()
-            return .terminateCancel
-        case .ask:
-            break
         }
 
         isTerminationDecisionInProgress = true
@@ -983,20 +972,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func exitDuplicatePrelaunchProcess() -> Never {
         // Duplicate-prelaunch exits should not wait on normal AppKit termination flushes.
         Darwin.exit(EXIT_SUCCESS)
-    }
-
-    private func terminationPreferenceForCurrentRequest() -> QuitTerminationPreference {
-        if bypassQuitConfirmationPromptOnce {
-            bypassQuitConfirmationPromptOnce = false
-            return .quit
-        }
-
-        guard let rawValue = settingsStore.string(forKey: Self.quitConfirmationPreferenceKey),
-              let storedPreference = QuitTerminationPreference(rawValue: rawValue) else {
-            return .ask
-        }
-
-        return storedPreference
     }
 
     private func beginTerminationFlush() {
@@ -1026,16 +1001,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func presentQuitConfirmationAlert() {
         Log.info("[AppDelegate] Presenting standard quit confirmation alert", category: .app)
 
-        let alert = NSAlert()
-        alert.alertStyle = .warning
-        alert.icon = NSApp.applicationIconImage
-        alert.messageText = "Are you sure you want to quit Retrace?"
-        alert.informativeText = "Quitting Retrace will stop any active capture and end ongoing recording. You can keep Retrace running in the background without interruption."
-        alert.showsSuppressionButton = true
-        alert.suppressionButton?.title = "Don't ask again"
-        alert.addButton(withTitle: "Quit Retrace")
-        alert.addButton(withTitle: "Run Retrace in Background")
-        alert.addButton(withTitle: "Cancel")
+        let alert = Self.makeQuitConfirmationAlert(applicationIcon: NSApp.applicationIconImage)
         styleQuitAlertPrimaryButton(alert, context: "initial")
         scheduleQuitButtonStyleEnforcement(for: alert, context: "quit-confirmation")
 
@@ -1043,7 +1009,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             alert.beginSheetModal(for: anchorWindow) { [weak self] response in
                 Task { @MainActor in
                     guard let self else { return }
-                    self.handleQuitAlertResponse(response, dontAskAgain: alert.suppressionButton?.state == .on)
+                    self.handleQuitAlertResponse(response)
                 }
             }
             return
@@ -1051,18 +1017,30 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         NSApp.activate(ignoringOtherApps: true)
         let response = alert.runModal()
-        handleQuitAlertResponse(response, dontAskAgain: alert.suppressionButton?.state == .on)
+        handleQuitAlertResponse(response)
     }
 
-    private func handleQuitAlertResponse(_ response: NSApplication.ModalResponse, dontAskAgain: Bool) {
+    static func makeQuitConfirmationAlert(applicationIcon: NSImage?) -> NSAlert {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.icon = applicationIcon
+        alert.messageText = "Are you sure you want to quit Retrace?"
+        alert.informativeText = "Quitting Retrace will stop any active capture and end ongoing recording. You can keep Retrace running in the background without interruption."
+        alert.addButton(withTitle: "Quit Retrace")
+        alert.addButton(withTitle: "Run Retrace in Background")
+        alert.addButton(withTitle: "Cancel")
+        return alert
+    }
+
+    private func handleQuitAlertResponse(_ response: NSApplication.ModalResponse) {
         let result: QuitConfirmationResult
         switch response {
         case .alertFirstButtonReturn:
-            result = QuitConfirmationResult(action: .quit, dontAskAgain: dontAskAgain)
+            result = QuitConfirmationResult(action: .quit)
         case .alertSecondButtonReturn:
-            result = QuitConfirmationResult(action: .runInBackground, dontAskAgain: dontAskAgain)
+            result = QuitConfirmationResult(action: .runInBackground)
         default:
-            result = QuitConfirmationResult(action: .cancel, dontAskAgain: dontAskAgain)
+            result = QuitConfirmationResult(action: .cancel)
         }
         handleQuitConfirmationResult(result)
     }
@@ -1132,17 +1110,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func handleQuitConfirmationResult(_ result: QuitConfirmationResult) {
         isTerminationDecisionInProgress = false
-
-        if result.dontAskAgain {
-            switch result.action {
-            case .quit:
-                settingsStore.set(QuitTerminationPreference.quit.rawValue, forKey: Self.quitConfirmationPreferenceKey)
-            case .runInBackground:
-                settingsStore.set(QuitTerminationPreference.runInBackground.rawValue, forKey: Self.quitConfirmationPreferenceKey)
-            case .cancel:
-                break
-            }
-        }
 
         switch result.action {
         case .quit:
@@ -2706,7 +2673,6 @@ private enum QuitConfirmationAction {
 
 private struct QuitConfirmationResult {
     let action: QuitConfirmationAction
-    let dontAskAgain: Bool
 }
 
 // MARK: - URL Handling

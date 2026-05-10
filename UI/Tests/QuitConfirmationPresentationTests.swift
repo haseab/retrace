@@ -56,6 +56,17 @@ final class QuitConfirmationPresentationTests: XCTestCase {
         XCTAssertNil(anchor)
     }
 
+    func testQuitConfirmationAlertDoesNotOfferDontAskAgain() {
+        let alert = AppDelegate.makeQuitConfirmationAlert(applicationIcon: nil)
+
+        XCTAssertFalse(alert.showsSuppressionButton)
+        XCTAssertEqual(alert.buttons.map(\.title), [
+            "Quit Retrace",
+            "Run Retrace in Background",
+            "Cancel"
+        ])
+    }
+
     func testFreshLaunchActivatesExistingInstanceWhenMatchingRunningAppExistsEvenIfLockWasAcquired() {
         XCTAssertEqual(
             AppDelegate.launchGateAction(
