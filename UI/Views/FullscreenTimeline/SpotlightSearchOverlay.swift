@@ -2137,7 +2137,9 @@ struct SpotlightSearchField: NSViewRepresentable {
     }
 
     func updateNSView(_ textField: FocusableTextField, context: Context) {
-        if textField.stringValue != text {
+        // Skip the write-back while IME composition is active; it would commit marked text.
+        let isComposing = (textField.currentEditor() as? NSTextView)?.hasMarkedText() ?? false
+        if !isComposing, textField.stringValue != text {
             textField.stringValue = text
         }
         context.coordinator.onSubmit = onSubmit
