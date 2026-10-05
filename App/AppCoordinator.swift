@@ -1636,7 +1636,8 @@ public actor AppCoordinator {
                 ocrAccuracyLevel: currentConfig.ocrAccuracyLevel,
                 recognitionLanguages: currentConfig.recognitionLanguages,
                 minimumConfidence: currentConfig.minimumConfidence,
-                preferBackgroundProcessing: preferBackground
+                preferBackgroundProcessing: preferBackground,
+                ocrLanguageCorrectionEnabled: currentConfig.ocrLanguageCorrectionEnabled
             )
             await services.processing.updateConfig(updatedConfig)
         }

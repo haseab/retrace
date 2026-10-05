@@ -35,8 +35,10 @@ Processing/
 └── Tests/
     ├── ExtractRequestInstrumentationTests.swift # Region tail aggregation and coordinator helper coverage
     ├── InPageURLMetadataResolutionTests.swift # In-page URL metadata retry and rewrite scheduling regression coverage
+    ├── OCRLanguageCorrectionConfigTests.swift # Vision language-correction default and request-config propagation
     ├── OCRMemoryBackpressurePolicyTests.swift # OCR memory backpressure threshold/default coverage
     ├── PhraseLevelRedactionTests.swift        # Manual + automatic OCR phrase-level redaction coverage
+    ├── RegionOCRLanguageCorrectionBenchmark.swift # Opt-in paired benchmark: language correction cost on real frames
     ├── RewriteRetryPolicyTests.swift          # Bounded automatic rewrite retry coverage
     ├── TestLogger.swift                       # Shared processing test logging helpers
     └── _future/
