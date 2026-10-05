@@ -188,6 +188,41 @@ private actor FailingRewriteStorage: StorageProtocol, RewriteAttemptCountingStor
     }
 }
 
+private struct RewriteTestTimeout: Error, CustomStringConvertible {
+    let stage: String
+    let seconds: Double
+
+    var description: String {
+        "Timed out after \(seconds)s waiting for: \(stage)"
+    }
+}
+
+/// Delivers whichever of two racing tasks finishes first and ignores the loser.
+private actor FirstRewriteTestOutcome<T: Sendable> {
+    private var resolved: Result<T, Error>?
+    private var waiter: CheckedContinuation<Result<T, Error>, Never>?
+
+    func resolve(_ outcome: Result<T, Error>) {
+        guard resolved == nil else { return }
+        resolved = outcome
+
+        if let waiter {
+            self.waiter = nil
+            waiter.resume(returning: outcome)
+        }
+    }
+
+    func firstOutcome() async -> Result<T, Error> {
+        if let resolved {
+            return resolved
+        }
+
+        return await withCheckedContinuation { continuation in
+            waiter = continuation
+        }
+    }
+}
+
 private actor BlockingRewriteStorage: StorageProtocol, RewriteAttemptCountingStorage {
     private var rewriteAttemptCount = 0
     private var firstRewriteStarted = false
@@ -296,6 +331,13 @@ private actor BlockingRewriteStorage: StorageProtocol, RewriteAttemptCountingSto
 }
 
 final class RewriteRetryPolicyTests: XCTestCase {
+    /// The secret the fixtures encrypt node text with.
+    ///
+    /// It is injected into the queue rather than read from the Keychain: `processPendingRewrites`
+    /// defers with `.missingMasterKey` when no app-wide secret exists, so reading real machine
+    /// state would make every rewrite here depend on whether the host happens to have run the app.
+    private static let testAppWideSecret = "test-secret"
+
     private var database: DatabaseManager!
     private var queue: FrameProcessingQueue!
     private var storage: FailingRewriteStorage!
@@ -316,7 +358,8 @@ final class RewriteRetryPolicyTests: XCTestCase {
                 maxRetryAttempts: 3,
                 maxQueueSize: 1000,
                 retryableRewriteRetryDelayNs: 50_000_000
-            )
+            ),
+            appWideSecretProvider: { Self.testAppWideSecret }
         )
     }
 
@@ -375,7 +418,8 @@ final class RewriteRetryPolicyTests: XCTestCase {
                 maxRetryAttempts: 3,
                 maxQueueSize: 1000,
                 retryableRewriteRetryDelayNs: 50_000_000
-            )
+            ),
+            appWideSecretProvider: { Self.testAppWideSecret }
         )
 
         let fixture = try await insertVideoFixture(frameCount: 2)
@@ -402,7 +446,9 @@ final class RewriteRetryPolicyTests: XCTestCase {
         let firstRewriteTask = Task {
             try await blockingQueue.processPendingRewrites(for: fixture.videoID.value)
         }
-        await blockingStorage.waitForFirstRewriteToStart()
+        try await withTestTimeout("first rewrite to start") {
+            await blockingStorage.waitForFirstRewriteToStart()
+        }
 
         let secondFrameID = try await insertFrameReference(
             segmentID: fixture.segmentID,
@@ -423,11 +469,17 @@ final class RewriteRetryPolicyTests: XCTestCase {
             rewritePurpose: "redaction"
         )
 
-        let deferredOutcome = try await blockingQueue.processPendingRewrites(for: fixture.videoID.value)
+        let deferredOutcome = try await withTestTimeout(
+            "second processPendingRewrites to return .deferred(.rewriteAlreadyInProgress)"
+        ) {
+            try await blockingQueue.processPendingRewrites(for: fixture.videoID.value)
+        }
         XCTAssertEqual(deferredOutcome, .deferred(.rewriteAlreadyInProgress))
 
         await blockingStorage.releaseFirstRewrite()
-        let firstRewriteOutcome = try await firstRewriteTask.value
+        let firstRewriteOutcome = try await withTestTimeout("first rewrite task to finish") {
+            try await firstRewriteTask.value
+        }
         XCTAssertEqual(firstRewriteOutcome, .completed)
 
         try await waitForRewriteAttemptCount(2, in: blockingStorage)
@@ -437,6 +489,55 @@ final class RewriteRetryPolicyTests: XCTestCase {
         )
         XCTAssertEqual(statuses[firstFrameID.value], FrameProcessingStatus.rewriteCompleted.rawValue)
         XCTAssertEqual(statuses[secondFrameID.value], FrameProcessingStatus.rewriteCompleted.rawValue)
+    }
+
+    /// Bounds an await that would otherwise hang the whole test process.
+    ///
+    /// `swift test` has no per-test timeout, so a suspension that never resumes takes
+    /// the entire run with it — one stuck test made the full suite unrunnable rather
+    /// than merely red. This converts that into a named failure at the exact stage
+    /// that stalled.
+    ///
+    /// The operation runs as an unstructured task deliberately. A task group cannot return
+    /// until every child has finished, and `cancelAll()` does nothing to a child parked in a
+    /// non-cancellable `withCheckedContinuation` — which is exactly what the waits here do.
+    /// A group-based timeout therefore reported the failure and *then* wedged the process
+    /// during teardown, leaving the run unable to finish even though it knew the answer.
+    /// Abandoning an unstructured task leaks a suspended task instead, which costs a little
+    /// memory and lets the suite report and move on.
+    private func withTestTimeout<T: Sendable>(
+        _ stage: String,
+        seconds: Double = 20,
+        file: StaticString = #filePath,
+        line: UInt = #line,
+        _ operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        let outcome = FirstRewriteTestOutcome<T>()
+
+        let operationTask = Task {
+            do {
+                await outcome.resolve(.success(try await operation()))
+            } catch {
+                await outcome.resolve(.failure(error))
+            }
+        }
+        let timeoutTask = Task {
+            try? await Task.sleep(for: .seconds(seconds), clock: .continuous)
+            await outcome.resolve(.failure(RewriteTestTimeout(stage: stage, seconds: seconds)))
+        }
+        defer {
+            operationTask.cancel()
+            timeoutTask.cancel()
+        }
+
+        switch await outcome.firstOutcome() {
+        case .success(let value):
+            return value
+        case .failure(let error):
+            // Throwing from an async test already records a failure carrying this
+            // error's description, so an XCTFail here would report the same timeout twice.
+            throw error
+        }
     }
 
     private func waitForRewriteAttemptCount<Storage: RewriteAttemptCountingStorage>(
@@ -579,7 +680,7 @@ final class RewriteRetryPolicyTests: XCTestCase {
             text,
             frameID: frameID.value,
             nodeOrder: 0,
-            secret: "test-secret"
+            secret: Self.testAppWideSecret
         ) ?? text
         try await database.insertNodes(
             frameID: frameID,
