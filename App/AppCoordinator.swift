@@ -257,12 +257,19 @@ public final class PipelineStatusHolder: @unchecked Sendable {
 /// This path is lossy by design: when disk/JPEG work falls behind, we prefer
 /// dropping older pending stills over retaining unbounded raw frame memory.
 actor TimelineStillDiskWriter {
+    struct CleanupPolicy: Sendable {
+        var interval: TimeInterval = 60
+        var maxAge: TimeInterval = 20 * 60
+        var maxBytes: Int64 = 2 * 1024 * 1024 * 1024
+    }
+
     struct Diagnostics: Sendable {
         var enqueuedCount = 0
         var writtenCount = 0
         var droppedCount = 0
         var failureCount = 0
         var terminatedEnqueueCount = 0
+        var cleanupCount = 0
     }
 
     private struct WriteRequest: Sendable {
@@ -273,14 +280,19 @@ actor TimelineStillDiskWriter {
     typealias DestinationResolver = @Sendable (Int64) -> URL
     typealias Encoder = @Sendable (CapturedFrame) throws -> Data
     typealias WarningLogger = @Sendable (String) -> Void
+    typealias ProcessingStatuses = @Sendable ([Int64]) async throws -> [Int64: Int]
 
     private let destinationResolver: DestinationResolver
     private let encoder: Encoder
     private let warningLogger: WarningLogger
+    private let cleanupPolicy: CleanupPolicy
+    private let processingStatuses: ProcessingStatuses
     private let stream: AsyncStream<WriteRequest>
     private let continuation: AsyncStream<WriteRequest>.Continuation
 
     private var workerTask: Task<Void, Never>?
+    private var cleanupTask: Task<Void, Never>?
+    private var lastCleanupUptime: TimeInterval?
     private var diagnostics = Diagnostics()
     private var isClosed = false
 
@@ -288,7 +300,9 @@ actor TimelineStillDiskWriter {
         bufferLimit: Int,
         destinationResolver: @escaping DestinationResolver,
         encoder: @escaping Encoder,
-        warningLogger: @escaping WarningLogger
+        warningLogger: @escaping WarningLogger,
+        cleanupPolicy: CleanupPolicy = CleanupPolicy(),
+        processingStatuses: @escaping ProcessingStatuses = { _ in [:] }
     ) {
         let (stream, continuation) = AsyncStream<WriteRequest>.makeStream(
             bufferingPolicy: .bufferingNewest(bufferLimit)
@@ -296,6 +310,8 @@ actor TimelineStillDiskWriter {
         self.destinationResolver = destinationResolver
         self.encoder = encoder
         self.warningLogger = warningLogger
+        self.cleanupPolicy = cleanupPolicy
+        self.processingStatuses = processingStatuses
         self.stream = stream
         self.continuation = continuation
     }
@@ -332,6 +348,9 @@ actor TimelineStillDiskWriter {
         }
 
         isClosed = true
+        // A large old cache must not hold shutdown hostage. The sweep checks cancellation
+        // between entries and after every database await; no further sweep can be scheduled.
+        cleanupTask?.cancel()
         continuation.finish()
         if let workerTask {
             await workerTask.value
@@ -350,31 +369,191 @@ actor TimelineStillDiskWriter {
         let destinationResolver = self.destinationResolver
         let encoder = self.encoder
         let warningLogger = self.warningLogger
-
         workerTask = Task.detached(priority: .utility) {
             for await request in stream {
+                let destinationURL = destinationResolver(request.frameID)
                 do {
-                    let destinationURL = destinationResolver(request.frameID)
                     let jpegData = try encoder(request.frame)
                     try FileManager.default.createDirectory(
                         at: destinationURL.deletingLastPathComponent(),
                         withIntermediateDirectories: true
                     )
                     try jpegData.write(to: destinationURL, options: [.atomic])
-                    await self.recordWriteSuccess()
+                    await self.recordWriteSuccess(directory: destinationURL.deletingLastPathComponent())
                 } catch {
                     await self.recordWriteFailure(
                         frameID: request.frameID,
                         error: error,
                         warningLogger: warningLogger
                     )
+                    // In particular, a full disk must not prevent the cleanup that frees space.
+                    await self.scheduleCleanupIfNeeded(directory: destinationURL.deletingLastPathComponent())
                 }
             }
         }
     }
 
-    private func recordWriteSuccess() {
+    private func scheduleCleanupIfNeeded(directory: URL) {
+        guard !isClosed, cleanupTask == nil else { return }
+        let uptime = ProcessInfo.processInfo.systemUptime
+        guard lastCleanupUptime.map({ uptime - $0 >= cleanupPolicy.interval }) ?? true else { return }
+        let policy = cleanupPolicy
+        let statuses = processingStatuses
+        let logger = warningLogger
+        cleanupTask = Task.detached(priority: .background) { [weak self] in
+            await Self.pruneCache(directory: directory, policy: policy, processingStatuses: statuses, warningLogger: logger)
+            await self?.didFinishCleanup()
+        }
+    }
+
+    private func didFinishCleanup() {
+        lastCleanupUptime = ProcessInfo.processInfo.systemUptime
+        cleanupTask = nil
+        diagnostics.cleanupCount += 1
+    }
+
+    private struct CacheEntry {
+        let url: URL
+        let frameID: Int64
+        let modified: Date
+        let bytes: Int64
+    }
+
+    /// The byte budget is best effort: unreadable/unknown frames are protected, even over budget.
+    /// Run independently of the still writer, query bounded batches, and never await this on shutdown.
+    nonisolated private static func pruneCache(
+        directory: URL,
+        policy: CleanupPolicy,
+        processingStatuses: ProcessingStatuses,
+        warningLogger: WarningLogger
+    ) async {
+        let manager = FileManager.default
+        let keys: Set<URLResourceKey> = [.isRegularFileKey, .isSymbolicLinkKey, .contentModificationDateKey, .fileSizeKey]
+        var failureCount = 0
+        guard let files = manager.enumerator(
+            at: directory,
+            includingPropertiesForKeys: Array(keys),
+            options: [.skipsHiddenFiles, .skipsSubdirectoryDescendants],
+            errorHandler: { _, _ in
+                failureCount += 1
+                return !Task.isCancelled
+            }
+        ) else {
+            warningLogger("[Timeline-DiskBuffer] Capture cache cleanup could not enumerate directory")
+            return
+        }
+
+        let cutoff = Date().addingTimeInterval(-policy.maxAge)
+        var retained: [CacheEntry] = []
+        var batch: [CacheEntry] = []
+        var totalBytes: Int64 = 0
+        var protectedBytes: Int64 = 0
+        var removedCount = 0
+        var removedBytes: Int64 = 0
+
+        func remove(_ entry: CacheEntry) -> Bool {
+            guard !Task.isCancelled else { return false }
+            do {
+                // The timeline may atomically replace an old cached image while we await the DB.
+                // Preserve replacements until a later sweep rather than unlinking a fresh preview.
+                var currentURL = entry.url
+                currentURL.removeAllCachedResourceValues()
+                let current = try currentURL.resourceValues(forKeys: keys)
+                guard current.isRegularFile == true, current.isSymbolicLink != true,
+                      current.contentModificationDate == entry.modified,
+                      current.fileSize == Int(entry.bytes) else { return false }
+                try manager.removeItem(at: entry.url)
+                removedCount += 1
+                removedBytes += entry.bytes
+                return true
+            } catch let error as NSError where error.domain == NSCocoaErrorDomain &&
+                (error.code == NSFileNoSuchFileError || error.code == NSFileReadNoSuchFileError) {
+                return true // Timeline cleanup removed it concurrently.
+            } catch {
+                failureCount += 1
+                return false
+            }
+        }
+
+        func processBatch() async throws {
+            try Task.checkCancellation()
+            let statuses = try await processingStatuses(batch.map(\.frameID))
+            try Task.checkCancellation()
+            for entry in batch {
+                try Task.checkCancellation()
+                totalBytes += entry.bytes
+                // Status 4 has no readable video yet. Unknown rows/statuses and in-progress
+                // rewrites are also retained. Lookup failure aborts the sweep without guessing.
+                guard let status = statuses[entry.frameID], [0, 1, 2, 3, 7, 8].contains(status) else {
+                    protectedBytes += entry.bytes
+                    continue
+                }
+                if entry.modified < cutoff, remove(entry) {
+                    totalBytes -= entry.bytes
+                } else {
+                    retained.append(entry)
+                }
+            }
+            batch.removeAll(keepingCapacity: true)
+            await Task.yield()
+        }
+
+        do {
+            for case let url as URL in files {
+                try Task.checkCancellation()
+                guard url.pathExtension == "jpg",
+                      let frameID = Int64(url.deletingPathExtension().lastPathComponent) else { continue }
+                do {
+                    let values = try url.resourceValues(forKeys: keys)
+                    guard values.isRegularFile == true, values.isSymbolicLink != true,
+                          let modified = values.contentModificationDate,
+                          let size = values.fileSize else { continue }
+                    batch.append(CacheEntry(url: url, frameID: frameID, modified: modified, bytes: Int64(size)))
+                } catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError {
+                    continue
+                } catch {
+                    failureCount += 1
+                }
+                if batch.count >= 128 { try await processBatch() }
+            }
+            if !batch.isEmpty { try await processBatch() }
+            try Task.checkCancellation()
+
+            if totalBytes > policy.maxBytes {
+                // Recheck eligibility in bounded batches before size eviction: a rewrite may
+                // have begun since enumeration. Most recent entries are evicted last.
+                let oldestFirst = retained.sorted { $0.modified < $1.modified }
+                for offset in stride(from: 0, to: oldestFirst.count, by: 128) {
+                    guard totalBytes > policy.maxBytes else { break }
+                    try Task.checkCancellation()
+                    let candidates = oldestFirst[offset..<min(offset + 128, oldestFirst.count)]
+                    let statuses = try await processingStatuses(candidates.map(\.frameID))
+                    try Task.checkCancellation()
+                    for entry in candidates {
+                        guard totalBytes > policy.maxBytes else { break }
+                        guard let status = statuses[entry.frameID], [0, 1, 2, 3, 7, 8].contains(status) else { continue }
+                        if remove(entry) { totalBytes -= entry.bytes }
+                    }
+                    await Task.yield()
+                }
+            }
+        } catch is CancellationError {
+            return
+        } catch {
+            warningLogger("[Timeline-DiskBuffer] Capture cache cleanup stopped: \(error); preserving unchecked stills")
+            return
+        }
+        if removedCount > 0 || totalBytes > policy.maxBytes {
+            Log.info("[Timeline-DiskBuffer] Capture cache cleanup removed=\(removedCount) reclaimedBytes=\(removedBytes) remainingBytes=\(totalBytes) protectedBytes=\(protectedBytes)", category: .app)
+        }
+        if failureCount > 0 {
+            warningLogger("[Timeline-DiskBuffer] Capture cache cleanup failures=\(failureCount); will retry on next sweep")
+        }
+    }
+
+    private func recordWriteSuccess(directory: URL) {
         diagnostics.writtenCount += 1
+        scheduleCleanupIfNeeded(directory: directory)
     }
 
     private func recordWriteFailure(
@@ -600,6 +779,9 @@ public actor AppCoordinator {
             },
             warningLogger: { message in
                 Log.warning(message, category: .app)
+            },
+            processingStatuses: { frameIDs in
+                try await services.database.getFrameProcessingStatuses(frameIDs: frameIDs)
             }
         )
         Log.info("AppCoordinator created", category: .app)
@@ -607,7 +789,8 @@ public actor AppCoordinator {
 
     /// Convenience initializer with default configuration
     public init() {
-        self.services = ServiceContainer()
+        let services = ServiceContainer()
+        self.services = services
         self.timelineStillDiskWriter = TimelineStillDiskWriter(
             bufferLimit: Self.timelineStillWriterBufferLimit,
             destinationResolver: { frameID in
@@ -618,6 +801,9 @@ public actor AppCoordinator {
             },
             warningLogger: { message in
                 Log.warning(message, category: .app)
+            },
+            processingStatuses: { frameIDs in
+                try await services.database.getFrameProcessingStatuses(frameIDs: frameIDs)
             }
         )
         Log.info("AppCoordinator created with default services", category: .app)
