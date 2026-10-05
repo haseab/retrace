@@ -136,7 +136,12 @@ extension VisionOCR {
 
     static func synchronizedLedgerSnapshot() async -> MemoryLedger.Snapshot {
         let processSnapshot = ProcessingMemoryDiagnostics.currentProcessMemorySnapshot()
-        MemoryLedger.setProcessSnapshot(
+        // Ordered, not fire-and-forget: this function's contract is that the process
+        // snapshot is applied *before* the ledger is read, and the fire-and-forget path
+        // may refuse a write once its backlog is saturated -- which would leave the
+        // snapshot below reading a stale footprint precisely when the process is under
+        // the most memory pressure. Mirrors ProcessingExtractMemoryLedger's copy.
+        await MemoryLedger.setProcessSnapshotOrdered(
             footprintBytes: processSnapshot?.physFootprintBytes,
             residentBytes: processSnapshot?.residentBytes,
             internalBytes: processSnapshot?.internalBytes,
