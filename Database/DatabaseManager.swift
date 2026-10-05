@@ -3748,12 +3748,24 @@ public actor DatabaseManager: DatabaseProtocol {
         do {
             keyData = try loadKeyFromKeychain(service: keychainService, account: keychainAccount)
             Log.debug("[DatabaseManager] Loaded existing database encryption key from Keychain", category: .database)
-        } catch {
-            // Generate new key
+        } catch KeychainKeyError.notFound {
+            // Genuinely no key exists yet (first run with encryption enabled).
+            // Only in this case is it safe to mint a fresh key.
             let key = SymmetricKey(size: .bits256)
             keyData = key.withUnsafeBytes { Data($0) }
             try saveKeyToKeychain(keyData, service: keychainService, account: keychainAccount)
             Log.debug("[DatabaseManager] Generated and saved new database encryption key to Keychain", category: .database)
+        } catch KeychainKeyError.readFailed(let status) {
+            // Transient / permission failure (locked keychain, denied ACL prompt,
+            // securityd hiccup, errSecAuthFailed, ...). Previously this branch fell
+            // through to generating a replacement key, and saveKeyToKeychain deletes
+            // the existing item first -- destroying the ONLY copy of the real key and
+            // permanently bricking the encrypted database. Never do that on ambiguity:
+            // refuse to open so the user can retry once the Keychain is available.
+            Log.error("[DatabaseManager] Database encryption key is temporarily unavailable (Keychain status: \(status)); refusing to open to avoid overwriting the existing key", category: .database)
+            throw DatabaseError.connectionFailed(
+                underlying: "Database encryption key is temporarily unavailable (Keychain status: \(status)). Refusing to open the encrypted database so the existing key is not overwritten."
+            )
         }
 
         // Set key using PRAGMA key (SQLCipher)
@@ -3768,13 +3780,51 @@ public actor DatabaseManager: DatabaseProtocol {
 
         guard sqlite3_exec(db, pragma, nil, nil, &errorMessage) == SQLITE_OK else {
             let message = errorMessage.map { String(cString: $0) } ?? "Unknown error"
-            Log.error("[DatabaseManager] Failed to set database encryption key: \(message)", category: .database)
-            Log.warning("[DatabaseManager] SQLCipher may not be available - falling back to unencrypted database", category: .database)
-            // Don't throw - fall back to unencrypted database
-            return
+            Log.error("[DatabaseManager] Failed to apply database encryption key: \(message)", category: .database)
+            // The user explicitly enabled encryption. Do NOT silently fall back to an
+            // unencrypted database -- that would write months of screen data in plaintext
+            // while Settings still reports encryption as on. Fail loudly instead.
+            throw DatabaseError.connectionFailed(
+                underlying: "Failed to apply database encryption key: \(message). Refusing to open the database unencrypted."
+            )
         }
 
+        // PRAGMA key returns SQLITE_OK even when the runtime is plain SQLite (the pragma
+        // is silently ignored) or when the wrong key was applied to an existing encrypted
+        // database. Verify the key actually took effect before proceeding.
+        try verifyEncryptionApplied(db: db)
+
         Log.debug("[DatabaseManager] Database encryption key set successfully", category: .database)
+    }
+
+    /// Confirm that SQLCipher is active and the supplied key actually decrypts the
+    /// database. Throws (aborting the open) rather than allowing a silent plaintext
+    /// or wrong-key database to be used when the user enabled encryption.
+    private func verifyEncryptionApplied(db: OpaquePointer) throws {
+        // 1. SQLCipher must be present. On plain SQLite `PRAGMA cipher_version`
+        //    is an unknown pragma and returns no rows.
+        var versionStmt: OpaquePointer?
+        defer { sqlite3_finalize(versionStmt) }
+        guard sqlite3_prepare_v2(db, "PRAGMA cipher_version;", -1, &versionStmt, nil) == SQLITE_OK,
+              sqlite3_step(versionStmt) == SQLITE_ROW,
+              let versionC = sqlite3_column_text(versionStmt, 0),
+              !String(cString: versionC).isEmpty else {
+            throw DatabaseError.connectionFailed(
+                underlying: "Encryption is enabled but SQLCipher is unavailable in this runtime. Refusing to open the database unencrypted."
+            )
+        }
+
+        // 2. The key must actually decrypt the database. On an existing encrypted
+        //    database the wrong key makes the first real page read fail with
+        //    "file is not a database".
+        var checkError: UnsafeMutablePointer<CChar>?
+        defer { sqlite3_free(checkError) }
+        guard sqlite3_exec(db, "SELECT count(*) FROM sqlite_master;", nil, nil, &checkError) == SQLITE_OK else {
+            let message = checkError.map { String(cString: $0) } ?? "Unknown error"
+            throw DatabaseError.connectionFailed(
+                underlying: "Database encryption key did not decrypt the database (\(message)). Refusing to open to avoid overwriting existing data."
+            )
+        }
     }
 
     private func verifyFTS5RuntimeSupport() throws {
@@ -3838,6 +3888,15 @@ public actor DatabaseManager: DatabaseProtocol {
         }
     }
 
+    /// Distinguishes "the key genuinely does not exist" from "the Keychain read
+    /// failed for a transient/permission reason". The two must never be conflated:
+    /// treating a transient failure as "no key" leads to the existing key being
+    /// overwritten and the encrypted database bricked.
+    private enum KeychainKeyError: Error {
+        case notFound
+        case readFailed(OSStatus)
+    }
+
     /// Load encryption key from Keychain
     private func loadKeyFromKeychain(service: String, account: String) throws -> Data {
         let query: [String: Any] = [
@@ -3850,8 +3909,12 @@ public actor DatabaseManager: DatabaseProtocol {
 
         var result: AnyObject?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
+        if status == errSecItemNotFound {
+            throw KeychainKeyError.notFound
+        }
         guard status == errSecSuccess, let data = result as? Data else {
-            throw DatabaseError.connectionFailed(underlying: "Failed to load encryption key from Keychain")
+            // Any non-success, non-notFound status is a transient/permission failure.
+            throw KeychainKeyError.readFailed(status)
         }
         return data
     }
