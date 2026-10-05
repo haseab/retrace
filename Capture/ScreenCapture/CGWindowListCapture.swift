@@ -1195,8 +1195,11 @@ public actor CGWindowListCapture {
                 space: colorSpace,
                 bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
               ) else {
-            Log.error("[Masking] Failed to create graphics context", category: .capture)
-            return FilteredCaptureResult(image: fullScreenImage, visibleExcludedWindowIDs: [])
+            Log.error("[Masking] Failed to create graphics context - dropping frame to avoid leaking excluded windows", category: .capture)
+            // Fail closed: excluded/private windows are visible and we could not mask
+            // them. Returning the unmasked capture would persist a full screenshot of
+            // exactly the content the user marked as sensitive. Drop the frame instead.
+            return nil
         }
 
         // Draw the full screen image
@@ -1204,8 +1207,9 @@ public actor CGWindowListCapture {
 
         let fullImageRect = CGRect(x: 0, y: 0, width: width, height: height)
         guard let blurredImage = makeBlurredRedactionImage(from: fullScreenImage) else {
-            Log.error("[Masking] Failed to create blurred redaction image", category: .capture)
-            return FilteredCaptureResult(image: fullScreenImage, visibleExcludedWindowIDs: [])
+            Log.error("[Masking] Failed to create blurred redaction image - dropping frame to avoid leaking excluded windows", category: .capture)
+            // Fail closed (see above): drop rather than persist an unmasked capture.
+            return nil
         }
 
         var maskPaths: [CGPath] = []
@@ -1255,8 +1259,9 @@ public actor CGWindowListCapture {
         context.restoreGState()
 
         guard let maskedImage = context.makeImage() else {
-            Log.error("[Masking] Failed to create masked image", category: .capture)
-            return FilteredCaptureResult(image: fullScreenImage, visibleExcludedWindowIDs: [])
+            Log.error("[Masking] Failed to create masked image - dropping frame to avoid leaking excluded windows", category: .capture)
+            // Fail closed (see above): drop rather than persist an unmasked capture.
+            return nil
         }
 
         let visibleExcludedWindowIDs = Set(visibleExcludedRegions.map { $0.windowID })
