@@ -74,7 +74,10 @@ let package = Package(
         ),
         .testTarget(
             name: "DatabaseTests",
-            dependencies: ["Database", "Shared"],
+            // Storage/Processing/Search are imported by AsyncQueuePipelineTests. Undeclared,
+            // a cold build races and fails with "no such module 'Processing'" -- it only ever
+            // worked because another target happened to build them first.
+            dependencies: ["Database", "Shared", "Storage", "Processing", "Search"],
             path: "Database/Tests",
             exclude: [
                 "_future"  // Release 2+ tests
@@ -209,7 +212,8 @@ let package = Package(
             dependencies: [
                 "App",
                 "Database",
-                "Shared"
+                "Shared",
+                "Storage"
             ],
             path: "App/Tests"
             // ⚠️ RELEASE 2 ONLY - Whisper cSettings and linkerSettings removed for Release 1
@@ -284,7 +288,7 @@ let package = Package(
         ),
         .testTarget(
             name: "RetraceTests",
-            dependencies: ["Retrace", "CrashRecoverySupport", "Shared", "App"],
+            dependencies: ["Retrace", "CrashRecoverySupport", "Shared", "App", "Processing"],
             path: "UI/Tests"
             // ⚠️ RELEASE 2 ONLY - Whisper cSettings and linkerSettings removed for Release 1
         ),
