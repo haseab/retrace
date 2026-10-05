@@ -4033,7 +4033,12 @@ public class SimpleTimelineViewModel: ObservableObject {
             targetIndex = findClosestFrameIndex(to: targetDate)
         }
 
-        guard requestStillCurrent?() ?? true else { return nil }
+        // No staleness re-check here on purpose. `requestStillCurrent` asks whether the playhead
+        // still sits on the originally requested frame, and applyNavigationFrameWindow above has
+        // just replaced the window -- so by this point our own mutation has invalidated it. There
+        // is no await between the last check and here, so no request can have superseded us
+        // either. Re-checking could only abort a navigation that had already happened, leaving a
+        // freshly applied window with a stale index and reporting failure to the caller.
         navigateToFrame(targetIndex)
         return targetIndex
     }
