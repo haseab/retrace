@@ -5,10 +5,10 @@ import Shared
 /// Segment writer with write-ahead logging
 ///
 /// Features:
-/// - Writes raw frames to WAL before encoding (crash-safe)
-/// - Encoder writes frames incrementally to video file
-/// - WAL enables crash recovery - frames can be re-encoded from WAL on restart
-/// - Video file becomes readable only after finalize(), but WAL ensures no data loss
+/// - Buffers compressed frames in the WAL before encoding (memory-backed by default)
+/// - Encoder writes readable fragments incrementally to the video file
+/// - Persists WAL frames before discarding a failed encoder's video
+/// - Abrupt termination can lose the unflushed tail of a memory-backed session
 public actor IncrementalSegmentWriter: SegmentWriter {
     public let segmentID: VideoSegmentID
     public private(set) var frameCount: Int = 0
@@ -66,8 +66,8 @@ public actor IncrementalSegmentWriter: SegmentWriter {
         // Track I/O latency for storage health monitoring
         let writeStart = CFAbsoluteTimeGetCurrent()
 
-        // STEP 1: Write to WAL first (crash-safe persistence)
-        // This is the critical durability guarantee - frames are safe even if app crashes
+        // STEP 1: Buffer in the WAL before encoding. Memory-backed sessions
+        // become durable through video fragments or an explicit spill to disk.
         if walSession == nil {
             let session = try await walManager.createSession(videoID: segmentID)
             walSession = session
@@ -165,6 +165,12 @@ public actor IncrementalSegmentWriter: SegmentWriter {
 
     private func cancelInternal(preserveWALForRecovery: Bool) async throws {
         cancelled = true
+        if preserveWALForRecovery, let session = walSession {
+            // reset() deletes the video too. Persist first, and keep both the
+            // encoder and session intact if spilling fails so cancellation can
+            // be retried without losing the only surviving recovery copy.
+            try await walManager.persistSessionForRecovery(videoID: session.videoID)
+        }
         await encoder.reset()
         try? FileManager.default.removeItem(at: fileURL)
 
