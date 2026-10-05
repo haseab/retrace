@@ -10,20 +10,25 @@ You are responsible for the **Storage** module of Retrace. Your job is to implem
 Storage/
 ├── GeneratorCachePolicy.swift   # Shared idle/LRU eviction policy for AVAsset generator caches
 ├── StorageManager.swift         # Main StorageProtocol implementation
+├── StorageModuleError.swift     # Storage-specific errors
 ├── SegmentWriterImpl.swift      # SegmentWriter implementation
-├── Encryption/
-│   ├── EncryptionManager.swift  # AES-256-GCM encryption
-│   └── KeychainHelper.swift     # Keychain key storage
+├── IncrementalSegmentWriter.swift # Incremental HEVC writer with WAL recovery
+├── ImageExtractor.swift         # Video frame extraction
 ├── FileManager/
 │   ├── DirectoryManager.swift   # Directory structure management
 │   └── StorageHealthMonitor.swift # Disk space + I/O + volume health monitoring
 ├── VideoEncoder/
 │   ├── HEVCEncoder.swift        # VideoToolbox HEVC encoding
 │   └── FrameConverter.swift     # Pixel format conversion
+├── WAL/
+│   ├── WALManager.swift         # Compressed disk frame storage and frame ID mappings
+│   └── RecoveryManager.swift    # Recover interrupted segments
 └── Tests/
     ├── StorageManagerTests.swift
-    ├── EncryptionTests.swift
-    └── HEVCEncoderTests.swift
+    ├── DirectoryManagerTests.swift
+    ├── HEVCEncoderTests.swift
+    ├── WALManagerCompressedPayloadTests.swift # Disk format and corrupt payload coverage
+    └── TestLogger.swift
 ```
 
 ## Protocols You Must Implement
