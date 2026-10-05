@@ -2,6 +2,12 @@ import Foundation
 import SQLite3
 import Shared
 
+/// SQLite's SQLITE_TRANSIENT sentinel: instructs SQLite to make its own copy of
+/// the bound bytes. Required whenever the source buffer (e.g. a temporary
+/// NSString's utf8String) may be freed before sqlite3_step() runs; passing nil
+/// (SQLITE_STATIC) there binds freed/garbage memory.
+private let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
 // MARK: - App Segment Queries
 
 /// SQL queries for Rewind-compatible segment table (app focus sessions)
@@ -922,16 +928,16 @@ enum AppSegmentQueries {
         sqlite3_bind_int64(statement, 2, Schema.dateToTimestamp(endDate))
         sqlite3_bind_int64(statement, 3, maxGapMs)
         sqlite3_bind_int64(statement, 4, maxGapMs)
-        sqlite3_bind_text(statement, 5, (bundleID as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(statement, 5, (bundleID as NSString).utf8String, -1, sqliteTransient)
 
         // For browser query, we have additional parameters for window fallback and tab-count CTEs.
         if isBrowser {
             sqlite3_bind_int64(statement, 6, maxGapMs)
             sqlite3_bind_int64(statement, 7, maxGapMs)
-            sqlite3_bind_text(statement, 8, (bundleID as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(statement, 8, (bundleID as NSString).utf8String, -1, sqliteTransient)
             sqlite3_bind_int64(statement, 9, maxGapMs)
             sqlite3_bind_int64(statement, 10, maxGapMs)
-            sqlite3_bind_text(statement, 11, (bundleID as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(statement, 11, (bundleID as NSString).utf8String, -1, sqliteTransient)
         }
 
         var results: [(windowName: String?, isWebsite: Bool, duration: TimeInterval, tabCount: Int?, totalCount: Int, totalDuration: TimeInterval)] = []
@@ -1033,7 +1039,7 @@ enum AppSegmentQueries {
         sqlite3_bind_int64(statement, 2, Schema.dateToTimestamp(endDate))
         sqlite3_bind_int64(statement, 3, maxGapMs)
         sqlite3_bind_int64(statement, 4, maxGapMs)
-        sqlite3_bind_text(statement, 5, (bundleID as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(statement, 5, (bundleID as NSString).utf8String, -1, sqliteTransient)
 
         var results: [(windowName: String?, browserUrl: String?, duration: TimeInterval)] = []
         while sqlite3_step(statement) == SQLITE_ROW {
@@ -1148,8 +1154,8 @@ enum AppSegmentQueries {
         sqlite3_bind_int64(statement, 2, Schema.dateToTimestamp(endDate))
         sqlite3_bind_int64(statement, 3, maxGapMs)
         sqlite3_bind_int64(statement, 4, maxGapMs)
-        sqlite3_bind_text(statement, 5, (bundleID as NSString).utf8String, -1, nil)
-        sqlite3_bind_text(statement, 6, (domain as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(statement, 5, (bundleID as NSString).utf8String, -1, sqliteTransient)
+        sqlite3_bind_text(statement, 6, (domain as NSString).utf8String, -1, sqliteTransient)
 
         var results: [(windowName: String?, browserUrl: String?, duration: TimeInterval)] = []
         while sqlite3_step(statement) == SQLITE_ROW {
