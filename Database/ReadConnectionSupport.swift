@@ -196,8 +196,21 @@ public enum SQLiteReadOnlyConnectionFactory {
 
         guard sqlite3_exec(db, sql, nil, nil, &errorMessage) == SQLITE_OK else {
             let message = errorMessage.map { String(cString: $0) } ?? String(cString: sqlite3_errmsg(db))
-            throw DatabaseConnectionError.executionFailed(sql: sql, error: message)
+            // Never surface the raw SQL for keying statements: PRAGMA key / rekey
+            // embed the SQLCipher key hex (or the Rewind password), and callers log
+            // executionFailed to the plaintext log file / feedback uploads.
+            throw DatabaseConnectionError.executionFailed(sql: redactedSQL(sql), error: message)
         }
+    }
+
+    /// Redacts secret material from a SQL string before it is placed in a thrown/logged
+    /// error. `PRAGMA key` / `PRAGMA rekey` carry the database key or password.
+    private static func redactedSQL(_ sql: String) -> String {
+        let lowered = sql.lowercased()
+        if lowered.contains("pragma key") || lowered.contains("pragma rekey") {
+            return "PRAGMA key = <redacted>;"
+        }
+        return sql
     }
 }
 
