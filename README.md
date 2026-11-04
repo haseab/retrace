@@ -284,3 +284,9 @@ Created with ♥ by [@haseab](https://github.com/haseab)
 ---
 
 **Would appreciate a Github Star if the project is useful!** ⭐
+
+## Local development ports
+
+This is a native Swift/macOS application, not a Node web app. Build with
+`swift build`; do not start a localhost web server for it. Port **3050** is
+reserved for any future explicitly configured HTTP tooling.

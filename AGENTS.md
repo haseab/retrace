@@ -487,3 +487,13 @@ Then check which path actually executes and fix the right code.
 ---
 
 _This file follows the AGENTS.md standard for AI agent guidance. Last updated: 2026-04-04_
+
+## Local development ports
+
+This is a native Swift/macOS application, not a Node web app. Build with
+`swift build`; do not start a localhost web server for it. Port **3050** is
+reserved for any future explicitly configured HTTP tooling.
+
+On Haseab's BB machine, the shared registry is `~/.bb/dev-ports.json` and
+`~/.bb/bin/project-dev retrace` uses the same assignment. These personal
+files are optional; collaborators can use the repository commands above.
