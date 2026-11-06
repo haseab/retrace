@@ -560,21 +560,30 @@ struct BrowserURLExtractor: Sendable {
     /// Window-scoped capture must never borrow the focused window's URL.
     static func getURLForWindow(bundleID: String, pid: pid_t, windowCacheKey: String?) async -> String? {
         guard isBrowser(bundleID), !firefoxBundleIDs.contains(bundleID),
-              let window = matchingAXWindow(pid: pid, requestedTitle: windowCacheKey) else { return nil }
-        let candidate = getAXURLString(window, kAXDocumentAttribute)
-            ?? findURLInWebArea(window)
-            ?? findURLInElement(window, depth: 0, maxDepth: 8)
-        return sanitizedBrowserURLCandidate(candidate, for: bundleID)
+              normalizedWindowTitleForWindowMatch(windowCacheKey) != nil else { return nil }
+        if let window = matchingAXWindow(pid: pid, requestedTitle: windowCacheKey) {
+            let candidate = getAXURLString(window, kAXDocumentAttribute)
+                ?? findURLInWebArea(window)
+                ?? findURLInElement(window, depth: 0, maxDepth: 8)
+            if let url = sanitizedBrowserURLCandidate(candidate, for: bundleID) { return url }
+        }
+        if isChromiumAppShim(bundleID) {
+            return await getWebAppURLViaAppleScript(bundleID: bundleID, pid: pid, windowCacheKey: windowCacheKey)
+        }
+        return await getChromiumURLViaWindowTitleAppleScript(
+            bundleID: bundleID, pid: pid, windowCacheKey: windowCacheKey
+        )
+    }
+
+    private static func canonicalTitle(_ value: String?) -> String? {
+        guard let normalized = normalizedWindowTitleForWindowMatch(value) else { return nil }
+        return normalized.lowercased().replacingOccurrences(
+            of: #"^(?:google chrome|safari|microsoft edge|brave|arc|vivaldi|opera|chromium) [—–-] | [—–-] (?:google chrome|safari|microsoft edge|brave|arc|vivaldi|opera|chromium)$"#,
+            with: "", options: .regularExpression
+        )
     }
 
     static func matchingWindowIndex(titles: [String?], requestedTitle: String?) -> Int? {
-        func canonicalTitle(_ value: String?) -> String? {
-            guard let normalized = normalizedWindowTitleForWindowMatch(value) else { return nil }
-            return normalized.lowercased().replacingOccurrences(
-                of: #"^(?:google chrome|safari|microsoft edge|brave|arc|vivaldi|opera|chromium) [—–-] | [—–-] (?:google chrome|safari|microsoft edge|brave|arc|vivaldi|opera|chromium)$"#,
-                with: "", options: .regularExpression
-            )
-        }
         guard let requested = canonicalTitle(requestedTitle) else { return nil }
         let matches = titles.indices.filter { canonicalTitle(titles[$0]) == requested }
         return matches.count == 1 ? matches[0] : nil
@@ -949,8 +958,8 @@ struct BrowserURLExtractor: Sendable {
         pid: pid_t,
         windowCacheKey: String?
     ) async -> String? {
-        guard chromiumWindowTitleAppleScriptBundleIDs.contains(bundleID),
-              let matchWindowTitle = normalizedWindowTitleForWindowMatch(windowCacheKey) else {
+        guard chromiumWindowTitleAppleScriptBundleIDs.contains(bundleID) || bundleID == "com.apple.Safari",
+              let matchWindowTitle = canonicalTitle(windowCacheKey) else {
             return nil
         }
 
@@ -1085,7 +1094,7 @@ struct BrowserURLExtractor: Sendable {
         windowCacheKey: String?,
         scriptLabel: String
     ) async -> BrowserURLAppleScriptResult {
-        guard let matchWindowTitle = normalizedWindowTitleForWindowMatch(windowCacheKey) else {
+        guard let matchWindowTitle = canonicalTitle(windowCacheKey) else {
             return BrowserURLAppleScriptResult(
                 output: hostMatchNoWindowTitleToken,
                 completedWithoutTimeout: true
@@ -1108,40 +1117,36 @@ struct BrowserURLExtractor: Sendable {
         )
     }
 
+    static var strictWindowURLSelectionHandler: String {
+        """
+        on selectWindowURL(candidateTitles, candidateURLs, matchTitle)
+            if (count of candidateTitles) is not (count of candidateURLs) then return "\(hostMatchStrictMismatchToken)"
+            set matchCount to 0
+            set matchingURL to ""
+            repeat with i from 1 to (count of candidateTitles)
+                set candidateTitle to ""
+                set candidateURL to ""
+                try
+                    set candidateTitle to item i of candidateTitles as text
+                    set candidateURL to item i of candidateURLs as text
+                end try
+                if candidateTitle is equal to matchTitle and candidateURL is not "" then
+                    set matchCount to matchCount + 1
+                    if matchCount > 1 then return "\(hostMatchStrictMismatchToken)"
+                    set matchingURL to candidateURL
+                end if
+            end repeat
+            if matchCount is 1 then return matchingURL
+            return "\(hostMatchStrictMismatchToken)"
+        end selectWindowURL
+        """
+    }
+
     private static func chromiumAppShimHostBrowserTitleMatchScript(
         hostBrowserBundleID: String,
         matchWindowTitle: String
     ) -> String {
-        let escapedMatchTitle = appleScriptEscaped(matchWindowTitle)
-        return """
-        set matchTitle to "\(escapedMatchTitle)"
-        if matchTitle is missing value then set matchTitle to ""
-        if matchTitle is "" then return "\(hostMatchNoWindowTitleToken)"
-
-        tell application id "\(hostBrowserBundleID)"
-            if (count of windows) = 0 then return "\(hostMatchNoHostWindowsToken)"
-
-            repeat with w in windows
-                set tabTitle to ""
-                set tabURL to ""
-                try
-                    set tabTitle to title of active tab of w
-                    set tabURL to URL of active tab of w
-                end try
-
-                if tabURL is not "" and tabTitle is not "" then
-                    if matchTitle is equal to tabTitle then
-                        return tabURL
-                    end if
-                    if matchTitle ends with (" - " & tabTitle) then
-                        return tabURL
-                    end if
-                end if
-            end repeat
-        end tell
-
-        return "\(hostMatchStrictMismatchToken)"
-        """
+        chromiumWindowTitleMatchScript(bundleID: hostBrowserBundleID, matchWindowTitle: matchWindowTitle)
     }
 
     private static func chromiumWindowTitleMatchScript(
@@ -1149,34 +1154,28 @@ struct BrowserURLExtractor: Sendable {
         matchWindowTitle: String
     ) -> String {
         let escapedMatchTitle = appleScriptEscaped(matchWindowTitle)
+        let tabTitleExpression = bundleID == "com.apple.Safari" ? "name of current tab of w" : "title of active tab of w"
+        let tabURLExpression = bundleID == "com.apple.Safari" ? "URL of current tab of w" : "URL of active tab of w"
         return """
+        \(strictWindowURLSelectionHandler)
         set matchTitle to "\(escapedMatchTitle)"
-        if matchTitle is missing value then set matchTitle to ""
         if matchTitle is "" then return "\(hostMatchNoWindowTitleToken)"
-
+        set candidateTitles to {}
+        set candidateURLs to {}
         tell application id "\(bundleID)"
             if (count of windows) = 0 then return "\(hostMatchNoHostWindowsToken)"
-
             repeat with w in windows
                 set tabTitle to ""
                 set tabURL to ""
                 try
-                    set tabTitle to title of active tab of w
-                    set tabURL to URL of active tab of w
+                    set tabTitle to \(tabTitleExpression)
+                    set tabURL to \(tabURLExpression)
                 end try
-
-                if tabURL is not "" and tabTitle is not "" then
-                    if matchTitle is equal to tabTitle then
-                        return tabURL
-                    end if
-                    if matchTitle ends with (" - " & tabTitle) then
-                        return tabURL
-                    end if
-                end if
+                set end of candidateTitles to tabTitle
+                set end of candidateURLs to tabURL
             end repeat
         end tell
-
-        return "\(hostMatchStrictMismatchToken)"
+        return my selectWindowURL(candidateTitles, candidateURLs, matchTitle)
         """
     }
 

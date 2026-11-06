@@ -2,6 +2,23 @@ import XCTest
 @testable import Capture
 
 final class BrowserURLAppleScriptCoordinatorTests: XCTestCase {
+    @MainActor
+    func testStrictAppleScriptWindowSelectionUsesUniqueMatchingTab() throws {
+        let cases = [
+            (#"return selectWindowURL({"News", "Weekly sync"}, {"https://example.com", "https://meet.google.com/abc-defg-hij"}, "Weekly sync")"#, "https://meet.google.com/abc-defg-hij"),
+            (#"return selectWindowURL({"Weekly sync", "Weekly sync"}, {"https://one.example", "https://two.example"}, "Weekly sync")"#, "__STRICT_TITLE_MISMATCH__"),
+            (#"return selectWindowURL({"News"}, {"https://example.com"}, "Weekly sync")"#, "__STRICT_TITLE_MISMATCH__"),
+            (#"return selectWindowURL({missing value, "Weekly sync"}, {missing value, "https://meet.google.com/abc-defg-hij"}, "weekly sync")"#, "https://meet.google.com/abc-defg-hij")
+        ]
+        for (invocation, expected) in cases {
+            let script = try XCTUnwrap(NSAppleScript(source: BrowserURLExtractor.strictWindowURLSelectionHandler + "\n" + invocation))
+            var error: NSDictionary?
+            let result = script.executeAndReturnError(&error)
+            XCTAssertNil(error)
+            XCTAssertEqual(result.stringValue, expected)
+        }
+    }
+
     func testStrictWindowSelectionRejectsMissingAndAmbiguousTitles() {
         XCTAssertEqual(BrowserURLExtractor.matchingWindowIndex(
             titles: ["News", "Meet - abc-defg-hij"], requestedTitle: "Meet - abc-defg-hij"

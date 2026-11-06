@@ -79,7 +79,10 @@ public struct ConferenceFramePrivacyEvent: Sendable, Equatable {
     public let windowName: String?
     public let browserURL: String?
     public let matchedBy: String?
+    /// Status identity for a recognized window, even when call activity is uncertain.
     public let callID: String?
+    /// Opaque permission token available only for a verified active call session.
+    public let consentSessionID: String?
     public let isPreferredMenuCandidate: Bool
 
     public init(
@@ -93,6 +96,7 @@ public struct ConferenceFramePrivacyEvent: Sendable, Equatable {
         browserURL: String? = nil,
         matchedBy: String? = nil,
         callID: String? = nil,
+        consentSessionID: String? = nil,
         isPreferredMenuCandidate: Bool = false
     ) {
         self.timestamp = timestamp
@@ -105,6 +109,7 @@ public struct ConferenceFramePrivacyEvent: Sendable, Equatable {
         self.browserURL = browserURL
         self.matchedBy = matchedBy
         self.callID = callID
+        self.consentSessionID = consentSessionID
         self.isPreferredMenuCandidate = isPreferredMenuCandidate
     }
 }

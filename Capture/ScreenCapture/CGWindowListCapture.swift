@@ -672,7 +672,8 @@ public actor CGWindowListCapture {
                     windowLayer: conferenceContext.windowLayer,
                     windowName: conferenceContext.windowName,
                     browserURL: conferenceContext.browserURL,
-                    callID: callSessionID,
+                    callID: callIdentity.id,
+                    consentSessionID: callSessionID,
                     isPreferredMenuCandidate: isPreferredMenuCandidate
                 )
                 continue
@@ -696,11 +697,12 @@ public actor CGWindowListCapture {
                         windowLayer: conferenceContext.windowLayer,
                         windowName: conferenceContext.windowName,
                         browserURL: conferenceContext.browserURL,
-                        callID: callSessionID,
+                        callID: callIdentity.id,
+                        consentSessionID: callSessionID,
                         isPreferredMenuCandidate: isPreferredMenuCandidate
                     )
                     Log.warning(
-                        "[ConferencePrivacy] Missing ROI for conference-matched window; applied full-window blur fallback for \(conferenceMatch.kind.rawValue) layer=\(conferenceContext.windowLayer) window='\(conferenceContext.windowName ?? "unknown")' bounds=\(conferenceContext.windowBounds.map { String(describing: $0) } ?? "nil")",
+                        "[ConferencePrivacy] Missing ROI for conference-matched window; applied full-window blur fallback for \(conferenceMatch.kind.rawValue) layer=\(conferenceContext.windowLayer) bounds=\(conferenceContext.windowBounds.map { String(describing: $0) } ?? "nil")",
                         category: .capture
                     )
                     continue
@@ -714,11 +716,12 @@ public actor CGWindowListCapture {
                     windowLayer: conferenceContext.windowLayer,
                     windowName: conferenceContext.windowName,
                     browserURL: conferenceContext.browserURL,
-                    callID: callSessionID,
+                    callID: callIdentity.id,
+                    consentSessionID: callSessionID,
                     isPreferredMenuCandidate: isPreferredMenuCandidate
                 )
                 Log.error(
-                    "[ConferencePrivacy] Dropping frame after missing ROI and failed full-window blur fallback for \(conferenceMatch.kind.rawValue) layer=\(conferenceContext.windowLayer) window='\(conferenceContext.windowName ?? "unknown")'",
+                    "[ConferencePrivacy] Dropping frame after missing ROI and failed full-window blur fallback for \(conferenceMatch.kind.rawValue) layer=\(conferenceContext.windowLayer)",
                     category: .capture
                 )
                 return nil
@@ -745,7 +748,8 @@ public actor CGWindowListCapture {
                         windowLayer: conferenceContext.windowLayer,
                         windowName: conferenceContext.windowName,
                         browserURL: conferenceContext.browserURL,
-                        callID: callSessionID,
+                        callID: callIdentity.id,
+                        consentSessionID: callSessionID,
                         isPreferredMenuCandidate: isPreferredMenuCandidate
                     )
                 } else {
@@ -757,7 +761,8 @@ public actor CGWindowListCapture {
                         windowLayer: conferenceContext.windowLayer,
                         windowName: conferenceContext.windowName,
                         browserURL: conferenceContext.browserURL,
-                        callID: callSessionID,
+                        callID: callIdentity.id,
+                        consentSessionID: callSessionID,
                         isPreferredMenuCandidate: isPreferredMenuCandidate
                     )
                 }
@@ -776,11 +781,12 @@ public actor CGWindowListCapture {
                         windowLayer: conferenceContext.windowLayer,
                         windowName: conferenceContext.windowName,
                         browserURL: conferenceContext.browserURL,
-                        callID: callSessionID,
+                        callID: callIdentity.id,
+                        consentSessionID: callSessionID,
                         isPreferredMenuCandidate: isPreferredMenuCandidate
                     )
                     Log.warning(
-                        "[ConferencePrivacy] Face detection failed; applied full-window blur fallback for \(conferenceMatch.kind.rawValue) layer=\(conferenceContext.windowLayer) window='\(conferenceContext.windowName ?? "unknown")': \(error.localizedDescription)",
+                        "[ConferencePrivacy] Face detection failed; applied full-window blur fallback for \(conferenceMatch.kind.rawValue) layer=\(conferenceContext.windowLayer): \(error.localizedDescription)",
                         category: .capture
                     )
                 } else {
@@ -792,11 +798,12 @@ public actor CGWindowListCapture {
                         windowLayer: conferenceContext.windowLayer,
                         windowName: conferenceContext.windowName,
                         browserURL: conferenceContext.browserURL,
-                        callID: callSessionID,
+                        callID: callIdentity.id,
+                        consentSessionID: callSessionID,
                         isPreferredMenuCandidate: isPreferredMenuCandidate
                     )
                     Log.error(
-                        "[ConferencePrivacy] Dropping frame after face detection failure and failed full-window blur fallback for \(conferenceMatch.kind.rawValue) layer=\(conferenceContext.windowLayer) window='\(conferenceContext.windowName ?? "unknown")': \(error.localizedDescription)",
+                        "[ConferencePrivacy] Dropping frame after face detection failure and failed full-window blur fallback for \(conferenceMatch.kind.rawValue) layer=\(conferenceContext.windowLayer): \(error.localizedDescription)",
                         category: .capture
                     )
                     return nil
@@ -1633,6 +1640,7 @@ public actor CGWindowListCapture {
         windowName: String?,
         browserURL: String?,
         callID: String?,
+        consentSessionID: String?,
         isPreferredMenuCandidate: Bool
     ) async {
         await emitConferenceFramePrivacyEvent(
@@ -1647,6 +1655,7 @@ public actor CGWindowListCapture {
                 browserURL: browserURL,
                 matchedBy: conferenceMatch.matchedBy,
                 callID: callID,
+                consentSessionID: consentSessionID,
                 isPreferredMenuCandidate: isPreferredMenuCandidate
             )
         )

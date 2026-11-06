@@ -48,7 +48,8 @@ final class MenuBarManagerClickBehaviorTests: XCTestCase {
             callID: "call-2",
             title: "Meet - active",
             lastObservedAt: Date(),
-            isBlurBypassedForConsent: false
+            isBlurBypassedForConsent: false,
+            consentSessionID: "session-2"
         )
         XCTAssertEqual(
             MenuBarManager.conferenceConsentMenuItemTitle(for: activeState),

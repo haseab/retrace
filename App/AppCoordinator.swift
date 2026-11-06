@@ -35,17 +35,22 @@ public struct ConferenceConsentMenuState: Sendable, Equatable {
     public let title: String
     public let lastObservedAt: Date
     public let isBlurBypassedForConsent: Bool
+    public let consentSessionID: String?
+
+    public var canDisableFaceBlur: Bool { consentSessionID != nil && !isBlurBypassedForConsent }
 
     public init(
         callID: String,
         title: String,
         lastObservedAt: Date,
-        isBlurBypassedForConsent: Bool
+        isBlurBypassedForConsent: Bool,
+        consentSessionID: String? = nil
     ) {
         self.callID = callID
         self.title = title
         self.lastObservedAt = lastObservedAt
         self.isBlurBypassedForConsent = isBlurBypassedForConsent
+        self.consentSessionID = consentSessionID
     }
 
     public func isVisible(at now: Date = Date()) -> Bool {
@@ -53,12 +58,14 @@ public struct ConferenceConsentMenuState: Sendable, Equatable {
     }
 
     public var notificationUserInfo: [AnyHashable: Any] {
-        [
+        var payload: [String: Any] = [
             "callID": callID,
             "title": title,
             "lastObservedAt": lastObservedAt.timeIntervalSince1970,
             "isBlurBypassedForConsent": isBlurBypassedForConsent
         ]
+        payload["consentSessionID"] = consentSessionID
+        return payload
     }
 
     public static func from(notificationUserInfo: [AnyHashable: Any]?) -> ConferenceConsentMenuState? {
@@ -73,7 +80,8 @@ public struct ConferenceConsentMenuState: Sendable, Equatable {
             callID: callID,
             title: title,
             lastObservedAt: Date(timeIntervalSince1970: lastObservedAtSeconds),
-            isBlurBypassedForConsent: isBlurBypassedForConsent
+            isBlurBypassedForConsent: isBlurBypassedForConsent,
+            consentSessionID: notificationUserInfo?["consentSessionID"] as? String
         )
     }
 }
@@ -4689,7 +4697,8 @@ public actor AppCoordinator {
             callID: callID,
             title: title,
             lastObservedAt: event.timestamp,
-            isBlurBypassedForConsent: event.outcome == .consentBypassed
+            isBlurBypassedForConsent: event.outcome == .consentBypassed,
+            consentSessionID: event.consentSessionID
         )
         pruneConferenceConsentMenuStates(now: event.timestamp)
         conferenceConsentMenuStateByCallID[callID] = ConferenceConsentMenuSelectionCandidate(
@@ -4716,29 +4725,20 @@ public actor AppCoordinator {
         )
         guard didApply else { return false }
 
-        if var storedState = conferenceConsentMenuStateByCallID[normalizedCallID] {
-            storedState = ConferenceConsentMenuSelectionCandidate(
+        if let statusID = conferenceConsentMenuStateByCallID.first(where: {
+            $0.value.state.consentSessionID == normalizedCallID
+        })?.key, let storedState = conferenceConsentMenuStateByCallID[statusID] {
+            conferenceConsentMenuStateByCallID[statusID] = ConferenceConsentMenuSelectionCandidate(
                 state: ConferenceConsentMenuState(
                     callID: storedState.state.callID,
                     title: storedState.state.title,
                     lastObservedAt: Date(),
-                    isBlurBypassedForConsent: true
+                    isBlurBypassedForConsent: true,
+                    consentSessionID: normalizedCallID
                 ),
                 menuSelectionPriority: storedState.menuSelectionPriority
             )
-            conferenceConsentMenuStateByCallID[normalizedCallID] = storedState
-            await publishPreferredConferenceConsentMenuState(now: storedState.state.lastObservedAt)
-        } else if var currentState = latestConferenceConsentMenuState,
-                  currentState.callID == normalizedCallID {
-            currentState = ConferenceConsentMenuState(
-                callID: currentState.callID,
-                title: currentState.title,
-                lastObservedAt: Date(),
-                isBlurBypassedForConsent: true
-            )
-            latestConferenceConsentMenuState = currentState
-            let publishedState = currentState
-            await publishConferenceConsentMenuStateNotification(publishedState)
+            await publishPreferredConferenceConsentMenuState(now: Date())
         }
 
         return true

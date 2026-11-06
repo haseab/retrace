@@ -1135,7 +1135,7 @@ public class MenuBarManager: ObservableObject {
 
     private func activeConferenceConsentState() -> ConferenceConsentMenuState? {
         guard let state = visibleConferenceConsentState() else { return nil }
-        guard !state.isBlurBypassedForConsent else { return nil }
+        guard state.canDisableFaceBlur else { return nil }
         return state
     }
 
@@ -1144,7 +1144,7 @@ public class MenuBarManager: ObservableObject {
         truncatedTitleLimit: Int = 30
     ) -> String {
         guard state.isBlurBypassedForConsent else {
-            return "Disable Face Blurring This Call"
+            return state.canDisableFaceBlur ? "Disable Face Blurring This Call" : "Face Blurring Enabled"
         }
 
         let trimmedTitle = state.title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1261,11 +1261,11 @@ public class MenuBarManager: ObservableObject {
         if let conferenceConsentState = visibleConferenceConsentState() {
             let consentItem = NSMenuItem(
                 title: Self.conferenceConsentMenuItemTitle(for: conferenceConsentState),
-                action: conferenceConsentState.isBlurBypassedForConsent ? nil : #selector(disableFaceBlurThisCall),
+                action: conferenceConsentState.canDisableFaceBlur ? #selector(disableFaceBlurThisCall) : nil,
                 keyEquivalent: ""
             )
             consentItem.image = NSImage(systemSymbolName: "person.crop.circle.badge.checkmark", accessibilityDescription: nil)
-            consentItem.isEnabled = !conferenceConsentState.isBlurBypassedForConsent
+            consentItem.isEnabled = conferenceConsentState.canDisableFaceBlur
             menu.addItem(consentItem)
         }
 
@@ -1527,13 +1527,13 @@ public class MenuBarManager: ObservableObject {
     }
 
     @objc private func disableFaceBlurThisCall() {
-        guard let state = activeConferenceConsentState() else {
+        guard let state = activeConferenceConsentState(), let consentSessionID = state.consentSessionID else {
             Log.warning("[FaceBlurConsentUI] Menu action invoked without an active conference consent state", category: .ui)
             return
         }
 
         Log.info(
-            "[FaceBlurConsentUI] Presenting consent dialog for call title='\(state.title)'",
+            "[FaceBlurConsentUI] Presenting consent dialog",
             category: .ui
         )
 
@@ -1560,13 +1560,14 @@ public class MenuBarManager: ObservableObject {
 
                 Task { @MainActor [weak self] in
                     guard let self else { return }
-                    let didApply = await coordinator.disableFaceBlurForConferenceCall(callID: state.callID)
+                    let didApply = await coordinator.disableFaceBlurForConferenceCall(callID: consentSessionID)
                     if didApply {
                         conferenceConsentMenuState = ConferenceConsentMenuState(
                             callID: state.callID,
                             title: state.title,
                             lastObservedAt: Date(),
-                            isBlurBypassedForConsent: true
+                            isBlurBypassedForConsent: true,
+                            consentSessionID: consentSessionID
                         )
                         setupMenu()
                         return
