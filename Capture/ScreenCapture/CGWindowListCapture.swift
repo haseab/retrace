@@ -474,7 +474,8 @@ public actor CGWindowListCapture {
     private let conferenceFaceBlurProcessor = ConferenceFaceBlurProcessor()
     private var lastDisplaySurfaceBytes: Int64 = 0
     nonisolated(unsafe) private var onConferenceFramePrivacyEvent: (@Sendable (ConferenceFramePrivacyEvent) async -> Void)?
-    private var consentedConferenceCallIDs = Set<String>()
+    private var conferenceCallConsent = ConferenceCallConsentState()
+    private var lastConferenceObservationAt: Date?
     private var cachedSystemMediaCaptureState = SystemMediaCaptureState(
         cameraInUse: false,
         microphoneInUse: false
@@ -497,7 +498,8 @@ public actor CGWindowListCapture {
         self.currentConfig = config
         self.isActive = true
         self.lastCaptureBlockReason = nil
-        self.consentedConferenceCallIDs.removeAll()
+        self.conferenceCallConsent.reset()
+        self.lastConferenceObservationAt = nil
         self.screenLockStateMonitor.start()
 
         // Use provided display ID or fall back to main display
@@ -510,7 +512,8 @@ public actor CGWindowListCapture {
 
         isActive = false
         lastCaptureBlockReason = nil
-        consentedConferenceCallIDs.removeAll()
+        conferenceCallConsent.reset()
+        lastConferenceObservationAt = nil
         screenLockStateMonitor.stop()
         lastDisplaySurfaceBytes = 0
         updatePersistentCaptureNativeLedger()
@@ -540,9 +543,13 @@ public actor CGWindowListCapture {
 
     func disableFaceBlurForConferenceCall(callID: String) -> Bool {
         let normalizedCallID = callID.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !normalizedCallID.isEmpty else { return false }
-        consentedConferenceCallIDs.insert(normalizedCallID)
-        return true
+        let freshnessInterval = max(8, (currentConfig?.captureIntervalSeconds ?? 2) * 3)
+        guard isActive, !normalizedCallID.isEmpty,
+              let lastConferenceObservationAt,
+              Date().timeIntervalSince(lastConferenceObservationAt) <= freshnessInterval else {
+            return false
+        }
+        return conferenceCallConsent.disableFaceBlur(callID: normalizedCallID)
     }
 
     // MARK: - Private Helpers
@@ -644,6 +651,14 @@ public actor CGWindowListCapture {
             from: exclusionResult.conferenceWindowContexts,
             systemMediaCaptureState: systemMediaCaptureState
         )
+        let observationTime = Date()
+        let freshnessInterval = max(8, config.captureIntervalSeconds * 3)
+        if let lastConferenceObservationAt,
+           observationTime.timeIntervalSince(lastConferenceObservationAt) > freshnessInterval {
+            conferenceCallConsent.reset()
+        }
+        conferenceCallConsent.update(activeCallIDs: Set(conferenceWindowMatches.map { $0.callIdentity.id }))
+        lastConferenceObservationAt = observationTime
         let preferredConferenceCallID = preferredConferenceCallID(
             from: conferenceWindowMatches,
             visibleWindowContext: visibleWindowContext
@@ -655,7 +670,7 @@ public actor CGWindowListCapture {
             let callIdentity = conferenceWindowMatch.callIdentity
             let isPreferredMenuCandidate = callIdentity.id == preferredConferenceCallID
 
-            if consentedConferenceCallIDs.contains(callIdentity.id) {
+            if conferenceCallConsent.isBypassed(callID: callIdentity.id) {
                 await emitConferenceFramePrivacyOutcome(
                     conferenceMatch: conferenceMatch,
                     outcome: .consentBypassed,
@@ -721,6 +736,11 @@ public actor CGWindowListCapture {
                     in: cgImage,
                     regionOfInterest: visionROI,
                     configuration: .production
+                )
+                Log.recordLatency(
+                    "capture.conference_face_blur",
+                    valueMs: blurredResult.detectionDurationMs,
+                    category: .capture
                 )
                 if let blurredImage = blurredResult.blurredImage {
                     cgImage = blurredImage

@@ -83,6 +83,24 @@ struct ConferenceConsentMenuSelectionCandidate: Sendable, Equatable {
     let menuSelectionPriority: Int
 }
 
+struct ConferencePrivacyMetricState: Sendable {
+    private struct Observation: Sendable {
+        let outcome: String
+        let timestamp: Date
+    }
+    private var observations: [String: Observation] = [:]
+
+    mutating func shouldRecord(callID: String, outcome: String, at timestamp: Date) -> Bool {
+        if let previous = observations[callID], timestamp < previous.timestamp { return false }
+        observations = observations.filter {
+            timestamp.timeIntervalSince($0.value.timestamp) <= ConferenceConsentMenuState.visibilityInterval
+        }
+        let previous = observations[callID]
+        observations[callID] = Observation(outcome: outcome, timestamp: timestamp)
+        return previous?.outcome != outcome
+    }
+}
+
 public enum VisibleBlockBoundaryDirection: String, Sendable {
     case start
     case end
@@ -817,6 +835,7 @@ public actor AppCoordinator {
     private let timelineStillDiskWriter: TimelineStillDiskWriter
     private var latestConferenceConsentMenuState: ConferenceConsentMenuState?
     private var conferenceConsentMenuStateByCallID: [String: ConferenceConsentMenuSelectionCandidate] = [:]
+    private var conferencePrivacyMetricState = ConferencePrivacyMetricState()
     private var unexpectedRecordingStopState: UnexpectedRecordingStopState?
     private var hasLoadedUnexpectedRecordingStopState = false
     private var unexpectedRecordingStopCounters = UnexpectedRecordingStopCounters()
@@ -1551,6 +1570,7 @@ public actor AppCoordinator {
         statusHolder.update(isRunning: false)
         latestConferenceConsentMenuState = nil
         conferenceConsentMenuStateByCallID.removeAll()
+        conferencePrivacyMetricState = ConferencePrivacyMetricState()
         DispatchQueue.main.async {
             NotificationCenter.default.post(
                 name: ConferenceConsentStateNotification.didChange,
@@ -4647,6 +4667,9 @@ public actor AppCoordinator {
             return
         }
 
+        let shouldRecord = conferencePrivacyMetricState.shouldRecord(
+            callID: callID, outcome: event.outcome.rawValue, at: event.timestamp
+        )
         let title = conferenceConsentMenuTitle(
             conferenceKind: event.conferenceKind,
             windowName: event.windowName
@@ -4663,14 +4686,32 @@ public actor AppCoordinator {
             menuSelectionPriority: event.isPreferredMenuCandidate ? 0 : 1
         )
         await publishPreferredConferenceConsentMenuState(now: event.timestamp)
+        if shouldRecord {
+            try? await recordMetricEvent(
+                metricType: .conferencePrivacy,
+                timestamp: event.timestamp,
+                metadata: Self.metricMetadata([
+                    "action": "protection_changed", "outcome": event.outcome.rawValue,
+                    "conferenceKind": event.conferenceKind.rawValue, "source": "capture"
+                ])
+            )
+        }
     }
 
     public func disableFaceBlurForConferenceCall(callID: String) async -> Bool {
         let normalizedCallID = callID.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !normalizedCallID.isEmpty else { return false }
-
-        let didApply = await services.capture.disableFaceBlurForConferenceCall(
-            callID: normalizedCallID
+        let didApply: Bool
+        if normalizedCallID.isEmpty {
+            didApply = false
+        } else {
+            didApply = await services.capture.disableFaceBlurForConferenceCall(callID: normalizedCallID)
+        }
+        try? await recordMetricEvent(
+            metricType: .conferencePrivacy,
+            metadata: Self.metricMetadata([
+                "action": "consent_override", "outcome": didApply ? "succeeded" : "failed",
+                "source": "menu_bar"
+            ])
         )
         guard didApply else { return false }
 

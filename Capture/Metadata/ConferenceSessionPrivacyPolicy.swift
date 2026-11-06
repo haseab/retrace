@@ -69,6 +69,32 @@ struct ConferenceSessionMatch: Sendable, Equatable {
     let matchedBy: String
 }
 
+/// Consent belongs to a currently observed call, never to a reusable window forever.
+struct ConferenceCallConsentState: Sendable {
+    private var activeCallIDs: Set<String> = []
+    private var consentedCallIDs: Set<String> = []
+
+    mutating func update(activeCallIDs: Set<String>) {
+        self.activeCallIDs = activeCallIDs
+        consentedCallIDs.formIntersection(activeCallIDs)
+    }
+
+    mutating func disableFaceBlur(callID: String) -> Bool {
+        guard activeCallIDs.contains(callID) else { return false }
+        consentedCallIDs.insert(callID)
+        return true
+    }
+
+    func isBypassed(callID: String) -> Bool {
+        consentedCallIDs.contains(callID)
+    }
+
+    mutating func reset() {
+        activeCallIDs.removeAll()
+        consentedCallIDs.removeAll()
+    }
+}
+
 public enum ConferenceFramePrivacyOutcome: String, Sendable, Equatable {
     case blurred
     case noFacesDetected = "no_faces_detected"

@@ -1538,12 +1538,25 @@ public class MenuBarManager: ObservableObject {
         )
 
         Task { @MainActor [weak self] in
-            self?.presentFaceBlurConsentDialog(callTitle: state.title) { [weak self] didConfirm in
+            guard let self else { return }
+            UIMetricsRecorder.recordDictionary(
+                coordinator: coordinator, type: .conferencePrivacy,
+                payload: ["action": "consent_dialog", "outcome": "opened", "source": "menu_bar"]
+            )
+            presentFaceBlurConsentDialog(callTitle: state.title) { [weak self] didConfirm in
                 Log.info(
                     "[FaceBlurConsentUI] Consent dialog decision confirmed=\(didConfirm)",
                     category: .ui
                 )
-                guard let self, didConfirm else { return }
+                guard let self else { return }
+                UIMetricsRecorder.recordDictionary(
+                    coordinator: coordinator, type: .conferencePrivacy,
+                    payload: [
+                        "action": "consent_dialog", "outcome": didConfirm ? "confirmed" : "cancelled",
+                        "source": "menu_bar"
+                    ]
+                )
+                guard didConfirm else { return }
 
                 Task { @MainActor [weak self] in
                     guard let self else { return }

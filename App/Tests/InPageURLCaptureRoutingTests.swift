@@ -6,6 +6,25 @@ import Storage
 import SQLCipher
 @testable import App
 
+final class ConferencePrivacyMetricStateTests: XCTestCase {
+    func testRepeatedFramesOnlyRecordOutcomeTransitionsForEachCall() {
+        var state = ConferencePrivacyMetricState()
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        XCTAssertTrue(state.shouldRecord(callID: "meet", outcome: "blurred", at: start))
+        XCTAssertFalse(state.shouldRecord(callID: "meet", outcome: "blurred", at: start.addingTimeInterval(2)))
+        XCTAssertTrue(state.shouldRecord(callID: "meet", outcome: "no_faces_detected", at: start.addingTimeInterval(4)))
+        XCTAssertTrue(state.shouldRecord(callID: "zoom", outcome: "no_faces_detected", at: start.addingTimeInterval(4)))
+        XCTAssertFalse(state.shouldRecord(callID: "meet", outcome: "blurred", at: start.addingTimeInterval(1)))
+    }
+
+    func testCallObservedAfterAnInactivityGapRecordsANewOutcome() {
+        var state = ConferencePrivacyMetricState()
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        XCTAssertTrue(state.shouldRecord(callID: "meet", outcome: "blurred", at: start))
+        XCTAssertTrue(state.shouldRecord(callID: "meet", outcome: "blurred", at: start.addingTimeInterval(30)))
+    }
+}
+
 final class InPageURLCaptureRoutingTests: XCTestCase {
     func testHostBrowserBundleIDMapsExactChromiumBrowser() {
         XCTAssertEqual(

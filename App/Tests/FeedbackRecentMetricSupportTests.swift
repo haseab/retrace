@@ -3,6 +3,20 @@ import Database
 @testable import App
 
 final class FeedbackRecentMetricSupportTests: XCTestCase {
+    func testConferencePrivacyMetricsExcludeCallIdentityAndWindowContent() {
+        let events = FeedbackRecentMetricSupport.sanitize([
+            .init(
+                metricType: .conferencePrivacy,
+                timestamp: Date(timeIntervalSince1970: 1_700_000_000),
+                metadata: #"{"action":"protection_changed","outcome":"blurred","conferenceKind":"google_meet","source":"capture","callID":"private-call","windowName":"Confidential meeting","browserURL":"https://meet.google.com/private"}"#
+            )
+        ])
+        XCTAssertEqual(events.first?.details, [
+            "action": "protection_changed", "outcome": "blurred",
+            "conferenceKind": "google_meet", "source": "capture"
+        ])
+    }
+
     func testSanitizeRecentMetricEventsRedactsLegacySensitiveMetadata() {
         let events: [DailyMetricsQueries.RecentEvent] = [
             .init(

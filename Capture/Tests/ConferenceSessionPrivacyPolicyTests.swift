@@ -2,6 +2,34 @@ import XCTest
 @testable import Capture
 
 final class ConferenceSessionPrivacyPolicyTests: XCTestCase {
+    func testConsentDoesNotSurviveCallDisappearanceAndReappearance() {
+        var consent = ConferenceCallConsentState()
+        consent.update(activeCallIDs: ["meet-window"])
+        XCTAssertTrue(consent.disableFaceBlur(callID: "meet-window"))
+        XCTAssertTrue(consent.isBypassed(callID: "meet-window"))
+
+        consent.update(activeCallIDs: [])
+        consent.update(activeCallIDs: ["meet-window"])
+        XCTAssertFalse(consent.isBypassed(callID: "meet-window"))
+    }
+
+    func testConsentOnlyAppliesToTheSelectedActiveCall() {
+        var consent = ConferenceCallConsentState()
+        consent.update(activeCallIDs: ["meet-window", "zoom-window"])
+        XCTAssertFalse(consent.disableFaceBlur(callID: "unknown-call"))
+        XCTAssertTrue(consent.disableFaceBlur(callID: "meet-window"))
+        XCTAssertFalse(consent.isBypassed(callID: "zoom-window"))
+        consent.reset()
+        XCTAssertFalse(consent.isBypassed(callID: "meet-window"))
+        XCTAssertFalse(consent.disableFaceBlur(callID: "meet-window"))
+    }
+
+    func testConsentOverrideRejectsCallsThatHaveNeverBeenObserved() async {
+        let capture = CGWindowListCapture()
+        let accepted = await capture.disableFaceBlurForConferenceCall(callID: "unknown-call")
+        XCTAssertFalse(accepted)
+    }
+
     func testMatchesInstalledZoomBundleID() {
         let match = ConferenceSessionPrivacyPolicy.match(
             appBundleID: "us.zoom.xos",
