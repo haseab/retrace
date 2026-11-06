@@ -2,6 +2,7 @@ import AppKit
 import AVFoundation
 import Darwin
 import Foundation
+import ImageIO
 import Shared
 import CoreMedia
 
@@ -1227,13 +1228,28 @@ public actor StorageManager: StorageProtocol {
             )
         }
 
-        let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
-        guard let tiffData = nsImage.tiffRepresentation,
-              let bitmap = NSBitmapImageRep(data: tiffData),
-              let jpegData = bitmap.representation(using: .jpeg, properties: [.compressionFactor: 0.8]) else {
+        // Encode straight from the CGImage via ImageIO, avoiding the
+        // NSImage -> tiffRepresentation -> NSBitmapImageRep round-trip (a full
+        // uncompressed frame copy + re-decode). The transient-bytes ledger
+        // accounting above is kept so memory telemetry stays consistent.
+        let data = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(
+            data as CFMutableData,
+            "public.jpeg" as CFString,
+            1,
+            nil
+        ) else {
             throw StorageError.fileReadFailed(path: "", underlying: "Failed to convert CGImage to JPEG")
         }
-        return jpegData
+        CGImageDestinationAddImage(
+            destination,
+            cgImage,
+            [kCGImageDestinationLossyCompressionQuality: 0.8] as CFDictionary
+        )
+        guard CGImageDestinationFinalize(destination) else {
+            throw StorageError.fileReadFailed(path: "", underlying: "Failed to convert CGImage to JPEG")
+        }
+        return data as Data
     }
 
     static func makeBGRAData(from image: CGImage) throws -> Data {
