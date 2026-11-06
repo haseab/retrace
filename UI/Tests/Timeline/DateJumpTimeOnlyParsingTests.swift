@@ -217,6 +217,138 @@ final class DateJumpTimeOnlyParsingTests: XCTestCase {
         XCTAssertEqual(components.month, 7)
     }
 
+    func testEnglishMonthAndYearInputParses() {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let now = makeDate(year: 2026, month: 3, day: 1, hour: 9, minute: 0)
+
+        guard let result = viewModel.test_parseNaturalLanguageDateForDateSearch("june 2026", now: now) else {
+            XCTFail("Expected parser to resolve English month/year input")
+            return
+        }
+
+        let components = Calendar.current.dateComponents([.year, .month], from: result)
+        XCTAssertEqual(components.year, 2026)
+        XCTAssertEqual(components.month, 6)
+    }
+
+    func testInTwoWeeksInputParses() {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let now = makeDate(year: 2026, month: 2, day: 23, hour: 10, minute: 0)
+
+        guard let result = viewModel.test_parseNaturalLanguageDateForDateSearch("in 2 weeks", now: now) else {
+            XCTFail("Expected parser to resolve in-relative input")
+            return
+        }
+
+        assertDateComponents(result, year: 2026, month: 3, day: 9, hour: 0, minute: 0)
+    }
+
+    func testNextWeekdayKeepsFollowingWeekInterpretation() {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let now = makeDate(year: 2026, month: 2, day: 23, hour: 10, minute: 0)
+
+        guard let result = viewModel.test_parseNaturalLanguageDateForDateSearch("next friday", now: now) else {
+            XCTFail("Expected parser to resolve next-weekday input")
+            return
+        }
+
+        assertDateComponents(result, year: 2026, month: 3, day: 6, hour: 0, minute: 0)
+    }
+
+    func testDayOffsetFromNowAdvancesCalendarDate() throws {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let now = makeDate(year: 2026, month: 2, day: 23, hour: 10, minute: 0)
+        let result = try XCTUnwrap(viewModel.test_parseNaturalLanguageDateForDateSearch("2 days from now", now: now))
+
+        assertDateComponents(result, year: 2026, month: 2, day: 25, hour: 0, minute: 0)
+    }
+
+    func testDayOffsetFromNowPreservesExplicitTime() throws {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let now = makeDate(year: 2026, month: 2, day: 23, hour: 10, minute: 0)
+        let result = try XCTUnwrap(viewModel.test_parseNaturalLanguageDateForDateSearch("2 days from now at 4pm", now: now))
+
+        assertDateComponents(result, year: 2026, month: 2, day: 25, hour: 16, minute: 0)
+    }
+
+    func testCompact24HourDateKeepsMostRecentYearLateInTheYear() throws {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let now = makeDate(year: 2026, month: 11, day: 6, hour: 10, minute: 0).addingTimeInterval(59)
+        let result = try XCTUnwrap(viewModel.test_parseNaturalLanguageDateForDateSearch("feb 28 1417", now: now))
+
+        assertDateComponents(result, year: 2026, month: 2, day: 28, hour: 14, minute: 17)
+        XCTAssertEqual(Calendar.current.component(.second, from: result), 0)
+    }
+
+    func testNumericDateWithCompactTimeKeepsMostRecentYear() throws {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let now = makeDate(year: 2026, month: 11, day: 6, hour: 10, minute: 0)
+        let result = try XCTUnwrap(viewModel.test_parseNaturalLanguageDateForDateSearch("02/28 1417", now: now))
+
+        assertDateComponents(result, year: 2026, month: 2, day: 28, hour: 14, minute: 17)
+    }
+
+    func testBareWeekdayKeepsMostRecentOccurrence() throws {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let now = makeDate(year: 2026, month: 2, day: 23, hour: 10, minute: 0)
+        let result = try XCTUnwrap(viewModel.test_parseNaturalLanguageDateForDateSearch("Friday", now: now))
+
+        assertDateComponents(result, year: 2026, month: 2, day: 20, hour: 0, minute: 0)
+    }
+
+    func testWrittenDayOffsetKeepsExistingSupport() throws {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let now = makeDate(year: 2026, month: 2, day: 23, hour: 10, minute: 0)
+        let result = try XCTUnwrap(viewModel.test_parseNaturalLanguageDateForDateSearch("three days ago", now: now))
+
+        let components = Calendar.current.dateComponents([.year, .month, .day], from: result)
+        XCTAssertEqual(components.year, 2026)
+        XCTAssertEqual(components.month, 2)
+        XCTAssertEqual(components.day, 20)
+    }
+
+    func testFractionalHourOffsetKeepsExistingSupport() throws {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let now = makeDate(year: 2026, month: 2, day: 23, hour: 10, minute: 0)
+        let result = try XCTUnwrap(viewModel.test_parseNaturalLanguageDateForDateSearch("half an hour ago", now: now))
+
+        assertDateComponents(result, year: 2026, month: 2, day: 23, hour: 9, minute: 30)
+    }
+
+    func testCasualNightDatesKeepExistingTimes() throws {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let now = makeDate(year: 2026, month: 2, day: 23, hour: 10, minute: 0)
+        let tonight = try XCTUnwrap(viewModel.test_parseNaturalLanguageDateForDateSearch("tonight", now: now))
+        let lastNight = try XCTUnwrap(viewModel.test_parseNaturalLanguageDateForDateSearch("last night", now: now))
+
+        assertDateComponents(tonight, year: 2026, month: 2, day: 23, hour: 22, minute: 0)
+        assertDateComponents(lastNight, year: 2026, month: 2, day: 22, hour: 0, minute: 0)
+    }
+
+    func testRelativeLookbacksKeepCalendarDaysAcrossSpringClockChange() throws {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let calendar = Calendar.current
+        let now = makeDate(year: 2026, month: 3, day: 9, hour: 0, minute: 30)
+        let cases = [("1 day ago", 1), ("2 days ago", 2), ("1 week ago", 7)]
+
+        for (input, days) in cases {
+            let result = try XCTUnwrap(viewModel.test_parseNaturalLanguageDateForDateSearch(input, now: now))
+            let expected = try XCTUnwrap(calendar.date(byAdding: .day, value: -days, to: now))
+            XCTAssertEqual(result, calendar.startOfDay(for: expected), input)
+        }
+    }
+
+    func testNonEnglishRelativeDatesKeepExistingSupport() throws {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let now = makeDate(year: 2026, month: 2, day: 23, hour: 10, minute: 0)
+        let result = try XCTUnwrap(viewModel.test_parseNaturalLanguageDateForDateSearch("hace 2 días", now: now))
+
+        let components = Calendar.current.dateComponents([.year, .month, .day], from: result)
+        XCTAssertEqual(components.year, 2026)
+        XCTAssertEqual(components.month, 2)
+        XCTAssertEqual(components.day, 21)
+    }
+
     private func makeDate(year: Int, month: Int, day: Int, hour: Int, minute: Int) -> Date {
         let calendar = Calendar.current
         let components = DateComponents(
