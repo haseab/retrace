@@ -447,6 +447,16 @@ struct BrowserURLExtractor: Sendable {
         "com.openai.chat",
         "com.nicklockwood.Thorium",
     ]
+    private static let chromiumWindowTitleAppleScriptBundleIDs: Set<String> = [
+        "com.google.Chrome",
+        "com.google.Chrome.canary",
+        "com.microsoft.edgemac",
+        "com.brave.Browser",
+        "com.vivaldi.Vivaldi",
+        "com.operasoftware.Opera",
+        "org.chromium.Chromium",
+        "com.nicklockwood.Thorium",
+    ]
     private static let appleScriptCoordinator = BrowserURLAppleScriptCoordinator(
         runner: { source, browserBundleID, pid, timeoutSeconds, isBootstrapTimeout, scriptLabel in
             await runAppleScriptViaProcess(
@@ -581,6 +591,11 @@ struct BrowserURLExtractor: Sendable {
             return url
         }
 
+        if isChromiumBrowser(bundleID),
+           windowCacheKey?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
+            return nil
+        }
+
         // Fallback: Try generic AX-based URL extraction for any browser.
         return sanitizedBrowserURLCandidate(
             getURLViaWebArea(bundleID: bundleID, pid: pid),
@@ -704,8 +719,19 @@ struct BrowserURLExtractor: Sendable {
         pid: pid_t,
         windowCacheKey: String?
     ) async -> String? {
-        let axURL = getChromiumURLViaAX(pid: pid)
+        let axURL = getChromiumURLViaAX(
+            pid: pid,
+            windowCacheKey: windowCacheKey
+        )
         if let url = sanitizedBrowserURLCandidate(axURL, for: bundleID) {
+            return url
+        }
+
+        if let url = await getChromiumURLViaWindowTitleAppleScript(
+            bundleID: bundleID,
+            pid: pid,
+            windowCacheKey: windowCacheKey
+        ) {
             return url
         }
 
@@ -718,10 +744,11 @@ struct BrowserURLExtractor: Sendable {
                 )
             }
 
-            if let url = await getVivaldiURLViaAppleScript(
+            if windowCacheKey?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false,
+               let url = await getVivaldiURLViaAppleScript(
                 pid: pid,
                 windowCacheKey: windowCacheKey
-            ) {
+               ) {
                 return url
             }
         }
@@ -827,12 +854,31 @@ struct BrowserURLExtractor: Sendable {
         return nil
     }
 
-    private static func getChromiumURLViaAX(pid: pid_t) -> String? {
+    private static func getChromiumURLViaAX(
+        pid: pid_t,
+        windowCacheKey: String?
+    ) -> String? {
         let appRef = AXUIElementCreateApplication(pid)
 
         // Try to enable accessibility on Chromium/Electron apps
         // This sets AXManualAccessibility = true which forces the AX tree to be exposed
         enableAccessibilityIfNeeded(appRef)
+
+        if let matchedWindow = matchingChromiumAXWindow(
+            appRef: appRef,
+            requestedWindowCacheKey: windowCacheKey
+        ) {
+            if let url = getAXURLString(matchedWindow, kAXDocumentAttribute) {
+                return url
+            }
+            if let url = findURLInWebArea(matchedWindow) {
+                return url
+            }
+            if let url = findURLInElement(matchedWindow, depth: 0, maxDepth: 8) {
+                return url
+            }
+            return nil
+        }
 
         // Get focused window
         guard let window: AXUIElement = getAXAttribute(appRef, kAXFocusedWindowAttribute) else {
@@ -861,6 +907,49 @@ struct BrowserURLExtractor: Sendable {
 
         // Method 4: Deep search for address bar
         return findURLInElement(window, depth: 0, maxDepth: 8)
+    }
+
+    private static func getChromiumURLViaWindowTitleAppleScript(
+        bundleID: String,
+        pid: pid_t,
+        windowCacheKey: String?
+    ) async -> String? {
+        guard chromiumWindowTitleAppleScriptBundleIDs.contains(bundleID),
+              let matchWindowTitle = normalizedWindowTitleForWindowMatch(windowCacheKey) else {
+            return nil
+        }
+
+        let result = await appleScriptCoordinator.execute(
+            source: chromiumWindowTitleMatchScript(
+                bundleID: bundleID,
+                matchWindowTitle: matchWindowTitle
+            ),
+            browserBundleID: bundleID,
+            pid: pid,
+            windowCacheKey: windowCacheKey,
+            scriptLabel: "chromium-window-title-match",
+            outputValidator: { output in
+                sanitizedBrowserURLCandidate(output, for: bundleID) != nil &&
+                    !isHostBrowserDiagnosticToken(output)
+            }
+        )
+
+        if let url = extractValidatedURL(from: result) {
+            if result.returnedFromCache {
+                Log.debug(
+                    "[BrowserURL] [\(bundleID)] URL extracted via cache (chromium strict title match)",
+                    category: .capture
+                )
+            } else {
+                Log.info(
+                    "[BrowserURL] [\(bundleID)] ✅ URL extracted via Chromium strict title match",
+                    category: .capture
+                )
+            }
+            return url
+        }
+
+        return nil
     }
 
     private static func getWebAppURLViaAppleScript(
@@ -961,7 +1050,7 @@ struct BrowserURLExtractor: Sendable {
         windowCacheKey: String?,
         scriptLabel: String
     ) async -> BrowserURLAppleScriptResult {
-        guard let matchWindowTitle = normalizedWindowTitleForHostMatch(windowCacheKey) else {
+        guard let matchWindowTitle = normalizedWindowTitleForWindowMatch(windowCacheKey) else {
             return BrowserURLAppleScriptResult(
                 output: hostMatchNoWindowTitleToken,
                 completedWithoutTimeout: true
@@ -995,6 +1084,42 @@ struct BrowserURLExtractor: Sendable {
         if matchTitle is "" then return "\(hostMatchNoWindowTitleToken)"
 
         tell application id "\(hostBrowserBundleID)"
+            if (count of windows) = 0 then return "\(hostMatchNoHostWindowsToken)"
+
+            repeat with w in windows
+                set tabTitle to ""
+                set tabURL to ""
+                try
+                    set tabTitle to title of active tab of w
+                    set tabURL to URL of active tab of w
+                end try
+
+                if tabURL is not "" and tabTitle is not "" then
+                    if matchTitle is equal to tabTitle then
+                        return tabURL
+                    end if
+                    if matchTitle ends with (" - " & tabTitle) then
+                        return tabURL
+                    end if
+                end if
+            end repeat
+        end tell
+
+        return "\(hostMatchStrictMismatchToken)"
+        """
+    }
+
+    private static func chromiumWindowTitleMatchScript(
+        bundleID: String,
+        matchWindowTitle: String
+    ) -> String {
+        let escapedMatchTitle = appleScriptEscaped(matchWindowTitle)
+        return """
+        set matchTitle to "\(escapedMatchTitle)"
+        if matchTitle is missing value then set matchTitle to ""
+        if matchTitle is "" then return "\(hostMatchNoWindowTitleToken)"
+
+        tell application id "\(bundleID)"
             if (count of windows) = 0 then return "\(hostMatchNoHostWindowsToken)"
 
             repeat with w in windows
@@ -1063,7 +1188,7 @@ struct BrowserURLExtractor: Sendable {
         }
     }
 
-    private static func normalizedWindowTitleForHostMatch(_ value: String?) -> String? {
+    static func normalizedWindowTitleForWindowMatch(_ value: String?) -> String? {
         let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !trimmed.isEmpty else { return nil }
         let collapsed = trimmed
@@ -1071,6 +1196,19 @@ struct BrowserURLExtractor: Sendable {
             .map(String.init)
             .joined(separator: " ")
         return collapsed.isEmpty ? nil : collapsed
+    }
+
+    static func chromiumWindowTitleMatchesRequestedWindow(
+        windowTitle: String?,
+        requestedWindowCacheKey: String?
+    ) -> Bool {
+        guard let normalizedWindowTitle = normalizedWindowTitleForWindowMatch(windowTitle),
+              let normalizedRequestedTitle = normalizedWindowTitleForWindowMatch(requestedWindowCacheKey) else {
+            return false
+        }
+
+        return normalizedRequestedTitle == normalizedWindowTitle ||
+            normalizedRequestedTitle.hasSuffix(" - \(normalizedWindowTitle)")
     }
 
     private static func normalizedTitleForStrictMatch(_ value: String?) -> String {
@@ -1098,6 +1236,24 @@ struct BrowserURLExtractor: Sendable {
             .replacingOccurrences(of: "\"", with: "\\\"")
             .replacingOccurrences(of: "\r", with: " ")
             .replacingOccurrences(of: "\n", with: " ")
+    }
+
+    private static func matchingChromiumAXWindow(
+        appRef: AXUIElement,
+        requestedWindowCacheKey: String?
+    ) -> AXUIElement? {
+        guard normalizedWindowTitleForWindowMatch(requestedWindowCacheKey) != nil,
+              let windows: [AXUIElement] = getAXAttribute(appRef, kAXWindowsAttribute) else {
+            return nil
+        }
+
+        return windows.first { window in
+            let windowTitle: String? = getAXAttribute(window, kAXTitleAttribute)
+            return chromiumWindowTitleMatchesRequestedWindow(
+                windowTitle: windowTitle,
+                requestedWindowCacheKey: requestedWindowCacheKey
+            )
+        }
     }
 
     // MARK: - Arc Browser
@@ -1162,7 +1318,10 @@ struct BrowserURLExtractor: Sendable {
         Log.debug("[BrowserURL] Arc AppleScript methods failed, falling back to Chromium AX approach", category: .capture)
 
         // Method 3: Fall back to Chromium AX approach
-        let chromiumResult = getChromiumURLViaAX(pid: pid)
+        let chromiumResult = getChromiumURLViaAX(
+            pid: pid,
+            windowCacheKey: windowCacheKey
+        )
         if chromiumResult != nil {
             Log.info("[BrowserURL] ✅ Arc URL extracted via Chromium AX fallback", category: .capture)
         } else {

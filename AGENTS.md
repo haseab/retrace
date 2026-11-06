@@ -117,8 +117,10 @@ retrace/
 │   ├── AGENTS.md
 │   ├── CaptureManager.swift
 │   ├── ScreenCapture/           # Screen capture implementation
+│   │   └── ConferenceFaceBlurProcessor.swift # Vision face detection + irreversible conference-call face blur
 │   ├── Deduplication/           # Perceptual hash deduplication
 │   ├── Metadata/                # AppInfoProvider, BrowserURLExtractor
+│   │   └── ConferenceSessionPrivacyPolicy.swift # Conferencing-app bundle IDs + Meet browser heuristics
 │   └── Tests/
 │
 ├── Processing/                  # OCR and text extraction
@@ -486,4 +488,4 @@ Then check which path actually executes and fix the right code.
 
 ---
 
-_This file follows the AGENTS.md standard for AI agent guidance. Last updated: 2026-04-04_
+_This file follows the AGENTS.md standard for AI agent guidance. Last updated: 2026-04-14_

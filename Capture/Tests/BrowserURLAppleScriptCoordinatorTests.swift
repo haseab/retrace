@@ -507,4 +507,33 @@ final class BrowserURLAppleScriptCoordinatorTests: XCTestCase {
             "https://www.youtube.com/watch?v=abc123"
         )
     }
+
+    func testNormalizedWindowTitleForWindowMatchCollapsesWhitespace() {
+        XCTAssertEqual(
+            BrowserURLExtractor.normalizedWindowTitleForWindowMatch("  Meet   -   abc-defg-hij \n "),
+            "Meet - abc-defg-hij"
+        )
+        XCTAssertNil(BrowserURLExtractor.normalizedWindowTitleForWindowMatch("   "))
+    }
+
+    func testChromiumWindowTitleMatchesRequestedWindowAllowsBrowserSuffixForm() {
+        XCTAssertTrue(
+            BrowserURLExtractor.chromiumWindowTitleMatchesRequestedWindow(
+                windowTitle: "Daily Standup",
+                requestedWindowCacheKey: "Google Meet - Daily Standup"
+            )
+        )
+        XCTAssertTrue(
+            BrowserURLExtractor.chromiumWindowTitleMatchesRequestedWindow(
+                windowTitle: "Meet - abc-defg-hij",
+                requestedWindowCacheKey: "Meet - abc-defg-hij"
+            )
+        )
+        XCTAssertFalse(
+            BrowserURLExtractor.chromiumWindowTitleMatchesRequestedWindow(
+                windowTitle: "Meet - abc-defg-hij",
+                requestedWindowCacheKey: "Meet - xyz-qrst-uvw"
+            )
+        )
+    }
 }

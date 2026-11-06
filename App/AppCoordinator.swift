@@ -24,6 +24,65 @@ public enum CaptureObservedNotification {
     public static let didObserve = Notification.Name("CaptureObserved")
 }
 
+public enum ConferenceConsentStateNotification {
+    public static let didChange = Notification.Name("ConferenceConsentStateDidChange")
+}
+
+public struct ConferenceConsentMenuState: Sendable, Equatable {
+    public static let visibilityInterval: TimeInterval = 8
+
+    public let callID: String
+    public let title: String
+    public let lastObservedAt: Date
+    public let isBlurBypassedForConsent: Bool
+
+    public init(
+        callID: String,
+        title: String,
+        lastObservedAt: Date,
+        isBlurBypassedForConsent: Bool
+    ) {
+        self.callID = callID
+        self.title = title
+        self.lastObservedAt = lastObservedAt
+        self.isBlurBypassedForConsent = isBlurBypassedForConsent
+    }
+
+    public func isVisible(at now: Date = Date()) -> Bool {
+        now.timeIntervalSince(lastObservedAt) <= Self.visibilityInterval
+    }
+
+    public var notificationUserInfo: [AnyHashable: Any] {
+        [
+            "callID": callID,
+            "title": title,
+            "lastObservedAt": lastObservedAt.timeIntervalSince1970,
+            "isBlurBypassedForConsent": isBlurBypassedForConsent
+        ]
+    }
+
+    public static func from(notificationUserInfo: [AnyHashable: Any]?) -> ConferenceConsentMenuState? {
+        guard let callID = notificationUserInfo?["callID"] as? String,
+              let title = notificationUserInfo?["title"] as? String,
+              let lastObservedAtSeconds = notificationUserInfo?["lastObservedAt"] as? TimeInterval,
+              let isBlurBypassedForConsent = notificationUserInfo?["isBlurBypassedForConsent"] as? Bool else {
+            return nil
+        }
+
+        return ConferenceConsentMenuState(
+            callID: callID,
+            title: title,
+            lastObservedAt: Date(timeIntervalSince1970: lastObservedAtSeconds),
+            isBlurBypassedForConsent: isBlurBypassedForConsent
+        )
+    }
+}
+
+struct ConferenceConsentMenuSelectionCandidate: Sendable, Equatable {
+    let state: ConferenceConsentMenuState
+    let menuSelectionPriority: Int
+}
+
 public enum VisibleBlockBoundaryDirection: String, Sendable {
     case start
     case end
@@ -753,8 +812,11 @@ public actor AppCoordinator {
     private static let dbStorageSnapshotIntervalNanoseconds: Int64 = 60_000_000_000
     private static let timelineDiskCacheJPEGCompressionQuality: CGFloat = 0.80
     private static let timelineStillWriterBufferLimit = 4
+    static let conferenceConsentMenuStateRetentionInterval = ConferenceConsentMenuState.visibilityInterval
 
     private let timelineStillDiskWriter: TimelineStillDiskWriter
+    private var latestConferenceConsentMenuState: ConferenceConsentMenuState?
+    private var conferenceConsentMenuStateByCallID: [String: ConferenceConsentMenuSelectionCandidate] = [:]
     private var unexpectedRecordingStopState: UnexpectedRecordingStopState?
     private var hasLoadedUnexpectedRecordingStopState = false
     private var unexpectedRecordingStopCounters = UnexpectedRecordingStopCounters()
@@ -1387,6 +1449,10 @@ public actor AppCoordinator {
                 timestamp: timestamp
             )
         }
+        services.capture.onConferenceFramePrivacyEvent = { [weak self] event in
+            guard let self else { return }
+            await self.updateConferenceConsentMenuState(with: event)
+        }
 
         // Start screen capture
         try await services.capture.startCapture(config: await services.capture.getConfig())
@@ -1483,6 +1549,15 @@ public actor AppCoordinator {
 
         isRunning = false
         statusHolder.update(isRunning: false)
+        latestConferenceConsentMenuState = nil
+        conferenceConsentMenuStateByCallID.removeAll()
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(
+                name: ConferenceConsentStateNotification.didChange,
+                object: nil,
+                userInfo: [:]
+            )
+        }
 
         if persistState {
             saveRecordingState(false)
@@ -4562,6 +4637,130 @@ public actor AppCoordinator {
             metricType: .videoQualityUpdated,
             metadata: metadata
         )
+    }
+
+    private func updateConferenceConsentMenuState(
+        with event: ConferenceFramePrivacyEvent
+    ) async {
+        guard let callID = event.callID?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !callID.isEmpty else {
+            return
+        }
+
+        let title = conferenceConsentMenuTitle(
+            conferenceKind: event.conferenceKind,
+            windowName: event.windowName
+        )
+        let nextState = ConferenceConsentMenuState(
+            callID: callID,
+            title: title,
+            lastObservedAt: event.timestamp,
+            isBlurBypassedForConsent: event.outcome == .consentBypassed
+        )
+        pruneConferenceConsentMenuStates(now: event.timestamp)
+        conferenceConsentMenuStateByCallID[callID] = ConferenceConsentMenuSelectionCandidate(
+            state: nextState,
+            menuSelectionPriority: event.isPreferredMenuCandidate ? 0 : 1
+        )
+        await publishPreferredConferenceConsentMenuState(now: event.timestamp)
+    }
+
+    public func disableFaceBlurForConferenceCall(callID: String) async -> Bool {
+        let normalizedCallID = callID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedCallID.isEmpty else { return false }
+
+        let didApply = await services.capture.disableFaceBlurForConferenceCall(
+            callID: normalizedCallID
+        )
+        guard didApply else { return false }
+
+        if var storedState = conferenceConsentMenuStateByCallID[normalizedCallID] {
+            storedState = ConferenceConsentMenuSelectionCandidate(
+                state: ConferenceConsentMenuState(
+                    callID: storedState.state.callID,
+                    title: storedState.state.title,
+                    lastObservedAt: Date(),
+                    isBlurBypassedForConsent: true
+                ),
+                menuSelectionPriority: storedState.menuSelectionPriority
+            )
+            conferenceConsentMenuStateByCallID[normalizedCallID] = storedState
+            await publishPreferredConferenceConsentMenuState(now: storedState.state.lastObservedAt)
+        } else if var currentState = latestConferenceConsentMenuState,
+                  currentState.callID == normalizedCallID {
+            currentState = ConferenceConsentMenuState(
+                callID: currentState.callID,
+                title: currentState.title,
+                lastObservedAt: Date(),
+                isBlurBypassedForConsent: true
+            )
+            latestConferenceConsentMenuState = currentState
+            let publishedState = currentState
+            await publishConferenceConsentMenuStateNotification(publishedState)
+        }
+
+        return true
+    }
+
+    private func pruneConferenceConsentMenuStates(now: Date) {
+        conferenceConsentMenuStateByCallID = conferenceConsentMenuStateByCallID.filter { _, candidate in
+            now.timeIntervalSince(candidate.state.lastObservedAt) <= Self.conferenceConsentMenuStateRetentionInterval
+        }
+    }
+
+    private func publishPreferredConferenceConsentMenuState(now: Date) async {
+        pruneConferenceConsentMenuStates(now: now)
+        let selectedState = Self.selectConferenceConsentMenuState(
+            from: Array(conferenceConsentMenuStateByCallID.values),
+            now: now,
+            retentionInterval: Self.conferenceConsentMenuStateRetentionInterval
+        )
+        latestConferenceConsentMenuState = selectedState
+        await publishConferenceConsentMenuStateNotification(selectedState)
+    }
+
+    static func selectConferenceConsentMenuState(
+        from candidates: [ConferenceConsentMenuSelectionCandidate],
+        now: Date,
+        retentionInterval: TimeInterval
+    ) -> ConferenceConsentMenuState? {
+        candidates
+            .filter { now.timeIntervalSince($0.state.lastObservedAt) <= retentionInterval }
+            .sorted { lhs, rhs in
+                if lhs.menuSelectionPriority != rhs.menuSelectionPriority {
+                    return lhs.menuSelectionPriority < rhs.menuSelectionPriority
+                }
+                if lhs.state.lastObservedAt != rhs.state.lastObservedAt {
+                    return lhs.state.lastObservedAt > rhs.state.lastObservedAt
+                }
+                return lhs.state.title.localizedCaseInsensitiveCompare(rhs.state.title) == .orderedAscending
+            }
+            .first?
+            .state
+    }
+
+    private func conferenceConsentMenuTitle(
+        conferenceKind: ConferenceSessionKind,
+        windowName: String?
+    ) -> String {
+        let trimmedWindowName = windowName?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !trimmedWindowName.isEmpty {
+            return trimmedWindowName
+        }
+        return conferenceKind.displayName
+    }
+
+    private func publishConferenceConsentMenuStateNotification(
+        _ state: ConferenceConsentMenuState?
+    ) async {
+        await MainActor.run {
+            NotificationCenter.default.post(
+                name: ConferenceConsentStateNotification.didChange,
+                object: nil,
+                userInfo: state?.notificationUserInfo ?? [:]
+            )
+        }
     }
 
     private func recordUnexpectedRecordingStopMetric(

@@ -11,6 +11,7 @@ Capture/
 ├── CaptureManager.swift           # Main CaptureProtocol implementation
 ├── ScreenCapture/
 │   ├── CGWindowListCapture.swift  # Legacy CGWindowList API wrapper
+│   ├── ConferenceFaceBlurProcessor.swift # Vision face detection + irreversible conference-call face blur
 │   ├── DisplayMonitor.swift       # Track available displays
 │   ├── DisplaySwitchMonitor.swift # Detect display changes
 │   ├── MouseClickMonitor.swift    # Post-dispatch left-click capture monitor
@@ -23,11 +24,14 @@ Capture/
 ├── Metadata/
 │   ├── AppInfoProvider.swift      # Get active app info via NSWorkspace
 │   ├── ForegroundWindowSelection.swift # Reject sharing helpers and background processes for attribution
-│   └── BrowserURLExtractor.swift  # Extract URL from browsers (AX API)
+│   ├── BrowserURLExtractor.swift  # Extract URL from browsers (AX API)
+│   └── ConferenceSessionPrivacyPolicy.swift # Qualifying conferencing-session bundle ID + browser heuristics
 └── Tests/
     ├── AccessibilityInspectorTest.swift
     ├── BrowserURLAppleScriptCoordinatorTests.swift
     ├── ForegroundWindowSelectionTests.swift
+    ├── ConferenceROIPlannerTests.swift
+    ├── ConferenceSessionPrivacyPolicyTests.swift
     ├── CaptureTriggerSchedulingTests.swift
     └── DeduplicationTests.swift
 ```

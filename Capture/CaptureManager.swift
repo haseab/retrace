@@ -74,6 +74,10 @@ protocol ScreenCaptureBackend: Actor {
     func stopCapture() async throws
     func updateConfig(_ config: CaptureConfig) async throws
     func captureFrame(displayID: CGDirectDisplayID) async -> CapturedFrame?
+    func disableFaceBlurForConferenceCall(callID: String) async -> Bool
+    func setOnConferenceFramePrivacyEvent(
+        _ callback: (@Sendable (ConferenceFramePrivacyEvent) async -> Void)?
+    ) async
 }
 
 protocol CaptureDisplayMonitoring: Actor {
@@ -214,6 +218,7 @@ public actor CaptureManager: CaptureProtocol {
     nonisolated(unsafe) public var onCaptureStopped: (@Sendable () async -> Void)?
     nonisolated(unsafe) public var onCaptureObserved: (@Sendable (Date, String) async -> Void)?
     nonisolated(unsafe) public var onMouseClickCaptureOutcome: (@Sendable (MouseClickCaptureOutcome, Date) async -> Void)?
+    nonisolated(unsafe) public var onConferenceFramePrivacyEvent: (@Sendable (ConferenceFramePrivacyEvent) async -> Void)?
 
     public init(config: CaptureConfig = .default) {
         let displayMonitor = DisplayMonitor()
@@ -281,6 +286,9 @@ public actor CaptureManager: CaptureProtocol {
             config: config,
             displayID: activeDisplayID
         )
+        await cgWindowListCapture.setOnConferenceFramePrivacyEvent { [weak self] event in
+            await self?.onConferenceFramePrivacyEvent?(event)
+        }
 
         _isCapturing = true
         resetCaptureState()
@@ -310,6 +318,7 @@ public actor CaptureManager: CaptureProtocol {
 
         await displaySwitchMonitor.stopMonitoring()
         await mouseClickMonitor.stopMonitoring()
+        await cgWindowListCapture.setOnConferenceFramePrivacyEvent(nil)
         try await cgWindowListCapture.stopCapture()
 
         dedupedFrameContinuation?.finish()
@@ -375,6 +384,10 @@ public actor CaptureManager: CaptureProtocol {
 
     public func getFocusedDisplay() async throws -> DisplayInfo? {
         try await displayMonitor.getFocusedDisplay()
+    }
+
+    public func disableFaceBlurForConferenceCall(callID: String) async -> Bool {
+        await cgWindowListCapture.disableFaceBlurForConferenceCall(callID: callID)
     }
 
     public func getStatistics() -> CaptureStatistics {

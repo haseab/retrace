@@ -375,6 +375,7 @@ public struct DashboardView: View {
         viewModel.showAccessibilityWarning
             || viewModel.showScreenRecordingWarning
             || launchOnLoginReminderManager.shouldShowReminder
+            || viewModel.conferencePrivacyBanner != nil
             || crashRecoveryBannerModel.state != nil
             || viewModel.unexpectedRecordingStop != nil
             || viewModel.storageHealthBanner != nil
@@ -446,6 +447,10 @@ public struct DashboardView: View {
                                 launchOnLoginReminderManager.dismissReminder()
                             }
                         )
+                    }
+
+                    if viewModel.conferencePrivacyBanner != nil {
+                        ConferencePrivacyDashboardBanner()
                     }
 
                     if let statusBanner = crashRecoveryBannerModel.state {
@@ -2400,6 +2405,57 @@ private struct UnexpectedRecordingStopBanner: View {
             RoundedRectangle(cornerRadius: 8)
                 .stroke(Color.orange.opacity(0.3), lineWidth: 1)
         )
+    }
+}
+
+private struct ConferencePrivacyDashboardBanner: View {
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(Color.white.opacity(0.14))
+                    .frame(width: 36, height: 36)
+
+                Image(systemName: "eye.slash.fill")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(.white)
+            }
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Video calls are automatically blurred to protect the privacy of others.")
+                    .font(.retraceCaptionBold)
+                    .foregroundColor(.white)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .minimumScaleFactor(0.94)
+
+                Text("Go to the menu bar icon options to disable blurring (must disable each time you join a call)")
+                    .font(.retraceCaption2)
+                    .foregroundColor(Color.white.opacity(0.92))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .minimumScaleFactor(0.94)
+            }
+
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(
+            LinearGradient(
+                colors: [
+                    Color(red: 0.12, green: 0.35, blue: 0.85).opacity(0.32),
+                    Color(red: 0.10, green: 0.24, blue: 0.63).opacity(0.24)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(Color(red: 0.43, green: 0.68, blue: 1.0).opacity(0.45), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 }
 

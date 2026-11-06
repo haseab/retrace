@@ -2814,3 +2814,65 @@ final class VideoQualityMetricsTests: XCTestCase {
         }
     }
 }
+
+final class ConferenceConsentMenuSelectionTests: XCTestCase {
+    func testSelectConferenceConsentMenuStatePrefersPreferredCandidateOverNewerFallback() {
+        let now = Date(timeIntervalSince1970: 1_776_000_100)
+        let preferredCandidate = ConferenceConsentMenuSelectionCandidate(
+            state: ConferenceConsentMenuState(
+                callID: "preferred",
+                title: "Focused Meet",
+                lastObservedAt: Date(timeIntervalSince1970: 1_776_000_099),
+                isBlurBypassedForConsent: false
+            ),
+            menuSelectionPriority: 0
+        )
+        let fallbackCandidate = ConferenceConsentMenuSelectionCandidate(
+            state: ConferenceConsentMenuState(
+                callID: "fallback",
+                title: "Background Meet",
+                lastObservedAt: now,
+                isBlurBypassedForConsent: false
+            ),
+            menuSelectionPriority: 1
+        )
+
+        let selectedState = AppCoordinator.selectConferenceConsentMenuState(
+            from: [fallbackCandidate, preferredCandidate],
+            now: now,
+            retentionInterval: AppCoordinator.conferenceConsentMenuStateRetentionInterval
+        )
+
+        XCTAssertEqual(selectedState?.callID, "preferred")
+    }
+
+    func testSelectConferenceConsentMenuStateIgnoresExpiredCandidates() {
+        let now = Date(timeIntervalSince1970: 1_776_000_200)
+        let expiredCandidate = ConferenceConsentMenuSelectionCandidate(
+            state: ConferenceConsentMenuState(
+                callID: "expired",
+                title: "Old Meet",
+                lastObservedAt: now.addingTimeInterval(-20),
+                isBlurBypassedForConsent: false
+            ),
+            menuSelectionPriority: 0
+        )
+        let freshCandidate = ConferenceConsentMenuSelectionCandidate(
+            state: ConferenceConsentMenuState(
+                callID: "fresh",
+                title: "Current Meet",
+                lastObservedAt: now.addingTimeInterval(-1),
+                isBlurBypassedForConsent: false
+            ),
+            menuSelectionPriority: 1
+        )
+
+        let selectedState = AppCoordinator.selectConferenceConsentMenuState(
+            from: [expiredCandidate, freshCandidate],
+            now: now,
+            retentionInterval: AppCoordinator.conferenceConsentMenuStateRetentionInterval
+        )
+
+        XCTAssertEqual(selectedState?.callID, "fresh")
+    }
+}

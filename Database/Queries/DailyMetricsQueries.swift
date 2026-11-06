@@ -4,8 +4,11 @@ import Shared
 
 // MARK: - Daily Metrics Queries
 
-/// SQL queries for daily_metrics table
-/// Tracks engagement events (timeline opens, searches, text copies) as individual rows
+/// SQL queries for daily_metrics table.
+/// Tracks engagement events (timeline opens, searches, text copies) as individual rows.
+/// Privacy boundary: this table is local, on-device user analytics for Retrace features.
+/// It is not a third-party/developer analytics pipeline; data only leaves the device when
+/// the user explicitly exports/shares diagnostics.
 /// Owner: DATABASE agent
 public enum DailyMetricsQueries {
 

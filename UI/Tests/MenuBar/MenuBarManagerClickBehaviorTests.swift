@@ -6,6 +6,56 @@ import App
 @testable import Retrace
 
 final class MenuBarManagerClickBehaviorTests: XCTestCase {
+    @MainActor
+    func testFaceBlurConsentPanelUsesStandaloneHeaderDragConfiguration() {
+        let panel = MenuBarManager.makeFaceBlurConsentPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 420, height: 320)
+        )
+
+        XCTAssertTrue(panel.styleMask.contains(.borderless))
+        XCTAssertTrue(panel.styleMask.contains(.nonactivatingPanel))
+        XCTAssertTrue(panel.styleMask.contains(.fullSizeContentView))
+        XCTAssertEqual(panel.level, .modalPanel)
+        XCTAssertTrue(panel.isFloatingPanel)
+        XCTAssertFalse(panel.isMovableByWindowBackground)
+        XCTAssertFalse(panel.hidesOnDeactivate)
+        XCTAssertFalse(panel.isReleasedWhenClosed)
+        XCTAssertEqual(panel.sharingType, .readOnly)
+        XCTAssertTrue(panel.collectionBehavior.contains(.moveToActiveSpace))
+        XCTAssertTrue(panel.collectionBehavior.contains(.fullScreenAuxiliary))
+        XCTAssertTrue(panel.collectionBehavior.contains(.ignoresCycle))
+
+        panel.close()
+    }
+
+    func testConferenceConsentMenuItemTitleUsesDisabledStatusCopyWithTruncation() {
+        let disabledState = ConferenceConsentMenuState(
+            callID: "call-1",
+            title: "Meet - this-is-a-very-long-conference-window-title",
+            lastObservedAt: Date(),
+            isBlurBypassedForConsent: true
+        )
+
+        XCTAssertEqual(
+            MenuBarManager.conferenceConsentMenuItemTitle(
+                for: disabledState,
+                truncatedTitleLimit: 18
+            ),
+            "Blurring is disabled for 'Meet - this-is-a-…'"
+        )
+
+        let activeState = ConferenceConsentMenuState(
+            callID: "call-2",
+            title: "Meet - active",
+            lastObservedAt: Date(),
+            isBlurBypassedForConsent: false
+        )
+        XCTAssertEqual(
+            MenuBarManager.conferenceConsentMenuItemTitle(for: activeState),
+            "Disable Face Blurring This Call"
+        )
+    }
+
     func testLeftMouseDownOpensStatusMenu() {
         XCTAssertTrue(MenuBarManager.shouldOpenStatusMenu(for: .leftMouseDown))
     }

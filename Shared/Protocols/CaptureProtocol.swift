@@ -44,6 +44,10 @@ public protocol CaptureProtocol: Actor {
 
     /// Get the currently focused display
     func getFocusedDisplay() async throws -> DisplayInfo?
+
+    /// Disable conference face blur for a specific in-progress call identity.
+    /// Returns true when the identity was accepted.
+    func disableFaceBlurForConferenceCall(callID: String) async -> Bool
 }
 
 // MARK: - Deduplication Protocol
