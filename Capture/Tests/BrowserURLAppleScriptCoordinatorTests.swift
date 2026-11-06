@@ -7,6 +7,7 @@ final class BrowserURLAppleScriptCoordinatorTests: XCTestCase {
         let cases = [
             (#"return selectWindowURL({"News", "Weekly sync"}, {"https://example.com", "https://meet.google.com/abc-defg-hij"}, "Weekly sync")"#, "https://meet.google.com/abc-defg-hij"),
             (#"return selectWindowURL({"Weekly sync", "Weekly sync"}, {"https://one.example", "https://two.example"}, "Weekly sync")"#, "__STRICT_TITLE_MISMATCH__"),
+            (#"return selectWindowURL({"Weekly sync", "Weekly sync"}, {"", "https://other.example"}, "Weekly sync")"#, "__STRICT_TITLE_MISMATCH__"),
             (#"return selectWindowURL({"News"}, {"https://example.com"}, "Weekly sync")"#, "__STRICT_TITLE_MISMATCH__"),
             (#"return selectWindowURL({missing value, "Weekly sync"}, {missing value, "https://meet.google.com/abc-defg-hij"}, "weekly sync")"#, "https://meet.google.com/abc-defg-hij")
         ]

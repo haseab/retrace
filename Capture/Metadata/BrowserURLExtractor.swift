@@ -1130,13 +1130,13 @@ struct BrowserURLExtractor: Sendable {
                     set candidateTitle to item i of candidateTitles as text
                     set candidateURL to item i of candidateURLs as text
                 end try
-                if candidateTitle is equal to matchTitle and candidateURL is not "" then
+                if candidateTitle is equal to matchTitle then
                     set matchCount to matchCount + 1
                     if matchCount > 1 then return "\(hostMatchStrictMismatchToken)"
                     set matchingURL to candidateURL
                 end if
             end repeat
-            if matchCount is 1 then return matchingURL
+            if matchCount is 1 and matchingURL is not "" then return matchingURL
             return "\(hostMatchStrictMismatchToken)"
         end selectWindowURL
         """
