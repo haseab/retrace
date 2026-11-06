@@ -2740,7 +2740,10 @@ struct DateRangeInputParser {
     }
 
     func endOfDay(_ date: Date) -> Date {
-        calendar.date(bySettingHour: 23, minute: 59, second: 59, of: date) ?? date
+        guard let nextDay = calendar.date(byAdding: .day, value: 1, to: calendar.startOfDay(for: date)) else {
+            return date
+        }
+        return nextDay.addingTimeInterval(-0.001)
     }
 
     func formatRange(start: Date, end: Date) -> String {
@@ -2884,12 +2887,7 @@ public enum DateRangeQuickPreset: String, CaseIterable {
 
         let normalizedStart = calendar.startOfDay(for: startDay)
         let normalizedEndDay = calendar.startOfDay(for: endDay)
-        let normalizedEnd = calendar.date(
-            bySettingHour: 23,
-            minute: 59,
-            second: 59,
-            of: normalizedEndDay
-        ) ?? normalizedEndDay
+        let normalizedEnd = DateRangeInputParser(calendar: calendar).endOfDay(normalizedEndDay)
 
         return DateRangeCriterion(start: normalizedStart, end: normalizedEnd)
     }
@@ -3761,7 +3759,7 @@ public struct DateRangeFilterPopover: View {
             rangeInputText = formatted
             parseError = nil
             if applyImmediately {
-                let end = calendar.date(bySettingHour: 23, minute: 59, second: 59, of: localEndDate) ?? localEndDate
+                let end = inputParser.endOfDay(localEndDate)
                 applyAllRanges(
                     primaryOverride: DateRangeCriterion(start: localStartDate, end: end),
                     moveToNextDropdown: moveToNextDropdown

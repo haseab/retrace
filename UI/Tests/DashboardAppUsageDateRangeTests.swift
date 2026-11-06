@@ -7,6 +7,27 @@ import Shared
 
 @MainActor
 final class DashboardAppUsageDateRangeTests: XCTestCase {
+    func testFullDayIncludesFinalMillisecondButExplicitSecondRemainsExact() async throws {
+        let calendar = Calendar.current
+        let today = calendar.startOfDay(for: Date())
+        let yesterday = try XCTUnwrap(calendar.date(byAdding: .day, value: -1, to: today))
+        let dayLength = today.timeIntervalSince(yesterday)
+        let offsets = [dayLength - 0.5, dayLength - 0.001]
+        let (viewModel, day) = try await makeStatisticsViewModel(metricEventOffsets: offsets)
+        let nextDay = try XCTUnwrap(Calendar.current.date(byAdding: .day, value: 1, to: day))
+        await viewModel.setAppUsageDateRange(from: DateRangeQuickPreset.yesterday.resolvedRange(now: nextDay))
+        XCTAssertEqual(viewModel.searchesThisWeek, 2)
+        XCTAssertEqual(viewModel.timelineOpensThisWeek, 2)
+        XCTAssertEqual(viewModel.textCopiesThisWeek, 2)
+
+        await viewModel.setAppUsageDateRange(from: DateRangeCriterion(
+            start: day, end: nextDay.addingTimeInterval(-1)
+        ))
+        XCTAssertEqual(viewModel.searchesThisWeek, 0)
+        XCTAssertEqual(viewModel.timelineOpensThisWeek, 0)
+        XCTAssertEqual(viewModel.textCopiesThisWeek, 0)
+    }
+
     func testExactRangeCountsOnlyEventsInsideSelectedHours() async throws {
         let offsets = [16, 17, 20, 30, 31].map { TimeInterval(12 * 3600 + $0 * 60) }
         let (viewModel, day) = try await makeStatisticsViewModel(metricEventOffsets: offsets)
@@ -172,7 +193,7 @@ final class DashboardAppUsageDateRangeTests: XCTestCase {
         XCTAssertEqual(normalized.start, start)
         XCTAssertEqual(
             normalized.end,
-            calendar.date(bySettingHour: 23, minute: 59, second: 59, of: calendar.date(byAdding: .day, value: 29, to: start)!)!
+            calendar.date(bySettingHour: 23, minute: 59, second: 59, of: calendar.date(byAdding: .day, value: 29, to: start)!)!.addingTimeInterval(0.999)
         )
     }
 
@@ -195,7 +216,7 @@ final class DashboardAppUsageDateRangeTests: XCTestCase {
         XCTAssertEqual(normalized.start, start)
         XCTAssertEqual(
             normalized.end,
-            calendar.date(bySettingHour: 23, minute: 59, second: 59, of: now)!
+            calendar.date(bySettingHour: 23, minute: 59, second: 59, of: now)!.addingTimeInterval(0.999)
         )
     }
 

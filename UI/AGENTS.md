@@ -318,7 +318,7 @@ func handleURL(_ url: URL) {
 - `retrace://dashboard` opens the dashboard and preserves the current range.
 - `retrace://dashboard?start={start}&end={end}` opens the existing app/window breakdown for that range.
 - Both bounds are required when either is supplied. Accept Unix **milliseconds**, ISO 8601 datetimes with `Z` or an explicit offset, or date-only `YYYY-MM-DD` values.
-- Exact times are preserved. A date-only start is local midnight; a date-only end is local 23:59:59, respecting daylight saving time.
+- Exact times are preserved. A date-only start is local midnight; a date-only end is local 23:59:59.999, respecting daylight saving time and including the final millisecond.
 - Invalid, reversed, incomplete, or greater-than-31-calendar-day ranges are rejected.
 - Apply the range to the controller-owned dashboard model before creating the window, so cold launches do not briefly load the default range or scan all storage.
 - Show the window before awaiting statistics. Controller/appearance/refresh triggers join one in-flight load for the same range, and a completed cold-link load is reused on first appearance.

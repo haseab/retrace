@@ -36,7 +36,7 @@ final class DeeplinkHandlerTests: XCTestCase {
         XCTAssertEqual(calendar.component(.hour, from: end), 23)
         XCTAssertEqual(calendar.component(.minute, from: end), 59)
         XCTAssertEqual(calendar.component(.second, from: end), 59)
-        XCTAssertEqual(end.timeIntervalSince(start), 25 * 60 * 60 - 1)
+        XCTAssertEqual(end.timeIntervalSince(start), 25 * 60 * 60 - 0.001, accuracy: 0.001)
     }
 
     func testBareDashboardLinkOpensWithoutReplacingTheCurrentRange() throws {
