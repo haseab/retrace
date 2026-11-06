@@ -491,6 +491,14 @@ public actor FrameProcessingQueue {
     private let processing: ProcessingProtocol
     private let search: SearchProtocol
 
+    /// Supplies the app-wide OCR scrambling secret.
+    ///
+    /// Defaults to the Keychain-backed master key. It is injectable because reading the
+    /// Keychain makes rewrite behaviour depend on ambient machine state: on a host with no
+    /// master key every redaction rewrite silently defers with `.missingMasterKey`, which is
+    /// correct for the app but makes the rewrite tests unrunnable.
+    private let appWideSecretProvider: @Sendable () -> String?
+
     private let config: ProcessingQueueConfig
     private var workers: [Task<Void, Never>] = []
     private var isRunning = false
@@ -570,13 +578,17 @@ public actor FrameProcessingQueue {
         storage: StorageProtocol,
         processing: ProcessingProtocol,
         search: SearchProtocol,
-        config: ProcessingQueueConfig = .default
+        config: ProcessingQueueConfig = .default,
+        appWideSecretProvider: @escaping @Sendable () -> String? = {
+            ReversibleOCRScrambler.currentAppWideSecret()
+        }
     ) {
         self.databaseManager = database
         self.storage = storage
         self.processing = processing
         self.search = search
         self.config = config
+        self.appWideSecretProvider = appWideSecretProvider
     }
 
     // MARK: - Power Configuration
@@ -2283,7 +2295,7 @@ public actor FrameProcessingQueue {
             return preliminaryResult
         }
 
-        let secret = ReversibleOCRScrambler.currentAppWideSecret()
+        let secret = appWideSecretProvider()
         let effectiveFrameID = actualFrameID ?? extracted.frameID.value
         let finalResult = Self.finalizedPhraseLevelRedactionResult(
             extracted: extracted,
@@ -2770,7 +2782,7 @@ public actor FrameProcessingQueue {
         }
 
         let actualSegmentID = try parseActualSegmentID(from: videoSegment.relativePath)
-        let secret = ReversibleOCRScrambler.currentAppWideSecret()
+        let secret = appWideSecretProvider()
         let executablePlan: VideoRewritePlan
 
         if plan.hasRedactionTargets && secret == nil {
