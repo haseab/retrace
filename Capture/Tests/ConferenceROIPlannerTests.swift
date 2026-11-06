@@ -3,6 +3,14 @@ import XCTest
 import CoreGraphics
 
 final class ConferenceROIPlannerTests: XCTestCase {
+    func testWindowMetadataDoesNotProveAnOrdinaryWindowIsOpaque() {
+        XCTAssertFalse(CGWindowListCapture.ConferenceROIPlanner.shouldUseAsOcclusionBlocker(
+            ownerName: "Transparent overlay", appBundleID: "com.example.overlay",
+            windowLayer: 0, windowBounds: CGRect(x: 0, y: 0, width: 800, height: 600),
+            displayBounds: CGRect(x: 0, y: 0, width: 1440, height: 900)
+        ))
+    }
+
     func testLargeBaseRegionUsesFullPassPlusOverlapping2x2AndCenterSquare() {
         let requestRegions = ConferenceFaceBlurProcessor.detectionRequestRegions(
             baseRegionOfInterest: nil,

@@ -25,7 +25,8 @@ Capture/
 │   ├── AppInfoProvider.swift      # Get active app info via NSWorkspace
 │   ├── ForegroundWindowSelection.swift # Reject sharing helpers and background processes for attribution
 │   ├── BrowserURLExtractor.swift  # Extract URL from browsers (AX API)
-│   └── ConferenceSessionPrivacyPolicy.swift # Qualifying conferencing-session bundle ID + browser heuristics
+│   ├── ConferenceCallActivityProvider.swift # Bounded window-specific active-call accessibility lookup
+│   └── ConferenceSessionPrivacyPolicy.swift # Conferencing-session rules + session-scoped consent
 └── Tests/
     ├── AccessibilityInspectorTest.swift
     ├── BrowserURLAppleScriptCoordinatorTests.swift

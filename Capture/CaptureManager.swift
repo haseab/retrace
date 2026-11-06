@@ -218,7 +218,7 @@ public actor CaptureManager: CaptureProtocol {
     nonisolated(unsafe) public var onCaptureStopped: (@Sendable () async -> Void)?
     nonisolated(unsafe) public var onCaptureObserved: (@Sendable (Date, String) async -> Void)?
     nonisolated(unsafe) public var onMouseClickCaptureOutcome: (@Sendable (MouseClickCaptureOutcome, Date) async -> Void)?
-    nonisolated(unsafe) public var onConferenceFramePrivacyEvent: (@Sendable (ConferenceFramePrivacyEvent) async -> Void)?
+    private var onConferenceFramePrivacyEvent: (@Sendable (ConferenceFramePrivacyEvent) async -> Void)?
 
     public init(config: CaptureConfig = .default) {
         let displayMonitor = DisplayMonitor()
@@ -388,6 +388,12 @@ public actor CaptureManager: CaptureProtocol {
 
     public func disableFaceBlurForConferenceCall(callID: String) async -> Bool {
         await cgWindowListCapture.disableFaceBlurForConferenceCall(callID: callID)
+    }
+
+    public func setOnConferenceFramePrivacyEvent(
+        _ callback: (@Sendable (ConferenceFramePrivacyEvent) async -> Void)?
+    ) {
+        onConferenceFramePrivacyEvent = callback
     }
 
     public func getStatistics() -> CaptureStatistics {

@@ -1605,7 +1605,7 @@ public class MenuBarManager: ObservableObject {
         faceBlurConsentWindowController?.close()
         faceBlurConsentWindowController = nil
 
-        let panelSize = CGSize(width: 420, height: 236)
+        let panelSize = CGSize(width: 420, height: 284)
         let panel = Self.makeFaceBlurConsentPanel(
             contentRect: NSRect(origin: .zero, size: panelSize)
         )
@@ -1975,6 +1975,11 @@ private struct FaceBlurConsentDialogView: View {
                     .lineSpacing(1.2)
                     .fixedSize(horizontal: false, vertical: true)
 
+                Text(callTitle)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(Color.white.opacity(0.85))
+                    .lineLimit(2)
+
                 HStack(spacing: 12) {
                     Button("Cancel", action: onCancel)
                         .buttonStyle(FaceBlurConsentSecondaryButtonStyle())
@@ -1990,7 +1995,7 @@ private struct FaceBlurConsentDialogView: View {
             .padding(.top, 18)
             .padding(.bottom, 20)
         }
-        .frame(width: 420, height: 236)
+        .frame(width: 420, height: 284)
     }
 }
 

@@ -48,6 +48,11 @@ public protocol CaptureProtocol: Actor {
     /// Disable conference face blur for a specific in-progress call identity.
     /// Returns true when the identity was accepted.
     func disableFaceBlurForConferenceCall(callID: String) async -> Bool
+
+    /// Observe privacy outcomes using shared types before frames enter downstream processing.
+    func setOnConferenceFramePrivacyEvent(
+        _ callback: (@Sendable (ConferenceFramePrivacyEvent) async -> Void)?
+    ) async
 }
 
 // MARK: - Deduplication Protocol

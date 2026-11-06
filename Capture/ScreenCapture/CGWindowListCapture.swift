@@ -330,24 +330,9 @@ public actor CGWindowListCapture {
             windowBounds: CGRect?,
             displayBounds: CGRect
         ) -> Bool {
-            let normalizedOwnerName = ownerName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            let normalizedBundleID = appBundleID?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-
-            guard windowLayer >= 18,
-                  normalizedOwnerName.contains("dock") || normalizedBundleID == "com.apple.dock",
-                  let windowBounds else {
-                return true
-            }
-
-            let intersection = windowBounds.intersection(displayBounds)
-            guard !intersection.isNull, !intersection.isEmpty else {
-                return true
-            }
-
-            let displayArea = max(displayBounds.width * displayBounds.height, 1)
-            let areaRatio = (intersection.width * intersection.height) / displayArea
-
-            return areaRatio < 0.95
+            // CGWindow metadata cannot prove per-pixel opacity (including alpha=1
+            // panels). Conservatively scan conference ROIs behind other windows.
+            false
         }
 
         private static func subtractRect(_ subtractor: CGRect, from rects: [CGRect]) -> [CGRect] {
@@ -414,6 +399,7 @@ public actor CGWindowListCapture {
 
     private struct VisibleWindowContext: Sendable {
         let windowID: CGWindowID
+        let ownerPID: pid_t?
         let appBundleID: String?
         let appName: String?
         let windowName: String?
@@ -473,7 +459,7 @@ public actor CGWindowListCapture {
     private let redactionCIContext = CIContext()
     private let conferenceFaceBlurProcessor = ConferenceFaceBlurProcessor()
     private var lastDisplaySurfaceBytes: Int64 = 0
-    nonisolated(unsafe) private var onConferenceFramePrivacyEvent: (@Sendable (ConferenceFramePrivacyEvent) async -> Void)?
+    private var onConferenceFramePrivacyEvent: (@Sendable (ConferenceFramePrivacyEvent) async -> Void)?
     private var conferenceCallConsent = ConferenceCallConsentState()
     private var lastConferenceObservationAt: Date?
     private var cachedSystemMediaCaptureState = SystemMediaCaptureState(
@@ -657,10 +643,16 @@ public actor CGWindowListCapture {
            observationTime.timeIntervalSince(lastConferenceObservationAt) > freshnessInterval {
             conferenceCallConsent.reset()
         }
-        conferenceCallConsent.update(activeCallIDs: Set(conferenceWindowMatches.map { $0.callIdentity.id }))
+        let activeConferenceMatches = conferenceWindowMatches.filter { match in
+            guard let pid = match.context.ownerPID else { return false }
+            return ConferenceCallActivityProvider.hasActiveCallControl(
+                pid: pid, windowTitle: match.context.windowName
+            )
+        }
+        conferenceCallConsent.update(activeCallIDs: Set(activeConferenceMatches.map { $0.callIdentity.id }))
         lastConferenceObservationAt = observationTime
         let preferredConferenceCallID = preferredConferenceCallID(
-            from: conferenceWindowMatches,
+            from: activeConferenceMatches,
             visibleWindowContext: visibleWindowContext
         )
 
@@ -668,9 +660,10 @@ public actor CGWindowListCapture {
             let conferenceContext = conferenceWindowMatch.context
             let conferenceMatch = conferenceWindowMatch.match
             let callIdentity = conferenceWindowMatch.callIdentity
+            let callSessionID = conferenceCallConsent.sessionID(for: callIdentity.id)
             let isPreferredMenuCandidate = callIdentity.id == preferredConferenceCallID
 
-            if conferenceCallConsent.isBypassed(callID: callIdentity.id) {
+            if let callSessionID, conferenceCallConsent.isBypassed(callID: callSessionID) {
                 await emitConferenceFramePrivacyOutcome(
                     conferenceMatch: conferenceMatch,
                     outcome: .consentBypassed,
@@ -679,7 +672,7 @@ public actor CGWindowListCapture {
                     windowLayer: conferenceContext.windowLayer,
                     windowName: conferenceContext.windowName,
                     browserURL: conferenceContext.browserURL,
-                    callID: callIdentity.id,
+                    callID: callSessionID,
                     isPreferredMenuCandidate: isPreferredMenuCandidate
                 )
                 continue
@@ -703,7 +696,7 @@ public actor CGWindowListCapture {
                         windowLayer: conferenceContext.windowLayer,
                         windowName: conferenceContext.windowName,
                         browserURL: conferenceContext.browserURL,
-                        callID: callIdentity.id,
+                        callID: callSessionID,
                         isPreferredMenuCandidate: isPreferredMenuCandidate
                     )
                     Log.warning(
@@ -721,7 +714,7 @@ public actor CGWindowListCapture {
                     windowLayer: conferenceContext.windowLayer,
                     windowName: conferenceContext.windowName,
                     browserURL: conferenceContext.browserURL,
-                    callID: callIdentity.id,
+                    callID: callSessionID,
                     isPreferredMenuCandidate: isPreferredMenuCandidate
                 )
                 Log.error(
@@ -752,7 +745,7 @@ public actor CGWindowListCapture {
                         windowLayer: conferenceContext.windowLayer,
                         windowName: conferenceContext.windowName,
                         browserURL: conferenceContext.browserURL,
-                        callID: callIdentity.id,
+                        callID: callSessionID,
                         isPreferredMenuCandidate: isPreferredMenuCandidate
                     )
                 } else {
@@ -764,7 +757,7 @@ public actor CGWindowListCapture {
                         windowLayer: conferenceContext.windowLayer,
                         windowName: conferenceContext.windowName,
                         browserURL: conferenceContext.browserURL,
-                        callID: callIdentity.id,
+                        callID: callSessionID,
                         isPreferredMenuCandidate: isPreferredMenuCandidate
                     )
                 }
@@ -783,7 +776,7 @@ public actor CGWindowListCapture {
                         windowLayer: conferenceContext.windowLayer,
                         windowName: conferenceContext.windowName,
                         browserURL: conferenceContext.browserURL,
-                        callID: callIdentity.id,
+                        callID: callSessionID,
                         isPreferredMenuCandidate: isPreferredMenuCandidate
                     )
                     Log.warning(
@@ -799,7 +792,7 @@ public actor CGWindowListCapture {
                         windowLayer: conferenceContext.windowLayer,
                         windowName: conferenceContext.windowName,
                         browserURL: conferenceContext.browserURL,
-                        callID: callIdentity.id,
+                        callID: callSessionID,
                         isPreferredMenuCandidate: isPreferredMenuCandidate
                     )
                     Log.error(
@@ -920,7 +913,7 @@ public actor CGWindowListCapture {
                 }
             }
 
-            let fetchedURL = await BrowserURLExtractor.getURL(
+            let fetchedURL = await BrowserURLExtractor.getURLForWindow(
                 bundleID: bundleID,
                 pid: ownerPID,
                 windowCacheKey: windowCacheKey
@@ -997,6 +990,7 @@ public actor CGWindowListCapture {
                     conferenceWindowContexts.append(
                         VisibleWindowContext(
                             windowID: windowID,
+                            ownerPID: ownerPID,
                             appBundleID: bundleID,
                             appName: appName,
                             windowName: normalizedWindowName,
@@ -1023,6 +1017,7 @@ public actor CGWindowListCapture {
                ) {
                 visibleWindowContext = VisibleWindowContext(
                     windowID: windowID,
+                    ownerPID: ownerPID,
                     appBundleID: bundleID,
                     appName: appName,
                     windowName: normalizedWindowName,
@@ -1046,6 +1041,7 @@ public actor CGWindowListCapture {
                    let currentBrowserURL {
                     visibleWindowContext = VisibleWindowContext(
                         windowID: visibleWindowContext?.windowID ?? windowID,
+                        ownerPID: visibleWindowContext?.ownerPID ?? ownerPID,
                         appBundleID: visibleWindowContext?.appBundleID,
                         appName: visibleWindowContext?.appName,
                         windowName: visibleWindowContext?.windowName,
@@ -1059,6 +1055,7 @@ public actor CGWindowListCapture {
             conferenceWindowContexts.append(
                 VisibleWindowContext(
                     windowID: windowID,
+                    ownerPID: ownerPID,
                     appBundleID: bundleID,
                     appName: appName,
                     windowName: normalizedWindowName,
@@ -1635,7 +1632,7 @@ public actor CGWindowListCapture {
         windowLayer: Int?,
         windowName: String?,
         browserURL: String?,
-        callID: String,
+        callID: String?,
         isPreferredMenuCandidate: Bool
     ) async {
         await emitConferenceFramePrivacyEvent(

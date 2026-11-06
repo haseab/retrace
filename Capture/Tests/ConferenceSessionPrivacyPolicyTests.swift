@@ -1,27 +1,43 @@
 import XCTest
+import Shared
 @testable import Capture
 
 final class ConferenceSessionPrivacyPolicyTests: XCTestCase {
     func testConsentDoesNotSurviveCallDisappearanceAndReappearance() {
         var consent = ConferenceCallConsentState()
         consent.update(activeCallIDs: ["meet-window"])
-        XCTAssertTrue(consent.disableFaceBlur(callID: "meet-window"))
-        XCTAssertTrue(consent.isBypassed(callID: "meet-window"))
+        let originalSession = consent.sessionID(for: "meet-window")!
+        XCTAssertTrue(consent.disableFaceBlur(callID: originalSession))
+        XCTAssertTrue(consent.isBypassed(callID: originalSession))
 
         consent.update(activeCallIDs: [])
         consent.update(activeCallIDs: ["meet-window"])
-        XCTAssertFalse(consent.isBypassed(callID: "meet-window"))
+        let nextSession = consent.sessionID(for: "meet-window")!
+        XCTAssertNotEqual(originalSession, nextSession)
+        XCTAssertFalse(consent.isBypassed(callID: nextSession))
+        XCTAssertFalse(consent.disableFaceBlur(callID: originalSession))
     }
 
     func testConsentOnlyAppliesToTheSelectedActiveCall() {
         var consent = ConferenceCallConsentState()
         consent.update(activeCallIDs: ["meet-window", "zoom-window"])
+        let meetSession = consent.sessionID(for: "meet-window")!
+        let zoomSession = consent.sessionID(for: "zoom-window")!
         XCTAssertFalse(consent.disableFaceBlur(callID: "unknown-call"))
-        XCTAssertTrue(consent.disableFaceBlur(callID: "meet-window"))
-        XCTAssertFalse(consent.isBypassed(callID: "zoom-window"))
+        XCTAssertTrue(consent.disableFaceBlur(callID: meetSession))
+        XCTAssertFalse(consent.isBypassed(callID: zoomSession))
         consent.reset()
-        XCTAssertFalse(consent.isBypassed(callID: "meet-window"))
-        XCTAssertFalse(consent.disableFaceBlur(callID: "meet-window"))
+        XCTAssertFalse(consent.isBypassed(callID: meetSession))
+        XCTAssertFalse(consent.disableFaceBlur(callID: meetSession))
+    }
+
+    func testActiveCallRequiresAnActionControlNotMeetingPageText() {
+        XCTAssertTrue(ConferenceCallActivityProvider.isActiveCallControl(role: "AXButton", label: "Leave call"))
+        XCTAssertTrue(ConferenceCallActivityProvider.isActiveCallControl(role: "AXButton", label: "End meeting for all"))
+        XCTAssertFalse(ConferenceCallActivityProvider.isActiveCallControl(role: "AXButton", label: "Join now"))
+        XCTAssertFalse(ConferenceCallActivityProvider.isActiveCallControl(role: "AXButton", label: "Leave call", isEnabled: false))
+        XCTAssertFalse(ConferenceCallActivityProvider.isActiveCallControl(role: "AXStaticText", label: "Leave call"))
+        XCTAssertFalse(ConferenceCallActivityProvider.isActiveCallControl(role: "AXButton", label: "Weekly sync"))
     }
 
     func testConsentOverrideRejectsCallsThatHaveNeverBeenObserved() async {

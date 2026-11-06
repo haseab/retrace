@@ -75,6 +75,7 @@ retrace/
 │   │   ├── TextRegion.swift     # OCR text region types
 │   │   ├── Search.swift         # SearchQuery, SearchResult
 │   │   ├── Segment.swift        # Segment data model
+│   │   ├── ConferencePrivacy.swift # Shared call kinds and capture privacy outcome events
 │   │   ├── Config.swift         # Configuration types
 │   │   ├── Errors.swift         # Error types
 │   │   ├── Audio.swift          # Audio model types (Release 2)
@@ -120,7 +121,8 @@ retrace/
 │   │   └── ConferenceFaceBlurProcessor.swift # Vision face detection + irreversible conference-call face blur
 │   ├── Deduplication/           # Perceptual hash deduplication
 │   ├── Metadata/                # AppInfoProvider, BrowserURLExtractor
-│   │   └── ConferenceSessionPrivacyPolicy.swift # Conferencing-app bundle IDs + Meet browser heuristics
+│   │   ├── ConferenceCallActivityProvider.swift # Window-specific active-call accessibility controls
+│   │   └── ConferenceSessionPrivacyPolicy.swift # Conferencing-app rules + call-session consent tracking
 │   └── Tests/
 │
 ├── Processing/                  # OCR and text extraction

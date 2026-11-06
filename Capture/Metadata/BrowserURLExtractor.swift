@@ -557,6 +557,41 @@ struct BrowserURLExtractor: Sendable {
     /// 1. Browser-specific method (AX attributes or AppleScript)
     /// 2. Generic AXWebArea → AXURL traversal
     /// 3. Address bar text field search
+    /// Window-scoped capture must never borrow the focused window's URL.
+    static func getURLForWindow(bundleID: String, pid: pid_t, windowCacheKey: String?) async -> String? {
+        guard isBrowser(bundleID), !firefoxBundleIDs.contains(bundleID),
+              let window = matchingAXWindow(pid: pid, requestedTitle: windowCacheKey) else { return nil }
+        let candidate = getAXURLString(window, kAXDocumentAttribute)
+            ?? findURLInWebArea(window)
+            ?? findURLInElement(window, depth: 0, maxDepth: 8)
+        return sanitizedBrowserURLCandidate(candidate, for: bundleID)
+    }
+
+    static func matchingWindowIndex(titles: [String?], requestedTitle: String?) -> Int? {
+        func canonicalTitle(_ value: String?) -> String? {
+            guard let normalized = normalizedWindowTitleForWindowMatch(value) else { return nil }
+            return normalized.lowercased().replacingOccurrences(
+                of: #"^(?:google chrome|safari|microsoft edge|brave|arc|vivaldi|opera|chromium) [—–-] | [—–-] (?:google chrome|safari|microsoft edge|brave|arc|vivaldi|opera|chromium)$"#,
+                with: "", options: .regularExpression
+            )
+        }
+        guard let requested = canonicalTitle(requestedTitle) else { return nil }
+        let matches = titles.indices.filter { canonicalTitle(titles[$0]) == requested }
+        return matches.count == 1 ? matches[0] : nil
+    }
+
+    static func matchingAXWindow(pid: pid_t, requestedTitle: String?) -> AXUIElement? {
+        guard normalizedWindowTitleForWindowMatch(requestedTitle) != nil else { return nil }
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 0.02)
+        enableAccessibilityIfNeeded(app)
+        guard let windows: [AXUIElement] = getAXAttribute(app, kAXWindowsAttribute) else { return nil }
+        let titles: [String?] = windows.map { getAXAttribute($0, kAXTitleAttribute) }
+        guard let index = matchingWindowIndex(titles: titles, requestedTitle: requestedTitle) else { return nil }
+        AXUIElementSetMessagingTimeout(windows[index], 0.02)
+        return windows[index]
+    }
+
     static func getURL(bundleID: String, pid: pid_t, windowCacheKey: String? = nil) async -> String? {
         if bundleID == "com.apple.finder" {
             return await getFinderTargetURL(pid: pid, windowCacheKey: windowCacheKey)

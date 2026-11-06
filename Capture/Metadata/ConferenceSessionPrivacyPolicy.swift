@@ -2,68 +2,6 @@ import CoreGraphics
 import Foundation
 import Shared
 
-public enum ConferenceSessionKind: String, Sendable, Equatable {
-    case discord = "discord"
-    case slack = "slack"
-    case messenger = "messenger"
-    case weChat = "wechat"
-    case vkMessenger = "vk_messenger"
-    case kakaoTalk = "kakaotalk"
-    case line = "line"
-    case dingTalk = "dingtalk"
-    case whatsapp = "whatsapp"
-    case signal = "signal"
-    case telegram = "telegram"
-    case viber = "viber"
-    case tencentMeeting = "tencent_meeting"
-    case voovMeeting = "voov_meeting"
-    case zoom = "zoom"
-    case faceTime = "facetime"
-    case teams = "teams"
-    case googleMeet = "google_meet"
-
-    public var displayName: String {
-        switch self {
-        case .discord:
-            return "Discord"
-        case .slack:
-            return "Slack"
-        case .messenger:
-            return "Messenger"
-        case .weChat:
-            return "WeChat"
-        case .vkMessenger:
-            return "VK Messenger"
-        case .kakaoTalk:
-            return "KakaoTalk"
-        case .line:
-            return "LINE"
-        case .dingTalk:
-            return "DingTalk"
-        case .whatsapp:
-            return "WhatsApp"
-        case .signal:
-            return "Signal"
-        case .telegram:
-            return "Telegram"
-        case .viber:
-            return "Viber"
-        case .tencentMeeting:
-            return "Tencent Meeting"
-        case .voovMeeting:
-            return "VooV Meeting"
-        case .zoom:
-            return "Zoom"
-        case .faceTime:
-            return "FaceTime"
-        case .teams:
-            return "Teams"
-        case .googleMeet:
-            return "Google Meet"
-        }
-    }
-}
-
 struct ConferenceSessionMatch: Sendable, Equatable {
     let kind: ConferenceSessionKind
     let matchedBy: String
@@ -71,74 +9,30 @@ struct ConferenceSessionMatch: Sendable, Equatable {
 
 /// Consent belongs to a currently observed call, never to a reusable window forever.
 struct ConferenceCallConsentState: Sendable {
-    private var activeCallIDs: Set<String> = []
-    private var consentedCallIDs: Set<String> = []
+    private var sessions: [String: String] = [:]
+    private var consentedSessionIDs: Set<String> = []
 
     mutating func update(activeCallIDs: Set<String>) {
-        self.activeCallIDs = activeCallIDs
-        consentedCallIDs.formIntersection(activeCallIDs)
+        sessions = sessions.filter { activeCallIDs.contains($0.key) }
+        for identity in activeCallIDs where sessions[identity] == nil {
+            sessions[identity] = UUID().uuidString
+        }
+        consentedSessionIDs.formIntersection(Set(sessions.values))
     }
 
+    func sessionID(for identity: String) -> String? { sessions[identity] }
+
     mutating func disableFaceBlur(callID: String) -> Bool {
-        guard activeCallIDs.contains(callID) else { return false }
-        consentedCallIDs.insert(callID)
+        guard sessions.values.contains(callID) else { return false }
+        consentedSessionIDs.insert(callID)
         return true
     }
 
-    func isBypassed(callID: String) -> Bool {
-        consentedCallIDs.contains(callID)
-    }
+    func isBypassed(callID: String) -> Bool { consentedSessionIDs.contains(callID) }
 
     mutating func reset() {
-        activeCallIDs.removeAll()
-        consentedCallIDs.removeAll()
-    }
-}
-
-public enum ConferenceFramePrivacyOutcome: String, Sendable, Equatable {
-    case blurred
-    case noFacesDetected = "no_faces_detected"
-    case droppedDetectionFailure = "dropped_detection_failure"
-    case consentBypassed = "consent_bypassed"
-}
-
-public struct ConferenceFramePrivacyEvent: Sendable, Equatable {
-    public let timestamp: Date
-    public let conferenceKind: ConferenceSessionKind
-    public let outcome: ConferenceFramePrivacyOutcome
-    public let appBundleID: String?
-    public let faceCount: Int
-    public let windowLayer: Int?
-    public let windowName: String?
-    public let browserURL: String?
-    public let matchedBy: String?
-    public let callID: String?
-    public let isPreferredMenuCandidate: Bool
-
-    public init(
-        timestamp: Date,
-        conferenceKind: ConferenceSessionKind,
-        outcome: ConferenceFramePrivacyOutcome,
-        appBundleID: String?,
-        faceCount: Int,
-        windowLayer: Int? = nil,
-        windowName: String? = nil,
-        browserURL: String? = nil,
-        matchedBy: String? = nil,
-        callID: String? = nil,
-        isPreferredMenuCandidate: Bool = false
-    ) {
-        self.timestamp = timestamp
-        self.conferenceKind = conferenceKind
-        self.outcome = outcome
-        self.appBundleID = appBundleID
-        self.faceCount = faceCount
-        self.windowLayer = windowLayer
-        self.windowName = windowName
-        self.browserURL = browserURL
-        self.matchedBy = matchedBy
-        self.callID = callID
-        self.isPreferredMenuCandidate = isPreferredMenuCandidate
+        sessions.removeAll()
+        consentedSessionIDs.removeAll()
     }
 }
 

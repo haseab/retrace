@@ -2,6 +2,16 @@ import XCTest
 @testable import Capture
 
 final class BrowserURLAppleScriptCoordinatorTests: XCTestCase {
+    func testStrictWindowSelectionRejectsMissingAndAmbiguousTitles() {
+        XCTAssertEqual(BrowserURLExtractor.matchingWindowIndex(
+            titles: ["News", "Meet - abc-defg-hij"], requestedTitle: "Meet - abc-defg-hij"
+        ), 1)
+        XCTAssertNil(BrowserURLExtractor.matchingWindowIndex(titles: ["News"], requestedTitle: "Weekly sync"))
+        XCTAssertNil(BrowserURLExtractor.matchingWindowIndex(titles: ["Meet", "Meet"], requestedTitle: "Meet"))
+        XCTAssertNil(BrowserURLExtractor.matchingWindowIndex(titles: ["News"], requestedTitle: nil))
+        XCTAssertEqual(BrowserURLExtractor.matchingWindowIndex(titles: ["Weekly sync - Safari"], requestedTitle: "Weekly sync"), 0)
+        XCTAssertNil(BrowserURLExtractor.matchingWindowIndex(titles: ["Weekly sync", "Weekly sync - Safari"], requestedTitle: "Weekly sync"))
+    }
 
     actor RunnerProbe {
         private var callCount = 0

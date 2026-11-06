@@ -1468,7 +1468,7 @@ public actor AppCoordinator {
                 timestamp: timestamp
             )
         }
-        services.capture.onConferenceFramePrivacyEvent = { [weak self] event in
+        await services.capture.setOnConferenceFramePrivacyEvent { [weak self] event in
             guard let self else { return }
             await self.updateConferenceConsentMenuState(with: event)
         }
@@ -4662,14 +4662,25 @@ public actor AppCoordinator {
     private func updateConferenceConsentMenuState(
         with event: ConferenceFramePrivacyEvent
     ) async {
+        let metricCallKey = event.callID ?? "unverified-\(event.conferenceKind.rawValue)"
+        if conferencePrivacyMetricState.shouldRecord(
+            callID: metricCallKey, outcome: event.outcome.rawValue, at: event.timestamp
+        ) {
+            try? await recordMetricEvent(
+                metricType: .conferencePrivacy,
+                timestamp: event.timestamp,
+                metadata: Self.metricMetadata([
+                    "action": "protection_changed", "outcome": event.outcome.rawValue,
+                    "conferenceKind": event.conferenceKind.rawValue, "source": "capture"
+                ])
+            )
+        }
         guard let callID = event.callID?.trimmingCharacters(in: .whitespacesAndNewlines),
               !callID.isEmpty else {
+            await publishPreferredConferenceConsentMenuState(now: event.timestamp)
             return
         }
 
-        let shouldRecord = conferencePrivacyMetricState.shouldRecord(
-            callID: callID, outcome: event.outcome.rawValue, at: event.timestamp
-        )
         let title = conferenceConsentMenuTitle(
             conferenceKind: event.conferenceKind,
             windowName: event.windowName
@@ -4686,16 +4697,6 @@ public actor AppCoordinator {
             menuSelectionPriority: event.isPreferredMenuCandidate ? 0 : 1
         )
         await publishPreferredConferenceConsentMenuState(now: event.timestamp)
-        if shouldRecord {
-            try? await recordMetricEvent(
-                metricType: .conferencePrivacy,
-                timestamp: event.timestamp,
-                metadata: Self.metricMetadata([
-                    "action": "protection_changed", "outcome": event.outcome.rawValue,
-                    "conferenceKind": event.conferenceKind.rawValue, "source": "capture"
-                ])
-            )
-        }
     }
 
     public func disableFaceBlurForConferenceCall(callID: String) async -> Bool {
