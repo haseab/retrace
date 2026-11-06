@@ -1770,7 +1770,7 @@ public class SearchViewModel: ObservableObject {
             guard let self else { return }
 
             do {
-                try await Task.sleep(nanoseconds: otherAppsRefreshDelayNs)
+                try await Task.sleep(for: .nanoseconds(Int64(otherAppsRefreshDelayNs)), clock: .continuous)
             } catch {
                 return
             }
