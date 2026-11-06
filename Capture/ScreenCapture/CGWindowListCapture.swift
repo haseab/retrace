@@ -429,6 +429,9 @@ public actor CGWindowListCapture {
         var redactionWindowOrder: [CGWindowID] = []
         var visibleWindowContext: VisibleWindowContext?
         var captureBlockReason: String?
+        let foregroundPID = await MainActor.run {
+            NSWorkspace.shared.frontmostApplication?.processIdentifier
+        }
 
         enum BrowserURLLookupResult {
             case found(String)
@@ -494,7 +497,13 @@ public actor CGWindowListCapture {
                 captureBlockReason = Self.captureBlockReason(ownerName: ownerName, bundleID: bundleID)
             }
 
-            if visibleWindowContext == nil {
+            if visibleWindowContext == nil,
+               ForegroundWindowSelection.isEligible(
+                   windowInfo,
+                   foregroundPID: foregroundPID,
+                   bundleID: bundleID,
+                   displayBounds: displayBounds
+               ) {
                 visibleWindowContext = VisibleWindowContext(
                     appBundleID: bundleID,
                     appName: appDisplayName(ownerName: ownerName, bundleID: bundleID),

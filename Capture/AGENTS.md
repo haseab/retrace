@@ -22,10 +22,12 @@ Capture/
 │   └── PerceptualHash.swift       # dHash (difference hash) for comparison
 ├── Metadata/
 │   ├── AppInfoProvider.swift      # Get active app info via NSWorkspace
+│   ├── ForegroundWindowSelection.swift # Reject sharing helpers and background processes for attribution
 │   └── BrowserURLExtractor.swift  # Extract URL from browsers (AX API)
 └── Tests/
     ├── AccessibilityInspectorTest.swift
     ├── BrowserURLAppleScriptCoordinatorTests.swift
+    ├── ForegroundWindowSelectionTests.swift
     ├── CaptureTriggerSchedulingTests.swift
     └── DeduplicationTests.swift
 ```
