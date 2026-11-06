@@ -30,10 +30,14 @@ UI/
 │   │   └── StandaloneQuickCommentView.swift # Dedicated standalone quick-comment UI
 │   ├── Dashboard/
 │   │   ├── DashboardView.swift          # Main dashboard
+│   │   ├── DashboardWindowController.swift # Dashboard window lifecycle
 │   │   ├── ChangelogView.swift          # Appcast-powered release notes view
-│   │   ├── AnalyticsCard.swift          # Stats widgets
-│   │   ├── MigrationPanel.swift         # Import UI
-│   │   └── SupportLink.swift            # Twitter/support
+│   │   ├── AppUsageListView.swift       # App, website, and window usage breakdown
+│   │   ├── AppUsageHardDriveView.swift  # App usage treemap
+│   │   ├── AppSessionsDetailView.swift # App/window session details
+│   │   ├── MiniLineGraphView.swift      # Daily statistic graphs
+│   │   ├── SystemMonitorView.swift     # CPU and memory monitor
+│   │   └── SystemMonitorWindowController.swift # System Monitor window lifecycle
 │   ├── Feedback/
 │   │   ├── FeedbackFormView.swift       # Feedback sheet with form, sending, and success states
 │   │   ├── FeedbackDiagnosticsPresentation.swift # Feedback diagnostics section building + readable formatting helpers
@@ -95,7 +99,7 @@ UI/
 │   ├── BoundingBoxOverlay.swift         # Text region highlighting
 │   ├── CrashRecoveryManager.swift       # App-side SMAppService/XPC lifecycle manager
 │   ├── SessionTimeline.swift            # App session visualization
-│   ├── DeeplinkHandler.swift            # URL scheme routing
+│   ├── DeeplinkHandler.swift            # Search, timeline, and exact dashboard date/time URL routing
 │   ├── LaunchMenuRouting.swift          # Shared dashboard/timeline/settings/system-monitor routing and frontmost-window checks for app/status menus
 │   ├── AppMetadataCache.swift           # App name/icon lookup caches and app icon view
 │   ├── FaviconProvider.swift            # Favicon memory+disk cache and favicon view
@@ -104,6 +108,7 @@ UI/
 │   ├── ProcessMemoryCardPresentation.swift # Local presentation controller + row builder for memory monitor card
 │   ├── ProcessMonitorModels.swift       # System Monitor snapshot/models + ranking/build helpers
 │   ├── HoverLatchedScrollMonitor.swift  # Shared nested-scroll latch helper for hover-routed inner scroll regions
+│   ├── FilterPopoverComponents.swift   # Shared filters; date input preserves exact times and expands date-only bounds to full days
 │   ├── ProcessCPUSummaryCard.swift      # System Monitor CPU table/card UI
 │   ├── ProcessMemorySummaryCard.swift   # System Monitor memory table/card UI
 │   ├── RetraceAboutPanel.swift          # Custom About panel content and window factory used by the app menu
@@ -148,8 +153,8 @@ UI/
     ├── SearchViewModelAvailableAppsTests.swift # Search app-list merge/deduplication coverage
     ├── SpotlightSearchOverlayRecentEntryAppMapTests.swift # Recent entry app-name map deduplication coverage
     ├── Search/SearchPaginationCancellationTests.swift # Search stale-pagination cancellation coverage on mode/sort changes
-    ├── DashboardAppUsageDateRangeTests.swift # Dashboard app-usage date-range normalization coverage
-    ├── DateRangePresetShortcutTests.swift # Shared date-range preset shortcut mapping and inclusive-range coverage
+    ├── DashboardAppUsageDateRangeTests.swift # Dashboard date/time range normalization and cache coverage
+    ├── DateRangePresetShortcutTests.swift # Date/time parsing, round-trip formatting, full-day bounds, and preset shortcuts
     ├── CaptureIntervalSettingsTests.swift # Live capture-interval config update coverage
     ├── ProcessCPUDisplayMetricsTests.swift # CPU sampler display math and live ranking coverage
     ├── SearchHighlightTooltipTests.swift # Search highlight tooltip hover/dismiss coverage
@@ -307,6 +312,27 @@ func handleURL(_ url: URL) {
 **Share functionality**:
 - Right-click result → Copy Link
 - Generates deeplink to share with others (or paste into notes)
+
+**Dashboard breakdown links**:
+
+- `retrace://dashboard` opens the dashboard and preserves the current range.
+- `retrace://dashboard?start={start}&end={end}` opens the existing app/window breakdown for that range.
+- Both bounds are required when either is supplied. Accept Unix **milliseconds**, ISO 8601 datetimes with `Z` or an explicit offset, or date-only `YYYY-MM-DD` values.
+- Exact times are preserved. A date-only start is local midnight; a date-only end is local 23:59:59.999, respecting daylight saving time and including the final millisecond.
+- Invalid, reversed, incomplete, or greater-than-31-calendar-day ranges are rejected.
+- Apply the range to the controller-owned dashboard model before creating the window, so cold launches do not briefly load the default range or scan all storage.
+- Show the window before awaiting statistics. Controller/appearance/refresh triggers join one in-flight load for the same range, and a completed cold-link load is reused on first appearance.
+- Dashboard engagement counts use exact timestamp bounds; date-only inputs already provide full-day bounds. Reopened picker text preserves millisecond precision.
+- `launchSurfaceReveal` records dashboard deeplink entry; the existing dashboard range metrics record filter application/outcomes with source `dashboard_deeplink`.
+
+Example from another macOS app or shell:
+
+```sh
+open 'retrace://dashboard?start=2026-11-06T05:00:00-08:00&end=2026-11-06T06:10:00-08:00'
+```
+
+Use `DeeplinkHandler.generateDashboardLink(start:end:)` to generate canonical millisecond links.
+macOS URL dispatch requires an updated app bundle registered for the `retrace` scheme. For a standalone SwiftPM/dev run, use the existing `RETRACE_DEV_DEEPLINK_URL` startup hook to test routing without changing the registered release app.
 
 ### 3. Frame Viewer with Bounding Box Highlighting
 

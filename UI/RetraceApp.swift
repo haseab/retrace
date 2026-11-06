@@ -2603,6 +2603,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         switch route {
+        case let .dashboard(dateRange):
+            DashboardWindowController.shared.openDeeplink(dateRange: dateRange)
+
         case let .timeline(timestamp):
             Log.info("[AppDelegate] Opening timeline deeplink at timestamp: \(String(describing: timestamp))", category: .app)
             if let timestamp {
