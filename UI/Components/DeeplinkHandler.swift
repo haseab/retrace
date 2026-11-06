@@ -56,10 +56,14 @@ public class DeeplinkHandler: ObservableObject {
             return .timeline(timestamp: timestamp)
 
         case "dashboard":
-            guard queryParams["start"] != nil || queryParams["end"] != nil else {
+            let boundItems = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.filter {
+                $0.name == "start" || $0.name == "end"
+            } ?? []
+            guard !boundItems.isEmpty else {
                 return .dashboard(dateRange: nil)
             }
-            guard let rawStart = queryParams["start"]?.trimmedOrNil,
+            guard boundItems.count == 2,
+                  let rawStart = queryParams["start"]?.trimmedOrNil,
                   let rawEnd = queryParams["end"]?.trimmedOrNil,
                   let start = parseDashboardDate(rawStart, isEnd: false, calendar: calendar),
                   let end = parseDashboardDate(rawEnd, isEnd: true, calendar: calendar),

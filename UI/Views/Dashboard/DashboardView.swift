@@ -644,7 +644,9 @@ public struct DashboardView: View {
             if !hasLoadedInitialData {
                 hasLoadedInitialData = true
                 Log.debug("[Dashboard] Initial load - first appearance", category: .ui)
-                await viewModel.loadStatistics(reason: "initial_appearance")
+                if !viewModel.hasLoadedStatistics {
+                    await viewModel.loadStatistics(reason: "initial_appearance")
+                }
             } else {
                 Log.debug("[Dashboard] Tab switch - skipping reload", category: .ui)
             }

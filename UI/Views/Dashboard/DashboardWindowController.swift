@@ -174,10 +174,13 @@ public class DashboardWindowController: NSObject {
         )
         deeplinkTask = Task { [weak self] in
             if let dateRange {
-                await viewModel.setAppUsageDateRange(from: dateRange, source: "dashboard_deeplink")
+                await viewModel.setAppUsageDateRange(
+                    from: dateRange, source: "dashboard_deeplink", reloadStatistics: false
+                )
             }
             guard !Task.isCancelled, let self else { return }
             self.showDashboard()
+            await viewModel.loadStatistics(reason: "dashboard_deeplink")
             Log.info("[DashboardWindowController] Dashboard deeplink presented range=\(viewModel.appUsageRangeLabel)", category: .ui)
         }
     }

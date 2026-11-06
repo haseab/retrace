@@ -46,6 +46,8 @@ final class DeeplinkHandlerTests: XCTestCase {
 
     func testDashboardRejectsIncompleteInvalidReversedAndOversizedRanges() throws {
         for query in [
+            "start", "end", "start&end", "start&end=2026-11-06",
+            "start=2026-11-06&end", "start=2026-11-06&start=2026-11-07&end=2026-11-08",
             "start=2026-11-06", "end=2026-11-06", "start=&end=2026-11-06",
             "start=bad&end=2026-11-06", "start=2026-02-30&end=2026-03-01",
             "start=2026-11-06T05:00:00&end=2026-11-06T06:10:00",

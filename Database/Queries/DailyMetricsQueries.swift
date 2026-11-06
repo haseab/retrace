@@ -179,10 +179,11 @@ public enum DailyMetricsQueries {
         db: OpaquePointer,
         metricType: MetricType,
         from startDate: Date,
-        to endDate: Date
+        to endDate: Date,
+        preserveTimeBounds: Bool = false
     ) throws -> [(date: Date, value: Int64)] {
-        let startTimestamp = startOfDay(startDate)
-        let endTimestamp = endOfDay(endDate)
+        let startTimestamp = preserveTimeBounds ? Int64(startDate.timeIntervalSince1970 * 1000) : startOfDay(startDate)
+        let endTimestamp = preserveTimeBounds ? Int64(endDate.timeIntervalSince1970 * 1000) : endOfDay(endDate)
 
         let sql = """
             SELECT

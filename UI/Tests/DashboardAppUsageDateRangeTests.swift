@@ -7,6 +7,31 @@ import Shared
 
 @MainActor
 final class DashboardAppUsageDateRangeTests: XCTestCase {
+    func testExactRangeCountsOnlyEventsInsideSelectedHours() async throws {
+        let offsets = [16, 17, 20, 30, 31].map { TimeInterval(12 * 3600 + $0 * 60) }
+        let (viewModel, day) = try await makeStatisticsViewModel(metricEventOffsets: offsets)
+        await viewModel.setAppUsageDateRange(from: DateRangeCriterion(
+            start: day.addingTimeInterval(12 * 3600 + 17 * 60),
+            end: day.addingTimeInterval(12 * 3600 + 30 * 60)
+        ))
+        XCTAssertNil(viewModel.error)
+        XCTAssertEqual(viewModel.timelineOpensThisWeek, 3)
+        XCTAssertEqual(viewModel.searchesThisWeek, 3)
+        XCTAssertEqual(viewModel.textCopiesThisWeek, 3)
+    }
+
+    func testAppearanceAndWindowRefreshShareOneStatisticsLoad() async throws {
+        let (viewModel, _) = try await makeStatisticsViewModel()
+        var loadingStarts = 0
+        let publication = viewModel.$isLoading.dropFirst().filter { $0 }.sink { _ in loadingStarts += 1 }
+        async let appearance: Void = viewModel.loadStatistics(reason: "initial_appearance")
+        async let windowRefresh: Void = viewModel.loadStatistics(reason: "window_became_key")
+        _ = await (appearance, windowRefresh)
+        withExtendedLifetime(publication) {}
+        XCTAssertNil(viewModel.error)
+        XCTAssertEqual(loadingStarts, 1)
+    }
+
     func testCustomRangeLoadsDayStorageWithoutRefreshingAllTimeMetadata() async throws {
         let (viewModel, day) = try await makeStatisticsViewModel()
         viewModel.isDefaultAppUsageRangeSelected = false
@@ -53,17 +78,26 @@ final class DashboardAppUsageDateRangeTests: XCTestCase {
             return XCTFail("Expected dashboard date range")
         }
 
-        await viewModel.setAppUsageDateRange(from: dateRange, source: "dashboard_deeplink")
+        await viewModel.setAppUsageDateRange(
+            from: dateRange, source: "dashboard_deeplink", reloadStatistics: false
+        )
+        XCTAssertEqual(viewModel.appUsageQueryRange.start, start)
+        XCTAssertEqual(viewModel.appUsageQueryRange.end, end)
+        XCTAssertTrue(viewModel.dailyStorageData.isEmpty, "The window can be shown before statistics load")
+        XCTAssertFalse(viewModel.hasLoadedStatistics)
+
+        await viewModel.loadStatistics(reason: "dashboard_deeplink")
 
         XCTAssertNil(viewModel.error)
         XCTAssertFalse(viewModel.isDefaultAppUsageRangeSelected)
+        XCTAssertTrue(viewModel.hasLoadedStatistics)
         XCTAssertEqual(viewModel.appUsageQueryRange.start, start)
         XCTAssertEqual(viewModel.appUsageQueryRange.end, end)
         XCTAssertEqual(viewModel.weeklyStorageBytes, 256)
         XCTAssertEqual(viewModel.totalStorageBytes, 0, "Deeplinks must not start an all-time storage scan")
     }
 
-    private func makeStatisticsViewModel() async throws -> (DashboardViewModel, Date) {
+    private func makeStatisticsViewModel(metricEventOffsets: [TimeInterval] = []) async throws -> (DashboardViewModel, Date) {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("dashboard-range-\(UUID().uuidString)")
         let calendar = Calendar.current
         let day = try XCTUnwrap(calendar.date(byAdding: .day, value: -1, to: calendar.startOfDay(for: Date())))
@@ -81,6 +115,12 @@ final class DashboardAppUsageDateRangeTests: XCTestCase {
         )
         let database = await services.database
         try await database.initialize()
+        for offset in metricEventOffsets {
+            let timestamp = day.addingTimeInterval(offset)
+            try await database.recordMetricEvent(metricType: .timelineOpens, timestamp: timestamp)
+            try await database.recordMetricEvent(metricType: .searches, timestamp: timestamp)
+            try await database.recordMetricEvent(metricType: .textCopies, timestamp: timestamp)
+        }
         addTeardownBlock {
             try await database.close()
             try FileManager.default.removeItem(at: root)

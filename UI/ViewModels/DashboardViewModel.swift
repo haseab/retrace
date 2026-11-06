@@ -212,6 +212,7 @@ public class DashboardViewModel: ObservableObject {
     // Loading state
     @Published public var isLoading = false
     @Published public var error: String?
+    private(set) var hasLoadedStatistics = false
 
     // Queue monitoring
     @Published public var ocrQueueDepth: Int = 0
@@ -267,6 +268,7 @@ public class DashboardViewModel: ObservableObject {
     private var appUsageRangeCache = DashboardAppUsageRangeCache()
     private var statisticsLoadGeneration: UInt64 = 0
     private var activeStatisticsLoadCount = 0
+    private var statisticsLoadTask: (range: DateRangeCriterion, isDefault: Bool, id: UUID, task: Task<Void, Never>)?
 
     /// Whether the dashboard window is currently visible
     /// Set by DashboardWindowController on show/hide to gate UI updates
@@ -1355,10 +1357,11 @@ public class DashboardViewModel: ObservableObject {
 
     public func setAppUsageDateRange(
         from range: DateRangeCriterion,
-        source: String = "dashboard_app_usage_calendar"
+        source: String = "dashboard_app_usage_calendar",
+        reloadStatistics: Bool = true
     ) async {
         guard range.hasBounds else {
-            await resetAppUsageDateRangeToDefault(source: source)
+            await resetAppUsageDateRangeToDefault(source: source, reloadStatistics: reloadStatistics)
             return
         }
 
@@ -1395,12 +1398,14 @@ public class DashboardViewModel: ObservableObject {
             end: requestedRange.end,
             source: source,
             action: "set_range",
-            shouldRecordMetric: true
+            shouldRecordMetric: true,
+            reloadStatistics: reloadStatistics
         )
     }
 
     public func resetAppUsageDateRangeToDefault(
-        source: String = "dashboard_app_usage_default"
+        source: String = "dashboard_app_usage_default",
+        reloadStatistics: Bool = true
     ) async {
         let defaultRange = Self.defaultAppUsageDateRange()
         isDefaultAppUsageRangeSelected = true
@@ -1409,7 +1414,8 @@ public class DashboardViewModel: ObservableObject {
             end: defaultRange.end,
             source: source,
             action: "reset_default",
-            shouldRecordMetric: true
+            shouldRecordMetric: true,
+            reloadStatistics: reloadStatistics
         )
     }
 
@@ -1441,7 +1447,8 @@ public class DashboardViewModel: ObservableObject {
         end: Date,
         source: String,
         action: String,
-        shouldRecordMetric: Bool
+        shouldRecordMetric: Bool,
+        reloadStatistics: Bool = true
     ) async {
         let applyStartedAt = CFAbsoluteTimeGetCurrent()
         let normalized = Self.normalizedAppUsageDateRange(start: start, end: end)
@@ -1469,7 +1476,7 @@ public class DashboardViewModel: ObservableObject {
         }
 
         let loadReason = "range_\(action):\(source)"
-        await loadStatistics(reason: loadReason)
+        if reloadStatistics { await loadStatistics(reason: loadReason) }
 
         let applyElapsedMs = elapsedMs(since: applyStartedAt)
         Log.recordLatency(
@@ -1734,6 +1741,21 @@ public class DashboardViewModel: ObservableObject {
     }
 
     public func loadStatistics(reason: String = "dashboard_refresh") async {
+        let range = DateRangeCriterion(start: appUsageRangeStart, end: appUsageRangeEnd)
+        if reason != "data_source_changed", let flight = statisticsLoadTask,
+           flight.range == range, flight.isDefault == isDefaultAppUsageRangeSelected {
+            Log.info("[DASHBOARD-LOAD] JOIN reason=\(reason)", category: .ui)
+            await flight.task.value
+            return
+        }
+        let id = UUID()
+        let task = Task { await self.performStatisticsLoad(reason: reason) }
+        statisticsLoadTask = (range, isDefaultAppUsageRangeSelected, id, task)
+        await task.value
+        if statisticsLoadTask?.id == id { statisticsLoadTask = nil }
+    }
+
+    private func performStatisticsLoad(reason: String) async {
         let loadStartedAt = CFAbsoluteTimeGetCurrent()
         let loadGeneration = nextStatisticsLoadGeneration()
         let trace = DashboardLoadTrace(generation: loadGeneration)
@@ -1829,6 +1851,7 @@ public class DashboardViewModel: ObservableObject {
                 guard isLatestStatisticsLoad(loadGeneration) else { return }
             }
 
+            hasLoadedStatistics = true
             outcome = "complete"
             let loadElapsedMs = elapsedMs(since: loadStartedAt)
             Log.recordLatency(
@@ -1903,7 +1926,8 @@ public class DashboardViewModel: ObservableObject {
                     try await coordinator.getDailyMetrics(
                         metricType: .timelineOpens,
                         from: rangeStart,
-                        to: rangeEnd
+                        to: rangeEnd,
+                        preserveTimeBounds: true
                     )
                 }
                 return (data, (CFAbsoluteTimeGetCurrent() - startedAt) * 1000)
@@ -1915,7 +1939,8 @@ public class DashboardViewModel: ObservableObject {
                     try await coordinator.getDailyMetrics(
                         metricType: .searches,
                         from: rangeStart,
-                        to: rangeEnd
+                        to: rangeEnd,
+                        preserveTimeBounds: true
                     )
                 }
                 return (data, (CFAbsoluteTimeGetCurrent() - startedAt) * 1000)
@@ -1927,7 +1952,8 @@ public class DashboardViewModel: ObservableObject {
                     try await coordinator.getDailyMetrics(
                         metricType: .textCopies,
                         from: rangeStart,
-                        to: rangeEnd
+                        to: rangeEnd,
+                        preserveTimeBounds: true
                     )
                 }
                 return (data, (CFAbsoluteTimeGetCurrent() - startedAt) * 1000)

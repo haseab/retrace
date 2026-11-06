@@ -2460,6 +2460,18 @@ struct DateRangeInputParser {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedLower = trimmed.lowercased()
 
+        // Parse our fractional-second display format before natural-language parsers,
+        // which otherwise discard the milliseconds from reopened dashboard links.
+        if trimmed.range(of: #"\d{2}:\d{2}\.\d{3}\s*[ap]m$"#, options: [.regularExpression, .caseInsensitive]) != nil {
+            let formatter = DateFormatter()
+            formatter.calendar = calendar
+            formatter.timeZone = calendar.timeZone
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.dateFormat = "MMM d, yyyy h:mm:ss.SSS a"
+            formatter.isLenient = false
+            if let date = formatter.date(from: trimmed) { return date }
+        }
+
         if let referenceDate,
            let day = Int(trimmedLower),
            (1...31).contains(day) {
@@ -2750,7 +2762,8 @@ struct DateRangeInputParser {
         let startDayText = formatter.string(from: start)
         let endDayText = formatter.string(from: end)
         let includeSeconds = calendar.component(.second, from: start) != 0 || calendar.component(.second, from: end) != 0
-        formatter.dateFormat = includeSeconds ? "MMM d, yyyy h:mm:ss a" : "MMM d, yyyy h:mm a"
+        let includeMilliseconds = calendar.component(.nanosecond, from: start) != 0 || calendar.component(.nanosecond, from: end) != 0
+        formatter.dateFormat = includeMilliseconds ? "MMM d, yyyy h:mm:ss.SSS a" : (includeSeconds ? "MMM d, yyyy h:mm:ss a" : "MMM d, yyyy h:mm a")
         let startText = startsAtMidnight ? startDayText : formatter.string(from: start)
         let endText = endsAtDayEnd ? endDayText : formatter.string(from: end)
         return "\(startText) to \(endText)"

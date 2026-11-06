@@ -3214,14 +3214,16 @@ public actor DatabaseManager: DatabaseProtocol {
     public func getDailyMetrics(
         metricType: DailyMetricsQueries.MetricType,
         from startDate: Date,
-        to endDate: Date
+        to endDate: Date,
+        preserveTimeBounds: Bool = false
     ) async throws -> [(date: Date, value: Int64)] {
         try withTracedDatabaseOperation("get_daily_metrics") { db in
             try DailyMetricsQueries.getDailyCounts(
                 db: db,
                 metricType: metricType,
                 from: startDate,
-                to: endDate
+                to: endDate,
+                preserveTimeBounds: preserveTimeBounds
             )
         }
     }

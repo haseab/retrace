@@ -321,6 +321,8 @@ func handleURL(_ url: URL) {
 - Exact times are preserved. A date-only start is local midnight; a date-only end is local 23:59:59, respecting daylight saving time.
 - Invalid, reversed, incomplete, or greater-than-31-calendar-day ranges are rejected.
 - Apply the range to the controller-owned dashboard model before creating the window, so cold launches do not briefly load the default range or scan all storage.
+- Show the window before awaiting statistics. Controller/appearance/refresh triggers join one in-flight load for the same range, and a completed cold-link load is reused on first appearance.
+- Dashboard engagement counts use exact timestamp bounds; date-only inputs already provide full-day bounds. Reopened picker text preserves millisecond precision.
 - `launchSurfaceReveal` records dashboard deeplink entry; the existing dashboard range metrics record filter application/outcomes with source `dashboard_deeplink`.
 
 Example from another macOS app or shell:

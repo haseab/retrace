@@ -96,6 +96,16 @@ final class DateRangePresetShortcutTests: XCTestCase {
         XCTAssertEqual(range.end.timeIntervalSince(range.start), 23 * 60 * 60 - 1)
     }
 
+    func testReopeningDashboardLinkRangePreservesMilliseconds() throws {
+        let parser = DateRangeInputParser(calendar: utcCalendar)
+        let start = Date(timeIntervalSince1970: 1_793_970_000.123)
+        let end = Date(timeIntervalSince1970: 1_793_974_200.456)
+        let text = parser.formatRange(start: start, end: end)
+        let reopened = try XCTUnwrap(parser.parse(text))
+        XCTAssertEqual(reopened.start.timeIntervalSince1970, start.timeIntervalSince1970, accuracy: 0.001)
+        XCTAssertEqual(reopened.end.timeIntervalSince1970, end.timeIntervalSince1970, accuracy: 0.001)
+    }
+
     func testIntradayRangeDoesNotMatchTheWholeDayPreset() throws {
         let calendar = utcCalendar
         let now = try makeDate(year: 2026, month: 11, day: 6, hour: 14, minute: 0, second: 0, calendar: calendar)
