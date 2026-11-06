@@ -427,6 +427,53 @@ final class DashboardAppUsageDateRangeTests: XCTestCase {
         )
     }
 
+    func testConferencePrivacyBannerStateRequiresFreshVisibleCall() {
+        let now = Date(timeIntervalSince1970: 1_776_006_000)
+        let state = ConferenceConsentMenuState(
+            callID: "call-123",
+            title: "Meet - abc-defg-hij",
+            lastObservedAt: now.addingTimeInterval(-2),
+            isBlurBypassedForConsent: false
+        )
+
+        let bannerState = DashboardViewModel.conferencePrivacyBannerState(
+            state: state,
+            now: now
+        )
+
+        XCTAssertEqual(bannerState?.callID, "call-123")
+    }
+
+    func testConferencePrivacyBannerStateRejectsBypassedAndExpiredCalls() {
+        let now = Date(timeIntervalSince1970: 1_776_006_100)
+        let bypassedState = ConferenceConsentMenuState(
+            callID: "call-123",
+            title: "Meet - abc-defg-hij",
+            lastObservedAt: now.addingTimeInterval(-1),
+            isBlurBypassedForConsent: true
+        )
+        let expiredState = ConferenceConsentMenuState(
+            callID: "call-123",
+            title: "Meet - abc-defg-hij",
+            lastObservedAt: now.addingTimeInterval(-20),
+            isBlurBypassedForConsent: false
+        )
+
+        XCTAssertNil(
+            DashboardViewModel.conferencePrivacyBannerState(
+                state: bypassedState,
+                now: now
+            )
+        )
+
+        XCTAssertNil(
+            DashboardViewModel.conferencePrivacyBannerState(
+                state: expiredState,
+                now: now
+            )
+        )
+    }
+
     func testAppUsageRangeKeyboardShortcutsStandDownForBlockedStates() {
         XCTAssertNil(
             DashboardView.appUsageRangeKeyboardShortcut(

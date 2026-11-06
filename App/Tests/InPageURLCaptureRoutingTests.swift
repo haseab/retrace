@@ -6,6 +6,25 @@ import Storage
 import SQLCipher
 @testable import App
 
+final class ConferencePrivacyMetricStateTests: XCTestCase {
+    func testRepeatedFramesOnlyRecordOutcomeTransitionsForEachCall() {
+        var state = ConferencePrivacyMetricState()
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        XCTAssertTrue(state.shouldRecord(callID: "meet", outcome: "blurred", at: start))
+        XCTAssertFalse(state.shouldRecord(callID: "meet", outcome: "blurred", at: start.addingTimeInterval(2)))
+        XCTAssertTrue(state.shouldRecord(callID: "meet", outcome: "no_faces_detected", at: start.addingTimeInterval(4)))
+        XCTAssertTrue(state.shouldRecord(callID: "zoom", outcome: "no_faces_detected", at: start.addingTimeInterval(4)))
+        XCTAssertFalse(state.shouldRecord(callID: "meet", outcome: "blurred", at: start.addingTimeInterval(1)))
+    }
+
+    func testCallObservedAfterAnInactivityGapRecordsANewOutcome() {
+        var state = ConferencePrivacyMetricState()
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        XCTAssertTrue(state.shouldRecord(callID: "meet", outcome: "blurred", at: start))
+        XCTAssertTrue(state.shouldRecord(callID: "meet", outcome: "blurred", at: start.addingTimeInterval(30)))
+    }
+}
+
 final class InPageURLCaptureRoutingTests: XCTestCase {
     func testHostBrowserBundleIDMapsExactChromiumBrowser() {
         XCTAssertEqual(
@@ -2812,5 +2831,67 @@ final class VideoQualityMetricsTests: XCTestCase {
             try? await services.shutdown()
             throw error
         }
+    }
+}
+
+final class ConferenceConsentMenuSelectionTests: XCTestCase {
+    func testSelectConferenceConsentMenuStatePrefersPreferredCandidateOverNewerFallback() {
+        let now = Date(timeIntervalSince1970: 1_776_000_100)
+        let preferredCandidate = ConferenceConsentMenuSelectionCandidate(
+            state: ConferenceConsentMenuState(
+                callID: "preferred",
+                title: "Focused Meet",
+                lastObservedAt: Date(timeIntervalSince1970: 1_776_000_099),
+                isBlurBypassedForConsent: false
+            ),
+            menuSelectionPriority: 0
+        )
+        let fallbackCandidate = ConferenceConsentMenuSelectionCandidate(
+            state: ConferenceConsentMenuState(
+                callID: "fallback",
+                title: "Background Meet",
+                lastObservedAt: now,
+                isBlurBypassedForConsent: false
+            ),
+            menuSelectionPriority: 1
+        )
+
+        let selectedState = AppCoordinator.selectConferenceConsentMenuState(
+            from: [fallbackCandidate, preferredCandidate],
+            now: now,
+            retentionInterval: AppCoordinator.conferenceConsentMenuStateRetentionInterval
+        )
+
+        XCTAssertEqual(selectedState?.callID, "preferred")
+    }
+
+    func testSelectConferenceConsentMenuStateIgnoresExpiredCandidates() {
+        let now = Date(timeIntervalSince1970: 1_776_000_200)
+        let expiredCandidate = ConferenceConsentMenuSelectionCandidate(
+            state: ConferenceConsentMenuState(
+                callID: "expired",
+                title: "Old Meet",
+                lastObservedAt: now.addingTimeInterval(-20),
+                isBlurBypassedForConsent: false
+            ),
+            menuSelectionPriority: 0
+        )
+        let freshCandidate = ConferenceConsentMenuSelectionCandidate(
+            state: ConferenceConsentMenuState(
+                callID: "fresh",
+                title: "Current Meet",
+                lastObservedAt: now.addingTimeInterval(-1),
+                isBlurBypassedForConsent: false
+            ),
+            menuSelectionPriority: 1
+        )
+
+        let selectedState = AppCoordinator.selectConferenceConsentMenuState(
+            from: [expiredCandidate, freshCandidate],
+            now: now,
+            retentionInterval: AppCoordinator.conferenceConsentMenuStateRetentionInterval
+        )
+
+        XCTAssertEqual(selectedState?.callID, "fresh")
     }
 }

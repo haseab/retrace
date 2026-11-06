@@ -4,8 +4,11 @@ import Shared
 
 // MARK: - Daily Metrics Queries
 
-/// SQL queries for daily_metrics table
-/// Tracks engagement events (timeline opens, searches, text copies) as individual rows
+/// SQL queries for daily_metrics table.
+/// Tracks engagement events (timeline opens, searches, text copies) as individual rows.
+/// Privacy boundary: this table is local, on-device user analytics for Retrace features.
+/// It is not a third-party/developer analytics pipeline; data only leaves the device when
+/// the user explicitly exports/shares diagnostics.
 /// Owner: DATABASE agent
 public enum DailyMetricsQueries {
 
@@ -98,6 +101,9 @@ public enum DailyMetricsQueries {
         case mouseClickCaptureToggle = "mouse_click_capture_toggle"
         case captureIntervalUpdated = "capture_interval_updated"  // metadata: JSON {seconds, mode, source}
         case videoQualityUpdated = "video_quality_updated"
+        // JSON {action, outcome, source, conferenceKind?}; excludes call IDs, titles and URLs.
+        // Capture outcomes are recorded on transitions, not on every frame.
+        case conferencePrivacy = "conference_privacy"
         case inPageURLPermissionProbe = "in_page_url_permission_probe"
         case inPageURLVerification = "in_page_url_verification"
         case inPageURLHover = "in_page_url_hover"  // metadata: JSON {url, linkText, nodeID}

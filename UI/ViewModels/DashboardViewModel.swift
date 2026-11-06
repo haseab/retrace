@@ -161,6 +161,10 @@ struct StorageHealthBannerState: Equatable {
     }
 }
 
+struct ConferencePrivacyDashboardBannerState: Equatable {
+    let callID: String
+}
+
 private enum StorageHealthNotificationNames {
     static let low = Notification.Name("StorageLow")
     static let criticalLow = Notification.Name("StorageCriticalLow")
@@ -224,6 +228,7 @@ public class DashboardViewModel: ObservableObject {
     @Published public var showAccessibilityWarning = false
     @Published public var showScreenRecordingWarning = false
     @Published var storageHealthBanner: StorageHealthBannerState?
+    @Published var conferencePrivacyBanner: ConferencePrivacyDashboardBannerState?
     @Published var recentCrashReport: DashboardCrashReportSummary?
     @Published var recentWALFailureCrash: WALFailureCrashReportSummary?
     @Published var unexpectedRecordingStop: UnexpectedRecordingStopState?
@@ -262,6 +267,7 @@ public class DashboardViewModel: ObservableObject {
     private var lastTrackedWALFailureBannerFileName: String?
     private var lastTrackedStorageHealthBannerSignature: String?
     private var lastTrackedUnexpectedRecordingStopSignature: String?
+    private var latestConferenceConsentMenuState: ConferenceConsentMenuState?
     private var isAutoRefreshInFlight = false
     private static let defaultAppUsageRangeDays = 7
     public nonisolated static let maxAppUsageRangeDays = 31
@@ -287,6 +293,7 @@ public class DashboardViewModel: ObservableObject {
         setupDataSourceObserver()
         setupStorageHealthObserver()
         setupUnexpectedRecordingStopObserver()
+        setupConferenceConsentObserver()
         // Check permissions immediately on init
         checkPermissions()
     }
@@ -348,6 +355,20 @@ public class DashboardViewModel: ObservableObject {
             .store(in: &cancellables)
     }
 
+    private func setupConferenceConsentObserver() {
+        NotificationCenter.default.publisher(for: ConferenceConsentStateNotification.didChange)
+            .sink { [weak self] notification in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    latestConferenceConsentMenuState = ConferenceConsentMenuState.from(
+                        notificationUserInfo: notification.userInfo
+                    )
+                    updateConferencePrivacyBanner()
+                }
+            }
+            .store(in: &cancellables)
+    }
+
     private func setupAutoRefresh() {
         // Refresh recording status and permissions every 1 second with leeway for power efficiency
         let timer = DispatchSource.makeTimerSource(queue: .main)
@@ -362,6 +383,7 @@ public class DashboardViewModel: ObservableObject {
                 defer { self.isAutoRefreshInFlight = false }
                 self.updateRecordingStatus()
                 self.updatePauseStatus()
+                self.updateConferencePrivacyBanner()
                 await self.updateQueueStatus()
                 self.checkPermissions()
                 await self.refreshRecentCrashReportState()
@@ -386,6 +408,14 @@ public class DashboardViewModel: ObservableObject {
         }
         isRecordingPaused = menuBarManager.isPausedState
         recordingPauseRemainingSeconds = menuBarManager.timedPauseRemainingSeconds
+    }
+
+    private func updateConferencePrivacyBanner(now: Date = Date()) {
+        let nextBannerState = Self.conferencePrivacyBannerState(
+            state: latestConferenceConsentMenuState,
+            now: now
+        )
+        conferencePrivacyBanner = nextBannerState
     }
 
     private func updateQueueStatus() async {
@@ -1256,6 +1286,21 @@ public class DashboardViewModel: ObservableObject {
                 "availableGB": state.availableGB,
                 "shouldStop": state.shouldStop
             ]
+        )
+    }
+
+    static func conferencePrivacyBannerState(
+        state: ConferenceConsentMenuState?,
+        now: Date = Date()
+    ) -> ConferencePrivacyDashboardBannerState? {
+        guard let state,
+              state.isVisible(at: now),
+              !state.isBlurBypassedForConsent else {
+            return nil
+        }
+
+        return ConferencePrivacyDashboardBannerState(
+            callID: state.callID
         )
     }
 

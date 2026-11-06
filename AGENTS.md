@@ -75,6 +75,7 @@ retrace/
 │   │   ├── TextRegion.swift     # OCR text region types
 │   │   ├── Search.swift         # SearchQuery, SearchResult
 │   │   ├── Segment.swift        # Segment data model
+│   │   ├── ConferencePrivacy.swift # Shared call kinds and capture privacy outcome events
 │   │   ├── Config.swift         # Configuration types
 │   │   ├── Errors.swift         # Error types
 │   │   ├── Audio.swift          # Audio model types (Release 2)
@@ -117,8 +118,11 @@ retrace/
 │   ├── AGENTS.md
 │   ├── CaptureManager.swift
 │   ├── ScreenCapture/           # Screen capture implementation
+│   │   └── ConferenceFaceBlurProcessor.swift # Vision face detection + irreversible conference-call face blur
 │   ├── Deduplication/           # Perceptual hash deduplication
 │   ├── Metadata/                # AppInfoProvider, BrowserURLExtractor
+│   │   ├── ConferenceCallActivityProvider.swift # Window-specific active-call accessibility controls
+│   │   └── ConferenceSessionPrivacyPolicy.swift # Conferencing-app rules + call-session consent tracking
 │   └── Tests/
 │
 ├── Processing/                  # OCR and text extraction
@@ -486,4 +490,4 @@ Then check which path actually executes and fix the right code.
 
 ---
 
-_This file follows the AGENTS.md standard for AI agent guidance. Last updated: 2026-04-04_
+_This file follows the AGENTS.md standard for AI agent guidance. Last updated: 2026-04-14_
