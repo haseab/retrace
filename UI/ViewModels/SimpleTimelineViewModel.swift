@@ -14998,7 +14998,13 @@ public class SimpleTimelineViewModel: ObservableObject {
             ? [trimmed]
             : [normalizedWithCompactTimes, trimmed]
         for chronoInput in chronoInputs {
-            if let result = chrono.parse(text: chronoInput, refDate: now, opt: [:]).first?.start.date {
+            // SwiftyChrono understands "in N units"; otherwise "N units from now" can match only "now".
+            let normalizedChronoInput = chronoInput.replacingOccurrences(
+                of: #"^(\d+\s+(?:seconds?|min(?:ute)?s?|hours?|days?|weeks?|months?|years?))\s+from\s+now\b"#,
+                with: "in $1",
+                options: [.regularExpression, .caseInsensitive]
+            )
+            if let result = chrono.parse(text: normalizedChronoInput, refDate: now, opt: [:]).first?.start.date {
                 let normalized = finalizeParsedDate(result)
                 return normalized
             }
@@ -15586,7 +15592,8 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     private func shouldCoerceYearlessAbsoluteDateToPast(_ input: String) -> Bool {
-        let normalizedInput = normalizeRelativeDateShorthand(input)
+        // Classify years after compact times such as "1417" have become "14:17".
+        let normalizedInput = normalizeCompactTimeFormat(normalizeRelativeDateShorthand(input))
         // Keep relative expressions as-is (tomorrow/next/last/etc).
         if normalizedInput.range(
             of: #"\b(today|tomorrow|yesterday|next|last|ago|this|now|tonight)\b|from now"#,
