@@ -818,12 +818,22 @@ extension CaptureConfig {
 }
 
 extension ProcessingConfig {
+    /// Escape hatch for re-enabling Vision's language-correction pass without a rebuild:
+    /// `defaults write io.retrace.app retrace.ocr.languageCorrectionEnabled -bool YES`
+    ///
+    /// Unset reads as false, which is the measured-better default (see `ProcessingConfig`).
+    static var ocrLanguageCorrectionOverride: Bool {
+        let defaults = UserDefaults(suiteName: MasterKeyManager.settingsSuiteName) ?? .standard
+        return defaults.bool(forKey: "retrace.ocr.languageCorrectionEnabled")
+    }
+
     public static var `default`: ProcessingConfig {
         ProcessingConfig(
             accessibilityEnabled: false,  // Disabled - reads live screen, not video frames
             ocrAccuracyLevel: .accurate,
             recognitionLanguages: ["en-US"],
-            minimumConfidence: 0.5
+            minimumConfidence: 0.5,
+            ocrLanguageCorrectionEnabled: ocrLanguageCorrectionOverride
         )
     }
 }

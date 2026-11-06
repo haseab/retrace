@@ -313,18 +313,47 @@ public struct ProcessingConfig: Codable, Sendable {
     /// Hint to Vision to prefer background processing (lower resource usage)
     public let preferBackgroundProcessing: Bool
 
+    /// Whether Vision runs its language-correction pass over recognised text.
+    ///
+    /// Off by default because it doubles the cost of the region path, which is the one
+    /// production actually uses. Measured by `RegionOCRLanguageCorrectionBenchmark`,
+    /// which replays real captured frames through `recognizeTextRegionBased` with both
+    /// settings in OFF/ON/ON/OFF order so load drift cancels: over 156 paired region
+    /// frames from four 3440x1440 chunks, region OCR costs 42.6 s with correction off
+    /// versus 86.6 s with it on -- **50.2% cheaper** (per chunk 48.4/50.7/50.7/52.3%,
+    /// and 51.7/51.4/52.0/48.5% across two independent re-runs). The saving holds at
+    /// every changed-tile count, including the 51-200 tiles typical of interactive use
+    /// (50.3% and 49.1%), so it does not depend on the workload.
+    ///
+    /// An earlier synthetic benchmark put this at 27.9% and reported that recall was
+    /// identical and that correction recognised *less* text. Real frames contradict
+    /// both of those: correction recognises 1-2% *more* characters, and the two token
+    /// sets overlap only 68-76% -- in **both** directions. Correction is not a superset
+    /// or a subset, it is a different index. Off yields 6-12% more distinct search
+    /// tokens, and the tokens only it finds are longer (mean 7.9-8.4 vs 6.4-6.9 chars)
+    /// and less often plain alphabetic, which is what you would expect if correction
+    /// rewrites technical strings into dictionary words. That is the reason to keep it
+    /// off for a developer's timeline, but which index is *more accurate* was not
+    /// established -- doing so needs ground truth for what was on screen.
+    ///
+    /// Reversible without a rebuild:
+    /// `defaults write io.retrace.app retrace.ocr.languageCorrectionEnabled -bool YES`
+    public let ocrLanguageCorrectionEnabled: Bool
+
     public init(
         accessibilityEnabled: Bool = true,
         ocrAccuracyLevel: OCRAccuracyLevel = .accurate,
         recognitionLanguages: [String] = ["en-US"],
         minimumConfidence: Float = 0.5,
-        preferBackgroundProcessing: Bool = false
+        preferBackgroundProcessing: Bool = false,
+        ocrLanguageCorrectionEnabled: Bool = false
     ) {
         self.accessibilityEnabled = accessibilityEnabled
         self.ocrAccuracyLevel = ocrAccuracyLevel
         self.recognitionLanguages = recognitionLanguages
         self.minimumConfidence = minimumConfidence
         self.preferBackgroundProcessing = preferBackgroundProcessing
+        self.ocrLanguageCorrectionEnabled = ocrLanguageCorrectionEnabled
     }
 
     public static let `default` = ProcessingConfig()
