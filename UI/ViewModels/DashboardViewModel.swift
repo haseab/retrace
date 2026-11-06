@@ -10,11 +10,6 @@ import Dispatch
 struct DashboardAppUsageRangeCacheKey: Hashable {
     let start: Date
     let end: Date
-
-    init(start: Date, end: Date, calendar: Calendar = .current) {
-        self.start = calendar.startOfDay(for: start)
-        self.end = calendar.startOfDay(for: end)
-    }
 }
 
 struct DashboardAppUsageRangeSnapshot {
@@ -1239,7 +1234,7 @@ public class DashboardViewModel: ObservableObject {
         let today = calendar.startOfDay(for: now)
         let offset = -(defaultAppUsageRangeDays - 1)
         let start = calendar.date(byAdding: .day, value: offset, to: today) ?? today
-        return (start: start, end: today)
+        return (start: start, end: DateRangeInputParser(calendar: calendar).endOfDay(today))
     }
     private static func normalizedUnboundedAppUsageDateRange(
         start: Date,
@@ -1248,24 +1243,16 @@ public class DashboardViewModel: ObservableObject {
         now: Date = Date()
     ) -> (start: Date, end: Date) {
         let today = calendar.startOfDay(for: now)
-        var startDay = calendar.startOfDay(for: start)
-        var endDay = calendar.startOfDay(for: end)
+        var lower = min(start, end)
+        var upper = max(start, end)
 
-        if endDay < startDay {
-            swap(&startDay, &endDay)
+        if calendar.startOfDay(for: lower) > today {
+            lower = today
         }
-
-        if startDay > today {
-            startDay = today
+        if calendar.startOfDay(for: upper) > today {
+            upper = DateRangeInputParser(calendar: calendar).endOfDay(today)
         }
-        if endDay > today {
-            endDay = today
-        }
-        if endDay < startDay {
-            startDay = endDay
-        }
-
-        return (start: startDay, end: endDay)
+        return (start: lower, end: max(lower, upper))
     }
 
     static func normalizedAppUsageDateRange(
@@ -1281,17 +1268,16 @@ public class DashboardViewModel: ObservableObject {
             calendar: calendar,
             now: now
         )
-        let startDay = unbounded.start
-        var endDay = unbounded.end
+        let rangeStart = unbounded.start
+        var rangeEnd = unbounded.end
 
         let boundedMaxDays = max(1, maxDays)
         let maxOffset = boundedMaxDays - 1
-        if let maxEnd = calendar.date(byAdding: .day, value: maxOffset, to: startDay),
-           endDay > maxEnd {
-            endDay = maxEnd
+        if let lastAllowedDay = calendar.date(byAdding: .day, value: maxOffset, to: rangeStart) {
+            rangeEnd = min(rangeEnd, DateRangeInputParser(calendar: calendar).endOfDay(lastAllowedDay))
         }
 
-        return (start: startDay, end: endDay)
+        return (start: rangeStart, end: rangeEnd)
     }
 
     static func shouldCacheAppUsageRange(
@@ -1306,11 +1292,7 @@ public class DashboardViewModel: ObservableObject {
     }
 
     public var appUsageDateRange: DateRangeCriterion {
-        let calendar = Calendar.current
-        let start = calendar.startOfDay(for: appUsageRangeStart)
-        let endDay = calendar.startOfDay(for: appUsageRangeEnd)
-        let end = calendar.date(bySettingHour: 23, minute: 59, second: 59, of: endDay) ?? endDay
-        return DateRangeCriterion(start: start, end: end)
+        DateRangeCriterion(start: appUsageRangeStart, end: appUsageRangeEnd)
     }
 
     public var appUsageRangeDaySpan: Int {
@@ -1357,7 +1339,11 @@ public class DashboardViewModel: ObservableObject {
         let calendar = Calendar.current
         let requestedDays = max(
             1,
-            (calendar.dateComponents([.day], from: requestedRange.start, to: requestedRange.end).day ?? 0) + 1
+            (calendar.dateComponents(
+                [.day],
+                from: calendar.startOfDay(for: requestedRange.start),
+                to: calendar.startOfDay(for: requestedRange.end)
+            ).day ?? 0) + 1
         )
         guard requestedDays <= Self.maxAppUsageRangeDays else {
             appUsageRangeErrorText = "Date range must be 31 days or less."
@@ -1427,9 +1413,8 @@ public class DashboardViewModel: ObservableObject {
     ) async {
         let applyStartedAt = CFAbsoluteTimeGetCurrent()
         let normalized = Self.normalizedAppUsageDateRange(start: start, end: end)
-        let calendar = Calendar.current
-        let startChanged = !calendar.isDate(normalized.start, inSameDayAs: appUsageRangeStart)
-        let endChanged = !calendar.isDate(normalized.end, inSameDayAs: appUsageRangeEnd)
+        let startChanged = normalized.start != appUsageRangeStart
+        let endChanged = normalized.end != appUsageRangeEnd
         let normalizedRangeLabel = Self.formatAppUsageRangeLabel(start: normalized.start, end: normalized.end)
 
         appUsageRangeStart = normalized.start
@@ -1470,12 +1455,8 @@ public class DashboardViewModel: ObservableObject {
     }
 
     private func resolvedAppUsageQueryRange(now: Date = Date()) -> (start: Date, end: Date) {
-        let calendar = Calendar.current
-        let startDay = calendar.startOfDay(for: appUsageRangeStart)
-        let endDay = calendar.startOfDay(for: appUsageRangeEnd)
-        let endOfDay = calendar.date(bySettingHour: 23, minute: 59, second: 59, of: endDay) ?? endDay
-        let queryEnd = min(endOfDay, now)
-        return (start: startDay, end: max(startDay, queryEnd))
+        let queryEnd = min(appUsageRangeEnd, now)
+        return (start: appUsageRangeStart, end: max(appUsageRangeStart, queryEnd))
     }
 
     private static func formatAppUsageRangeLabel(
@@ -1491,7 +1472,22 @@ public class DashboardViewModel: ObservableObject {
         let includeYear = !sameYear || calendar.component(.year, from: startDay) != currentYear
 
         let formatter = DateFormatter()
+        formatter.calendar = calendar
+        formatter.timeZone = calendar.timeZone
         formatter.dateFormat = includeYear ? "MMM d, yyyy" : "MMM d"
+
+        let isWholeDays = start == startDay && end == DateRangeInputParser(calendar: calendar).endOfDay(end)
+        if !isWholeDays {
+            let startDateText = formatter.string(from: start)
+            let endDateText = formatter.string(from: end)
+            let includeSeconds = calendar.component(.second, from: start) != 0 || calendar.component(.second, from: end) != 0
+            formatter.dateFormat = includeSeconds ? "h:mm:ss a" : "h:mm a"
+            let startTime = formatter.string(from: start)
+            let endTime = formatter.string(from: end)
+            return sameDay
+                ? "\(startDateText), \(startTime) - \(endTime)"
+                : "\(startDateText), \(startTime) - \(endDateText), \(endTime)"
+        }
 
         if sameDay {
             return formatter.string(from: startDay)
@@ -1547,7 +1543,8 @@ public class DashboardViewModel: ObservableObject {
                 "source": source,
                 "startDate": Int64(start.timeIntervalSince1970 * 1000),
                 "endDate": Int64(end.timeIntervalSince1970 * 1000),
-                "rangeDays": rangeDays ?? appUsageRangeDaySpan
+                "rangeDays": rangeDays ?? appUsageRangeDaySpan,
+                "rangeSeconds": end.timeIntervalSince(start)
             ]
         )
     }
@@ -1697,7 +1694,7 @@ public class DashboardViewModel: ObservableObject {
         do {
             let now = Date()
 
-            // Keep selected app-usage range valid (day-boundary, <= today, <= max range).
+            // Keep the range valid while preserving any explicit time boundaries.
             let normalizedAppUsageRange = if isDefaultAppUsageRangeSelected {
                 Self.defaultAppUsageDateRange(calendar: Calendar.current, now: now)
             } else {
@@ -1720,8 +1717,7 @@ public class DashboardViewModel: ObservableObject {
             let rangeEnd = selectedRange.end
             let cacheKey = DashboardAppUsageRangeCacheKey(
                 start: normalizedAppUsageRange.start,
-                end: normalizedAppUsageRange.end,
-                calendar: Calendar.current
+                end: normalizedAppUsageRange.end
             )
             let cacheEligible = Self.shouldCacheAppUsageRange(
                 start: normalizedAppUsageRange.start,

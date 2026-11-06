@@ -30,10 +30,14 @@ UI/
 │   │   └── StandaloneQuickCommentView.swift # Dedicated standalone quick-comment UI
 │   ├── Dashboard/
 │   │   ├── DashboardView.swift          # Main dashboard
+│   │   ├── DashboardWindowController.swift # Dashboard window lifecycle
 │   │   ├── ChangelogView.swift          # Appcast-powered release notes view
-│   │   ├── AnalyticsCard.swift          # Stats widgets
-│   │   ├── MigrationPanel.swift         # Import UI
-│   │   └── SupportLink.swift            # Twitter/support
+│   │   ├── AppUsageListView.swift       # App, website, and window usage breakdown
+│   │   ├── AppUsageHardDriveView.swift  # App usage treemap
+│   │   ├── AppSessionsDetailView.swift # App/window session details
+│   │   ├── MiniLineGraphView.swift      # Daily statistic graphs
+│   │   ├── SystemMonitorView.swift     # CPU and memory monitor
+│   │   └── SystemMonitorWindowController.swift # System Monitor window lifecycle
 │   ├── Feedback/
 │   │   ├── FeedbackFormView.swift       # Feedback sheet with form, sending, and success states
 │   │   ├── FeedbackDiagnosticsPresentation.swift # Feedback diagnostics section building + readable formatting helpers
@@ -104,6 +108,7 @@ UI/
 │   ├── ProcessMemoryCardPresentation.swift # Local presentation controller + row builder for memory monitor card
 │   ├── ProcessMonitorModels.swift       # System Monitor snapshot/models + ranking/build helpers
 │   ├── HoverLatchedScrollMonitor.swift  # Shared nested-scroll latch helper for hover-routed inner scroll regions
+│   ├── FilterPopoverComponents.swift   # Shared filters; date input preserves exact times and expands date-only bounds to full days
 │   ├── ProcessCPUSummaryCard.swift      # System Monitor CPU table/card UI
 │   ├── ProcessMemorySummaryCard.swift   # System Monitor memory table/card UI
 │   ├── RetraceAboutPanel.swift          # Custom About panel content and window factory used by the app menu
@@ -148,8 +153,8 @@ UI/
     ├── SearchViewModelAvailableAppsTests.swift # Search app-list merge/deduplication coverage
     ├── SpotlightSearchOverlayRecentEntryAppMapTests.swift # Recent entry app-name map deduplication coverage
     ├── Search/SearchPaginationCancellationTests.swift # Search stale-pagination cancellation coverage on mode/sort changes
-    ├── DashboardAppUsageDateRangeTests.swift # Dashboard app-usage date-range normalization coverage
-    ├── DateRangePresetShortcutTests.swift # Shared date-range preset shortcut mapping and inclusive-range coverage
+    ├── DashboardAppUsageDateRangeTests.swift # Dashboard date/time range normalization and cache coverage
+    ├── DateRangePresetShortcutTests.swift # Date/time parsing, round-trip formatting, full-day bounds, and preset shortcuts
     ├── CaptureIntervalSettingsTests.swift # Live capture-interval config update coverage
     ├── ProcessCPUDisplayMetricsTests.swift # CPU sampler display math and live ranking coverage
     ├── SearchHighlightTooltipTests.swift # Search highlight tooltip hover/dismiss coverage

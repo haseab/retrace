@@ -10,6 +10,100 @@ final class DateRangePresetShortcutTests: XCTestCase {
         return calendar
     }
 
+    func testExactDateTimeRangesPreserveTimesAndInheritTheStartDay() throws {
+        let calendar = utcCalendar
+        let parser = DateRangeInputParser(calendar: calendar)
+        let now = try makeDate(year: 2026, month: 11, day: 6, hour: 14, minute: 0, second: 0, calendar: calendar)
+        let expectedStart = try makeDate(year: 2025, month: 12, day: 4, hour: 12, minute: 17, second: 0, calendar: calendar)
+        let expectedEnd = try makeDate(year: 2025, month: 12, day: 4, hour: 12, minute: 30, second: 0, calendar: calendar)
+
+        for input in [
+            "December 4th, 2025 12:17 p.m. to 12:30 p.m.",
+            "Dec 4, 2025 12:17 PM to Dec 4, 2025 12:30 PM",
+            "2025-12-04 12:17 to 2025-12-04 12:30"
+        ] {
+            let range = try XCTUnwrap(parser.parse(input, now: now), input)
+            XCTAssertEqual(range.start, expectedStart, input)
+            XCTAssertEqual(range.end, expectedEnd, input)
+        }
+    }
+
+    func testDateOnlyInputCoversTheWholeDay() throws {
+        let calendar = utcCalendar
+        let parser = DateRangeInputParser(calendar: calendar)
+        let now = try makeDate(year: 2026, month: 11, day: 6, hour: 14, minute: 0, second: 0, calendar: calendar)
+        let range = try XCTUnwrap(parser.parse("December 14th", now: now))
+
+        XCTAssertEqual(range.start, try makeDate(year: 2025, month: 12, day: 14, hour: 0, minute: 0, second: 0, calendar: calendar))
+        XCTAssertEqual(range.end, try makeDate(year: 2025, month: 12, day: 14, hour: 23, minute: 59, second: 59, calendar: calendar))
+    }
+
+    func testExplicitMidnightEndIsNotExpandedToTheWholeDay() throws {
+        let calendar = utcCalendar
+        let parser = DateRangeInputParser(calendar: calendar)
+        let now = try makeDate(year: 2026, month: 11, day: 6, hour: 14, minute: 0, second: 0, calendar: calendar)
+        let range = try XCTUnwrap(parser.parse("Dec 4, 2025 11:50 PM to Dec 5, 2025 12:00 AM", now: now))
+
+        XCTAssertEqual(range.start, try makeDate(year: 2025, month: 12, day: 4, hour: 23, minute: 50, second: 0, calendar: calendar))
+        XCTAssertEqual(range.end, try makeDate(year: 2025, month: 12, day: 5, hour: 0, minute: 0, second: 0, calendar: calendar))
+    }
+
+    func testMixedDateAndTimeBoundariesOnlyExpandTheDateOnlyBoundary() throws {
+        let calendar = utcCalendar
+        let parser = DateRangeInputParser(calendar: calendar)
+        let now = try makeDate(year: 2026, month: 11, day: 6, hour: 14, minute: 0, second: 0, calendar: calendar)
+        let range = try XCTUnwrap(parser.parse("Dec 4, 2025 12:17 PM to Dec 5, 2025", now: now))
+
+        XCTAssertEqual(range.start, try makeDate(year: 2025, month: 12, day: 4, hour: 12, minute: 17, second: 0, calendar: calendar))
+        XCTAssertEqual(range.end, try makeDate(year: 2025, month: 12, day: 5, hour: 23, minute: 59, second: 59, calendar: calendar))
+
+        let sameDayRange = try XCTUnwrap(parser.parse("Dec 4, 2025 12:17 PM to Dec 4, 2025", now: now))
+        XCTAssertEqual(sameDayRange.start, range.start)
+        XCTAssertEqual(sameDayRange.end, try makeDate(year: 2025, month: 12, day: 4, hour: 23, minute: 59, second: 59, calendar: calendar))
+    }
+
+    func testFormattedRangesCanBeReopenedAndAppliedWithoutLosingTimePrecision() throws {
+        let calendar = utcCalendar
+        let parser = DateRangeInputParser(calendar: calendar)
+        let now = try makeDate(year: 2026, month: 11, day: 6, hour: 14, minute: 0, second: 0, calendar: calendar)
+
+        for input in [
+            "Dec 4, 2025 12:17 PM to 12:30 PM",
+            "Dec 4, 2025 11:50 PM to Dec 5, 2025 12:00 AM",
+            "Dec 4, 2025 12:17:15 PM to 12:30:45 PM",
+            "Dec 4, 2025 to Dec 5, 2025 12:30 PM",
+            "Dec 4, 2025 12:17 PM to Dec 5, 2025",
+            "December 14th",
+            "Dec 4, 2025 to Dec 5, 2025"
+        ] {
+            let original = try XCTUnwrap(parser.parse(input, now: now), input)
+            let formatted = parser.formatRange(start: original.start, end: original.end)
+            let reopened = try XCTUnwrap(parser.parse(formatted, now: now), formatted)
+            XCTAssertEqual(reopened.start, original.start, formatted)
+            XCTAssertEqual(reopened.end, original.end, formatted)
+        }
+    }
+
+    func testDateOnlyInputUsesLocalDayBoundsAcrossDaylightSavingTime() throws {
+        var calendar = utcCalendar
+        calendar.timeZone = try XCTUnwrap(TimeZone(identifier: "America/Los_Angeles"))
+        let parser = DateRangeInputParser(calendar: calendar)
+        let now = try makeDate(year: 2026, month: 11, day: 6, hour: 14, minute: 0, second: 0, calendar: calendar)
+        let range = try XCTUnwrap(parser.parse("March 8, 2026", now: now))
+
+        XCTAssertEqual(range.start, try makeDate(year: 2026, month: 3, day: 8, hour: 0, minute: 0, second: 0, calendar: calendar))
+        XCTAssertEqual(range.end, try makeDate(year: 2026, month: 3, day: 8, hour: 23, minute: 59, second: 59, calendar: calendar))
+        XCTAssertEqual(range.end.timeIntervalSince(range.start), 23 * 60 * 60 - 1)
+    }
+
+    func testIntradayRangeDoesNotMatchTheWholeDayPreset() throws {
+        let calendar = utcCalendar
+        let now = try makeDate(year: 2026, month: 11, day: 6, hour: 14, minute: 0, second: 0, calendar: calendar)
+        let range = DateRangeCriterion(start: now.addingTimeInterval(-13 * 60), end: now)
+
+        XCTAssertNil(DateRangeQuickPreset.matchingPreset(for: range, now: now, calendar: calendar))
+    }
+
     func testShortcutKeysMapToExpectedPresets() {
         XCTAssertEqual(DateRangeQuickPreset.preset(for: "a", modifiers: []), .today)
         XCTAssertEqual(DateRangeQuickPreset.preset(for: "s", modifiers: []), .yesterday)
@@ -83,7 +177,7 @@ final class DateRangePresetShortcutTests: XCTestCase {
         )
         XCTAssertEqual(
             pastWeek.end,
-            try makeDate(year: 2026, month: 4, day: 10, hour: 0, minute: 0, second: 0, calendar: calendar)
+            try makeDate(year: 2026, month: 4, day: 10, hour: 23, minute: 59, second: 59, calendar: calendar)
         )
 
         let pastMonth = try XCTUnwrap(parser.parse("past month", now: now))
@@ -93,7 +187,7 @@ final class DateRangePresetShortcutTests: XCTestCase {
         )
         XCTAssertEqual(
             pastMonth.end,
-            try makeDate(year: 2026, month: 4, day: 10, hour: 0, minute: 0, second: 0, calendar: calendar)
+            try makeDate(year: 2026, month: 4, day: 10, hour: 23, minute: 59, second: 59, calendar: calendar)
         )
 
         let lastTwelveDays = try XCTUnwrap(parser.parse("last 12 days", now: now))
@@ -103,7 +197,7 @@ final class DateRangePresetShortcutTests: XCTestCase {
         )
         XCTAssertEqual(
             lastTwelveDays.end,
-            try makeDate(year: 2026, month: 4, day: 10, hour: 0, minute: 0, second: 0, calendar: calendar)
+            try makeDate(year: 2026, month: 4, day: 10, hour: 23, minute: 59, second: 59, calendar: calendar)
         )
     }
 
@@ -119,7 +213,7 @@ final class DateRangePresetShortcutTests: XCTestCase {
         )
         XCTAssertEqual(
             thisWeek.end,
-            try makeDate(year: 2026, month: 4, day: 10, hour: 0, minute: 0, second: 0, calendar: calendar)
+            try makeDate(year: 2026, month: 4, day: 10, hour: 23, minute: 59, second: 59, calendar: calendar)
         )
 
         let lastWeek = try XCTUnwrap(parser.parse("last week", now: now))
@@ -129,7 +223,7 @@ final class DateRangePresetShortcutTests: XCTestCase {
         )
         XCTAssertEqual(
             lastWeek.end,
-            try makeDate(year: 2026, month: 4, day: 5, hour: 0, minute: 0, second: 0, calendar: calendar)
+            try makeDate(year: 2026, month: 4, day: 5, hour: 23, minute: 59, second: 59, calendar: calendar)
         )
     }
 
@@ -145,7 +239,7 @@ final class DateRangePresetShortcutTests: XCTestCase {
         )
         XCTAssertEqual(
             compactRange.end,
-            try makeDate(year: 2026, month: 4, day: 10, hour: 0, minute: 0, second: 0, calendar: calendar)
+            try makeDate(year: 2026, month: 4, day: 10, hour: 23, minute: 59, second: 59, calendar: calendar)
         )
     }
 
@@ -161,7 +255,7 @@ final class DateRangePresetShortcutTests: XCTestCase {
         )
         XCTAssertEqual(
             januaryRange.end,
-            try makeDate(year: 2026, month: 1, day: 30, hour: 0, minute: 0, second: 0, calendar: calendar)
+            try makeDate(year: 2026, month: 1, day: 30, hour: 23, minute: 59, second: 59, calendar: calendar)
         )
     }
 
@@ -177,7 +271,7 @@ final class DateRangePresetShortcutTests: XCTestCase {
         )
         XCTAssertEqual(
             decemberRange.end,
-            try makeDate(year: 2025, month: 12, day: 5, hour: 0, minute: 0, second: 0, calendar: calendar)
+            try makeDate(year: 2025, month: 12, day: 5, hour: 23, minute: 59, second: 59, calendar: calendar)
         )
     }
 
@@ -193,7 +287,7 @@ final class DateRangePresetShortcutTests: XCTestCase {
         )
         XCTAssertEqual(
             aprilRange.end,
-            try makeDate(year: 2026, month: 4, day: 7, hour: 0, minute: 0, second: 0, calendar: calendar)
+            try makeDate(year: 2026, month: 4, day: 7, hour: 23, minute: 59, second: 59, calendar: calendar)
         )
     }
 
@@ -209,7 +303,7 @@ final class DateRangePresetShortcutTests: XCTestCase {
         )
         XCTAssertEqual(
             aprilRange.end,
-            try makeDate(year: 2026, month: 4, day: 5, hour: 0, minute: 0, second: 0, calendar: calendar)
+            try makeDate(year: 2026, month: 4, day: 5, hour: 23, minute: 59, second: 59, calendar: calendar)
         )
 
         let namedMonthWithYearRange = try XCTUnwrap(parser.parse("first 10 days of jul 2025", now: now))
@@ -219,7 +313,7 @@ final class DateRangePresetShortcutTests: XCTestCase {
         )
         XCTAssertEqual(
             namedMonthWithYearRange.end,
-            try makeDate(year: 2025, month: 7, day: 10, hour: 0, minute: 0, second: 0, calendar: calendar)
+            try makeDate(year: 2025, month: 7, day: 10, hour: 23, minute: 59, second: 59, calendar: calendar)
         )
     }
 
@@ -235,7 +329,7 @@ final class DateRangePresetShortcutTests: XCTestCase {
         )
         XCTAssertEqual(
             currentWeekRange.end,
-            try makeDate(year: 2026, month: 4, day: 8, hour: 0, minute: 0, second: 0, calendar: calendar)
+            try makeDate(year: 2026, month: 4, day: 8, hour: 23, minute: 59, second: 59, calendar: calendar)
         )
 
         let lastWeekRange = try XCTUnwrap(parser.parse("first 4 days of last week", now: now))
@@ -245,7 +339,7 @@ final class DateRangePresetShortcutTests: XCTestCase {
         )
         XCTAssertEqual(
             lastWeekRange.end,
-            try makeDate(year: 2026, month: 4, day: 2, hour: 0, minute: 0, second: 0, calendar: calendar)
+            try makeDate(year: 2026, month: 4, day: 2, hour: 23, minute: 59, second: 59, calendar: calendar)
         )
     }
 

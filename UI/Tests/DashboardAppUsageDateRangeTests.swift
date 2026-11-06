@@ -4,6 +4,31 @@ import AppKit
 
 @MainActor
 final class DashboardAppUsageDateRangeTests: XCTestCase {
+    func testNormalizedAppUsageDateRangePreservesExactTimes() throws {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .gmt
+        let start = try XCTUnwrap(calendar.date(from: DateComponents(year: 2025, month: 12, day: 4, hour: 12, minute: 17)))
+        let end = start.addingTimeInterval(13 * 60)
+        let now = end.addingTimeInterval(24 * 60 * 60)
+
+        let normalized = DashboardViewModel.normalizedAppUsageDateRange(start: start, end: end, calendar: calendar, now: now)
+
+        XCTAssertEqual(normalized.start, start)
+        XCTAssertEqual(normalized.end, end)
+    }
+
+    func testAppUsageCacheDistinguishesTimeRangesOnTheSameDay() {
+        let start = Date(timeIntervalSince1970: 1_764_850_620)
+        let first = DashboardAppUsageRangeCacheKey(start: start, end: start.addingTimeInterval(13 * 60))
+        let second = DashboardAppUsageRangeCacheKey(start: start.addingTimeInterval(60), end: start.addingTimeInterval(14 * 60))
+        var cache = DashboardAppUsageRangeCache()
+        cache.insert(makeSnapshot(), for: first)
+
+        XCTAssertNotEqual(first, second)
+        XCTAssertNotNil(cache.snapshot(for: first))
+        XCTAssertNil(cache.snapshot(for: second))
+    }
+
     func testNormalizedAppUsageDateRangeCapsSpanToThirtyDays() {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = TimeZone(secondsFromGMT: 0)!
@@ -23,7 +48,7 @@ final class DashboardAppUsageDateRangeTests: XCTestCase {
         XCTAssertEqual(normalized.start, start)
         XCTAssertEqual(
             normalized.end,
-            calendar.date(byAdding: .day, value: 29, to: start)!
+            calendar.date(bySettingHour: 23, minute: 59, second: 59, of: calendar.date(byAdding: .day, value: 29, to: start)!)!
         )
     }
 
@@ -46,7 +71,7 @@ final class DashboardAppUsageDateRangeTests: XCTestCase {
         XCTAssertEqual(normalized.start, start)
         XCTAssertEqual(
             normalized.end,
-            calendar.startOfDay(for: now)
+            calendar.date(bySettingHour: 23, minute: 59, second: 59, of: now)!
         )
     }
 
@@ -105,8 +130,7 @@ final class DashboardAppUsageDateRangeTests: XCTestCase {
         let keys = (0..<101).map { offset in
             DashboardAppUsageRangeCacheKey(
                 start: calendar.date(from: DateComponents(year: 2026, month: 4, day: offset + 1))!,
-                end: calendar.date(from: DateComponents(year: 2026, month: 4, day: offset + 1))!,
-                calendar: calendar
+                end: calendar.date(from: DateComponents(year: 2026, month: 4, day: offset + 1))!
             )
         }
 

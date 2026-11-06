@@ -2175,16 +2175,23 @@ struct DateRangeInputParser {
         if let split = splitRangeText(trimmed),
            let start = parseSingleDate(split.start, relativeTo: nil, now: now),
            let end = parseSingleDate(split.end, relativeTo: start, now: now) {
-            return normalizeRange(start, end)
+            return normalizeRange(
+                start, end,
+                startHasTime: containsTime(split.start),
+                endHasTime: containsTime(split.end)
+            )
         }
 
         if let detectedRange = parseRangeWithDetector(trimmed, now: now) {
-            return normalizeRange(detectedRange.start, detectedRange.end)
+            return normalizeRange(
+                detectedRange.start, detectedRange.end,
+                startHasTime: containsTime(trimmed),
+                endHasTime: containsTime(trimmed)
+            )
         }
 
         if let single = parseSingleDate(trimmed, relativeTo: nil, now: now) {
-            let day = calendar.startOfDay(for: single)
-            return (day, day)
+            return normalizeRange(single, single, startHasTime: containsTime(trimmed))
         }
 
         return nil
@@ -2453,13 +2460,6 @@ struct DateRangeInputParser {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedLower = trimmed.lowercased()
 
-        Chrono.defaultImpliedHour = 0
-        let chrono = Chrono()
-        let results = chrono.parse(text: trimmed, refDate: referenceDate ?? now, opt: [.forwardDate: 0])
-        if let result = results.first?.start.date {
-            return adjustImplicitFutureDateToPast(result, originalText: trimmedLower, now: now)
-        }
-
         if let referenceDate,
            let day = Int(trimmedLower),
            (1...31).contains(day) {
@@ -2478,8 +2478,32 @@ struct DateRangeInputParser {
             }
         }
 
-        if let timeOnlyDate = parseTimeOnly(trimmedLower, relativeTo: now) {
+        if containsTime(trimmedLower),
+           let timeOnlyDate = parseTimeOnly(trimmedLower, relativeTo: referenceDate ?? now) {
             return timeOnlyDate
+        }
+
+        Chrono.defaultImpliedHour = 0
+        let chrono = Chrono()
+        // Chrono uses the system calendar. Supply the reference wall clock and rebuild
+        // its parsed components in our calendar so time zones are respected.
+        let referenceComponents = calendar.dateComponents([.year, .month, .day, .hour, .minute, .second], from: referenceDate ?? now)
+        let chronoReference = Calendar.current.date(from: referenceComponents) ?? referenceDate ?? now
+        let results = chrono.parse(text: trimmed, refDate: chronoReference, opt: [.forwardDate: 0])
+        if let parsed = results.first?.start {
+            var components = DateComponents()
+            components.year = parsed[.year]
+            components.month = parsed[.month]
+            components.day = parsed[.day]
+            components.hour = parsed[.hour]
+            components.minute = parsed[.minute]
+            components.second = parsed[.second]
+            if parsed.isCertain(component: .timeZoneOffset), let offset = parsed[.timeZoneOffset] {
+                components.timeZone = TimeZone(secondsFromGMT: offset * 60)
+            }
+            if let date = calendar.date(from: components) {
+                return adjustImplicitFutureDateToPast(date, originalText: trimmedLower, now: now)
+            }
         }
 
         let normalizedText = normalizeCompactTimeFormat(trimmedLower)
@@ -2510,7 +2534,7 @@ struct DateRangeInputParser {
         for formatString in formatStrings {
             let formatter = DateFormatter()
             formatter.dateFormat = formatString
-            formatter.timeZone = .current
+            formatter.timeZone = calendar.timeZone
             formatter.defaultDate = referenceDate ?? now
 
             if let date = formatter.date(from: text) {
@@ -2573,7 +2597,7 @@ struct DateRangeInputParser {
     }
 
     private func parseTimeOnly(_ text: String, relativeTo now: Date) -> Date? {
-        var input = text.trimmingCharacters(in: .whitespaces)
+        var input = text.replacingOccurrences(of: ".", with: "").trimmingCharacters(in: .whitespaces)
         var isPM = false
         var isAM = false
 
@@ -2591,15 +2615,20 @@ struct DateRangeInputParser {
 
         var hour: Int?
         var minute = 0
+        var second = 0
 
         if input.contains(":") {
             let parts = input.split(separator: ":")
-            if parts.count == 2,
+            if (2...3).contains(parts.count),
                let h = Int(parts[0]),
                let m = Int(parts[1]),
                h >= 0 && h <= 23 && m >= 0 && m <= 59 {
                 hour = h
                 minute = m
+                if parts.count == 3 {
+                    guard let seconds = Int(parts[2]), (0...59).contains(seconds) else { return nil }
+                    second = seconds
+                }
             }
         } else if let numericValue = Int(input) {
             if numericValue >= 0 && numericValue <= 23 {
@@ -2626,9 +2655,18 @@ struct DateRangeInputParser {
         var components = calendar.dateComponents([.year, .month, .day], from: now)
         components.hour = finalHour
         components.minute = minute
-        components.second = 0
+        components.second = second
 
         return calendar.date(from: components)
+    }
+
+    private func containsTime(_ text: String) -> Bool {
+        let patterns = [
+            #"\d{1,2}:\d{2}"#,
+            #"\b\d{1,4}\s*[ap](?:\.?\s*m\.?)?\b"#,
+            #"\b(?:noon|midnight)\b"#
+        ]
+        return patterns.contains { text.range(of: $0, options: [.regularExpression, .caseInsensitive]) != nil }
     }
 
     private func normalizeCompactTimeFormat(_ text: String) -> String {
@@ -2672,14 +2710,50 @@ struct DateRangeInputParser {
         return result
     }
 
-    private func normalizeRange(_ start: Date, _ end: Date) -> (start: Date, end: Date) {
-        var startDay = calendar.startOfDay(for: start)
-        var endDay = calendar.startOfDay(for: end)
-        if endDay < startDay {
-            swap(&startDay, &endDay)
+    private func normalizeRange(
+        _ start: Date,
+        _ end: Date,
+        startHasTime: Bool = false,
+        endHasTime: Bool = false
+    ) -> (start: Date, end: Date) {
+        let startDay = calendar.startOfDay(for: start)
+        let endDay = calendar.startOfDay(for: end)
+        if endDay < startDay || (startDay == endDay && startHasTime && endHasTime && end < start) {
+            return normalizeRange(end, start, startHasTime: endHasTime, endHasTime: startHasTime)
         }
 
-        return (startDay, endDay)
+        let lower = startHasTime ? start : calendar.startOfDay(for: start)
+        let upper = endHasTime ? end : endOfDay(end)
+        return (lower, upper)
+    }
+
+    func endOfDay(_ date: Date) -> Date {
+        calendar.date(bySettingHour: 23, minute: 59, second: 59, of: date) ?? date
+    }
+
+    func formatRange(start: Date, end: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.calendar = calendar
+        formatter.timeZone = calendar.timeZone
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "MMM d, yyyy"
+
+        let startsAtMidnight = start == calendar.startOfDay(for: start)
+        let endsAtDayEnd = end == endOfDay(end)
+        if startsAtMidnight && endsAtDayEnd {
+            if calendar.isDate(start, inSameDayAs: end) {
+                return formatter.string(from: start)
+            }
+            return "\(formatter.string(from: start)) to \(formatter.string(from: end))"
+        }
+
+        let startDayText = formatter.string(from: start)
+        let endDayText = formatter.string(from: end)
+        let includeSeconds = calendar.component(.second, from: start) != 0 || calendar.component(.second, from: end) != 0
+        formatter.dateFormat = includeSeconds ? "MMM d, yyyy h:mm:ss a" : "MMM d, yyyy h:mm a"
+        let startText = startsAtMidnight ? startDayText : formatter.string(from: start)
+        let endText = endsAtDayEnd ? endDayText : formatter.string(from: end)
+        return "\(startText) to \(endText)"
     }
 }
 
@@ -2825,8 +2899,7 @@ public enum DateRangeQuickPreset: String, CaseIterable {
                 return false
             }
 
-            return calendar.isDate(start, inSameDayAs: resolvedStart)
-                && calendar.isDate(end, inSameDayAs: resolvedEnd)
+            return start == resolvedStart && end == resolvedEnd
         }
     }
 }
@@ -3531,9 +3604,8 @@ public struct DateRangeFilterPopover: View {
         let primaryStart = primaryRange?.start ?? primaryRange?.end ?? fallbackStart
         let primaryEnd = primaryRange?.end ?? primaryRange?.start ?? now
 
-        let normalizedPrimary = normalizeRange(primaryStart, primaryEnd)
-        localStartDate = normalizedPrimary.start
-        localEndDate = normalizedPrimary.end
+        localStartDate = min(primaryStart, primaryEnd)
+        localEndDate = max(primaryStart, primaryEnd)
 
         displayedMonth = localEndDate
         activeCalendarBoundary = .start
@@ -3617,7 +3689,7 @@ public struct DateRangeFilterPopover: View {
                parsed.hasBounds,
                let start = parsed.start,
                let end = parsed.end {
-                return (calendar.startOfDay(for: start), calendar.startOfDay(for: end))
+                return (start, end)
             }
 
             let trimmed = additionalRangeInputTexts[index].trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3669,7 +3741,7 @@ public struct DateRangeFilterPopover: View {
             }
             return
         }
-        let formatted = formatRangeInput(start: localStartDate, end: localEndDate)
+        let formatted = formatRangeInput(start: localStartDate, end: inputParser.endOfDay(localEndDate))
 
         switch resolvedCalendarTarget(activeCalendarTarget) {
         case .primary:
@@ -3692,7 +3764,7 @@ public struct DateRangeFilterPopover: View {
             }
             additionalRangeInputTexts[index] = formatted
             additionalParseErrors[index] = nil
-            additionalParsedRanges[index] = normalizedFilterRange(start: localStartDate, end: localEndDate)
+            additionalParsedRanges[index] = normalizedFilterRange(start: localStartDate, end: inputParser.endOfDay(localEndDate))
             if applyImmediately {
                 applyAllRanges(moveToNextDropdown: moveToNextDropdown)
             }
@@ -4029,28 +4101,11 @@ public struct DateRangeFilterPopover: View {
     }
 
     private func normalizedFilterRange(start: Date, end: Date) -> DateRangeCriterion {
-        let startDay = calendar.startOfDay(for: start)
-        let endOfDay = calendar.date(bySettingHour: 23, minute: 59, second: 59, of: end) ?? end
-        if endOfDay < startDay {
-            let swappedStart = calendar.startOfDay(for: end)
-            let swappedEnd = calendar.date(bySettingHour: 23, minute: 59, second: 59, of: start) ?? start
-            return DateRangeCriterion(start: swappedStart, end: swappedEnd)
-        }
-        return DateRangeCriterion(start: startDay, end: endOfDay)
+        DateRangeCriterion(start: min(start, end), end: max(start, end))
     }
 
     private func formatRangeInput(start: Date, end: Date) -> String {
-        let startDay = calendar.startOfDay(for: start)
-        let endDay = calendar.startOfDay(for: end)
-
-        let fullDateFormatter = DateFormatter()
-        fullDateFormatter.dateFormat = "MMM d, yyyy"
-
-        if calendar.isDate(startDay, inSameDayAs: endDay) {
-            return fullDateFormatter.string(from: startDay)
-        }
-
-        return "\(fullDateFormatter.string(from: startDay)) to \(fullDateFormatter.string(from: endDay))"
+        inputParser.formatRange(start: start, end: end)
     }
 
     private func formatRangeInputText(for range: DateRangeCriterion) -> String {
