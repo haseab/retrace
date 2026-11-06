@@ -17,7 +17,7 @@ Retrace is an open source alternative to Rewind AI that gives you photographic m
 - **OCR text extraction** using Apple's Vision framework
 - **Full-text search** with advanced filters (app, date, exclusions)
 - **Timeline viewer** - Scrub through your screen history frame-by-frame
-- **Dashboard analytics** - Visualize app usage, screen time, and activity patterns
+- **Dashboard analytics** - Visualize app usage, screen time, and activity patterns (stored locally on-device, not sent to third-party/developer analytics services)
 - **Rewind AI import** - Seamless, resumable background import of existing Rewind data
 - **Settings panel** - Comprehensive controls for capture, storage, privacy, and shortcuts
 - **Global hotkeys** - Quick access (Cmd+Shift+T for timeline, Cmd+Shift+D for dashboard)

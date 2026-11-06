@@ -210,6 +210,11 @@ enum FeedbackRecentMetricSupport {
         }
 
         switch metricType {
+        case .conferencePrivacy:
+            return allowlistedDetails(
+                from: payload,
+                keys: ["action", "outcome", "source", "conferenceKind"]
+            )
         case .inPageURLHover, .inPageURLClick, .inPageURLRightClick, .inPageURLCopyLink:
             return linkInteractionDetails(from: payload)
         case .timelineAutoDismissed:

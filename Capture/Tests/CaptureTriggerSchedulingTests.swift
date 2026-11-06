@@ -895,6 +895,10 @@ private actor FakeScreenCaptureBackend: ScreenCaptureBackend {
     func startCapture(config: CaptureConfig, displayID: CGDirectDisplayID?) async throws {}
     func stopCapture() async throws {}
     func updateConfig(_ config: CaptureConfig) async throws {}
+    func disableFaceBlurForConferenceCall(callID: String) async -> Bool { true }
+    func setOnConferenceFramePrivacyEvent(
+        _ callback: (@Sendable (ConferenceFramePrivacyEvent) async -> Void)?
+    ) async {}
 
     func captureFrame(displayID: CGDirectDisplayID) async -> CapturedFrame? {
         displayIDs.append(displayID)
