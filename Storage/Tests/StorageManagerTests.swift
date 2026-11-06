@@ -1242,6 +1242,7 @@ final class StorageManagerTests: XCTestCase {
 
     func testCancelAfterAppendPreservesWALSessionForRecovery() async throws {
         let root = makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
         let storage = StorageManager(storageRoot: root)
         try await storage.initialize(config: makeStorageConfig(root: root))
 
@@ -1251,21 +1252,64 @@ final class StorageManagerTests: XCTestCase {
         try await writer.appendFrame(makeCapturedFrame())
 
         let walManager = await storage.getWALManager()
-
+        try await walManager.registerFrameID(videoID: segmentID, frameID: 101, frameIndex: 0)
         try await incrementalWriter.cancelPreservingRecoveryData()
 
         let segmentExists = try await storage.segmentExists(id: segmentID)
         XCTAssertFalse(segmentExists)
 
-        let activeSessions = try await walManager.listActiveSessions()
+        // Reopen as a new process would: querying the original manager would
+        // spill its live memory and mask a failure to persist during cancellation.
+        let reopened = WALManager(walRoot: root.appendingPathComponent("wal"))
+        let activeSessions = try await reopened.listActiveSessions()
         XCTAssertEqual(activeSessions.count, 1)
         XCTAssertEqual(activeSessions.first?.videoID, segmentID)
         if let session = activeSessions.first {
-            let recoverableFrameCount = try await walManager.recoverableFrameCount(for: session)
+            let recoverableFrameCount = try await reopened.recoverableFrameCount(for: session)
             XCTAssertEqual(recoverableFrameCount, 1)
         }
+        let recovered = try await reopened.readFrame(videoID: segmentID, frameID: 101, fallbackFrameIndex: 999)
+        XCTAssertEqual(recovered.imageData, makeCapturedFrame().imageData)
+    }
 
-        try? FileManager.default.removeItem(at: root)
+    func testCancelPreservingRecoveryDataKeepsVideoWhenSpillFailsAndCanRetry() async throws {
+        let root = makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let storage = StorageManager(storageRoot: root)
+        try await storage.initialize(config: makeStorageConfig(root: root))
+        let writer = try await storage.createSegmentWriter()
+        let incrementalWriter = try XCTUnwrap(writer as? IncrementalSegmentWriter)
+        let segmentID = await writer.segmentID
+        try await writer.appendFrame(makeCapturedFrame())
+        let wal = await storage.getWALManager()
+        try await wal.registerFrameID(videoID: segmentID, frameID: 101, frameIndex: 0)
+        let sessions = try await wal.listActiveSessions()
+        let session = try XCTUnwrap(sessions.first)
+        let videoExisted = try await storage.segmentExists(id: segmentID)
+        XCTAssertTrue(videoExisted)
+
+        try FileManager.default.removeItem(at: session.framesURL)
+        try FileManager.default.createDirectory(at: session.framesURL, withIntermediateDirectories: false)
+        try Data([1]).write(to: session.framesURL.appendingPathComponent("blocker"))
+        do {
+            try await incrementalWriter.cancelPreservingRecoveryData()
+            XCTFail("Cancellation must report that recovery data could not be persisted")
+        } catch {
+            // Neither encoder reset nor video deletion may run after this failure.
+        }
+        let videoRetained = try await storage.segmentExists(id: segmentID)
+        XCTAssertTrue(videoRetained)
+        let retained = try await wal.readFrame(videoID: segmentID, frameID: 101, fallbackFrameIndex: 999)
+        XCTAssertEqual(retained.imageData, makeCapturedFrame().imageData)
+
+        try FileManager.default.removeItem(at: session.framesURL)
+        try Data().write(to: session.framesURL)
+        try await incrementalWriter.cancelPreservingRecoveryData()
+        let videoRemoved = try await storage.segmentExists(id: segmentID)
+        XCTAssertFalse(videoRemoved)
+        let reopened = WALManager(walRoot: root.appendingPathComponent("wal"))
+        let recovered = try await reopened.readFrame(videoID: segmentID, frameID: 101, fallbackFrameIndex: 999)
+        XCTAssertEqual(recovered.imageData, makeCapturedFrame().imageData)
     }
 
     func testCancelAfterAppendRemovesWALSessionByDefault() async throws {
