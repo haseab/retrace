@@ -271,6 +271,23 @@ final class DateJumpTimeOnlyParsingTests: XCTestCase {
         assertDateComponents(result, year: 2026, month: 2, day: 25, hour: 16, minute: 0)
     }
 
+    func testCompact24HourDateKeepsMostRecentYearLateInTheYear() throws {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let now = makeDate(year: 2026, month: 11, day: 6, hour: 10, minute: 0).addingTimeInterval(59)
+        let result = try XCTUnwrap(viewModel.test_parseNaturalLanguageDateForDateSearch("feb 28 1417", now: now))
+
+        assertDateComponents(result, year: 2026, month: 2, day: 28, hour: 14, minute: 17)
+        XCTAssertEqual(Calendar.current.component(.second, from: result), 0)
+    }
+
+    func testNumericDateWithCompactTimeKeepsMostRecentYear() throws {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let now = makeDate(year: 2026, month: 11, day: 6, hour: 10, minute: 0)
+        let result = try XCTUnwrap(viewModel.test_parseNaturalLanguageDateForDateSearch("02/28 1417", now: now))
+
+        assertDateComponents(result, year: 2026, month: 2, day: 28, hour: 14, minute: 17)
+    }
+
     func testBareWeekdayKeepsMostRecentOccurrence() throws {
         let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
         let now = makeDate(year: 2026, month: 2, day: 23, hour: 10, minute: 0)

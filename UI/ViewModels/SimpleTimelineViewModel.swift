@@ -15592,7 +15592,8 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     private func shouldCoerceYearlessAbsoluteDateToPast(_ input: String) -> Bool {
-        let normalizedInput = normalizeRelativeDateShorthand(input)
+        // Classify years after compact times such as "1417" have become "14:17".
+        let normalizedInput = normalizeCompactTimeFormat(normalizeRelativeDateShorthand(input))
         // Keep relative expressions as-is (tomorrow/next/last/etc).
         if normalizedInput.range(
             of: #"\b(today|tomorrow|yesterday|next|last|ago|this|now|tonight)\b|from now"#,
