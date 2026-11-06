@@ -626,7 +626,7 @@ public struct DashboardView: View {
         )
         .background(
             Button("") {
-                Task { await viewModel.loadStatistics() }
+                Task { await viewModel.loadStatistics(reason: "manual_refresh") }
             }
             .keyboardShortcut("r", modifiers: .command)
             .frame(width: 0, height: 0)
@@ -644,14 +644,14 @@ public struct DashboardView: View {
             if !hasLoadedInitialData {
                 hasLoadedInitialData = true
                 Log.debug("[Dashboard] Initial load - first appearance", category: .ui)
-                await viewModel.loadStatistics()
+                await viewModel.loadStatistics(reason: "initial_appearance")
             } else {
                 Log.debug("[Dashboard] Tab switch - skipping reload", category: .ui)
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: .dashboardDidBecomeKey)) { _ in
             Log.debug("[Dashboard] Window became key - refreshing", category: .ui)
-            Task { await viewModel.loadStatistics() }
+            Task { await viewModel.loadStatistics(reason: "window_became_key") }
         }
         .onReceive(NotificationCenter.default.publisher(for: .dashboardDidOpen)) { _ in
             viewModel.isWindowVisible = true

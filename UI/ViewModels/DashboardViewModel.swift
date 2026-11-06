@@ -44,6 +44,37 @@ private struct DashboardAppUsageGraphSnapshot {
     let weeklyStorageBytes: Int64
 }
 
+/// One trace per user-triggered statistics load, including concurrent refreshes.
+private struct DashboardLoadTrace: Sendable {
+    let id: String
+    private let startedAt = CFAbsoluteTimeGetCurrent()
+
+    init(generation: UInt64) {
+        id = "\(generation)-\(UUID().uuidString.prefix(8))"
+    }
+
+    func log(_ event: String) {
+        let elapsedMs = (CFAbsoluteTimeGetCurrent() - startedAt) * 1000
+        Log.info("[DASHBOARD-LOAD][\(id)] +\(String(format: "%.1f", elapsedMs))ms \(event)", category: .ui)
+    }
+
+    @MainActor
+    func measure<T>(_ stage: String, operation: () async throws -> T) async rethrows -> T {
+        let stageStartedAt = CFAbsoluteTimeGetCurrent()
+        log("START stage=\(stage)")
+        do {
+            let result = try await operation()
+            let elapsedMs = (CFAbsoluteTimeGetCurrent() - stageStartedAt) * 1000
+            log("END stage=\(stage) elapsedMs=\(String(format: "%.1f", elapsedMs))")
+            return result
+        } catch {
+            let elapsedMs = (CFAbsoluteTimeGetCurrent() - stageStartedAt) * 1000
+            log("FAIL stage=\(stage) elapsedMs=\(String(format: "%.1f", elapsedMs)) error=\(error)")
+            throw error
+        }
+    }
+}
+
 struct DashboardAppUsageRangeCache {
     let capacity: Int
     private(set) var snapshotsByKey: [DashboardAppUsageRangeCacheKey: DashboardAppUsageRangeSnapshot] = [:]
@@ -235,6 +266,7 @@ public class DashboardViewModel: ObservableObject {
     public nonisolated static let maxAppUsageRangeDays = 31
     private var appUsageRangeCache = DashboardAppUsageRangeCache()
     private var statisticsLoadGeneration: UInt64 = 0
+    private var activeStatisticsLoadCount = 0
 
     /// Whether the dashboard window is currently visible
     /// Set by DashboardWindowController on show/hide to gate UI updates
@@ -266,7 +298,7 @@ public class DashboardViewModel: ObservableObject {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor in
-                await self?.loadStatistics()
+                await self?.loadStatistics(reason: "data_source_changed")
             }
         }
     }
@@ -1551,13 +1583,18 @@ public class DashboardViewModel: ObservableObject {
 
     private func fetchAppUsageBreakdown(
         rangeStart: Date,
-        rangeEnd: Date
+        rangeEnd: Date,
+        trace: DashboardLoadTrace
     ) async throws -> DashboardAppUsageBreakdownSnapshot {
         let appUsageStartedAt = CFAbsoluteTimeGetCurrent()
-        let appStats = try await coordinator.getAppUsageStats(from: rangeStart, to: rangeEnd)
+        let appStats = try await trace.measure("app_usage.query") {
+            try await coordinator.getAppUsageStats(from: rangeStart, to: rangeEnd)
+        }
 
         let totalWeeklyTime = appStats.reduce(0) { $0 + $1.duration }
-        let appNamesByBundleID = await resolveAppNames(bundleIDs: appStats.map(\.bundleID))
+        let appNamesByBundleID = await trace.measure("app_usage.names") {
+            await resolveAppNames(bundleIDs: appStats.map(\.bundleID))
+        }
         let weeklyAppUsage = appStats.map { stat in
             AppUsageData(
                 appBundleID: stat.bundleID,
@@ -1568,6 +1605,7 @@ public class DashboardViewModel: ObservableObject {
             )
         }
         .sorted { $0.duration > $1.duration }
+        trace.log("READY app_usage apps=\(weeklyAppUsage.count) recordedSeconds=\(Int(totalWeeklyTime))")
 
         let appUsageElapsedMs = elapsedMs(since: appUsageStartedAt)
         Log.recordLatency(
@@ -1587,13 +1625,18 @@ public class DashboardViewModel: ObservableObject {
 
     private func fetchAppUsageRangeSnapshot(
         rangeStart: Date,
-        rangeEnd: Date
+        rangeEnd: Date,
+        trace: DashboardLoadTrace,
+        onAppUsageReady: (DashboardAppUsageBreakdownSnapshot) -> Void
     ) async throws -> DashboardAppUsageRangeSnapshot {
         let dailyGraphStartedAt = CFAbsoluteTimeGetCurrent()
-        async let appUsageBreakdownTask = fetchAppUsageBreakdown(rangeStart: rangeStart, rangeEnd: rangeEnd)
-        async let dailyGraphSnapshotTask = fetchDailyGraphSnapshot(rangeStart: rangeStart, rangeEnd: rangeEnd)
+        async let appUsageBreakdownTask = fetchAppUsageBreakdown(rangeStart: rangeStart, rangeEnd: rangeEnd, trace: trace)
+        async let dailyGraphSnapshotTask = fetchDailyGraphSnapshot(rangeStart: rangeStart, rangeEnd: rangeEnd, trace: trace)
 
         let appUsageBreakdown = try await appUsageBreakdownTask
+        // App usage is independent of filesystem-backed charts. Publish it before
+        // waiting for them, including when an older storage request is still running.
+        onAppUsageReady(appUsageBreakdown)
         let dailyGraphSnapshot = await dailyGraphSnapshotTask
 
         let dailyGraphElapsedMs = elapsedMs(since: dailyGraphStartedAt)
@@ -1622,11 +1665,18 @@ public class DashboardViewModel: ObservableObject {
         )
     }
 
-    private func loadBackgroundMeta() async {
+    private func loadBackgroundMeta(includeAllTimeMetadata: Bool, trace: DashboardLoadTrace) async {
+        // Custom-range cards use range totals, so none of the all-time queries are needed.
+        guard includeAllTimeMetadata else {
+            trace.log("SKIP metadata.all_time reason=custom_range")
+            return
+        }
         let backgroundStartedAt = CFAbsoluteTimeGetCurrent()
 
         let totalStorageStartedAt = CFAbsoluteTimeGetCurrent()
-        if let storage = try? await coordinator.getTotalStorageUsed() {
+        if let storage = try? await trace.measure("metadata.total_storage_scan", operation: {
+            try await coordinator.getTotalStorageUsed()
+        }) {
             let totalStorageElapsedMs = (CFAbsoluteTimeGetCurrent() - totalStorageStartedAt) * 1000
             Log.recordLatency(
                 "dashboard.query.total_storage_ms",
@@ -1640,7 +1690,9 @@ public class DashboardViewModel: ObservableObject {
         }
 
         let totalCapturedDurationStartedAt = CFAbsoluteTimeGetCurrent()
-        if let duration = try? await coordinator.getTotalCapturedDuration() {
+        if let duration = try? await trace.measure("metadata.total_captured_duration", operation: {
+            try await coordinator.getTotalCapturedDuration()
+        }) {
             let totalCapturedDurationElapsedMs = (CFAbsoluteTimeGetCurrent() - totalCapturedDurationStartedAt) * 1000
             Log.recordLatency(
                 "dashboard.query.total_captured_duration_ms",
@@ -1654,7 +1706,9 @@ public class DashboardViewModel: ObservableObject {
         }
 
         let distinctDatesStartedAt = CFAbsoluteTimeGetCurrent()
-        if let allDates = try? await coordinator.getDistinctDates() {
+        if let allDates = try? await trace.measure("metadata.distinct_dates", operation: {
+            try await coordinator.getDistinctDates()
+        }) {
             let distinctDatesElapsedMs = (CFAbsoluteTimeGetCurrent() - distinctDatesStartedAt) * 1000
             Log.recordLatency(
                 "dashboard.query.distinct_dates_ms",
@@ -1682,14 +1736,22 @@ public class DashboardViewModel: ObservableObject {
     public func loadStatistics(reason: String = "dashboard_refresh") async {
         let loadStartedAt = CFAbsoluteTimeGetCurrent()
         let loadGeneration = nextStatisticsLoadGeneration()
+        let trace = DashboardLoadTrace(generation: loadGeneration)
+        activeStatisticsLoadCount += 1
+        trace.log("BEGIN reason=\(reason) activeLoads=\(activeStatisticsLoadCount) startMs=\(Int64(appUsageRangeStart.timeIntervalSince1970 * 1000)) endMs=\(Int64(appUsageRangeEnd.timeIntervalSince1970 * 1000))")
+        var outcome = "superseded"
+        defer {
+            activeStatisticsLoadCount -= 1
+            trace.log("FINISH outcome=\(outcome) latestGeneration=\(statisticsLoadGeneration) activeLoads=\(activeStatisticsLoadCount)")
+        }
         error = nil
 
         // Update recording status
         updateRecordingStatus()
         updatePauseStatus()
-        await refreshUnexpectedRecordingStopState()
-        await refreshRecentCrashReportState()
-        await refreshRecentWALFailureCrashState()
+        await trace.measure("preflight.recording_status") { await refreshUnexpectedRecordingStopState() }
+        await trace.measure("preflight.crash_reports") { await refreshRecentCrashReportState() }
+        await trace.measure("preflight.wal_reports") { await refreshRecentWALFailureCrashState() }
 
         do {
             let now = Date()
@@ -1726,29 +1788,48 @@ public class DashboardViewModel: ObservableObject {
                 now: now
             )
             let cachedSnapshot = cacheEligible ? appUsageRangeCache.snapshot(for: cacheKey) : nil
+            trace.log("RANGE startMs=\(Int64(rangeStart.timeIntervalSince1970 * 1000)) endMs=\(Int64(rangeEnd.timeIntervalSince1970 * 1000)) spanSeconds=\(Int(rangeEnd.timeIntervalSince(rangeStart))) cache=\(cacheEligible ? (cachedSnapshot == nil ? "miss" : "hit") : "ineligible_live_day")")
             isLoading = cachedSnapshot == nil
-            async let backgroundMetaTask: Void = loadBackgroundMeta()
+            let includeAllTimeMetadata = isDefaultAppUsageRangeSelected
+            async let backgroundMetaTask: Void = loadBackgroundMeta(includeAllTimeMetadata: includeAllTimeMetadata, trace: trace)
 
             if let cachedSnapshot {
                 applyAppUsageRangeSnapshot(cachedSnapshot)
                 isLoading = false
+                trace.log("PUBLISH source=cache apps=\(cachedSnapshot.weeklyAppUsage.count)")
                 await backgroundMetaTask
                 guard isLatestStatisticsLoad(loadGeneration) else { return }
             } else {
-                let snapshot = try await fetchAppUsageRangeSnapshot(rangeStart: rangeStart, rangeEnd: rangeEnd)
+                let snapshot = try await fetchAppUsageRangeSnapshot(rangeStart: rangeStart, rangeEnd: rangeEnd, trace: trace) { breakdown in
+                    guard isLatestStatisticsLoad(loadGeneration) else { return }
+                    weeklyAppUsage = breakdown.weeklyAppUsage
+                    totalWeeklyTime = breakdown.totalWeeklyTime
+                    totalDailyTime = breakdown.totalWeeklyTime
+                    isLoading = false
+                    trace.log("PUBLISH source=app_usage apps=\(breakdown.weeklyAppUsage.count)")
+                    Log.recordLatency(
+                        "dashboard.load.app_usage_visible_ms",
+                        valueMs: elapsedMs(since: loadStartedAt),
+                        category: .ui,
+                        summaryEvery: 10,
+                        warningThresholdMs: 800,
+                        criticalThresholdMs: 2500
+                    )
+                }
                 if cacheEligible {
                     appUsageRangeCache.insert(snapshot, for: cacheKey)
                 }
                 guard isLatestStatisticsLoad(loadGeneration) else { return }
 
                 applyAppUsageRangeSnapshot(snapshot)
-                isLoading = false
+                trace.log("PUBLISH source=charts apps=\(snapshot.weeklyAppUsage.count)")
 
                 // Keep metadata updates in-flight with chart/query work.
                 await backgroundMetaTask
                 guard isLatestStatisticsLoad(loadGeneration) else { return }
             }
 
+            outcome = "complete"
             let loadElapsedMs = elapsedMs(since: loadStartedAt)
             Log.recordLatency(
                 "dashboard.load.total_ms",
@@ -1760,6 +1841,7 @@ public class DashboardViewModel: ObservableObject {
             )
         } catch {
             guard isLatestStatisticsLoad(loadGeneration) else { return }
+            outcome = "failed"
             isLoading = false
             let loadElapsedMs = elapsedMs(since: loadStartedAt)
             Log.recordLatency(
@@ -1780,7 +1862,8 @@ public class DashboardViewModel: ObservableObject {
     /// Load daily data for all metric graphs using the selected dashboard date range.
     private func fetchDailyGraphSnapshot(
         rangeStart: Date,
-        rangeEnd: Date
+        rangeEnd: Date,
+        trace: DashboardLoadTrace
     ) async -> DashboardAppUsageGraphSnapshot {
         let totalStartedAt = CFAbsoluteTimeGetCurrent()
         let calendar = Calendar.current
@@ -1800,46 +1883,53 @@ public class DashboardViewModel: ObservableObject {
         do {
             async let screenTimeResult: ([(date: Date, value: Int64)], Double) = {
                 let startedAt = CFAbsoluteTimeGetCurrent()
-                let data = try await coordinator.getDailyScreenTime(
-                    from: rangeStart,
-                    to: rangeEnd
-                )
+                let data = try await trace.measure("charts.screen_time") {
+                    try await coordinator.getDailyScreenTime(from: rangeStart, to: rangeEnd)
+                }
                 return (data, (CFAbsoluteTimeGetCurrent() - startedAt) * 1000)
             }()
 
             async let dailyStorageResult: ([DailyDataPoint], Double) = {
                 let startedAt = CFAbsoluteTimeGetCurrent()
-                let data = try await loadDailyStorageData(for: allDays)
+                let data = try await trace.measure("charts.storage") {
+                    try await loadDailyStorageData(for: allDays, trace: trace)
+                }
                 return (data, (CFAbsoluteTimeGetCurrent() - startedAt) * 1000)
             }()
 
             async let timelineResult: ([(date: Date, value: Int64)], Double) = {
                 let startedAt = CFAbsoluteTimeGetCurrent()
-                let data = try await coordinator.getDailyMetrics(
-                    metricType: .timelineOpens,
-                    from: rangeStart,
-                    to: rangeEnd
-                )
+                let data = try await trace.measure("charts.timeline_opens") {
+                    try await coordinator.getDailyMetrics(
+                        metricType: .timelineOpens,
+                        from: rangeStart,
+                        to: rangeEnd
+                    )
+                }
                 return (data, (CFAbsoluteTimeGetCurrent() - startedAt) * 1000)
             }()
 
             async let searchesResult: ([(date: Date, value: Int64)], Double) = {
                 let startedAt = CFAbsoluteTimeGetCurrent()
-                let data = try await coordinator.getDailyMetrics(
-                    metricType: .searches,
-                    from: rangeStart,
-                    to: rangeEnd
-                )
+                let data = try await trace.measure("charts.searches") {
+                    try await coordinator.getDailyMetrics(
+                        metricType: .searches,
+                        from: rangeStart,
+                        to: rangeEnd
+                    )
+                }
                 return (data, (CFAbsoluteTimeGetCurrent() - startedAt) * 1000)
             }()
 
             async let textCopiesResult: ([(date: Date, value: Int64)], Double) = {
                 let startedAt = CFAbsoluteTimeGetCurrent()
-                let data = try await coordinator.getDailyMetrics(
-                    metricType: .textCopies,
-                    from: rangeStart,
-                    to: rangeEnd
-                )
+                let data = try await trace.measure("charts.text_copies") {
+                    try await coordinator.getDailyMetrics(
+                        metricType: .textCopies,
+                        from: rangeStart,
+                        to: rangeEnd
+                    )
+                }
                 return (data, (CFAbsoluteTimeGetCurrent() - startedAt) * 1000)
             }()
 
@@ -1953,17 +2043,16 @@ public class DashboardViewModel: ObservableObject {
     }
 
     /// Load storage for each day's folder
-    private func loadDailyStorageData(for days: [Date]) async throws -> [DailyDataPoint] {
+    private func loadDailyStorageData(for days: [Date], trace: DashboardLoadTrace) async throws -> [DailyDataPoint] {
         let totalStartedAt = CFAbsoluteTimeGetCurrent()
         let calendar = Calendar.current
 
         let dbEstimateStartedAt = CFAbsoluteTimeGetCurrent()
         let dbEstimates: [(date: Date, value: Int64)]
         if let firstDay = days.first, let lastDay = days.last {
-            dbEstimates = try await coordinator.getDailyDBStorageEstimatedBytes(
-                from: firstDay,
-                to: lastDay
-            )
+            dbEstimates = try await trace.measure("storage.daily_db_estimates") {
+                try await coordinator.getDailyDBStorageEstimatedBytes(from: firstDay, to: lastDay)
+            }
         } else {
             dbEstimates = []
         }
@@ -1983,7 +2072,9 @@ public class DashboardViewModel: ObservableObject {
         var dataPoints: [DailyDataPoint] = []
         for day in days {
             let dayQueryStartedAt = CFAbsoluteTimeGetCurrent()
-            let dayStorage = try await coordinator.getStorageUsedForDateRange(from: day, to: day)
+            let dayStorage = try await trace.measure("storage.day_folder.\(Int64(day.timeIntervalSince1970))") {
+                try await coordinator.getStorageUsedForDateRange(from: day, to: day)
+            }
             let dayQueryElapsedMs = elapsedMs(since: dayQueryStartedAt)
             Log.recordLatency(
                 "dashboard.query.storage_single_day_ms",

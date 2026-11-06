@@ -99,7 +99,7 @@ UI/
 │   ├── BoundingBoxOverlay.swift         # Text region highlighting
 │   ├── CrashRecoveryManager.swift       # App-side SMAppService/XPC lifecycle manager
 │   ├── SessionTimeline.swift            # App session visualization
-│   ├── DeeplinkHandler.swift            # URL scheme routing
+│   ├── DeeplinkHandler.swift            # Search, timeline, and exact dashboard date/time URL routing
 │   ├── LaunchMenuRouting.swift          # Shared dashboard/timeline/settings/system-monitor routing and frontmost-window checks for app/status menus
 │   ├── AppMetadataCache.swift           # App name/icon lookup caches and app icon view
 │   ├── FaviconProvider.swift            # Favicon memory+disk cache and favicon view
@@ -312,6 +312,25 @@ func handleURL(_ url: URL) {
 **Share functionality**:
 - Right-click result → Copy Link
 - Generates deeplink to share with others (or paste into notes)
+
+**Dashboard breakdown links**:
+
+- `retrace://dashboard` opens the dashboard and preserves the current range.
+- `retrace://dashboard?start={start}&end={end}` opens the existing app/window breakdown for that range.
+- Both bounds are required when either is supplied. Accept Unix **milliseconds**, ISO 8601 datetimes with `Z` or an explicit offset, or date-only `YYYY-MM-DD` values.
+- Exact times are preserved. A date-only start is local midnight; a date-only end is local 23:59:59, respecting daylight saving time.
+- Invalid, reversed, incomplete, or greater-than-31-calendar-day ranges are rejected.
+- Apply the range to the controller-owned dashboard model before creating the window, so cold launches do not briefly load the default range or scan all storage.
+- `launchSurfaceReveal` records dashboard deeplink entry; the existing dashboard range metrics record filter application/outcomes with source `dashboard_deeplink`.
+
+Example from another macOS app or shell:
+
+```sh
+open 'retrace://dashboard?start=2026-11-06T05:00:00-08:00&end=2026-11-06T06:10:00-08:00'
+```
+
+Use `DeeplinkHandler.generateDashboardLink(start:end:)` to generate canonical millisecond links.
+macOS URL dispatch requires an updated app bundle registered for the `retrace` scheme. For a standalone SwiftPM/dev run, use the existing `RETRACE_DEV_DEEPLINK_URL` startup hook to test routing without changing the registered release app.
 
 ### 3. Frame Viewer with Bounding Box Highlighting
 
