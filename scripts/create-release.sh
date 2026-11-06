@@ -4,16 +4,22 @@
 # =============================================================================
 # This script automates the release process:
 # 1. Builds the app (Release configuration)
-# 2. Creates a signed ZIP
-# 3. Generates the signature for Sparkle
-# 4. Updates the appcast.xml
-# 5. Outputs instructions for uploading
+# 2. Exports a Developer ID signed app
+# Packaging, notarization, Sparkle signing, and publication follow separately.
 #
 # Usage: ./scripts/create-release.sh [version]
 # Example: ./scripts/create-release.sh 1.0.1
 # =============================================================================
 
-set -e
+set -euo pipefail
+
+run_xcodebuild() {
+    if command -v xcbeautify > /dev/null 2>&1; then
+        xcodebuild "$@" | xcbeautify
+    else
+        xcodebuild "$@"
+    fi
+}
 
 # Configuration
 APP_NAME="Retrace"
@@ -131,17 +137,7 @@ echo -e "${YELLOW}Step 3: Archiving...${NC}"
 ARCHIVE_PATH="build/${APP_NAME}.xcarchive"
 rm -rf "$ARCHIVE_PATH"
 
-xcodebuild -project "$XCODE_PROJECT_PATH" \
-    -scheme Retrace \
-    -configuration Release \
-    -archivePath "$ARCHIVE_PATH" \
-    -derivedDataPath "$DERIVED_DATA_PATH" \
-    -disableAutomaticPackageResolution \
-    -onlyUsePackageVersionsFromResolvedFile \
-    clean archive \
-    "${XCODE_BUILDINFO_ARGS[@]}" \
-    CODE_SIGN_IDENTITY="Developer ID Application" \
-    | xcbeautify || xcodebuild -project "$XCODE_PROJECT_PATH" \
+run_xcodebuild -project "$XCODE_PROJECT_PATH" \
     -scheme Retrace \
     -configuration Release \
     -archivePath "$ARCHIVE_PATH" \
@@ -184,11 +180,7 @@ EXPORT_PATH="build/Build/Products/Release"
 rm -rf "$EXPORT_PATH"
 mkdir -p "$EXPORT_PATH"
 
-xcodebuild -exportArchive \
-    -archivePath "$ARCHIVE_PATH" \
-    -exportPath "$EXPORT_PATH" \
-    -exportOptionsPlist "$EXPORT_OPTIONS_PATH" \
-    | xcbeautify || xcodebuild -exportArchive \
+run_xcodebuild -exportArchive \
     -archivePath "$ARCHIVE_PATH" \
     -exportPath "$EXPORT_PATH" \
     -exportOptionsPlist "$EXPORT_OPTIONS_PATH"

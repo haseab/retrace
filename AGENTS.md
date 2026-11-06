@@ -20,6 +20,14 @@ Retrace is a local-first screen recording and search application for macOS, insp
 
 ## Project Commands
 
+### Cloudflare Accounts
+
+- Use the installed account wrappers: `wrangler personal ...` and `wrangler work ...`. Do not use bare `wrangler` commands.
+- `wrangler personal` selects the personal Cloudflare account (`hullah3000@gmail.com`); use it for Retrace's `retrace` R2 bucket and release DMG uploads.
+- `wrangler work` selects the work Cloudflare account (`haseab@f.inc`); use it for work resources, not Retrace's release bucket.
+- Verify identity and resource access with the selected wrapper, for example `wrangler personal whoami` and `wrangler personal r2 bucket list`. A successful identity check alone does not prove R2 permission.
+- Upload releases with `wrangler personal r2 object put retrace/Retrace-v<VERSION>.dmg --file=<DMG_PATH> --remote`, then verify the public artifact before deploying the appcast.
+
 ### Build & Test
 
 ```bash
@@ -57,8 +65,7 @@ retrace/
 ├── CONTRIBUTING.md              # Contribution guidelines
 ├── Package.swift                # Swift Package Manager configuration
 ├── scripts/                     # Build/release/validation scripts
-│   ├── release.sh               # End-to-end release automation
-│   ├── create-release.sh        # Release build + packaging helper
+│   ├── create-release.sh        # Signed Release archive/export helper
 │   ├── check_no_nanoseconds_sleep.sh # Guardrail for Task.sleep(nanoseconds:)
 │   ├── validate_sleep_wake_stability.sh # Sleep/wake soak validation workflow
 │   └── validate_darkwake_watchdog.sh # Automated darkwake watchdog regression validation
