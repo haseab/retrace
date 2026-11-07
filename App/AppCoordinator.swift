@@ -2974,10 +2974,31 @@ public actor AppCoordinator {
         let encoderFrameCount = await writerState.writer.frameCount
         Log.info("[FINALIZE-DEBUG] About to finalize videoDBID=\(writerState.videoDBID), writerState.frameCount=\(writerState.frameCount), encoderFrameCount=\(encoderFrameCount)", category: .app)
 
+        // Read aggregate counters before finalization deletes the temporary WAL.
+        let walManager = await services.storage.getWALManager()
+        let walVideoID = await writerState.writer.segmentID
+        let walCompression = await walManager.compressionStatistics(videoID: walVideoID)
         _ = try await writerState.writer.finalize()
         let fileSize = await writerState.writer.currentFileSize
         try await services.database.markVideoFinalized(id: writerState.videoDBID, frameCount: writerState.frameCount, fileSize: fileSize)
         Log.info("[FINALIZE-DEBUG] Marked videoDBID=\(writerState.videoDBID) as finalized with frameCount=\(writerState.frameCount), fileSize=\(fileSize) bytes", category: .app)
+
+        if let statistics = walCompression {
+            try? await recordMetricEvent(
+                metricType: .walCompression,
+                metadata: Self.metricMetadata([
+                    "codec": "lzfse", "outcome": "finalized",
+                    "frameCount": statistics.frameCount,
+                    "compressedFrameCount": statistics.compressedFrameCount,
+                    "rawBytes": statistics.rawBytes, "storedBytes": statistics.storedBytes,
+                    "compressionMilliseconds": statistics.compressionMilliseconds
+                ])
+            )
+            Log.info(
+                "[WAL-Compression] frames=\(statistics.frameCount) rawBytes=\(statistics.rawBytes) storedBytes=\(statistics.storedBytes) compressionMs=\(String(format: "%.1f", statistics.compressionMilliseconds))",
+                category: .storage
+            )
+        }
 
         // After finalization, all frames are now readable from the video file
         // Mark them as readable and enqueue for OCR processing

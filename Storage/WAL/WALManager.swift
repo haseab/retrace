@@ -1,3 +1,5 @@
+import Compression
+import CryptoKit
 import Foundation
 import Shared
 
@@ -17,15 +19,13 @@ public enum WALQuarantineDisposition: Sendable {
 
 /// Write-Ahead Log Manager for crash-safe frame persistence
 ///
-/// Writes raw captured frames to disk before video encoding, ensuring:
-/// - No data loss on crash/termination
-/// - Fast sequential writes (raw BGRA pixels)
-/// - Recovery on app restart
+/// Persists losslessly compressed BGRA frames before video encoding. Each record is
+/// independently readable for OCR and crash recovery; legacy raw records remain readable.
 ///
 /// Directory structure:
 /// {AppPaths.storageRoot}/wal/
 ///   └── active_segment_{videoID}/
-///       ├── frames.bin      # Binary: [FrameHeader|PixelData][FrameHeader|PixelData]...
+///       ├── frames.bin      # Independent versioned records (header, metadata, LZFSE pixels)
 ///       └── metadata.json   # Segment metadata (videoID, startTime, frameCount)
 public actor WALManager {
     private let walRootURL: URL
@@ -33,6 +33,10 @@ public actor WALManager {
     private var frameIDOffsetIndexCache: [Int64: WALFrameIDOffsetIndex] = [:]
     private var debugRawReadOffsetsByVideoID: [Int64: [UInt64]] = [:]
     private static let eagerReadSafetyLimitBytes: Int64 = 512 * 1024 * 1024
+    private static let maximumFrameBytes = 256 * 1024 * 1024
+    private static let recordMagic = Data("RTRCWAL2".utf8)
+    private static let recordExtensionSize = 48  // magic + codec + decoded size + SHA-256
+    private var compressionTotals: [Int64: WALCompressionTotals] = [:]
     private static let discardableQuarantinePrefix = "quarantined_segment_"
     private static let retainedQuarantinePrefix = "retained_segment_"
 
@@ -129,99 +133,72 @@ public actor WALManager {
 
     /// Append a frame to the WAL
     public func appendFrame(_ frame: CapturedFrame, to session: inout WALSession) async throws {
-        // Open file handle for appending
-        guard let fileHandle = FileHandle(forWritingAtPath: session.framesURL.path) else {
-            throw StorageError.fileWriteFailed(
-                path: session.framesURL.path,
-                underlying: "Cannot open file for appending"
-            )
+        let strings = [
+            frame.metadata.appBundleID, frame.metadata.appName,
+            frame.metadata.windowName, frame.metadata.browserURL
+        ].map { Data(($0 ?? "").utf8) }
+        guard frame.width > 0, frame.height > 0,
+            frame.timestamp.timeIntervalSince1970.isFinite,
+            frame.width <= Int(UInt32.max), frame.height <= Int(UInt32.max),
+            frame.bytesPerRow >= frame.width * 4,
+            frame.bytesPerRow <= Self.maximumFrameBytes / frame.height,
+            frame.imageData.count == frame.bytesPerRow * frame.height,
+            strings.allSatisfy({ $0.count <= Int(UInt16.max) })
+        else {
+            throw StorageError.fileWriteFailed(path: session.framesURL.path, underlying: "Invalid WAL frame dimensions or metadata")
+        }
+
+        // This actor serializes codec work. The streaming encoder has a fixed output
+        // scratch buffer and retains at most one frame's worth of compressed output.
+        let compressionStart = CFAbsoluteTimeGetCurrent()
+        let compressed = try compressPixels(frame.imageData)
+        let codec: WALPayloadCodec = compressed == nil ? .raw : .lzfse
+        let payload = compressed ?? frame.imageData
+        let compressionMs = (CFAbsoluteTimeGetCurrent() - compressionStart) * 1000
+        let header = WALFrameHeader(
+            timestamp: frame.timestamp.timeIntervalSince1970,
+            width: UInt32(frame.width), height: UInt32(frame.height),
+            bytesPerRow: UInt32(frame.bytesPerRow), dataSize: UInt32(payload.count),
+            displayID: frame.metadata.displayID,
+            appBundleIDLength: UInt16(strings[0].count), appNameLength: UInt16(strings[1].count),
+            windowNameLength: UInt16(strings[2].count), browserURLLength: UInt16(strings[3].count)
+        )
+        var headerData = Self.recordMagic
+        appendLittleEndian(codec.rawValue, to: &headerData)
+        appendLittleEndian(UInt32(frame.imageData.count), to: &headerData)
+        headerData.append(contentsOf: SHA256.hash(data: frame.imageData))
+        appendLittleEndian(header.timestamp.bitPattern, to: &headerData)
+        for value in [header.width, header.height, header.bytesPerRow, header.dataSize, header.displayID] {
+            appendLittleEndian(value, to: &headerData)
+        }
+        for string in strings { appendLittleEndian(UInt16(string.count), to: &headerData) }
+
+        let fileHandle: FileHandle
+        do {
+            fileHandle = try FileHandle(forWritingTo: session.framesURL)
+        } catch {
+            throw makeStorageWriteError(path: session.framesURL.path, error: error, fallback: "Cannot open WAL for appending")
         }
         defer { try? fileHandle.close() }
-
+        let recordOffset = try fileHandle.seekToEnd()
         do {
-            // Seek to end
-            if #available(macOS 10.15.4, *) {
-                try fileHandle.seekToEnd()
-            } else {
-                fileHandle.seekToEndOfFile()
-            }
-
-            // Write frame header + pixel data
-            let header = WALFrameHeader(
-                timestamp: frame.timestamp.timeIntervalSince1970,
-                width: UInt32(frame.width),
-                height: UInt32(frame.height),
-                bytesPerRow: UInt32(frame.bytesPerRow),
-                dataSize: UInt32(frame.imageData.count),
-                displayID: frame.metadata.displayID,
-                appBundleIDLength: UInt16(frame.metadata.appBundleID?.utf8.count ?? 0),
-                appNameLength: UInt16(frame.metadata.appName?.utf8.count ?? 0),
-                windowNameLength: UInt16(frame.metadata.windowName?.utf8.count ?? 0),
-                browserURLLength: UInt16(frame.metadata.browserURL?.utf8.count ?? 0)
-            )
-
-            // Write header
-            var headerData = Data()
-            withUnsafeBytes(of: header.timestamp) { headerData.append(contentsOf: $0) }
-            withUnsafeBytes(of: header.width) { headerData.append(contentsOf: $0) }
-            withUnsafeBytes(of: header.height) { headerData.append(contentsOf: $0) }
-            withUnsafeBytes(of: header.bytesPerRow) { headerData.append(contentsOf: $0) }
-            withUnsafeBytes(of: header.dataSize) { headerData.append(contentsOf: $0) }
-            withUnsafeBytes(of: header.displayID) { headerData.append(contentsOf: $0) }
-            withUnsafeBytes(of: header.appBundleIDLength) { headerData.append(contentsOf: $0) }
-            withUnsafeBytes(of: header.appNameLength) { headerData.append(contentsOf: $0) }
-            withUnsafeBytes(of: header.windowNameLength) { headerData.append(contentsOf: $0) }
-            withUnsafeBytes(of: header.browserURLLength) { headerData.append(contentsOf: $0) }
-
-            if #available(macOS 10.15.4, *) {
-                try fileHandle.write(contentsOf: headerData)
-            } else {
-                fileHandle.write(headerData)
-            }
-
-            // Write metadata strings
-            if let appBundleID = frame.metadata.appBundleID?.data(using: .utf8) {
-                if #available(macOS 10.15.4, *) {
-                    try fileHandle.write(contentsOf: appBundleID)
-                } else {
-                    fileHandle.write(appBundleID)
-                }
-            }
-            if let appName = frame.metadata.appName?.data(using: .utf8) {
-                if #available(macOS 10.15.4, *) {
-                    try fileHandle.write(contentsOf: appName)
-                } else {
-                    fileHandle.write(appName)
-                }
-            }
-            if let windowName = frame.metadata.windowName?.data(using: .utf8) {
-                if #available(macOS 10.15.4, *) {
-                    try fileHandle.write(contentsOf: windowName)
-                } else {
-                    fileHandle.write(windowName)
-                }
-            }
-            if let browserURL = frame.metadata.browserURL?.data(using: .utf8) {
-                if #available(macOS 10.15.4, *) {
-                    try fileHandle.write(contentsOf: browserURL)
-                } else {
-                    fileHandle.write(browserURL)
-                }
-            }
-
-            // Write pixel data
-            if #available(macOS 10.15.4, *) {
-                try fileHandle.write(contentsOf: frame.imageData)
-            } else {
-                fileHandle.write(frame.imageData)
-            }
+            try fileHandle.write(contentsOf: headerData)
+            for string in strings { try fileHandle.write(contentsOf: string) }
+            try fileHandle.write(contentsOf: payload)
         } catch {
-            throw makeStorageWriteError(
-                path: session.framesURL.path,
-                error: error,
-                fallback: "Failed to append frame to WAL"
-            )
+            // A failed append must not strand a partial record before the next append.
+            // A process crash still leaves a recoverable prefix, as with legacy WALs.
+            try? fileHandle.truncate(atOffset: recordOffset)
+            frameOffsetIndexCache.removeValue(forKey: session.videoID.value)
+            throw makeStorageWriteError(path: session.framesURL.path, error: error, fallback: "Failed to append frame to WAL")
         }
+        var totals = compressionTotals[session.videoID.value, default: WALCompressionTotals()]
+        totals.frameCount += 1
+        totals.compressedFrameCount += codec == .lzfse ? 1 : 0
+        totals.rawBytes += Int64(frame.imageData.count)
+        totals.storedBytes += Int64(headerData.count + strings.reduce(0) { $0 + $1.count } + payload.count)
+        totals.compressionMilliseconds += compressionMs
+        compressionTotals[session.videoID.value] = totals
 
         // Update session metadata
         session.metadata.frameCount += 1
@@ -401,6 +378,7 @@ public actor WALManager {
 
         frameOffsetIndexCache.removeAll()
         frameIDOffsetIndexCache.removeAll()
+        compressionTotals.removeAll()
     }
 
     /// Delete discardable quarantined WAL sessions older than the provided cutoff date.
@@ -501,7 +479,21 @@ public actor WALManager {
                     category: .storage
                 )
 
-                if let rebuiltMetadata = try rebuildMetadata(videoID: videoID, framesURL: framesURL) {
+                let rebuiltMetadata: WALMetadata?
+                let quarantineReason: String
+                do {
+                    rebuiltMetadata = try rebuildMetadata(videoID: videoID, framesURL: framesURL)
+                    quarantineReason = "Corrupted metadata and no recoverable WAL frames"
+                } catch {
+                    // A complete but unsupported/corrupt record is not a truncated
+                    // tail. Retain this directory without blocking healthy sessions
+                    // or allowing its parse failure to prevent recording startup.
+                    rebuiltMetadata = nil
+                    quarantineReason = "Cannot rebuild WAL metadata: \(error.localizedDescription)"
+                    Log.warning("[WAL] Retaining session \(videoID.value): \(quarantineReason)", category: .storage)
+                }
+
+                if let rebuiltMetadata {
                     do {
                         try saveMetadata(rebuiltMetadata, to: dir)
                     } catch {
@@ -526,7 +518,7 @@ public actor WALManager {
                     do {
                         _ = try await quarantineSession(
                             placeholderSession,
-                            reason: "Corrupted metadata and no recoverable WAL frames",
+                            reason: quarantineReason,
                             disposition: .retained
                         )
                     } catch {
@@ -551,7 +543,7 @@ public actor WALManager {
         return sessions
     }
 
-    /// Returns the current size of a WAL session's raw frames file.
+    /// Returns the current size of a WAL session's stored frame records.
     public func framesFileSize(for session: WALSession) async throws -> Int64 {
         guard FileManager.default.fileExists(atPath: session.framesURL.path) else {
             throw StorageError.fileNotFound(path: session.framesURL.path)
@@ -703,8 +695,7 @@ public actor WALManager {
         }
 
         try FileManager.default.moveItem(at: session.sessionDir, to: destinationURL)
-        frameOffsetIndexCache.removeValue(forKey: session.videoID.value)
-        frameIDOffsetIndexCache.removeValue(forKey: session.videoID.value)
+        clearSessionCaches(videoIDValue: session.videoID.value)
 
         Log.warning(
             "[WAL] \(disposition.logLabel) session \(session.videoID.value) to \(destinationURL.lastPathComponent): \(reason)",
@@ -714,8 +705,12 @@ public actor WALManager {
         return destinationURL
     }
 
-    /// Read all frames from a WAL session
-    public func readFrames(from session: WALSession) async throws -> [CapturedFrame] {
+    /// Read all frames only when their decoded pixels fit the requested budget.
+    /// The maximum eager-read budget is 512 MiB; single-frame reads do not load the backlog.
+    public func readFrames(
+        from session: WALSession,
+        maximumDecodedBytes: Int64 = 512 * 1024 * 1024
+    ) async throws -> [CapturedFrame] {
         let fileSize = try await framesFileSize(for: session)
         if fileSize > Self.eagerReadSafetyLimitBytes {
             throw StorageError.fileReadFailed(
@@ -729,6 +724,24 @@ public actor WALManager {
             framesURL: session.framesURL,
             currentFileSize: fileSize
         )
+        // A small compressed file can expand to gigabytes. Inspect headers before
+        // materializing any pixels, and allow callers to choose a smaller budget.
+        let budget = min(maximumDecodedBytes, Self.eagerReadSafetyLimitBytes)
+        let handle = try FileHandle(forReadingFrom: session.framesURL)
+        defer { try? handle.close() }
+        var decodedBytes: Int64 = 0
+        for offset in offsets {
+            try handle.seek(toOffset: offset)
+            guard let record = try readRecordHeader(fileHandle: handle, path: session.framesURL.path),
+                Int64(record.decodedSize) <= budget - decodedBytes
+            else {
+                throw StorageError.fileReadFailed(
+                    path: session.framesURL.path,
+                    underlying: "WAL session too large for eager read (decoded byte budget \(budget))"
+                )
+            }
+            decodedBytes += Int64(record.decodedSize)
+        }
         var frames: [CapturedFrame] = []
         frames.reserveCapacity(offsets.count)
         for offset in offsets {
@@ -809,6 +822,104 @@ public actor WALManager {
 
     private static let headerSize = 36
     private static let frameIDMapRecordSize = MemoryLayout<Int64>.size + MemoryLayout<UInt64>.size
+
+    /// Aggregate once per segment, rather than adding per-frame database/log writes.
+    public func compressionStatistics(videoID: VideoSegmentID) -> (
+        frameCount: Int, compressedFrameCount: Int, rawBytes: Int64,
+        storedBytes: Int64, compressionMilliseconds: Double
+    )? {
+        guard let totals = compressionTotals[videoID.value] else { return nil }
+        return (
+            totals.frameCount, totals.compressedFrameCount, totals.rawBytes,
+            totals.storedBytes, totals.compressionMilliseconds
+        )
+    }
+
+    private func appendLittleEndian<T: FixedWidthInteger>(_ value: T, to data: inout Data) {
+        var value = value.littleEndian
+        withUnsafeBytes(of: &value) { data.append(contentsOf: $0) }
+    }
+
+    /// Returns nil when storing the original is smaller. Never retain output larger
+    /// than the source, and never write an uncompressed intermediate to disk.
+    private func compressPixels(_ pixels: Data) throws -> Data? {
+        let chunkSize = 64 * 1024
+        let output = UnsafeMutablePointer<UInt8>.allocate(capacity: chunkSize)
+        defer { output.deallocate() }
+        var stream = compression_stream(dst_ptr: output, dst_size: 0, src_ptr: output, src_size: 0, state: nil)
+        guard compression_stream_init(&stream, COMPRESSION_STREAM_ENCODE, COMPRESSION_LZFSE) != COMPRESSION_STATUS_ERROR else {
+            throw StorageError.fileWriteFailed(path: "WAL compression", underlying: "Cannot initialize LZFSE encoder")
+        }
+        defer { compression_stream_destroy(&stream) }
+        return try pixels.withUnsafeBytes { input in
+            stream.src_ptr = input.bindMemory(to: UInt8.self).baseAddress!
+            stream.src_size = pixels.count
+            var compressed = Data()
+            while true {
+                stream.dst_ptr = output
+                stream.dst_size = chunkSize
+                let previousInputSize = stream.src_size
+                let status = compression_stream_process(&stream, Int32(COMPRESSION_STREAM_FINALIZE.rawValue))
+                let produced = chunkSize - stream.dst_size
+                guard status != COMPRESSION_STATUS_ERROR else {
+                    throw StorageError.fileWriteFailed(path: "WAL compression", underlying: "LZFSE encoding failed")
+                }
+                if produced >= pixels.count - compressed.count { return nil }
+                compressed.append(output, count: produced)
+                if status == COMPRESSION_STATUS_END { return compressed }
+                guard produced > 0 || stream.src_size < previousInputSize else {
+                    throw StorageError.fileWriteFailed(path: "WAL compression", underlying: "LZFSE encoder made no progress")
+                }
+            }
+        }
+    }
+
+    /// V2 is self-describing in frames.bin, so loss of metadata.json cannot erase
+    /// the codec/version. Per-record framing also allows legacy and V2 records together.
+    private func readRecordHeader(fileHandle: FileHandle, path: String) throws -> WALRecordHeader? {
+        guard let prefix = try fileHandle.read(upToCount: 8), !prefix.isEmpty else { return nil }
+        guard prefix.count == 8 else {
+            throw StorageError.fileReadFailed(path: path, underlying: "Incomplete WAL record prefix")
+        }
+        let record: WALRecordHeader
+        if prefix == Self.recordMagic {
+            let ext = try readExact(fileHandle: fileHandle, count: Self.recordExtensionSize - 8, path: path, label: "V2 record extension")
+            let codecValue = ext.withUnsafeBytes { UInt32(littleEndian: $0.loadUnaligned(as: UInt32.self)) }
+            guard let codec = WALPayloadCodec(rawValue: codecValue) else {
+                throw StorageError.fileReadFailed(path: path, underlying: "Unsupported WAL payload codec \(codecValue)")
+            }
+            let decodedSize = ext.withUnsafeBytes { UInt32(littleEndian: $0.loadUnaligned(fromByteOffset: 4, as: UInt32.self)) }
+            let header = try parseFrameHeader(
+                from: readExact(
+                    fileHandle: fileHandle, count: Self.headerSize, path: path, label: "V2 frame header"
+                ))
+            record = WALRecordHeader(
+                frame: header, codec: codec, decodedSize: decodedSize,
+                checksum: Data(ext[8..<40]), headerByteCount: Self.headerSize + Self.recordExtensionSize
+            )
+        } else {
+            var data = prefix
+            data.append(try readExact(fileHandle: fileHandle, count: Self.headerSize - 8, path: path, label: "legacy frame header"))
+            let header = try parseFrameHeader(from: data)
+            record = WALRecordHeader(
+                frame: header, codec: .raw, decodedSize: header.dataSize, checksum: nil, headerByteCount: Self.headerSize)
+        }
+        let header = record.frame
+        let expectedSize = UInt64(header.bytesPerRow) * UInt64(header.height)
+        let payloadSizeIsValid =
+            record.codec == .raw
+            ? header.dataSize == record.decodedSize : header.dataSize < record.decodedSize
+        guard header.timestamp.isFinite, header.width > 0, header.height > 0,
+            UInt64(header.bytesPerRow) >= UInt64(header.width) * 4,
+            expectedSize > 0, expectedSize <= UInt64(Self.maximumFrameBytes),
+            expectedSize == UInt64(record.decodedSize),
+            header.dataSize > 0, header.dataSize <= Self.maximumFrameBytes,
+            payloadSizeIsValid
+        else {
+            throw StorageError.fileReadFailed(path: path, underlying: "Invalid WAL frame size or dimensions")
+        }
+        return record
+    }
 
     private func metadataNeedsRepair(_ metadata: WALMetadata) -> Bool {
         guard metadata.width > 0, metadata.height > 0, metadata.frameCount > 0 else {
@@ -1091,34 +1202,24 @@ public actor WALManager {
         var offsets: [UInt64] = []
         let fileSize = UInt64(max(0, currentFileSize))
 
-        while true {
+        while currentOffset(fileHandle: fileHandle) < fileSize {
             let frameOffset = currentOffset(fileHandle: fileHandle)
-            guard let headerData = try? fileHandle.read(upToCount: Self.headerSize), !headerData.isEmpty else {
+            let record: WALRecordHeader
+            do {
+                guard let parsed = try readRecordHeader(fileHandle: fileHandle, path: framesURL.path) else { break }
+                record = parsed
+            } catch StorageError.fileReadFailed(_, let reason) where reason.hasPrefix("Incomplete ") {
+                // Only incomplete writes are a recoverable tail. Unknown codecs or
+                // malformed complete headers must propagate so recovery retains
+                // the session instead of deleting data it doesn't understand.
+                Log.warning("[WAL] Ignoring truncated frame header at offset \(frameOffset): \(reason)", category: .storage)
                 break
             }
-            guard headerData.count == Self.headerSize else {
-                Log.warning(
-                    "[WAL] Ignoring truncated frame header while indexing \(framesURL.lastPathComponent) at offset \(frameOffset)",
-                    category: .storage
-                )
-                break
-            }
-
-            let header = try parseFrameHeader(from: headerData)
-            let metadataBytes = Int(header.appBundleIDLength)
-                + Int(header.appNameLength)
-                + Int(header.windowNameLength)
-                + Int(header.browserURLLength)
-            let payloadBytes = metadataBytes + Int(header.dataSize)
-            let nextOffset = frameOffset + UInt64(Self.headerSize + payloadBytes)
+            let nextOffset = frameOffset + UInt64(record.headerByteCount + record.metadataByteCount) + UInt64(record.frame.dataSize)
             guard nextOffset <= fileSize else {
-                Log.warning(
-                    "[WAL] Ignoring truncated frame payload while indexing \(framesURL.lastPathComponent) at offset \(frameOffset)",
-                    category: .storage
-                )
+                Log.warning("[WAL] Ignoring truncated frame payload at offset \(frameOffset)", category: .storage)
                 break
             }
-
             offsets.append(frameOffset)
             try seek(fileHandle: fileHandle, toOffset: nextOffset)
         }
@@ -1200,13 +1301,10 @@ public actor WALManager {
 
         try seek(fileHandle: fileHandle, toOffset: frameOffset)
 
-        let headerData = try readExact(
-            fileHandle: fileHandle,
-            count: Self.headerSize,
-            path: framesURL.path,
-            label: "frame header at offset \(frameOffset)"
-        )
-        let header = try parseFrameHeader(from: headerData)
+        guard let record = try readRecordHeader(fileHandle: fileHandle, path: framesURL.path) else {
+            throw StorageError.fileReadFailed(path: framesURL.path, underlying: "Missing WAL frame header")
+        }
+        let header = record.frame
 
         let appBundleID = try readOptionalString(
             fileHandle: fileHandle,
@@ -1233,12 +1331,36 @@ public actor WALManager {
             label: "browserURL"
         )
 
-        let pixelData = try readExact(
-            fileHandle: fileHandle,
-            count: Int(header.dataSize),
-            path: framesURL.path,
-            label: "pixel data at offset \(frameOffset)"
+        let payload = try readExact(
+            fileHandle: fileHandle, count: Int(header.dataSize),
+            path: framesURL.path, label: "pixel data at offset \(frameOffset)"
         )
+        let pixelData: Data
+        switch record.codec {
+        case .raw:
+            pixelData = payload
+        case .lzfse:
+            // The extra byte detects streams that expand beyond the declared size.
+            // Validate dimensions/decoded length before allocating the destination.
+            var decoded = Data(count: Int(record.decodedSize) + 1)
+            let decodedCount = decoded.withUnsafeMutableBytes { destination in
+                payload.withUnsafeBytes { source in
+                    compression_decode_buffer(
+                        destination.bindMemory(to: UInt8.self).baseAddress!, destination.count,
+                        source.bindMemory(to: UInt8.self).baseAddress!, source.count,
+                        nil, COMPRESSION_LZFSE
+                    )
+                }
+            }
+            guard decodedCount == Int(record.decodedSize) else {
+                throw StorageError.fileReadFailed(path: framesURL.path, underlying: "Corrupt LZFSE frame or decoded size mismatch")
+            }
+            decoded.removeLast()
+            pixelData = decoded
+        }
+        if let checksum = record.checksum, Data(SHA256.hash(data: pixelData)) != checksum {
+            throw StorageError.fileReadFailed(path: framesURL.path, underlying: "WAL frame checksum mismatch")
+        }
 
         return CapturedFrame(
             timestamp: Date(timeIntervalSince1970: header.timestamp),
@@ -1290,6 +1412,7 @@ public actor WALManager {
     }
 
     private func clearSessionCaches(videoIDValue: Int64) {
+        compressionTotals.removeValue(forKey: videoIDValue)
         frameOffsetIndexCache.removeValue(forKey: videoIDValue)
         frameIDOffsetIndexCache.removeValue(forKey: videoIDValue)
     }
@@ -1348,13 +1471,8 @@ public actor WALManager {
         defer { try? fileHandle.close() }
 
         try seek(fileHandle: fileHandle, toOffset: firstOffset)
-        let headerData = try readExact(
-            fileHandle: fileHandle,
-            count: Self.headerSize,
-            path: framesURL.path,
-            label: "frame header during metadata rebuild"
-        )
-        let header = try parseFrameHeader(from: headerData)
+        guard let record = try readRecordHeader(fileHandle: fileHandle, path: framesURL.path) else { return nil }
+        let header = record.frame
 
         return WALMetadata(
             videoID: videoID,
@@ -1427,7 +1545,7 @@ public actor WALManager {
 
         var offset = 0
 
-        func read<T>(_ type: T.Type) throws -> T {
+        func read<T: FixedWidthInteger>(_ type: T.Type) throws -> T {
             let size = MemoryLayout<T>.size
             // Bounds check to prevent crash on corrupted data
             guard offset + size <= data.count else {
@@ -1436,13 +1554,13 @@ public actor WALManager {
                     underlying: "Out of bounds read at offset \(offset) for \(size) bytes (data size: \(data.count))"
                 )
             }
-            let value = data.withUnsafeBytes { $0.load(fromByteOffset: offset, as: type) }
+            let value = data.withUnsafeBytes { T(littleEndian: $0.loadUnaligned(fromByteOffset: offset, as: type)) }
             offset += size
             return value
         }
 
         return WALFrameHeader(
-            timestamp: try read(Double.self),
+            timestamp: Double(bitPattern: try read(UInt64.self)),
             width: try read(UInt32.self),
             height: try read(UInt32.self),
             bytesPerRow: try read(UInt32.self),
@@ -1542,7 +1660,7 @@ private struct WALFrameHeader {
     let width: UInt32              // 4 bytes
     let height: UInt32             // 4 bytes
     let bytesPerRow: UInt32        // 4 bytes
-    let dataSize: UInt32           // 4 bytes - pixel data size
+    let dataSize: UInt32  // 4 bytes - stored payload size (compressed in V2)
     let displayID: UInt32          // 4 bytes
     let appBundleIDLength: UInt16  // 2 bytes
     let appNameLength: UInt16      // 2 bytes
@@ -1550,7 +1668,33 @@ private struct WALFrameHeader {
     let browserURLLength: UInt16   // 2 bytes
     // Total: 36 bytes (8+20+8)
     // Followed by: appBundleID, appName, windowName, browserURL (UTF-8 strings)
-    // Followed by: pixel data (dataSize bytes)
+    // Followed by: stored pixel payload (dataSize bytes)
+}
+
+private enum WALPayloadCodec: UInt32 {
+    case raw = 0
+    case lzfse = 1
+}
+
+private struct WALRecordHeader {
+    let frame: WALFrameHeader
+    let codec: WALPayloadCodec
+    let decodedSize: UInt32
+    let checksum: Data?
+    let headerByteCount: Int
+
+    var metadataByteCount: Int {
+        Int(frame.appBundleIDLength) + Int(frame.appNameLength)
+            + Int(frame.windowNameLength) + Int(frame.browserURLLength)
+    }
+}
+
+private struct WALCompressionTotals {
+    var frameCount = 0
+    var compressedFrameCount = 0
+    var rawBytes: Int64 = 0
+    var storedBytes: Int64 = 0
+    var compressionMilliseconds: Double = 0
 }
 
 private struct WALFrameOffsetIndex {
