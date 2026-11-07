@@ -2,7 +2,7 @@
 
 You are responsible for the **Storage** module of Retrace. Your job is to implement file storage operations including video segment writing, encryption/decryption, and disk space management.
 
-**Status**: ✅ HEVC encoding working with VideoToolbox hardware acceleration. **Not yet optimized** - currently using ~50-70GB/month vs target of ~15-20GB/month. **Apple Silicon required** for hardware HEVC encoding. No audio segment storage yet.
+**Status**: ✅ HEVC encoding with VideoToolbox hardware acceleration and per-frame lossless LZFSE recovery journals. Legacy raw WAL records remain readable. **Apple Silicon required** for hardware HEVC encoding. No audio segment storage yet.
 
 ## Your Directory
 
@@ -10,20 +10,24 @@ You are responsible for the **Storage** module of Retrace. Your job is to implem
 Storage/
 ├── GeneratorCachePolicy.swift   # Shared idle/LRU eviction policy for AVAsset generator caches
 ├── StorageManager.swift         # Main StorageProtocol implementation
+├── ImageExtractor.swift         # Frame extraction and AVAsset generator caches
+├── IncrementalSegmentWriter.swift # WAL-first recording and video finalization
 ├── SegmentWriterImpl.swift      # SegmentWriter implementation
-├── Encryption/
-│   ├── EncryptionManager.swift  # AES-256-GCM encryption
-│   └── KeychainHelper.swift     # Keychain key storage
+├── StorageModuleError.swift     # Storage-local errors
 ├── FileManager/
 │   ├── DirectoryManager.swift   # Directory structure management
 │   └── StorageHealthMonitor.swift # Disk space + I/O + volume health monitoring
 ├── VideoEncoder/
 │   ├── HEVCEncoder.swift        # VideoToolbox HEVC encoding
 │   └── FrameConverter.swift     # Pixel format conversion
+├── WAL/
+│   ├── WALManager.swift         # Versioned lossless/raw records, checksums, random reads, decoded byte limits
+│   └── RecoveryManager.swift    # Crash recovery and durable video-prefix reuse
 └── Tests/
+    ├── DirectoryManagerTests.swift
     ├── StorageManagerTests.swift
-    ├── EncryptionTests.swift
-    └── HEVCEncoderTests.swift
+    ├── HEVCEncoderTests.swift
+    └── TestLogger.swift
 ```
 
 ## Protocols You Must Implement
@@ -45,21 +49,23 @@ Location: `AppPaths.storageRoot` (default: `~/Library/Application Support/Retrac
 
 ```
 {storageRoot}/
-├── config.json                    # App configuration
 ├── retrace.db                     # SQLite database (owned by DATABASE)
-├── segments/
-│   ├── 2024/
-│   │   ├── 01/
-│   │   │   ├── 15/
-│   │   │   │   ├── segment_abc123.hevc.enc  # Encrypted video
-│   │   │   │   └── segment_def456.hevc.enc
-│   │   │   └── 16/
-│   │   │       └── ...
-│   │   └── 02/
-│   │       └── ...
-│   └── ...
-└── temp/                          # Temporary files during encoding
+├── chunks/YYYYMM/DD/{videoID}      # HEVC MP4 video files
+├── wal/active_segment_{videoID}/
+│   ├── frames.bin                 # Independently compressed image records
+│   ├── frame_id_map.bin           # Database frame ID -> record offset
+│   └── metadata.json              # Recoverable segment metadata and durable frontier
+└── temp/                          # Temporary files
 ```
+
+### WAL format and memory rules
+
+- New records begin with `RTRCWAL2`, a UInt32 codec (0 = raw fallback, 1 = LZFSE), a UInt32 decoded size, and a 32-byte SHA-256 pixel digest. The existing 36-byte frame header, metadata strings, and stored payload follow. Integers use little-endian encoding.
+- Records are independent. Index scans skip payloads, while OCR/recovery decode one frame at a time. Loss of `metadata.json` must not prevent format detection or recovery.
+- Preserve legacy raw record support, exact row stride/padding, and frame-ID offset mappings. Never silently fall back to a different frame index when an ID mapping is missing.
+- Compression runs serially on the WAL actor with a 64 KiB output scratch buffer. Incompressible images use a checksummed raw fallback without writing an intermediate raw copy.
+- Validate decoded sizes against dimensions and the 256 MiB per-frame bound before allocating. Eager reads must enforce the decoded byte budget (512 MiB maximum), regardless of compressed file size.
+- Aggregate compression statistics once per finalized segment; do not add per-frame metrics/log writes.
 
 ## Key Implementation Details
 

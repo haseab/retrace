@@ -114,6 +114,10 @@ public enum DailyMetricsQueries {
         case feedbackReportExport = "feedback_report_export"  // metadata: JSON {outcome, source, feedbackType, includeLogs, includeScreenshot, exportedFileCount}
         case watchdogCrashBannerAction = "watchdog_crash_banner_action"  // metadata: JSON {action, fileName, reportAgeSeconds}
         case walFailureBannerAction = "wal_failure_banner_action"  // metadata: JSON {action, fileName, reportAgeSeconds}
+        // One aggregate per finalized recording segment. storedBytes includes record headers;
+        // rawBytes counts the original pixel bytes, excluding metadata sidecars and ID maps.
+        // metadata: JSON {codec, outcome, frameCount, compressedFrameCount, rawBytes, storedBytes, compressionMilliseconds}
+        case walCompression = "wal_compression"
         case unexpectedRecordingStopAction = "unexpected_recording_stop_action"  // metadata: JSON {action, reason, ...}
         case storageHealthBannerAction = "storage_health_banner_action"  // metadata: JSON {action, severity, availableGB, shouldStop}
         case crashRecoveryApprovalBannerAction = "crash_recovery_approval_banner_action"  // metadata: JSON {action, status}
