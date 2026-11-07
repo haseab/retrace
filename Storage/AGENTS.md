@@ -63,6 +63,7 @@ Location: `AppPaths.storageRoot` (default: `~/Library/Application Support/Retrac
 - New records begin with `RTRCWAL2`, a UInt32 codec (0 = raw fallback, 1 = LZFSE), a UInt32 decoded size, and a 32-byte SHA-256 pixel digest. The existing 36-byte frame header, metadata strings, and stored payload follow. Integers use little-endian encoding.
 - Records are independent. Index scans skip payloads, while OCR/recovery decode one frame at a time. Loss of `metadata.json` must not prevent format detection or recovery.
 - Preserve legacy raw record support, exact row stride/padding, and frame-ID offset mappings. Never silently fall back to a different frame index when an ID mapping is missing.
+- Isolate metadata rebuild failures per session. Retain/quarantine unsupported or corrupt journals without deleting their bytes or blocking healthy recovery and recording startup.
 - Compression runs serially on the WAL actor with a 64 KiB output scratch buffer. Incompressible images use a checksummed raw fallback without writing an intermediate raw copy.
 - Validate decoded sizes against dimensions and the 256 MiB per-frame bound before allocating. Eager reads must enforce the decoded byte budget (512 MiB maximum), regardless of compressed file size.
 - Aggregate compression statistics once per finalized segment; do not add per-frame metrics/log writes.

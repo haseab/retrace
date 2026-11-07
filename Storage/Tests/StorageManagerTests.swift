@@ -1139,6 +1139,56 @@ final class StorageManagerTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: session.framesURL.path))
     }
 
+    func testWALMalformedJournalWithMissingOrStaleMetadataDoesNotBlockHealthyRecovery() async throws {
+        let root = makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let manager = WALManager(walRoot: root)
+        let frame = try makeWALScreenshotFrame()
+        var damagedRecords: [Int64: Data] = [:]
+        for (index, offset) in [UInt64(8), 8, 56, 56].enumerated() {
+            var session = try await manager.createSession(videoID: VideoSegmentID(value: Int64(410 + index)))
+            try await manager.appendFrame(frame, to: &session)
+            let handle = try FileHandle(forWritingTo: session.framesURL)
+            try handle.seek(toOffset: offset)
+            try handle.write(contentsOf: Data(repeating: 0xFF, count: 4))
+            try handle.close()
+            damagedRecords[session.videoID.value] = try Data(contentsOf: session.framesURL)
+            let metadataURL = session.sessionDir.appendingPathComponent("metadata.json")
+            if index.isMultiple(of: 2) {
+                try FileManager.default.removeItem(at: metadataURL)
+            } else {
+                var staleMetadata = session.metadata
+                staleMetadata.width = 0
+                staleMetadata.height = 0
+                let encoder = JSONEncoder()
+                encoder.dateEncodingStrategy = .iso8601
+                try encoder.encode(staleMetadata).write(to: metadataURL)
+            }
+        }
+        var healthy = try await manager.createSession(videoID: VideoSegmentID(value: 420))
+        try await manager.appendFrame(frame, to: &healthy)
+
+        let listed = try await manager.listActiveSessions()
+        XCTAssertEqual(listed.map(\.videoID), [healthy.videoID])
+        let retained = try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
+        for (videoID, expectedBytes) in damagedRecords {
+            let directory = try XCTUnwrap(retained.first { $0.lastPathComponent.hasPrefix("retained_segment_\(videoID)_") })
+            XCTAssertEqual(try Data(contentsOf: directory.appendingPathComponent("frames.bin")), expectedBytes)
+        }
+
+        let database = try await makeDatabase(name: "malformed_wal_isolation")
+        let storage = RecoveryTestStorage(
+            writerPlans: [.init(failAfter: nil)],
+            existingFrameCounts: [healthy.videoID.value: 0],
+            validVideoIDs: [healthy.videoID.value]
+        )
+        let recovery = makeRecoveryManager(walManager: manager, storage: storage, database: database)
+        let result = try await recovery.recoverAll()
+        XCTAssertEqual(result.sessionsRecovered, 1)
+        XCTAssertEqual(result.framesRecovered, 1)
+        try await database.close()
+    }
+
     func testWALIncompressiblePixelsUseChecksummedRawFallback() async throws {
         let root = makeTempRoot()
         defer { try? FileManager.default.removeItem(at: root) }

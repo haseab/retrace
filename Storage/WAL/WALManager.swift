@@ -479,7 +479,21 @@ public actor WALManager {
                     category: .storage
                 )
 
-                if let rebuiltMetadata = try rebuildMetadata(videoID: videoID, framesURL: framesURL) {
+                let rebuiltMetadata: WALMetadata?
+                let quarantineReason: String
+                do {
+                    rebuiltMetadata = try rebuildMetadata(videoID: videoID, framesURL: framesURL)
+                    quarantineReason = "Corrupted metadata and no recoverable WAL frames"
+                } catch {
+                    // A complete but unsupported/corrupt record is not a truncated
+                    // tail. Retain this directory without blocking healthy sessions
+                    // or allowing its parse failure to prevent recording startup.
+                    rebuiltMetadata = nil
+                    quarantineReason = "Cannot rebuild WAL metadata: \(error.localizedDescription)"
+                    Log.warning("[WAL] Retaining session \(videoID.value): \(quarantineReason)", category: .storage)
+                }
+
+                if let rebuiltMetadata {
                     do {
                         try saveMetadata(rebuiltMetadata, to: dir)
                     } catch {
@@ -504,7 +518,7 @@ public actor WALManager {
                     do {
                         _ = try await quarantineSession(
                             placeholderSession,
-                            reason: "Corrupted metadata and no recoverable WAL frames",
+                            reason: quarantineReason,
                             disposition: .retained
                         )
                     } catch {
