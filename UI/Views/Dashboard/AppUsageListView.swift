@@ -462,7 +462,7 @@ struct AppUsageListView: View {
             onWindowTapped?(app, window)
         }
         .contextMenu {
-            DashboardUsageMenu(target: .tab(app: app, window: window), onAction: onUsageAction)
+            DashboardUsageMenu(target: .window(app: app, window: window), onAction: onUsageAction)
         }
     }
 
@@ -600,7 +600,7 @@ struct AppUsageListView: View {
         }
         .contextMenu {
             DashboardUsageMenu(
-                target: window.isWebsite ? .website(app: app, domain: window.displayName) : .tab(app: app, window: window),
+                target: window.isWebsite ? .website(app: app, domain: window.displayName) : .window(app: app, window: window),
                 onAction: onUsageAction
             )
         }

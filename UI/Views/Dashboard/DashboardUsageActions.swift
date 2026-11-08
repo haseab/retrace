@@ -10,7 +10,12 @@ enum DashboardUsageAction: String, Sendable {
 
 /// Retains the actual grouping keys, never a cleaned display title or substring filter.
 struct DashboardUsageTarget: Sendable {
-    enum Scope: Sendable { case app, website(String), tab(title: String?, url: String?) }
+    enum Scope: Sendable {
+        case app
+        case website(String)
+        case tab(title: String?, url: String?)
+        case window(title: String?, withoutWebsite: Bool)
+    }
     let bundleID: String
     let name: String
     let scope: Scope
@@ -25,6 +30,11 @@ struct DashboardUsageTarget: Sendable {
 
     static func tab(app: AppUsageData, window: WindowUsageData) -> Self {
         Self(bundleID: app.appBundleID, name: window.displayName, scope: .tab(title: window.windowName, url: window.browserUrl))
+    }
+
+    static func window(app: AppUsageData, window: WindowUsageData) -> Self {
+        Self(bundleID: app.appBundleID, name: window.displayName,
+             scope: .window(title: window.windowName, withoutWebsite: app.isBrowser))
     }
 
     func matches(_ frame: FrameReference) -> Bool {
@@ -44,6 +54,9 @@ struct DashboardUsageTarget: Sendable {
             return authority == domain
         case .tab(let title, let url):
             return frame.metadata.windowName == title && frame.metadata.browserURL == url
+        case .window(let title, let withoutWebsite):
+            return frame.metadata.windowName == title &&
+                (!withoutWebsite || frame.metadata.browserURL?.isEmpty != false)
         }
     }
 }
@@ -109,7 +122,7 @@ struct DashboardUsageConfirmationView: View {
                 HStack { ProgressView().controlSize(.small); Text("Finding matching segments…") }
             } else if let plan {
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("\(plan.segmentIDs.count) segments · \(plan.frames.count) frames")
+                    Text("\(plan.segmentIDs.count) segments · \(plan.frames.count) frames in range")
                         .font(.retraceCalloutBold)
                     Text("\(plan.start.formatted(date: .abbreviated, time: .standard)) – \(plan.end.formatted(date: .abbreviated, time: .standard))")
                         .font(.retraceCaption).foregroundColor(.retraceSecondary)
@@ -118,7 +131,7 @@ struct DashboardUsageConfirmationView: View {
                 .background(Color.white.opacity(0.04), in: RoundedRectangle(cornerRadius: 10))
 
                 Text(request.action == .hide
-                    ? "Hide these entire segments from the dashboard, timeline, and search. Segments crossing the selected date range will also be hidden outside that range. Your recordings are preserved. Restore them using the timeline’s Hidden filter and Unhide action."
+                    ? "Hide these entire segments from the dashboard, timeline, and search. Segments crossing this date range are hidden in full, including new frames if a segment is still active. Your recordings are preserved. Restore them using the timeline’s Hidden filter and Unhide action."
                     : "Permanently delete matching recorded frames within this date range. This cannot be undone. Recordings still being encoded will be queued for deletion. This does not stop future recording.")
                     .font(.retraceCaption).foregroundColor(.retraceSecondary)
                 Text("Applies to this app only. Already hidden segments and Rewind recordings are excluded.")

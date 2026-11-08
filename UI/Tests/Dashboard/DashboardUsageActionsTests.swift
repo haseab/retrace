@@ -97,6 +97,28 @@ final class DashboardUsageActionsTests: XCTestCase {
         XCTAssertTrue(remaining.contains { $0.metadata.appBundleID == "com.apple.Safari" })
     }
 
+    func testWindowFallbacksAndWebsitePortsMatchDashboardGroups() async throws {
+        let (model, _, database, start) = try await fixture()
+        let rows: [(String, String?, String)] = [
+            ("com.google.Chrome", "", "Same title"),
+            ("com.google.Chrome", "https://example.com:8443/a", "Same title"),
+            ("com.editor", "https://example.com/a", "Editor"),
+            ("com.editor", "https://example.com/b", "Editor")
+        ]
+        for (bundleID, url, title) in rows {
+            let id = try await database.insertSegment(bundleID: bundleID, startDate: start, endDate: start.addingTimeInterval(10), windowName: title, browserUrl: url, type: 0)
+            _ = try await database.insertFrame(FrameReference(id: FrameID(value: 0), timestamp: start.addingTimeInterval(6), segmentID: AppSegmentID(value: id), frameIndexInSegment: 0, metadata: FrameMetadata()))
+        }
+        let chrome = AppUsageData(appBundleID: "com.google.Chrome", appName: "Chrome", duration: 10, uniqueItemCount: 4, percentage: 1)
+        let port = try await model.prepareUsageAction(target: .website(app: chrome, domain: "example.com:8443"), action: .delete)
+        XCTAssertEqual(port.frames.count, 1)
+        let fallback = try await model.prepareUsageAction(target: .window(app: chrome, window: WindowUsageData(windowName: "Same title", isWebsite: false, duration: 1, percentage: 1)), action: .delete)
+        XCTAssertEqual(fallback.frames.count, 1, "Browser fallback groups include empty URLs and exclude website tabs")
+        let editor = AppUsageData(appBundleID: "com.editor", appName: "Editor", duration: 1, uniqueItemCount: 1, percentage: 1)
+        let window = try await model.prepareUsageAction(target: .window(app: editor, window: WindowUsageData(windowName: "Editor", isWebsite: false, duration: 1, percentage: 1)), action: .delete)
+        XCTAssertEqual(window.frames.count, 2, "Non-browser window groups do not distinguish URLs")
+    }
+
     private func fixture() async throws -> (DashboardViewModel, AppCoordinator, any DatabaseProtocol, Date) {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("dashboard-actions-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
