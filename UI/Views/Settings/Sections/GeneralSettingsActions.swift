@@ -399,19 +399,20 @@ extension SettingsView {
         return StorageEstimateRange(lowGB: sanitizedLowGB, highGB: sanitizedHighGB)
     }
 
-    private static func formatStorageEstimate(range: StorageEstimateRange) -> String {
+    private static func formatStorageEstimate(range: StorageEstimateRange, retentionDays: Int) -> String {
+        let period = (1...30).contains(retentionDays) ? "retained" : "per month"
         let sanitizedLowGB = range.lowGB
         let sanitizedHighGB = range.highGB
         let lowStr = String(format: "%.1f", sanitizedLowGB)
         let highStr = String(format: "%.1f", sanitizedHighGB)
 
         if sanitizedHighGB < 0.1 {
-            return "Estimated: <0.1 GB per month"
+            return "Estimated: <0.1 GB \(period)"
         } else if lowStr == highStr {
-            return "Estimated: ~\(lowStr) GB per month"
+            return "Estimated: ~\(lowStr) GB \(period)"
         }
 
-        return "Estimated: ~\(lowStr) to \(highStr) GB per month"
+        return "Estimated: ~\(lowStr) to \(highStr) GB \(period)"
     }
 
     static func captureStorageEstimateText(
@@ -420,7 +421,8 @@ extension SettingsView {
         captureOnWindowChange: Bool,
         captureOnMouseClick: Bool,
         deduplicationThreshold: Double = CaptureConfig.defaultDeduplicationThreshold,
-        keepFramesOnMouseMovement: Bool = false
+        keepFramesOnMouseMovement: Bool = false,
+        retentionDays: Int = 0
     ) -> String {
         let range = captureStorageEstimateRange(
             videoQuality: videoQuality,
@@ -428,9 +430,10 @@ extension SettingsView {
             captureOnWindowChange: captureOnWindowChange,
             captureOnMouseClick: captureOnMouseClick,
             deduplicationThreshold: deduplicationThreshold,
-            keepFramesOnMouseMovement: keepFramesOnMouseMovement
+            keepFramesOnMouseMovement: keepFramesOnMouseMovement,
+            retentionDays: retentionDays
         )
-        return Self.formatStorageEstimate(range: range)
+        return Self.formatStorageEstimate(range: range, retentionDays: retentionDays)
     }
 
     static func captureStorageEstimateRange(
@@ -439,7 +442,8 @@ extension SettingsView {
         captureOnWindowChange: Bool,
         captureOnMouseClick: Bool,
         deduplicationThreshold: Double = CaptureConfig.defaultDeduplicationThreshold,
-        keepFramesOnMouseMovement: Bool = false
+        keepFramesOnMouseMovement: Bool = false,
+        retentionDays: Int = 0
     ) -> StorageEstimateRange {
         let qualityMultiplier = Self.videoQualityMultiplier(for: normalizedVideoQuality(videoQuality))
         let intervalMultiplier = Self.captureIntervalMultiplier(for: captureIntervalSeconds)
@@ -456,12 +460,17 @@ extension SettingsView {
 
         let baselineLowGB = (intervalOnlyBaselineLowGBAtTwoSeconds * intervalMultiplier) + eventDrivenHeuristic.lowGB
         let baselineHighGB = (intervalOnlyBaselineHighGBAtTwoSeconds * intervalMultiplier) + eventDrivenHeuristic.highGB
-        let lowGB = baselineLowGB * qualityMultiplier * deduplicationMultiplier * mouseMovementMultiplier
-        let highGB = baselineHighGB * qualityMultiplier * deduplicationMultiplier * mouseMovementMultiplier
+        // A month is 30 days in the retention picker. Short retention shows
+        // the expected amount kept on-device rather than monthly accumulation.
+        let retentionMultiplier = (1...30).contains(retentionDays)
+            ? Double(retentionDays) / 30.0
+            : 1.0
+        let lowGB = baselineLowGB * qualityMultiplier * deduplicationMultiplier * mouseMovementMultiplier * retentionMultiplier
+        let highGB = baselineHighGB * qualityMultiplier * deduplicationMultiplier * mouseMovementMultiplier * retentionMultiplier
         return Self.sanitizedStorageEstimateRange(lowGB: lowGB, highGB: highGB)
     }
 
-    /// Estimated storage per month based on video quality and capture interval settings.
+    /// Estimated retained storage for short retention, otherwise monthly storage growth.
     /// Reference: 50% quality at 2s interval ≈ 8-13 GB/month before event-driven uplift.
     var videoQualityEstimateText: String {
         Self.captureStorageEstimateText(
@@ -470,7 +479,8 @@ extension SettingsView {
             captureOnWindowChange: captureOnWindowChange,
             captureOnMouseClick: captureOnMouseClick,
             deduplicationThreshold: deduplicationThreshold,
-            keepFramesOnMouseMovement: effectiveMousePositionStorageMultiplierEnabled
+            keepFramesOnMouseMovement: effectiveMousePositionStorageMultiplierEnabled,
+            retentionDays: retentionDays
         )
     }
 
@@ -485,7 +495,8 @@ extension SettingsView {
             captureOnWindowChange: captureOnWindowChange,
             captureOnMouseClick: captureOnMouseClick,
             deduplicationThreshold: deduplicationThreshold,
-            keepFramesOnMouseMovement: effectiveMousePositionStorageMultiplierEnabled
+            keepFramesOnMouseMovement: effectiveMousePositionStorageMultiplierEnabled,
+            retentionDays: retentionDays
         )
     }
 
