@@ -542,7 +542,7 @@ enum AppSegmentQueries {
         // 5. Count unique windows (or domains for browsers) per bundleID
         let sql = """
             WITH frames_with_app AS (
-                SELECT s.bundleID, f.createdAt
+                SELECT s.bundleID, s.id as segmentId, f.createdAt
                 FROM frame f
                 JOIN segment s ON f.segmentId = s.id
                 WHERE f.createdAt >= ? AND f.createdAt <= ?
@@ -550,6 +550,7 @@ enum AppSegmentQueries {
             frame_gaps AS (
                 SELECT
                     LAG(bundleID) OVER (ORDER BY createdAt) as prev_bundleID,
+                    LAG(segmentId) OVER (ORDER BY createdAt) as prev_segmentId,
                     createdAt - LAG(createdAt) OVER (ORDER BY createdAt) as gap_ms
                 FROM frames_with_app
             ),
@@ -578,8 +579,13 @@ enum AppSegmentQueries {
                             END
                         ELSE windowName
                     END) as unique_count
-                FROM segment
+                FROM segment s
                 WHERE startDate >= ? AND startDate <= ?
+                    AND NOT EXISTS (
+                        SELECT 1 FROM segment_tag st
+                        JOIN tag t ON st.tagId = t.id
+                        WHERE st.segmentId = s.id AND t.name = 'hidden'
+                    )
                 GROUP BY bundleID
             )
             SELECT
@@ -593,6 +599,11 @@ enum AppSegmentQueries {
             FROM frame_gaps fg
             LEFT JOIN unique_items ui ON fg.prev_bundleID = ui.bundleID
             WHERE fg.prev_bundleID IS NOT NULL
+                AND NOT EXISTS (
+                    SELECT 1 FROM segment_tag st
+                    JOIN tag t ON st.tagId = t.id
+                    WHERE st.segmentId = fg.prev_segmentId AND t.name = 'hidden'
+                )
             GROUP BY fg.prev_bundleID
             """
 

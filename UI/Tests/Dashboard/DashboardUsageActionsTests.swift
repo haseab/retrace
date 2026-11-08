@@ -64,6 +64,8 @@ final class DashboardUsageActionsTests: XCTestCase {
         let hidden = try await coordinator.getHiddenSegmentIds()
         XCTAssertEqual(hidden, Set(plan.segmentIDs))
         XCTAssertFalse(model.weeklyAppUsage.contains { $0.appBundleID == app.appBundleID }, "Historical dashboard snapshots must be invalidated")
+        XCTAssertEqual(model.weeklyAppUsage.first { $0.appBundleID == "com.apple.Safari" }?.duration, 1,
+                       "Hidden frame gaps must not be reassigned to the remaining visible app")
         let afterHide = try await model.prepareUsageAction(target: .app(app), action: .delete)
         XCTAssertTrue(afterHide.frames.isEmpty)
     }
