@@ -70,7 +70,7 @@ struct DashboardUsageActionPlan: Sendable {
     let segmentIDs: [SegmentID]
 }
 
-/// Native macOS menu chrome matches the other right-click menus in Retrace.
+/// Native macOS chrome provides standard focus, dismissal, and keyboard behavior.
 struct DashboardUsageMenu: View {
     let target: DashboardUsageTarget
     let onAction: ((DashboardUsageTarget, DashboardUsageAction) -> Void)?
@@ -156,7 +156,7 @@ struct DashboardUsageConfirmationView: View {
                     .disabled(isApplying)
                 if resultText == nil {
                     Button {
-                        guard let plan else { return }
+                        guard let plan, !isApplying else { return }
                         isApplying = true
                         errorText = nil
                         Task {

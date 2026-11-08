@@ -81,7 +81,7 @@ final class DashboardUsageActionsTests: XCTestCase {
         XCTAssertTrue(plan.frames.contains { $0.id.value == frameID })
     }
 
-    func testDeleteBatchesMoreThanSQLiteVariableLimit() async throws {
+    func testDeleteSpansMultipleBatches() async throws {
         let (model, _, database, start) = try await fixture()
         let id = try await database.insertSegment(bundleID: "com.google.Chrome", startDate: start, endDate: start.addingTimeInterval(10), windowName: "Large batch", browserUrl: nil, type: 0)
         for index in 0..<1_100 {
