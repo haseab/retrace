@@ -4243,6 +4243,28 @@ public actor AppCoordinator {
 
     // MARK: - Frame Deletion
 
+    /// Dashboard bulk actions operate on native visible recordings only. Query directly
+    /// so imported Rewind IDs can never collide with native segment IDs during mutation.
+    public func getDashboardUsageActionFrames(bundleID: String, from start: Date, to end: Date) async throws -> [FrameReference] {
+        let hidden = try await services.database.getHiddenSegmentIds()
+        var selected: [FrameReference] = []
+        var cursor = start
+        // Bound temporary allocations while resolving the entire range, rather than
+        // accidentally acting on only the first dashboard page or a frame query limit.
+        repeat {
+            try Task.checkCancellation()
+            let batchEnd = min(cursor.addingTimeInterval(24 * 60 * 60), end)
+            let frames = try await services.database.getFrames(from: cursor, to: batchEnd, limit: Int(Int32.max))
+            selected.append(contentsOf: frames.filter {
+                $0.source == .native && $0.metadata.appBundleID == bundleID &&
+                !hidden.contains(SegmentID(value: $0.segmentID.value)) &&
+                (batchEnd == end || $0.timestamp < batchEnd)
+            })
+            cursor = batchEnd
+        } while cursor < end
+        return selected
+    }
+
     /// Delete a single frame from the database
     /// Note: For Rewind data, this only removes the database entry. Video files remain on disk.
     public func deleteFrame(

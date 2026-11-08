@@ -33,6 +33,7 @@ UI/
 │   │   ├── DashboardWindowController.swift # Dashboard window lifecycle
 │   │   ├── ChangelogView.swift          # Appcast-powered release notes view
 │   │   ├── AppUsageListView.swift       # App, website, and window usage breakdown
+│   │   ├── DashboardUsageActions.swift # Native usage context menus, exact grouping targets, and bulk hide/delete confirmations
 │   │   ├── AppUsageHardDriveView.swift  # App usage treemap
 │   │   ├── AppSessionsDetailView.swift # App/window session details
 │   │   ├── MiniLineGraphView.swift      # Daily statistic graphs
@@ -159,6 +160,7 @@ UI/
     ├── ProcessCPUDisplayMetricsTests.swift # CPU sampler display math and live ranking coverage
     ├── SearchHighlightTooltipTests.swift # Search highlight tooltip hover/dismiss coverage
     ├── Dashboard/                        # Dashboard-specific XCTestCase files
+    │   └── DashboardUsageActionsTests.swift # Real SQLite bulk-action scope, hidden exclusion, and preparation coverage
     ├── MenuBar/                          # Menu bar interaction tests
     ├── Search/                           # Search/deeplink/overlay XCTestCase files
     ├── Settings/                         # Settings-focused XCTestCase files, including shell/view-model coverage

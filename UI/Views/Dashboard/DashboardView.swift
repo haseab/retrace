@@ -84,6 +84,7 @@ public struct DashboardView: View {
     @State private var selectedApp: AppUsageData? = nil
     @State private var selectedWindow: WindowUsageData? = nil
     @State private var showSessionsSheet = false
+    @State private var usageActionRequest: DashboardUsageActionRequest?
     @State private var showSystemMonitor = false
     @State private var showAppUsageDatePopover = false
     @State private var appUsageDateFocusRequestID: UUID?
@@ -303,6 +304,7 @@ public struct DashboardView: View {
         guard appUsageRangeShortcutMonitor == nil else { return }
 
         appUsageRangeShortcutMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [self] event in
+            guard usageActionRequest == nil else { return event }
             guard event.window?.windowNumber == DashboardWindowController.shared.window?.windowNumber else {
                 return event
             }
@@ -618,6 +620,11 @@ public struct DashboardView: View {
             FeedbackFormView(launchContext: feedbackLaunchContext)
                 .id(feedbackPresentationID)
             .environmentObject(coordinatorWrapper)
+        }
+        .sheet(item: $usageActionRequest) { request in
+            DashboardUsageConfirmationView(viewModel: viewModel, request: request) {
+                usageActionRequest = nil
+            }
         }
         .background(
             ZStack {
@@ -1525,6 +1532,9 @@ public struct DashboardView: View {
                     },
                     onWindowTapped: { app, window in
                         handleWindowTapped(app, window)
+                    },
+                    onUsageAction: { target, action in
+                        usageActionRequest = DashboardUsageActionRequest(target: target, action: action)
                     }
                 )
                 .id(
@@ -1537,6 +1547,9 @@ public struct DashboardView: View {
                     totalTime: viewModel.totalWeeklyTime,
                     onAppTapped: { app in
                         handleAppTapped(app)
+                    },
+                    onUsageAction: { target, action in
+                        usageActionRequest = DashboardUsageActionRequest(target: target, action: action)
                     }
                 )
                 .id(
