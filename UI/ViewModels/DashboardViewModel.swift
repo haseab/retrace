@@ -305,7 +305,9 @@ public class DashboardViewModel: ObservableObject {
             forName: .dataSourceDidChange,
             object: nil,
             queue: .main
-        ) { [weak self] _ in
+        ) { [weak self] notification in
+            // This model refreshes explicitly after its own bulk action.
+            guard notification.userInfo?["source"] as? String != "dashboard_usage_action" else { return }
             Task { @MainActor in
                 await self?.loadStatistics(reason: "data_source_changed")
             }
@@ -2193,6 +2195,67 @@ public class DashboardViewModel: ObservableObject {
     }
 
     // MARK: - App Session Details
+
+    func prepareUsageAction(target: DashboardUsageTarget, action: DashboardUsageAction) async throws -> DashboardUsageActionPlan {
+        let range = resolvedAppUsageQueryRange()
+        let frames = try await coordinator.getDashboardUsageActionFrames(bundleID: target.bundleID, from: range.start, to: range.end)
+        let plan = await Task.detached(priority: .userInitiated) {
+            let matching = frames.filter { target.matches($0) }
+            let ids = Set(matching.map { SegmentID(value: $0.segmentID.value) }).sorted { $0.value < $1.value }
+            return DashboardUsageActionPlan(target: target, action: action, start: range.start, end: range.end, frames: matching, segmentIDs: ids)
+        }.value
+        recordUsageAction(plan, phase: "prepared")
+        return plan
+    }
+
+    func applyUsageAction(_ plan: DashboardUsageActionPlan) async throws -> String {
+        guard !plan.frames.isEmpty else { return "No matching recordings." }
+        recordUsageAction(plan, phase: "submitted")
+        do {
+            let message: String
+            switch plan.action {
+            case .hide:
+                try await coordinator.hideSegments(segmentIds: plan.segmentIDs)
+                Self.recordSegmentHide(coordinator: coordinator, source: "dashboard_app_usage", segmentCount: plan.segmentIDs.count,
+                                       frameCount: plan.frames.count, hiddenFilter: HiddenFilter.hide.rawValue)
+                message = "Hidden \(plan.segmentIDs.count) segments. You can restore them from the timeline."
+            case .delete:
+                // Keep each request below SQLite's bound-variable limit, including
+                // when the selected row represents many sessions or tabs.
+                var result = FrameDeletionResult.empty
+                for offset in stride(from: 0, to: plan.frames.count, by: 500) {
+                    let batch = Array(plan.frames[offset..<min(offset + 500, plan.frames.count)])
+                    result = result.merging(try await coordinator.deleteFrames(batch, metricSource: "dashboard_app_usage"))
+                }
+                message = "Deleted \(result.completedFrames) frames. \(result.queuedFrames) frames queued for deletion."
+            }
+            recordUsageAction(plan, phase: "succeeded")
+            await refreshAfterUsageAction()
+            return message
+        } catch {
+            recordUsageAction(plan, phase: "failed")
+            await refreshAfterUsageAction()
+            throw error
+        }
+    }
+
+    private func recordUsageAction(_ plan: DashboardUsageActionPlan, phase: String) {
+        UIMetricsRecorder.recordDictionary(coordinator: coordinator,
+            type: .dashboardUsageAction,
+            payload: ["source": "dashboard_app_usage", "action": plan.action.rawValue, "phase": phase,
+                      "segmentCount": plan.segmentIDs.count, "frameCount": plan.frames.count,
+                      "rangeStartMs": Int64(plan.start.timeIntervalSince1970 * 1000),
+                      "rangeEndMs": Int64(plan.end.timeIntervalSince1970 * 1000)])
+    }
+
+    private func refreshAfterUsageAction() async {
+        // Wait for older loads before invalidating so they cannot repopulate stale snapshots.
+        if let flight = statisticsLoadTask { await flight.task.value }
+        appUsageRangeCache.removeAll()
+        NotificationCenter.default.post(name: .dataSourceDidChange, object: nil,
+                                        userInfo: ["source": "dashboard_usage_action"])
+        await loadStatistics(reason: "dashboard_usage_action")
+    }
 
     /// Fetch detailed sessions for a specific app with pagination
     /// - Parameters:

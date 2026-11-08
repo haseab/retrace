@@ -131,6 +131,7 @@ struct AppUsageListView: View {
     var loadWindowUsage: ((String, Int) async -> WindowUsagePage)? = nil  // For websites (domain aggregation)
     var loadTabsForDomain: ((String, String) async -> [WindowUsageData])? = nil  // (bundleID, domain) -> tabs for that domain
     var onWindowTapped: ((AppUsageData, WindowUsageData) -> Void)? = nil
+    var onUsageAction: ((DashboardUsageTarget, DashboardUsageAction) -> Void)? = nil
 
     @State private var hoveredAppIndex: Int? = nil
     @State private var hoveredWindowKey: String? = nil
@@ -460,6 +461,9 @@ struct AppUsageListView: View {
         .onTapGesture {
             onWindowTapped?(app, window)
         }
+        .contextMenu {
+            DashboardUsageMenu(target: .tab(app: app, window: window), onAction: onUsageAction)
+        }
     }
 
     // MARK: - Website Row (Expandable) or Window Fallback Row
@@ -594,6 +598,12 @@ struct AppUsageListView: View {
                 onWindowTapped?(app, window)
             }
         }
+        .contextMenu {
+            DashboardUsageMenu(
+                target: window.isWebsite ? .website(app: app, domain: window.displayName) : .tab(app: app, window: window),
+                onAction: onUsageAction
+            )
+        }
     }
 
     // MARK: - Domain Tabs Section
@@ -702,6 +712,9 @@ struct AppUsageListView: View {
         }
         .buttonStyle(.plain)
         .help("Open details")
+        .contextMenu {
+            DashboardUsageMenu(target: .tab(app: app, window: tab), onAction: onUsageAction)
+        }
         .contentShape(Rectangle())
         .onHover { hovering in
             withAnimation(.easeInOut(duration: 0.1)) {
@@ -890,6 +903,9 @@ struct AppUsageListView: View {
         }
         .onTapGesture {
             toggleExpansion(for: app)
+        }
+        .contextMenu {
+            DashboardUsageMenu(target: .app(app), onAction: onUsageAction)
         }
     }
 

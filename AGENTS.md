@@ -188,7 +188,7 @@ retrace/
     ├── ViewModels/              # View models (Dashboard, Search, Timeline, Feedback, Settings)
     │   └── Settings/            # Settings-specific view models and extracted helper logic
     ├── Views/
-    │   ├── Dashboard/           # App usage analytics views
+    │   ├── Dashboard/           # App usage analytics views and confirmed bulk segment hide/delete actions
     │   ├── FullscreenTimeline/  # Timeline scrubbing & playback (10 views)
     │   ├── Search/              # Search UI (SearchView, ResultRow, FrameViewer)
     │   ├── Settings/            # Settings shell, support components, and extracted section/action files

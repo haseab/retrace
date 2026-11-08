@@ -58,6 +58,9 @@ public enum DailyMetricsQueries {
         case dateSearchOutcome = "date_search_outcome"
         // Timeline tagging/comments/playback metrics
         case segmentHide = "segment_hide"
+        // metadata: JSON {source, action: hide|delete, phase: prepared|submitted|succeeded|failed,
+        // segmentCount, frameCount, rangeStartMs, rangeEndMs}. No titles or URLs.
+        case dashboardUsageAction = "dashboard_usage_action"
         case segmentUnhide = "segment_unhide"
         case tagSubmenuOpen = "tag_submenu_open"
         case tagToggleOnBlock = "tag_toggle_on_block"
