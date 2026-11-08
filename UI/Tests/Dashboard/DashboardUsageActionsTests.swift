@@ -25,12 +25,12 @@ final class DashboardUsageActionsTests: XCTestCase {
     }
 
     func testAppTargetIncludesAllRowsAndCancelDoesNotMutate() async throws {
-        let (model, _, database, start) = try await fixture()
+        let (model, coordinator, database, start) = try await fixture()
         let app = AppUsageData(appBundleID: "com.google.Chrome", appName: "Chrome", duration: 10, uniqueItemCount: 3, percentage: 1)
         let plan = try await model.prepareUsageAction(target: .app(app), action: .delete)
         XCTAssertEqual(plan.frames.count, 5)
         XCTAssertTrue(plan.frames.allSatisfy { $0.timestamp >= start && $0.timestamp <= start.addingTimeInterval(10) })
-        let hidden = try await database.getHiddenSegmentIds()
+        let hidden = try await coordinator.getHiddenSegmentIds()
         XCTAssertTrue(hidden.isEmpty)
         let frames = try await database.getFrames(from: start, to: start.addingTimeInterval(10), limit: 100)
         XCTAssertEqual(frames.count, 6)
