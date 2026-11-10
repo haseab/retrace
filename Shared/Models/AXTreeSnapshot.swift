@@ -107,8 +107,10 @@ public struct AXTreeSnapshot: Codable, Sendable, Equatable {
     }
 
     /// Readable text in tree (document) order, one entry per element string, with exact
-    /// duplicates removed. Static text and text fields contribute their value; controls
-    /// contribute their title or label.
+    /// duplicates removed. Static text and text fields contribute their value; other
+    /// elements contribute their title or label. Controls (buttons, menus, toggles) are
+    /// skipped: their labels are mostly icon names and shortcut hints ("Toggle Panel
+    /// (⌘J)"), and any label drawn on screen is already read by OCR.
     public func textLines() -> [TextLine] {
         var lines: [TextLine] = []
         var seen = Set<String>()
@@ -130,9 +132,11 @@ public struct AXTreeSnapshot: Codable, Sendable, Equatable {
             if Self.valueRoles.contains(node.role) {
                 add(node.value, node.bounds)
             }
-            add(node.title, node.bounds)
-            if node.children.isEmpty || !Self.valueRoles.contains(node.role) {
-                add(node.label, node.bounds)
+            if !Self.controlRoles.contains(node.role) {
+                add(node.title, node.bounds)
+                if node.children.isEmpty || !Self.valueRoles.contains(node.role) {
+                    add(node.label, node.bounds)
+                }
             }
             for child in node.children {
                 visit(child)
@@ -146,6 +150,13 @@ public struct AXTreeSnapshot: Codable, Sendable, Equatable {
     /// Roles whose `value` is their visible text. Capture reads values only for these.
     public static let valueRoles: Set<String> = [
         "AXStaticText", "AXTextField", "AXTextArea", "AXComboBox", "AXSearchField", "AXHeading", "AXCell"
+    ]
+
+    /// Interactive controls whose title and label are not indexed (see `textLines`).
+    static let controlRoles: Set<String> = [
+        "AXButton", "AXMenuButton", "AXPopUpButton", "AXCheckBox", "AXDisclosureTriangle",
+        "AXMenu", "AXMenuItem", "AXMenuBar", "AXMenuBarItem", "AXToolbar", "AXSlider",
+        "AXIncrementor", "AXScrollBar", "AXSplitter", "AXValueIndicator", "AXColorWell"
     ]
 }
 

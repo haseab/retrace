@@ -39,7 +39,28 @@ final class AccessibilityTextIndexingTests: XCTestCase {
 
         let lines = snapshot(root).textLines().map(\.text)
 
-        XCTAssertEqual(lines, ["Inbox", "Compose", "Meeting at noon", "Avatar"])
+        XCTAssertEqual(lines, ["Inbox", "Meeting at noon", "Avatar"])
+    }
+
+    func testTextLinesSkipControlLabelsButKeepTextInsideThem() {
+        let root = AXNodeSnapshot(
+            role: "AXWindow",
+            title: "ledger.py",
+            children: [
+                AXNodeSnapshot(role: "AXButton", label: "Toggle Panel (⌘J)"),
+                AXNodeSnapshot(role: "AXMenuItem", title: "Split Editor Right"),
+                AXNodeSnapshot(
+                    role: "AXButton",
+                    children: [AXNodeSnapshot(role: "AXStaticText", value: "Continue without Signing In")]
+                ),
+                AXNodeSnapshot(role: "AXGroup", label: "Explorer Section: quokka-ws"),
+                AXNodeSnapshot(role: "AXRadioButton", title: "shipping.py")
+            ]
+        )
+
+        let lines = snapshot(root).textLines().map(\.text)
+
+        XCTAssertEqual(lines, ["ledger.py", "Continue without Signing In", "Explorer Section: quokka-ws", "shipping.py"])
     }
 
     // MARK: - appendingAccessibilityText
