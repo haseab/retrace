@@ -1,8 +1,59 @@
 import XCTest
+import CoreGraphics
 import Shared
 @testable import Capture
 
 final class ConferenceSessionPrivacyPolicyTests: XCTestCase {
+    func testConsentSurvivesBackgroundWindowVisibilityChangesButNotCallEnd() throws {
+        let callWindow = CGWindowListCapture.VisibleWindowContext(
+            windowID: 20, ownerPID: 123, appBundleID: "us.zoom.xos",
+            appName: "Zoom", windowName: "Weekly sync", browserURL: nil,
+            windowLayer: 0, windowBounds: CGRect(x: 0, y: 0, width: 800, height: 600)
+        )
+        var consent = ConferenceCallConsentState()
+        func observe(visibleWindowIDs: Set<CGWindowID>, callIsActive: Bool = true)
+            -> CGWindowListCapture.ConferenceWindowSelection {
+            let selection = CGWindowListCapture.ConferenceWindowSelection(
+                contexts: [callWindow], visibleWindowIDs: visibleWindowIDs,
+                redactedWindowIDs: []
+            )
+            // Production checks active-call controls on tracked windows, regardless of visibility.
+            consent.update(activeCallIDs: callIsActive
+                ? Set(selection.tracked.map { String($0.windowID) }) : [])
+            return selection
+        }
+
+        XCTAssertEqual(observe(visibleWindowIDs: [20]).visible.count, 1)
+        let sessionID = try XCTUnwrap(consent.sessionID(for: "20"))
+        XCTAssertTrue(consent.disableFaceBlur(callID: sessionID))
+
+        let coveredWindowIDs = CGWindowListCapture.ConferenceROIPlanner.visibleWindowIDs(
+            from: [
+                .init(windowID: 10, windowBounds: callWindow.windowBounds),
+                .init(windowID: 20, windowBounds: callWindow.windowBounds)
+            ],
+            displayBounds: CGRect(x: 0, y: 0, width: 800, height: 600)
+        )
+        XCTAssertFalse(coveredWindowIDs.contains(20))
+        // Repeated captures while covered, off-display, or hidden must not end the session.
+        for _ in 0..<30 {
+            let selection = observe(visibleWindowIDs: coveredWindowIDs)
+            XCTAssertTrue(selection.visible.isEmpty)
+            XCTAssertEqual(selection.tracked.count, 1)
+            XCTAssertEqual(consent.sessionID(for: "20"), sessionID)
+            XCTAssertTrue(consent.isBypassed(callID: sessionID))
+        }
+        XCTAssertEqual(observe(visibleWindowIDs: [20]).visible.count, 1)
+        XCTAssertTrue(consent.isBypassed(callID: sessionID))
+
+        _ = observe(visibleWindowIDs: [], callIsActive: false)
+        XCTAssertNil(consent.sessionID(for: "20"))
+        _ = observe(visibleWindowIDs: [20])
+        let nextSessionID = try XCTUnwrap(consent.sessionID(for: "20"))
+        XCTAssertNotEqual(nextSessionID, sessionID)
+        XCTAssertFalse(consent.isBypassed(callID: nextSessionID))
+    }
+
     func testConsentDoesNotSurviveCallDisappearanceAndReappearance() {
         var consent = ConferenceCallConsentState()
         consent.update(activeCallIDs: ["meet-window"])

@@ -397,7 +397,7 @@ public actor CGWindowListCapture {
         let appName: String?
     }
 
-    private struct VisibleWindowContext: Sendable {
+    struct VisibleWindowContext: Sendable {
         let windowID: CGWindowID
         let ownerPID: pid_t?
         let appBundleID: String?
@@ -406,6 +406,21 @@ public actor CGWindowListCapture {
         let browserURL: String?
         let windowLayer: Int
         let windowBounds: CGRect?
+    }
+
+    /// Call lifetime and pixel visibility are separate: hidden windows can still host active calls.
+    struct ConferenceWindowSelection: Sendable {
+        let tracked: [VisibleWindowContext]
+        let visible: [VisibleWindowContext]
+
+        init(
+            contexts: [VisibleWindowContext],
+            visibleWindowIDs: Set<CGWindowID>,
+            redactedWindowIDs: Set<CGWindowID>
+        ) {
+            tracked = contexts.filter { !redactedWindowIDs.contains($0.windowID) }
+            visible = tracked.filter { visibleWindowIDs.contains($0.windowID) }
+        }
     }
 
     private struct ConferenceCallIdentity: Sendable {
@@ -433,7 +448,7 @@ public actor CGWindowListCapture {
         let redactionContextByWindowID: [CGWindowID: RedactionWindowContext]
         let redactionWindowOrder: [CGWindowID]
         let visibleWindowContext: VisibleWindowContext?
-        let conferenceWindowContexts: [VisibleWindowContext]
+        let conferenceWindowContexts: ConferenceWindowSelection
         let captureBlockReason: String?
     }
 
@@ -634,7 +649,7 @@ public actor CGWindowListCapture {
         let frameMetadataBrowserURL = redactionSummary == nil ? visibleWindowContext?.browserURL : nil
 
         let conferenceWindowMatches = matchedConferenceWindows(
-            from: exclusionResult.conferenceWindowContexts,
+            from: exclusionResult.conferenceWindowContexts.tracked,
             systemMediaCaptureState: systemMediaCaptureState
         )
         let observationTime = Date()
@@ -651,12 +666,14 @@ public actor CGWindowListCapture {
         }
         conferenceCallConsent.update(activeCallIDs: Set(activeConferenceMatches.map { $0.callIdentity.id }))
         lastConferenceObservationAt = observationTime
+        let visibleConferenceWindowIDs = Set(exclusionResult.conferenceWindowContexts.visible.map(\.windowID))
         let preferredConferenceCallID = preferredConferenceCallID(
-            from: activeConferenceMatches,
+            from: activeConferenceMatches.filter { visibleConferenceWindowIDs.contains($0.context.windowID) },
             visibleWindowContext: visibleWindowContext
         )
 
-        for conferenceWindowMatch in conferenceWindowMatches {
+        for conferenceWindowMatch in conferenceWindowMatches
+            where visibleConferenceWindowIDs.contains(conferenceWindowMatch.context.windowID) {
             let conferenceContext = conferenceWindowMatch.context
             let conferenceMatch = conferenceWindowMatch.match
             let callIdentity = conferenceWindowMatch.callIdentity
@@ -868,9 +885,9 @@ public actor CGWindowListCapture {
             case unavailable
         }
 
-        // Get all on-screen windows
+        // Observe background/off-screen calls too; pixel capture eligibility is checked below.
         guard let windowList = CGWindowListCopyWindowInfo(
-            [.optionOnScreenOnly, .excludeDesktopElements],
+            [.optionAll, .excludeDesktopElements],
             kCGNullWindowID
         ) as? [[String: Any]] else {
             return ExclusionComputationResult(
@@ -879,7 +896,9 @@ public actor CGWindowListCapture {
                 redactionContextByWindowID: redactionContextByWindowID,
                 redactionWindowOrder: redactionWindowOrder,
                 visibleWindowContext: visibleWindowContext,
-                conferenceWindowContexts: conferenceWindowContexts,
+                conferenceWindowContexts: ConferenceWindowSelection(
+                    contexts: [], visibleWindowIDs: [], redactedWindowIDs: []
+                ),
                 captureBlockReason: captureBlockReason
             )
         }
@@ -975,6 +994,22 @@ public actor CGWindowListCapture {
             var currentBrowserURL: String?
 
             guard isCaptureEligible else {
+                // These windows never enter the pixel/redaction path, but an active call
+                // in one must retain its session while another app or Space is in front.
+                if layer == 0 || overlayQualified {
+                    if let ownerPID, let bundleID, BrowserURLExtractor.isBrowser(bundleID) {
+                        currentBrowserURL = await cachedBrowserURL(
+                            ownerPID: ownerPID, bundleID: bundleID,
+                            ownerName: ownerName, windowName: windowName
+                        )
+                    }
+                    conferenceWindowContexts.append(VisibleWindowContext(
+                        windowID: windowID, ownerPID: ownerPID, appBundleID: bundleID,
+                        appName: appName, windowName: normalizedWindowName,
+                        browserURL: currentBrowserURL, windowLayer: layer,
+                        windowBounds: currentWindowBounds
+                    ))
+                }
                 continue
             }
 
@@ -1321,10 +1356,10 @@ public actor CGWindowListCapture {
             from: visibilityCandidatesInOrder,
             displayBounds: displayBounds
         )
-        let visibleConferenceWindowContexts = conferenceWindowContexts.filter { context in
-            visibleWindowIDs.contains(context.windowID) &&
-                !redactedWindowIDs.contains(context.windowID)
-        }
+        let conferenceWindows = ConferenceWindowSelection(
+            contexts: conferenceWindowContexts, visibleWindowIDs: visibleWindowIDs,
+            redactedWindowIDs: redactedWindowIDs
+        )
 
         return ExclusionComputationResult(
             excludedWindowIDs: excludedIDs,
@@ -1332,7 +1367,7 @@ public actor CGWindowListCapture {
             redactionContextByWindowID: redactionContextByWindowID,
             redactionWindowOrder: redactionWindowOrder,
             visibleWindowContext: visibleWindowContext,
-            conferenceWindowContexts: visibleConferenceWindowContexts,
+            conferenceWindowContexts: conferenceWindows,
             captureBlockReason: captureBlockReason
         )
     }
