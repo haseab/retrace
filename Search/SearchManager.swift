@@ -225,8 +225,10 @@ public actor SearchManager: SearchProtocol {
             throw SearchError.indexNotReady
         }
 
-        // Skip empty text
-        guard !text.isEmpty else {
+        // Skip frames with no text at all. Chrome text counts: accessibility text that
+        // OCR missed lands there, and may be the only text a frame has.
+        let hasChromeText = !text.chromeText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        guard !text.isEmpty || hasChromeText else {
             // Return 0 for empty text (no docid assigned)
             return 0
         }
