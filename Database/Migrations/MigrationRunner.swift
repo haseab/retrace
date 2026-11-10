@@ -106,7 +106,8 @@ actor MigrationRunner {
             V16_ProcessingQueueFrameIDIndex(),
             V17_FrameCaptureTrigger(),
             V18_DailyMetricsRecencyIndex(),
-            V19_FrameEncodedAt()
+            V19_FrameEncodedAt(),
+            V20_FrameWindowMap()
         ]
     }
 

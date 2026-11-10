@@ -33,9 +33,11 @@ Database/
 │   ├── V16_ProcessingQueueFrameIDIndex.swift
 │   ├── V17_FrameCaptureTrigger.swift
 │   ├── V18_DailyMetricsRecencyIndex.swift
-│   └── V19_FrameEncodedAt.swift
+│   ├── V19_FrameEncodedAt.swift
+│   └── V20_FrameWindowMap.swift   # frame_window: on-screen windows per frame, front to back
 ├── Queries/
 │   ├── FrameQueries.swift     # Frame CRUD operations
+│   ├── FrameWindowQueries.swift # Per-frame window map read/replace (frame_window)
 │   ├── SegmentQueries.swift   # Segment CRUD operations
 │   ├── DailyMetricsQueries.swift # Metric events and local-day counts, with optional exact timestamp bounds
 │   └── DocumentQueries.swift  # Document/FTS operations
