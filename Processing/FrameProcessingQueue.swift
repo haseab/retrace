@@ -1240,8 +1240,17 @@ public actor FrameProcessingQueue {
             ocrStage = stage
         }
 
+        let frameWindows: [CapturedWindow]
+        do {
+            frameWindows = try await databaseManager.getFrameWindows(frameID: FrameID(value: frameID))
+        } catch {
+            Log.warning("[Queue] Failed to load window map for frame \(frameID): \(error)", category: .processing)
+            frameWindows = []
+        }
+        let orderedText = Self.applyReadingOrder(to: ocrStage.extractedText, windows: frameWindows)
+
         let phraseRedactionResult = applyPhraseLevelRedaction(
-            to: ocrStage.extractedText,
+            to: orderedText,
             actualFrameID: frameID
         )
         let indexedText = phraseRedactionResult.sanitizedText
@@ -1271,7 +1280,7 @@ public actor FrameProcessingQueue {
                     textOffset: mainOffset,
                     textLength: textLength,
                     bounds: region.bounds,
-                    windowIndex: nil
+                    windowIndex: WindowMap.owningWindowIndex(for: region.bounds, in: frameWindows)
                 ))
                 mainOffset += textLength + 1
             }
@@ -1284,7 +1293,7 @@ public actor FrameProcessingQueue {
                     textOffset: chromeOffset,
                     textLength: textLength,
                     bounds: region.bounds,
-                    windowIndex: nil
+                    windowIndex: WindowMap.owningWindowIndex(for: region.bounds, in: frameWindows)
                 ))
                 chromeOffset += textLength + 1
             }
@@ -2267,6 +2276,29 @@ public actor FrameProcessingQueue {
     private struct IndexedPhraseRedactionToken {
         let token: String
         let combinedNodeOrder: Int
+    }
+
+    /// Reorder main-content OCR regions into reading order (see `ReadingOrder`).
+    ///
+    /// Leaves the text untouched when `fullText` is not simply the regions joined by
+    /// spaces (for example when accessibility text was merged in), because node offsets
+    /// are computed from that join.
+    static func applyReadingOrder(to extracted: ExtractedText, windows: [CapturedWindow]) -> ExtractedText {
+        guard extracted.regions.count > 1,
+              extracted.fullText == extracted.regions.map(\.text).joined(separator: " ") else {
+            return extracted
+        }
+
+        let regions = ReadingOrder.order(extracted.regions, windows: windows).map(\.region)
+        return ExtractedText(
+            frameID: extracted.frameID,
+            timestamp: extracted.timestamp,
+            regions: regions,
+            chromeRegions: extracted.chromeRegions,
+            fullText: nil,
+            chromeText: extracted.chromeText,
+            metadata: extracted.metadata
+        )
     }
 
     private func applyPhraseLevelRedaction(

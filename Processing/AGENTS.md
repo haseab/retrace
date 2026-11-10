@@ -21,6 +21,7 @@ Processing/
 │   ├── VisionOCRResidualSupport.swift # OCR residual reset tables and reconciliation helpers
 │   ├── FullFrameOCRCache.swift    # Cached full-frame OCR results for region re-OCR
 │   ├── OCRTileCache.swift         # Tile cache support for region OCR
+│   ├── ReadingOrder.swift         # Window-grouped XY-cut reading order for OCR regions
 │   ├── RegionOCRMerger.swift      # Region OCR merge helpers
 │   ├── RegionOCRResult.swift      # Region OCR result/stat models
 │   ├── TileChangeDetector.swift   # Tile-based change detection
@@ -37,6 +38,7 @@ Processing/
     ├── InPageURLMetadataResolutionTests.swift # In-page URL metadata retry and rewrite scheduling regression coverage
     ├── OCRMemoryBackpressurePolicyTests.swift # OCR memory backpressure threshold/default coverage
     ├── PhraseLevelRedactionTests.swift        # Manual + automatic OCR phrase-level redaction coverage
+    ├── ReadingOrderTests.swift                # Window grouping and XY-cut reading order coverage
     ├── RewriteRetryPolicyTests.swift          # Bounded automatic rewrite retry coverage
     ├── TestLogger.swift                       # Shared processing test logging helpers
     └── _future/
