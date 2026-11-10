@@ -283,6 +283,9 @@ public actor DatabaseManager: DatabaseProtocol {
     private let storageRootPath: String
     private let inMemorySharedConnection: SharedSQLiteConnection?
     private var isInitialized = false
+    /// Pending cleanup of accessibility nodes orphaned by frame deletions (debounced).
+    private var axNodePurgeTask: Task<Void, Never>?
+    private var axNodePurgeDelaySeconds: Double = 30
     private var dbActorOperationSequence: UInt64 = 0
     private var dbActorOperationStack: [(id: UInt64, name: String, startedAt: CFAbsoluteTime)] = []
     private static let dbActorSlowHoldWarningMs: Double = 200
@@ -479,11 +482,16 @@ public actor DatabaseManager: DatabaseProtocol {
 
         isInitialized = true
         Log.info("[DatabaseManager] Database initialized at: \(expandedPath)", category: .database)
+
+        // Nodes orphaned by deletions made just before the last quit.
+        scheduleAXNodePurge()
     }
 
     public func close() async throws {
         guard let db = db else { return }
 
+        axNodePurgeTask?.cancel()
+        axNodePurgeTask = nil
         await readConnectionPool.close()
 
         // Checkpoint WAL before closing (if not in-memory)
@@ -701,7 +709,9 @@ public actor DatabaseManager: DatabaseProtocol {
         guard let db = db else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
-        return try FrameQueries.deleteOlderThan(db: db, date: date)
+        let deleted = try FrameQueries.deleteOlderThan(db: db, date: date)
+        scheduleAXNodePurge()
+        return deleted
     }
 
     /// Delete frames newer than the specified date (for quick delete feature)
@@ -709,7 +719,9 @@ public actor DatabaseManager: DatabaseProtocol {
         guard let db = db else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
-        return try FrameQueries.deleteNewerThan(db: db, date: date)
+        let deleted = try FrameQueries.deleteNewerThan(db: db, date: date)
+        scheduleAXNodePurge()
+        return deleted
     }
 
     public func deleteFrame(id: FrameID) async throws {
@@ -717,6 +729,7 @@ public actor DatabaseManager: DatabaseProtocol {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
         try FrameQueries.delete(db: db, id: id)
+        scheduleAXNodePurge()
     }
 
     public func getFrameCount() async throws -> Int {
@@ -774,6 +787,69 @@ public actor DatabaseManager: DatabaseProtocol {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
         return try FrameQueries.getMetadata(db: db, frameId: frameID.value)
+    }
+
+    /// Store the accessibility tree snapshot captured with a frame. Unchanged subtrees
+    /// shared with earlier frames are reused rather than stored again.
+    /// Returns how many new node rows the snapshot needed.
+    @discardableResult
+    public func replaceFrameAXSnapshot(frameID: FrameID, snapshot: AXTreeSnapshot) async throws -> Int {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try AXSnapshotQueries.replace(db: db, frameId: frameID.value, snapshot: snapshot).newNodeCount
+    }
+
+    /// Accessibility tree snapshot captured with a frame, or nil.
+    public func getFrameAXSnapshot(frameID: FrameID) async throws -> AXTreeSnapshot? {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try AXSnapshotQueries.fetch(db: db, frameId: frameID.value)
+    }
+
+    /// Purge accessibility nodes orphaned by frame deletions, after a short delay so a
+    /// burst of deletions costs one purge. Snapshot rows go with their frame (ON DELETE
+    /// CASCADE), but nodes can be shared with other frames and are only freed here.
+    private func scheduleAXNodePurge() {
+        axNodePurgeTask?.cancel()
+        let delay = axNodePurgeDelaySeconds
+        axNodePurgeTask = Task { [weak self] in
+            if delay > 0 {
+                try? await Task.sleep(for: .seconds(delay))
+            }
+            guard !Task.isCancelled, let self else { return }
+            await self.runScheduledAXNodePurge()
+        }
+    }
+
+    private func runScheduledAXNodePurge() async {
+        axNodePurgeTask = nil
+        do {
+            let purged = try await purgeUnreferencedAXNodes()
+            if purged > 0 {
+                Log.info("[DatabaseManager] Purged \(purged) unreferenced accessibility nodes", category: .database)
+            }
+        } catch {
+            Log.warning("[DatabaseManager] Accessibility node purge failed: \(error)", category: .database)
+        }
+    }
+
+    func setAXNodePurgeDelayForTesting(_ seconds: Double) {
+        axNodePurgeDelaySeconds = seconds
+    }
+
+    func waitForScheduledAXNodePurgeForTesting() async {
+        await axNodePurgeTask?.value
+    }
+
+    /// Delete accessibility nodes no remaining frame snapshot reaches. Returns the count.
+    @discardableResult
+    public func purgeUnreferencedAXNodes() async throws -> Int {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try AXSnapshotQueries.purgeUnreferencedNodes(db: db)
     }
 
     /// Store the window map (on-screen windows, front to back) captured with a frame.
@@ -1222,6 +1298,7 @@ public actor DatabaseManager: DatabaseProtocol {
         // The FK on segment_comment_link cascades link deletion; we then clean orphan comments.
         let linkedCommentIDs = try getCommentIDsForSegment(db: db, segmentId: id)
         try AppSegmentQueries.delete(db: db, id: id)
+        scheduleAXNodePurge()
 
         // Best-effort orphan cleanup after this segment's links are removed.
         for commentID in linkedCommentIDs {
@@ -2748,6 +2825,7 @@ public actor DatabaseManager: DatabaseProtocol {
                     db: db,
                     frameIDs: immediatelyDeletedFrameIDs.map { FrameID(value: $0) }
                 )
+                scheduleAXNodePurge()
             }
 
             try markFramesPendingDeletion(
@@ -2880,9 +2958,14 @@ public actor DatabaseManager: DatabaseProtocol {
                         db: db,
                         frameIDs: deletionFrameIDs.map { FrameID(value: $0) }
                     )
+                    scheduleAXNodePurge()
                 }
 
                 if !plan.redactionFrameIDs.isEmpty {
+                    // Frames being redacted lose their accessibility text too.
+                    try AXSnapshotQueries.deleteSnapshots(db: db, frameIds: plan.redactionFrameIDs)
+                    scheduleAXNodePurge()
+
                     let placeholders = plan.redactionFrameIDs.map { _ in "?" }.joined(separator: ", ")
                     let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
                     let sql = """

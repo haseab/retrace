@@ -2940,6 +2940,138 @@ final class DatabaseManagerTests: XCTestCase {
         XCTAssertTrue(stored.isEmpty)
     }
 
+    func testMigrationRunner_V21CreatesAccessibilitySnapshotTables() async throws {
+        let dbPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RetraceV21Migration-\(UUID().uuidString).sqlite")
+            .path
+        let db = try openRawDatabase(at: dbPath)
+
+        defer {
+            sqlite3_close(db)
+            removeSQLiteTestArtifacts(atPath: dbPath)
+        }
+
+        try await runLegacyMigrations(throughVersion: 20, db: db)
+        let runner = MigrationRunner(db: db)
+        try await runner.runMigrations()
+
+        for table in ["ax_node", "ax_node_child", "frame_ax_snapshot"] {
+            let count = try fetchInt64(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '\(table)';",
+                db: db
+            )
+            XCTAssertEqual(count, 1, table)
+        }
+        let currentVersion = try fetchInt64("SELECT MAX(version) FROM schema_migrations;", db: db)
+        XCTAssertGreaterThanOrEqual(currentVersion, 21)
+    }
+
+    private func sampleAXSnapshot(paragraph: String = "Hello world") -> AXTreeSnapshot {
+        let sidebar = AXNodeSnapshot(
+            role: "AXGroup",
+            label: "Sidebar",
+            bounds: CGRect(x: 0, y: 0, width: 200, height: 800),
+            children: [
+                AXNodeSnapshot(role: "AXButton", title: "New", bounds: CGRect(x: 10, y: 10, width: 80, height: 20)),
+                AXNodeSnapshot(role: "AXButton", title: "Search", bounds: CGRect(x: 10, y: 40, width: 80, height: 20))
+            ]
+        )
+        let content = AXNodeSnapshot(
+            role: "AXGroup",
+            bounds: CGRect(x: 200, y: 0, width: 600, height: 800),
+            children: [
+                AXNodeSnapshot(role: "AXStaticText", value: paragraph, bounds: CGRect(x: 220, y: 20, width: 400, height: 20))
+            ]
+        )
+        let root = AXNodeSnapshot(
+            role: "AXWindow",
+            title: "Doc",
+            bounds: CGRect(x: 0, y: 0, width: 800, height: 800),
+            children: [sidebar, content]
+        )
+        return AXTreeSnapshot(
+            bundleID: "com.example.app",
+            processID: 42,
+            root: root,
+            nodeCount: 6,
+            isTruncated: false,
+            walkMilliseconds: 7
+        )
+    }
+
+    private func axNodeCount() async throws -> Int64 {
+        try await fetchInt64("SELECT COUNT(*) FROM ax_node;")
+    }
+
+    func testAXSnapshotRoundTrips() async throws {
+        let frameID = try await insertTestFrame(browserURL: nil)
+        let snapshot = sampleAXSnapshot()
+
+        try await database.replaceFrameAXSnapshot(frameID: frameID, snapshot: snapshot)
+        let stored = try await database.getFrameAXSnapshot(frameID: frameID)
+
+        XCTAssertEqual(stored, snapshot)
+    }
+
+    func testAXSnapshotsShareUnchangedSubtrees() async throws {
+        let first = try await insertTestFrame(browserURL: nil)
+        let second = try await insertTestFrame(browserURL: nil)
+
+        try await database.replaceFrameAXSnapshot(frameID: first, snapshot: sampleAXSnapshot())
+        let afterFirst = try await axNodeCount()
+        XCTAssertEqual(afterFirst, 6)
+
+        // Only the changed text node and its ancestors (content group, window) are new.
+        try await database.replaceFrameAXSnapshot(frameID: second, snapshot: sampleAXSnapshot(paragraph: "Changed"))
+        let afterSecond = try await axNodeCount()
+        XCTAssertEqual(afterSecond, 9)
+
+        // An identical snapshot adds nothing.
+        let third = try await insertTestFrame(browserURL: nil)
+        try await database.replaceFrameAXSnapshot(frameID: third, snapshot: sampleAXSnapshot())
+        let afterThird = try await axNodeCount()
+        XCTAssertEqual(afterThird, 9)
+
+        let storedSecond = try await database.getFrameAXSnapshot(frameID: second)
+        XCTAssertEqual(storedSecond, sampleAXSnapshot(paragraph: "Changed"))
+    }
+
+    func testDeletingAFramePurgesItsUnsharedAXNodesWithoutRetention() async throws {
+        await database.setAXNodePurgeDelayForTesting(0)
+        let first = try await insertTestFrame(browserURL: nil)
+        let second = try await insertTestFrame(browserURL: nil)
+        try await database.replaceFrameAXSnapshot(frameID: first, snapshot: sampleAXSnapshot())
+        try await database.replaceFrameAXSnapshot(frameID: second, snapshot: sampleAXSnapshot(paragraph: "Changed"))
+
+        try await database.deleteFrame(id: first)
+        await database.waitForScheduledAXNodePurgeForTesting()
+
+        let remaining = try await axNodeCount()
+        XCTAssertEqual(remaining, 6)
+        let storedSecond = try await database.getFrameAXSnapshot(frameID: second)
+        XCTAssertEqual(storedSecond, sampleAXSnapshot(paragraph: "Changed"))
+    }
+
+    func testPurgeRemovesOnlyNodesNoSnapshotReaches() async throws {
+        let first = try await insertTestFrame(browserURL: nil)
+        let second = try await insertTestFrame(browserURL: nil)
+        try await database.replaceFrameAXSnapshot(frameID: first, snapshot: sampleAXSnapshot())
+        try await database.replaceFrameAXSnapshot(frameID: second, snapshot: sampleAXSnapshot(paragraph: "Changed"))
+
+        try await database.deleteFrame(id: first)
+        let deleted = try await database.purgeUnreferencedAXNodes()
+
+        XCTAssertEqual(deleted, 3)
+        let remaining = try await axNodeCount()
+        XCTAssertEqual(remaining, 6)
+        let storedSecond = try await database.getFrameAXSnapshot(frameID: second)
+        XCTAssertEqual(storedSecond, sampleAXSnapshot(paragraph: "Changed"))
+        let orphanEdges = try await fetchInt64(
+            "SELECT COUNT(*) FROM ax_node_child WHERE parentId NOT IN (SELECT id FROM ax_node);"
+        )
+        XCTAssertEqual(orphanEdges, 0)
+    }
+
     func testGetPendingFrameIDsNotInQueueReturnsOnlyNewestOrphanedFrames() async throws {
         let oldestFrame = try await insertTestFrame(
             browserURL: "https://example.com/oldest",
@@ -4129,7 +4261,8 @@ final class DatabaseManagerTests: XCTestCase {
             V16_ProcessingQueueFrameIDIndex(),
             V17_FrameCaptureTrigger(),
             V18_DailyMetricsRecencyIndex(),
-            V19_FrameEncodedAt()
+            V19_FrameEncodedAt(),
+            V20_FrameWindowMap()
         ]
 
         for migration in migrations where migration.version <= version {

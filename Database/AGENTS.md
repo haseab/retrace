@@ -34,10 +34,12 @@ Database/
 │   ├── V17_FrameCaptureTrigger.swift
 │   ├── V18_DailyMetricsRecencyIndex.swift
 │   ├── V19_FrameEncodedAt.swift
-│   └── V20_FrameWindowMap.swift   # frame_window: on-screen windows per frame, front to back
+│   ├── V20_FrameWindowMap.swift   # frame_window: on-screen windows per frame, front to back
+│   └── V21_AccessibilitySnapshots.swift # ax_node / ax_node_child / frame_ax_snapshot (content-addressed)
 ├── Queries/
 │   ├── FrameQueries.swift     # Frame CRUD operations
 │   ├── FrameWindowQueries.swift # Per-frame window map read/replace (frame_window)
+│   ├── AXSnapshotQueries.swift  # Accessibility snapshot store/fetch, subtree sharing, unreferenced-node purge
 │   ├── SegmentQueries.swift   # Segment CRUD operations
 │   ├── DailyMetricsQueries.swift # Metric events and local-day counts, with optional exact timestamp bounds
 │   └── DocumentQueries.swift  # Document/FTS operations
