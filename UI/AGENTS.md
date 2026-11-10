@@ -105,7 +105,8 @@ UI/
 │   ├── AppMetadataCache.swift           # App name/icon lookup caches and app icon view
 │   ├── FaviconProvider.swift            # Favicon memory+disk cache and favicon view
 │   ├── FocusableTextInputSupport.swift  # Shared AppKit-backed text input wrapper and right-click deferral helpers for borderless UI surfaces
-│   ├── ProcessCPUMonitor.swift          # Shared process CPU+memory sampler + 24h aggregation service
+│   ├── ProcessCPUMonitor.swift          # Shared process CPU+memory sampler + bounded 12h tally aggregation
+│   ├── ProcessUsageLogCleanup.swift     # Removes the unused legacy raw CPU log without reading it
 │   ├── ProcessMemoryCardPresentation.swift # Local presentation controller + row builder for memory monitor card
 │   ├── ProcessMonitorModels.swift       # System Monitor snapshot/models + ranking/build helpers
 │   ├── HoverLatchedScrollMonitor.swift  # Shared nested-scroll latch helper for hover-routed inner scroll regions
@@ -167,6 +168,7 @@ UI/
     ├── Support/                          # Shared XCTest helpers and support-only tests
     │   └── FocusableTextInputSupportTests.swift # Borderless text-input keyboard shortcut, right-click deferral, and menu-filter coverage
     ├── SystemMonitor/                    # System monitor XCTestCase files
+    │   └── ProcessUsageLogCleanupTests.swift # Large legacy log cleanup and tally/recording preservation
     ├── Timeline/TimelineCoordinatorVisibilityDecisionTests.swift # Timeline coordinator visibility generation/race policy coverage
     ├── Timeline/TimelineCopyFeedbackTests.swift # Timeline copy image/text toast feedback coverage
     ├── Timeline/TimelinePositionRecoveryHintTests.swift # Timeline reopen Cmd+Z recovery hint behavior and policy coverage
