@@ -35,6 +35,7 @@ Processing/
 └── Tests/
     ├── ExtractRequestInstrumentationTests.swift # Region tail aggregation and coordinator helper coverage
     ├── InPageURLMetadataResolutionTests.swift # In-page URL metadata retry and rewrite scheduling regression coverage
+    ├── MemoryLedgerPendingWriteBoundTests.swift # Ledger pending-write backlog cap and ordered-write coverage
     ├── OCRMemoryBackpressurePolicyTests.swift # OCR memory backpressure threshold/default coverage
     ├── PhraseLevelRedactionTests.swift        # Manual + automatic OCR phrase-level redaction coverage
     ├── RewriteRetryPolicyTests.swift          # Bounded automatic rewrite retry coverage
