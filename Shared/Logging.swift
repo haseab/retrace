@@ -64,8 +64,13 @@ public enum Log {
 
     // MARK: - Log File (for fast feedback diagnostics)
 
-    /// Path to the log file - persists across crashes
-    public static let logFilePath = NSHomeDirectory() + "/Library/Logs/Retrace/retrace.log"
+    /// Path to the log file - persists across crashes.
+    ///
+    /// Resolved the same way the writer resolves it, so readers (feedback diagnostics)
+    /// and the writer never disagree about which file is the log.
+    public static var logFilePath: String {
+        NSHomeDirectory() + "/Library/Logs/Retrace/" + LogFile.resolveLogFileName()
+    }
     /// Get recent logs from the log file (fast file read, no OSLogStore)
     public static func getRecentLogs(maxCount: Int = 200) -> [String] {
         LogFile.shared.readLastLines(count: maxCount)
@@ -388,9 +393,31 @@ private final class LogFile: @unchecked Sendable {
     private var fileHandle: FileHandle?
     private let maxFileSize: Int64 = 50 * 1024 * 1024  // 50MB max, then rotate
 
+    /// Test processes log somewhere else entirely.
+    ///
+    /// Every process opens its own handle and calls `seekToEndOfFile()` exactly once,
+    /// then writes at its own advancing offset. Two writers therefore do not
+    /// interleave -- they overwrite each other's bytes, leaving a file whose
+    /// timestamps run out of order and whose records are shredded. They also share
+    /// the 50 MB rotation budget, and a full `swift test` run writes on the order of
+    /// a megabyte, so a testing session evicts the running app's diagnostics within
+    /// the hour. That log is the only record of what the app actually did, so tests
+    /// must not be able to destroy it.
+    ///
+    /// `swift test` sets none of the usual `XCTest*` environment variables (verified,
+    /// not assumed), so detect the loaded XCTest runtime instead. `RETRACE_LOG_FILE`
+    /// overrides the choice outright.
+    fileprivate static func resolveLogFileName() -> String {
+        if let override = ProcessInfo.processInfo.environment["RETRACE_LOG_FILE"],
+           !override.isEmpty {
+            return override
+        }
+        return NSClassFromString("XCTestCase") != nil ? "retrace-tests.log" : "retrace.log"
+    }
+
     private init() {
         let logDir = NSHomeDirectory() + "/Library/Logs/Retrace"
-        self.fileURL = URL(fileURLWithPath: logDir + "/retrace.log")
+        self.fileURL = URL(fileURLWithPath: logDir + "/" + Self.resolveLogFileName())
 
         // Create directory if needed
         try? FileManager.default.createDirectory(
