@@ -39,7 +39,9 @@ public final class VisionOCR: OCRProtocol, @unchecked Sendable {
         config: ProcessingConfig,
         extractInstrumentation: ProcessingExtractRequestInstrumentation?
     ) async throws -> [TextRegion] {
-        let requestConfig = Self.fullFrameRecognitionRequestConfig()
+        let requestConfig = Self.fullFrameRecognitionRequestConfig(
+            usesLanguageCorrection: config.ocrLanguageCorrectionEnabled
+        )
         if let extractInstrumentation {
             await extractInstrumentation.prepareForOCR(reason: requestConfig.memoryReason)
         } else {
@@ -588,7 +590,7 @@ public final class VisionOCR: OCRProtocol, @unchecked Sendable {
         )
         let requestConfig = Self.regionRecognitionRequestConfig(
             regionOfInterest: normalizedRegion,
-            usesLanguageCorrection: config.ocrAccuracyLevel == .accurate
+            usesLanguageCorrection: config.ocrLanguageCorrectionEnabled
         )
 
         return try await recognizeTextWithEnvelope(

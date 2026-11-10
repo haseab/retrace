@@ -30,7 +30,9 @@ extension VisionOCR {
         let usesLanguageCorrection: Bool
     }
 
-    static func fullFrameRecognitionRequestConfig() -> RecognitionRequestConfig {
+    static func fullFrameRecognitionRequestConfig(
+        usesLanguageCorrection: Bool = false
+    ) -> RecognitionRequestConfig {
         RecognitionRequestConfig(
             envelopeImageBridgeTag: "processing.ocr.fullFrameImageBridge",
             envelopeImageBridgeFunction: "processing.ocr.full_frame",
@@ -56,7 +58,7 @@ extension VisionOCR {
             phaseResidualDuration: Self.transientPhaseResidualHoldSeconds,
             retainedHeapDuration: 4,
             regionOfInterest: nil,
-            usesLanguageCorrection: false
+            usesLanguageCorrection: usesLanguageCorrection
         )
     }
 
