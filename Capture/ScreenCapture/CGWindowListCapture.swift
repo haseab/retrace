@@ -604,6 +604,14 @@ public actor CGWindowListCapture {
             return nil
         }
         var cgImage = captureResult.image
+        // Snapshot the window stack immediately so it matches the captured pixels.
+        let windowMap = WindowMapProvider.capture(
+            displayID: displayID,
+            frameWidth: cgImage.width,
+            frameHeight: cgImage.height,
+            excludedWindowIDs: excludedIDs,
+            redactedWindowIDs: exclusionResult.redactedWindowIDs
+        )
         let displaySurfaceBytes = Self.estimatedImageSurfaceBytes(width: cgImage.width, height: cgImage.height)
         lastDisplaySurfaceBytes = displaySurfaceBytes
         updatePersistentCaptureNativeLedger()
@@ -854,7 +862,8 @@ public actor CGWindowListCapture {
                 windowName: frameMetadataWindowName,
                 browserURL: frameMetadataBrowserURL,
                 redactionReason: redactionSummary?.reason,
-                displayID: UInt32(displayID)
+                displayID: UInt32(displayID),
+                windows: windowMap
             )
         )
 
