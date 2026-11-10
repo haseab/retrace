@@ -63,6 +63,12 @@ public struct FrameMetadata: Codable, Sendable, Equatable {
     /// Nil when no window map was recorded (imported frames, WAL recovery, older builds).
     public let windows: [CapturedWindow]?
 
+    /// Focused window's accessibility tree at capture time. Nil when not captured.
+    public let axSnapshot: AXTreeSnapshot?
+
+    /// Whether a snapshot was taken for this frame, or why not. Nil when not attempted.
+    public let axSnapshotOutcome: AXSnapshotOutcome?
+
     public init(
         appBundleID: String? = nil,
         appName: String? = nil,
@@ -72,7 +78,9 @@ public struct FrameMetadata: Codable, Sendable, Equatable {
         captureTrigger: FrameCaptureTrigger? = nil,
         displayID: UInt32 = 0,
         mousePosition: CGPoint? = nil,
-        windows: [CapturedWindow]? = nil
+        windows: [CapturedWindow]? = nil,
+        axSnapshot: AXTreeSnapshot? = nil,
+        axSnapshotOutcome: AXSnapshotOutcome? = nil
     ) {
         self.appBundleID = appBundleID
         self.appName = appName
@@ -83,6 +91,8 @@ public struct FrameMetadata: Codable, Sendable, Equatable {
         self.displayID = displayID
         self.mousePosition = mousePosition
         self.windows = windows
+        self.axSnapshot = axSnapshot
+        self.axSnapshotOutcome = axSnapshotOutcome
     }
 
     public static let empty = FrameMetadata()

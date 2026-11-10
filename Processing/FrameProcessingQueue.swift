@@ -2308,7 +2308,7 @@ public actor FrameProcessingQueue {
         let defaults = UserDefaults(suiteName: ReversibleOCRScrambler.settingsSuiteName) ?? .standard
         let preliminaryResult = Self.applyPhraseLevelRedaction(
             to: extracted,
-            phrases: loadPhraseLevelRedactionPhrases(defaults: defaults)
+            phrases: Self.loadPhraseLevelRedactionPhrases(defaults: defaults)
         )
 
         guard !preliminaryResult.redactedCombinedNodeOrders.isEmpty else {
@@ -2502,7 +2502,71 @@ public actor FrameProcessingQueue {
         )
     }
 
-    private func loadPhraseLevelRedactionPhrases(defaults: UserDefaults) -> [NormalizedPhraseRedactionPhrase] {
+    /// Remove every string that matches a protected phrase from an accessibility snapshot,
+    /// so the stored snapshot never holds text that phrase-level redaction protects. Uses
+    /// the same matcher as OCR redaction; a matching string is dropped whole.
+    public static func removingProtectedPhrases(from snapshot: AXTreeSnapshot) -> AXTreeSnapshot {
+        let defaults = UserDefaults(suiteName: ReversibleOCRScrambler.settingsSuiteName) ?? .standard
+        return removingProtectedPhrases(from: snapshot, phrases: loadPhraseLevelRedactionPhrases(defaults: defaults))
+    }
+
+    static func removingProtectedPhrases(from snapshot: AXTreeSnapshot, phraseStrings: [String]) -> AXTreeSnapshot {
+        removingProtectedPhrases(from: snapshot, phrases: normalizedRedactionPhrases(phraseStrings))
+    }
+
+    private static func removingProtectedPhrases(
+        from snapshot: AXTreeSnapshot,
+        phrases: [NormalizedPhraseRedactionPhrase]
+    ) -> AXTreeSnapshot {
+        guard !phrases.isEmpty else { return snapshot }
+
+        // Every string in tree order becomes a region, so the matcher (which can span
+        // adjacent regions) sees the text in the order it appears.
+        var strings: [String] = []
+        func collect(_ node: AXNodeSnapshot) {
+            for string in [node.title, node.value, node.label].compactMap({ $0 }) {
+                strings.append(string)
+            }
+            node.children.forEach(collect)
+        }
+        collect(snapshot.root)
+        guard !strings.isEmpty else { return snapshot }
+
+        let regions = strings.map { TextRegion(frameID: FrameID(value: 0), text: $0, bounds: .zero) }
+        let protected = redactedCombinedNodeOrders(in: regions, offset: 0, phrases: phrases)
+        guard !protected.isEmpty else { return snapshot }
+
+        var index = 0
+        func next(_ string: String?) -> String? {
+            guard let string else { return nil }
+            defer { index += 1 }
+            return protected.contains(index) ? nil : string
+        }
+        func scrub(_ node: AXNodeSnapshot) -> AXNodeSnapshot {
+            let title = next(node.title)
+            let value = next(node.value)
+            let label = next(node.label)
+            return AXNodeSnapshot(
+                role: node.role,
+                subrole: node.subrole,
+                title: title,
+                value: value,
+                label: label,
+                bounds: node.bounds,
+                children: node.children.map(scrub)
+            )
+        }
+        return AXTreeSnapshot(
+            bundleID: snapshot.bundleID,
+            processID: snapshot.processID,
+            root: scrub(snapshot.root),
+            nodeCount: snapshot.nodeCount,
+            isTruncated: snapshot.isTruncated,
+            walkMilliseconds: snapshot.walkMilliseconds
+        )
+    }
+
+    private static func loadPhraseLevelRedactionPhrases(defaults: UserDefaults) -> [NormalizedPhraseRedactionPhrase] {
         guard let raw = defaults.string(forKey: Self.phraseRedactionPhrasesDefaultsKey),
               !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return []

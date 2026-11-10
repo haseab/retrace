@@ -121,6 +121,10 @@ public enum DailyMetricsQueries {
         // rawBytes counts the original pixel bytes, excluding metadata sidecars and ID maps.
         // metadata: JSON {codec, outcome, frameCount, compressedFrameCount, rawBytes, storedBytes, compressionMilliseconds}
         case walCompression = "wal_compression"
+        // One aggregate per finalized recording segment; never includes captured text.
+        // metadata: JSON {phase: "capture", frames, outcomes: {captured, disabled, ...}, truncated,
+        // nodeRefs, newNodes, walkMsTotal, walkMsMax, phraseScrubbed}
+        case accessibilitySnapshots = "accessibility_snapshots"
         case unexpectedRecordingStopAction = "unexpected_recording_stop_action"  // metadata: JSON {action, reason, ...}
         case storageHealthBannerAction = "storage_health_banner_action"  // metadata: JSON {action, severity, availableGB, shouldStop}
         case crashRecoveryApprovalBannerAction = "crash_recovery_approval_banner_action"  // metadata: JSON {action, status}

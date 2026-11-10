@@ -143,7 +143,22 @@ public struct AXTreeSnapshot: Codable, Sendable, Equatable {
         return lines
     }
 
-    static let valueRoles: Set<String> = [
+    /// Roles whose `value` is their visible text. Capture reads values only for these.
+    public static let valueRoles: Set<String> = [
         "AXStaticText", "AXTextField", "AXTextArea", "AXComboBox", "AXSearchField", "AXHeading", "AXCell"
     ]
+}
+
+/// Why a kept frame did or did not get an accessibility snapshot. Used for metrics.
+public enum AXSnapshotOutcome: String, Codable, Sendable, CaseIterable {
+    case captured
+    case disabled
+    case noPermission = "no_permission"
+    case redactedFrame = "redacted_frame"
+    case excludedApp = "excluded_app"
+    case appChanged = "app_changed"
+    case noFocusedWindow = "no_focused_window"
+    case windowMismatch = "window_mismatch"
+    case privateWindow = "private_window"
+    case offDisplay = "off_display"
 }

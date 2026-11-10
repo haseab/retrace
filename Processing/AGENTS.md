@@ -34,6 +34,7 @@ Processing/
 ├── TextMerger/
 │   └── TextMerger.swift            # Combine OCR + AX results
 └── Tests/
+    ├── AXSnapshotPhraseRedactionTests.swift   # Protected phrases removed from accessibility snapshots before storage
     ├── ExtractRequestInstrumentationTests.swift # Region tail aggregation and coordinator helper coverage
     ├── InPageURLMetadataResolutionTests.swift # In-page URL metadata retry and rewrite scheduling regression coverage
     ├── OCRMemoryBackpressurePolicyTests.swift # OCR memory backpressure threshold/default coverage

@@ -340,7 +340,7 @@ struct PrivateWindowDetector {
     ///   - element: The AXUIElement representing the window
     ///   - bundleID: The application's bundle identifier
     /// - Returns: true if the window is private
-    private static func isPrivateWindowElement(_ element: AXUIElement, bundleID: String) -> Bool {
+    static func isPrivateWindowElement(_ element: AXUIElement, bundleID: String) -> Bool {
         // Check browser-specific attributes
         switch bundleID {
         case "com.google.Chrome", "com.google.Chrome.canary", "com.microsoft.edgemac",
