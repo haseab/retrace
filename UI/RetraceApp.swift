@@ -268,6 +268,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var isHandlingSystemWake = false
     private var pendingDeeplinkURLs: [URL] = []
     private var shouldShowDashboardAfterInitialization = false
+    private var pendingAutomaticDashboardRevealSource: String?
+    private let dashboardRevealScheduler = DashboardRevealScheduler()
     private var isActivationRevealInFlight = false
     private var isInitialized = false
     private var isTerminationFlushInProgress = false
@@ -788,9 +790,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 requestDashboardReveal(source: "pendingExternalDashboardReveal")
                 shouldShowDashboardAfterInitialization = false
             } else if !didHandleInitialDeeplink {
-                // Show dashboard on first launch (only if no deeplinks)
-                DashboardWindowController.shared.show()
+                // A launch URL can arrive just after initialization completes.
+                // Give it the same precedence as a URL opening a running app.
+                scheduleAutomaticDashboardReveal(
+                    source: pendingAutomaticDashboardRevealSource ?? "initialLaunch"
+                )
             }
+            pendingAutomaticDashboardRevealSource = nil
 
         } catch {
             Log.error("[AppDelegate] Failed to initialize: \(error)", category: .app)
@@ -917,28 +923,24 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        Task { @MainActor in
-            Log.info("[LaunchSurface] applicationShouldHandleReopen hasVisibleWindows=\(flag) state=\(launchSurfaceStateSnapshot())", category: .app)
-            logGhostAppCheck("applicationShouldHandleReopen hasVisibleWindows=\(flag)")
-            requestDashboardReveal(source: "applicationShouldHandleReopen")
-        }
+        Log.info("[LaunchSurface] applicationShouldHandleReopen hasVisibleWindows=\(flag) state=\(launchSurfaceStateSnapshot())", category: .app)
+        logGhostAppCheck("applicationShouldHandleReopen hasVisibleWindows=\(flag)")
+        scheduleAutomaticDashboardReveal(source: "applicationShouldHandleReopen")
         return true
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
-        Task { @MainActor in
-            self.installMainMenuIfNeeded()
-            CrashRecoveryManager.shared.refreshUserFacingStatus()
-            let shouldReveal = shouldRevealDashboardForActivation()
-            Log.info("[LaunchSurface] applicationDidBecomeActive shouldReveal=\(shouldReveal) state=\(launchSurfaceStateSnapshot())", category: .app)
-            logGhostAppCheck("applicationDidBecomeActive shouldReveal=\(shouldReveal)")
+        self.installMainMenuIfNeeded()
+        CrashRecoveryManager.shared.refreshUserFacingStatus()
+        let shouldReveal = shouldRevealDashboardForActivation()
+        Log.info("[LaunchSurface] applicationDidBecomeActive shouldReveal=\(shouldReveal) state=\(launchSurfaceStateSnapshot())", category: .app)
+        logGhostAppCheck("applicationDidBecomeActive shouldReveal=\(shouldReveal)")
 
-            guard shouldReveal, !isActivationRevealInFlight else { return }
+        guard shouldReveal, !isActivationRevealInFlight else { return }
 
-            isActivationRevealInFlight = true
-            requestDashboardReveal(source: "applicationDidBecomeActive")
-            isActivationRevealInFlight = false
-        }
+        isActivationRevealInFlight = true
+        scheduleAutomaticDashboardReveal(source: "applicationDidBecomeActive")
+        isActivationRevealInFlight = false
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -2305,7 +2307,26 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @MainActor
+    private func scheduleAutomaticDashboardReveal(source: String) {
+        dashboardRevealScheduler.schedule { [weak self] in
+            guard let self else { return }
+            // URL delivery and timeline presentation may have changed the state
+            // since the activation callback. Recheck before revealing anything.
+            if source == "applicationDidBecomeActive", !self.shouldRevealDashboardForActivation() {
+                return
+            }
+            if self.isInitialized {
+                self.requestDashboardReveal(source: source)
+            } else {
+                self.pendingAutomaticDashboardRevealSource = source
+            }
+        }
+    }
+
+    @MainActor
     private func requestDashboardReveal(source: String) {
+        dashboardRevealScheduler.cancelPendingReveal()
+        dashboardRevealScheduler.finishDeeplinkPresentation()
         logGhostAppCheck("requestDashboardReveal start source=\(source)")
         if isInitialized {
             Log.info("[LaunchSurface] requestDashboardReveal source=\(source) before state=\(launchSurfaceStateSnapshot())", category: .app)
@@ -2414,6 +2435,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func setupGhostAppLoggingObservers() {
         NotificationCenter.default.addObserver(
             self,
+            selector: #selector(handleTimelineDeeplinkDidOpen(_:)),
+            name: .timelineDidOpen,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
             selector: #selector(handleGhostAppDashboardDidClose(_:)),
             name: .dashboardDidClose,
             object: nil
@@ -2464,7 +2491,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    @objc private func handleTimelineDeeplinkDidOpen(_ notification: Notification) {
+        dashboardRevealScheduler.finishDeeplinkPresentation()
+    }
+
     @objc private func handleGhostAppTimelineDidClose(_ notification: Notification) {
+        dashboardRevealScheduler.finishDeeplinkPresentation()
         Task { @MainActor in
             logGhostAppCheck("notification timelineDidClose")
         }
@@ -2531,6 +2563,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @MainActor
     private func shouldRevealDashboardForActivation() -> Bool {
+        guard !dashboardRevealScheduler.isPresentingDeeplink else { return false }
         guard isInitialized else { return false }
         guard !isTerminationDecisionInProgress else { return false }
         guard !isTerminationFlushInProgress else { return false }
@@ -2548,6 +2581,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         Self.isApplicationTerminating = true
+        dashboardRevealScheduler.cancelPendingReveal()
         // Keep the single-instance lock until the process actually exits.
         // Releasing it here lets a fresh launch race against a half-dead instance
         // that still appears in NSWorkspace.runningApplications.
@@ -2584,6 +2618,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func application(_ application: NSApplication, open urls: [URL]) {
         Log.info("[AppDelegate] Received URLs: \(urls), isInitialized: \(isInitialized)", category: .app)
         for url in urls {
+            // Cancel the automatic fallback synchronously, before hopping to a
+            // Task or waiting for initialization. Explicit dashboard links still
+            // open through their normal route below.
+            if DeeplinkHandler.route(for: url) != nil {
+                dashboardRevealScheduler.beginDeeplinkPresentation()
+                pendingAutomaticDashboardRevealSource = nil
+            }
             if isInitialized {
                 Task { @MainActor in
                     self.handleDeeplink(url)
@@ -2601,10 +2642,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let route = DeeplinkHandler.route(for: url) else {
             return
         }
+        dashboardRevealScheduler.beginDeeplinkPresentation()
+        pendingAutomaticDashboardRevealSource = nil
 
         switch route {
         case let .dashboard(dateRange):
             DashboardWindowController.shared.openDeeplink(dateRange: dateRange)
+            dashboardRevealScheduler.finishDeeplinkPresentation()
 
         case let .timeline(timestamp):
             Log.info("[AppDelegate] Opening timeline deeplink at timestamp: \(String(describing: timestamp))", category: .app)
@@ -2622,6 +2666,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 appBundleID: appBundleID,
                 source: "AppDelegate.openURLs"
             )
+        }
+        // An already-open timeline does not emit another didOpen notification.
+        if TimelineWindowController.shared.isVisible {
+            dashboardRevealScheduler.finishDeeplinkPresentation()
         }
     }
 
