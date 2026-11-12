@@ -2,6 +2,12 @@ import Foundation
 import SQLCipher
 import Shared
 
+/// SQLite's SQLITE_TRANSIENT sentinel: instructs SQLite to make its own copy of
+/// the bound bytes. Required whenever the source buffer (e.g. a temporary
+/// NSString's utf8String) may be freed before sqlite3_step() runs; passing nil
+/// (SQLITE_STATIC) there binds freed/garbage memory.
+private let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
 /// Configuration for database operations, encapsulating source-specific differences
 /// Allows UnifiedDatabaseAdapter to work uniformly across different data sources
 public struct DatabaseConfig: Sendable {
@@ -109,7 +115,7 @@ extension DatabaseConfig {
         if let formatter = dateFormatter {
             // TEXT binding (Rewind)
             let iso = formatter.string(from: date)
-            sqlite3_bind_text(statement, index, (iso as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(statement, index, (iso as NSString).utf8String, -1, sqliteTransient)
         } else {
             // INTEGER binding (Retrace)
             let ms = Int64(date.timeIntervalSince1970 * 1000)
