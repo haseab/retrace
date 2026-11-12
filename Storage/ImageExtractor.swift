@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import AVFoundation
+import ImageIO
 import Shared
 
 /// Protocol for extracting frame images from video storage
@@ -476,16 +477,28 @@ public final class HEVCStorageExtractor: ImageExtractor, FrameExtractionCacheInv
     }
 
     private func convertToJPEG(cgImage: CGImage, path: String) throws -> Data {
-        let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
-        guard let tiffData = nsImage.tiffRepresentation,
-              let bitmapImage = NSBitmapImageRep(data: tiffData),
-              let jpegData = bitmapImage.representation(
-                using: .jpeg,
-                properties: [.compressionFactor: 0.8]
-              ) else {
+        // Encode straight from the CGImage via ImageIO. The previous
+        // NSImage -> tiffRepresentation -> NSBitmapImageRep path materialized a
+        // full uncompressed copy of the frame (~24MB at Retina) plus a re-decode
+        // on every extraction; this is on the timeline scrubbing hot path.
+        let data = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(
+            data as CFMutableData,
+            "public.jpeg" as CFString,
+            1,
+            nil
+        ) else {
             throw ImageExtractionError.conversionFailed(path: path)
         }
-        return jpegData
+        CGImageDestinationAddImage(
+            destination,
+            cgImage,
+            [kCGImageDestinationLossyCompressionQuality: 0.8] as CFDictionary
+        )
+        guard CGImageDestinationFinalize(destination) else {
+            throw ImageExtractionError.conversionFailed(path: path)
+        }
+        return data as Data
     }
 
     public func purgeFrameExtractionCaches(reason: String) {
@@ -692,16 +705,28 @@ public final class AVAssetExtractor: ImageExtractor, FrameExtractionCacheInvalid
     }
 
     private func convertToJPEG(cgImage: CGImage, path: String) throws -> Data {
-        let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
-        guard let tiffData = nsImage.tiffRepresentation,
-              let bitmapImage = NSBitmapImageRep(data: tiffData),
-              let jpegData = bitmapImage.representation(
-                using: .jpeg,
-                properties: [.compressionFactor: 0.8]
-              ) else {
+        // Encode straight from the CGImage via ImageIO. The previous
+        // NSImage -> tiffRepresentation -> NSBitmapImageRep path materialized a
+        // full uncompressed copy of the frame (~24MB at Retina) plus a re-decode
+        // on every extraction; this is on the timeline scrubbing hot path.
+        let data = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(
+            data as CFMutableData,
+            "public.jpeg" as CFString,
+            1,
+            nil
+        ) else {
             throw ImageExtractionError.conversionFailed(path: path)
         }
-        return jpegData
+        CGImageDestinationAddImage(
+            destination,
+            cgImage,
+            [kCGImageDestinationLossyCompressionQuality: 0.8] as CFDictionary
+        )
+        guard CGImageDestinationFinalize(destination) else {
+            throw ImageExtractionError.conversionFailed(path: path)
+        }
+        return data as Data
     }
 
     public func purgeFrameExtractionCaches(reason: String) {
