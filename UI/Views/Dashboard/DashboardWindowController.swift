@@ -370,7 +370,9 @@ struct DashboardContentView: View {
         self._dashboardViewModel = StateObject(wrappedValue: dashboardViewModel)
     }
 
-    var body: some View {
+    // The modifier chain is split across `rootContent` and `body` because a single
+    // chain of this length exceeds the type checker's time limit on Swift 6.4.
+    private var rootContent: some View {
         ZStack {
             if let showOnboarding = showOnboarding {
                 if showOnboarding {
@@ -427,6 +429,10 @@ struct DashboardContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: .fontStyleDidChange)) { _ in
             appearanceRefreshTick &+= 1
         }
+    }
+
+    var body: some View {
+        rootContent
         .onReceive(NotificationCenter.default.publisher(for: .toggleSettings)) { _ in
             // Toggle: if on settings go to dashboard, otherwise go to settings
             withAnimation(.easeInOut(duration: 0.2)) {
