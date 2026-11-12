@@ -1,4 +1,5 @@
 import Foundation
+import Security
 import SQLCipher
 import Shared
 
@@ -34,7 +35,53 @@ public actor FTSManager: FTSProtocol {
             throw DatabaseError.connectionFailed(underlying: errorMsg)
         }
 
+        // The FTS index lives in the SAME file DatabaseManager encrypts with SQLCipher.
+        // Without applying PRAGMA key here, every FTS statement fails with "file is not
+        // a database" whenever encryption is enabled -- silently breaking all search.
+        if let db {
+            sqlite3_busy_timeout(db, 5_000)
+            try applyEncryptionKeyIfEnabled(db: db)
+        }
+
         SQLiteRuntimeDiagnostics.log(label: "FTSManager/open", db: db)
+    }
+
+    /// Apply the SQLCipher key to this connection when database encryption is enabled,
+    /// mirroring ReadConnectionSupport.makeRetraceConnection. In-memory databases (used
+    /// by tests) are never encrypted and are skipped.
+    private func applyEncryptionKeyIfEnabled(db: OpaquePointer) throws {
+        if databasePath == ":memory:" || databasePath.contains("mode=memory") {
+            return
+        }
+
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        guard defaults.object(forKey: "encryptionEnabled") as? Bool ?? false else {
+            return
+        }
+
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: AppPaths.keychainService,
+            kSecAttrAccount as String: AppPaths.keychainAccount,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        guard status == errSecSuccess, let keyData = result as? Data else {
+            throw DatabaseError.connectionFailed(
+                underlying: "FTS encryption key unavailable (Keychain status: \(status)); refusing to open search index unkeyed."
+            )
+        }
+
+        let keyHex = keyData.map { String(format: "%02hhx", $0) }.joined()
+        var errorMessage: UnsafeMutablePointer<CChar>?
+        defer { sqlite3_free(errorMessage) }
+        guard sqlite3_exec(db, "PRAGMA key = \"x'\(keyHex)'\";", nil, nil, &errorMessage) == SQLITE_OK else {
+            let message = errorMessage.map { String(cString: $0) } ?? "Unknown error"
+            throw DatabaseError.connectionFailed(underlying: "Failed to apply FTS encryption key: \(message)")
+        }
     }
 
     /// Close the database connection
