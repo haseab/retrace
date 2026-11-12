@@ -1315,6 +1315,9 @@ public class TimelineWindowController: NSObject {
 
 	    /// Show the timeline overlay on the current screen
     public func show() {
+        // A newer explicit timeline command supersedes a pending Dock reveal.
+        let revealScheduler = DashboardRevealScheduler.shared
+        revealScheduler.cancelPendingReveal()
         reconcileVisibilityState(reason: "show")
         cancelDeferredHostingViewDetach()
         cancelWindowFadeIn(reason: "show")
@@ -1323,6 +1326,7 @@ public class TimelineWindowController: NSObject {
 
         // If we're in the middle of hiding, cancel the animation and snap back to visible
         if isHiding, let window = window {
+            revealScheduler.finishDeeplinkPresentation()
             isHiding = false
             presentationState = .visible
             // Cancel any running animation by setting duration to 0
@@ -1337,9 +1341,13 @@ public class TimelineWindowController: NSObject {
         }
 
         guard !isVisible, let coordinator = coordinator else {
+            revealScheduler.finishDeeplinkPresentation()
             return
         }
+        revealScheduler.beginDeeplinkPresentation()
         Task { @MainActor [weak self] in
+            // Covers failed presentations too, including a disconnected screen.
+            defer { revealScheduler.finishDeeplinkPresentation() }
             guard let self, !self.isVisible, self.coordinator === coordinator else { return }
         let showStartTime = CFAbsoluteTimeGetCurrent()
         liveModeCaptureTask?.cancel()

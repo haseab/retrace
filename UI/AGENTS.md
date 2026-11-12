@@ -102,6 +102,7 @@ UI/
 │   ├── SessionTimeline.swift            # App session visualization
 │   ├── DeeplinkHandler.swift            # Search, timeline, and exact dashboard date/time URL routing
 │   ├── LaunchMenuRouting.swift          # Shared dashboard/timeline/settings/system-monitor routing and frontmost-window checks for app/status menus
+│   ├── DashboardRevealScheduler.swift  # Cancellable activation/reopen fallback giving URL delivery precedence
 │   ├── AppMetadataCache.swift           # App name/icon lookup caches and app icon view
 │   ├── FaviconProvider.swift            # Favicon memory+disk cache and favicon view
 │   ├── FocusableTextInputSupport.swift  # Shared AppKit-backed text input wrapper and right-click deferral helpers for borderless UI surfaces
@@ -156,6 +157,7 @@ UI/
     ├── SpotlightSearchOverlayRecentEntryAppMapTests.swift # Recent entry app-name map deduplication coverage
     ├── Search/SearchPaginationCancellationTests.swift # Search stale-pagination cancellation coverage on mode/sort changes
     ├── DashboardAppUsageDateRangeTests.swift # Dashboard date/time range normalization and cache coverage
+    ├── DashboardRevealSchedulerTests.swift # Activation/URL ordering, cancellation, and later Dock reopen coverage
     ├── DateRangePresetShortcutTests.swift # Date/time parsing, round-trip formatting, full-day bounds, and preset shortcuts
     ├── CaptureIntervalSettingsTests.swift # Live capture-interval config update coverage
     ├── ProcessCPUDisplayMetricsTests.swift # CPU sampler display math and live ranking coverage
@@ -318,6 +320,15 @@ func handleURL(_ url: URL) {
 - Generates deeplink to share with others (or paste into notes)
 
 **Dashboard breakdown links**:
+
+Timeline and search deeplinks open their overlay without revealing a hidden dashboard.
+AppKit activation/reopen fallbacks wait 150 ms for URL delivery and are cancelled
+when a valid deeplink arrives. Automatic reveals stay suppressed until the timeline
+opens or closes; explicit dashboard commands and dashboard links still work.
+The timeline controller shares that scheduler: any explicit timeline open cancels
+older automatic reveals, and every completed/failed show attempt releases suppression.
+Cold-start automatic reveals are tracked separately from explicit dashboard requests,
+so a queued timeline/search link cannot inherit an earlier automatic dashboard request.
 
 - `retrace://dashboard` opens the dashboard and preserves the current range.
 - `retrace://dashboard?start={start}&end={end}` opens the existing app/window breakdown for that range.
