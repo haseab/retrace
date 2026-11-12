@@ -17,6 +17,10 @@ final class DashboardRevealSchedulerTests: XCTestCase {
 
         XCTAssertEqual(reveals, 0)
         XCTAssertFalse(scheduler.isPresentingDeeplink)
+
+        scheduler.beginDeeplinkPresentation()
+        TimelineWindowController.shared.show()
+        XCTAssertFalse(scheduler.isPresentingDeeplink)
     }
 
     @MainActor
