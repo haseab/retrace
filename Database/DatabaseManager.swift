@@ -776,6 +776,23 @@ public actor DatabaseManager: DatabaseProtocol {
         return try FrameQueries.getMetadata(db: db, frameId: frameID.value)
     }
 
+    /// Store the window map (on-screen windows, front to back) captured with a frame.
+    public func replaceFrameWindows(frameID: FrameID, windows: [CapturedWindow]) async throws {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        try FrameWindowQueries.replace(db: db, frameId: frameID.value, windows: windows)
+    }
+
+    /// Window map captured with a frame, front to back. Empty for frames captured
+    /// before V20 or without a window map.
+    public func getFrameWindows(frameID: FrameID) async throws -> [CapturedWindow] {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try FrameWindowQueries.fetch(db: db, frameId: frameID.value)
+    }
+
     public func replaceFrameInPageURLData(
         frameID: FrameID,
         state: FrameInPageURLState?,

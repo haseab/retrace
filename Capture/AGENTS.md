@@ -26,6 +26,7 @@ Capture/
 │   ├── ForegroundWindowSelection.swift # Reject sharing helpers and background processes for attribution
 │   ├── BrowserURLExtractor.swift  # Extract URL from browsers (AX API)
 │   ├── ConferenceCallActivityProvider.swift # Bounded window-specific active-call accessibility lookup
+│   ├── WindowMapProvider.swift    # Per-frame window map (on-screen windows, front to back, frame pixels)
 │   └── ConferenceSessionPrivacyPolicy.swift # Conferencing-session rules + session-scoped consent
 └── Tests/
     ├── AccessibilityInspectorTest.swift
@@ -34,7 +35,8 @@ Capture/
     ├── ConferenceROIPlannerTests.swift
     ├── ConferenceSessionPrivacyPolicyTests.swift
     ├── CaptureTriggerSchedulingTests.swift
-    └── DeduplicationTests.swift
+    ├── DeduplicationTests.swift
+    └── WindowMapProviderTests.swift
 ```
 
 ## System Requirements

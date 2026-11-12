@@ -2852,6 +2852,94 @@ final class DatabaseManagerTests: XCTestCase {
         XCTAssertEqual(legacyIndexCount, 0)
     }
 
+    func testMigrationRunner_V20CreatesFrameWindowTable() async throws {
+        let dbPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RetraceV20Migration-\(UUID().uuidString).sqlite")
+            .path
+        let db = try openRawDatabase(at: dbPath)
+
+        defer {
+            sqlite3_close(db)
+            removeSQLiteTestArtifacts(atPath: dbPath)
+        }
+
+        try await runLegacyMigrations(throughVersion: 19, db: db)
+        let preMigrationTableCount = try fetchInt64(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'frame_window';",
+            db: db
+        )
+        XCTAssertEqual(preMigrationTableCount, 0)
+
+        let runner = MigrationRunner(db: db)
+        try await runner.runMigrations()
+
+        let columns = try tableColumnNames("frame_window", db: db)
+        XCTAssertEqual(
+            columns,
+            ["frameId", "zOrder", "windowId", "bundleID", "appName", "title",
+             "x", "y", "width", "height", "layer", "isFocused"]
+        )
+        let currentVersion = try fetchInt64("SELECT MAX(version) FROM schema_migrations;", db: db)
+        XCTAssertGreaterThanOrEqual(currentVersion, 20)
+    }
+
+    func testFrameWindowsRoundTripInStackingOrder() async throws {
+        let frameID = try await insertTestFrame(browserURL: nil)
+        let windows = [
+            CapturedWindow(
+                windowID: 42, zOrder: 0, bundleID: "com.apple.Safari", appName: "Safari",
+                title: "Example", bounds: CGRect(x: 10, y: 20, width: 800, height: 600),
+                layer: 0, isFocused: true
+            ),
+            CapturedWindow(
+                windowID: 7, zOrder: 1, bundleID: nil, appName: "Window Server",
+                title: nil, bounds: CGRect(x: 0, y: 0, width: 1920, height: 50),
+                layer: 25, isFocused: false
+            )
+        ]
+
+        try await database.replaceFrameWindows(frameID: frameID, windows: windows.reversed())
+        let stored = try await database.getFrameWindows(frameID: frameID)
+
+        XCTAssertEqual(stored, windows)
+    }
+
+    func testFrameWindowsReplaceOverwritesPreviousMap() async throws {
+        let frameID = try await insertTestFrame(browserURL: nil)
+        let first = CapturedWindow(
+            windowID: 1, zOrder: 0, bundleID: "a", appName: "A", title: "one",
+            bounds: CGRect(x: 0, y: 0, width: 10, height: 10), layer: 0, isFocused: true
+        )
+        let second = CapturedWindow(
+            windowID: 2, zOrder: 0, bundleID: "b", appName: "B", title: "two",
+            bounds: CGRect(x: 5, y: 5, width: 20, height: 20), layer: 0, isFocused: false
+        )
+
+        try await database.replaceFrameWindows(frameID: frameID, windows: [first])
+        try await database.replaceFrameWindows(frameID: frameID, windows: [second])
+
+        let stored = try await database.getFrameWindows(frameID: frameID)
+        XCTAssertEqual(stored, [second])
+    }
+
+    func testFrameWindowsAreDeletedWithFrame() async throws {
+        let frameID = try await insertTestFrame(browserURL: nil)
+        try await database.replaceFrameWindows(
+            frameID: frameID,
+            windows: [
+                CapturedWindow(
+                    windowID: 1, zOrder: 0, bundleID: nil, appName: nil, title: nil,
+                    bounds: CGRect(x: 0, y: 0, width: 10, height: 10), layer: 0, isFocused: false
+                )
+            ]
+        )
+
+        try await database.deleteFrame(id: frameID)
+
+        let stored = try await database.getFrameWindows(frameID: frameID)
+        XCTAssertTrue(stored.isEmpty)
+    }
+
     func testGetPendingFrameIDsNotInQueueReturnsOnlyNewestOrphanedFrames() async throws {
         let oldestFrame = try await insertTestFrame(
             browserURL: "https://example.com/oldest",
@@ -4040,7 +4128,8 @@ final class DatabaseManagerTests: XCTestCase {
             V15_NodeRedactionFlag(),
             V16_ProcessingQueueFrameIDIndex(),
             V17_FrameCaptureTrigger(),
-            V18_DailyMetricsRecencyIndex()
+            V18_DailyMetricsRecencyIndex(),
+            V19_FrameEncodedAt()
         ]
 
         for migration in migrations where migration.version <= version {

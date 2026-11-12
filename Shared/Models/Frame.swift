@@ -59,6 +59,10 @@ public struct FrameMetadata: Codable, Sendable, Equatable {
     /// Mouse position in frame pixel coordinates (top-left origin), when captured.
     public let mousePosition: CGPoint?
 
+    /// On-screen windows at capture time, front to back, in frame pixel coordinates.
+    /// Nil when no window map was recorded (imported frames, WAL recovery, older builds).
+    public let windows: [CapturedWindow]?
+
     public init(
         appBundleID: String? = nil,
         appName: String? = nil,
@@ -67,7 +71,8 @@ public struct FrameMetadata: Codable, Sendable, Equatable {
         redactionReason: String? = nil,
         captureTrigger: FrameCaptureTrigger? = nil,
         displayID: UInt32 = 0,
-        mousePosition: CGPoint? = nil
+        mousePosition: CGPoint? = nil,
+        windows: [CapturedWindow]? = nil
     ) {
         self.appBundleID = appBundleID
         self.appName = appName
@@ -77,6 +82,7 @@ public struct FrameMetadata: Codable, Sendable, Equatable {
         self.captureTrigger = captureTrigger
         self.displayID = displayID
         self.mousePosition = mousePosition
+        self.windows = windows
     }
 
     public static let empty = FrameMetadata()

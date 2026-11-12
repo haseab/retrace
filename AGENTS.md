@@ -80,6 +80,7 @@ retrace/
 │   │   ├── Frame.swift          # FrameID, CapturedFrame, VideoSegment
 │   │   ├── Text.swift           # ExtractedText, OCRTextRegion
 │   │   ├── TextRegion.swift     # OCR text region types
+│   │   ├── WindowMap.swift      # CapturedWindow (per-frame window map entry) + region→window lookup
 │   │   ├── Search.swift         # SearchQuery, SearchResult
 │   │   ├── Segment.swift        # Segment data model
 │   │   ├── ConferencePrivacy.swift # Shared call kinds and capture privacy outcome events

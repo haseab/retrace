@@ -2174,6 +2174,10 @@ public actor AppCoordinator {
                     frameID: frameID,
                     capturedFrame: frame
                 )
+                await persistWindowMapIfNeeded(
+                    frameID: frameID,
+                    capturedFrame: frame
+                )
                 await writeCapturedFrameStillToTimelineDiskCache(
                     frameID: frameID,
                     frame: frame
@@ -5279,6 +5283,27 @@ public actor AppCoordinator {
         case noMatchingWindow
         case scriptFailed(String)
         case invalidOutput(String)
+    }
+
+    private func persistWindowMapIfNeeded(
+        frameID: Int64,
+        capturedFrame: CapturedFrame
+    ) async {
+        guard let windows = capturedFrame.metadata.windows, !windows.isEmpty else {
+            return
+        }
+
+        do {
+            try await services.database.replaceFrameWindows(
+                frameID: FrameID(value: frameID),
+                windows: windows
+            )
+        } catch {
+            Log.warning(
+                "[WindowMap] Failed to persist window map for frame \(frameID): \(error)",
+                category: .app
+            )
+        }
     }
 
     private func persistGlobalMousePositionIfNeeded(
