@@ -269,7 +269,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var pendingDeeplinkURLs: [URL] = []
     private var shouldShowDashboardAfterInitialization = false
     private var pendingAutomaticDashboardRevealSource: String?
-    private let dashboardRevealScheduler = DashboardRevealScheduler()
+    private let dashboardRevealScheduler = DashboardRevealScheduler.shared
     private var isActivationRevealInFlight = false
     private var isInitialized = false
     private var isTerminationFlushInProgress = false

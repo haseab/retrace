@@ -3,6 +3,8 @@ import Foundation
 /// Gives AppKit URL delivery precedence over activation/reopen dashboard fallbacks.
 @MainActor
 final class DashboardRevealScheduler {
+    static let shared = DashboardRevealScheduler()
+
     private var pendingReveal: Task<Void, Never>?
     private let delay: @MainActor () async throws -> Void
     private(set) var isPresentingDeeplink = false

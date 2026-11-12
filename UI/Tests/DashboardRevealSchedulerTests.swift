@@ -1,7 +1,24 @@
 import XCTest
+import AppKit
 @testable import Retrace
 
 final class DashboardRevealSchedulerTests: XCTestCase {
+    @MainActor
+    func testExplicitTimelineOpenCancelsRevealAndFailedOpenReleasesSuppression() async throws {
+        _ = NSApplication.shared
+        let scheduler = DashboardRevealScheduler.shared
+        var reveals = 0
+        let task = try XCTUnwrap(scheduler.schedule { reveals += 1 })
+
+        // Exercise the actual controller entry point. Tests do not configure its
+        // coordinator, so this presentation must fail without leaving suppression.
+        TimelineWindowController.shared.show()
+        await task.value
+
+        XCTAssertEqual(reveals, 0)
+        XCTAssertFalse(scheduler.isPresentingDeeplink)
+    }
+
     @MainActor
     func testOrdinaryActivationRevealsDashboardAfterURLDeliveryWindow() async throws {
         let gate = SharedAsyncTestGate()

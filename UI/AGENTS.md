@@ -325,6 +325,8 @@ Timeline and search deeplinks open their overlay without revealing a hidden dash
 AppKit activation/reopen fallbacks wait 150 ms for URL delivery and are cancelled
 when a valid deeplink arrives. Automatic reveals stay suppressed until the timeline
 opens or closes; explicit dashboard commands and dashboard links still work.
+The timeline controller shares that scheduler: any explicit timeline open cancels
+older automatic reveals, and every completed/failed show attempt releases suppression.
 Cold-start automatic reveals are tracked separately from explicit dashboard requests,
 so a queued timeline/search link cannot inherit an earlier automatic dashboard request.
 
