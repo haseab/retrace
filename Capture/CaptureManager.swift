@@ -1109,6 +1109,12 @@ public actor CaptureManager: CaptureProtocol {
         let preservedDisplayID = frame.metadata.displayID != 0 ? frame.metadata.displayID : frontmostMetadata.displayID
         let captureTrigger = frame.metadata.captureTrigger ?? Self.storedCaptureTrigger(for: trigger)
 
+        let axResult = await captureAXSnapshotIfAllowed(
+            frame: frame,
+            bundleID: frame.metadata.appBundleID ?? frontmostMetadata.appBundleID,
+            displayID: preservedDisplayID
+        )
+
         let enrichedMetadata: FrameMetadata
         if redactionReason == nil {
             enrichedMetadata = FrameMetadata(
@@ -1118,7 +1124,10 @@ public actor CaptureManager: CaptureProtocol {
                 browserURL: frame.metadata.browserURL ?? frontmostMetadata.browserURL,
                 redactionReason: redactionReason,
                 captureTrigger: captureTrigger,
-                displayID: preservedDisplayID
+                displayID: preservedDisplayID,
+                windows: frame.metadata.windows,
+                axSnapshot: axResult.snapshot,
+                axSnapshotOutcome: axResult.outcome
             )
         } else {
             enrichedMetadata = FrameMetadata(
@@ -1128,7 +1137,9 @@ public actor CaptureManager: CaptureProtocol {
                 browserURL: nil,
                 redactionReason: redactionReason,
                 captureTrigger: captureTrigger,
-                displayID: preservedDisplayID
+                displayID: preservedDisplayID,
+                windows: frame.metadata.windows,
+                axSnapshotOutcome: axResult.outcome
             )
         }
 
@@ -1140,6 +1151,44 @@ public actor CaptureManager: CaptureProtocol {
             bytesPerRow: frame.bytesPerRow,
             metadata: enrichedMetadata
         )
+    }
+
+    /// Snapshot the focused window's accessibility tree for a kept frame. Skipped for
+    /// redacted frames and excluded apps; the snapshotter also requires the focused window
+    /// to be the one in the frame's window map and re-checks privacy rules against it. The
+    /// walk makes blocking IPC calls, so it runs off the actor.
+    private func captureAXSnapshotIfAllowed(
+        frame: CapturedFrame,
+        bundleID: String?,
+        displayID: UInt32
+    ) async -> (snapshot: AXTreeSnapshot?, outcome: AXSnapshotOutcome) {
+        guard frame.metadata.redactionReason == nil else { return (nil, .redactedFrame) }
+        guard displayID != 0 else { return (nil, .offDisplay) }
+        if let bundleID, currentConfig.excludedAppBundleIDs.contains(bundleID) { return (nil, .excludedApp) }
+
+        let width = frame.width
+        let height = frame.height
+        let expectedWindow = frame.metadata.windows?.first(where: \.isFocused)
+        let privacy = AXTreeSnapshotter.PrivacyRules(
+            excludePrivateWindows: currentConfig.excludePrivateWindows,
+            windowTitlePatterns: currentConfig.redactWindowTitlePatterns + currentConfig.customPrivateWindowPatterns
+        )
+        let result = await Task.detached(priority: .utility) {
+            AXTreeSnapshotter.captureFocusedWindow(
+                expectedBundleID: bundleID,
+                expectedWindow: expectedWindow,
+                privacy: privacy,
+                displayID: CGDirectDisplayID(displayID),
+                frameWidth: width,
+                frameHeight: height
+            )
+        }.value
+        switch result {
+        case .captured(let snapshot):
+            return (snapshot, .captured)
+        case .skipped(let outcome):
+            return (nil, outcome)
+        }
     }
 
     private static func storedCaptureTrigger(for trigger: CaptureTrigger) -> FrameCaptureTrigger {

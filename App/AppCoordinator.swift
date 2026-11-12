@@ -778,6 +778,8 @@ public actor AppCoordinator {
 
     private nonisolated let services: ServiceContainer
     private var captureTask: Task<Void, Never>?
+    /// Accessibility snapshot outcomes since the last finalized segment (daily_metrics).
+    private var axSnapshotMetrics = AXSnapshotMetrics()
     // ⚠️ RELEASE 2 ONLY
     // private var audioTask: Task<Void, Never>?
     private var isRunning = false
@@ -2174,6 +2176,14 @@ public actor AppCoordinator {
                     frameID: frameID,
                     capturedFrame: frame
                 )
+                await persistWindowMapIfNeeded(
+                    frameID: frameID,
+                    capturedFrame: frame
+                )
+                await persistAXSnapshotIfNeeded(
+                    frameID: frameID,
+                    capturedFrame: frame
+                )
                 await writeCapturedFrameStillToTimelineDiskCache(
                     frameID: frameID,
                     frame: frame
@@ -2982,6 +2992,15 @@ public actor AppCoordinator {
         let fileSize = await writerState.writer.currentFileSize
         try await services.database.markVideoFinalized(id: writerState.videoDBID, frameCount: writerState.frameCount, fileSize: fileSize)
         Log.info("[FINALIZE-DEBUG] Marked videoDBID=\(writerState.videoDBID) as finalized with frameCount=\(writerState.frameCount), fileSize=\(fileSize) bytes", category: .app)
+
+        if axSnapshotMetrics.frames > 0 {
+            let metrics = axSnapshotMetrics
+            axSnapshotMetrics = AXSnapshotMetrics()
+            try? await recordMetricEvent(
+                metricType: .accessibilitySnapshots,
+                metadata: Self.metricMetadata(metrics.payload)
+            )
+        }
 
         if let statistics = walCompression {
             try? await recordMetricEvent(
@@ -5281,6 +5300,59 @@ public actor AppCoordinator {
         case invalidOutput(String)
     }
 
+    private func persistAXSnapshotIfNeeded(
+        frameID: Int64,
+        capturedFrame: CapturedFrame
+    ) async {
+        if let outcome = capturedFrame.metadata.axSnapshotOutcome {
+            axSnapshotMetrics.record(outcome: outcome, snapshot: capturedFrame.metadata.axSnapshot)
+        }
+        guard let captured = capturedFrame.metadata.axSnapshot,
+              capturedFrame.metadata.redactionReason == nil else {
+            return
+        }
+
+        // Never store text that phrase-level redaction protects.
+        let snapshot = FrameProcessingQueue.removingProtectedPhrases(from: captured)
+        if snapshot != captured {
+            axSnapshotMetrics.phraseScrubbed += 1
+        }
+
+        do {
+            let newNodes = try await services.database.replaceFrameAXSnapshot(
+                frameID: FrameID(value: frameID),
+                snapshot: snapshot
+            )
+            axSnapshotMetrics.newNodes += newNodes
+        } catch {
+            Log.warning(
+                "[AXSnapshot] Failed to persist accessibility snapshot for frame \(frameID): \(error)",
+                category: .app
+            )
+        }
+    }
+
+    private func persistWindowMapIfNeeded(
+        frameID: Int64,
+        capturedFrame: CapturedFrame
+    ) async {
+        guard let windows = capturedFrame.metadata.windows, !windows.isEmpty else {
+            return
+        }
+
+        do {
+            try await services.database.replaceFrameWindows(
+                frameID: FrameID(value: frameID),
+                windows: windows
+            )
+        } catch {
+            Log.warning(
+                "[WindowMap] Failed to persist window map for frame \(frameID): \(error)",
+                category: .app
+            )
+        }
+    }
+
     private func persistGlobalMousePositionIfNeeded(
         frameID: Int64,
         capturedFrame: CapturedFrame
@@ -6107,5 +6179,41 @@ private final class MigrationProgressDelegate: MigrationDelegate, @unchecked Sen
 
     func migrationDidFail(error: Error) {
         Log.error("[Migration] Failed", category: .app, error: error)
+    }
+}
+
+/// Counts of accessibility snapshot outcomes, flushed to daily_metrics once per segment.
+struct AXSnapshotMetrics {
+    var frames = 0
+    var outcomes: [AXSnapshotOutcome: Int] = [:]
+    var truncated = 0
+    var nodeRefs = 0
+    var newNodes = 0
+    var walkMsTotal = 0
+    var walkMsMax = 0
+    var phraseScrubbed = 0
+
+    mutating func record(outcome: AXSnapshotOutcome, snapshot: AXTreeSnapshot?) {
+        frames += 1
+        outcomes[outcome, default: 0] += 1
+        guard let snapshot else { return }
+        if snapshot.isTruncated { truncated += 1 }
+        nodeRefs += snapshot.nodeCount
+        walkMsTotal += snapshot.walkMilliseconds
+        walkMsMax = max(walkMsMax, snapshot.walkMilliseconds)
+    }
+
+    var payload: [String: Any] {
+        [
+            "phase": "capture",
+            "frames": frames,
+            "outcomes": Dictionary(uniqueKeysWithValues: outcomes.map { ($0.key.rawValue, $0.value) }),
+            "truncated": truncated,
+            "nodeRefs": nodeRefs,
+            "newNodes": newNodes,
+            "walkMsTotal": walkMsTotal,
+            "walkMsMax": walkMsMax,
+            "phraseScrubbed": phraseScrubbed
+        ]
     }
 }

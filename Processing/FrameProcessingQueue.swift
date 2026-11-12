@@ -493,6 +493,12 @@ public actor FrameProcessingQueue {
 
     private let config: ProcessingQueueConfig
     private var workers: [Task<Void, Never>] = []
+    /// Frames with an accessibility snapshot processed since the last metric flush.
+    private var axIndexedFrames = 0
+    private var axIndexedFramesWithAddedText = 0
+    private var axIndexedLinesAdded = 0
+    /// Processed snapshot frames per accessibility_snapshots "indexed" metric event.
+    static let axIndexingMetricBatchSize = 200
     private var isRunning = false
     private var memoryReportTask: Task<Void, Never>?
 
@@ -1240,8 +1246,30 @@ public actor FrameProcessingQueue {
             ocrStage = stage
         }
 
+        let frameWindows: [CapturedWindow]
+        do {
+            frameWindows = try await databaseManager.getFrameWindows(frameID: FrameID(value: frameID))
+        } catch {
+            Log.warning("[Queue] Failed to load window map for frame \(frameID): \(error)", category: .processing)
+            frameWindows = []
+        }
+        let axSnapshot: AXTreeSnapshot?
+        do {
+            axSnapshot = try await databaseManager.getFrameAXSnapshot(frameID: FrameID(value: frameID))
+        } catch {
+            Log.warning("[Queue] Failed to load accessibility snapshot for frame \(frameID): \(error)", category: .processing)
+            axSnapshot = nil
+        }
+        let readingOrderText = Self.applyReadingOrder(to: ocrStage.extractedText, windows: frameWindows)
+        let orderedText = Self.appendingAccessibilityText(to: readingOrderText, snapshot: axSnapshot)
+        if axSnapshot != nil {
+            await recordAccessibilityIndexing(
+                linesAdded: orderedText.chromeRegions.count - readingOrderText.chromeRegions.count
+            )
+        }
+
         let phraseRedactionResult = applyPhraseLevelRedaction(
-            to: ocrStage.extractedText,
+            to: orderedText,
             actualFrameID: frameID
         )
         let indexedText = phraseRedactionResult.sanitizedText
@@ -1271,7 +1299,7 @@ public actor FrameProcessingQueue {
                     textOffset: mainOffset,
                     textLength: textLength,
                     bounds: region.bounds,
-                    windowIndex: nil
+                    windowIndex: WindowMap.owningWindowIndex(for: region.bounds, in: frameWindows)
                 ))
                 mainOffset += textLength + 1
             }
@@ -1284,7 +1312,7 @@ public actor FrameProcessingQueue {
                     textOffset: chromeOffset,
                     textLength: textLength,
                     bounds: region.bounds,
-                    windowIndex: nil
+                    windowIndex: WindowMap.owningWindowIndex(for: region.bounds, in: frameWindows)
                 ))
                 chromeOffset += textLength + 1
             }
@@ -2269,6 +2297,135 @@ public actor FrameProcessingQueue {
         let combinedNodeOrder: Int
     }
 
+    /// Share of a line's words that must already appear in the OCR text for the line to
+    /// count as already captured.
+    static let accessibilityLineCoveredThreshold = 0.8
+
+    /// Add accessibility text that OCR missed, as extra regions after the chrome text.
+    ///
+    /// Lines whose words OCR already found are skipped, so search is not padded with
+    /// duplicates. New lines become regions with their element bounds, so search hits
+    /// in them can be highlighted. They go after the chrome regions, which keeps every
+    /// existing node offset valid.
+    static func appendingAccessibilityText(to extracted: ExtractedText, snapshot: AXTreeSnapshot?) -> ExtractedText {
+        guard let snapshot else { return extracted }
+        let lines = snapshot.textLines()
+        guard !lines.isEmpty else { return extracted }
+
+        var knownWords = Set(
+            searchWords(in: extracted.fullText) + searchWords(in: extracted.chromeText)
+        )
+        var additions: [TextRegion] = []
+        // Text areas expose a whole document as one value; judge each of its lines on its
+        // own so a new line is not hidden by the many lines OCR already read.
+        let physicalLines = lines.flatMap { line in
+            line.text
+                .split(whereSeparator: \.isNewline)
+                .map { (text: $0.trimmingCharacters(in: .whitespaces), bounds: line.bounds) }
+                .filter { !$0.text.isEmpty }
+        }
+        // Padded with spaces so containment checks match whole tokens only.
+        let knownText = " " + normalizedForContainment(extracted.fullText + " " + extracted.chromeText) + " "
+        for line in physicalLines {
+            let words = Set(searchWords(in: line.text))
+            if words.isEmpty {
+                // Only one-character tokens ("A B C", a lone digit): keep the line unless
+                // OCR already has it verbatim.
+                let normalized = normalizedForContainment(line.text)
+                guard !normalized.isEmpty, !knownText.contains(" \(normalized) ") else { continue }
+            } else {
+                let covered = words.intersection(knownWords).count
+                if Double(covered) / Double(words.count) >= accessibilityLineCoveredThreshold {
+                    continue
+                }
+            }
+            additions.append(
+                TextRegion(
+                    frameID: extracted.frameID,
+                    text: line.text,
+                    bounds: line.bounds ?? .zero,
+                    confidence: nil
+                )
+            )
+            knownWords.formUnion(words)
+        }
+        guard !additions.isEmpty else { return extracted }
+
+        let chromeRegions = extracted.chromeRegions + additions
+        return ExtractedText(
+            frameID: extracted.frameID,
+            timestamp: extracted.timestamp,
+            regions: extracted.regions,
+            chromeRegions: chromeRegions,
+            fullText: extracted.fullText,
+            chromeText: chromeRegions.map(\.text).joined(separator: " "),
+            metadata: extracted.metadata
+        )
+    }
+
+    /// Lowercased letters and digits separated by single spaces, for substring checks.
+    private static func normalizedForContainment(_ text: String) -> String {
+        text.lowercased()
+            .split { !$0.isLetter && !$0.isNumber }
+            .joined(separator: " ")
+    }
+
+    private static func searchWords(in text: String) -> [String] {
+        text.lowercased()
+            .split { !$0.isLetter && !$0.isNumber }
+            .filter { $0.count >= 2 }
+            .map(String.init)
+    }
+
+    /// Count how often accessibility text added searchable lines, and record one
+    /// accessibility_snapshots "indexed" metric per batch of frames (no text included).
+    private func recordAccessibilityIndexing(linesAdded: Int) async {
+        axIndexedFrames += 1
+        if linesAdded > 0 {
+            axIndexedFramesWithAddedText += 1
+            axIndexedLinesAdded += linesAdded
+        }
+        guard axIndexedFrames >= Self.axIndexingMetricBatchSize else { return }
+
+        let payload: [String: Any] = [
+            "phase": "indexed",
+            "frames": axIndexedFrames,
+            "framesWithAddedText": axIndexedFramesWithAddedText,
+            "linesAdded": axIndexedLinesAdded
+        ]
+        axIndexedFrames = 0
+        axIndexedFramesWithAddedText = 0
+        axIndexedLinesAdded = 0
+        guard let data = try? JSONSerialization.data(withJSONObject: payload),
+              let metadata = String(data: data, encoding: .utf8) else {
+            return
+        }
+        try? await databaseManager.recordMetricEvent(metricType: .accessibilitySnapshots, metadata: metadata)
+    }
+
+    /// Reorder main-content OCR regions into reading order (see `ReadingOrder`).
+    ///
+    /// Leaves the text untouched when `fullText` is not simply the regions joined by
+    /// spaces (for example when accessibility text was merged in), because node offsets
+    /// are computed from that join.
+    static func applyReadingOrder(to extracted: ExtractedText, windows: [CapturedWindow]) -> ExtractedText {
+        guard extracted.regions.count > 1,
+              extracted.fullText == extracted.regions.map(\.text).joined(separator: " ") else {
+            return extracted
+        }
+
+        let regions = ReadingOrder.order(extracted.regions, windows: windows).map(\.region)
+        return ExtractedText(
+            frameID: extracted.frameID,
+            timestamp: extracted.timestamp,
+            regions: regions,
+            chromeRegions: extracted.chromeRegions,
+            fullText: nil,
+            chromeText: extracted.chromeText,
+            metadata: extracted.metadata
+        )
+    }
+
     private func applyPhraseLevelRedaction(
         to extracted: ExtractedText,
         actualFrameID: Int64? = nil
@@ -2276,7 +2433,7 @@ public actor FrameProcessingQueue {
         let defaults = UserDefaults(suiteName: ReversibleOCRScrambler.settingsSuiteName) ?? .standard
         let preliminaryResult = Self.applyPhraseLevelRedaction(
             to: extracted,
-            phrases: loadPhraseLevelRedactionPhrases(defaults: defaults)
+            phrases: Self.loadPhraseLevelRedactionPhrases(defaults: defaults)
         )
 
         guard !preliminaryResult.redactedCombinedNodeOrders.isEmpty else {
@@ -2470,7 +2627,71 @@ public actor FrameProcessingQueue {
         )
     }
 
-    private func loadPhraseLevelRedactionPhrases(defaults: UserDefaults) -> [NormalizedPhraseRedactionPhrase] {
+    /// Remove every string that matches a protected phrase from an accessibility snapshot,
+    /// so the stored snapshot never holds text that phrase-level redaction protects. Uses
+    /// the same matcher as OCR redaction; a matching string is dropped whole.
+    public static func removingProtectedPhrases(from snapshot: AXTreeSnapshot) -> AXTreeSnapshot {
+        let defaults = UserDefaults(suiteName: ReversibleOCRScrambler.settingsSuiteName) ?? .standard
+        return removingProtectedPhrases(from: snapshot, phrases: loadPhraseLevelRedactionPhrases(defaults: defaults))
+    }
+
+    static func removingProtectedPhrases(from snapshot: AXTreeSnapshot, phraseStrings: [String]) -> AXTreeSnapshot {
+        removingProtectedPhrases(from: snapshot, phrases: normalizedRedactionPhrases(phraseStrings))
+    }
+
+    private static func removingProtectedPhrases(
+        from snapshot: AXTreeSnapshot,
+        phrases: [NormalizedPhraseRedactionPhrase]
+    ) -> AXTreeSnapshot {
+        guard !phrases.isEmpty else { return snapshot }
+
+        // Every string in tree order becomes a region, so the matcher (which can span
+        // adjacent regions) sees the text in the order it appears.
+        var strings: [String] = []
+        func collect(_ node: AXNodeSnapshot) {
+            for string in [node.title, node.value, node.label].compactMap({ $0 }) {
+                strings.append(string)
+            }
+            node.children.forEach(collect)
+        }
+        collect(snapshot.root)
+        guard !strings.isEmpty else { return snapshot }
+
+        let regions = strings.map { TextRegion(frameID: FrameID(value: 0), text: $0, bounds: .zero) }
+        let protected = redactedCombinedNodeOrders(in: regions, offset: 0, phrases: phrases)
+        guard !protected.isEmpty else { return snapshot }
+
+        var index = 0
+        func next(_ string: String?) -> String? {
+            guard let string else { return nil }
+            defer { index += 1 }
+            return protected.contains(index) ? nil : string
+        }
+        func scrub(_ node: AXNodeSnapshot) -> AXNodeSnapshot {
+            let title = next(node.title)
+            let value = next(node.value)
+            let label = next(node.label)
+            return AXNodeSnapshot(
+                role: node.role,
+                subrole: node.subrole,
+                title: title,
+                value: value,
+                label: label,
+                bounds: node.bounds,
+                children: node.children.map(scrub)
+            )
+        }
+        return AXTreeSnapshot(
+            bundleID: snapshot.bundleID,
+            processID: snapshot.processID,
+            root: scrub(snapshot.root),
+            nodeCount: snapshot.nodeCount,
+            isTruncated: snapshot.isTruncated,
+            walkMilliseconds: snapshot.walkMilliseconds
+        )
+    }
+
+    private static func loadPhraseLevelRedactionPhrases(defaults: UserDefaults) -> [NormalizedPhraseRedactionPhrase] {
         guard let raw = defaults.string(forKey: Self.phraseRedactionPhrasesDefaultsKey),
               !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return []

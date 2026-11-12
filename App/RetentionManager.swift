@@ -233,6 +233,17 @@ public actor RetentionManager {
                 Log.info("[RetentionManager] Cleaned up \(deletedNodesCount) orphaned OCR nodes", category: .app)
             }
 
+            // Step 5b: Drop window maps and accessibility snapshots of deleted frames, then
+            // accessibility nodes no remaining snapshot shares.
+            do {
+                let purgedAXNodes = try await cleanupOrphanedCaptureContext()
+                if purgedAXNodes > 0 {
+                    Log.info("[RetentionManager] Purged \(purgedAXNodes) unreferenced accessibility nodes", category: .app)
+                }
+            } catch {
+                Log.warning("[RetentionManager] Accessibility/window-map cleanup failed: \(error)", category: .app)
+            }
+
             // Step 6: Vacuum database to reclaim space (do this less frequently)
             if deletedFrameCount > 1000 || deletedVideoCount > 10 {
                 try await database.vacuum()
@@ -505,6 +516,28 @@ public actor RetentionManager {
     }
 
     /// Clean up OCR nodes that reference deleted frames
+    /// Delete frame_window and frame_ax_snapshot rows whose frame is gone (normally
+    /// removed by ON DELETE CASCADE; this covers deletes made with foreign keys off),
+    /// then purge accessibility nodes nothing references. Returns purged node count.
+    private func cleanupOrphanedCaptureContext() async throws -> Int {
+        guard let db = await database.getConnection() else {
+            throw RetentionError.databaseNotConnected
+        }
+
+        let sql = """
+            DELETE FROM frame_window WHERE frameId NOT IN (SELECT id FROM frame);
+            DELETE FROM frame_ax_snapshot WHERE frameId NOT IN (SELECT id FROM frame);
+        """
+        var errorPointer: UnsafeMutablePointer<CChar>?
+        guard sqlite3_exec(db, sql, nil, nil, &errorPointer) == SQLITE_OK else {
+            let message = errorPointer.map { String(cString: $0) } ?? "Unknown error"
+            sqlite3_free(errorPointer)
+            throw RetentionError.queryFailed(message)
+        }
+
+        return try await database.purgeUnreferencedAXNodes()
+    }
+
     private func cleanupOrphanedNodes() async throws -> Int {
         guard let db = await database.getConnection() else {
             throw RetentionError.databaseNotConnected
