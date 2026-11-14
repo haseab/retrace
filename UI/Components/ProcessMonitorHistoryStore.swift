@@ -15,6 +15,7 @@ final class ProcessMonitorHistoryStore<State: ProcessMonitorHistoryState> {
     private struct Checkpoint: Codable {
         let sequence: UInt64
         let state: State
+        let savedAt: Date?
     }
 
     private struct Update: Codable {
@@ -53,12 +54,20 @@ final class ProcessMonitorHistoryStore<State: ProcessMonitorHistoryState> {
         var recovered: State?
         var recoveredSequence: UInt64 = 0
         var legacy = false
+        var recoveredCheckpointDate: Date?
         if FileManager.default.fileExists(atPath: checkpointURL.path) {
             let data = try Data(contentsOf: checkpointURL)
             if !data.isEmpty {
                 if let checkpoint = try? decoder.decode(Checkpoint.self, from: data) {
                     recovered = checkpoint.state
                     recoveredSequence = checkpoint.sequence
+                    if let savedAt = checkpoint.savedAt {
+                        recoveredCheckpointDate = savedAt
+                    } else {
+                        recoveredCheckpointDate = try checkpointURL.resourceValues(
+                            forKeys: [.contentModificationDateKey]
+                        ).contentModificationDate
+                    }
                 } else {
                     recovered = try decoder.decode(State.self, from: data)
                     legacy = true
@@ -98,6 +107,7 @@ final class ProcessMonitorHistoryStore<State: ProcessMonitorHistoryState> {
         sequence = recoveredSequence
         journalBytes = bytes
         needsCheckpoint = legacy
+        lastCheckpointDate = recoveredCheckpointDate
         loaded = true
         return recovered
     }
@@ -166,7 +176,7 @@ final class ProcessMonitorHistoryStore<State: ProcessMonitorHistoryState> {
     private func checkpoint(_ state: State, at now: Date) throws {
         try ensureDirectory()
         let nextSequence = sequence + 1
-        try encoder.encode(Checkpoint(sequence: nextSequence, state: state))
+        try encoder.encode(Checkpoint(sequence: nextSequence, state: state, savedAt: now))
             .write(to: checkpointURL, options: .atomic)
         // Publish the checkpoint before rotating. Leftover older updates are skipped on replay.
         sequence = nextSequence

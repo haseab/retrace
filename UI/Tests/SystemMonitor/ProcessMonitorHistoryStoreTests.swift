@@ -107,6 +107,30 @@ final class ProcessMonitorHistoryStoreTests: XCTestCase {
         }
     }
 
+    func testCompactionDeadlineSurvivesRepeatedRelaunches() throws {
+        try withDirectory { url in
+            var history = state()
+            try ProcessMonitorHistoryStore<State>(checkpointURL: url, checkpointInterval: 60)
+                .save(history, at: Date(timeIntervalSince1970: 0))
+            let originalCheckpoint = try Data(contentsOf: url)
+            for offset: TimeInterval in [15, 30, 45, 60] {
+                let reopened = ProcessMonitorHistoryStore<State>(checkpointURL: url, checkpointInterval: 60)
+                XCTAssertEqual(try reopened.load(), history)
+                history.latestSampleTimestamp += 15
+                history.buckets[179].cpuNanoseconds += 1
+                try reopened.save(history, at: Date(timeIntervalSince1970: offset))
+                if offset < 60 {
+                    XCTAssertEqual(try Data(contentsOf: url), originalCheckpoint)
+                    XCTAssertGreaterThan(try Data(contentsOf: reopened.journalURL).count, 0)
+                } else {
+                    XCTAssertFalse(try Data(contentsOf: url) == originalCheckpoint)
+                    XCTAssertEqual(try Data(contentsOf: reopened.journalURL).count, 0)
+                }
+            }
+            XCTAssertEqual(try ProcessMonitorHistoryStore<State>(checkpointURL: url).load(), history)
+        }
+    }
+
     func testResetCannotResurrectOldBucketsFromJournal() throws {
         try withDirectory { url in
             let store = ProcessMonitorHistoryStore<State>(checkpointURL: url)
