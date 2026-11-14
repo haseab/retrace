@@ -107,6 +107,7 @@ UI/
 │   ├── FaviconProvider.swift            # Favicon memory+disk cache and favicon view
 │   ├── FocusableTextInputSupport.swift  # Shared AppKit-backed text input wrapper and right-click deferral helpers for borderless UI surfaces
 │   ├── ProcessCPUMonitor.swift          # Shared process CPU+memory sampler + bounded 12h tally aggregation
+│   ├── ProcessMonitorHistoryStore.swift # Incremental bucket journal, legacy tally loading, bounded compaction and crash-safe reset
 │   ├── ProcessUsageLogCleanup.swift     # Removes the unused legacy raw CPU log without reading it
 │   ├── ProcessMemoryCardPresentation.swift # Local presentation controller + row builder for memory monitor card
 │   ├── ProcessMonitorModels.swift       # System Monitor snapshot/models + ranking/build helpers
@@ -170,12 +171,22 @@ UI/
     ├── Support/                          # Shared XCTest helpers and support-only tests
     │   └── FocusableTextInputSupportTests.swift # Borderless text-input keyboard shortcut, right-click deferral, and menu-filter coverage
     ├── SystemMonitor/                    # System monitor XCTestCase files
+    │   ├── ProcessMonitorHistoryStoreTests.swift # File-backed incremental writes, migration, retention, recovery and reset coverage
     │   └── ProcessUsageLogCleanupTests.swift # Large legacy log cleanup and tally/recording preservation
     ├── Timeline/TimelineCoordinatorVisibilityDecisionTests.swift # Timeline coordinator visibility generation/race policy coverage
     ├── Timeline/TimelineCopyFeedbackTests.swift # Timeline copy image/text toast feedback coverage
     ├── Timeline/TimelinePositionRecoveryHintTests.swift # Timeline reopen Cmd+Z recovery hint behavior and policy coverage
     └── Timeline/                         # Timeline XCTestCase files
 ```
+
+## System Monitor History Persistence
+
+- The sampler actor retains the bounded 12-hour tally while idle; it drops only derived chart state.
+- `ProcessMonitorHistoryStore` reads the legacy tally JSON and migrates on the next changed save.
+- Saves append changed time buckets, removed bucket keys, and latest-sample metadata once per minute. Closing the monitor and normal app termination flush pending history.
+- The checkpoint is compacted after 30 minutes or before the update journal exceeds 4 MB. Sequence numbers prevent old journal records from replaying over a newer checkpoint or reset.
+- Incomplete trailing appends are removed before the next write. Other corrupt history is preserved until an explicit Restart Baseline.
+- File access stays on the sampler actor, including initial loading. Isolated tests supply a temporary storage root; never use the user's live history for mutation tests.
 
 ## Feature Requirements
 

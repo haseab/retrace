@@ -89,12 +89,16 @@ final class ProcessCPUMonitor: ObservableObject {
     }
 
     private func restartSamplingLoop() {
-        samplingTask?.cancel()
+        let previousSamplingTask = samplingTask
+        previousSamplingTask?.cancel()
         let initialInterval = max(1, sampleIntervalSeconds)
         let taskPriority: TaskPriority = activeConsumers.isEmpty ? .utility : .userInitiated
 
         samplingTask = Task(priority: taskPriority) { [weak self] in
-            guard let self else { return }
+            // Join an in-flight sample before switching cadence. Shutdown can then await this
+            // task and flush every accepted sample, including one from the previous cadence.
+            await previousSamplingTask?.value
+            guard !Task.isCancelled, let self else { return }
             await runSamplingLoop(initialIntervalSeconds: initialInterval)
         }
     }
@@ -102,6 +106,13 @@ final class ProcessCPUMonitor: ObservableObject {
     func stop() {
         samplingTask?.cancel()
         samplingTask = nil
+    }
+
+    func stopAndFlush() async {
+        let pendingSample = samplingTask
+        stop()
+        await pendingSample?.value
+        await sampler.flush()
     }
 
     deinit {
@@ -175,7 +186,7 @@ private actor SamplerRequestGate {
     }
 }
 
-private actor ProcessCPULogSampler {
+actor ProcessCPULogSampler {
     private typealias ProcPidRusageFunction = @convention(c) (pid_t, Int32, UnsafeMutableRawPointer?) -> Int32
 
     private struct ProcessIdentity {
@@ -386,7 +397,7 @@ private actor ProcessCPULogSampler {
         }
     }
 
-    private struct ProcessTallyBucket: Codable {
+    private struct ProcessTallyBucket: ProcessMonitorHistoryBucket {
         let startTimestamp: TimeInterval
         var durationSeconds: TimeInterval
         var deltaNanosecondsByGroup: [String: UInt64]
@@ -403,7 +414,7 @@ private actor ProcessCPULogSampler {
         var peakMemoryLedgerBytesByFamily: [String: UInt64]?
     }
 
-    private struct ProcessTallyState: Codable {
+    private struct ProcessTallyState: ProcessMonitorHistoryState {
         let version: Int
         let bucketSeconds: TimeInterval
         let windowDurationSeconds: TimeInterval
@@ -419,7 +430,7 @@ private actor ProcessCPULogSampler {
     }
 
     private static let displayNamePersistInterval: TimeInterval = 30
-    private static let tallyPersistInterval: TimeInterval = 5
+    private static let tallyPersistInterval: TimeInterval = 60
     private static let tallyBucketDurationSeconds: TimeInterval = 60
     private static let tallyVersion = 3
     private static let memoryCompositionLogInterval: TimeInterval = 30
@@ -506,20 +517,23 @@ private actor ProcessCPULogSampler {
     private var tallyState: ProcessTallyState?
     private var lastTallyPersistDate: Date?
     private var didAttemptLegacyLogCleanup = false
+    private let storageRoot: URL
     private let tallyFileURL: URL
+    private let historyStore: ProcessMonitorHistoryStore<ProcessTallyState>
+    private var didLoadTally = false
     private let displayNamesFileURL: URL
     private let encoder = JSONEncoder()
 
-    init() {
+    init(storageRoot: URL = URL(fileURLWithPath: AppPaths.expandedStorageRoot, isDirectory: true)) {
+        self.storageRoot = storageRoot
         retraceBundleID = Bundle.main.bundleIdentifier ?? "io.retrace.app"
         retraceDisplayName = (Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String)
             ?? (Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String)
             ?? "Retrace"
-        tallyFileURL = Self.makeTallyFileURL()
-        displayNamesFileURL = Self.makeDisplayNamesFileURL()
-        Self.ensureLogFileExists(at: tallyFileURL)
-        groupDisplayNameByKey = Self.readGroupDisplayNameMap(from: displayNamesFileURL)
-        tallyState = Self.readTallyState(from: tallyFileURL)
+        let logs = storageRoot.appendingPathComponent("logs", isDirectory: true)
+        tallyFileURL = logs.appendingPathComponent("cpu_process_usage_tally.json")
+        displayNamesFileURL = logs.appendingPathComponent("cpu_process_groups.json")
+        historyStore = ProcessMonitorHistoryStore(checkpointURL: tallyFileURL)
         let retraceGroup = "bundle:\(retraceBundleID)"
         if groupDisplayNameByKey[retraceGroup] != retraceDisplayName {
             groupDisplayNameByKey[retraceGroup] = retraceDisplayName
@@ -530,20 +544,21 @@ private actor ProcessCPULogSampler {
     func sampleAndMaybeLoadSnapshot(
         windowDuration: TimeInterval,
         expectedIntervalSeconds: TimeInterval,
-        shouldBuildSnapshot: Bool
+        shouldBuildSnapshot: Bool,
+        at now: Date = Date()
     ) async -> ProcessCPUSnapshot? {
         // Run on the sampler actor, not during main-actor singleton initialization.
         if !didAttemptLegacyLogCleanup {
             didAttemptLegacyLogCleanup = true
             do {
                 try ProcessUsageLogCleanup.removeLegacyLog(
-                    storageRoot: URL(fileURLWithPath: AppPaths.expandedStorageRoot, isDirectory: true)
+                    storageRoot: storageRoot
                 )
             } catch {
                 Log.warning("[ProcessMonitor] Failed to remove legacy CPU usage log: \(error)", category: .ui)
             }
         }
-        let now = Date()
+        loadTallyIfNeeded()
         let appendedEntry = await captureSample(at: now, expectedIntervalSeconds: expectedIntervalSeconds)
         maybePersistDisplayNameMap(at: now)
         if let appendedEntry {
@@ -556,7 +571,6 @@ private actor ProcessCPULogSampler {
 
         if !shouldBuildSnapshot {
             dropWindowState()
-            tallyState = nil
             loadedWindowDuration = nil
             return nil
         }
@@ -570,7 +584,8 @@ private actor ProcessCPULogSampler {
         windowDuration: TimeInterval,
         expectedIntervalSeconds: TimeInterval
     ) async -> ProcessCPUSnapshot {
-        clearLogAndState()
+        loadTallyIfNeeded()
+        guard clearLogAndState() else { return snapshotFromWindowState() }
         let now = Date()
         if let entry = await captureSample(at: now, expectedIntervalSeconds: expectedIntervalSeconds) {
             applyEntryToTally(entry, windowDuration: windowDuration, now: now)
@@ -582,9 +597,10 @@ private actor ProcessCPULogSampler {
     }
 
     func cachedSnapshotFromTally(windowDuration: TimeInterval) -> ProcessCPUSnapshot? {
+        loadTallyIfNeeded()
         let now = Date()
         if tallyState == nil {
-            tallyState = Self.readTallyState(from: tallyFileURL)
+            tallyState = readTallyState()
         }
         pruneTally(now: now, windowDuration: windowDuration)
         hydrateWindowStateFromTally(windowDuration: windowDuration, now: now)
@@ -609,12 +625,25 @@ private actor ProcessCPULogSampler {
 
     func enterIdleMode(windowDuration: TimeInterval, warmWindowDuration: TimeInterval) {
         let _ = warmWindowDuration
+        loadTallyIfNeeded()
         let now = Date()
         pruneTally(now: now, windowDuration: windowDuration)
         maybePersistTally(at: now, force: true)
         dropWindowState()
-        tallyState = nil
         lastTallyDownsampleDate = nil
+    }
+
+    func flush() {
+        loadTallyIfNeeded()
+        maybePersistTally(at: Date(), force: true)
+        maybePersistDisplayNameMap(at: Date(), force: true)
+    }
+
+    private func loadTallyIfNeeded() {
+        guard !didLoadTally else { return }
+        didLoadTally = true
+        groupDisplayNameByKey.merge(Self.readGroupDisplayNameMap(from: displayNamesFileURL)) { current, _ in current }
+        tallyState = readTallyState()
     }
 
     private func captureSample(at now: Date, expectedIntervalSeconds: TimeInterval) async -> CPULogEntry? {
@@ -975,15 +1004,10 @@ private actor ProcessCPULogSampler {
         }
     }
 
-    private static func readTallyState(from fileURL: URL) -> ProcessTallyState? {
-        guard FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
-
+    private func readTallyState() -> ProcessTallyState? {
         do {
-            let data = try Data(contentsOf: fileURL)
-            guard !data.isEmpty else { return nil }
-
-            let decoded = try JSONDecoder().decode(ProcessTallyState.self, from: data)
-            guard decoded.version == tallyVersion else {
+            guard let decoded = try historyStore.load() else { return nil }
+            guard decoded.version == Self.tallyVersion else {
                 Log.info(
                     "[ProcessMonitor] Ignoring CPU tally file with unsupported version \(decoded.version)",
                     category: .ui
@@ -1127,7 +1151,7 @@ private actor ProcessCPULogSampler {
             }
 
             return ProcessTallyState(
-                version: tallyVersion,
+                version: Self.tallyVersion,
                 bucketSeconds: max(1, decoded.bucketSeconds),
                 windowDurationSeconds: max(0, decoded.windowDurationSeconds),
                 latestSampleTimestamp: latestSampleTimestamp,
@@ -1459,12 +1483,16 @@ private actor ProcessCPULogSampler {
         if let tallyState {
             return tallyState
         }
-        if let loaded = Self.readTallyState(from: tallyFileURL),
+        if let loaded = readTallyState(),
            loaded.version == Self.tallyVersion {
             tallyState = loaded
             return loaded
         }
-        return ProcessTallyState(
+        return makeEmptyTallyState(windowDuration: windowDuration)
+    }
+
+    private func makeEmptyTallyState(windowDuration: TimeInterval) -> ProcessTallyState {
+        ProcessTallyState(
             version: Self.tallyVersion,
             bucketSeconds: Self.tallyBucketDurationSeconds,
             windowDurationSeconds: windowDuration,
@@ -1716,9 +1744,7 @@ private actor ProcessCPULogSampler {
         }
 
         do {
-            Self.ensureLogFileExists(at: tallyFileURL)
-            let data = try encoder.encode(tallyState)
-            try data.write(to: tallyFileURL, options: .atomic)
+            try historyStore.save(tallyState, at: now)
             lastTallyPersistDate = now
         } catch {
             Log.warning("[ProcessMonitor] Failed to persist CPU tally state: \(error)", category: .ui)
@@ -1727,7 +1753,7 @@ private actor ProcessCPULogSampler {
 
     private func hydrateWindowStateFromTally(windowDuration: TimeInterval, now: Date) {
         if tallyState == nil {
-            tallyState = Self.readTallyState(from: tallyFileURL)
+            tallyState = readTallyState()
         }
         pruneTally(now: now, windowDuration: windowDuration)
 
@@ -2124,6 +2150,7 @@ private actor ProcessCPULogSampler {
             ? Double(windowTotalResidentPairs) / Double(entryCount)
             : 0
         let tallyFileSizeBytes = Self.fileSizeBytes(at: tallyFileURL)
+            + Self.fileSizeBytes(at: historyStore.journalURL)
         let displayNameMapSize = groupDisplayNameByKey.count
         let samplerStateBytes = Self.estimatedSamplerStateBytes(
             windowEntryCount: entryCount,
@@ -2176,8 +2203,8 @@ private actor ProcessCPULogSampler {
         )
     }
 
-    private func clearLogAndState() {
-        clearTallyStateFile()
+    private func clearLogAndState() -> Bool {
+        guard clearTallyStateFile() else { return false }
         tallyState = nil
         lastTallyPersistDate = nil
         lastSampleDate = nil
@@ -2199,12 +2226,12 @@ private actor ProcessCPULogSampler {
         latestTallySampleTimestamp = nil
         retraceGroupKey = nil
         lastMemoryCompositionLogDate = nil
+        return true
     }
 
-    private func clearTallyStateFile() {
+    private func clearTallyStateFile() -> Bool {
         do {
-            Self.ensureLogFileExists(at: tallyFileURL)
-            try Data().write(to: tallyFileURL, options: .atomic)
+            try historyStore.reset(to: makeEmptyTallyState(windowDuration: 12 * 60 * 60))
             MemoryLedger.set(
                 tag: Self.memoryLedgerTallyFileTag,
                 bytes: 0,
@@ -2215,8 +2242,10 @@ private actor ProcessCPULogSampler {
                 note: "on-disk",
                 countsTowardTrackedMemory: false
             )
+            return true
         } catch {
             Log.warning("[ProcessMonitor] Failed to clear CPU tally state: \(error)", category: .ui)
+            return false
         }
     }
 
@@ -3041,20 +3070,6 @@ private actor ProcessCPULogSampler {
         } catch {
             Log.warning("[SettingsView] Failed to create CPU usage log directory: \(error)", category: .ui)
         }
-    }
-
-    private static func makeTallyFileURL() -> URL {
-        let rootURL = URL(fileURLWithPath: AppPaths.expandedStorageRoot, isDirectory: true)
-        return rootURL
-            .appendingPathComponent("logs", isDirectory: true)
-            .appendingPathComponent("cpu_process_usage_tally.json", isDirectory: false)
-    }
-
-    private static func makeDisplayNamesFileURL() -> URL {
-        let rootURL = URL(fileURLWithPath: AppPaths.expandedStorageRoot, isDirectory: true)
-        return rootURL
-            .appendingPathComponent("logs", isDirectory: true)
-            .appendingPathComponent("cpu_process_groups.json", isDirectory: false)
     }
 
     private static func listAllProcessIDs() -> [pid_t] {

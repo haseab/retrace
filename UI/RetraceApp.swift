@@ -994,6 +994,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Use terminateLater to avoid blocking the main thread during shutdown.
         Task { @MainActor [weak self] in
             await CrashRecoveryManager.shared.prepareForExpectedExit()
+            await ProcessCPUMonitor.shared.stopAndFlush()
             _ = await TimelineWindowController.shared.forceRecordSessionMetrics(timeoutMs: 350)
             self?.isTerminationFlushInProgress = false
             NSApp.reply(toApplicationShouldTerminate: true)
