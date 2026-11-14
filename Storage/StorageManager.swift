@@ -177,7 +177,7 @@ fileprivate actor SegmentRewriteExecutor {
             )
         }
 
-        if request.plan.hasRedactionTargets, request.secret == nil {
+        if request.plan.requiresRedactionSecret, request.secret == nil {
             throw StorageError.fileWriteFailed(
                 path: request.segmentURL.path,
                 underlying: "Missing rewrite secret for redaction targets"
@@ -230,7 +230,9 @@ fileprivate actor SegmentRewriteExecutor {
                             imageWidth: width,
                             imageHeight: height
                         )
-                        guard pixelRect.width > 1, pixelRect.height > 1 else { continue }
+                        guard pixelRect.width > 0, pixelRect.height > 0 else {
+                            throw StorageModuleError.encodingFailed(underlying: "Invalid redaction rectangle")
+                        }
                         if loggedTargets < 20 {
                             Log.debug(
                                 "[PhraseRedaction][Storage] Scramble mapping node=\(target.nodeID) frame=\(target.frameID) normalized=(\(String(format: "%.4f", target.normalizedRect.origin.x)),\(String(format: "%.4f", target.normalizedRect.origin.y)),\(String(format: "%.4f", target.normalizedRect.width)),\(String(format: "%.4f", target.normalizedRect.height))) pixelRect=(x=\(Int(pixelRect.origin.x)),y=\(Int(pixelRect.origin.y)),w=\(Int(pixelRect.width)),h=\(Int(pixelRect.height))) image=\(width)x\(height)",
@@ -243,17 +245,23 @@ fileprivate actor SegmentRewriteExecutor {
                             frameBytesPerRow: width * 4,
                             rect: pixelRect
                         ) else {
-                            continue
+                            throw StorageModuleError.encodingFailed(underlying: "Unable to extract protected region")
                         }
-                        ReversibleOCRScrambler.scramblePatchBGRA(
-                            &patch.data,
-                            width: patch.width,
-                            height: patch.height,
-                            bytesPerRow: patch.bytesPerRow,
-                            frameID: target.frameID,
-                            nodeID: target.nodeID,
-                            secret: request.secret ?? ""
-                        )
+                        if target.mode == .permanent {
+                            guard ReversibleOCRScrambler.permanentlyRedactPatchBGRA(
+                                &patch.data, width: patch.width, height: patch.height, bytesPerRow: patch.bytesPerRow
+                            ) else { throw StorageModuleError.encodingFailed(underlying: "Unable to permanently redact region") }
+                        } else {
+                            ReversibleOCRScrambler.scramblePatchBGRA(
+                                &patch.data,
+                                width: patch.width,
+                                height: patch.height,
+                                bytesPerRow: patch.bytesPerRow,
+                                frameID: target.frameID,
+                                nodeID: target.nodeID,
+                                secret: request.secret ?? ""
+                            )
+                        }
                         BGRAImageUtilities.writePatch(
                             patch,
                             into: &bgra,

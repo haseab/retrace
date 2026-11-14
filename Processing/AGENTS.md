@@ -404,3 +404,7 @@ throw ProcessingError.imageConversionFailed
 5. Write tests with sample images
 
 Start with Vision OCR since it's the core functionality, then add Accessibility support.
+
+## Keyword redaction processing
+
+Read `PhraseRedactionMode` once when protecting OCR output and store the mode per node. Permanent matches retain masked text and only the permanent marker, never encrypted originals. Scramble matches without a master key must fail before search indexing. Rewrite scheduling uses each stored target mode; permanent-only plans run without a key. Purge stale timeline stills/search thumbnails after a successful video rewrite, before marking it complete, and publish `PhraseRedactionMode.didFinishNotification` to invalidate UI image caches.

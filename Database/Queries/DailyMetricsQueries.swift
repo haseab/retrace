@@ -1,5 +1,5 @@
 import Foundation
-import SQLite3
+import SQLCipher
 import Shared
 
 // MARK: - Daily Metrics Queries
@@ -89,6 +89,7 @@ public enum DailyMetricsQueries {
         case dockIconVisibilityToggle = "dock_icon_visibility_toggle"  // metadata: JSON {enabled, source}
         case redactionRulesUpdated = "redaction_rules_updated"
         case masterKeyFlow = "master_key_flow"  // metadata: JSON {action, source, ...}
+        case phraseLevelRedactionModeUpdated = "phrase_level_redaction_mode_updated" // metadata: JSON {mode: scramble|permanent, source}
         case phraseLevelRedactionRulesUpdated = "phrase_level_redaction_rules_updated"
         case phraseLevelRedactionReveal = "phrase_level_redaction_reveal"
         case phraseLevelRedactionQueuedHover = "phrase_level_redaction_queued_hover"  // metadata: JSON {nodeID, frameID, processingStatus}

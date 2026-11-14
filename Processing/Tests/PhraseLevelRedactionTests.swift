@@ -70,6 +70,18 @@ final class PhraseLevelRedactionTests: XCTestCase {
         XCTAssertEqual(result.sanitizedText.regions.map(\.text), ["insentions"])
     }
 
+    func testPermanentRedactionMasksOCRWithoutRetainingPlaintextOrRequiringKey() {
+        let extracted = makeExtractedText(regions: ["secret", "visible"])
+        let result = FrameProcessingQueue.applyPhraseLevelRedactionForTesting(
+            to: extracted, phrases: ["secret"], redactionSecret: nil, mode: .permanent
+        )
+        XCTAssertEqual(result.redactedCombinedNodeOrders, Set([0]))
+        XCTAssertEqual(result.sanitizedText.regions[0].text, String(repeating: " ", count: 6))
+        XCTAssertEqual(result.sanitizedText.regions[1].text, "visible")
+        XCTAssertEqual(result.encryptedRedactedTexts, [0: PhraseRedactionMode.permanentTextMarker])
+        XCTAssertFalse(result.sanitizedText.fullText.contains("secret"))
+    }
+
     func testEncryptedOCRTextRoundTripsWithCorrectNodeContext() throws {
         let secret = "test-secret"
         let plaintext = "secret key 123"

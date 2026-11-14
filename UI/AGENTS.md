@@ -82,6 +82,7 @@ UI/
 │           ├── PrivacyMasterKeyActions.swift
 │           ├── PrivacySettingsActions.swift
 │           ├── PhraseLevelRedactionSettingsView.swift
+│           ├── PhraseRedactionMethodPicker.swift # Scramble/permanent selector with future-match scope and reveal explanation
 │           ├── PrivateModeAutomationSettingsView.swift
 │           ├── PowerSettingsView.swift
 │           ├── TagManagementSettingsView.swift
@@ -755,3 +756,11 @@ You depend on:
 8. Add UI tests for behaviorally significant flows when warranted
 
 Focus on getting the timeline + search working first before polishing dashboard/settings.
+
+## Privacy controls
+
+- Phrase Level Redaction offers Scramble (default) and Permanently redact. Permanent mode requires no master key; switching an enabled feature back to scrambling without a key disables it and starts the existing key-setup flow.
+- The method selection emits `phrase_level_redaction_mode_updated` with `{mode, source}`; never include keyword contents.
+- Permanent-node tooltips are noninteractive and say “Permanently redacted”; reveal and clipboard paths must never recover their removed text or pixels.
+- Feedback log readers accept only the privacy-safe logger format and strip its format marker before normal grouping. All legacy file lines, including error and grouped channels, are excluded.
+- While keyword protection is enabled, timeline/search disk previews are bypassed. Completed rewrites invalidate preview images without resetting timeline filters or search queries.

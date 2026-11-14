@@ -877,11 +877,14 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     enum PhraseLevelRedactionTooltipState: Equatable {
         case queued
+        case permanent
         case reveal
         case hide
 
         var title: String {
             switch self {
+            case .permanent:
+                return "Permanently redacted"
             case .queued:
                 return "Queued..."
             case .reveal:
@@ -893,6 +896,8 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         var tooltipText: String {
             switch self {
+            case .permanent:
+                return "Permanently redacted"
             case .queued:
                 return "Queued..."
             case .reveal:
@@ -904,7 +909,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         var isInteractive: Bool {
             switch self {
-            case .queued:
+            case .queued, .permanent:
                 return false
             case .reveal, .hide:
                 return true
@@ -2735,6 +2740,24 @@ public class SimpleTimelineViewModel: ObservableObject {
             searchViewModel.suppressRecentEntriesForNextOverlayOpen()
         }
 
+        NotificationCenter.default.addObserver(
+            forName: PhraseRedactionMode.didFinishNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                self.cancelForegroundFrameLoad(reason: "redaction completed")
+                self.cancelCacheExpansion(reason: "redaction completed")
+                self.unavailableFrameDiskLookupTask?.cancel()
+                self.unavailableFrameDiskLookupTask = nil
+                self.diskFrameBufferIndex.removeAll()
+                self.inMemoryJPEGFrameCache.removeAllObjects()
+                self.hotWindowRange = nil
+                self.clearCurrentFrameOverlayPresentation()
+                self.clearCurrentImagePresentation()
+                self.loadImageIfNeeded()
+            }
+        }
+
         // Listen for data source changes (e.g., Rewind data toggled)
         Log.debug("[SimpleTimelineViewModel] Setting up dataSourceDidChange observer", category: .ui)
         NotificationCenter.default.addObserver(
@@ -2986,6 +3009,8 @@ public class SimpleTimelineViewModel: ObservableObject {
         for frameID: FrameID,
         logPrefix: String
     ) async -> NSImage? {
+        let privacyDefaults = UserDefaults(suiteName: ReversibleOCRScrambler.settingsSuiteName) ?? .standard
+        guard !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { return nil }
         let fileURL = timelineDiskFrameBufferFileURL(for: frameID)
         guard FileManager.default.fileExists(atPath: fileURL.path) else {
             return nil
@@ -2996,6 +3021,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                 try Data(contentsOf: fileURL, options: [.mappedIfSafe])
             }.value
 
+            guard !Task.isCancelled, !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { return nil }
             guard let image = NSImage(data: data) else {
                 Log.warning(
                     "\(logPrefix) Failed to decode timeline disk-buffer preview for frame \(frameID.value)",
@@ -3357,6 +3383,8 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     private func readFrameDataFromDiskFrameBuffer(frameID: FrameID) async -> Data? {
+        let privacyDefaults = UserDefaults(suiteName: ReversibleOCRScrambler.settingsSuiteName) ?? .standard
+        guard !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { return nil }
         await awaitDiskFrameBufferInitializationIfNeeded()
         let existingEntry = diskFrameBufferIndex[frameID]
         let fileURL = existingEntry?.fileURL ?? diskFrameBufferURL(for: frameID)
@@ -3380,6 +3408,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                 try Data(contentsOf: fileURL, options: [.mappedIfSafe])
             }.value
 
+            guard !Task.isCancelled, !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { return nil }
             if existingEntry != nil {
                 touchDiskFrameBufferEntry(frameID)
             } else {
@@ -3401,6 +3430,8 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     private func storeFrameDataInDiskFrameBuffer(frameID: FrameID, data: Data) async {
+        let privacyDefaults = UserDefaults(suiteName: ReversibleOCRScrambler.settingsSuiteName) ?? .standard
+        guard !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { return }
         await awaitDiskFrameBufferInitializationIfNeeded()
         let fileURL = diskFrameBufferURL(for: frameID)
         do {
@@ -3409,8 +3440,13 @@ public class SimpleTimelineViewModel: ObservableObject {
                     at: fileURL.deletingLastPathComponent(),
                     withIntermediateDirectories: true
                 )
+                guard !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { return }
                 try data.write(to: fileURL, options: [.atomic])
+                if PhraseRedactionMode.isEnabled(in: privacyDefaults) {
+                    try? FileManager.default.removeItem(at: fileURL)
+                }
             }.value
+            guard !Task.isCancelled, !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { return }
 
             diskFrameBufferAccessSequence &+= 1
             let entry = DiskFrameBufferEntry(
@@ -10540,13 +10576,14 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     static func phraseLevelRedactionTooltipState(
         for processingStatus: Int,
-        isRevealed: Bool
+        isRevealed: Bool,
+        isPermanent: Bool = false
     ) -> PhraseLevelRedactionTooltipState? {
         switch processingStatus {
         case 5, 6:
             return .queued
         case 2, 7:
-            return isRevealed ? .hide : .reveal
+            return isPermanent ? .permanent : (isRevealed ? .hide : .reveal)
         default:
             return nil
         }
@@ -11989,7 +12026,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     public func togglePhraseLevelRedactionReveal(for node: OCRNodeWithText) {
-        guard node.isRedacted else { return }
+        guard node.isRedacted, !node.isPermanentlyRedacted else { return }
         guard let frame = currentTimelineFrame?.frame else { return }
         guard Self.isSuccessfulProcessingStatus(currentTimelineFrame?.processingStatus ?? -1) else { return }
         guard let secret = ReversibleOCRScrambler.currentAppWideSecret() else { return }

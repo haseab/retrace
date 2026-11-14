@@ -142,6 +142,7 @@ extension FeedbackService {
         var groupedEntriesReversed: [HighVolumeLogKind: [ParsedHighVolumeLogEntry]] = [:]
 
         enumerateFeedbackLogLinesInReverse(fileURL: fileURL) { entry in
+            guard Log.isPrivacySafeLogEntry(entry) else { return false }
             let parsedLine = parseFeedbackLogLine(entry)
 
             let excludedByMarker = isExcludedFeedbackMessage(
@@ -379,6 +380,7 @@ extension FeedbackService {
     }
 
     private static func isExcludedFeedbackLogEntry(_ entry: String) -> Bool {
+        guard Log.isPrivacySafeLogEntry(entry) else { return true }
         let parsedLine = parseFeedbackLogLine(entry)
         return isExcludedFeedbackMessage(
             parsedLine.message,
@@ -550,7 +552,8 @@ extension FeedbackService {
 
         let remainder = entry[cursor...]
         if let separatorRange = remainder.range(of: " - ") {
-            let message = remainder[separatorRange.upperBound...]
+            var message = remainder[separatorRange.upperBound...]
+            if message.hasPrefix("[privacy-v1] ") { message = message.dropFirst("[privacy-v1] ".count) }
             return ParsedFeedbackLogLine(
                 rawTimestamp: rawTimestamp,
                 level: level,
@@ -588,6 +591,7 @@ extension FeedbackService {
         for entry: String,
         parsedLine: ParsedFeedbackLogLine? = nil
     ) -> FeedbackLogDisposition {
+        guard Log.isPrivacySafeLogEntry(entry) else { return .drop }
         let parsedLine = parsedLine ?? parseFeedbackLogLine(entry)
 
         if isExcludedFeedbackMessage(

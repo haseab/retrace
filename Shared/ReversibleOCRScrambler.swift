@@ -87,6 +87,25 @@ public enum ReversibleOCRScrambler {
         )
     }
 
+    /// Destructively replace every patch pixel with opaque black. No key or original is retained.
+    @discardableResult
+    public static func permanentlyRedactPatchBGRA(
+        _ patch: inout Data, width: Int, height: Int, bytesPerRow: Int
+    ) -> Bool {
+        guard width > 0, height > 0, width <= Int.max / 4, bytesPerRow >= width * 4,
+              height <= Int.max / bytesPerRow, patch.count >= height * bytesPerRow else { return false }
+        patch.withUnsafeMutableBytes { raw in
+            let bytes = raw.bindMemory(to: UInt8.self)
+            for y in 0..<height {
+                for x in 0..<width {
+                    let offset = y * bytesPerRow + x * 4
+                    bytes[offset] = 0; bytes[offset + 1] = 0; bytes[offset + 2] = 0; bytes[offset + 3] = 255
+                }
+            }
+        }
+        return true
+    }
+
     public static func encryptOCRText(
         _ text: String,
         frameID: Int64,
@@ -113,6 +132,7 @@ public enum ReversibleOCRScrambler {
         nodeOrder: Int,
         secret: String
     ) -> String? {
+        guard encryptedText != PhraseRedactionMode.permanentTextMarker else { return nil }
         let candidateFrameIDs: [Int64] = frameID == 0 ? [0] : [frameID, 0]
         for candidateFrameID in candidateFrameIDs {
             if let plaintext = decryptOCRText(

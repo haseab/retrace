@@ -1240,7 +1240,7 @@ public actor FrameProcessingQueue {
             ocrStage = stage
         }
 
-        let phraseRedactionResult = applyPhraseLevelRedaction(
+        let phraseRedactionResult = try applyPhraseLevelRedaction(
             to: ocrStage.extractedText,
             actualFrameID: frameID
         )
@@ -2272,7 +2272,7 @@ public actor FrameProcessingQueue {
     private func applyPhraseLevelRedaction(
         to extracted: ExtractedText,
         actualFrameID: Int64? = nil
-    ) -> PhraseLevelRedactionResult {
+    ) throws -> PhraseLevelRedactionResult {
         let defaults = UserDefaults(suiteName: ReversibleOCRScrambler.settingsSuiteName) ?? .standard
         let preliminaryResult = Self.applyPhraseLevelRedaction(
             to: extracted,
@@ -2283,22 +2283,22 @@ public actor FrameProcessingQueue {
             return preliminaryResult
         }
 
-        let secret = ReversibleOCRScrambler.currentAppWideSecret()
+        let mode = PhraseRedactionMode.load(from: defaults)
+        let secret = mode == .scramble ? ReversibleOCRScrambler.currentAppWideSecret() : nil
+        guard mode == .permanent || secret != nil else {
+            throw ProcessingError.ocrFailed(underlying: "Phrase redaction requires the unavailable master key; retrying without indexing")
+        }
         let effectiveFrameID = actualFrameID ?? extracted.frameID.value
         let finalResult = Self.finalizedPhraseLevelRedactionResult(
             extracted: extracted,
             preliminaryResult: preliminaryResult,
             secret: secret,
-            actualFrameID: effectiveFrameID
+            actualFrameID: effectiveFrameID,
+            mode: mode
         )
-        if secret != nil {
-            return finalResult
+        guard finalResult.encryptedRedactedTexts.count == finalResult.redactedCombinedNodeOrders.count else {
+            throw ProcessingError.ocrFailed(underlying: "Unable to protect every matched OCR region")
         }
-
-        Log.warning(
-            "[PhraseRedaction] Skipping phrase-level redaction for frame \(effectiveFrameID) because no master key exists",
-            category: .processing
-        )
         return finalResult
     }
 
@@ -2306,7 +2306,8 @@ public actor FrameProcessingQueue {
         to extracted: ExtractedText,
         phrases: [String],
         redactionSecret: String? = "test-secret",
-        actualFrameID: Int64? = nil
+        actualFrameID: Int64? = nil,
+        mode: PhraseRedactionMode = .scramble
     ) -> (
         sanitizedText: ExtractedText,
         redactedCombinedNodeOrders: Set<Int>,
@@ -2320,7 +2321,8 @@ public actor FrameProcessingQueue {
             extracted: extracted,
             preliminaryResult: preliminaryResult,
             secret: redactionSecret,
-            actualFrameID: actualFrameID ?? extracted.frameID.value
+            actualFrameID: actualFrameID ?? extracted.frameID.value,
+            mode: mode
         )
         return (
             finalResult.sanitizedText,
@@ -2445,10 +2447,20 @@ public actor FrameProcessingQueue {
         extracted: ExtractedText,
         preliminaryResult: PhraseLevelRedactionResult,
         secret: String?,
-        actualFrameID: Int64
+        actualFrameID: Int64,
+        mode: PhraseRedactionMode = .scramble
     ) -> PhraseLevelRedactionResult {
         guard !preliminaryResult.redactedCombinedNodeOrders.isEmpty else {
             return preliminaryResult
+        }
+        if mode == .permanent {
+            return PhraseLevelRedactionResult(
+                sanitizedText: preliminaryResult.sanitizedText,
+                redactedCombinedNodeOrders: preliminaryResult.redactedCombinedNodeOrders,
+                encryptedRedactedTexts: Dictionary(uniqueKeysWithValues: preliminaryResult.redactedCombinedNodeOrders.map {
+                    ($0, PhraseRedactionMode.permanentTextMarker)
+                })
+            )
         }
         guard let secret else {
             return PhraseLevelRedactionResult(
@@ -2773,7 +2785,7 @@ public actor FrameProcessingQueue {
         let secret = ReversibleOCRScrambler.currentAppWideSecret()
         let executablePlan: VideoRewritePlan
 
-        if plan.hasRedactionTargets && secret == nil {
+        if plan.segmentRewritePlan.requiresRedactionSecret && secret == nil {
             if plan.hasDeletionTargets {
                 executablePlan = plan.droppingRedactions()
                 Log.warning(
@@ -2809,7 +2821,23 @@ public actor FrameProcessingQueue {
                 secret: secret
             )
             rewriteCommitted = true
+            if executablePlan.hasRedactionTargets {
+                let ids = executablePlan.redactions.map(\.frameID)
+                try await Task.detached(priority: .utility) {
+                    let manager = FileManager.default
+                    let caches = manager.urls(for: .cachesDirectory, in: .userDomainMask).first ?? manager.temporaryDirectory
+                    for id in ids {
+                        let path = caches.appendingPathComponent("io.retrace.app/TimelineFrameBuffer/\(id).jpg")
+                        if manager.fileExists(atPath: path.path) { try manager.removeItem(at: path) }
+                    }
+                    let thumbnails = caches.appendingPathComponent("search_thumbnails_v1")
+                    if manager.fileExists(atPath: thumbnails.path) { try manager.removeItem(at: thumbnails) }
+                }.value
+            }
             try await databaseManager.finalizeVideoRewrite(executablePlan)
+            if executablePlan.hasRedactionTargets {
+                NotificationCenter.default.post(name: PhraseRedactionMode.didFinishNotification, object: nil)
+            }
             totalRewritten += executablePlan.deletions.count + executablePlan.redactions.count
 
             do {

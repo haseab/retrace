@@ -11,6 +11,8 @@ Capture/
 ├── CaptureManager.swift           # Main CaptureProtocol implementation
 ├── ScreenCapture/
 │   ├── CGWindowListCapture.swift  # Legacy CGWindowList API wrapper
+│   ├── ExcludedWindowMasker.swift # Full-bounds masking; failure returns no screenshot
+│   ├── PrivateWindowDetector.swift # Private-window accessibility heuristics
 │   ├── ConferenceFaceBlurProcessor.swift # Vision face detection + irreversible conference-call face blur
 │   ├── DisplayMonitor.swift       # Track available displays
 │   ├── DisplaySwitchMonitor.swift # Detect display changes
@@ -30,6 +32,7 @@ Capture/
 └── Tests/
     ├── AccessibilityInspectorTest.swift
     ├── BrowserURLAppleScriptCoordinatorTests.swift
+    ├── ExcludedWindowMaskerTests.swift # Pixel coverage and injected render-failure regression coverage
     ├── ForegroundWindowSelectionTests.swift
     ├── ConferenceROIPlannerTests.swift
     ├── ConferenceSessionPrivacyPolicyTests.swift

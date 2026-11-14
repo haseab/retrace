@@ -454,3 +454,30 @@ public struct AppConfig: Codable, Sendable {
 
     public static let `default` = AppConfig()
 }
+
+/// Each node records its mode, independently of later settings changes.
+public enum PhraseRedactionMode: String, CaseIterable, Codable, Sendable {
+    case scramble
+    case permanent
+
+    public static let didFinishNotification = Notification.Name("PhraseRedactionDidFinish")
+
+    public static func isEnabled(in defaults: UserDefaults) -> Bool {
+        if let enabled = defaults.object(forKey: "phraseLevelRedactionEnabled") as? Bool { return enabled }
+        guard let raw = defaults.string(forKey: "phraseLevelRedactionPhrases"),
+              let data = raw.data(using: .utf8), let phrases = try? JSONDecoder().decode([String].self, from: data) else { return false }
+        return phrases.contains { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    }
+
+    public static let defaultsKey = "phraseLevelRedactionMode"
+    /// A non-recoverable marker in the existing protected-text column, containing no original text.
+    public static let permanentTextMarker = "rtx-permanent-v1"
+
+    public static func load(from defaults: UserDefaults) -> Self {
+        Self(rawValue: defaults.string(forKey: defaultsKey) ?? "") ?? .scramble
+    }
+
+    public init(storedText: String?) {
+        self = storedText == Self.permanentTextMarker ? .permanent : .scramble
+    }
+}

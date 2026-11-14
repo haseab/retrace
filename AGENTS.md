@@ -71,7 +71,7 @@ retrace/
 │   └── validate_darkwake_watchdog.sh # Automated darkwake watchdog regression validation
 │
 ├── Shared/                      # CRITICAL: Shared types and protocols
-│   ├── Logging.swift            # Central log utility (Log.debug/info/warning/error)
+│   ├── Logging.swift            # PrivacyLogMessage removes free-form interpolations before console/file/unified logs
 │   ├── AppPaths.swift           # Application path configuration
 │   ├── BGRAImageUtilities.swift # Shared BGRA conversion + patch extraction helpers
 │   ├── MasterKeyManager.swift   # Keychain-backed master key creation + recovery phrase export
@@ -83,7 +83,7 @@ retrace/
 │   │   ├── Search.swift         # SearchQuery, SearchResult
 │   │   ├── Segment.swift        # Segment data model
 │   │   ├── ConferencePrivacy.swift # Shared call kinds and capture privacy outcome events
-│   │   ├── Config.swift         # Configuration types
+│   │   ├── Config.swift         # Configuration types and per-node PhraseRedactionMode
 │   │   ├── Errors.swift         # Error types
 │   │   ├── Audio.swift          # Audio model types (Release 2)
 │   │   ├── FilterCriteria.swift # Timeline/search filter criteria
@@ -168,6 +168,7 @@ retrace/
 │   └── Tests/
 │       ├── FeedbackRecentMetricSupportTests.swift # Feedback-export metric sanitization coverage
 │       ├── InPageURLCaptureRoutingTests.swift
+│       ├── PrivacyProtectionTests.swift # Logging privacy, permanent pixel removal, and redaction mode defaults
 │       ├── MasterKeyManagerTests.swift
 │       ├── ServiceContainerRewindCutoffTests.swift # Rewind cutoff defaults and latest-frame probe coverage
 │       ├── TestLogger.swift
@@ -498,3 +499,12 @@ Then check which path actually executes and fix the right code.
 ---
 
 _This file follows the AGENTS.md standard for AI agent guidance. Last updated: 2026-04-14_
+
+### Privacy protection modes and diagnostics
+
+- Keyword redaction defaults to scrambling. The Settings permanent option applies to newly processed matches, replacing text with spaces and pixels with opaque black. Existing recordings are not converted by changing the setting.
+- `PhraseRedactionMode` is stored per node: `rtx-permanent-v1` is a non-recoverable marker in the existing protected-text column. It contains no original text. Never infer an older node's mode from the current setting.
+- Permanent nodes cannot be revealed and do not require a master key; scrambling still requires one. Missing keys must prevent indexing a matched region unprotected.
+- Excluded-window masking failures drop the frame. Full excluded bounds are protected, including overlapped/translucent areas and edges.
+- `PrivacyLogMessage` strips free-form interpolated values before every logging sink; only primitive numbers and booleans are retained. Preformatted `String` messages are removed as a whole. Do not bypass this by explicitly constructing string literals from captured content.
+- Legacy diagnostic logs are discarded on logger initialization and are excluded from feedback reads, including the error channel. Raw capture-time previews are bypassed while keyword protection is enabled and stale preview copies are invalidated after rewrite.

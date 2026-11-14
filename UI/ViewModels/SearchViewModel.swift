@@ -550,6 +550,14 @@ public class SearchViewModel: ObservableObject {
     // MARK: - Setup
 
     private func setupBindings() {
+        NotificationCenter.default.publisher(for: PhraseRedactionMode.didFinishNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.searchGeneration += 1
+                self?.clearInMemoryThumbnailCache()
+            }
+            .store(in: &cancellables)
+
         // NOTE: Auto-search on typing is disabled - search is triggered manually on Enter
         // Clear results and cache when query is cleared by user (not on init)
         $searchQuery
@@ -680,6 +688,9 @@ public class SearchViewModel: ObservableObject {
     }
 
     public func loadThumbnailFromDiskIfAvailable(for key: String, generation: Int) async -> Bool {
+        let privacyDefaults = UserDefaults(suiteName: ReversibleOCRScrambler.settingsSuiteName) ?? .standard
+        guard !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { return false }
+
         if thumbnailCache[key] != nil {
             touchThumbnailKey(key)
             return true
@@ -690,7 +701,8 @@ public class SearchViewModel: ObservableObject {
             try? Data(contentsOf: url, options: [.mappedIfSafe])
         }.value
 
-        guard let data, searchGeneration == generation else { return false }
+        guard let data, searchGeneration == generation,
+              !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { return false }
         guard let image = NSImage(data: data) else { return false }
 
         insertThumbnailIntoMemory(image, for: key)
@@ -722,15 +734,23 @@ public class SearchViewModel: ObservableObject {
     }
 
     private func persistThumbnailToDisk(_ image: NSImage, for key: String) {
+        let privacyDefaults = UserDefaults(suiteName: ReversibleOCRScrambler.settingsSuiteName) ?? .standard
+        guard !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { return }
+
         guard let tiffData = image.tiffRepresentation else { return }
         let targetURL = Self.diskThumbnailURL(for: key)
 
         Task.detached(priority: .utility) {
-            guard let data = Self.jpegData(fromTIFFData: tiffData) else { return }
+            guard let data = Self.jpegData(fromTIFFData: tiffData),
+                  !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { return }
             let directory = Self.cachedSearchThumbnailsDirectory
             try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             do {
                 try data.write(to: targetURL, options: .atomic)
+                if PhraseRedactionMode.isEnabled(in: privacyDefaults) {
+                    try? FileManager.default.removeItem(at: targetURL)
+                    return
+                }
                 Self.trimThumbnailDiskCache(
                     maxBytes: Self.thumbnailDiskCacheMaxBytes,
                     maxAge: Self.thumbnailDiskCacheMaxAge

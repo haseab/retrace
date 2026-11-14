@@ -123,12 +123,14 @@ public struct PendingNodeRedactionJob: Sendable, Equatable {
     public let frameIndex: Int
     public let nodeID: Int
     public let normalizedRect: CGRect
+    public let mode: PhraseRedactionMode
 
-    public init(frameID: Int64, frameIndex: Int, nodeID: Int, normalizedRect: CGRect) {
+    public init(frameID: Int64, frameIndex: Int, nodeID: Int, normalizedRect: CGRect, mode: PhraseRedactionMode = .scramble) {
         self.frameID = frameID
         self.frameIndex = frameIndex
         self.nodeID = nodeID
         self.normalizedRect = normalizedRect
+        self.mode = mode
     }
 }
 
@@ -2584,7 +2586,8 @@ public actor DatabaseManager: DatabaseProtocol {
                 SegmentRedactionTarget(
                     frameID: job.frameID,
                     nodeID: job.nodeID,
-                    normalizedRect: job.normalizedRect
+                    normalizedRect: job.normalizedRect,
+                    mode: job.mode
                 )
             )
         }
@@ -2977,7 +2980,8 @@ public actor DatabaseManager: DatabaseProtocol {
                 n.leftX,
                 n.topY,
                 n.width,
-                n.height
+                n.height,
+                n.encryptedText
             FROM frame f
             JOIN node n ON n.frameId = f.id
             WHERE f.videoId = ?
@@ -3013,12 +3017,22 @@ public actor DatabaseManager: DatabaseProtocol {
                     frameID: frameID,
                     frameIndex: frameIndex,
                     nodeID: nodeID,
-                    normalizedRect: CGRect(x: leftX, y: topY, width: width, height: height)
+                    normalizedRect: CGRect(x: leftX, y: topY, width: width, height: height),
+                    mode: PhraseRedactionMode(storedText: sqlite3_column_text(statement, 7).map { String(cString: $0) })
                 )
             )
         }
 
         return jobs
+    }
+
+    public func hasPendingScrambleRedactions() async throws -> Bool {
+        let videos = try await getVideoIDsWithPendingNodeRedactions(includeRetryableFailures: true)
+        for video in videos {
+            if try await getPendingNodeRedactionJobs(videoID: video, includeInProgressJobs: true,
+                includeRetryableFailures: true).contains(where: { $0.mode == .scramble }) { return true }
+        }
+        return false
     }
 
     /// Return distinct video IDs that still have frame-level redaction work pending or in progress.
@@ -3068,6 +3082,7 @@ public actor DatabaseManager: DatabaseProtocol {
                 SELECT 1
                 FROM node
                 WHERE encryptedText IS NOT NULL
+                  AND encryptedText != 'rtx-permanent-v1'
                 LIMIT 1
             );
             """

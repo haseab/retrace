@@ -28,37 +28,53 @@ final class FeedbackExportTests: XCTestCase {
         )
     }
 
+    func testLegacyLogContentIsNeverIncludedInFeedback() {
+        let legacy = "[2026-04-05T01:05:25Z] [INFO] [UI] Search.swift:1 - token=PRIVATE_FEEDBACK_CANARY"
+        XCTAssertTrue(FeedbackService.filteredFeedbackLogEntries([legacy]).isEmpty)
+    }
+
+    func testLegacyLogsAreExcludedFromAllSnapshotChannels() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let legacy = "[2026-04-05T01:05:25Z] [❌ ERROR] [UI] Search.swift:1 - PRIVATE_FEEDBACK_CANARY"
+        try legacy.write(to: url, atomically: true, encoding: .utf8)
+        let snapshot = FeedbackService.collectFeedbackLogSnapshotWithErrors(rawLimit: 10, fileURL: url, errorLimit: 10)
+        XCTAssertTrue(snapshot.retainedLogs.isEmpty)
+        XCTAssertTrue(snapshot.recentErrors.isEmpty)
+        XCTAssertNil(snapshot.groupedLogs)
+    }
+
     func testFilteredFeedbackLogEntriesExcludeVMMapSummaryLogs() {
         let filtered = FeedbackService.filteredFeedbackLogEntries([
-            "[2026-03-13T11:57:00Z] [INFO] [ProcessMonitor-VMMap] TOTAL, minus reserved VM space: 1.2G",
-            "[2026-04-05T01:05:25Z] [INFO] [UI] SearchViewModel.swift:821 - [Search-Memory] results=0 visibleResults=0 thumbnails=0/Zero KB appIcons=0/Zero KB",
-            "[2026-04-05T01:05:25Z] [INFO] [UI] SimpleTimelineViewModel.swift:2721 - [Timeline-Memory] diskFrameBufferCount=0 diskFrameBufferBytes=Zero KB frameWindowCount=100",
-            "[2026-04-05T01:05:25Z] [INFO] [Processing] FrameProcessingQueue.swift:3276 - [Queue-Memory] footprint=1.00 GB resident=1.10 GB internal=1.05 GB compressed=Zero KB ocrQueueDepth=0 ocrPending=0 ocrProcessing=0 rewritePending=0 rewriteProcessing=0 workers=2 memoryPaused=false",
-            "[2026-04-05T01:05:25Z] [DEBUG] [UI] SimpleTimelineViewModel.swift:2065 - [SimpleTimelineViewModel] currentVideoInfo: frame 123 videoPath=/tmp/test, frameIndex=1, processingStatus=2",
-            "[2026-04-05T01:05:25Z] [INFO] [Processing] FrameProcessingQueue.swift:1337 - [Queue-TIMING] Frame 123: prep=15ms frame=63ms ocr=604ms index=10ms total=692ms size=3024x1964",
-            "[2026-04-05T01:05:25Z] [DEBUG] [Processing] FrameProcessingQueue.swift:724 - [Queue-Rewrite] Suspended pending segment rewrites (timeline-scrubbing); timelineVisible=true, scrubbing=true",
-            "[2026-04-05T01:05:25Z] [DEBUG] [UI] SimpleTimelineView.swift:2001 - [VideoView] Released decoder resources (view removed from window)",
-            "[2026-04-05T01:05:25Z] [INFO] [Storage] StorageManager.swift:681 - [VideoExtract] Invalidated stale cache for 1775357238907, creating fresh generator",
-            "[2026-04-05T01:05:25Z] [INFO] [App] AppCoordinator.swift:1775 - [Pipeline-Memory] reason=rotation pendingRawFrames=0 pendingRawBytes=0 B activeWriters=1 byResolution=[none]",
-            "[2026-04-05T01:05:25Z] [INFO] [Storage] StorageHealthMonitor.swift:430 - [StorageHealth] diskFreeGB=120.0 avgLatencyMs=0 slowWrites=0 criticalWrites=0 spinups=0",
-            "[2026-04-05T01:05:25Z] [DEBUG] [UI] SimpleTimelineView.swift:4222 - [ZoomedTextSelectionNSView] updateNSView called, selectionStart=true",
-            "[2026-04-05T01:05:25Z] [DEBUG] [UI] SimpleTimelineView.swift:3586 - [ZoomDismiss] ZoomUnifiedOverlay rendered - isTransitioning: false, isExitTransitioning: false, progress: 1.0",
-            "[2026-04-05T01:05:25Z] [INFO] [UI] SimpleTimelineViewModel.swift:17013 - [Memory] APPLYING deferred trim trigger=manual direction=newer frames=100",
-            "[2026-04-05T01:05:25Z] [INFO] [UI] TimelineWindowController.swift:1211 - [TimelineToggle] show requested state=hidden actualVisible=false searchOverlayVisible=false",
-            "[2026-04-05T01:05:25Z] [INFO] [UI] TimelineWindowController.swift:1413 - [TIMELINE-SHOW] visible=true",
-            "[2026-04-05T01:05:25Z] [INFO] [UI] TimelineWindowController.swift:706 - [TIMELINE-FOCUS] Captured restore target pid=123 bundleID=com.apple.Safari",
-            "[2026-04-05T01:05:25Z] [INFO] [UI] TimelineWindowController.swift:1154 - [TIMELINE-PRERENDER] prepareWindow() started",
-            "[2026-04-05T01:05:25Z] [INFO] [UI] TimelineWindowController.swift:1314 - [TIMELINE-REOPEN] hidden=5.0s framesFromNewestBefore=0 framesFromNewestAfter=0 loadedTapeIsRecent=true instantEligible=true instantExpiryElapsed=true nearEligible=true nearExpiryElapsed=true cacheExpired=false hasActiveFilters=false shouldSnapOnShow=true liveModeOnShow=true",
-            "[2026-04-05T01:05:25Z] [INFO] [UI] SimpleTimelineViewModel.swift:12462 - [PhraseRedaction][UI] Skipping reveal for tiny node 1 frame=2",
-            "[2026-04-05T01:05:25Z] [INFO] [UI] SpotlightSearchOverlay.swift:635 - refreshRecentEntriesPopoverVisibility visible=true",
-            "[2026-04-05T01:05:25Z] [DEBUG] [Database] DataAdapter.swift:1810 - [Filter] Query SQL:",
+            "[2026-03-13T11:57:00Z] [INFO] [ProcessMonitor-VMMap] Fixture.swift:1 - [privacy-v1] TOTAL, minus reserved VM space: 1.2G",
+            "[2026-04-05T01:05:25Z] [INFO] [UI] SearchViewModel.swift:821 - [privacy-v1] [Search-Memory] results=0 visibleResults=0 thumbnails=0/Zero KB appIcons=0/Zero KB",
+            "[2026-04-05T01:05:25Z] [INFO] [UI] SimpleTimelineViewModel.swift:2721 - [privacy-v1] [Timeline-Memory] diskFrameBufferCount=0 diskFrameBufferBytes=Zero KB frameWindowCount=100",
+            "[2026-04-05T01:05:25Z] [INFO] [Processing] FrameProcessingQueue.swift:3276 - [privacy-v1] [Queue-Memory] footprint=1.00 GB resident=1.10 GB internal=1.05 GB compressed=Zero KB ocrQueueDepth=0 ocrPending=0 ocrProcessing=0 rewritePending=0 rewriteProcessing=0 workers=2 memoryPaused=false",
+            "[2026-04-05T01:05:25Z] [DEBUG] [UI] SimpleTimelineViewModel.swift:2065 - [privacy-v1] [SimpleTimelineViewModel] currentVideoInfo: frame 123 videoPath=/tmp/test, frameIndex=1, processingStatus=2",
+            "[2026-04-05T01:05:25Z] [INFO] [Processing] FrameProcessingQueue.swift:1337 - [privacy-v1] [Queue-TIMING] Frame 123: prep=15ms frame=63ms ocr=604ms index=10ms total=692ms size=3024x1964",
+            "[2026-04-05T01:05:25Z] [DEBUG] [Processing] FrameProcessingQueue.swift:724 - [privacy-v1] [Queue-Rewrite] Suspended pending segment rewrites (timeline-scrubbing); timelineVisible=true, scrubbing=true",
+            "[2026-04-05T01:05:25Z] [DEBUG] [UI] SimpleTimelineView.swift:2001 - [privacy-v1] [VideoView] Released decoder resources (view removed from window)",
+            "[2026-04-05T01:05:25Z] [INFO] [Storage] StorageManager.swift:681 - [privacy-v1] [VideoExtract] Invalidated stale cache for 1775357238907, creating fresh generator",
+            "[2026-04-05T01:05:25Z] [INFO] [App] AppCoordinator.swift:1775 - [privacy-v1] [Pipeline-Memory] reason=rotation pendingRawFrames=0 pendingRawBytes=0 B activeWriters=1 byResolution=[none]",
+            "[2026-04-05T01:05:25Z] [INFO] [Storage] StorageHealthMonitor.swift:430 - [privacy-v1] [StorageHealth] diskFreeGB=120.0 avgLatencyMs=0 slowWrites=0 criticalWrites=0 spinups=0",
+            "[2026-04-05T01:05:25Z] [DEBUG] [UI] SimpleTimelineView.swift:4222 - [privacy-v1] [ZoomedTextSelectionNSView] updateNSView called, selectionStart=true",
+            "[2026-04-05T01:05:25Z] [DEBUG] [UI] SimpleTimelineView.swift:3586 - [privacy-v1] [ZoomDismiss] ZoomUnifiedOverlay rendered - isTransitioning: false, isExitTransitioning: false, progress: 1.0",
+            "[2026-04-05T01:05:25Z] [INFO] [UI] SimpleTimelineViewModel.swift:17013 - [privacy-v1] [Memory] APPLYING deferred trim trigger=manual direction=newer frames=100",
+            "[2026-04-05T01:05:25Z] [INFO] [UI] TimelineWindowController.swift:1211 - [privacy-v1] [TimelineToggle] show requested state=hidden actualVisible=false searchOverlayVisible=false",
+            "[2026-04-05T01:05:25Z] [INFO] [UI] TimelineWindowController.swift:1413 - [privacy-v1] [TIMELINE-SHOW] visible=true",
+            "[2026-04-05T01:05:25Z] [INFO] [UI] TimelineWindowController.swift:706 - [privacy-v1] [TIMELINE-FOCUS] Captured restore target pid=123 bundleID=com.apple.Safari",
+            "[2026-04-05T01:05:25Z] [INFO] [UI] TimelineWindowController.swift:1154 - [privacy-v1] [TIMELINE-PRERENDER] prepareWindow() started",
+            "[2026-04-05T01:05:25Z] [INFO] [UI] TimelineWindowController.swift:1314 - [privacy-v1] [TIMELINE-REOPEN] hidden=5.0s framesFromNewestBefore=0 framesFromNewestAfter=0 loadedTapeIsRecent=true instantEligible=true instantExpiryElapsed=true nearEligible=true nearExpiryElapsed=true cacheExpired=false hasActiveFilters=false shouldSnapOnShow=true liveModeOnShow=true",
+            "[2026-04-05T01:05:25Z] [INFO] [UI] SimpleTimelineViewModel.swift:12462 - [privacy-v1] [PhraseRedaction][UI] Skipping reveal for tiny node 1 frame=2",
+            "[2026-04-05T01:05:25Z] [INFO] [UI] SpotlightSearchOverlay.swift:635 - [privacy-v1] refreshRecentEntriesPopoverVisibility visible=true",
+            "[2026-04-05T01:05:25Z] [DEBUG] [Database] DataAdapter.swift:1810 - [privacy-v1] [Filter] Query SQL:",
             "SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodedAt, f.processingStatus, f.redactionReason,",
             "FROM frame f",
-            "[2026-03-13T11:59:00Z] [INFO] [UI] Sample log line"
+            "[2026-03-13T11:59:00Z] [INFO] [UI] Fixture.swift:1 - [privacy-v1] Sample log line"
         ])
 
         XCTAssertEqual(filtered, [
-            "[2026-03-13T11:59:00Z] [INFO] [UI] Sample log line"
+            "[2026-03-13T11:59:00Z] [INFO] [UI] Fixture.swift:1 - [privacy-v1] Sample log line"
         ])
     }
 
@@ -308,13 +324,13 @@ final class FeedbackExportTests: XCTestCase {
 
     func testCompactFeedbackLogEntriesGroupsHighVolumeFamiliesAndKeepsRawOneOffs() throws {
         let rawEntries = groupedLogInputEntries() + [
-            "[2026-04-05T01:05:29Z] [DEBUG] [App] AppCoordinator.swift:2430 - Started segment: com.openai.codex [segmentID=42, windowToken=w_3f6a8c1d2b4e, browserURL=nil]"
+            "[2026-04-05T01:05:29Z] [DEBUG] [App] AppCoordinator.swift:2430 - [privacy-v1] Started segment: com.openai.codex [segmentID=42, windowToken=w_3f6a8c1d2b4e, browserURL=nil]"
         ]
 
         let compacted = FeedbackService.compactFeedbackLogEntries(rawEntries)
 
         XCTAssertEqual(compacted.retainedLogs, [
-            "[2026-04-05T01:05:29Z] [DEBUG] [App] AppCoordinator.swift:2430 - Started segment: com.openai.codex [segmentID=42, windowToken=w_3f6a8c1d2b4e, browserURL=nil]"
+            "[2026-04-05T01:05:29Z] [DEBUG] [App] AppCoordinator.swift:2430 - [privacy-v1] Started segment: com.openai.codex [segmentID=42, windowToken=w_3f6a8c1d2b4e, browserURL=nil]"
         ])
 
         let groupedLogs = try XCTUnwrap(compacted.groupedLogs)
@@ -348,20 +364,20 @@ final class FeedbackExportTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: url) }
 
         let contents = [
-            "[2026-04-05T01:05:20Z] [INFO] [UI] First kept line",
-            "[2026-04-05T01:05:21Z] [INFO] [Processing] FrameProcessingQueue.swift:1337 - [Queue-TIMING] Frame 123: prep=15ms frame=63ms ocr=604ms index=10ms total=692ms size=3024x1964",
+            "[2026-04-05T01:05:20Z] [INFO] [UI] Fixture.swift:1 - [privacy-v1] First kept line",
+            "[2026-04-05T01:05:21Z] [INFO] [Processing] FrameProcessingQueue.swift:1337 - [privacy-v1] [Queue-TIMING] Frame 123: prep=15ms frame=63ms ocr=604ms index=10ms total=692ms size=3024x1964",
             "SELECT f.id, f.createdAt FROM frame f",
-            "[2026-04-05T01:05:22Z] [INFO] [UI] Second kept line",
-            "[2026-04-05T01:05:23Z] [DEBUG] [Processing] FrameProcessingQueue.swift:724 - [Queue-Rewrite] Suspended pending segment rewrites (timeline-scrubbing); timelineVisible=true, scrubbing=true",
-            "[2026-04-05T01:05:24Z] [INFO] [UI] Third kept line",
+            "[2026-04-05T01:05:22Z] [INFO] [UI] Fixture.swift:1 - [privacy-v1] Second kept line",
+            "[2026-04-05T01:05:23Z] [DEBUG] [Processing] FrameProcessingQueue.swift:724 - [privacy-v1] [Queue-Rewrite] Suspended pending segment rewrites (timeline-scrubbing); timelineVisible=true, scrubbing=true",
+            "[2026-04-05T01:05:24Z] [INFO] [UI] Fixture.swift:1 - [privacy-v1] Third kept line",
         ].joined(separator: "\n")
         try contents.write(to: url, atomically: true, encoding: .utf8)
 
         let lines = FeedbackService.readRecentFeedbackLogEntries(maxCount: 2, fileURL: url)
 
         XCTAssertEqual(lines, [
-            "[2026-04-05T01:05:22Z] [INFO] [UI] Second kept line",
-            "[2026-04-05T01:05:24Z] [INFO] [UI] Third kept line",
+            "[2026-04-05T01:05:22Z] [INFO] [UI] Fixture.swift:1 - [privacy-v1] Second kept line",
+            "[2026-04-05T01:05:24Z] [INFO] [UI] Fixture.swift:1 - [privacy-v1] Third kept line",
         ])
     }
 
@@ -371,17 +387,17 @@ final class FeedbackExportTests: XCTestCase {
             .appendingPathExtension("log")
         defer { try? FileManager.default.removeItem(at: url) }
 
-        var data = Data("[2026-04-05T01:05:25Z] [INFO] first line\n".utf8)
+        var data = Data("[2026-04-05T01:05:25Z] [INFO] [UI] Fixture.swift:1 - [privacy-v1] first line\n[2026-04-05T01:05:26Z] [INFO] [UI] Fixture.swift:1 - [privacy-v1] ".utf8)
         data.append(Data([0xF0, 0x9F]))
-        data.append(Data("broken utf8\n[2026-04-05T01:05:30Z] [INFO] second line\n".utf8))
+        data.append(Data("broken utf8\n[2026-04-05T01:05:30Z] [INFO] [UI] Fixture.swift:1 - [privacy-v1] second line\n".utf8))
         try data.write(to: url)
 
         let lines = FeedbackService.readRecentFeedbackLogEntries(maxCount: 10, fileURL: url)
 
         XCTAssertEqual(lines.count, 3)
-        XCTAssertEqual(lines.first, "[2026-04-05T01:05:25Z] [INFO] first line")
+        XCTAssertEqual(lines.first, "[2026-04-05T01:05:25Z] [INFO] [UI] Fixture.swift:1 - [privacy-v1] first line")
         XCTAssertTrue(lines[1].contains("broken utf8"))
-        XCTAssertEqual(lines.last, "[2026-04-05T01:05:30Z] [INFO] second line")
+        XCTAssertEqual(lines.last, "[2026-04-05T01:05:30Z] [INFO] [UI] Fixture.swift:1 - [privacy-v1] second line")
     }
 
     func testReadRecentFeedbackLogEntriesHandlesChunkBoundariesFromTail() throws {
@@ -392,7 +408,7 @@ final class FeedbackExportTests: XCTestCase {
 
         let lines = (1...220).map { index in
             let padding = String(repeating: "x", count: 380)
-            return "[2026-04-05T01:05:\(String(format: "%02d", index % 60))Z] [INFO] [UI] Chunk boundary line \(index) \(padding)"
+            return "[2026-04-05T01:05:\(String(format: "%02d", index % 60))Z] [INFO] [UI] Fixture.swift:1 - [privacy-v1] Chunk boundary line \(index) \(padding)"
         }
         try lines.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
 
@@ -416,15 +432,15 @@ final class FeedbackExportTests: XCTestCase {
         }
 
         let rawLines = (1...520).map { index in
-            "[\(timestamp(index))] [INFO] [UI] Raw kept line \(index)"
+            "[\(timestamp(index))] [INFO] [UI] Fixture.swift:1 - [privacy-v1] Raw kept line \(index)"
         }
 
         let groupedLines = (1...100).map { index in
-            "[\(timestamp(1_000 + index))] [DEBUG] [UI] SimpleTimelineViewModel.swift:14366 - [Timeline-Scrub] started source=trackpad"
+            "[\(timestamp(1_000 + index))] [DEBUG] [UI] SimpleTimelineViewModel.swift:14366 - [privacy-v1] [Timeline-Scrub] started source=trackpad"
         }
 
         let excludedLines = (1...100).map { index in
-            "[\(timestamp(2_000 + index))] [INFO] [Processing] FrameProcessingQueue.swift:1337 - [Queue-TIMING] Frame \(index): prep=15ms frame=63ms ocr=604ms index=10ms total=692ms size=3024x1964"
+            "[\(timestamp(2_000 + index))] [INFO] [Processing] FrameProcessingQueue.swift:1337 - [privacy-v1] [Queue-TIMING] Frame \(index): prep=15ms frame=63ms ocr=604ms index=10ms total=692ms size=3024x1964"
         }
 
         let contents = (rawLines + groupedLines + excludedLines).joined(separator: "\n")
@@ -460,11 +476,11 @@ final class FeedbackExportTests: XCTestCase {
         }
 
         let rawLines = (1...1_020).map { index in
-            "[\(timestamp(index))] [INFO] [UI] Raw kept line \(index)"
+            "[\(timestamp(index))] [INFO] [UI] Fixture.swift:1 - [privacy-v1] Raw kept line \(index)"
         }
 
         let errorLines = (1...80).map { index in
-            "[\(timestamp(2_000 + index))] [⚠️ WARN] [UI] Logging.swift:257 - [PERF] slow sample \(index)"
+            "[\(timestamp(2_000 + index))] [⚠️ WARN] [UI] Logging.swift:257 - [privacy-v1] [PERF] slow sample \(index)"
         }
 
         let contents = (rawLines + errorLines).joined(separator: "\n")
@@ -669,7 +685,7 @@ final class FeedbackExportTests: XCTestCase {
     }
 
     func testExportJSONDoesNotRepeatRecentErrorsInsideRecentLogs() throws {
-        let repeatedError = "[2026-04-05T02:47:21.875Z] [⚠️ WARN] [UI] Logging.swift:257 - [PERF] dashboard.query.storage_single_day_ms slow sample: 269.8ms (warning >= 250.0ms)"
+        let repeatedError = "[2026-04-05T02:47:21.875Z] [⚠️ WARN] [UI] Logging.swift:257 - [privacy-v1] [PERF] dashboard.query.storage_single_day_ms slow sample: 269.8ms (warning >= 250.0ms)"
         let diagnostics = DiagnosticInfo(
             appVersion: "1.2.3",
             buildNumber: "45",
@@ -1027,23 +1043,23 @@ final class FeedbackExportTests: XCTestCase {
 
     private func groupedLogInputEntries() -> [String] {
         [
-            "[2026-04-05T01:05:25Z] [INFO] [Capture] CaptureManager.swift:729 - Deduplication analysis (trigger: interval, similarity: 99.91%, threshold: 99.85%, keepBySimilarity: false, keepByMouseMovement: false, outcome: deduplicated)",
-            "[2026-04-05T01:06:32Z] [INFO] [Capture] CaptureManager.swift:729 - Deduplication analysis (trigger: mouse_click, similarity: 99.95%, threshold: 99.85%, keepBySimilarity: true, keepByMouseMovement: true, outcome: kept)",
-            "[2026-04-05T01:05:35Z] [DEBUG] [Processing] ProcessingManager.swift:141 - [ProcessingManager] Region OCR: 24/64 tiles, 62% energy saved, 81.6ms",
-            "[2026-04-05T01:05:40Z] [DEBUG] [Processing] ProcessingManager.swift:141 - [ProcessingManager] Region OCR: 8/64 tiles, 87% energy saved, 24.3ms",
-            "[2026-04-05T01:05:42Z] [INFO] [Storage] HEVCEncoder.swift:559 - 📦 Fragment 18 written: +512KB (total: 6144KB, 12 frames flushed, video time: 5.0s) - frames now readable!",
-            "[2026-04-05T01:05:48Z] [INFO] [Storage] HEVCEncoder.swift:559 - 📦 Fragment 19 written: +768KB (total: 6912KB, 18 frames flushed, video time: 7.5s) - frames now readable!",
-            "[2026-04-05T01:05:50Z] [DEBUG] [UI] SimpleTimelineViewModel.swift:14366 - [Timeline-Scrub] started source=trackpad",
-            "[2026-04-05T01:05:55Z] [DEBUG] [UI] SimpleTimelineViewModel.swift:14366 - [Timeline-Scrub] started source=mouse-wheel",
-            "[2026-04-05T01:05:25Z] [INFO] [UI] SearchViewModel.swift:821 - [Search-Memory] results=0 visibleResults=0 thumbnails=0/Zero KB appIcons=0/Zero KB",
-            "[2026-04-05T01:05:30Z] [INFO] [UI] SearchViewModel.swift:821 - [Search-Memory] results=0 visibleResults=0 thumbnails=1/Zero KB appIcons=2/Zero KB",
-            "[2026-04-05T01:05:31Z] [INFO] [Processing] FrameProcessingQueue.swift:1156 - [Queue-DIAG] Worker 0 COMPLETED frame 51045031 in 0.45s",
-            "[2026-04-05T01:05:32Z] [DEBUG] [UI] SimpleTimelineViewModel.swift:2065 - [SimpleTimelineViewModel] currentVideoInfo: frame 123 videoPath=/tmp/test, frameIndex=1, processingStatus=2",
-            "[2026-04-05T01:05:33Z] [INFO] [Processing] FrameProcessingQueue.swift:1337 - [Queue-TIMING] Frame 123: prep=15ms frame=63ms ocr=604ms index=10ms total=692ms size=3024x1964",
-            "[2026-04-05T01:05:34Z] [DEBUG] [Processing] FrameProcessingQueue.swift:724 - [Queue-Rewrite] Suspended pending segment rewrites (timeline-scrubbing); timelineVisible=true, scrubbing=true",
-            "[2026-04-05T01:05:35Z] [DEBUG] [UI] SimpleTimelineView.swift:2001 - [VideoView] Released decoder resources (view removed from window)",
-            "[2026-04-05T01:05:36Z] [INFO] [Storage] StorageManager.swift:681 - [VideoExtract] Invalidated stale cache for 1775357238907, creating fresh generator",
-            "[2026-04-05T01:05:37Z] [DEBUG] [Database] DataAdapter.swift:1810 - [Filter] Query SQL:",
+            "[2026-04-05T01:05:25Z] [INFO] [Capture] CaptureManager.swift:729 - [privacy-v1] Deduplication analysis (trigger: interval, similarity: 99.91%, threshold: 99.85%, keepBySimilarity: false, keepByMouseMovement: false, outcome: deduplicated)",
+            "[2026-04-05T01:06:32Z] [INFO] [Capture] CaptureManager.swift:729 - [privacy-v1] Deduplication analysis (trigger: mouse_click, similarity: 99.95%, threshold: 99.85%, keepBySimilarity: true, keepByMouseMovement: true, outcome: kept)",
+            "[2026-04-05T01:05:35Z] [DEBUG] [Processing] ProcessingManager.swift:141 - [privacy-v1] [ProcessingManager] Region OCR: 24/64 tiles, 62% energy saved, 81.6ms",
+            "[2026-04-05T01:05:40Z] [DEBUG] [Processing] ProcessingManager.swift:141 - [privacy-v1] [ProcessingManager] Region OCR: 8/64 tiles, 87% energy saved, 24.3ms",
+            "[2026-04-05T01:05:42Z] [INFO] [Storage] HEVCEncoder.swift:559 - [privacy-v1] 📦 Fragment 18 written: +512KB (total: 6144KB, 12 frames flushed, video time: 5.0s) - frames now readable!",
+            "[2026-04-05T01:05:48Z] [INFO] [Storage] HEVCEncoder.swift:559 - [privacy-v1] 📦 Fragment 19 written: +768KB (total: 6912KB, 18 frames flushed, video time: 7.5s) - frames now readable!",
+            "[2026-04-05T01:05:50Z] [DEBUG] [UI] SimpleTimelineViewModel.swift:14366 - [privacy-v1] [Timeline-Scrub] started source=trackpad",
+            "[2026-04-05T01:05:55Z] [DEBUG] [UI] SimpleTimelineViewModel.swift:14366 - [privacy-v1] [Timeline-Scrub] started source=mouse-wheel",
+            "[2026-04-05T01:05:25Z] [INFO] [UI] SearchViewModel.swift:821 - [privacy-v1] [Search-Memory] results=0 visibleResults=0 thumbnails=0/Zero KB appIcons=0/Zero KB",
+            "[2026-04-05T01:05:30Z] [INFO] [UI] SearchViewModel.swift:821 - [privacy-v1] [Search-Memory] results=0 visibleResults=0 thumbnails=1/Zero KB appIcons=2/Zero KB",
+            "[2026-04-05T01:05:31Z] [INFO] [Processing] FrameProcessingQueue.swift:1156 - [privacy-v1] [Queue-DIAG] Worker 0 COMPLETED frame 51045031 in 0.45s",
+            "[2026-04-05T01:05:32Z] [DEBUG] [UI] SimpleTimelineViewModel.swift:2065 - [privacy-v1] [SimpleTimelineViewModel] currentVideoInfo: frame 123 videoPath=/tmp/test, frameIndex=1, processingStatus=2",
+            "[2026-04-05T01:05:33Z] [INFO] [Processing] FrameProcessingQueue.swift:1337 - [privacy-v1] [Queue-TIMING] Frame 123: prep=15ms frame=63ms ocr=604ms index=10ms total=692ms size=3024x1964",
+            "[2026-04-05T01:05:34Z] [DEBUG] [Processing] FrameProcessingQueue.swift:724 - [privacy-v1] [Queue-Rewrite] Suspended pending segment rewrites (timeline-scrubbing); timelineVisible=true, scrubbing=true",
+            "[2026-04-05T01:05:35Z] [DEBUG] [UI] SimpleTimelineView.swift:2001 - [privacy-v1] [VideoView] Released decoder resources (view removed from window)",
+            "[2026-04-05T01:05:36Z] [INFO] [Storage] StorageManager.swift:681 - [privacy-v1] [VideoExtract] Invalidated stale cache for 1775357238907, creating fresh generator",
+            "[2026-04-05T01:05:37Z] [DEBUG] [Database] DataAdapter.swift:1810 - [privacy-v1] [Filter] Query SQL:",
             "SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodedAt, f.processingStatus, f.redactionReason,",
             "FROM frame f",
         ]
