@@ -2495,6 +2495,7 @@ public actor DatabaseManager: DatabaseProtocol {
             SELECT id, videoId, videoFrameIndex
             FROM frame
             WHERE videoId = ?
+              AND processingStatus != 2
               AND \(statusFilter)
               AND rewritePurpose = 'deletion'
             ORDER BY videoFrameIndex ASC, id ASC;
@@ -2538,7 +2539,7 @@ public actor DatabaseManager: DatabaseProtocol {
             SELECT DISTINCT videoId
             FROM frame
             WHERE videoId IS NOT NULL
-              AND processingStatus IN (\(statuses.map(String.init).joined(separator: ", ")))
+              AND processingStatus != 2 AND processingStatus IN (\(statuses.map(String.init).joined(separator: ", ")))
               AND rewritePurpose IN ('redaction', 'deletion')
             ORDER BY videoId ASC;
             """
@@ -2992,6 +2993,7 @@ public actor DatabaseManager: DatabaseProtocol {
             FROM frame f
             JOIN node n ON n.frameId = f.id
             WHERE f.videoId = ?
+              AND f.processingStatus != 2
               AND \(statusFilter)
               AND COALESCE(f.rewritePurpose, 'redaction') = 'redaction'
               AND n.encryptedText IS NOT NULL
@@ -3055,7 +3057,7 @@ public actor DatabaseManager: DatabaseProtocol {
             SELECT DISTINCT f.videoId
             FROM frame f
             JOIN node n ON n.frameId = f.id
-            WHERE f.processingStatus IN (\(statuses.map(String.init).joined(separator: ", ")))
+            WHERE f.processingStatus != 2 AND f.processingStatus IN (\(statuses.map(String.init).joined(separator: ", ")))
               AND COALESCE(f.rewritePurpose, 'redaction') = 'redaction'
               AND n.encryptedText IS NOT NULL
             ORDER BY f.videoId ASC;
@@ -3123,7 +3125,7 @@ public actor DatabaseManager: DatabaseProtocol {
             UPDATE frame
             SET processingStatus = 8,
                 rewritePurpose = ?
-            WHERE processingStatus IN (5, 6, 8)
+            WHERE processingStatus != 2 AND processingStatus IN (5, 6, 8)
               AND COALESCE(rewritePurpose, 'redaction') = 'redaction'
               AND EXISTS (
                   SELECT 1
@@ -3167,7 +3169,7 @@ public actor DatabaseManager: DatabaseProtocol {
             SELECT 1
             FROM frame
             WHERE videoId = ?
-              AND processingStatus IN (0, 1, 4)
+              AND processingStatus != 2 AND processingStatus IN (0, 1, 4)
             LIMIT 1;
             """
 
@@ -3986,41 +3988,59 @@ public actor DatabaseManager: DatabaseProtocol {
 
     // MARK: - Processing Queue Operations
 
-    /// Enqueue a frame for OCR processing
-    /// Only enqueues frames with processingStatus = 0 (pending)
+    /// Enqueue a frame for OCR processing. Only pending frames are eligible.
     public func enqueueFrameForProcessing(frameID: Int64, priority: Int = 0) async throws {
         guard let db = db else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
+        try enqueueProcessingFrames(db: db, frameIDs: [frameID], priority: priority)
+    }
 
-        // Only enqueue if processingStatus = 0 (pending)
+    /// Enqueue a backlog atomically with one prepared insert. Duplicates retain
+    /// the single-frame API's behavior; any missing/ineligible frame fails the batch.
+    public func enqueueFramesForProcessing(frameIDs: [Int64], priority: Int = 0) async throws {
+        guard !frameIDs.isEmpty else { return }
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        // SAVEPOINT/RELEASE is one transaction when standalone, and keeps a
+        // caller-owned transaction open while isolating a failed batch's writes.
+        try executeImmediateSQL("SAVEPOINT retrace_enqueue_batch;", db: db)
+        do {
+            try enqueueProcessingFrames(db: db, frameIDs: frameIDs, priority: priority)
+            try executeImmediateSQL("RELEASE retrace_enqueue_batch;", db: db)
+        } catch {
+            try? executeImmediateSQL("ROLLBACK TO retrace_enqueue_batch;", db: db)
+            try? executeImmediateSQL("RELEASE retrace_enqueue_batch;", db: db)
+            throw error
+        }
+    }
+
+    private func enqueueProcessingFrames(db: OpaquePointer, frameIDs: [Int64], priority: Int) throws {
         let sql = """
             INSERT INTO processing_queue (frameId, enqueuedAt, priority, retryCount)
             SELECT ?, ?, ?, 0
             FROM frame
             WHERE id = ? AND processingStatus = 0;
-        """
-
+            """
         var stmt: OpaquePointer?
         defer { sqlite3_finalize(stmt) }
-
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
             throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
         }
-
-        sqlite3_bind_int64(stmt, 1, frameID)
-        sqlite3_bind_double(stmt, 2, Date().timeIntervalSince1970)
-        sqlite3_bind_int(stmt, 3, Int32(priority))
-        sqlite3_bind_int64(stmt, 4, frameID)
-
-        guard sqlite3_step(stmt) == SQLITE_DONE else {
-            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
-        }
-
-        // Check if any row was actually inserted
-        let changes = sqlite3_changes(db)
-        if changes == 0 {
-            throw DatabaseError.queryFailed(query: sql, underlying: "Frame \(frameID) not eligible for processing (processingStatus != 0)")
+        for frameID in frameIDs {
+            sqlite3_bind_int64(stmt, 1, frameID)
+            sqlite3_bind_double(stmt, 2, Date().timeIntervalSince1970)
+            sqlite3_bind_int(stmt, 3, Int32(priority))
+            sqlite3_bind_int64(stmt, 4, frameID)
+            guard sqlite3_step(stmt) == SQLITE_DONE else {
+                throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+            }
+            guard sqlite3_changes(db) == 1 else {
+                throw DatabaseError.queryFailed(query: sql, underlying: "Frame \(frameID) not eligible for processing (processingStatus != 0)")
+            }
+            sqlite3_reset(stmt)
+            sqlite3_clear_bindings(stmt)
         }
     }
 
@@ -4039,7 +4059,7 @@ public actor DatabaseManager: DatabaseProtocol {
                     SELECT pq.id, pq.frameId, pq.retryCount
                     FROM processing_queue pq
                     INNER JOIN frame f ON pq.frameId = f.id
-                    WHERE f.processingStatus = 0
+                    WHERE f.processingStatus != 2 AND f.processingStatus = 0
                     ORDER BY pq.priority DESC, pq.enqueuedAt ASC
                     LIMIT 1;
                 """
@@ -4153,7 +4173,7 @@ public actor DatabaseManager: DatabaseProtocol {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
 
-        let sql = "SELECT COUNT(*) FROM frame WHERE processingStatus IN (0, 1, 6);"
+        let sql = "SELECT COUNT(*) FROM frame WHERE processingStatus != 2 AND processingStatus IN (0, 1, 6);"
         var stmt: OpaquePointer?
         defer { sqlite3_finalize(stmt) }
 
@@ -4179,7 +4199,7 @@ public actor DatabaseManager: DatabaseProtocol {
         let sql = """
             SELECT processingStatus, COUNT(*)
             FROM frame
-            WHERE processingStatus IN (0, 1, 5, 6)
+            WHERE processingStatus != 2 AND processingStatus IN (0, 1, 5, 6)
             GROUP BY processingStatus;
             """
         var stmt: OpaquePointer?
@@ -4241,7 +4261,7 @@ public actor DatabaseManager: DatabaseProtocol {
         }
 
         // processingStatus = 1 means "processing" (crashed)
-        let sql = "SELECT id FROM frame WHERE processingStatus = 1;"
+        let sql = "SELECT id FROM frame WHERE processingStatus != 2 AND processingStatus = 1;"
         var stmt: OpaquePointer?
         defer { sqlite3_finalize(stmt) }
 
@@ -4500,7 +4520,7 @@ public actor DatabaseManager: DatabaseProtocol {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
 
-        let sql = "SELECT COUNT(*) FROM frame WHERE processingStatus = 4;"
+        let sql = "SELECT COUNT(*) FROM frame WHERE processingStatus != 2 AND processingStatus = 4;"
         var stmt: OpaquePointer?
         defer { sqlite3_finalize(stmt) }
 
@@ -4524,7 +4544,7 @@ public actor DatabaseManager: DatabaseProtocol {
         let sql = """
             SELECT COUNT(*)
             FROM frame
-            WHERE processingStatus = 4
+            WHERE processingStatus != 2 AND processingStatus = 4
               AND createdAt >= ?;
             """
 
@@ -4669,7 +4689,7 @@ public actor DatabaseManager: DatabaseProtocol {
             let sql = """
                 SELECT f.id
                 FROM frame f
-                WHERE f.processingStatus = 0
+                WHERE f.processingStatus != 2 AND f.processingStatus = 0
                   AND NOT EXISTS (
                       SELECT 1
                       FROM processing_queue pq
@@ -4702,7 +4722,7 @@ public actor DatabaseManager: DatabaseProtocol {
             let sql = """
                 SELECT COUNT(*)
                 FROM frame f
-                WHERE f.processingStatus = 0
+                WHERE f.processingStatus != 2 AND f.processingStatus = 0
                   AND NOT EXISTS (
                       SELECT 1
                       FROM processing_queue pq

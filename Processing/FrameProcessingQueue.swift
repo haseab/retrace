@@ -998,9 +998,9 @@ public actor FrameProcessingQueue {
 
     /// Enqueue multiple frames (batch operation)
     public func enqueueBatch(frameIDs: [Int64], priority: Int = 0) async throws {
-        for frameID in frameIDs {
-            try await enqueue(frameID: frameID, priority: priority)
-        }
+        guard !frameIDs.isEmpty else { return }
+        try await databaseManager.enqueueFramesForProcessing(frameIDs: frameIDs, priority: priority)
+        currentQueueDepth += frameIDs.count
     }
 
     /// Dequeue the next frame for processing

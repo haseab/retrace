@@ -3,6 +3,7 @@ import Foundation
 import CoreGraphics
 import Shared
 import Database
+import SQLCipher
 @testable import Processing
 
 private actor RewriteRetryNoopSearch: SearchProtocol {
@@ -329,6 +330,25 @@ final class RewriteRetryPolicyTests: XCTestCase {
         database = nil
         queue = nil
         storage = nil
+    }
+
+    func testEnqueueBatchIsAtomicAndUsesDatabaseBatch() async throws {
+        let connection = await database.getConnection()
+        let db = try XCTUnwrap(connection)
+        let sql = "INSERT INTO frame(id,createdAt,imageFileName,processingStatus) VALUES (1,1000,'one',0),(2,2000,'two',0);"
+        guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+        do {
+            try await queue.enqueueBatch(frameIDs: [1,2,999], priority: 7)
+            XCTFail("Expected the invalid frame to reject the whole batch")
+        } catch {}
+        let failedDepth = try await database.getProcessingQueueDepth()
+        XCTAssertEqual(failedDepth, 0, "The Processing entry point must not retain a partially enqueued prefix")
+        try await queue.enqueueBatch(frameIDs: [1,2], priority: 7)
+        try await queue.enqueueBatch(frameIDs: [])
+        let depth = try await database.getProcessingQueueDepth()
+        XCTAssertEqual(depth, 2)
     }
 
     func testRecoveryNeverScansWhileAnotherRewriteIsActive() async throws {
