@@ -97,6 +97,7 @@ UI/
 ├── LaunchAgents/
 │   └── io.retrace.app.crash-recovery.plist # SMAppService launch-agent plist for crash recovery
 ├── Components/
+│   ├── CapturedURLPolicy.swift # HTTP(S)-only captured-link dispatch validation
 │   ├── MasterKeyRedactionFlowCoordinator.swift # Shared missing-master-key prompt/recovery coordinator
 │   ├── BoundingBoxOverlay.swift         # Text region highlighting
 │   ├── CrashRecoveryManager.swift       # App-side SMAppService/XPC lifecycle manager
@@ -774,3 +775,9 @@ Focus on getting the timeline + search working first before polishing dashboard/
 ## Preview cache I/O and budgets
 
 Timeline index touches do not rescan sizes. JPEG NSCache entries have compressed-byte costs (64 MiB cost limit). Search LRU costs use decoded representation estimates (32 MiB, 60 entries); no CGImage decode is forced for accounting. Cache disk operations go through the shared FIFO utility worker; a brief admission lock only bounds pending memory. Coalesce thumbnail trim scans (burst debounce, 60-second minimum interval), batch deletions, and prune by request-time cutoff so new files survive delayed cleanup. Invalidation epochs and main-actor generations prevent stale completions from restoring cleared previews. Search keys use render identity and a persisted revision, with highlighted geometry kept distinct. Changing the rendering algorithm must advance the key format version. Keyword privacy bypasses and redaction purge paths remain mandatory.
+
+### Captured link policy
+
+- `UI/Components/CapturedURLPolicy.swift` allows HTTP(S) URLs with a host for captured browser/OCR links. Apply it before NSWorkspace/browser lookup in every captured-link open path. Existing comment-authored links are outside this policy. `HyperlinkResolutionTests` covers allowed and rejected schemes.
+
+- PreviewCacheEntryEpochs in PreviewCacheMaintenance.swift isolates frame eviction from unrelated reads/writes. Release read-miss epochs after all overlapping operations finish; keep whole-cache invalidation for clear/redaction.

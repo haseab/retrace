@@ -4,6 +4,15 @@ import Shared
 import App
 
 final class HyperlinkResolutionTests: XCTestCase {
+    func testCapturedLinksAllowOnlyWebURLsWithHosts() {
+        for value in ["https://example.com/a?q=1", "HTTP://example.com", "https://例え.jp/docs"] {
+            XCTAssertNotNil(CapturedURLPolicy.webURL(value))
+        }
+        for value in ["file:///tmp/a", "javascript:alert(1)", "data:text/html,test", "retrace://open", "mailto:a@example.com", "https:missing-host", "/relative", "https://"] {
+            XCTAssertNil(CapturedURLPolicy.webURL(value))
+        }
+    }
+
     @MainActor
     func testResolveStoredHyperlinkURLKeepsAbsoluteURLs() {
         XCTAssertEqual(

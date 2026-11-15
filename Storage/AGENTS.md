@@ -15,6 +15,7 @@ Storage/
 ├── SegmentWriterImpl.swift      # SegmentWriter implementation
 ├── StorageModuleError.swift     # Storage-local errors
 ├── FileManager/
+│   ├── TemporaryVideoLink.swift # Scoped AVAssetReader links removed on success/error
 │   ├── DirectoryManager.swift   # Directory structure management
 │   └── StorageHealthMonitor.swift # Disk space + I/O + volume health monitoring
 ├── VideoEncoder/
@@ -25,6 +26,7 @@ Storage/
 │   └── RecoveryManager.swift    # Crash recovery and durable video-prefix reuse
 └── Tests/
     ├── DirectoryManagerTests.swift
+    ├── TemporaryVideoLinkTests.swift # Real file/link lifecycle regression
     ├── StorageManagerTests.swift
     ├── HEVCEncoderTests.swift
     └── TestLogger.swift
@@ -357,3 +359,6 @@ Start with the HEVC encoder since that's the core complexity, then add encryptio
 - Frame count/dimensions are reconstructible from `frames.bin`; checkpoint them at most once per 30 seconds during append instead of rewriting `metadata.json` for each screenshot.
 - Durable video frontier updates still persist immediately. Merge them into later session-copy checkpoints so the persisted frontier never regresses.
 - Recovery reconciles even structurally valid stale metadata against the complete WAL record prefix, preserving its durable frontier. Missing metadata remains recoverable. Checkpoint state is cleared with all other session caches.
+
+- Maintain an eight-entry LRU of WAL writer handles and extend offsets incrementally within an active session, but force validation scans for recovery. Close handles on session removal/reset and failed appends.
+- Local video readers use TemporaryVideoLink through a defer covering every return/error; cached AVAssetImageGenerator links remain alive until generator eviction.

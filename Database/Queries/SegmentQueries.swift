@@ -413,6 +413,35 @@ enum SegmentQueries {
 
     // MARK: - Delete
 
+    /// Atomic guard against retention deleting a still-referenced or active video.
+    /// An already absent row is success so a journal can retry its file removal.
+    static func deleteUnreferenced(db: OpaquePointer, id: VideoSegmentID) throws -> Bool {
+        let sql = """
+            DELETE FROM video WHERE id = ? AND processingState = 0
+            AND NOT EXISTS (SELECT 1 FROM frame WHERE videoId = video.id);
+            """
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+        sqlite3_bind_int64(statement, 1, id.value)
+        guard sqlite3_step(statement) == SQLITE_DONE else {
+            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+        var check: OpaquePointer?
+        defer { sqlite3_finalize(check) }
+        guard sqlite3_prepare_v2(db, "SELECT 1 FROM video WHERE id = ?", -1, &check, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: "retention video existence", underlying: String(cString: sqlite3_errmsg(db)))
+        }
+        sqlite3_bind_int64(check, 1, id.value)
+        let result = sqlite3_step(check)
+        guard result == SQLITE_ROW || result == SQLITE_DONE else {
+            throw DatabaseError.queryFailed(query: "retention video existence", underlying: String(cString: sqlite3_errmsg(db)))
+        }
+        return result == SQLITE_DONE
+    }
+
     static func delete(db: OpaquePointer, id: VideoSegmentID) throws {
         let sql = "DELETE FROM video WHERE id = ?;"
 

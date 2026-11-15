@@ -2387,6 +2387,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     private var diskFrameBufferBytes: Int64 { diskFrameBufferIndex.totalBytes }
     private var diskFrameBufferGeneration: UInt64 = 0
     private let diskFrameBufferEpoch = PreviewCacheEpoch()
+    private var diskFrameBufferEntryEpochs = PreviewCacheEntryEpochs<FrameID>()
     private var diskFrameBufferAccessSequence: UInt64 = 0
     private let diskFrameBufferDirectoryURL: URL
 
@@ -2738,6 +2739,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                 self.unavailableFrameDiskLookupTask = nil
                 self.diskFrameBufferGeneration &+= 1
                 self.diskFrameBufferEpoch.invalidate()
+                self.diskFrameBufferEntryEpochs.invalidateAll()
                 self.diskFrameBufferIndex.removeAll()
                 self.inMemoryJPEGFrameCache.removeAllObjects()
                 self.hotWindowRange = nil
@@ -3138,8 +3140,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         removeExternalFiles: Bool = false
     ) -> (removedFromIndex: Int, removedFromDisk: Int, preservedExternal: Int) {
         guard !frameIDs.isEmpty else { return (0, 0, 0) }
-        diskFrameBufferGeneration &+= 1
-        diskFrameBufferEpoch.invalidate()
+        diskFrameBufferEntryEpochs.invalidate(frameIDs)
 
         var removedFromIndex = 0
         var removedFromDisk = 0
@@ -3171,6 +3172,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     private func clearDiskFrameBuffer(reason: String) {
         diskFrameBufferGeneration &+= 1
         diskFrameBufferEpoch.invalidate()
+        diskFrameBufferEntryEpochs.invalidateAll()
         unavailableFrameDiskLookupTask?.cancel()
         unavailableFrameDiskLookupTask = nil
         cancelForegroundFrameLoad(reason: "clearDiskFrameBuffer.\(reason)")
@@ -3353,12 +3355,15 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
 
         let generation = diskFrameBufferGeneration
+        let entryEpoch = diskFrameBufferEntryEpochs.epoch(for: frameID)
+        let entryToken = entryEpoch.current
+        defer { diskFrameBufferEntryEpochs.finish(frameID, epoch: entryEpoch, keep: diskFrameBufferIndex[frameID] != nil) }
         do {
             let data = try await Task.detached(priority: .userInitiated) {
                 try Data(contentsOf: fileURL, options: [.mappedIfSafe])
             }.value
 
-            guard !Task.isCancelled, generation == diskFrameBufferGeneration,
+            guard !Task.isCancelled, generation == diskFrameBufferGeneration, entryEpoch.matches(entryToken),
                   !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { return nil }
             if existingEntry != nil {
                 touchDiskFrameBufferEntry(frameID)
@@ -3375,8 +3380,10 @@ public class SimpleTimelineViewModel: ObservableObject {
             storeInMemoryJPEGFrameData(data, frameID: frameID)
             return data
         } catch {
-            guard generation == diskFrameBufferGeneration else { return nil }
-            removeDiskFrameBufferEntries([frameID], reason: "read failure")
+            guard generation == diskFrameBufferGeneration, entryEpoch.matches(entryToken) else { return nil }
+            if existingEntry != nil {
+                removeDiskFrameBufferEntries([frameID], reason: "read failure")
+            }
             return nil
         }
     }
@@ -3390,12 +3397,15 @@ public class SimpleTimelineViewModel: ObservableObject {
         let generation = diskFrameBufferGeneration
         let epoch = diskFrameBufferEpoch
         let token = epoch.current
+        let entryEpoch = diskFrameBufferEntryEpochs.epoch(for: frameID)
+        let entryToken = entryEpoch.current
+        defer { diskFrameBufferEntryEpochs.finish(frameID, epoch: entryEpoch, keep: diskFrameBufferIndex[frameID] != nil) }
         let wrote = await withCheckedContinuation { continuation in
             PreviewCacheDiskWorker.shared.enqueueWrite(data, to: fileURL, allowed: {
-                epoch.matches(token) && !PhraseRedactionMode.isEnabled(in: privacyDefaults)
+                epoch.matches(token) && entryEpoch.matches(entryToken) && !PhraseRedactionMode.isEnabled(in: privacyDefaults)
             }, completion: { continuation.resume(returning: $0) })
         }
-        guard wrote, !Task.isCancelled, generation == diskFrameBufferGeneration,
+        guard wrote, !Task.isCancelled, generation == diskFrameBufferGeneration, entryEpoch.matches(entryToken),
               !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { return }
 
         diskFrameBufferAccessSequence &+= 1
@@ -11181,7 +11191,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Open the URL in the default browser
     public func openURLInBrowser() {
         guard let box = urlBoundingBox,
-              let url = URL(string: box.url) else {
+              let url = CapturedURLPolicy.webURL(box.url) else {
             return
         }
 
@@ -11211,7 +11221,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             "[BrowserLinkOpen] resolved frameId=\(timelineFrame.frame.id.value) finalURL=\(finalURLString)",
             category: .ui
         )
-        guard let finalURL = URL(string: finalURLString) else {
+        guard let finalURL = CapturedURLPolicy.webURL(finalURLString) else {
             Log.warning(
                 "[BrowserLinkOpen] invalid final URL frameId=\(timelineFrame.frame.id.value) finalURL=\(finalURLString)",
                 category: .ui
@@ -11542,7 +11552,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     @discardableResult
     public func openHyperlinkMatch(_ match: OCRHyperlinkMatch) -> Bool {
         guard let resolvedURLString = resolvedHyperlinkURLString(for: match),
-              let url = URL(string: resolvedURLString) else {
+              let url = CapturedURLPolicy.webURL(resolvedURLString) else {
             return false
         }
         let coordinator = self.coordinator

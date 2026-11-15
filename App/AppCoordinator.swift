@@ -841,7 +841,7 @@ public actor AppCoordinator {
     private static let memoryLedgerSummaryIntervalSeconds: TimeInterval = 30
     private static let memoryLedgerPendingRawFramesTag = "app.capture.pendingRawFrames"
     private static let memoryLedgerActiveWritersTag = "app.capture.activeWriters"
-    private static let dbStorageSnapshotIntervalNanoseconds: Int64 = 60_000_000_000
+    private static let dbStorageSnapshotIntervalNanoseconds: Int64 = 900_000_000_000
     private static let timelineDiskCacheJPEGCompressionQuality: CGFloat = 0.80
     private static let timelineStillWriterBufferLimit = 4
     static let conferenceConsentMenuStateRetentionInterval = ConferenceConsentMenuState.visibilityInterval
@@ -1058,7 +1058,7 @@ public actor AppCoordinator {
         // Apply power-aware OCR settings
         await applyPowerSettings()
 
-        // Start periodic orphaned video cleanup (runs every 60s)
+        // Start periodic orphaned video cleanup (runs every 10 minutes)
         startOrphanedVideoCleanup()
         await recordDBStorageSnapshot(reason: "initialize")
         startDBStorageSnapshotTask()
@@ -1844,12 +1844,12 @@ public actor AppCoordinator {
     // MARK: - Orphaned Video Cleanup
 
     /// Start periodic cleanup of orphaned videos (processingState stuck at 1)
-    /// Runs every 60 seconds to catch videos that weren't finalized properly
+    /// Runs every 10 minutes after startup recovery to catch videos that weren't finalized properly
     private func startOrphanedVideoCleanup() {
         orphanedVideoCleanupTask?.cancel()
 
         orphanedVideoCleanupTask = Task { [weak self] in
-            let cleanupInterval: UInt64 = 60_000_000_000 // 60 seconds
+            let cleanupInterval: UInt64 = 600_000_000_000 // 10 minutes
 
             while !Task.isCancelled {
                 try? await Task.sleep(for: .nanoseconds(Int64(cleanupInterval)), clock: .continuous)
@@ -1859,7 +1859,7 @@ public actor AppCoordinator {
             }
         }
 
-        Log.info("[AppCoordinator] Orphaned video cleanup task started (60s interval)", category: .app)
+        Log.info("[AppCoordinator] Orphaned video cleanup task started (10 minute interval)", category: .app)
     }
 
     /// Stop the orphaned video cleanup task
@@ -1885,7 +1885,7 @@ public actor AppCoordinator {
             }
         }
 
-        Log.info("[AppCoordinator] DB storage snapshot task started (60s interval)", category: .app)
+        Log.info("[AppCoordinator] DB storage snapshot task started (15 minute interval)", category: .app)
     }
 
     private func stopDBStorageSnapshotTask() {

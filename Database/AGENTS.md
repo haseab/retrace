@@ -41,6 +41,7 @@ Database/
 │   └── DocumentQueries.swift  # Document/FTS operations
 └── Tests/
     ├── AsyncQueuePipelineTests.swift
+    ├── RetentionVideoDeletionTests.swift # Real migrated SQLite retention guards and injected failure
     ├── DatabaseManagerTests.swift
     ├── EdgeCaseTests.swift
     ├── FTSManagerTests.swift
@@ -649,3 +650,5 @@ Trade-off: Slightly more complex writes (populate junction tables + text regions
 ## Stored keyword protection mode
 
 The existing `node.encryptedText` column stores either the reversible protected-text payload or the exact non-recoverable marker `rtx-permanent-v1`. Permanent markers keep nodes masked and discoverable for rewrite scheduling, but must be excluded from missing-master-key recovery checks. Propagate mode into `PendingNodeRedactionJob` and `SegmentRedactionTarget`; no schema migration is needed. Active query files use the declared SQLCipher module, avoiding mixed system SQLite/SQLCipher headers.
+
+- Retention video deletion uses an atomic DELETE guarded by processingState=0 and absence of frame references. Report an already absent row as success for journal retry, but propagate SQLite errors before any file deletion.

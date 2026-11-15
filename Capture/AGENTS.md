@@ -10,6 +10,7 @@ You are responsible for the **Capture** module of Retrace. Your job is to implem
 Capture/
 ├── CaptureManager.swift           # Main CaptureProtocol implementation
 ├── ScreenCapture/
+│   ├── CaptureFrameCandidate.swift # Defer BGRA materialization for exact native duplicates
 │   ├── CGWindowListCapture.swift  # Legacy CGWindowList API wrapper
 │   ├── ExcludedWindowMasker.swift # Full-bounds masking; failure returns no screenshot
 │   ├── PrivateWindowDetector.swift # Private-window accessibility heuristics
@@ -36,6 +37,7 @@ Capture/
     ├── ForegroundWindowSelectionTests.swift
     ├── ConferenceROIPlannerTests.swift
     ├── ConferenceSessionPrivacyPolicyTests.swift
+    ├── CaptureFrameCandidateTests.swift # Committed screenshot pixel/layout comparison
     ├── CaptureTriggerSchedulingTests.swift
     └── DeduplicationTests.swift
 ```
@@ -491,3 +493,5 @@ throw CaptureError.captureSessionFailed(underlying: error.localizedDescription)
 4. Read `CaptureManager.swift` - protocol conformance + pipeline
 
 The implementation is complete. Focus on understanding the existing code rather than rewriting.
+
+- CaptureFrameCandidate is module-local and contains the already privacy-filtered CGImage. Only exact pixel/render-property equality permits BGRA reuse. Keep near-duplicate thresholds and mouse-movement decisions unchanged; account for the single retained native image.

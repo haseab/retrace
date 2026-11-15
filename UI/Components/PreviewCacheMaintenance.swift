@@ -33,6 +33,33 @@ final class PreviewCacheEpoch: @unchecked Sendable {
     func invalidate() { lock.lock(); value &+= 1; lock.unlock() }
 }
 
+/// The owner mutates this map on the main actor; workers only read an individual
+/// thread-safe epoch. Removing one frame must not discard another frame's work.
+struct PreviewCacheEntryEpochs<Key: Hashable> {
+    private struct Entry {
+        let epoch = PreviewCacheEpoch()
+        var inFlight = 0
+    }
+    private var entries: [Key: Entry] = [:]
+    var count: Int { entries.count }
+    mutating func epoch(for key: Key) -> PreviewCacheEpoch {
+        entries[key, default: Entry()].inFlight += 1
+        return entries[key]!.epoch
+    }
+    mutating func finish(_ key: Key, epoch: PreviewCacheEpoch, keep: Bool) {
+        guard entries[key]?.epoch === epoch else { return }
+        entries[key]?.inFlight -= 1
+        if entries[key]?.inFlight == 0 && !keep { entries.removeValue(forKey: key) }
+    }
+    mutating func invalidate(_ keys: [Key]) {
+        for key in keys { entries.removeValue(forKey: key)?.epoch.invalidate() }
+    }
+    mutating func invalidateAll() {
+        for entry in entries.values { entry.epoch.invalidate() }
+        entries.removeAll()
+    }
+}
+
 /// Immutable after handoff. AppKit image serialization happens only on the worker.
 private struct PreviewImage: @unchecked Sendable { let image: NSImage }
 

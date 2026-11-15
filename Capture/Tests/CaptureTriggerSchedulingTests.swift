@@ -1,4 +1,5 @@
 import XCTest
+import ImageIO
 import Shared
 @testable import Capture
 
@@ -713,6 +714,30 @@ final class CaptureTriggerSchedulingTests: XCTestCase {
         XCTAssertEqual(finalCollectedFrameCount, 2)
     }
 
+    func testNativeScreenshotCandidatesPreserveDuplicateAndDimensionChangeDecisions() async throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let source = try XCTUnwrap(CGImageSourceCreateWithURL(root.appendingPathComponent("UI/Assets.xcassets/InPageURLInstructions.imageset/safari_instructions.png") as CFURL, nil))
+        let image = try XCTUnwrap(CGImageSourceCreateImageAtIndex(source, 0, nil))
+        let crop = try XCTUnwrap(image.cropping(to: CGRect(x: 0, y: 0, width: image.width / 2, height: image.height)))
+        let backend = FakeScreenCaptureBackend(candidates: [image, image, crop].enumerated().map {
+            CaptureFrameCandidate(image: $0.element, timestamp: Date().addingTimeInterval(Double($0.offset)), metadata: FrameMetadata(displayID: 1))
+        })
+        let clicks = FakeMouseClickMonitor(startResult: true)
+        let manager = makeManager(backend: backend, displayMonitor: FakeDisplayMonitor(activeDisplayID: 1, hasPermission: true), displaySwitchMonitor: FakeDisplaySwitchMonitor(), mouseClickMonitor: clicks)
+        try await manager.startCapture(config: testConfig(captureIntervalSeconds: 0, captureOnWindowChange: false))
+        for expected in 1...3 {
+            await clicks.emitMouseUp()
+            for _ in 0..<100 {
+                if await manager.getStatistics().totalFramesCaptured >= expected { break }
+                try await sleep(milliseconds: 20)
+            }
+        }
+        let stats = await manager.getStatistics()
+        XCTAssertEqual(stats.totalFramesCaptured, 3)
+        XCTAssertEqual(stats.framesDeduped, 1)
+        try await manager.stopCapture()
+    }
+
     private func makeManager(
         backend: FakeScreenCaptureBackend,
         displayMonitor: FakeDisplayMonitor,
@@ -740,7 +765,8 @@ final class CaptureTriggerSchedulingTests: XCTestCase {
             displaySwitchMonitor: displaySwitchMonitor,
             mouseClickMonitor: mouseClickMonitor,
             appInfoProvider: appInfoProvider,
-            schedulingConfiguration: schedulingConfiguration
+            schedulingConfiguration: schedulingConfiguration,
+            permissionCheck: { true }
         )
     }
 
@@ -885,11 +911,25 @@ final class MouseClickMonitorTests: XCTestCase {
 }
 
 private actor FakeScreenCaptureBackend: ScreenCaptureBackend {
+    private var candidates: [CaptureFrameCandidate] = []
     private var frames: [CapturedFrame]
     private var displayIDs: [UInt32] = []
 
     init(frames: [CapturedFrame]) {
         self.frames = frames
+    }
+
+    init(candidates: [CaptureFrameCandidate]) {
+        frames = []
+        self.candidates = candidates
+    }
+
+    func captureCandidate(displayID: CGDirectDisplayID) async -> CaptureFrameCandidate? {
+        if !candidates.isEmpty {
+            displayIDs.append(displayID)
+            return candidates.removeFirst()
+        }
+        return await captureFrame(displayID: displayID).map { CaptureFrameCandidate(frame: $0) }
     }
 
     func startCapture(config: CaptureConfig, displayID: CGDirectDisplayID?) async throws {}
