@@ -361,7 +361,7 @@ Start with the HEVC encoder since that's the core complexity, then add encryptio
 - Durable video frontier updates still persist immediately. Merge them into later session-copy checkpoints so the persisted frontier never regresses.
 - Recovery reconciles even structurally valid stale metadata against the complete WAL record prefix, preserving its durable frontier. Missing metadata remains recoverable. Checkpoint state is cleared with all other session caches.
 
-- Maintain an eight-entry LRU of WAL writer handles and extend offsets incrementally within an active session, but force validation scans for recovery. Close handles on session removal/reset and failed appends.
+- Maintain an eight-entry LRU of WAL writer handles and extend offsets incrementally within an active session, but force validation scans for recovery. Close handles on session removal/reset and failed appends, including seek failures. Failed appends invalidate both offset caches; truncate a partial record only if the initial seek returned a valid offset.
 - Local video readers use TemporaryVideoLink through a defer covering every return/error; cached AVAssetImageGenerator links remain alive until generator eviction.
 
 ### Encoder output inspection

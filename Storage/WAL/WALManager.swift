@@ -47,6 +47,7 @@ public actor WALManager {
     private var activeMetadata: [Int64: WALMetadata] = [:]
     private var metadataCheckpointTimes: [Int64: TimeInterval] = [:]
     private let metadataCheckpointInterval: TimeInterval
+    private let seekForAppend: @Sendable (FileHandle) throws -> UInt64
     private var compressionTotals: [Int64: WALCompressionTotals] = [:]
     private static let discardableQuarantinePrefix = "quarantined_segment_"
     private static let retainedQuarantinePrefix = "retained_segment_"
@@ -54,11 +55,17 @@ public actor WALManager {
     public init(walRoot: URL) {
         self.walRootURL = walRoot
         self.metadataCheckpointInterval = 30
+        self.seekForAppend = { try $0.seekToEnd() }
     }
 
-    init(walRoot: URL, metadataCheckpointInterval: TimeInterval) {
+    init(
+        walRoot: URL,
+        metadataCheckpointInterval: TimeInterval,
+        seekForAppend: @escaping @Sendable (FileHandle) throws -> UInt64 = { try $0.seekToEnd() }
+    ) {
         self.walRootURL = walRoot
         self.metadataCheckpointInterval = max(0, metadataCheckpointInterval)
+        self.seekForAppend = seekForAppend
     }
 
     public func initialize() async throws {
@@ -213,18 +220,22 @@ public actor WALManager {
         }
         appendUseSequence &+= 1
         appendHandleUses[session.videoID.value] = appendUseSequence
-        let recordOffset = try fileHandle.seekToEnd()
+        let recordOffset: UInt64
+        var rollbackOffset: UInt64?
         do {
+            recordOffset = try seekForAppend(fileHandle)
+            rollbackOffset = recordOffset
             try fileHandle.write(contentsOf: headerData)
             for string in strings { try fileHandle.write(contentsOf: string) }
             try fileHandle.write(contentsOf: payload)
         } catch {
             // A failed append must not strand a partial record before the next append.
             // A process crash still leaves a recoverable prefix, as with legacy WALs.
-            try? fileHandle.truncate(atOffset: recordOffset)
-            try? appendHandles.removeValue(forKey: session.videoID.value)?.close()
-            appendHandleUses.removeValue(forKey: session.videoID.value)
+            // A failed seek gives us no safe truncation point.
+            if let rollbackOffset { try? fileHandle.truncate(atOffset: rollbackOffset) }
+            closeAppendHandle(videoIDValue: session.videoID.value)
             frameOffsetIndexCache.removeValue(forKey: session.videoID.value)
+            frameIDOffsetIndexCache.removeValue(forKey: session.videoID.value)
             throw makeStorageWriteError(path: session.framesURL.path, error: error, fallback: "Failed to append frame to WAL")
         }
         var totals = compressionTotals[session.videoID.value, default: WALCompressionTotals()]
