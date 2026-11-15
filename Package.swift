@@ -29,6 +29,7 @@ let package = Package(
         .library(name: "App", targets: ["App"]),
         .library(name: "CrashRecoverySupport", targets: ["CrashRecoverySupport"]),
         .executable(name: "Retrace", targets: ["Retrace"]),
+        .executable(name: "RetraceCLI", targets: ["RetraceCLI"]),
         .executable(name: "RetraceCrashRecoveryHelper", targets: ["RetraceCrashRecoveryHelper"]),
         .executable(name: "TestMostRecentFrame", targets: ["TestMostRecentFrame"]),
         .executable(name: "QueryRewindApps", targets: ["QueryRewindApps"]),
@@ -195,7 +196,8 @@ let package = Package(
                 "Processing",
                 "Search",
                 "Migration",
-                .product(name: "SQLCipher", package: "swift-sqlcipher")
+                .product(name: "SQLCipher", package: "swift-sqlcipher"),
+                .product(name: "SwiftyChrono", package: "SwiftyChrono")
             ],
             path: "App",
             exclude: [
@@ -261,6 +263,14 @@ let package = Package(
             sources: [
                 "main.swift"
             ]
+        ),
+        .executableTarget(
+            name: "RetraceCLI",
+            dependencies: [
+                "App",
+                "Shared"
+            ],
+            path: "Sources/RetraceCLI"
         ),
 
         // MARK: - Test executable for getMostRecentFrameTimestamp

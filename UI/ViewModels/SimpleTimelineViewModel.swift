@@ -8266,21 +8266,16 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Apply deeplink search state from `retrace://search`.
     /// This resets stale query/filter state first, then applies deeplink values.
-    public func applySearchDeeplink(query: String?, appBundleID: String?, source: String = "unknown") {
+    public func applySearchDeeplink(state: CLIDeeplinkSearchState, source: String = "unknown") async {
         let deeplinkID = String(UUID().uuidString.prefix(8))
         let normalizedQuery: String? = {
-            guard let query else { return nil }
+            guard let query = state.queryText else { return nil }
             let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? nil : trimmed
-        }()
-        let normalizedAppBundleID: String? = {
-            guard let appBundleID else { return nil }
-            let trimmed = appBundleID.trimmingCharacters(in: .whitespacesAndNewlines)
             return trimmed.isEmpty ? nil : trimmed
         }()
 
         Log.info(
-            "[SearchDeeplink][\(deeplinkID)] begin source=\(source), query=\(normalizedQuery ?? "nil"), app=\(normalizedAppBundleID ?? "nil")",
+            "[SearchDeeplink][\(deeplinkID)] begin source=\(source), query=\(normalizedQuery ?? "nil"), apps=\(state.appBundleIDs.joined(separator: ",")), tags=\(state.tagIDs.map(String.init).joined(separator: ",")) ranges=\(state.dateRanges.count)",
             category: .ui
         )
         openSearchOverlay()
@@ -8289,19 +8284,50 @@ public class SimpleTimelineViewModel: ObservableObject {
         searchViewModel.cancelSearch()
         searchViewModel.searchQuery = ""
         searchViewModel.clearAllFilters()
+        searchViewModel.resetSearchOrderToDefault()
 
-        if let normalizedAppBundleID {
-            searchViewModel.setAppFilter(normalizedAppBundleID)
+        if !state.appBundleIDs.isEmpty {
+            searchViewModel.selectedAppFilters = Set(state.appBundleIDs)
+            searchViewModel.appFilterMode = state.appFilterMode
+        }
+
+        if !state.tagIDs.isEmpty {
+            searchViewModel.selectedTags = Set(state.tagIDs)
+            searchViewModel.tagFilterMode = state.tagFilterMode
+        }
+
+        searchViewModel.hiddenFilter = state.hiddenFilter
+        searchViewModel.commentFilter = state.commentFilter
+        searchViewModel.setDateRanges(state.dateRanges)
+        searchViewModel.windowNameTerms = state.windowNameTerms
+        searchViewModel.windowNameExcludedTerms = state.windowNameExcludedTerms
+        searchViewModel.windowNameFilterMode =
+            (state.windowNameTerms.isEmpty && !state.windowNameExcludedTerms.isEmpty) ? .exclude : .include
+        searchViewModel.browserUrlTerms = state.browserURLTerms
+        searchViewModel.browserUrlExcludedTerms = state.browserURLExcludedTerms
+        searchViewModel.browserUrlFilterMode =
+            (state.browserURLTerms.isEmpty && !state.browserURLExcludedTerms.isEmpty) ? .exclude : .include
+
+        switch state.sort {
+        case .relevance:
+            searchViewModel.searchMode = .relevant
+            searchViewModel.sortOrder = .newestFirst
+        case .newest:
+            searchViewModel.searchMode = .all
+            searchViewModel.sortOrder = .newestFirst
+        case .oldest:
+            searchViewModel.searchMode = .all
+            searchViewModel.sortOrder = .oldestFirst
         }
 
         guard let normalizedQuery else {
-            Log.info("[SearchDeeplink][\(deeplinkID)] completed with no query (app=\(normalizedAppBundleID ?? "nil"))", category: .ui)
+            Log.info("[SearchDeeplink][\(deeplinkID)] completed with no query", category: .ui)
             return
         }
 
         searchViewModel.searchQuery = normalizedQuery
         searchViewModel.submitSearch(trigger: "deeplink:\(source)")
-        Log.info("[SearchDeeplink][\(deeplinkID)] submitted query='\(normalizedQuery)' app=\(normalizedAppBundleID ?? "nil")", category: .ui)
+        Log.info("[SearchDeeplink][\(deeplinkID)] submitted query='\(normalizedQuery)'", category: .ui)
     }
 
     // MARK: - State Cache Methods
@@ -14680,6 +14706,20 @@ public class SimpleTimelineViewModel: ObservableObject {
                 frameIDLookupAttempted: frameIDLookupAttempted
             )
         }
+    }
+
+    /// Search for a frame by its ID and navigate to it.
+    /// Returns true if frame was found and navigation succeeded.
+    public func navigateToFrameID(
+        _ frameID: Int64,
+        includeHiddenSegments: Bool = false,
+        showFailureUI: Bool = true
+    ) async -> Bool {
+        await searchForFrameID(
+            frameID,
+            includeHiddenSegments: includeHiddenSegments,
+            showFailureUI: showFailureUI
+        )
     }
 
     /// Search for a frame by its ID and navigate to it

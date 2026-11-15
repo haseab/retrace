@@ -369,6 +369,57 @@ public actor ServiceContainer {
         Log.info("✓ Processing queue workers started (\(ProcessingQueueConfig.default.workerCount) workers)", category: .app)
     }
 
+    /// Initialize the minimal read/query surface needed for CLI commands.
+    /// Skips processing workers, retention, and other background activity.
+    public func initializeForCLI(includeRewind: Bool? = nil) async throws {
+        guard !isInitialized else {
+            Log.warning("ServiceContainer already initialized", category: .app)
+            return
+        }
+
+        Log.info("Initializing CLI services...", category: .app)
+
+        try await database.initialize()
+        Log.info("✓ Database initialized", category: .app)
+
+        try await ftsEngine.initialize()
+        Log.info("✓ FTS engine initialized", category: .app)
+
+        try await storage.initialize(config: storageConfig)
+        Log.info("✓ Storage initialized", category: .app)
+
+        try await search.initialize(config: searchConfig)
+        Log.info("✓ Search initialized", category: .app)
+
+        guard let dbPointer = await database.getConnection() else {
+            throw ServiceError.databaseNotReady
+        }
+
+        let retraceConnection = SQLiteConnection(db: dbPointer)
+        let retraceConfig = DatabaseConfig.retrace(storageRoot: storageConfig.expandedStorageRootPath)
+        let retraceImageExtractor = HEVCStorageExtractor(storageManager: storage)
+
+        let adapter = DataAdapter(
+            retraceConnection: retraceConnection,
+            retraceReadConnectionPool: database.readConnectionPool,
+            retraceConfig: retraceConfig,
+            retraceImageExtractor: retraceImageExtractor,
+            database: database
+        )
+
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        if includeRewind ?? defaults.bool(forKey: "useRewindData") {
+            await configureRewindSource(adapter: adapter)
+        }
+
+        try await adapter.initialize()
+        self.dataAdapter = adapter
+        Log.info("✓ DataAdapter initialized", category: .app)
+
+        isInitialized = true
+        Log.info("CLI services initialized successfully", category: .app)
+    }
+
     /// Register Rewind data source if user has opted in
     /// Can be called after initialization (e.g., after onboarding completes)
     public func registerRewindSourceIfEnabled() async throws {

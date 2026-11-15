@@ -67,6 +67,7 @@ retrace/
 ├── scripts/                     # Build/release/validation scripts
 │   ├── create-release.sh        # Signed Release archive/export helper
 │   ├── check_no_nanoseconds_sleep.sh # Guardrail for Task.sleep(nanoseconds:)
+│   ├── benchmark_retrace_cli.sh # JSON benchmark helper for hot CLI commands
 │   ├── validate_sleep_wake_stability.sh # Sleep/wake soak validation workflow
 │   └── validate_darkwake_watchdog.sh # Automated darkwake watchdog regression validation
 │
@@ -158,9 +159,11 @@ retrace/
 │   └── Importers/               # Source-specific importers (Rewind)
 │
 ├── App/                         # Main application coordinator
+│   ├── CLI/                     # App-layer CLI parsing, deeplink/result-store helpers, launcher install helpers, IPC transport, output models, and coordinator facade
 │   ├── AppCoordinator.swift     # Central coordinator (orchestrates all modules)
 │   ├── DataAdapter.swift        # Data layer adapter (DB queries, transformations)
 │   ├── FeedbackRecentMetricSupport.swift # Shared feedback-export metric models and sanitization helpers
+│   ├── NaturalLanguageDateParser.swift # Shared natural-language date parsing for CLI + timeline date jumps
 │   ├── ServiceContainer.swift   # Dependency injection container
 │   ├── AppLifecycle.swift       # App lifecycle management
 │   ├── ModelManager.swift       # Model management
@@ -168,6 +171,12 @@ retrace/
 │   ├── RetentionDeletionJournal.swift # Durable retries for database-first video deletion
 │   ├── RetentionManager.swift   # Data retention policies
 │   └── Tests/
+│       ├── CLIArgumentParserTests.swift # CLI argument parsing, help/usage parsing, isolated config and unsafe-setting guards
+│       ├── CLIImageExportIPCTests.swift # App-backed image export IPC round trips and traversal, identity, size, symlink, age guards
+│       ├── CLILauncherManagerTests.swift # Terminal command launcher install/repair/remove coverage
+│       ├── CLIOutputContractTests.swift # Stable JSON key/output contract coverage for CLI surfaces
+│       ├── CLIResultStoreTests.swift # Latest-search result-store, isolated SQLite search integration, diagnostic scope coverage
+│       ├── CLITimeParserTests.swift # Shared natural-language time parser coverage for CLI + timeline
 │       ├── RetentionDeletionJournalTests.swift # Real-file deletion failure and retry coverage
 │       ├── FeedbackRecentMetricSupportTests.swift # Feedback-export metric sanitization coverage
 │       ├── InPageURLCaptureRoutingTests.swift
@@ -179,6 +188,11 @@ retrace/
 │       ├── TimelineStillDiskWriterTests.swift
 │       ├── RecordingDatabaseFailureTests.swift # Real recording pipeline with an injected metadata insert failure
 │       └── UnexpectedRecordingStopHeuristicTests.swift # Unexpected-stop watchdog heuristic coverage
+│
+├── Sources/                     # Swift executable entrypoints
+│   ├── RetraceCLI/              # JSON terminal executable; flushes diagnostics before exit
+│   ├── QueryRewindApps/         # Rewind database inspection helper
+│   └── TestMostRecentFrame/     # Latest-frame probe helper
 │
 └── UI/                          # SwiftUI interface
     ├── AGENTS.md
@@ -225,7 +239,7 @@ retrace/
 | **PROCESSING** | `Processing/` | `Processing/AGENTS.md` | Vision OCR, Accessibility API (no audio transcription yet)         |
 | **SEARCH**     | `Search/`     | `Search/AGENTS.md`     | Query parsing, FTS5 queries, result ranking (no vector search yet) |
 | **MIGRATION**  | `Migration/`  | `Migration/AGENTS.md`  | Import from Rewind AI (Rewind only, others planned)                |
-| **APP**        | `App/`        | —                      | Coordinator, DI container, data adapter, lifecycle management      |
+| **APP**        | `App/`        | —                      | Coordinator, DI container, data adapter, lifecycle management, CLI facade |
 | **UI**         | `UI/`         | `UI/AGENTS.md`         | SwiftUI interface (timeline, dashboard, settings, search)          |
 
 **Rule**: Each agent should **ONLY** modify files in their assigned module directory. Cross-module changes require explicit coordination.

@@ -108,6 +108,11 @@ public enum Log {
         LogFile.shared.recordRoutine(event, count: count, durationMs: durationMs)
     }
 
+    /// Disable console printing for machine-readable command surfaces such as the CLI.
+    public static func disableConsolePrinting() {
+        LogFile.shared.disableConsolePrinting()
+    }
+
     // MARK: - Log File (for fast feedback diagnostics)
 
     /// Path to the log file - persists across crashes
@@ -506,6 +511,12 @@ final class LogFile: @unchecked Sendable {
     deinit {
         timer.cancel()
         try? fileHandle?.close()
+    }
+
+    func disableConsolePrinting() {
+        lock.lock()
+        consoleEnabled = false
+        lock.unlock()
     }
 
     func enableConsolePrinting() {

@@ -280,6 +280,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let settingsStore = UserDefaults(suiteName: "io.retrace.app") ?? .standard
     private static let devDeeplinkEnvKey = "RETRACE_DEV_DEEPLINK_URL"
     private static let externalDashboardRevealNotification = Notification.Name("io.retrace.app.externalDashboardReveal")
+    private static let cliImageExportNotification = CLIImageExportIPC.requestNotification
     private static let showDockIconPreferenceKey = "showDockIcon"
     private static let dashboardShortcutDefaultsKey = "dashboardShortcutConfig"
     private static let recordingShortcutDefaultsKey = "recordingShortcutConfig"
@@ -347,6 +348,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func beginPostSingleInstanceLaunchSetup() {
         TextInputContextMenuAutofillFilter.install()
         setupExternalDashboardRevealObserver()
+        setupCLIImageExportObserver()
         setupGhostAppLoggingObservers()
         installMainMenuIfNeeded(force: true)
         applyDockIconVisibilityPreference()
@@ -2435,6 +2437,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         )
     }
 
+    private func setupCLIImageExportObserver() {
+        Log.info("[CLIImageExport] Registering app-hosted export observer", category: .app)
+        DistributedNotificationCenter.default().addObserver(
+            self,
+            selector: #selector(handleCLIImageExportNotification(_:)),
+            name: Self.cliImageExportNotification,
+            object: nil
+        )
+    }
+
     private func setupGhostAppLoggingObservers() {
         NotificationCenter.default.addObserver(
             self,
@@ -2485,6 +2497,90 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             Log.info("[LaunchSurface] Received external dashboard reveal notification state=\(launchSurfaceStateSnapshot())", category: .app)
             logGhostAppCheck("external dashboard reveal notification")
             requestDashboardReveal(source: "externalDashboardRevealNotification")
+        }
+    }
+
+    @objc private func handleCLIImageExportNotification(_ notification: Notification) {
+        guard let requestPath = CLIImageExportIPC.requestPath(from: notification) else {
+            Log.warning("[CLIImageExport] Ignoring request without requestPath", category: .app)
+            return
+        }
+
+        guard let notificationRequestID = CLIImageExportIPC.requestID(from: notification) else { return }
+
+        Task(priority: .userInitiated) { [weak self] in
+            guard let self else { return }
+            await self.processCLIImageExportRequest(
+                requestPath: requestPath,
+                notificationRequestID: notificationRequestID
+            )
+        }
+    }
+
+    private func processCLIImageExportRequest(
+        requestPath: String,
+        notificationRequestID: String
+    ) async {
+        let requestURL = URL(fileURLWithPath: requestPath)
+        let request: CLIImageExportRequest
+
+        do {
+            request = try await Task.detached(priority: .userInitiated) {
+                try CLIImageExportIPC.loadRequest(from: requestURL, expectedRequestID: notificationRequestID)
+            }.value
+        } catch {
+            Log.warning("[CLIImageExport] Ignoring invalid export request", category: .app)
+            return
+        }
+
+        let coordinator = await MainActor.run { coordinatorWrapper?.coordinator }
+        guard let coordinator else {
+            await writeCLIImageExportResponse(
+                CLIImageExportResponse(
+                    requestID: request.requestID,
+                    outputPath: request.outputPath,
+                    byteCount: nil,
+                    errorMessage: "Retrace.app is not ready to export images yet."
+                )
+            )
+            return
+        }
+
+        do {
+            let byteCount = try await coordinator.exportFrameImage(
+                frameID: FrameID(value: request.frameID),
+                outputPath: request.outputPath,
+                overwrite: request.overwrite
+            )
+
+            await writeCLIImageExportResponse(
+                CLIImageExportResponse(
+                    requestID: request.requestID,
+                    outputPath: request.outputPath,
+                    byteCount: byteCount,
+                    errorMessage: nil
+                )
+            )
+        } catch {
+            await writeCLIImageExportResponse(
+                CLIImageExportResponse(
+                    requestID: request.requestID,
+                    outputPath: request.outputPath,
+                    byteCount: nil,
+                    errorMessage: error.localizedDescription
+                )
+            )
+        }
+    }
+
+    private func writeCLIImageExportResponse(_ response: CLIImageExportResponse) async {
+        do {
+            _ = try await Task.detached { try CLIImageExportIPC.writeResponse(response) }.value
+        } catch {
+            Log.error(
+                "[CLIImageExport] Failed to write response for request \(response.requestID): \(error)",
+                category: .app
+            )
         }
     }
 
@@ -2651,20 +2747,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DashboardWindowController.shared.openDeeplink(dateRange: dateRange)
             dashboardRevealScheduler.finishDeeplinkPresentation()
 
-        case let .timeline(timestamp):
-            Log.info("[AppDelegate] Opening timeline deeplink at timestamp: \(String(describing: timestamp))", category: .app)
-            if let timestamp {
+        case let .timeline(state):
+            Log.info("[AppDelegate] Opening timeline deeplink at timestamp: \(String(describing: state.timestamp)) frameID=\(state.frameID.map(String.init) ?? "nil")", category: .app)
+            if let frameID = state.frameID {
+                TimelineWindowController.shared.showAndNavigate(toFrameID: frameID, fallbackTimestamp: state.timestamp)
+            } else if let timestamp = state.timestamp {
                 TimelineWindowController.shared.showAndNavigate(to: timestamp)
             } else {
                 TimelineWindowController.shared.show()
             }
 
-        case let .search(query, timestamp, appBundleID):
-            Log.info("[AppDelegate] Opening search deeplink: query=\(query ?? "nil"), timestamp=\(String(describing: timestamp)), app=\(appBundleID ?? "nil")", category: .app)
+        case let .search(state):
+            Log.info("[AppDelegate] Opening search deeplink: query=\(state.queryText ?? "nil"), timestamp=\(String(describing: state.timestamp)), apps=\(state.appBundleIDs.joined(separator: ","))", category: .app)
             TimelineWindowController.shared.showSearch(
-                query: query,
-                timestamp: timestamp,
-                appBundleID: appBundleID,
+                state: state,
                 source: "AppDelegate.openURLs"
             )
         }

@@ -1,11 +1,13 @@
 import Foundation
 import SwiftUI
+import App
 import Shared
 
 /// Handles deeplink URL routing for Retrace
-/// Supports: retrace://search?q={query}&t={unix_ms}&app={bundle_id}
-///           retrace://timeline?t={unix_ms}
-///           retrace://dashboard?start={unix_ms_or_ISO8601}&end={unix_ms_or_ISO8601}
+/// Supports encoded `state` payloads for search/timeline plus legacy:
+/// - retrace://search?q={query}&t={unix_ms}&app={bundle_id}
+/// - retrace://timeline?t={unix_ms}
+/// - retrace://dashboard?start={unix_ms_or_ISO8601}&end={unix_ms_or_ISO8601}
 ///           (legacy timestamp key `timestamp` is also accepted)
 @MainActor
 public class DeeplinkHandler: ObservableObject {
@@ -21,10 +23,10 @@ public class DeeplinkHandler: ObservableObject {
         activeRoute = route
 
         switch route {
-        case let .search(query, timestamp, appBundleID):
-            Log.info("[DeeplinkHandler] Navigating to search: query=\(query ?? "nil"), timestamp=\(String(describing: timestamp)), app=\(appBundleID ?? "nil")", category: .ui)
-        case let .timeline(timestamp):
-            Log.info("[DeeplinkHandler] Navigating to timeline: timestamp=\(String(describing: timestamp))", category: .ui)
+        case .search:
+            Log.info("[DeeplinkHandler] Navigating to search", category: .ui)
+        case let .timeline(state):
+            Log.info("[DeeplinkHandler] Navigating to timeline: timestamp=\(String(describing: state.timestamp)), frameID=\(state.frameID.map(String.init) ?? "nil")", category: .ui)
         case let .dashboard(dateRange):
             Log.info("[DeeplinkHandler] Navigating to dashboard: range=\(String(describing: dateRange))", category: .ui)
         }
@@ -46,14 +48,29 @@ public class DeeplinkHandler: ObservableObject {
 
         switch host.lowercased() {
         case "search":
+            if let state = CLIDeeplinkBuilder.decodedSearchState(from: url) {
+                return .search(state: state)
+            }
+
             let query = queryParams["q"].flatMap { $0.trimmedOrNil }
             let timestamp = parseTimestamp(queryParams: queryParams)
             let appBundleID = queryParams["app"].flatMap { $0.trimmedOrNil }
-            return .search(query: query, timestamp: timestamp, appBundleID: appBundleID)
+            return .search(
+                state: CLIDeeplinkSearchState(
+                    queryText: query,
+                    appBundleIDs: appBundleID.map { [$0] } ?? [],
+                    appFilterMode: .include,
+                    timestamp: timestamp
+                )
+            )
 
         case "timeline":
+            if let state = CLIDeeplinkBuilder.decodedTimelineState(from: url) {
+                return .timeline(state: state)
+            }
+
             let timestamp = parseTimestamp(queryParams: queryParams)
-            return .timeline(timestamp: timestamp)
+            return .timeline(state: CLIDeeplinkTimelineState(timestamp: timestamp))
 
         case "dashboard":
             let boundItems = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.filter {
@@ -135,42 +152,24 @@ public class DeeplinkHandler: ObservableObject {
     // MARK: - URL Generation
 
     /// Generate a deeplink URL for sharing
-    public static func generateSearchLink(query: String? = nil, timestamp: Date? = nil, appBundleID: String? = nil) -> URL? {
-        var components = URLComponents()
-        components.scheme = "retrace"
-        components.host = "search"
+    public static func generateSearchLink(
+        query: String? = nil,
+        timestamp: Date? = nil,
+        appBundleID: String? = nil
+    ) -> URL? {
+        CLIDeeplinkBuilder.searchURL(query: query, timestamp: timestamp, appBundleID: appBundleID)
+    }
 
-        var queryItems: [URLQueryItem] = []
-
-        if let query = query {
-            queryItems.append(URLQueryItem(name: "q", value: query))
-        }
-
-        if let timestamp = timestamp {
-            let unixMs = Int64(timestamp.timeIntervalSince1970 * 1000)
-            queryItems.append(URLQueryItem(name: "t", value: "\(unixMs)"))
-        }
-
-        if let appBundleID = appBundleID {
-            queryItems.append(URLQueryItem(name: "app", value: appBundleID))
-        }
-
-        if !queryItems.isEmpty {
-            components.queryItems = queryItems
-        }
-
-        return components.url
+    public static func generateSearchLink(state: CLIDeeplinkSearchState) -> URL? {
+        CLIDeeplinkBuilder.searchURL(state: state)
     }
 
     public static func generateTimelineLink(timestamp: Date) -> URL? {
-        var components = URLComponents()
-        components.scheme = "retrace"
-        components.host = "timeline"
+        CLIDeeplinkBuilder.timelineURL(timestamp: timestamp)
+    }
 
-        let unixMs = Int64(timestamp.timeIntervalSince1970 * 1000)
-        components.queryItems = [URLQueryItem(name: "t", value: "\(unixMs)")]
-
-        return components.url
+    public static func generateTimelineLink(state: CLIDeeplinkTimelineState) -> URL? {
+        CLIDeeplinkBuilder.timelineURL(state: state)
     }
 
     public static func generateDashboardLink(start: Date? = nil, end: Date? = nil) -> URL? {
@@ -202,16 +201,16 @@ public class DeeplinkHandler: ObservableObject {
 // MARK: - Deeplink Route
 
 public enum DeeplinkRoute: Equatable {
-    case search(query: String?, timestamp: Date?, appBundleID: String?)
-    case timeline(timestamp: Date?)
+    case search(state: CLIDeeplinkSearchState)
+    case timeline(state: CLIDeeplinkTimelineState)
     case dashboard(dateRange: DateRangeCriterion?)
 
     public static func == (lhs: DeeplinkRoute, rhs: DeeplinkRoute) -> Bool {
         switch (lhs, rhs) {
-        case let (.search(q1, t1, a1), .search(q2, t2, a2)):
-            return q1 == q2 && t1 == t2 && a1 == a2
-        case let (.timeline(t1), .timeline(t2)):
-            return t1 == t2
+        case let (.search(s1), .search(s2)):
+            return s1 == s2
+        case let (.timeline(s1), .timeline(s2)):
+            return s1 == s2
         case let (.dashboard(range1), .dashboard(range2)):
             return range1 == range2
         default:

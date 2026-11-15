@@ -77,14 +77,14 @@ final class DeeplinkHandlerTests: XCTestCase {
 
         let route = DeeplinkHandler.route(for: url)
 
-        guard case let .search(query, timestamp, appBundleID)? = route else {
+        guard case let .search(state)? = route else {
             XCTFail("Expected search route")
             return
         }
 
-        XCTAssertEqual(query, "error")
-        XCTAssertEqual(appBundleID, "com.google.Chrome")
-        guard let parsedTimestamp = timestamp?.timeIntervalSince1970 else {
+        XCTAssertEqual(state.queryText, "error")
+        XCTAssertEqual(state.appBundleIDs, ["com.google.Chrome"])
+        guard let parsedTimestamp = state.timestamp?.timeIntervalSince1970 else {
             XCTFail("Expected parsed timestamp")
             return
         }
@@ -96,14 +96,14 @@ final class DeeplinkHandlerTests: XCTestCase {
 
         let route = DeeplinkHandler.route(for: url)
 
-        guard case let .search(query, timestamp, appBundleID)? = route else {
+        guard case let .search(state)? = route else {
             XCTFail("Expected search route")
             return
         }
 
-        XCTAssertEqual(query, "errors")
-        XCTAssertEqual(appBundleID, nil)
-        guard let parsedTimestamp = timestamp?.timeIntervalSince1970 else {
+        XCTAssertEqual(state.queryText, "errors")
+        XCTAssertEqual(state.appBundleIDs, [])
+        guard let parsedTimestamp = state.timestamp?.timeIntervalSince1970 else {
             XCTFail("Expected parsed timestamp")
             return
         }
@@ -115,34 +115,60 @@ final class DeeplinkHandlerTests: XCTestCase {
 
         let route = DeeplinkHandler.route(for: url)
 
-        guard case let .timeline(timestamp)? = route else {
+        guard case let .timeline(state)? = route else {
             XCTFail("Expected timeline route")
             return
         }
 
-        guard let parsedTimestamp = timestamp?.timeIntervalSince1970 else {
+        guard let parsedTimestamp = state.timestamp?.timeIntervalSince1970 else {
             XCTFail("Expected parsed timestamp")
             return
         }
         XCTAssertEqual(parsedTimestamp, 1_704_067_200.999, accuracy: 0.0001)
     }
 
-    func testGenerateSearchLinkUsesCanonicalTimestampKey() {
+    func testGenerateSearchLinkRoundTripsEncodedState() {
         let timestamp = Date(timeIntervalSince1970: 1_704_067_200.123)
-        let url = DeeplinkHandler.generateSearchLink(
-            query: "error",
-            timestamp: timestamp,
-            appBundleID: "com.apple.Safari"
+        let state = CLIDeeplinkSearchState(
+            queryText: "\"error\"",
+            appBundleIDs: ["com.apple.Safari"],
+            appFilterMode: .include,
+            tagIDs: [42],
+            tagFilterMode: .exclude,
+            hiddenFilter: .showAll,
+            commentFilter: .commentsOnly,
+            dateRanges: [DateRangeCriterion(start: timestamp, end: timestamp.addingTimeInterval(60))],
+            windowNameTerms: ["Console"],
+            windowNameExcludedTerms: ["Help"],
+            browserURLTerms: ["openai.com"],
+            browserURLExcludedTerms: ["logout"],
+            sort: .oldest,
+            timestamp: timestamp
         )
 
+        let url = DeeplinkHandler.generateSearchLink(state: state)
         XCTAssertNotNil(url)
-        let components = URLComponents(url: url!, resolvingAgainstBaseURL: false)
-        let queryItems = components?.queryItems ?? []
-        let queryMap = Dictionary(uniqueKeysWithValues: queryItems.map { ($0.name, $0.value) })
 
-        XCTAssertEqual(queryMap["q"]!, "error")
-        XCTAssertEqual(queryMap["app"]!, "com.apple.Safari")
-        XCTAssertEqual(queryMap["t"]!, "1704067200123")
-        XCTAssertFalse(queryMap.keys.contains("timestamp"))
+        guard case let .search(parsedState)? = DeeplinkHandler.route(for: url!) else {
+            return XCTFail("Expected encoded search route")
+        }
+
+        XCTAssertEqual(parsedState, state)
+    }
+
+    func testGenerateTimelineLinkRoundTripsFrameID() {
+        let state = CLIDeeplinkTimelineState(
+            timestamp: Date(timeIntervalSince1970: 1_704_067_200.999),
+            frameID: 123_456
+        )
+
+        let url = DeeplinkHandler.generateTimelineLink(state: state)
+        XCTAssertNotNil(url)
+
+        guard case let .timeline(parsedState)? = DeeplinkHandler.route(for: url!) else {
+            return XCTFail("Expected encoded timeline route")
+        }
+
+        XCTAssertEqual(parsedState, state)
     }
 }

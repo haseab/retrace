@@ -517,7 +517,9 @@ extension SettingsView {
     func resetAdvancedSettings() {
         showFrameIDs = SettingsDefaults.showFrameIDs
         enableFrameIDSearch = SettingsDefaults.enableFrameIDSearch
+        enableRetraceCLI = SettingsDefaults.enableRetraceCLI
         showVideoControls = SettingsDefaults.showVideoControls
         showMenuBarCaptureFeedback = SettingsDefaults.showMenuBarCaptureFeedback
+        refreshRetraceCLIStatus()
     }
 }

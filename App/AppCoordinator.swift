@@ -1040,6 +1040,7 @@ public actor AppCoordinator {
     public func initialize() async throws {
         Log.info("Initializing AppCoordinator...", category: .app)
         try await services.initialize()
+        await RetraceCLIService.flushPendingMetrics(coordinator: self)
 
         if await services.storage.isWALReady() {
             _ = scheduleCrashRecoveryIfNeeded(
@@ -1066,6 +1067,13 @@ public actor AppCoordinator {
         // Log auto-start state for debugging
         let shouldAutoStart = Self.shouldAutoStartRecording()
         Log.info("Auto-start recording check: shouldAutoStartRecording=\(shouldAutoStart)", category: .app)
+    }
+
+    /// Initialize the minimal read/query path needed for CLI commands.
+    public func initializeForCLI(includeRewind: Bool? = nil) async throws {
+        Log.info("Initializing AppCoordinator for CLI...", category: .app)
+        try await services.initializeForCLI(includeRewind: includeRewind)
+        Log.info("AppCoordinator CLI initialization complete", category: .app)
     }
 
     func runCrashRecoveryForTesting() async throws {
@@ -3636,6 +3644,66 @@ public actor AppCoordinator {
             frameIndex: frameIndex,
             enforceTimestampMatch: shouldEnforceTimestampMatch
         )
+    }
+
+    /// Export a resolved frame image to disk from the app host.
+    /// This keeps the decode/write path inside the bundled app runtime.
+    public func exportFrameImage(
+        frameID: FrameID,
+        outputPath: String,
+        overwrite: Bool
+    ) async throws -> Int {
+        guard let frameWithVideoInfo = try await getFrameWithVideoInfoByID(id: frameID) else {
+            throw NSError(
+                domain: "AppCoordinator",
+                code: 404,
+                userInfo: [NSLocalizedDescriptionKey: "Frame \(frameID.value) was not found."]
+            )
+        }
+
+        let frame = frameWithVideoInfo.frame
+        let imageData: Data
+
+        if let videoInfo = frameWithVideoInfo.videoInfo {
+            imageData = try await getFrameImageFromPath(
+                videoPath: videoInfo.videoPath,
+                frameIndex: videoInfo.frameIndex,
+                enforceTimestampMatch: false
+            )
+        } else if frame.videoID.value > 0 {
+            imageData = try await getFrameImageByIndex(
+                videoID: frame.videoID,
+                frameIndex: frame.frameIndexInSegment,
+                source: frame.source
+            )
+        } else {
+            throw NSError(
+                domain: "AppCoordinator",
+                code: 422,
+                userInfo: [NSLocalizedDescriptionKey: "Frame \(frameID.value) does not have exportable image data."]
+            )
+        }
+
+        let destinationURL = URL(fileURLWithPath: NSString(string: outputPath).expandingTildeInPath)
+        let parentDirectoryURL = destinationURL.deletingLastPathComponent()
+        try FileManager.default.createDirectory(
+            at: parentDirectoryURL,
+            withIntermediateDirectories: true
+        )
+
+        if FileManager.default.fileExists(atPath: destinationURL.path) {
+            guard overwrite else {
+                throw NSError(
+                    domain: "AppCoordinator",
+                    code: 409,
+                    userInfo: [NSLocalizedDescriptionKey: "Refusing to overwrite existing file at \(destinationURL.path)."]
+                )
+            }
+
+        }
+
+        try imageData.write(to: destinationURL, options: overwrite ? .atomic : .withoutOverwriting)
+        return imageData.count
     }
 
     /// Get frames in a time range

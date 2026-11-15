@@ -86,6 +86,7 @@ UI/
 │           ├── PrivateModeAutomationSettingsView.swift
 │           ├── PowerSettingsView.swift
 │           ├── TagManagementSettingsView.swift
+│           ├── AdvancedSettingsActions.swift # CLI installation controls and background launcher operations
 │           ├── AdvancedSettingsView.swift
 │           ├── SettingsFeedbackActions.swift
 │           ├── SettingsUtilityActions.swift
