@@ -186,6 +186,7 @@ retrace/
     ├── Components/              # Reusable UI components (MenuBarManager, HotkeyManager, etc.)
     │   ├── MasterKeyRedactionFlowCoordinator.swift # Shared missing-master-key prompt/recovery coordinator
     │   ├── HoverLatchedScrollMonitor.swift # Shared nested-scroll latch helper for hover-routed inner scroll regions
+    │   ├── PreviewCacheMaintenance.swift # Incremental cache totals, bounded disk worker, batched cleanup and preview identity
     │   └── ProcessMonitorModels.swift # System Monitor snapshot/models + ranking helpers
     ├── ViewModels/              # View models (Dashboard, Search, Timeline, Feedback, Settings)
     │   └── Settings/            # Settings-specific view models and extracted helper logic
@@ -516,3 +517,10 @@ _This file follows the AGENTS.md standard for AI agent guidance. Last updated: 2
 - All console, unified-log and diagnostic-file sinks run on a serial background queue. Admission only takes a short memory lock. Buffer limits reserve space for errors; overflow produces a count-only warning rather than unbounded memory growth.
 - Retained messages flush after two seconds or 64 KiB; errors request an immediate background drain. Active routine counters summarize once per minute and on explicit flush. Idle logging has no repeating timer wakeup.
 - Await `Log.flush()` before asynchronous feedback snapshots and normal quit. Feedback export must not synchronously wait on the writer from the main thread. A hard crash can lose the pending batch.
+
+### Preview cache maintenance
+
+- Timeline cache byte totals are maintained on insert/replace/remove; access-only touches must remain O(1). Compressed JPEG NSCache entries carry their byte cost with a 64 MiB cost limit plus the existing count limit.
+- Search thumbnails have a 32 MiB estimated decoded-byte budget plus a 60-image count limit. Maintain costs incrementally and estimate from representation dimensions without forcing image decoding on main.
+- `PreviewCacheDiskWorker` serializes UI cache writes, JPEG serialization, deletion batches and folder pruning. Thumbnail trims coalesce bursts and run at most once per minute during continuing writes. Pending write payloads are bounded to 64 MiB; skipped persistence must not block display.
+- Preview keys describe source/frame/video identity, render dimensions, highlight geometry, and content revision. Queries do not belong in keys. Redaction completion advances the persisted revision and invalidates queued writes. Preserve the existing keyword-protection bypass and canonical preview paths used by the redaction purger.

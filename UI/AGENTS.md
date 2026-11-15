@@ -117,6 +117,7 @@ UI/
 │   ├── ProcessCPUSummaryCard.swift      # System Monitor CPU table/card UI
 │   ├── ProcessMemorySummaryCard.swift   # System Monitor memory table/card UI
 │   ├── RetraceAboutPanel.swift          # Custom About panel content and window factory used by the app menu
+│   ├── PreviewCacheMaintenance.swift # O(1) byte totals, bounded FIFO disk worker, batched cleanup, preview keys/costs
 │   └── UIMemoryEstimators.swift         # Shared UI memory-estimation helpers for telemetry
 ├── ViewModels/
 │   ├── SimpleTimelineViewModel.swift    # Fullscreen timeline state, caching, playback, filters, OCR overlays
@@ -143,6 +144,7 @@ UI/
 │       ├── TagsSettingsViewModel.swift
 │       └── AdvancedSettingsViewModel.swift
 └── Tests/
+    ├── Support/PreviewCacheMaintenanceTests.swift # Real-image/disk cleanup, invalidation, accounting, crop identity and queue-budget regressions
     ├── BuildInfoAndUpdaterTests.swift    # Build metadata formatting + updater version fallback tests
     ├── CommentComposerTargetContextTests.swift # Comment-target utilities and quick-comment persisted-preview source coverage
     ├── CrashRecoverySupportTests.swift   # Crash-recovery bundle resolution and registration policy coverage
@@ -768,3 +770,7 @@ Focus on getting the timeline + search working first before polishing dashboard/
 - Visible search cards reload thumbnails with a generation-keyed task after rewrite invalidation; keep card identity stable.
 
 - Async feedback collection awaits the background logger flush before reading the diagnostic file; normal termination awaits the same flush without blocking main. Keep queue diagnostic errors in feedback even when routine queue-detail messages are dropped.
+
+## Preview cache I/O and budgets
+
+Timeline index touches do not rescan sizes. JPEG NSCache entries have compressed-byte costs (64 MiB cost limit). Search LRU costs use decoded representation estimates (32 MiB, 60 entries); no CGImage decode is forced for accounting. Cache disk operations go through the shared FIFO utility worker; a brief admission lock only bounds pending memory. Coalesce thumbnail trim scans (burst debounce, 60-second minimum interval), batch deletions, and prune by request-time cutoff so new files survive delayed cleanup. Invalidation epochs and main-actor generations prevent stale completions from restoring cleared previews. Search keys use render identity and a persisted revision, with highlighted geometry kept distinct. Changing the rendering algorithm must advance the key format version. Keyword privacy bypasses and redaction purge paths remain mandatory.

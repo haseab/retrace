@@ -318,11 +318,10 @@ public class SearchViewModel: ObservableObject {
     public var savedScrollPosition: CGFloat = 0
 
     // Thumbnail cache - persists across overlay open/close, cleared on new search
-    @Published public var thumbnailCache: [String: NSImage] = [:] {
-        didSet {
-            thumbnailCacheBytes = UIMemoryEstimator.imageDictionaryBytes(thumbnailCache)
-        }
-    }
+    @Published public private(set) var thumbnailCache: [String: NSImage] = [:]
+    @Published public private(set) var thumbnailContentRevision = UserDefaults.standard.string(forKey: "search.thumbnailContentRevision.v2") ?? "initial-v2"
+    private let thumbnailDiskEpoch = PreviewCacheEpoch()
+    private var thumbnailCosts: [String: Int64] = [:]
     @Published public var loadingThumbnails: Set<String> = []
     @Published public var appIconCache: [String: NSImage] = [:] {
         didSet {
@@ -441,6 +440,7 @@ public class SearchViewModel: ObservableObject {
     private let otherAppsRefreshDelayNs: UInt64 = 2_000_000_000
     private let memoryReportIntervalNs: UInt64 = 5_000_000_000
     private let maxInMemoryThumbnailCount = 60
+    private let maxInMemoryThumbnailBytes: Int64 = 32 * 1024 * 1024
     nonisolated private static let memoryLedgerSummaryIntervalSeconds: TimeInterval = 30
     nonisolated private static let memoryLedgerThumbnailTag = "ui.search.thumbnailCache"
     nonisolated private static let memoryLedgerAppIconTag = "ui.search.appIconCache"
@@ -553,8 +553,12 @@ public class SearchViewModel: ObservableObject {
         NotificationCenter.default.publisher(for: PhraseRedactionMode.didFinishNotification)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
-                self?.searchGeneration += 1
-                self?.clearInMemoryThumbnailCache()
+                guard let self else { return }
+                self.thumbnailDiskEpoch.invalidate()
+                self.thumbnailContentRevision = UUID().uuidString
+                UserDefaults.standard.set(self.thumbnailContentRevision, forKey: "search.thumbnailContentRevision.v2")
+                self.searchGeneration += 1
+                self.clearInMemoryThumbnailCache()
             }
             .store(in: &cancellables)
 
@@ -623,19 +627,18 @@ public class SearchViewModel: ObservableObject {
         .store(in: &cancellables)
     }
 
+    private nonisolated static var thumbnailTrimPolicy: PreviewCacheDiskWorker.TrimPolicy {
+        .init(directory: cachedSearchThumbnailsDirectory, maxBytes: thumbnailDiskCacheMaxBytes, maxAge: thumbnailDiskCacheMaxAge)
+    }
+
     private func prepareThumbnailDiskCache() {
-        Task.detached(priority: .utility) {
-            let directory = Self.cachedSearchThumbnailsDirectory
-            try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            Self.trimThumbnailDiskCache(
-                maxBytes: Self.thumbnailDiskCacheMaxBytes,
-                maxAge: Self.thumbnailDiskCacheMaxAge
-            )
-        }
+        PreviewCacheDiskWorker.shared.requestTrim(Self.thumbnailTrimPolicy)
     }
 
     private func clearInMemoryThumbnailCache() {
         thumbnailCache.removeAll()
+        thumbnailCosts.removeAll()
+        thumbnailCacheBytes = 0
         loadingThumbnails.removeAll()
         thumbnailLRUKeys.removeAll()
     }
@@ -661,10 +664,7 @@ public class SearchViewModel: ObservableObject {
         generation: Int,
         persistToDisk: Bool = true
     ) {
-        guard searchGeneration == generation else {
-            loadingThumbnails.remove(key)
-            return
-        }
+        guard searchGeneration == generation else { return }
         insertThumbnailIntoMemory(image, for: key)
         loadingThumbnails.remove(key)
         if persistToDisk {
@@ -677,10 +677,7 @@ public class SearchViewModel: ObservableObject {
         for key: String,
         generation: Int
     ) {
-        guard searchGeneration == generation else {
-            loadingThumbnails.remove(key)
-            return
-        }
+        guard searchGeneration == generation else { return }
         if let placeholder {
             insertThumbnailIntoMemory(placeholder, for: key)
         }
@@ -688,6 +685,7 @@ public class SearchViewModel: ObservableObject {
     }
 
     public func loadThumbnailFromDiskIfAvailable(for key: String, generation: Int) async -> Bool {
+        guard searchGeneration == generation else { return false }
         let privacyDefaults = UserDefaults(suiteName: ReversibleOCRScrambler.settingsSuiteName) ?? .standard
         guard !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { return false }
 
@@ -710,6 +708,11 @@ public class SearchViewModel: ObservableObject {
     }
 
     private func insertThumbnailIntoMemory(_ image: NSImage, for key: String) {
+        let cost = PreviewThumbnailIdentity.memoryCost(image)
+        guard cost <= maxInMemoryThumbnailBytes else { return }
+        thumbnailCacheBytes -= thumbnailCosts[key] ?? 0
+        thumbnailCosts[key] = cost
+        thumbnailCacheBytes += cost
         thumbnailCache[key] = image
         touchThumbnailKey(key)
         evictThumbnailsIfNeeded()
@@ -723,105 +726,28 @@ public class SearchViewModel: ObservableObject {
     }
 
     private func evictThumbnailsIfNeeded() {
-        guard thumbnailCache.count > maxInMemoryThumbnailCount else { return }
-
-        let evictCount = thumbnailCache.count - maxInMemoryThumbnailCount
-        for _ in 0..<evictCount {
+        while thumbnailCache.count > maxInMemoryThumbnailCount || thumbnailCacheBytes > maxInMemoryThumbnailBytes {
             guard let oldestKey = thumbnailLRUKeys.first else { break }
             thumbnailLRUKeys.removeFirst()
             thumbnailCache.removeValue(forKey: oldestKey)
+            thumbnailCacheBytes -= thumbnailCosts.removeValue(forKey: oldestKey) ?? 0
         }
     }
 
     private func persistThumbnailToDisk(_ image: NSImage, for key: String) {
         let privacyDefaults = UserDefaults(suiteName: ReversibleOCRScrambler.settingsSuiteName) ?? .standard
         guard !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { return }
-
-        guard let tiffData = image.tiffRepresentation else { return }
-        let targetURL = Self.diskThumbnailURL(for: key)
-
-        Task.detached(priority: .utility) {
-            guard let data = Self.jpegData(fromTIFFData: tiffData),
-                  !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { return }
-            let directory = Self.cachedSearchThumbnailsDirectory
-            try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            do {
-                try data.write(to: targetURL, options: .atomic)
-                if PhraseRedactionMode.isEnabled(in: privacyDefaults) {
-                    try? FileManager.default.removeItem(at: targetURL)
-                    return
-                }
-                Self.trimThumbnailDiskCache(
-                    maxBytes: Self.thumbnailDiskCacheMaxBytes,
-                    maxAge: Self.thumbnailDiskCacheMaxAge
-                )
-            } catch {
-                // Ignore disk cache write failures; memory cache still serves this thumbnail.
-            }
-        }
+        let epoch = thumbnailDiskEpoch
+        let token = epoch.current
+        PreviewCacheDiskWorker.shared.enqueueThumbnail(image, to: Self.diskThumbnailURL(for: key), allowed: {
+            epoch.matches(token) && !PhraseRedactionMode.isEnabled(in: privacyDefaults)
+        }, trim: Self.thumbnailTrimPolicy)
     }
 
     private nonisolated static func diskThumbnailURL(for key: String) -> URL {
         let digest = SHA256.hash(data: Data(key.utf8))
         let fileName = digest.map { String(format: "%02x", $0) }.joined()
         return cachedSearchThumbnailsDirectory.appendingPathComponent("\(fileName).jpg")
-    }
-
-    private nonisolated static func jpegData(fromTIFFData tiffData: Data) -> Data? {
-        guard let bitmapRep = NSBitmapImageRep(data: tiffData) else { return nil }
-        return bitmapRep.representation(
-            using: .jpeg,
-            properties: [.compressionFactor: 0.72]
-        )
-    }
-
-    private nonisolated static func trimThumbnailDiskCache(maxBytes: Int64, maxAge: TimeInterval) {
-        let directory = cachedSearchThumbnailsDirectory
-        let fileManager = FileManager.default
-
-        guard let urls = try? fileManager.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey],
-            options: [.skipsHiddenFiles]
-        ) else {
-            return
-        }
-
-        let cutoff = Date().addingTimeInterval(-maxAge)
-        struct DiskEntry {
-            let url: URL
-            let modifiedAt: Date
-            let size: Int64
-        }
-
-        var entries: [DiskEntry] = []
-        var totalBytes: Int64 = 0
-
-        for url in urls {
-            guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey]),
-                  values.isRegularFile == true else {
-                continue
-            }
-
-            let modifiedAt = values.contentModificationDate ?? .distantPast
-            let size = Int64(values.fileSize ?? 0)
-
-            if modifiedAt < cutoff {
-                try? fileManager.removeItem(at: url)
-                continue
-            }
-
-            entries.append(DiskEntry(url: url, modifiedAt: modifiedAt, size: size))
-            totalBytes += size
-        }
-
-        guard totalBytes > maxBytes else { return }
-
-        let sortedByOldest = entries.sorted { $0.modifiedAt < $1.modifiedAt }
-        for entry in sortedByOldest where totalBytes > maxBytes {
-            try? fileManager.removeItem(at: entry.url)
-            totalBytes -= entry.size
-        }
     }
 
     private func startMemoryReporting() {
