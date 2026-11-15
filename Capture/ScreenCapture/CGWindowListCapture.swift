@@ -1118,7 +1118,7 @@ public actor CGWindowListCapture {
 
             // Check 1: Excluded app bundle IDs (check by bundle ID from PID)
             if let bundleID, config.excludedAppBundleIDs.contains(bundleID) {
-                Log.info("[Exclusion] EXCLUDING app window: '\(windowName)' from \(ownerName) (bundleID: \(bundleID))", category: .capture)
+                Log.debug("[Exclusion] EXCLUDING app window: '\(windowName)' from \(ownerName) (bundleID: \(bundleID))", category: .capture)
                 excludedIDs.insert(windowID)
                 redactedWindowIDs.insert(windowID)
                 if redactionContextByWindowID[windowID] == nil {
@@ -1240,7 +1240,7 @@ public actor CGWindowListCapture {
                             appName: appDisplayName(ownerName: ownerName, bundleID: bundleID)
                         )
                     }
-                    Log.info("[Redaction] Redacting private/incognito window \(windowID) via \(sourceLabel)", category: .capture)
+                    Log.debug("[Redaction] Redacting private/incognito window \(windowID) via \(sourceLabel)", category: .capture)
                     continue
                 }
             }
@@ -1258,7 +1258,7 @@ public actor CGWindowListCapture {
                         appName: appDisplayName(ownerName: ownerName, bundleID: bundleID)
                     )
                 }
-                Log.info("[Redaction] Redacting window \(windowID) by title rule '\(matchedPattern)'", category: .capture)
+                Log.debug("[Redaction] Redacting window \(windowID) by title rule '\(matchedPattern)'", category: .capture)
                 continue
             }
 
@@ -1278,7 +1278,7 @@ public actor CGWindowListCapture {
                         appName: appDisplayName(ownerName: ownerName, bundleID: bundleID)
                     )
                 }
-                Log.info("[Redaction] Redacting window \(windowID) by URL rule text in title '\(matchedPattern)'", category: .capture)
+                Log.debug("[Redaction] Redacting window \(windowID) by URL rule text in title '\(matchedPattern)'", category: .capture)
                 continue
             }
 
@@ -1314,7 +1314,7 @@ public actor CGWindowListCapture {
                     appName: appDisplayName(ownerName: ownerName, bundleID: bundleID)
                 )
             }
-            Log.info("[Redaction] Redacting window \(windowID) by URL rule '\(matchedPattern)'", category: .capture)
+            Log.debug("[Redaction] Redacting window \(windowID) by URL rule '\(matchedPattern)'", category: .capture)
 
         }
 
@@ -1337,7 +1337,7 @@ public actor CGWindowListCapture {
                 tracePrivateRedaction(
                     "companion-redaction windowID=\(candidate.windowID) pid=\(ownerPID)"
                 )
-                Log.info(
+                Log.debug(
                     "[Redaction] Redacting private/incognito companion window \(candidate.windowID) for pid \(ownerPID)",
                     category: .capture
                 )
@@ -1757,12 +1757,13 @@ public actor CGWindowListCapture {
 
         let displayBounds = CGDisplayBounds(displayID)
 
-        Log.info("[Filtering] Display bounds: \(displayBounds), displayID: \(displayID)", category: .capture)
-        Log.info("[Filtering] Attempting to capture \(includedWindowIDs.count) windows, excluding \(excludedWindowIDs.count)", category: .capture)
-        Log.info("[Filtering] Included window IDs: \(includedWindowIDs.prefix(10))...", category: .capture)
-        Log.info("[Filtering] Excluded window IDs: \(excludedWindowIDs)", category: .capture)
+        Log.debug("[Filtering] Display bounds: \(displayBounds), displayID: \(displayID)", category: .capture)
+        Log.debug("[Filtering] Attempting to capture \(includedWindowIDs.count) windows, excluding \(excludedWindowIDs.count)", category: .capture)
+        Log.debug("[Filtering] Included window IDs: \(includedWindowIDs.prefix(10))...", category: .capture)
+        Log.debug("[Filtering] Excluded window IDs: \(excludedWindowIDs)", category: .capture)
 
         // Log details about included windows
+        #if DEBUG
         for windowInfo in windowList {
             guard let windowID = windowInfo[kCGWindowNumber as String] as? CGWindowID else { continue }
             if includedWindowIDs.contains(windowID) {
@@ -1776,11 +1777,13 @@ public actor CGWindowListCapture {
             }
         }
 
+        #endif
+
         // Create CFArray of window IDs properly - must be CGWindowID (UInt32) wrapped as NSNumber/CFNumber
         let windowNumbers: [NSNumber] = includedWindowIDs.map { NSNumber(value: $0) }
         let windowArray: CFArray = windowNumbers as CFArray
 
-        Log.info("[Filtering] Created CFArray with \(CFArrayGetCount(windowArray)) elements", category: .capture)
+        Log.debug("[Filtering] Created CFArray with \(CFArrayGetCount(windowArray)) elements", category: .capture)
 
         // If we already know array capture is broken on this system, skip straight to fallback
         if arrayCaptureBroken {
@@ -1793,7 +1796,7 @@ public actor CGWindowListCapture {
             windowArray: windowArray,
             imageOption: [.bestResolution]
         ) {
-            Log.info("[Filtering] SUCCESS with array capture: \(image.width)x\(image.height)", category: .capture)
+            Log.recordRoutine(.captureArraySucceeded)
             return FilteredCaptureResult(image: image, visibleExcludedWindowIDs: [])
         }
 
@@ -1891,7 +1894,7 @@ public actor CGWindowListCapture {
 
         // If no visible regions to mask, return the full capture
         if visibleExcludedRegions.isEmpty {
-            Log.info("[Masking] Excluded windows are fully occluded, no masking needed", category: .capture)
+            Log.recordRoutine(.captureMaskNotNeeded)
             return FilteredCaptureResult(image: fullScreenImage, visibleExcludedWindowIDs: [])
         }
 
@@ -1903,7 +1906,7 @@ public actor CGWindowListCapture {
         }
 
         let visibleExcludedWindowIDs = Set(visibleExcludedRegions.map { $0.windowID })
-        Log.info("[Masking] Successfully masked \(visibleExcludedRegions.count) visible regions", category: .capture)
+        Log.recordRoutine(.captureMasked, count: visibleExcludedRegions.count)
         return FilteredCaptureResult(image: maskedImage, visibleExcludedWindowIDs: visibleExcludedWindowIDs)
     }
 

@@ -491,8 +491,10 @@ public final class FeedbackViewModel: ObservableObject {
 
     /// Export diagnostics to file
     public func exportDiagnostics() {
-        guard let url = feedbackService.exportDiagnostics() else { return }
-        NSWorkspace.shared.selectFile(url.path, inFileViewerRootedAtPath: "")
+        Task {
+            guard let url = await feedbackService.exportDiagnostics() else { return }
+            NSWorkspace.shared.selectFile(url.path, inFileViewerRootedAtPath: "")
+        }
     }
 
     /// Reset form for new submission

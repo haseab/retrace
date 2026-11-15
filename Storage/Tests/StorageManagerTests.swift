@@ -1014,6 +1014,48 @@ final class StorageManagerTests: XCTestCase {
         try handle.write(contentsOf: record)
     }
 
+    func testWALMetadataDoesNotRewriteForEachScreenshotAndRecoversStaleCount() async throws {
+        let root = makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let manager = WALManager(walRoot: root)
+        var session = try await manager.createSession(videoID: VideoSegmentID(value: 491))
+        let url = session.sessionDir.appendingPathComponent("metadata.json")
+        let initial = try Data(contentsOf: url)
+        let frame = try makeWALScreenshotFrame()
+        try await manager.appendFrame(frame, to: &session)
+        XCTAssertEqual(try Data(contentsOf: url), initial)
+        try await manager.updateDurableVideoState(videoID: session.videoID, readableFrameCount: 1, durableVideoFileSizeBytes: 777)
+        let checkpoint = try Data(contentsOf: url)
+        try await manager.appendFrame(frame, to: &session)
+        XCTAssertEqual(try Data(contentsOf: url), checkpoint)
+        let restarted = WALManager(walRoot: root)
+        let recovered = try await restarted.listActiveSessions()
+        XCTAssertEqual(recovered.first?.metadata.frameCount, 2)
+        XCTAssertEqual(recovered.first?.metadata.width, frame.width)
+        XCTAssertEqual(recovered.first?.metadata.durableReadableFrameCount, 1)
+        XCTAssertEqual(recovered.first?.metadata.durableVideoFileSizeBytes, 777)
+        let last = try await restarted.readFrame(videoID: session.videoID, frameIndex: 1)
+        XCTAssertEqual(last.imageData, frame.imageData)
+    }
+
+    func testWALPeriodicMetadataCheckpointPreservesDurableFrontier() async throws {
+        let root = makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let manager = WALManager(walRoot: root, metadataCheckpointInterval: 0)
+        var session = try await manager.createSession(videoID: VideoSegmentID(value: 492))
+        let frame = try makeWALScreenshotFrame()
+        try await manager.appendFrame(frame, to: &session)
+        try await manager.updateDurableVideoState(videoID: session.videoID, readableFrameCount: 1, durableVideoFileSizeBytes: 888)
+        try await manager.appendFrame(frame, to: &session)
+        let data = try Data(contentsOf: session.sessionDir.appendingPathComponent("metadata.json"))
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let persisted = try decoder.decode(WALMetadata.self, from: data)
+        XCTAssertEqual(persisted.frameCount, 2)
+        XCTAssertEqual(persisted.durableReadableFrameCount, 1)
+        XCTAssertEqual(persisted.durableVideoFileSizeBytes, 888)
+    }
+
     func testWALCompressesScreenshotLosslesslyAndSupportsMappedRandomAccessAfterRestart() async throws {
         let root = makeTempRoot()
         defer { try? FileManager.default.removeItem(at: root) }

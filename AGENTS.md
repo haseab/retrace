@@ -71,7 +71,7 @@ retrace/
 │   └── validate_darkwake_watchdog.sh # Automated darkwake watchdog regression validation
 │
 ├── Shared/                      # CRITICAL: Shared types and protocols
-│   ├── Logging.swift            # PrivacyLogMessage removes free-form interpolations before console/file/unified logs
+│   ├── Logging.swift            # Privacy-safe bounded background logging, batching, routine summaries and async flush
 │   ├── AppPaths.swift           # Application path configuration
 │   ├── BGRAImageUtilities.swift # Shared BGRA conversion + patch extraction helpers
 │   ├── MasterKeyManager.swift   # Keychain-backed master key creation + recovery phrase export
@@ -168,6 +168,7 @@ retrace/
 │   └── Tests/
 │       ├── FeedbackRecentMetricSupportTests.swift # Feedback-export metric sanitization coverage
 │       ├── InPageURLCaptureRoutingTests.swift
+│       ├── DiagnosticLoggingTests.swift # Background log writes, bounded buffering, flush, summaries and release suppression
 │       ├── PrivacyProtectionTests.swift # Logging privacy, permanent pixel removal, and redaction mode defaults
 │       ├── MasterKeyManagerTests.swift
 │       ├── ServiceContainerRewindCutoffTests.swift # Rewind cutoff defaults and latest-frame probe coverage
@@ -185,6 +186,7 @@ retrace/
     ├── Components/              # Reusable UI components (MenuBarManager, HotkeyManager, etc.)
     │   ├── MasterKeyRedactionFlowCoordinator.swift # Shared missing-master-key prompt/recovery coordinator
     │   ├── HoverLatchedScrollMonitor.swift # Shared nested-scroll latch helper for hover-routed inner scroll regions
+    │   ├── PreviewCacheMaintenance.swift # Incremental cache totals, bounded disk worker, batched cleanup and preview identity
     │   └── ProcessMonitorModels.swift # System Monitor snapshot/models + ranking helpers
     ├── ViewModels/              # View models (Dashboard, Search, Timeline, Feedback, Settings)
     │   └── Settings/            # Settings-specific view models and extracted helper logic
@@ -508,3 +510,27 @@ _This file follows the AGENTS.md standard for AI agent guidance. Last updated: 2
 - Excluded-window masking failures drop the frame. Full excluded bounds are protected, including overlapped/translucent areas and edges.
 - `PrivacyLogMessage` strips free-form interpolated values before every logging sink; only primitive numbers and booleans are retained. Preformatted `String` messages are removed as a whole. Do not bypass this by explicitly constructing string literals from captured content.
 - Legacy diagnostic logs are discarded on logger initialization and are excluded from feedback reads, including the error channel. Raw capture-time previews are bypassed while keyword protection is enabled and stale preview copies are invalidated after rewrite.
+
+### Diagnostic logging write policy
+
+- Release `Log.debug` and `Log.verbose` calls do not evaluate their messages. Keep lifecycle events, unusual outcomes, warnings and errors; record routine capture/OCR successes through the fixed `Log.RoutineEvent` counters.
+- All console, unified-log and diagnostic-file sinks run on a serial background queue. Admission only takes a short memory lock. Buffer limits reserve space for errors; overflow produces a count-only warning rather than unbounded memory growth.
+- Retained messages flush after two seconds or 64 KiB; errors request an immediate background drain. Active routine counters summarize once per minute and on explicit flush. Idle logging has no repeating timer wakeup.
+- Await `Log.flush()` before asynchronous feedback snapshots and normal quit. Feedback export must not synchronously wait on the writer from the main thread. A hard crash can lose the pending batch.
+
+### Preview cache maintenance
+
+- Timeline cache byte totals are maintained on insert/replace/remove; access-only touches must remain O(1). Compressed JPEG NSCache entries carry their byte cost with a 64 MiB cost limit plus the existing count limit.
+- Search thumbnails have a 32 MiB estimated decoded-byte budget plus a 60-image count limit. Maintain costs incrementally and estimate from representation dimensions without forcing image decoding on main.
+- `PreviewCacheDiskWorker` serializes UI cache writes, JPEG serialization, deletion batches and folder pruning. Thumbnail trims coalesce bursts and run at most once per minute during continuing writes. Pending write payloads are bounded to 64 MiB; skipped persistence must not block display.
+- Preview keys describe source/frame/video identity, render dimensions, highlight geometry, and content revision. Queries do not belong in keys. Redaction completion advances the persisted revision and invalidates queued writes. Preserve the existing keyword-protection bypass and canonical preview paths used by the redaction purger.
+
+### Stable development app identity
+
+- Use one persistent development app: bundle ID `io.retrace.app.dev`, app name `Retrace Dev`, installed at `/Applications/Retrace Dev.app`. Reuse this identity and location across branches and rebuilds; do not create PR-specific or timestamped app identities.
+- Agent UI testing through Computer Use requires a bundled macOS app. Use `/Applications/Retrace Dev.app` for these tests, with its stable identity and development data namespace; a bare `.build/debug/Retrace` executable is not the supported Computer Use test target.
+- `./dev.sh` should build a complete app bundle, sign and verify it, replace the app at that fixed location, and launch it. This is the required development workflow; the current bare SwiftPM executable launcher still needs to be updated to implement it.
+- Sign successive builds with the same certificate-backed signing identity and team, keeping the designated requirement stable. Ad-hoc signing ties identity to the binary hash and is unsuitable for preserving permissions across rebuilds. If the certificate and private key are unavailable, report the signing prerequisite instead of silently falling back to ad-hoc signing.
+- Keep a persistent development namespace for settings, library, caches, logs, Keychain items, and instance locks, separate from production. Preserve development data and permissions across normal rebuilds.
+- Build and sign on `hac-mini`. When using the authorized MacBook visual-testing fallback, transfer the prebuilt app; the fallback does not authorize builds or source edits on the MacBook.
+- Expect initial Screen Recording and Accessibility grants on each Mac. Stable signing should normally preserve recognition across rebuilds, but macOS can still require reauthorization. Codex computer-use launch confirmations are separate from macOS privacy permissions.

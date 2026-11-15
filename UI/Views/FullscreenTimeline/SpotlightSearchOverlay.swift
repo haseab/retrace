@@ -1316,9 +1316,12 @@ public struct SpotlightSearchOverlay: View {
     // MARK: - Thumbnail Loading
 
     private func thumbnailKey(for result: SearchResult) -> String {
-        // Use committedSearchQuery (set on Enter) instead of live searchQuery
-        // This prevents thumbnails from reloading while user is typing
-        "\(result.segmentID.stringValue)_\(result.timestamp.timeIntervalSince1970)_\(viewModel.committedSearchQuery)"
+        let highlight = result.highlightNode.map { CGRect(x: $0.x, y: $0.y, width: $0.width, height: $0.height) }
+        return PreviewThumbnailIdentity.key(
+            source: result.source.rawValue, frameID: result.id.value, videoID: result.videoID.value,
+            frameIndex: result.frameIndex, timestamp: result.timestamp.timeIntervalSince1970, size: thumbnailSize, highlight: highlight,
+            revision: viewModel.thumbnailContentRevision
+        )
     }
 
     private func loadThumbnail(for result: SearchResult) {
@@ -1342,6 +1345,7 @@ public struct SpotlightSearchOverlay: View {
                 return
             }
 
+            guard viewModel.searchGeneration == currentGeneration else { return }
             do {
                 // 1. Fetch frame image (prefer direct path to avoid per-thumbnail DB lookups and JPEG round-trips)
                 let fullImage: NSImage

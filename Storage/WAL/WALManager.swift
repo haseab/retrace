@@ -36,12 +36,23 @@ public actor WALManager {
     private static let maximumFrameBytes = 256 * 1024 * 1024
     private static let recordMagic = Data("RTRCWAL2".utf8)
     private static let recordExtensionSize = 48  // magic + codec + decoded size + SHA-256
+    // Reconstructible frame counts/dimensions need only occasional sidecar checkpoints.
+    // Durable video frontier updates still persist immediately and must never regress.
+    private var activeMetadata: [Int64: WALMetadata] = [:]
+    private var metadataCheckpointTimes: [Int64: TimeInterval] = [:]
+    private let metadataCheckpointInterval: TimeInterval
     private var compressionTotals: [Int64: WALCompressionTotals] = [:]
     private static let discardableQuarantinePrefix = "quarantined_segment_"
     private static let retainedQuarantinePrefix = "retained_segment_"
 
     public init(walRoot: URL) {
         self.walRootURL = walRoot
+        self.metadataCheckpointInterval = 30
+    }
+
+    init(walRoot: URL, metadataCheckpointInterval: TimeInterval) {
+        self.walRootURL = walRoot
+        self.metadataCheckpointInterval = max(0, metadataCheckpointInterval)
     }
 
     public func initialize() async throws {
@@ -123,6 +134,8 @@ public actor WALManager {
             )
         }
 
+        activeMetadata[videoID.value] = metadata
+        metadataCheckpointTimes[videoID.value] = ProcessInfo.processInfo.systemUptime
         return WALSession(
             videoID: videoID,
             sessionDir: sessionDir,
@@ -200,20 +213,30 @@ public actor WALManager {
         totals.compressionMilliseconds += compressionMs
         compressionTotals[session.videoID.value] = totals
 
-        // Update session metadata
+        // The caller holds a value copy of the session; preserve any newer durable
+        // frontier published between appends before checkpointing that copy.
+        if let current = activeMetadata[session.videoID.value] {
+            session.metadata.durableReadableFrameCount = max(session.metadata.durableReadableFrameCount, current.durableReadableFrameCount)
+            session.metadata.durableVideoFileSizeBytes = max(session.metadata.durableVideoFileSizeBytes, current.durableVideoFileSizeBytes)
+        }
         session.metadata.frameCount += 1
         if session.metadata.width == 0 {
             session.metadata.width = frame.width
             session.metadata.height = frame.height
         }
 
-        do {
-            try saveMetadata(session.metadata, to: session.sessionDir)
-        } catch {
-            Log.warning(
-                "[WAL] Failed to update metadata sidecar for session \(session.videoID.value): \(error.localizedDescription)",
-                category: .storage
-            )
+        activeMetadata[session.videoID.value] = session.metadata
+        let now = ProcessInfo.processInfo.systemUptime
+        if now - (metadataCheckpointTimes[session.videoID.value] ?? 0) >= metadataCheckpointInterval {
+            do {
+                try saveMetadata(session.metadata, to: session.sessionDir)
+                metadataCheckpointTimes[session.videoID.value] = now
+            } catch {
+                Log.warning(
+                    "[WAL] Failed to checkpoint screenshot metadata for session \(session.videoID.value)",
+                    category: .storage
+                )
+            }
         }
 
         // Invalidate frame offset index cache so the next random-access read
@@ -233,7 +256,12 @@ public actor WALManager {
             throw StorageError.fileNotFound(path: sessionDir.path)
         }
 
-        var metadata = try loadMetadata(from: sessionDir)
+        var metadata: WALMetadata
+        if let current = activeMetadata[videoID.value] {
+            metadata = current
+        } else {
+            metadata = try loadMetadata(from: sessionDir)
+        }
         let nextReadableFrameCount = max(metadata.durableReadableFrameCount, readableFrameCount)
         let nextDurableVideoFileSizeBytes = max(metadata.durableVideoFileSizeBytes, durableVideoFileSizeBytes)
 
@@ -245,6 +273,8 @@ public actor WALManager {
         metadata.durableReadableFrameCount = nextReadableFrameCount
         metadata.durableVideoFileSizeBytes = nextDurableVideoFileSizeBytes
         try saveMetadata(metadata, to: sessionDir)
+        activeMetadata[videoID.value] = metadata
+        metadataCheckpointTimes[videoID.value] = ProcessInfo.processInfo.systemUptime
     }
 
     /// Persist a stable mapping from database frameID -> WAL frame offset.
@@ -379,6 +409,8 @@ public actor WALManager {
         frameOffsetIndexCache.removeAll()
         frameIDOffsetIndexCache.removeAll()
         compressionTotals.removeAll()
+        activeMetadata.removeAll()
+        metadataCheckpointTimes.removeAll()
     }
 
     /// Delete discardable quarantined WAL sessions older than the provided cutoff date.
@@ -1412,6 +1444,8 @@ public actor WALManager {
     }
 
     private func clearSessionCaches(videoIDValue: Int64) {
+        activeMetadata.removeValue(forKey: videoIDValue)
+        metadataCheckpointTimes.removeValue(forKey: videoIDValue)
         compressionTotals.removeValue(forKey: videoIDValue)
         frameOffsetIndexCache.removeValue(forKey: videoIDValue)
         frameIDOffsetIndexCache.removeValue(forKey: videoIDValue)
@@ -1508,7 +1542,10 @@ public actor WALManager {
             return metadata
         }
 
-        let needsRepair = metadataNeedsRepair(metadata)
+        // A valid checkpoint can intentionally lag appended frame records. Reconcile
+        // once during recovery, including truncated tails, rather than trusting its count.
+        let offsets = try frameOffsets(for: videoID.value, framesURL: framesURL, currentFileSize: framesFileSize)
+        let needsRepair = metadataNeedsRepair(metadata) || metadata.frameCount != offsets.count
         guard needsRepair, let rebuiltMetadata = try rebuildMetadata(videoID: videoID, framesURL: framesURL) else {
             return metadata
         }

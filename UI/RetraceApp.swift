@@ -996,6 +996,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             await CrashRecoveryManager.shared.prepareForExpectedExit()
             await ProcessCPUMonitor.shared.stopAndFlush()
             _ = await TimelineWindowController.shared.forceRecordSessionMetrics(timeoutMs: 350)
+            Log.info("[AppDelegate] Application terminating", category: .app)
+            await Log.flush()
             self?.isTerminationFlushInProgress = false
             NSApp.reply(toApplicationShouldTerminate: true)
         }
@@ -2611,8 +2613,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         DistributedNotificationCenter.default().removeObserver(self)
         ProcessCPUMonitor.shared.stop()
         HotkeyManager.shared.shutdown()
-
-        Log.info("[AppDelegate] Application terminating", category: .app)
     }
     // MARK: - URL Handling
 

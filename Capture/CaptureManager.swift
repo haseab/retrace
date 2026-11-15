@@ -904,7 +904,8 @@ public actor CaptureManager: CaptureProtocol {
                     reportMouseClickOutcome(.captured)
                 }
 
-                Log.info(
+                Log.recordRoutine(.captureKept)
+                Log.debug(
                     Self.deduplicationAnalysisLogMessage(
                         triggerDescription: triggerDescription,
                         similarity: similarity,
@@ -928,7 +929,8 @@ public actor CaptureManager: CaptureProtocol {
                     reportMouseClickOutcome(.deduped)
                 }
 
-                Log.info(
+                Log.recordRoutine(.captureDeduplicated)
+                Log.debug(
                     Self.deduplicationAnalysisLogMessage(
                         triggerDescription: triggerDescription,
                         similarity: similarity,
@@ -958,7 +960,8 @@ public actor CaptureManager: CaptureProtocol {
                 reportMouseClickOutcome(.captured)
             }
 
-            Log.info(
+            Log.recordRoutine(.captureKept)
+            Log.debug(
                 Self.deduplicationAnalysisLogMessage(
                     triggerDescription: triggerDescription,
                     similarity: nil,

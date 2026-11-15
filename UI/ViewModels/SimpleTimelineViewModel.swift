@@ -2383,24 +2383,10 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     /// Disk-backed timeline frame buffer metadata (payload bytes are stored in Library/Caches).
-    private var diskFrameBufferIndex: [FrameID: DiskFrameBufferEntry] = [:] {
-        didSet {
-            let oldCount = oldValue.count
-            let newCount = diskFrameBufferIndex.count
-            diskFrameBufferBytes = diskFrameBufferIndex.values.reduce(into: Int64(0)) { total, entry in
-                total += entry.sizeBytes
-            }
-            if oldCount != newCount {
-                if Self.isVerboseTimelineLoggingEnabled {
-                    Log.debug(
-                        "[Memory] diskFrameBuffer changed: \(oldCount) → \(newCount) frames (\(Self.formatBytes(diskFrameBufferBytes)))",
-                        category: .ui
-                    )
-                }
-            }
-        }
-    }
-    private var diskFrameBufferBytes: Int64 = 0
+    private var diskFrameBufferIndex = ByteCountedCacheIndex<FrameID, DiskFrameBufferEntry>(cost: { $0.sizeBytes })
+    private var diskFrameBufferBytes: Int64 { diskFrameBufferIndex.totalBytes }
+    private var diskFrameBufferGeneration: UInt64 = 0
+    private let diskFrameBufferEpoch = PreviewCacheEpoch()
     private var diskFrameBufferAccessSequence: UInt64 = 0
     private let diskFrameBufferDirectoryURL: URL
 
@@ -2485,6 +2471,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     private static func makeInMemoryJPEGFrameCache() -> NSCache<NSNumber, NSData> {
         let cache = NSCache<NSNumber, NSData>()
         cache.countLimit = inMemoryJPEGFrameCacheCountLimit
+        cache.totalCostLimit = 64 * 1024 * 1024
         return cache
     }
 
@@ -2749,6 +2736,8 @@ public class SimpleTimelineViewModel: ObservableObject {
                 self.cancelCacheExpansion(reason: "redaction completed")
                 self.unavailableFrameDiskLookupTask?.cancel()
                 self.unavailableFrameDiskLookupTask = nil
+                self.diskFrameBufferGeneration &+= 1
+                self.diskFrameBufferEpoch.invalidate()
                 self.diskFrameBufferIndex.removeAll()
                 self.inMemoryJPEGFrameCache.removeAllObjects()
                 self.hotWindowRange = nil
@@ -3055,7 +3044,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     private func initializeDiskFrameBuffer() {
         diskFrameBufferAccessSequence = 0
-        diskFrameBufferIndex = [:]
+        diskFrameBufferIndex.removeAll()
         diskFrameBufferInitializationTask?.cancel()
 
         let directoryURL = diskFrameBufferDirectoryURL
@@ -3149,27 +3138,30 @@ public class SimpleTimelineViewModel: ObservableObject {
         removeExternalFiles: Bool = false
     ) -> (removedFromIndex: Int, removedFromDisk: Int, preservedExternal: Int) {
         guard !frameIDs.isEmpty else { return (0, 0, 0) }
+        diskFrameBufferGeneration &+= 1
+        diskFrameBufferEpoch.invalidate()
 
         var removedFromIndex = 0
         var removedFromDisk = 0
         var preservedExternal = 0
+        var removals: [URL] = []
         removeInMemoryJPEGFrameData(frameIDs)
         for frameID in frameIDs {
             if let entry = diskFrameBufferIndex.removeValue(forKey: frameID) {
                 removedFromIndex += 1
-                let shouldRemoveFile = removeExternalFiles || entry.origin == .timelineManaged
-                if shouldRemoveFile {
-                    try? FileManager.default.removeItem(at: entry.fileURL)
+                if removeExternalFiles || entry.origin == .timelineManaged {
+                    removals.append(entry.fileURL)
                     removedFromDisk += 1
                 } else {
                     preservedExternal += 1
                 }
             }
         }
+        PreviewCacheDiskWorker.shared.removeFiles(removals)
 
         if Self.isVerboseTimelineLoggingEnabled {
             Log.info(
-                "[Memory] Removed frame-buffer entries reason=\(reason) removedFromIndex=\(removedFromIndex) removedFromDisk=\(removedFromDisk) preservedExternal=\(preservedExternal)",
+                "[Memory] Removed frame-buffer entries reason=\(reason) removedFromIndex=\(removedFromIndex) queuedForDiskRemoval=\(removedFromDisk) preservedExternal=\(preservedExternal)",
                 category: .ui
             )
         }
@@ -3177,6 +3169,8 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     private func clearDiskFrameBuffer(reason: String) {
+        diskFrameBufferGeneration &+= 1
+        diskFrameBufferEpoch.invalidate()
         unavailableFrameDiskLookupTask?.cancel()
         unavailableFrameDiskLookupTask = nil
         cancelForegroundFrameLoad(reason: "clearDiskFrameBuffer.\(reason)")
@@ -3200,14 +3194,14 @@ public class SimpleTimelineViewModel: ObservableObject {
             preservedExternalIndexed = result.preservedExternal
         }
         let removeAllUnindexedFiles = shouldRemoveAllUnindexedDiskFrameBufferFiles(for: reason)
-        let removedUnindexedFiles = clearUnindexedDiskFrameBufferFiles(
+        clearUnindexedDiskFrameBufferFiles(
             reason: reason,
             removeAll: removeAllUnindexedFiles
         )
-        if removedIndexedFiles > 0 || removedUnindexedFiles > 0 || removeAllUnindexedFiles || preservedExternalIndexed > 0 {
+        if removedIndexedFiles > 0 || removeAllUnindexedFiles || preservedExternalIndexed > 0 {
             let mode = removeAllUnindexedFiles ? "all" : "prune-old"
             Log.info(
-                "[Timeline-DiskBuffer] clear reason=\(reason) indexedBefore=\(indexedBefore) removedIndexed=\(removedIndexedFiles) removedIndexedFromDisk=\(removedIndexedFromDisk) preservedExternalIndexed=\(preservedExternalIndexed) removedUnindexed=\(removedUnindexedFiles) mode=\(mode)",
+                "[Timeline-DiskBuffer] clear reason=\(reason) indexedBefore=\(indexedBefore) removedIndexed=\(removedIndexedFiles) queuedIndexedDiskRemoval=\(removedIndexedFromDisk) preservedExternalIndexed=\(preservedExternalIndexed) unindexedCleanupQueued=true mode=\(mode)",
                 category: .ui
             )
         }
@@ -3217,47 +3211,9 @@ public class SimpleTimelineViewModel: ObservableObject {
         reason == "data source reload"
     }
 
-    private func clearUnindexedDiskFrameBufferFiles(
-        reason: String,
-        removeAll: Bool
-    ) -> Int {
-        do {
-            let resourceKeys: Set<URLResourceKey> = [.isRegularFileKey, .contentModificationDateKey]
-            let files = try FileManager.default.contentsOfDirectory(
-                at: diskFrameBufferDirectoryURL,
-                includingPropertiesForKeys: Array(resourceKeys),
-                options: [.skipsHiddenFiles]
-            )
-            let cutoffDate = removeAll
-                ? nil
-                : Date().addingTimeInterval(-Self.diskFrameBufferUnindexedPruneAgeSeconds)
-            var removedCount = 0
-            for fileURL in files {
-                let values = try? fileURL.resourceValues(forKeys: resourceKeys)
-                guard values?.isRegularFile == true else { continue }
-                guard Self.frameID(fromDiskFrameFileURL: fileURL) != nil else { continue }
-                if let cutoffDate,
-                   let contentModifiedAt = values?.contentModificationDate,
-                   contentModifiedAt >= cutoffDate {
-                    continue
-                }
-                try? FileManager.default.removeItem(at: fileURL)
-                removedCount += 1
-            }
-            if removedCount > 0, Self.isVerboseTimelineLoggingEnabled {
-                Log.info(
-                    "[Timeline-DiskBuffer] Removed \(removedCount) unindexed disk-buffer files (\(reason))",
-                    category: .ui
-                )
-            }
-            return removedCount
-        } catch {
-            Log.warning(
-                "[Timeline-DiskBuffer] Failed to clear unindexed disk-buffer files (\(reason)): \(error)",
-                category: .ui
-            )
-            return 0
-        }
+    private func clearUnindexedDiskFrameBufferFiles(reason: String, removeAll: Bool) {
+        let cutoff = removeAll ? Date() : Date().addingTimeInterval(-Self.diskFrameBufferUnindexedPruneAgeSeconds)
+        PreviewCacheDiskWorker.shared.pruneTimelineFiles(in: diskFrameBufferDirectoryURL, olderThan: cutoff)
     }
 
     private func describeHotWindowRange() -> String {
@@ -3396,19 +3352,14 @@ public class SimpleTimelineViewModel: ObservableObject {
             return cachedData
         }
 
-        guard FileManager.default.fileExists(atPath: fileURL.path) else {
-            if existingEntry != nil {
-                removeDiskFrameBufferEntries([frameID], reason: "read missing file")
-            }
-            return nil
-        }
-
+        let generation = diskFrameBufferGeneration
         do {
             let data = try await Task.detached(priority: .userInitiated) {
                 try Data(contentsOf: fileURL, options: [.mappedIfSafe])
             }.value
 
-            guard !Task.isCancelled, !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { return nil }
+            guard !Task.isCancelled, generation == diskFrameBufferGeneration,
+                  !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { return nil }
             if existingEntry != nil {
                 touchDiskFrameBufferEntry(frameID)
             } else {
@@ -3424,6 +3375,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             storeInMemoryJPEGFrameData(data, frameID: frameID)
             return data
         } catch {
+            guard generation == diskFrameBufferGeneration else { return nil }
             removeDiskFrameBufferEntries([frameID], reason: "read failure")
             return nil
         }
@@ -3431,36 +3383,30 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     private func storeFrameDataInDiskFrameBuffer(frameID: FrameID, data: Data) async {
         let privacyDefaults = UserDefaults(suiteName: ReversibleOCRScrambler.settingsSuiteName) ?? .standard
-        guard !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { return }
+        guard !Task.isCancelled, !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { return }
         await awaitDiskFrameBufferInitializationIfNeeded()
+        guard !Task.isCancelled else { return }
         let fileURL = diskFrameBufferURL(for: frameID)
-        do {
-            try await Task.detached(priority: .utility) {
-                try FileManager.default.createDirectory(
-                    at: fileURL.deletingLastPathComponent(),
-                    withIntermediateDirectories: true
-                )
-                guard !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { return }
-                try data.write(to: fileURL, options: [.atomic])
-                if PhraseRedactionMode.isEnabled(in: privacyDefaults) {
-                    try? FileManager.default.removeItem(at: fileURL)
-                }
-            }.value
-            guard !Task.isCancelled, !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { return }
-
-            diskFrameBufferAccessSequence &+= 1
-            let entry = DiskFrameBufferEntry(
-                fileURL: fileURL,
-                sizeBytes: Int64(data.count),
-                lastAccessSequence: diskFrameBufferAccessSequence,
-                origin: .timelineManaged
-            )
-            diskFrameBufferIndex[frameID] = entry
-            storeInMemoryJPEGFrameData(data, frameID: frameID)
-
-        } catch {
-            Log.warning("[Timeline-DiskBuffer] Failed to write frame \(frameID.value) to disk buffer: \(error)", category: .ui)
+        let generation = diskFrameBufferGeneration
+        let epoch = diskFrameBufferEpoch
+        let token = epoch.current
+        let wrote = await withCheckedContinuation { continuation in
+            PreviewCacheDiskWorker.shared.enqueueWrite(data, to: fileURL, allowed: {
+                epoch.matches(token) && !PhraseRedactionMode.isEnabled(in: privacyDefaults)
+            }, completion: { continuation.resume(returning: $0) })
         }
+        guard wrote, !Task.isCancelled, generation == diskFrameBufferGeneration,
+              !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { return }
+
+        diskFrameBufferAccessSequence &+= 1
+        let entry = DiskFrameBufferEntry(
+            fileURL: fileURL,
+            sizeBytes: Int64(data.count),
+            lastAccessSequence: diskFrameBufferAccessSequence,
+            origin: .timelineManaged
+        )
+        diskFrameBufferIndex[frameID] = entry
+        storeInMemoryJPEGFrameData(data, frameID: frameID)
     }
 
     private func inMemoryJPEGFrameCacheKey(for frameID: FrameID) -> NSNumber {
@@ -3481,7 +3427,8 @@ public class SimpleTimelineViewModel: ObservableObject {
     private func storeInMemoryJPEGFrameData(_ data: Data, frameID: FrameID) {
         inMemoryJPEGFrameCache.setObject(
             data as NSData,
-            forKey: inMemoryJPEGFrameCacheKey(for: frameID)
+            forKey: inMemoryJPEGFrameCacheKey(for: frameID),
+            cost: data.count
         )
     }
 
