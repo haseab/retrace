@@ -522,6 +522,7 @@ public actor FrameProcessingQueue {
     private var rewriteResumeTask: Task<Void, Never>?
     private var retryableRewriteRetryTask: Task<Void, Never>?
     private var startupRewriteRecoveryPending = false
+    private var isRewriteRecoveryScanning = false
     private var exhaustedAutomaticRewriteRetryVideoIDs: Set<Int64> = []
 
     // MARK: - Power-Aware Processing Control
@@ -754,7 +755,11 @@ public actor FrameProcessingQueue {
 
     @discardableResult
     private func performStartupRewriteRecoveryIfPending(trigger: String) async -> Bool {
+        if isRewriteRecoveryScanning { return true }
         guard startupRewriteRecoveryPending else { return false }
+        // A recovery scan treats working files as interrupted. Only scan once all live
+        // encoders have finished; their completion schedules the pending recovery.
+        guard activeRewriteVideoIDs.isEmpty else { return true }
         guard !isRewriteSchedulingSuspended else {
             Log.debug(
                 "[Queue-Rewrite] Startup rewrite recovery still deferred while timeline is active (\(trigger))",
@@ -766,7 +771,11 @@ public actor FrameProcessingQueue {
         startupRewriteRecoveryPending = false
 
         do {
-            try await reconcileInterruptedSegmentRewritesOnStartup()
+            isRewriteRecoveryScanning = true
+            do {
+                defer { isRewriteRecoveryScanning = false }
+                try await reconcileInterruptedSegmentRewritesOnStartup()
+            }
 
             let pendingVideoIDs = try await databaseManager.getVideoIDsWithPendingRewrites(
                 includeRetryableFailures: true
@@ -2701,6 +2710,7 @@ public actor FrameProcessingQueue {
         includeRetryableFailures: Bool = false,
         isAutomaticRetryOfFailedRewrite: Bool = false
     ) async throws -> PendingRewriteDispatchOutcome {
+        guard !isRewriteRecoveryScanning else { return .deferred(.rewriteAlreadyInProgress) }
         if isRewriteSchedulingSuspended {
             Log.debug(
                 "[Queue-Rewrite] Deferring segment rewrite for video \(videoDatabaseID) while timeline interaction is active",
@@ -2726,6 +2736,9 @@ public actor FrameProcessingQueue {
             return .deferred(.pendingOCR)
         }
 
+        // Database awaits above can yield to a recovery scan. Reserve the live
+        // rewrite only after checking again, with no await between check and insert.
+        guard !isRewriteRecoveryScanning else { return .deferred(.rewriteAlreadyInProgress) }
         guard !activeRewriteVideoIDs.contains(videoDatabaseID) else {
             rewriteVideosNeedingRedrain.insert(videoDatabaseID)
             Log.debug(
@@ -2737,6 +2750,9 @@ public actor FrameProcessingQueue {
         activeRewriteVideoIDs.insert(videoDatabaseID)
         defer {
             activeRewriteVideoIDs.remove(videoDatabaseID)
+            if startupRewriteRecoveryPending && activeRewriteVideoIDs.isEmpty {
+                handleRewriteSchedulingStateChange(trigger: "active-rewrites-finished")
+            }
             schedulePendingRewriteRedrainIfNeeded(for: videoDatabaseID)
         }
 
