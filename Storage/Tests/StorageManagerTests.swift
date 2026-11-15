@@ -1038,6 +1038,81 @@ final class StorageManagerTests: XCTestCase {
         XCTAssertEqual(last.imageData, frame.imageData)
     }
 
+    func testWALSeekFailureClosesWriterAndPreservesRecoverableFrames() async throws {
+        // Exercise both a newly opened writer and a reused writer with a real record.
+        final class FailingSeek: @unchecked Sendable {
+            private let lock = NSLock()
+            private var calls = 0
+            private var failedHandle: FileHandle?
+            let failureCall: Int
+
+            init(failureCall: Int) { self.failureCall = failureCall }
+
+            func seek(_ handle: FileHandle) throws -> UInt64 {
+                lock.lock()
+                defer { lock.unlock() }
+                calls += 1
+                if calls == failureCall {
+                    failedHandle = handle
+                    throw NSError(domain: NSPOSIXErrorDomain, code: Int(EIO))
+                }
+                return try handle.seekToEnd()
+            }
+
+            func handleThatFailed() -> FileHandle? {
+                lock.lock()
+                defer { lock.unlock() }
+                return failedHandle
+            }
+        }
+
+        for failureCall in [1, 2] {
+            let root = makeTempRoot()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let failure = FailingSeek(failureCall: failureCall)
+            let manager = WALManager(
+                walRoot: root, metadataCheckpointInterval: 30,
+                seekForAppend: { try failure.seek($0) }
+            )
+            var session = try await manager.createSession(videoID: VideoSegmentID(value: 495))
+            let frame = try makeWALScreenshotFrame()
+            if failureCall == 2 {
+                try await manager.appendFrame(frame, to: &session)
+                try await manager.registerFrameID(videoID: session.videoID, frameID: 7100, frameIndex: 0)
+            }
+            let bytesBeforeFailure = try Data(contentsOf: session.framesURL)
+            do {
+                try await manager.appendFrame(frame, to: &session)
+                XCTFail("Expected injected seek failure")
+            } catch {
+                XCTAssertTrue(error is StorageError)
+            }
+            let afterFailure = await manager.debugIndexAndWriterCounts()
+            XCTAssertEqual(afterFailure.activeWriters, 0)
+            let failedHandle = try XCTUnwrap(failure.handleThatFailed())
+            XCTAssertThrowsError(try failedHandle.offset())
+            XCTAssertEqual(try Data(contentsOf: session.framesURL), bytesBeforeFailure)
+            XCTAssertEqual(session.metadata.frameCount, failureCall - 1)
+
+            try await manager.appendFrame(frame, to: &session)
+            let afterRetry = await manager.debugIndexAndWriterCounts()
+            XCTAssertEqual(afterRetry.writerOpens, 2)
+            XCTAssertEqual(afterRetry.activeWriters, 1)
+            let restarted = WALManager(walRoot: root)
+            let recovered = try await restarted.listActiveSessions()
+            XCTAssertEqual(recovered.first?.metadata.frameCount, failureCall)
+            for index in 0..<failureCall {
+                let read = try await restarted.readFrame(videoID: session.videoID, frameIndex: index)
+                XCTAssertEqual(read.imageData, frame.imageData)
+            }
+            if failureCall == 2 {
+                let mapped = try await restarted.readFrame(videoID: session.videoID, frameID: 7100, fallbackFrameIndex: 99)
+                XCTAssertEqual(mapped.imageData, frame.imageData)
+            }
+            try await manager.clearAllSessions()
+        }
+    }
+
     func testWALWriterHandlesAreBoundedAndReopenAfterEviction() async throws {
         let root = makeTempRoot()
         defer { try? FileManager.default.removeItem(at: root) }
