@@ -3,6 +3,53 @@ import XCTest
 @testable import Retrace
 
 final class PreviewCacheMaintenanceTests: XCTestCase {
+    func testOneFrameEvictionDoesNotCancelUnrelatedQueuedWrite() async throws {
+        let root = directory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let queue = DispatchQueue(label: "preview-entry-eviction-test")
+        let gate = DispatchSemaphore(value: 0)
+        queue.async { gate.wait() }
+        defer { gate.signal() }
+        let worker = PreviewCacheDiskWorker(queue: queue)
+        var entries = PreviewCacheEntryEpochs<Int>()
+        let first = entries.epoch(for: 1)
+        let firstToken = first.current
+        let second = entries.epoch(for: 2)
+        let secondToken = second.current
+        let data = try fixtureJPEG()
+        worker.enqueueWrite(data, to: root.appendingPathComponent("one.jpg"), allowed: { first.matches(firstToken) })
+        worker.enqueueWrite(data, to: root.appendingPathComponent("two.jpg"), allowed: { second.matches(secondToken) })
+        entries.invalidate([2])
+        gate.signal()
+        await worker.flush()
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("one.jpg")), data)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("two.jpg").path))
+    }
+
+    func testFinishedMissesReleaseEpochsWithoutCancellingSameFrameWriter() async throws {
+        let root = directory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        var entries = PreviewCacheEntryEpochs<Int>()
+        for key in 0..<1000 {
+            let epoch = entries.epoch(for: key)
+            entries.finish(key, epoch: epoch, keep: false)
+        }
+        XCTAssertEqual(entries.count, 0)
+        let read = entries.epoch(for: 1)
+        let write = entries.epoch(for: 1)
+        let token = write.current
+        entries.finish(1, epoch: read, keep: false)
+        let worker = PreviewCacheDiskWorker()
+        let data = try fixtureJPEG()
+        worker.enqueueWrite(data, to: root.appendingPathComponent("one.jpg"), allowed: { write.matches(token) })
+        await worker.flush()
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("one.jpg")), data)
+        entries.finish(1, epoch: write, keep: true)
+        entries.invalidate([1])
+        XCTAssertFalse(write.matches(token))
+        XCTAssertEqual(entries.count, 0)
+    }
+
     private func directory() -> URL {
         FileManager.default.temporaryDirectory.appendingPathComponent("preview-cache-" + UUID().uuidString)
     }

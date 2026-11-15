@@ -938,6 +938,13 @@ public actor DatabaseManager: DatabaseProtocol {
         try SegmentQueries.delete(db: db, id: id)
     }
 
+    public func deleteUnreferencedVideoSegment(id: VideoSegmentID) async throws -> Bool {
+        guard let db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try SegmentQueries.deleteUnreferenced(db: db, id: id)
+    }
+
     public func getTotalStorageBytes() async throws -> Int64 {
         try withTracedDatabaseOperation("get_total_storage_bytes") { db in
             try SegmentQueries.getTotalStorageBytes(db: db)

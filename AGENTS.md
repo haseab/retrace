@@ -108,7 +108,7 @@ retrace/
 │   ├── Schema.swift             # Current schema definition
 │   ├── Migrations/              # Schema migration scripts
 │   ├── Queries/                 # Query implementations
-│   └── Tests/
+│   └── Tests/                  # Includes RetentionVideoDeletionTests (real SQLite guard/failure cases)
 │
 ├── Storage/                     # File I/O, HEVC encoding
 │   ├── AGENTS.md
@@ -116,21 +116,22 @@ retrace/
 │   ├── ImageExtractor.swift     # Extract frames from video files
 │   ├── IncrementalSegmentWriter.swift
 │   ├── SegmentWriterImpl.swift
-│   ├── FileManager/             # File system utilities
+│   ├── FileManager/             # File system utilities, including scoped TemporaryVideoLink
 │   ├── VideoEncoder/            # HEVC video encoding
 │   ├── WAL/                     # Write-Ahead Log (WALManager, RecoveryManager)
-│   └── Tests/
+│   └── Tests/                  # Includes TemporaryVideoLinkTests (real symlink lifetime)
 │
 ├── Capture/                     # CGWindowListCapture integration
 │   ├── AGENTS.md
 │   ├── CaptureManager.swift
 │   ├── ScreenCapture/           # Screen capture implementation
+│   │   ├── CaptureFrameCandidate.swift # Native-image exact-duplicate check before BGRA materialization
 │   │   └── ConferenceFaceBlurProcessor.swift # Vision face detection + irreversible conference-call face blur
 │   ├── Deduplication/           # Perceptual hash deduplication
 │   ├── Metadata/                # AppInfoProvider, BrowserURLExtractor
 │   │   ├── ConferenceCallActivityProvider.swift # Window-specific active-call accessibility controls
 │   │   └── ConferenceSessionPrivacyPolicy.swift # Conferencing-app rules + call-session consent tracking
-│   └── Tests/
+│   └── Tests/                  # Includes CaptureFrameCandidateTests (real screenshot pixels)
 │
 ├── Processing/                  # OCR and text extraction
 │   ├── AGENTS.md
@@ -164,8 +165,10 @@ retrace/
 │   ├── AppLifecycle.swift       # App lifecycle management
 │   ├── ModelManager.swift       # Model management
 │   ├── OnboardingManager.swift  # First-run onboarding flow
+│   ├── RetentionDeletionJournal.swift # Durable retries for database-first video deletion
 │   ├── RetentionManager.swift   # Data retention policies
 │   └── Tests/
+│       ├── RetentionDeletionJournalTests.swift # Real-file deletion failure and retry coverage
 │       ├── FeedbackRecentMetricSupportTests.swift # Feedback-export metric sanitization coverage
 │       ├── InPageURLCaptureRoutingTests.swift
 │       ├── DiagnosticLoggingTests.swift # Background log writes, bounded buffering, flush, summaries and release suppression
@@ -186,6 +189,7 @@ retrace/
     ├── Components/              # Reusable UI components (MenuBarManager, HotkeyManager, etc.)
     │   ├── MasterKeyRedactionFlowCoordinator.swift # Shared missing-master-key prompt/recovery coordinator
     │   ├── HoverLatchedScrollMonitor.swift # Shared nested-scroll latch helper for hover-routed inner scroll regions
+    │   ├── CapturedURLPolicy.swift # HTTP(S)-only policy for captured browser/OCR links
     │   ├── PreviewCacheMaintenance.swift # Incremental cache totals, bounded disk worker, batched cleanup and preview identity
     │   └── ProcessMonitorModels.swift # System Monitor snapshot/models + ranking helpers
     ├── ViewModels/              # View models (Dashboard, Search, Timeline, Feedback, Settings)
@@ -534,3 +538,14 @@ _This file follows the AGENTS.md standard for AI agent guidance. Last updated: 2
 - Keep a persistent development namespace for settings, library, caches, logs, Keychain items, and instance locks, separate from production. Preserve development data and permissions across normal rebuilds.
 - Build and sign on `hac-mini`. When using the authorized MacBook visual-testing fallback, transfer the prebuilt app; the fallback does not authorize builds or source edits on the MacBook.
 - Expect initial Screen Recording and Accessibility grants on each Mac. Stable signing should normally preserve recognition across rebuilds, but macOS can still require reauthorization. Codex computer-use launch confirmations are separate from macOS privacy permissions.
+
+### Recording maintenance and deletion safety
+
+- WAL append handles use an eight-entry LRU cache within active sessions; close them on finalization, quarantine, reset, and append failure. Append/register extends the offset index in place. Recovery counts/indexes must rescan and validate headers instead of trusting a writer's cached offsets.
+- Retention persists pending video-deletion IDs under the library root before deleting any video rows. Delete only completed videos with no remaining frame references, then remove the file; preserve failed operations for retry after restart. Keep journal access on the retention actor and coalesce overlapping cleanup runs.
+- Native capture candidates have already passed window/conference privacy masking. Reuse prior BGRA pixels only when image bytes and rendering properties match exactly; preserve the existing perceptual threshold, mouse-trigger semantics, and metadata. Retain at most the last kept native image and account for it in the memory ledger. Near duplicates still require the normal BGRA conversion.
+- Temporary MP4 links owned by local AVAssetReader operations must be removed after reader completion and on error. Generator-cache links retain their existing longer lifetime until eviction. Do not sweep arbitrary historical UUID links from the shared temporary directory.
+- Captured browser/OCR links may launch only HTTP(S) URLs with a host. Validate before default-browser lookup, NSWorkspace fallback dispatch, or successful-open metrics.
+- Orphan-node scans require actual frame deletions. Routine DB storage sampling runs every 15 minutes; orphan-video polling runs every 10 minutes in addition to startup recovery. These are maintenance fixes, not new user actions requiring new daily metrics.
+
+- Ordinary timeline-cache misses do not advance the global cache epoch. Entry eviction invalidates only that frame; keep per-frame epochs alive while reads/writes overlap and release miss-only epochs when the final operation finishes. Clear/redaction still invalidates all work.

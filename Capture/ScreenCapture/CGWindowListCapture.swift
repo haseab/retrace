@@ -557,11 +557,16 @@ public actor CGWindowListCapture {
 
     func captureFrame(displayID: CGDirectDisplayID) async -> CapturedFrame? {
         currentDisplayID = displayID
-        return await captureFrameInternal(displayID: displayID)
+        return await captureFrameInternal(displayID: displayID)?.materialize()
     }
 
     /// Capture a single frame with real-time filtering of excluded apps and private windows
-    private func captureFrameInternal(displayID: CGWindowID) async -> CapturedFrame? {
+    func captureCandidate(displayID: CGDirectDisplayID) async -> CaptureFrameCandidate? {
+        guard isActive else { return nil }
+        return await captureFrameInternal(displayID: displayID)
+    }
+
+    private func captureFrameInternal(displayID: CGWindowID) async -> CaptureFrameCandidate? {
         guard isActive, let config = currentConfig else { return nil }
         let residualEpoch = await MemoryLedger.beginResidualEpoch(
             ownerFunction: "capture.screen_capture",
@@ -828,26 +833,16 @@ public actor CGWindowListCapture {
             }
         }
 
-        // Convert final CGImage to BGRA data format after any conference privacy blur is applied.
-        guard let frameData = convertCGImageToBGRAData(cgImage) else {
-            Log.warning("[CGWindowListCapture] Failed to convert CGImage to BGRA data for displayID=\(displayID)", category: .capture)
-            return nil
-        }
-
         // Get display info and captured image dimensions
         let width = cgImage.width
         let height = cgImage.height
-        let bytesPerRow = width * 4
 
         Log.verbose("[CGWindowListCapture] Frame captured: \(width)x\(height), excluded \(excludedIDs.count) windows", category: .capture)
 
         // Create captured frame
-        let frame = CapturedFrame(
+        let frame = CaptureFrameCandidate(
+            image: cgImage,
             timestamp: Date(),
-            imageData: frameData,
-            width: width,
-            height: height,
-            bytesPerRow: bytesPerRow,
             metadata: FrameMetadata(
                 appBundleID: frameMetadataAppBundleID,
                 appName: frameMetadataAppName,
@@ -2083,39 +2078,6 @@ public actor CGWindowListCapture {
     }
 
     /// Convert CGImage to BGRA Data format (matching ScreenCaptureKit's kCVPixelFormatType_32BGRA)
-    private func convertCGImageToBGRAData(_ cgImage: CGImage) -> Data? {
-        let width = cgImage.width
-        let height = cgImage.height
-        let bytesPerRow = width * 4 // BGRA = 4 bytes per pixel
-        let dataSize = bytesPerRow * height
-
-        // Allocate buffer
-        var pixelData = Data(count: dataSize)
-
-        // Create bitmap context and draw within the same closure to ensure pointer validity
-        let success = pixelData.withUnsafeMutableBytes { rawBufferPointer -> Bool in
-            guard let baseAddress = rawBufferPointer.baseAddress else { return false }
-
-            guard let context = CGContext(
-                data: baseAddress,
-                width: width,
-                height: height,
-                bitsPerComponent: 8,
-                bytesPerRow: bytesPerRow,
-                space: CGColorSpaceCreateDeviceRGB(),
-                bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
-            ) else {
-                return false
-            }
-
-            // Draw the image into the context (converts to BGRA)
-            context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
-            return true
-        }
-
-        return success ? pixelData : nil
-    }
-
     private static func estimatedImageSurfaceBytes(width: Int, height: Int, copies: Int64 = 1) -> Int64 {
         guard width > 0, height > 0, copies > 0 else { return 0 }
         let rowBytes = Int64(width) * 4

@@ -1038,6 +1038,48 @@ final class StorageManagerTests: XCTestCase {
         XCTAssertEqual(last.imageData, frame.imageData)
     }
 
+    func testWALWriterHandlesAreBoundedAndReopenAfterEviction() async throws {
+        let root = makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let manager = WALManager(walRoot: root)
+        let frame = try makeWALScreenshotFrame()
+        var first = try await manager.createSession(videoID: VideoSegmentID(value: 500))
+        try await manager.appendFrame(frame, to: &first)
+        for id in 501...512 {
+            var session = try await manager.createSession(videoID: VideoSegmentID(value: Int64(id)))
+            try await manager.appendFrame(frame, to: &session)
+        }
+        let counts = await manager.debugIndexAndWriterCounts()
+        XCTAssertEqual(counts.activeWriters, 8)
+        try await manager.appendFrame(frame, to: &first)
+        try await manager.registerFrameID(videoID: first.videoID, frameID: 7001, frameIndex: 1)
+        let reopened = try await manager.readFrame(videoID: first.videoID, frameID: 7001, fallbackFrameIndex: 99)
+        XCTAssertEqual(reopened.imageData, frame.imageData)
+        try await manager.clearAllSessions()
+        let cleared = await manager.debugIndexAndWriterCounts()
+        XCTAssertEqual(cleared.activeWriters, 0)
+    }
+
+    func testWALAppendAndRegisterKeepsIncrementalIndexAndSingleWriter() async throws {
+        let root = makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let manager = WALManager(walRoot: root)
+        var session = try await manager.createSession(videoID: VideoSegmentID(value: 493))
+        let frame = try makeWALScreenshotFrame()
+        for index in 0..<20 {
+            try await manager.appendFrame(frame, to: &session)
+            try await manager.registerFrameID(videoID: session.videoID, frameID: Int64(9000 + index), frameIndex: index)
+        }
+        let counts = await manager.debugIndexAndWriterCounts()
+        XCTAssertEqual(counts.indexBuilds, 0)
+        XCTAssertEqual(counts.writerOpens, 1)
+        let restarted = WALManager(walRoot: root)
+        let recovered = try await restarted.readFrame(videoID: session.videoID, frameID: 9019, fallbackFrameIndex: 99)
+        XCTAssertEqual(recovered.imageData, frame.imageData)
+        try await manager.finalizeSession(session)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: session.sessionDir.path))
+    }
+
     func testWALPeriodicMetadataCheckpointPreservesDurableFrontier() async throws {
         let root = makeTempRoot()
         defer { try? FileManager.default.removeItem(at: root) }

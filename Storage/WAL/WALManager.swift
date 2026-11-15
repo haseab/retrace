@@ -28,6 +28,12 @@ public enum WALQuarantineDisposition: Sendable {
 ///       ├── frames.bin      # Independent versioned records (header, metadata, LZFSE pixels)
 ///       └── metadata.json   # Segment metadata (videoID, startTime, frameCount)
 public actor WALManager {
+    private var appendHandles: [Int64: FileHandle] = [:]
+    private var appendHandleUses: [Int64: UInt64] = [:]
+    private var appendUseSequence: UInt64 = 0
+    private static let maximumAppendHandles = 8
+    private var indexBuildCount = 0
+    private var writerOpenCount = 0
     private let walRootURL: URL
     private var frameOffsetIndexCache: [Int64: WALFrameOffsetIndex] = [:]
     private var frameIDOffsetIndexCache: [Int64: WALFrameIDOffsetIndex] = [:]
@@ -92,6 +98,7 @@ public actor WALManager {
     /// Create a new WAL session for a video segment
     public func createSession(videoID: VideoSegmentID) async throws -> WALSession {
         try await initialize()
+        clearSessionCaches(videoIDValue: videoID.value)
 
         let sessionDir = walRootURL.appendingPathComponent("active_segment_\(videoID.value)")
 
@@ -134,6 +141,7 @@ public actor WALManager {
             )
         }
 
+        frameOffsetIndexCache[videoID.value] = WALFrameOffsetIndex(fileSize: 0, offsets: [])
         activeMetadata[videoID.value] = metadata
         metadataCheckpointTimes[videoID.value] = ProcessInfo.processInfo.systemUptime
         return WALSession(
@@ -188,11 +196,23 @@ public actor WALManager {
 
         let fileHandle: FileHandle
         do {
-            fileHandle = try FileHandle(forWritingTo: session.framesURL)
+            if let existing = appendHandles[session.videoID.value] {
+                fileHandle = existing
+            } else {
+                if appendHandles.count >= Self.maximumAppendHandles,
+                   let oldest = appendHandleUses.min(by: { $0.value < $1.value })?.key {
+                    try? appendHandles.removeValue(forKey: oldest)?.close()
+                    appendHandleUses.removeValue(forKey: oldest)
+                }
+                fileHandle = try FileHandle(forWritingTo: session.framesURL)
+                appendHandles[session.videoID.value] = fileHandle
+                writerOpenCount += 1
+            }
         } catch {
             throw makeStorageWriteError(path: session.framesURL.path, error: error, fallback: "Cannot open WAL for appending")
         }
-        defer { try? fileHandle.close() }
+        appendUseSequence &+= 1
+        appendHandleUses[session.videoID.value] = appendUseSequence
         let recordOffset = try fileHandle.seekToEnd()
         do {
             try fileHandle.write(contentsOf: headerData)
@@ -202,6 +222,8 @@ public actor WALManager {
             // A failed append must not strand a partial record before the next append.
             // A process crash still leaves a recoverable prefix, as with legacy WALs.
             try? fileHandle.truncate(atOffset: recordOffset)
+            try? appendHandles.removeValue(forKey: session.videoID.value)?.close()
+            appendHandleUses.removeValue(forKey: session.videoID.value)
             frameOffsetIndexCache.removeValue(forKey: session.videoID.value)
             throw makeStorageWriteError(path: session.framesURL.path, error: error, fallback: "Failed to append frame to WAL")
         }
@@ -239,9 +261,14 @@ public actor WALManager {
             }
         }
 
-        // Invalidate frame offset index cache so the next random-access read
-        // can rebuild with the newly appended frame.
-        frameOffsetIndexCache.removeValue(forKey: session.videoID.value)
+        // Extend in place: copying the cached array into a local value here would
+        // introduce copy-on-write work proportional to the segment length.
+        if frameOffsetIndexCache[session.videoID.value]?.fileSize == Int64(recordOffset) {
+            frameOffsetIndexCache[session.videoID.value]?.offsets.append(recordOffset)
+            frameOffsetIndexCache[session.videoID.value]?.fileSize = Int64(recordOffset) + Int64(headerData.count + strings.reduce(0) { $0 + $1.count } + payload.count)
+        } else {
+            frameOffsetIndexCache.removeValue(forKey: session.videoID.value)
+        }
     }
 
     /// Persist the readable frontier of the fragmented MP4 so recovery can
@@ -350,6 +377,7 @@ public actor WALManager {
 
     /// Finalize a WAL session (after successful video encoding)
     public func finalizeSession(_ session: WALSession) async throws {
+        closeAppendHandle(videoIDValue: session.videoID.value)
         // Delete the WAL directory - video is now safely encoded
         // Use try? to handle case where directory was already deleted (e.g., double-finalize)
         if FileManager.default.fileExists(atPath: session.sessionDir.path) {
@@ -375,6 +403,7 @@ public actor WALManager {
             )
         }
 
+        closeAppendHandle(videoIDValue: videoID.value)
         try FileManager.default.removeItem(at: sessionDir)
         clearSessionCaches(videoIDValue: videoID.value)
         return true
@@ -383,6 +412,11 @@ public actor WALManager {
     /// Clear ALL WAL sessions (used when changing database location)
     /// WARNING: This deletes unrecovered frame data! Only call when intentionally switching databases.
     public func clearAllSessions() async throws {
+        // Close first: even a partially failed directory removal must not leave a
+        // writer successfully appending to an unlinked, unrecoverable inode.
+        for handle in appendHandles.values { try? handle.close() }
+        appendHandles.removeAll()
+        appendHandleUses.removeAll()
         guard FileManager.default.fileExists(atPath: walRootURL.path) else {
             return
         }
@@ -593,7 +627,8 @@ public actor WALManager {
         return try frameOffsets(
             for: session.videoID.value,
             framesURL: session.framesURL,
-            currentFileSize: fileSize
+            currentFileSize: fileSize,
+            forceValidation: true
         ).count
     }
 
@@ -628,7 +663,8 @@ public actor WALManager {
         let recoverableOffsets = try frameOffsets(
             for: session.videoID.value,
             framesURL: session.framesURL,
-            currentFileSize: fileSize
+            currentFileSize: fileSize,
+            forceValidation: true
         )
         let offsetToFrameIndex = Dictionary(uniqueKeysWithValues: recoverableOffsets.enumerated().map { ($0.element, $0.offset) })
 
@@ -981,11 +1017,12 @@ public actor WALManager {
         return byteCount
     }
 
-    private func frameOffsets(for videoIDValue: Int64, framesURL: URL, currentFileSize: Int64) throws -> [UInt64] {
-        if let cached = frameOffsetIndexCache[videoIDValue], cached.fileSize == currentFileSize {
+    private func frameOffsets(for videoIDValue: Int64, framesURL: URL, currentFileSize: Int64, forceValidation: Bool = false) throws -> [UInt64] {
+        if !forceValidation, let cached = frameOffsetIndexCache[videoIDValue], cached.fileSize == currentFileSize {
             return cached.offsets
         }
 
+        indexBuildCount += 1
         let offsets = try buildFrameOffsetIndex(framesURL: framesURL, currentFileSize: currentFileSize)
         frameOffsetIndexCache[videoIDValue] = WALFrameOffsetIndex(fileSize: currentFileSize, offsets: offsets)
         return offsets
@@ -1443,7 +1480,17 @@ public actor WALManager {
         return data
     }
 
+    func debugIndexAndWriterCounts() -> (indexBuilds: Int, writerOpens: Int, activeWriters: Int) {
+        (indexBuildCount, writerOpenCount, appendHandles.count)
+    }
+
+    private func closeAppendHandle(videoIDValue: Int64) {
+        try? appendHandles.removeValue(forKey: videoIDValue)?.close()
+        appendHandleUses.removeValue(forKey: videoIDValue)
+    }
+
     private func clearSessionCaches(videoIDValue: Int64) {
+        closeAppendHandle(videoIDValue: videoIDValue)
         activeMetadata.removeValue(forKey: videoIDValue)
         metadataCheckpointTimes.removeValue(forKey: videoIDValue)
         compressionTotals.removeValue(forKey: videoIDValue)
@@ -1735,8 +1782,8 @@ private struct WALCompressionTotals {
 }
 
 private struct WALFrameOffsetIndex {
-    let fileSize: Int64
-    let offsets: [UInt64]
+    var fileSize: Int64
+    var offsets: [UInt64]
 }
 
 struct WALRecoveryIndex: Sendable {
