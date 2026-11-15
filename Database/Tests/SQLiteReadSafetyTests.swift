@@ -84,6 +84,37 @@ final class SQLiteReadSafetyTests: XCTestCase {
         }
     }
 
+    func testInterruptedSchemaReadFinalizesItsStatements() async throws {
+        let database = DatabaseManager(databasePath: "file:schema_read_\(UUID().uuidString)?mode=memory&cache=private")
+        try await database.initialize()
+        let pointer = await database.getConnection()
+        let db = try XCTUnwrap(pointer)
+        func statementCount() -> Int {
+            var count = 0
+            var statement = sqlite3_next_stmt(db, nil)
+            while let current = statement {
+                count += 1
+                statement = sqlite3_next_stmt(db, current)
+            }
+            return count
+        }
+        let before = statementCount()
+        sqlite3_trace_v2(db, UInt32(SQLITE_TRACE_STMT), { _, context, statement, _ in
+            if let statement, let sql = sqlite3_sql(OpaquePointer(statement)),
+               String(cString: sql).hasPrefix("PRAGMA table_info") {
+                sqlite3_interrupt(OpaquePointer(context!))
+            }
+            return 0
+        }, UnsafeMutableRawPointer(db))
+        do {
+            _ = try await database.getSchemaDescription()
+            XCTFail("Expected interrupted schema read")
+        } catch {}
+        sqlite3_trace_v2(db, 0, nil, nil)
+        XCTAssertEqual(statementCount(), before)
+        try await database.close()
+    }
+
     private final class BusyContext {
         let writer: OpaquePointer
         let releaseOnFirstBusy: Bool

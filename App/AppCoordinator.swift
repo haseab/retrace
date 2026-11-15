@@ -2274,8 +2274,8 @@ public actor AppCoordinator {
                     let frameToEnqueue = firstFrame
                     // Keep pending work until both database operations succeed.
                     try await services.database.markFrameReadable(frameID: frameToEnqueue.frameID)
-                    recordReadableFrameProgress(at: Date())
                     try await processingQueue.enqueue(frameID: frameToEnqueue.frameID)
+                    recordReadableFrameProgress(at: Date())
                     writerState.pendingFrames.removeFirst()
                 }
 

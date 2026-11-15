@@ -4779,6 +4779,7 @@ public actor DatabaseManager: DatabaseProtocol {
             var pragmaStmt: OpaquePointer?
 
             if sqlite3_prepare_v2(db, pragmaSql, -1, &pragmaStmt, nil) == SQLITE_OK {
+                defer { sqlite3_finalize(pragmaStmt) }
                 while try SQLiteReadStep.next(pragmaStmt) == SQLITE_ROW {
                     let colName = sqlite3_column_text(pragmaStmt, 1).map { String(cString: $0) } ?? "?"
                     let colType = sqlite3_column_text(pragmaStmt, 2).map { String(cString: $0) } ?? "?"
@@ -4790,7 +4791,6 @@ public actor DatabaseManager: DatabaseProtocol {
                     if notNull { colDesc += " NOT NULL" }
                     result += colDesc + "\n"
                 }
-                sqlite3_finalize(pragmaStmt)
             }
 
             result += "\n"
