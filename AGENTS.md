@@ -77,6 +77,7 @@ retrace/
 │   ├── MasterKeyManager.swift   # Keychain-backed master key creation + recovery phrase export
 │   ├── ReversibleOCRScrambler.swift # Deterministic reversible OCR patch scrambling + text protection
 │   ├── Models/                  # Data types used across modules
+│   │   ├── WindowTitleWords.swift # Word-level OCR title comparison for discrepancy analysis
 │   │   ├── Frame.swift          # FrameID, CapturedFrame, VideoSegment
 │   │   ├── Text.swift           # ExtractedText, OCRTextRegion
 │   │   ├── TextRegion.swift     # OCR text region types
@@ -550,3 +551,14 @@ _This file follows the AGENTS.md standard for AI agent guidance. Last updated: 2
 - Orphan-node scans require actual frame deletions. Routine DB storage sampling runs every 15 minutes; orphan-video polling runs every 10 minutes in addition to startup recovery. These are maintenance fixes, not new user actions requiring new daily metrics.
 
 - Ordinary timeline-cache misses do not advance the global cache epoch. Entry eviction invalidates only that frame; keep per-frame epochs alive while reads/writes overlap and release miss-only epochs when the final operation finishes. Clear/redaction still invalidates all work.
+
+## Window-title discrepancy analysis foundation
+
+Retain `Shared/Models/WindowTitleWords.swift` for word-level OCR/title comparison and
+`Processing/Tests/WindowTitleWordsTests.swift` for recorded BB OCR pairs. The APP coordinator
+owns this Shared/Processing foundation. The abandoned capture validation PR is closed; do not
+restore its added AX reads, 150ms wait, confidence schema or title-filter behavior. Capture,
+processing integration, storage and searches remain unchanged from main. No background job
+is wired yet, so this helper introduces no feature/action requiring a new daily metric.
+Future analysis should compare surrounding stored-title and spatial OCR-title sequences in
+both directions, tolerating spelling noise and investigating divergence/reconnection.
