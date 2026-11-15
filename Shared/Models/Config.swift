@@ -462,11 +462,20 @@ public enum PhraseRedactionMode: String, CaseIterable, Codable, Sendable {
 
     public static let didFinishNotification = Notification.Name("PhraseRedactionDidFinish")
 
+    public static func configuredPhrases(in defaults: UserDefaults) -> [String] {
+        guard let raw = defaults.string(forKey: "phraseLevelRedactionPhrases") else { return [] }
+        let phrases: [String]
+        if let data = raw.data(using: .utf8), let decoded = try? JSONDecoder().decode([String].self, from: data) {
+            phrases = decoded
+        } else {
+            phrases = raw.split(whereSeparator: { $0 == "," || $0 == "\n" }).map(String.init)
+        }
+        return phrases.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+    }
+
     public static func isEnabled(in defaults: UserDefaults) -> Bool {
         if let enabled = defaults.object(forKey: "phraseLevelRedactionEnabled") as? Bool { return enabled }
-        guard let raw = defaults.string(forKey: "phraseLevelRedactionPhrases"),
-              let data = raw.data(using: .utf8), let phrases = try? JSONDecoder().decode([String].self, from: data) else { return false }
-        return phrases.contains { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        return !configuredPhrases(in: defaults).isEmpty
     }
 
     public static let defaultsKey = "phraseLevelRedactionMode"

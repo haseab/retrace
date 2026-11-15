@@ -14,6 +14,19 @@ final class PrivacyProtectionTests: XCTestCase {
         XCTAssertEqual(PrivacyLogMessage(redacting: secret).text, "[private message]")
     }
 
+    func testLegacyKeywordSettingsEnablePreviewProtection() {
+        let suite = "retrace-privacy-test-" + UUID().uuidString
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        for raw in ["secret,email", "secret\nemail", "[\"secret\",\"email\"]"] {
+            defaults.set(raw, forKey: "phraseLevelRedactionPhrases")
+            XCTAssertTrue(PhraseRedactionMode.isEnabled(in: defaults))
+            XCTAssertEqual(PhraseRedactionMode.configuredPhrases(in: defaults), ["secret", "email"])
+        }
+        defaults.set(false, forKey: "phraseLevelRedactionEnabled")
+        XCTAssertFalse(PhraseRedactionMode.isEnabled(in: defaults))
+    }
+
     func testPermanentRedactionDestroysEveryPixelIncludingTinyPatches() {
         for (width, height) in [(1, 1), (16, 16), (32, 16), (61, 23)] {
             var bytes = Data(repeating: 123, count: width * height * 4)

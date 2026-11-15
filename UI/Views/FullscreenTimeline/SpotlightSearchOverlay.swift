@@ -1165,9 +1165,10 @@ public struct SpotlightSearchOverlay: View {
                             },
                             viewModel: viewModel
                         )
-                        .onAppear {
+                        .task(id: viewModel.searchGeneration) {
                             loadThumbnail(for: result)
-
+                        }
+                        .onAppear {
                             // Infinite scroll: load more when near the end
                             if index >= visibleResults.count - 3 && viewModel.canLoadMore {
                                 viewModel.loadMore()

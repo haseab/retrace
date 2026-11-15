@@ -764,3 +764,5 @@ Focus on getting the timeline + search working first before polishing dashboard/
 - Permanent-node tooltips are noninteractive and say “Permanently redacted”; reveal and clipboard paths must never recover their removed text or pixels.
 - Feedback log readers accept only the privacy-safe logger format and strip its format marker before normal grouping. All legacy file lines, including error and grouped channels, are excluded.
 - While keyword protection is enabled, timeline/search disk previews are bypassed. Completed rewrites invalidate preview images without resetting timeline filters or search queries.
+
+- Visible search cards reload thumbnails with a generation-keyed task after rewrite invalidation; keep card identity stable.
