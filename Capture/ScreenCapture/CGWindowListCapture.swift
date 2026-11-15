@@ -193,6 +193,7 @@ public actor CGWindowListCapture {
 
     // MARK: - Properties
 
+    private var titleCaptureGeneration: UInt64 = 0
     nonisolated(unsafe) private var currentDisplayID: CGWindowID?
     private var isActive = false
     private var currentConfig: CaptureConfig?
@@ -507,10 +508,12 @@ public actor CGWindowListCapture {
 
         // Use provided display ID or fall back to main display
         self.currentDisplayID = displayID ?? CGMainDisplayID()
+        titleCaptureGeneration &+= 1
     }
 
     /// Stop capturing frames
     func stopCapture() async throws {
+        titleCaptureGeneration &+= 1
         guard isActive else { return }
 
         isActive = false
@@ -524,6 +527,7 @@ public actor CGWindowListCapture {
 
     /// Update capture configuration
     func updateConfig(_ config: CaptureConfig) async throws {
+        titleCaptureGeneration &+= 1
         self.currentConfig = config
         // No need to update excluded windows here - they're computed on every capture
     }
@@ -559,12 +563,15 @@ public actor CGWindowListCapture {
 
     func captureFrame(displayID: CGDirectDisplayID) async -> CapturedFrame? {
         currentDisplayID = displayID
+        titleCaptureGeneration &+= 1
         return await captureFrameInternal(displayID: displayID)?.materialize()
     }
 
     /// Capture a single frame with real-time filtering of excluded apps and private windows
     func captureCandidate(displayID: CGDirectDisplayID) async -> CaptureFrameCandidate? {
         guard isActive else { return nil }
+        currentDisplayID = displayID
+        titleCaptureGeneration &+= 1
         return await captureFrameInternal(displayID: displayID)
     }
 
@@ -601,6 +608,17 @@ public actor CGWindowListCapture {
         }
         logCaptureResumeIfNeeded()
 
+        let generation = titleCaptureGeneration
+        let titleReader = WindowTitleBoundaryReader()
+        let titleBefore: WindowTitleObservation?
+        if let pid = exclusionResult.visibleWindowContext?.ownerPID {
+            // The fresh AX/CG pair chooses the window within the privacy plan's app.
+            titleBefore = await titleReader.read(displayID: displayID, expectedPID: pid)
+        } else {
+            titleBefore = nil
+        }
+        guard isActive, titleCaptureGeneration == generation else { return nil }
+        let imageTimestamp = Date()
         // Capture the frame using CGWindowList with filtering
         guard let captureResult = captureWithFiltering(
             displayID: displayID,
@@ -611,6 +629,20 @@ public actor CGWindowListCapture {
             Log.warning("[CGWindowListCapture] Failed to capture CGImage for displayID=\(displayID), excludedCount=\(excludedIDs.count)", category: .capture)
             return nil
         }
+        // Suspend without blocking the UI or doing a second OCR pass.
+        do { try await Task.sleep(for: .milliseconds(150), clock: .continuous) }
+        catch { return nil }
+        guard isActive, titleCaptureGeneration == generation, !Task.isCancelled,
+              screenLockStateMonitor.captureBlockReason() == nil else { return nil }
+        let titleAfter: WindowTitleObservation?
+        if let before = titleBefore {
+            titleAfter = await titleReader.read(displayID: displayID, expectedPID: before.pid,
+                                                expectedWindowID: before.windowID)
+        } else {
+            titleAfter = nil
+        }
+        guard isActive, titleCaptureGeneration == generation else { return nil }
+        let titleEvidence = WindowTitleEvidence(before: titleBefore, after: titleAfter)
         var cgImage = captureResult.image
         let displaySurfaceBytes = Self.estimatedImageSurfaceBytes(width: cgImage.width, height: cgImage.height)
         lastDisplaySurfaceBytes = displaySurfaceBytes
@@ -653,8 +685,12 @@ public actor CGWindowListCapture {
         // Conference blur detection may use a fallback overlay context separately.
         let frameMetadataAppBundleID = redactionSummary?.appBundleID ?? visibleWindowContext?.appBundleID
         let frameMetadataAppName = redactionSummary?.appName ?? visibleWindowContext?.appName
-        let frameMetadataWindowName = redactionSummary == nil ? visibleWindowContext?.windowName : nil
-        let frameMetadataBrowserURL = redactionSummary == nil ? visibleWindowContext?.browserURL : nil
+        let frameMetadataWindowName: String? = nil // Assigned only after existing OCR confirms the AX boundaries.
+        let boundaryMatchesContext = titleBefore?.windowID == visibleWindowContext?.windowID &&
+            titleAfter?.windowID == titleBefore?.windowID &&
+            titleBefore?.pid == titleAfter?.pid && titleBefore?.title == titleAfter?.title &&
+            titleBefore.map { WindowTitleWords.tokens($0.title) } == visibleWindowContext?.windowName.map { WindowTitleWords.tokens($0) }
+        let frameMetadataBrowserURL = redactionSummary == nil && boundaryMatchesContext ? visibleWindowContext?.browserURL : nil
 
         let conferenceWindowMatches = matchedConferenceWindows(
             from: exclusionResult.conferenceWindowContexts.tracked,
@@ -842,17 +878,20 @@ public actor CGWindowListCapture {
 
         Log.verbose("[CGWindowListCapture] Frame captured: \(width)x\(height), excluded \(excludedIDs.count) windows", category: .capture)
 
+        guard isActive, titleCaptureGeneration == generation, !Task.isCancelled,
+              screenLockStateMonitor.captureBlockReason() == nil else { return nil }
         // Create captured frame
         let frame = CaptureFrameCandidate(
             image: cgImage,
-            timestamp: Date(),
+            timestamp: imageTimestamp,
             metadata: FrameMetadata(
                 appBundleID: frameMetadataAppBundleID,
                 appName: frameMetadataAppName,
                 windowName: frameMetadataWindowName,
                 browserURL: frameMetadataBrowserURL,
                 redactionReason: redactionSummary?.reason,
-                displayID: UInt32(displayID)
+                displayID: UInt32(displayID),
+                windowTitleEvidence: redactionSummary == nil ? titleEvidence : nil
             )
         )
 

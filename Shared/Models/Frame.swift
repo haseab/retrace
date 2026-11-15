@@ -44,6 +44,9 @@ public struct FrameMetadata: Codable, Sendable, Equatable {
     /// Title of the active window
     public let windowName: String?
 
+    /// Non-nil means the title must remain unassigned until existing OCR validates it.
+    public let windowTitleEvidence: WindowTitleEvidence?
+
     /// URL if the active app is a browser
     public let browserURL: String?
 
@@ -67,7 +70,8 @@ public struct FrameMetadata: Codable, Sendable, Equatable {
         redactionReason: String? = nil,
         captureTrigger: FrameCaptureTrigger? = nil,
         displayID: UInt32 = 0,
-        mousePosition: CGPoint? = nil
+        mousePosition: CGPoint? = nil,
+        windowTitleEvidence: WindowTitleEvidence? = nil
     ) {
         self.appBundleID = appBundleID
         self.appName = appName
@@ -77,6 +81,7 @@ public struct FrameMetadata: Codable, Sendable, Equatable {
         self.captureTrigger = captureTrigger
         self.displayID = displayID
         self.mousePosition = mousePosition
+        self.windowTitleEvidence = windowTitleEvidence
     }
 
     public static let empty = FrameMetadata()

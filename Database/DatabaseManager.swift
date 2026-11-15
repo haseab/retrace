@@ -601,7 +601,12 @@ public actor DatabaseManager: DatabaseProtocol {
 
     public func insertFrame(_ frame: FrameReference) async throws -> Int64 {
         try withTracedDatabaseOperation("insert_frame") { db in
-            try FrameQueries.insert(db: db, frame: frame)
+            let id = try FrameQueries.insert(db: db, frame: frame)
+            if frame.metadata.windowTitleEvidence != nil {
+                try? DailyMetricsQueries.recordEvent(db: db, metricType: .windowTitleValidation,
+                    metadata: "{\"outcome\":\"pending\"}")
+            }
+            return id
         }
     }
 
@@ -769,6 +774,18 @@ public actor DatabaseManager: DatabaseProtocol {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
         try FrameQueries.updateMetadata(db: db, frameId: frameID.value, metadataJSON: metadataJSON)
+    }
+
+    public func getWindowTitleEvidence(frameID: FrameID) async throws -> WindowTitleEvidence? {
+        try withTracedDatabaseOperation("get_window_title_evidence") { db in
+            try FrameQueries.getWindowTitleEvidence(db: db, frameID: frameID.value)
+        }
+    }
+
+    public func resolveWindowTitle(frameID: FrameID, title: String?) async throws {
+        try withTracedDatabaseOperation("resolve_window_title") { db in
+            try FrameQueries.resolveWindowTitle(db: db, frameID: frameID.value, title: title)
+        }
     }
 
     public func getFrameMetadata(frameID: FrameID) async throws -> String? {

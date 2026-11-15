@@ -10,6 +10,7 @@ You are responsible for the **Processing** module of Retrace. Your job is to imp
 Processing/
 ├── ExtractMemoryInstrumentation.swift # Request-scoped extract residual/handoff instrumentation helper
 ├── ExtractRequestInstrumentation.swift # Request wrapper that drives extract-stage residual accounting
+├── WindowTitleValidator.swift       # Existing OCR caption/selected-tab comparison against capture AX evidence
 ├── ProcessingManager.swift        # Main ProcessingProtocol implementation
 ├── FrameProcessingQueue.swift     # OCR pipeline orchestration + queue telemetry
 ├── URLExtractor.swift             # URL extraction from OCR text
@@ -33,6 +34,7 @@ Processing/
 ├── TextMerger/
 │   └── TextMerger.swift            # Combine OCR + AX results
 └── Tests/
+    ├── WindowTitleValidatorTests.swift # Recorded BB title/OCR regressions and spatial guards
     ├── ExtractRequestInstrumentationTests.swift # Region tail aggregation and coordinator helper coverage
     ├── InPageURLMetadataResolutionTests.swift # In-page URL metadata retry and rewrite scheduling regression coverage
     ├── OCRMemoryBackpressurePolicyTests.swift # OCR memory backpressure threshold/default coverage
@@ -416,3 +418,12 @@ Recovery scanning must wait for all active rewrites and block new rewrite reserv
 `FrameProcessingQueue.enqueueBatch` passes the whole ID list to `DatabaseManager.enqueueFramesForProcessing` in one await. Increase `currentQueueDepth` only after the database commits the whole batch; empty batches are no-ops and failures add nothing. `RewriteRetryPolicyTests.testEnqueueBatchIsAtomicAndUsesDatabaseBatch` exercises this wiring against migrated SQLite. This is maintenance of an existing action; no new daily metric is needed.
 
 When checking whether a frame is unrecoverable, a failed video-row lookup must not authorize deletion. Only a successful missing-row result establishes that the video row is absent. `RewriteRetryPolicyTests.testDatabaseReadFailureDoesNotAuthorizeFrameDeletion` covers a denied read against real SQLite.
+
+### Window title attribution
+
+After phrase redaction, `FrameProcessingQueue` validates dedicated capture evidence using
+existing main/chrome OCR regions; do not run extra OCR or current-time AX queries here.
+OCR bounds are top-left frame pixels; capture evidence regions are top-left normalized.
+Publish only confirmed titles to the frame-owned segment and FTS metadata. Missing/changed
+AX, excluded OCR, unavailable title geometry or mismatched OCR leave screenshots retained
+and titles unassigned. Emit `window_title_validation` outcome metrics without title text.

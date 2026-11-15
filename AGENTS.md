@@ -77,6 +77,7 @@ retrace/
 │   ├── MasterKeyManager.swift   # Keychain-backed master key creation + recovery phrase export
 │   ├── ReversibleOCRScrambler.swift # Deterministic reversible OCR patch scrambling + text protection
 │   ├── Models/                  # Data types used across modules
+│   │   ├── WindowTitleValidation.swift # Capture boundary evidence and word-level OCR matching
 │   │   ├── Frame.swift          # FrameID, CapturedFrame, VideoSegment
 │   │   ├── Text.swift           # ExtractedText, OCRTextRegion
 │   │   ├── TextRegion.swift     # OCR text region types
@@ -129,12 +130,14 @@ retrace/
 │   │   └── ConferenceFaceBlurProcessor.swift # Vision face detection + irreversible conference-call face blur
 │   ├── Deduplication/           # Perceptual hash deduplication
 │   ├── Metadata/                # AppInfoProvider, BrowserURLExtractor
+│   │   ├── WindowTitleBoundaryReader.swift # Fresh bounded AX title + caption/selected-tab geometry
 │   │   ├── ConferenceCallActivityProvider.swift # Window-specific active-call accessibility controls
 │   │   └── ConferenceSessionPrivacyPolicy.swift # Conferencing-app rules + call-session consent tracking
 │   └── Tests/                  # Includes CaptureFrameCandidateTests (real screenshot pixels)
 │
 ├── Processing/                  # OCR and text extraction
 │   ├── AGENTS.md
+│   ├── WindowTitleValidator.swift # Validate capture evidence using existing OCR regions
 │   ├── ProcessingManager.swift
 │   ├── FrameProcessingQueue.swift # Async frame processing queue
 │   ├── URLExtractor.swift       # URL extraction from OCR text
@@ -550,3 +553,14 @@ _This file follows the AGENTS.md standard for AI agent guidance. Last updated: 2
 - Orphan-node scans require actual frame deletions. Routine DB storage sampling runs every 15 minutes; orphan-video polling runs every 10 minutes in addition to startup recovery. These are maintenance fixes, not new user actions requiring new daily metrics.
 
 - Ordinary timeline-cache misses do not advance the global cache epoch. Entry eviction invalidates only that frame; keep per-frame epochs alive while reads/writes overlap and release miss-only epochs when the final operation finishes. Clear/redaction still invalidates all work.
+
+## Capture window-title validation
+
+New native captures keep an optional `WindowTitleEvidence` in a dedicated frame column
+(V21 migration), independent of in-page URL metadata. Capture takes a fresh AX window
+observation immediately before pixels, suspends 150ms, then takes another. Late metadata
+enrichment must not restore pending titles. Existing OCR verifies the full caption or
+selected browser tab; ambiguous/unreadable frames remain stored with an unassigned title.
+Each pending frame owns a segment so delayed OCR cannot rename neighbouring frames.
+Legacy/imported frames are unchanged. Run `python3 scripts/validate_window_titles.py` on
+Command Line Tools hosts without XCTest, in addition to a normal App target build.

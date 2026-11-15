@@ -1139,10 +1139,16 @@ public actor CaptureManager: CaptureProtocol {
             guard let capturedBundleID = frame.metadata.appBundleID else { return true }
             return BrowserURLExtractor.isBrowser(capturedBundleID) || capturedBundleID == "com.apple.finder"
         }()
-        let frontmostMetadata = await appInfoProvider.getFrontmostAppInfo(
-            includeBrowserURL: shouldLookupBrowserURL,
-            preferredDisplayID: preferredDisplayID
-        )
+        // Captured boundary evidence is authoritative. Late AX/URL enrichment can
+        // describe the next window and must not restore an unverified title.
+        let frontmostMetadata: FrameMetadata
+        if frame.metadata.windowTitleEvidence != nil {
+            frontmostMetadata = frame.metadata
+        } else {
+            frontmostMetadata = await appInfoProvider.getFrontmostAppInfo(
+                includeBrowserURL: shouldLookupBrowserURL, preferredDisplayID: preferredDisplayID
+            )
+        }
         let redactionReason = frame.metadata.redactionReason
         let preservedDisplayID = frame.metadata.displayID != 0 ? frame.metadata.displayID : frontmostMetadata.displayID
         let captureTrigger = frame.metadata.captureTrigger ?? Self.storedCaptureTrigger(for: trigger)
@@ -1152,11 +1158,12 @@ public actor CaptureManager: CaptureProtocol {
             enrichedMetadata = FrameMetadata(
                 appBundleID: frame.metadata.appBundleID ?? frontmostMetadata.appBundleID,
                 appName: frame.metadata.appName ?? frontmostMetadata.appName,
-                windowName: frame.metadata.windowName ?? frontmostMetadata.windowName,
+                windowName: frame.metadata.windowTitleEvidence == nil ? (frame.metadata.windowName ?? frontmostMetadata.windowName) : nil,
                 browserURL: frame.metadata.browserURL ?? frontmostMetadata.browserURL,
                 redactionReason: redactionReason,
                 captureTrigger: captureTrigger,
-                displayID: preservedDisplayID
+                displayID: preservedDisplayID,
+                windowTitleEvidence: frame.metadata.windowTitleEvidence
             )
         } else {
             enrichedMetadata = FrameMetadata(

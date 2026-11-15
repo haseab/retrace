@@ -25,6 +25,7 @@ Capture/
 │   ├── FrameDeduplicator.swift    # DeduplicationProtocol implementation
 │   └── PerceptualHash.swift       # dHash (difference hash) for comparison
 ├── Metadata/
+│   ├── WindowTitleBoundaryReader.swift # Uncached bounded AX title and caption/selected-tab bounds
 │   ├── AppInfoProvider.swift      # Get active app info via NSWorkspace
 │   ├── ForegroundWindowSelection.swift # Reject sharing helpers and background processes for attribution
 │   ├── BrowserURLExtractor.swift  # Extract URL from browsers (AX API)
@@ -500,3 +501,11 @@ The implementation is complete. Focus on understanding the existing code rather 
 ### Capture window-list reuse
 
 Exclusion classification collects normal on-screen, non-transparent window IDs from its all-window snapshot, in window-server order, and removes excluded IDs before array capture. The successful array path does not fetch a second window list. Do not reuse old bounds for masking: privacy/AX checks can suspend while windows move. Forced masking, known-broken arrays, empty included arrays, and array failure must fetch fresh on-screen geometry and drop the frame if unavailable. No snapshot is cached across captures. Existing full-bounds masking and masking-failure behavior remain unchanged.
+
+### Capture title evidence
+
+`CGWindowListCapture` owns fresh AX before/screenshot/150ms/AX after ordering.
+It stores evidence, not an asserted title. Preserve this evidence through materialization
+and enrichment; do not fill pending `windowName` from a later app/AX lookup. Cancellation,
+stop/restart, display switches, configuration changes and screen lock invalidate in-flight
+candidates. AX queries stay off main; a bounded lookup failure leaves attribution unknown.

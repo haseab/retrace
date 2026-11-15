@@ -14,8 +14,8 @@ public enum FrameQueries {
     static func insert(db: OpaquePointer, frame: FrameReference) throws -> Int64 {
         let sql = """
             INSERT INTO frame (
-                createdAt, imageFileName, segmentId, videoId, videoFrameIndex, isStarred, redactionReason, capture_trigger, processingStatus
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 4);
+                createdAt, imageFileName, segmentId, videoId, videoFrameIndex, isStarred, redactionReason, capture_trigger, captureWindowTitleEvidence, processingStatus
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 4);
             """
 
         var statement: OpaquePointer?
@@ -59,6 +59,10 @@ public enum FrameQueries {
         // redactionReason: nullable, set when frame pixels were intentionally redacted
         bindTextOrNull(statement, 7, frame.metadata.redactionReason)
         bindTextOrNull(statement, 8, frame.metadata.captureTrigger?.rawValue)
+        let evidenceJSON = try frame.metadata.windowTitleEvidence.map {
+            String(decoding: try JSONEncoder().encode($0), as: UTF8.self)
+        }
+        bindTextOrNull(statement, 9, evidenceJSON)
 
         guard sqlite3_step(statement) == SQLITE_DONE else {
             throw DatabaseError.queryFailed(
@@ -68,6 +72,39 @@ public enum FrameQueries {
         }
 
         return sqlite3_last_insert_rowid(db)
+    }
+
+    static func getWindowTitleEvidence(db: OpaquePointer, frameID: Int64) throws -> WindowTitleEvidence? {
+        let sql = "SELECT captureWindowTitleEvidence FROM frame WHERE id=?;"
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+        sqlite3_bind_int64(statement, 1, frameID)
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW,
+              let json = getTextOrNil(statement!, 0) else { return nil }
+        return try JSONDecoder().decode(WindowTitleEvidence.self, from: Data(json.utf8))
+    }
+
+    static func resolveWindowTitle(db: OpaquePointer, frameID: Int64, title: String?) throws {
+        // Never rename a shared session, including legacy/imported sessions.
+        let sql = """
+            UPDATE segment SET windowName=?
+            WHERE id=(SELECT segmentId FROM frame WHERE id=? AND captureWindowTitleEvidence IS NOT NULL)
+              AND NOT EXISTS (SELECT 1 FROM frame f WHERE f.segmentId=segment.id AND f.id != ?);
+            """
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+        bindTextOrNull(statement, 1, title)
+        sqlite3_bind_int64(statement, 2, frameID)
+        sqlite3_bind_int64(statement, 3, frameID)
+        guard sqlite3_step(statement) == SQLITE_DONE, sqlite3_changes(db) == 1 else {
+            throw DatabaseError.queryFailed(query: sql, underlying: "Missing frame evidence or segment is shared")
+        }
     }
 
     // MARK: - Update Video Link

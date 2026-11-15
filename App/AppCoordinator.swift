@@ -3277,7 +3277,9 @@ public actor AppCoordinator {
             }
         }
 
-        if appChanged || windowChanged || currentSegment == nil || idleDetected {
+        // Pending title evidence owns a one-frame segment. Delayed OCR must never
+        // rename neighbouring frames whose pixels may show another thread.
+        if metadata.windowTitleEvidence != nil || appChanged || windowChanged || currentSegment == nil || idleDetected {
             // Close previous segment
             if let segID = currentSegmentID {
                 // If we crossed an idle boundary, close at the last observed frame.

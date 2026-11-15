@@ -1217,6 +1217,10 @@ public actor FrameProcessingQueue {
         // Check app filter - skip OCR for excluded apps (bundleID is in metadata from JOIN)
         let bundleID = frameRef.metadata.appBundleID
         if !shouldProcessOCR(forBundleID: bundleID) {
+            if try await databaseManager.getWindowTitleEvidence(frameID: FrameID(value: frameID)) != nil {
+                try? await databaseManager.recordMetricEvent(metricType: .windowTitleValidation,
+                    metadata: "{\"outcome\":\"ocr_excluded\"}")
+            }
             // Mark as completed (no OCR needed for this app)
             try await updateFrameProcessingStatus(frameID, status: .completed)
             Log.recordRoutine(.ocrExcluded)
@@ -1252,7 +1256,25 @@ public actor FrameProcessingQueue {
             to: ocrStage.extractedText,
             actualFrameID: frameID
         )
-        let indexedText = phraseRedactionResult.sanitizedText
+        let titleEvidence = try await databaseManager.getWindowTitleEvidence(frameID: FrameID(value: frameID))
+        let titleValidation = titleEvidence.map {
+            WindowTitleValidator.validate($0, text: phraseRedactionResult.sanitizedText,
+                                          width: videoSegment.width, height: videoSegment.height)
+        }
+        let sanitized = phraseRedactionResult.sanitizedText
+        let indexedText: ExtractedText
+        if let validation = titleValidation {
+            let m = sanitized.metadata
+            indexedText = ExtractedText(frameID: sanitized.frameID, timestamp: sanitized.timestamp,
+                regions: sanitized.regions, chromeRegions: sanitized.chromeRegions,
+                fullText: sanitized.fullText, chromeText: sanitized.chromeText,
+                metadata: FrameMetadata(appBundleID: m.appBundleID, appName: m.appName,
+                    windowName: validation.title, browserURL: m.browserURL,
+                    redactionReason: m.redactionReason, captureTrigger: m.captureTrigger,
+                    displayID: m.displayID, mousePosition: m.mousePosition))
+        } else {
+            indexedText = sanitized // Legacy/imported frames preserve existing attribution.
+        }
         let hasRedactedNodes = !phraseRedactionResult.redactedCombinedNodeOrders.isEmpty
 
         let docid = try await search.index(
@@ -1260,6 +1282,12 @@ public actor FrameProcessingQueue {
             segmentId: frameRef.segmentID.value,
             frameId: frameID
         )
+
+        if let validation = titleValidation {
+            try await databaseManager.resolveWindowTitle(frameID: FrameID(value: frameID), title: validation.title)
+            try? await databaseManager.recordMetricEvent(metricType: .windowTitleValidation,
+                metadata: "{\"outcome\":\"\(validation.outcome)\"}")
+        }
 
         // Insert OCR nodes for both main and chrome regions so any FTS hit can be highlighted.
         let hasAnyOCRRegions = !indexedText.regions.isEmpty || !indexedText.chromeRegions.isEmpty

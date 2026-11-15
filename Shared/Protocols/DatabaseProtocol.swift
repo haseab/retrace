@@ -63,6 +63,10 @@ public protocol DatabaseProtocol: Actor {
     /// Read per-frame metadata JSON payload.
     func getFrameMetadata(frameID: FrameID) async throws -> String?
 
+    func getWindowTitleEvidence(frameID: FrameID) async throws -> WindowTitleEvidence?
+    /// Only updates a segment exclusively owned by this frame. Nil leaves it unassigned.
+    func resolveWindowTitle(frameID: FrameID, title: String?) async throws
+
     /// Get processing status for multiple frames in a single query
     /// Returns dictionary of frameID -> processingStatus
     /// 0=pending, 1=processing, 2=completed, 3=failed, 4=not yet readable,
@@ -472,5 +476,13 @@ public struct OCRNodeWithText: Identifiable, Equatable, Sendable {
             encryptedText: encryptedText,
             isRedacted: isRedacted
         )
+    }
+}
+
+// Legacy/import-only database implementations do not create capture evidence.
+extension DatabaseProtocol {
+    public func getWindowTitleEvidence(frameID: FrameID) async throws -> WindowTitleEvidence? { nil }
+    public func resolveWindowTitle(frameID: FrameID, title: String?) async throws {
+        throw DatabaseError.queryFailed(query: "resolve_window_title", underlying: "Unsupported database implementation")
     }
 }
