@@ -332,6 +332,27 @@ final class RewriteRetryPolicyTests: XCTestCase {
         storage = nil
     }
 
+    func testDatabaseReadFailureDoesNotAuthorizeFrameDeletion() async throws {
+        let connection = await database.getConnection()
+        let db = try XCTUnwrap(connection)
+        XCTAssertEqual(sqlite3_exec(db, """
+            INSERT INTO segment(id,bundleID,startDate,endDate,type) VALUES(1,'example',0,10,0);
+            INSERT INTO video(id,height,width,path,fileSize,frameRate,processingState) VALUES(1,64,64,'segments/123',100,30,0);
+            INSERT INTO frame(id,createdAt,imageFileName,segmentId,videoId,videoFrameIndex) VALUES(1,1,'one',1,1,0);
+            """, nil, nil, nil), SQLITE_OK)
+        sqlite3_set_authorizer(db, { _, action, table, _, _, _ in
+            if action == SQLITE_READ, let table, String(cString: table) == "video" { return SQLITE_DENY }
+            return SQLITE_OK
+        }, nil)
+        let shouldDelete = await queue.verifyFrameIsUnrecoverable(
+            frameID: 1, error: StorageError.fileReadFailed(path: "segments/123", underlying: "Video file is empty")
+        )
+        sqlite3_set_authorizer(db, nil, nil)
+        XCTAssertFalse(shouldDelete)
+        let retained = try await database.getFrame(id: FrameID(value: 1))
+        XCTAssertNotNil(retained)
+    }
+
     func testEnqueueBatchIsAtomicAndUsesDatabaseBatch() async throws {
         let connection = await database.getConnection()
         let db = try XCTUnwrap(connection)

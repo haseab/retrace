@@ -3082,7 +3082,7 @@ public actor FrameProcessingQueue {
 
     /// Verify a frame is truly unrecoverable before deletion
     /// Returns true only if we're certain the video data cannot be recovered
-    private func verifyFrameIsUnrecoverable(frameID: Int64, error: Error) async -> Bool {
+    func verifyFrameIsUnrecoverable(frameID: Int64, error: Error) async -> Bool {
         let errorDesc = error.localizedDescription
 
         // SAFETY CHECK 1: Only delete for specific known-unrecoverable error types
@@ -3100,8 +3100,15 @@ public actor FrameProcessingQueue {
         }
 
         // SAFETY CHECK 3: Verify the video segment exists in DB
-        guard let videoSegment = try? await databaseManager.getVideoSegment(id: frameRef.videoID) else {
-            return true  // Video record doesn't exist, frame is orphaned
+        let videoSegment: VideoSegment
+        do {
+            guard let existing = try await databaseManager.getVideoSegment(id: frameRef.videoID) else {
+                return true  // A successful lookup confirmed the video row is absent.
+            }
+            videoSegment = existing
+        } catch {
+            // A failed read is not evidence that a recording is unrecoverable.
+            return false
         }
 
         // SAFETY CHECK 4: Extract segment ID and verify file state

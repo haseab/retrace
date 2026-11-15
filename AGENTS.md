@@ -177,6 +177,7 @@ retrace/
 │       ├── ServiceContainerRewindCutoffTests.swift # Rewind cutoff defaults and latest-frame probe coverage
 │       ├── TestLogger.swift
 │       ├── TimelineStillDiskWriterTests.swift
+│       ├── RecordingDatabaseFailureTests.swift # Real recording pipeline with an injected metadata insert failure
 │       └── UnexpectedRecordingStopHeuristicTests.swift # Unexpected-stop watchdog heuristic coverage
 │
 └── UI/                          # SwiftUI interface

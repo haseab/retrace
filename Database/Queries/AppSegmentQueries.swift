@@ -159,7 +159,7 @@ enum AppSegmentQueries {
 
         sqlite3_bind_int64(statement, 1, id)
 
-        guard sqlite3_step(statement) == SQLITE_ROW else {
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else {
             return nil
         }
 
@@ -190,7 +190,7 @@ enum AppSegmentQueries {
         sqlite3_bind_int64(statement, 2, Schema.dateToTimestamp(startDate))
 
         var results: [Segment] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             results.append(try parseSegment(statement: statement!))
         }
         return results
@@ -218,7 +218,7 @@ enum AppSegmentQueries {
 
         sqlite3_bind_int(statement, 1, Int32(limit))
 
-        guard sqlite3_step(statement) == SQLITE_ROW else {
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else {
             return nil
         }
 
@@ -250,7 +250,7 @@ enum AppSegmentQueries {
         sqlite3_bind_int(statement, 2, Int32(limit))
 
         var results: [Segment] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             results.append(try parseSegment(statement: statement!))
         }
         return results
@@ -293,7 +293,7 @@ enum AppSegmentQueries {
         sqlite3_bind_int(statement, 5, Int32(offset))
 
         var results: [Segment] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             results.append(try parseSegment(statement: statement!))
         }
         return results
@@ -371,7 +371,7 @@ enum AppSegmentQueries {
         }
 
         var results: [Segment] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             results.append(try parseSegment(statement: statement!))
         }
         return results
@@ -396,7 +396,7 @@ enum AppSegmentQueries {
             )
         }
 
-        guard sqlite3_step(statement) == SQLITE_ROW else {
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else {
             return 0
         }
 
@@ -425,7 +425,7 @@ enum AppSegmentQueries {
         // Bind date as milliseconds
         sqlite3_bind_int64(statement, 1, Schema.dateToTimestamp(date))
 
-        guard sqlite3_step(statement) == SQLITE_ROW else {
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else {
             return 0
         }
 
@@ -449,7 +449,7 @@ enum AppSegmentQueries {
             )
         }
 
-        guard sqlite3_step(statement) == SQLITE_ROW else {
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else {
             return 0
         }
 
@@ -501,7 +501,7 @@ enum AppSegmentQueries {
         sqlite3_bind_int64(statement, 2, Schema.dateToTimestamp(endDate))
 
         var results: [(bundleID: String, duration: TimeInterval, sessionCount: Int)] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             let bundleID = String(cString: sqlite3_column_text(statement, 0))
             let durationMs = sqlite3_column_int64(statement, 1)
             let sessionCount = Int(sqlite3_column_int(statement, 2))
@@ -642,7 +642,7 @@ enum AppSegmentQueries {
         let executeStartedAt = CFAbsoluteTimeGetCurrent()
         var results: [(bundleID: String, duration: TimeInterval, uniqueItemCount: Int)] = []
         var totalDurationMs: Int64 = 0
-        var stepResult = sqlite3_step(statement)
+        var stepResult = try SQLiteReadStep.next(statement)
         while stepResult == SQLITE_ROW {
             let bundleID = String(cString: sqlite3_column_text(statement, 0))
             let durationMs = sqlite3_column_int64(statement, 1)
@@ -655,7 +655,7 @@ enum AppSegmentQueries {
                 uniqueItemCount: uniqueCount
             ))
 
-            stepResult = sqlite3_step(statement)
+            stepResult = try SQLiteReadStep.next(statement)
         }
 
         guard stepResult == SQLITE_DONE else {
@@ -933,20 +933,20 @@ enum AppSegmentQueries {
         sqlite3_bind_int64(statement, 2, Schema.dateToTimestamp(endDate))
         sqlite3_bind_int64(statement, 3, maxGapMs)
         sqlite3_bind_int64(statement, 4, maxGapMs)
-        sqlite3_bind_text(statement, 5, (bundleID as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(statement, 5, (bundleID as NSString).utf8String, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
 
         // For browser query, we have additional parameters for window fallback and tab-count CTEs.
         if isBrowser {
             sqlite3_bind_int64(statement, 6, maxGapMs)
             sqlite3_bind_int64(statement, 7, maxGapMs)
-            sqlite3_bind_text(statement, 8, (bundleID as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(statement, 8, (bundleID as NSString).utf8String, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
             sqlite3_bind_int64(statement, 9, maxGapMs)
             sqlite3_bind_int64(statement, 10, maxGapMs)
-            sqlite3_bind_text(statement, 11, (bundleID as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(statement, 11, (bundleID as NSString).utf8String, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
         }
 
         var results: [(windowName: String?, isWebsite: Bool, duration: TimeInterval, tabCount: Int?, totalCount: Int, totalDuration: TimeInterval)] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             let windowName: String?
             if sqlite3_column_type(statement, 0) == SQLITE_NULL {
                 windowName = nil
@@ -1044,10 +1044,10 @@ enum AppSegmentQueries {
         sqlite3_bind_int64(statement, 2, Schema.dateToTimestamp(endDate))
         sqlite3_bind_int64(statement, 3, maxGapMs)
         sqlite3_bind_int64(statement, 4, maxGapMs)
-        sqlite3_bind_text(statement, 5, (bundleID as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(statement, 5, (bundleID as NSString).utf8String, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
 
         var results: [(windowName: String?, browserUrl: String?, duration: TimeInterval)] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             let windowName: String?
             if sqlite3_column_type(statement, 0) == SQLITE_NULL {
                 windowName = nil
@@ -1159,11 +1159,11 @@ enum AppSegmentQueries {
         sqlite3_bind_int64(statement, 2, Schema.dateToTimestamp(endDate))
         sqlite3_bind_int64(statement, 3, maxGapMs)
         sqlite3_bind_int64(statement, 4, maxGapMs)
-        sqlite3_bind_text(statement, 5, (bundleID as NSString).utf8String, -1, nil)
-        sqlite3_bind_text(statement, 6, (domain as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(statement, 5, (bundleID as NSString).utf8String, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        sqlite3_bind_text(statement, 6, (domain as NSString).utf8String, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
 
         var results: [(windowName: String?, browserUrl: String?, duration: TimeInterval)] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             let windowName: String?
             if sqlite3_column_type(statement, 0) == SQLITE_NULL {
                 windowName = nil
@@ -1219,7 +1219,7 @@ enum AppSegmentQueries {
         sqlite3_bind_int64(statement, 2, Schema.dateToTimestamp(endDate))
 
         var results: [(date: Date, value: Int64)] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             guard let localDay = parseLocalDay(sqlite3_column_text(statement, 0)) else {
                 continue
             }
@@ -1300,10 +1300,10 @@ enum AppSegmentQueries {
         let executeStartedAt = CFAbsoluteTimeGetCurrent()
         var results: [(date: Date, value: Int64)] = []
         var totalDurationMs: Int64 = 0
-        var stepResult = sqlite3_step(statement)
+        var stepResult = try SQLiteReadStep.next(statement)
         while stepResult == SQLITE_ROW {
             guard let localDay = parseLocalDay(sqlite3_column_text(statement, 0)) else {
-                stepResult = sqlite3_step(statement)
+                stepResult = try SQLiteReadStep.next(statement)
                 continue
             }
             let durationMs = sqlite3_column_int64(statement, 1)
@@ -1311,7 +1311,7 @@ enum AppSegmentQueries {
             // Return raw milliseconds - conversion happens in UI layer to preserve precision
             results.append((date: localDay, value: durationMs))
 
-            stepResult = sqlite3_step(statement)
+            stepResult = try SQLiteReadStep.next(statement)
         }
 
         guard stepResult == SQLITE_DONE else {
