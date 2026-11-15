@@ -190,6 +190,7 @@ private actor FailingRewriteStorage: StorageProtocol, RewriteAttemptCountingStor
 
 private actor BlockingRewriteStorage: StorageProtocol, RewriteAttemptCountingStorage {
     private var rewriteAttemptCount = 0
+    private var recoveryScanCount = 0
     private var firstRewriteStarted = false
     private var firstRewriteStartContinuations: [CheckedContinuation<Void, Never>] = []
     private var firstRewriteReleaseContinuation: CheckedContinuation<Void, Never>?
@@ -248,8 +249,11 @@ private actor BlockingRewriteStorage: StorageProtocol, RewriteAttemptCountingSto
     }
 
     func recoverInterruptedSegmentRewrites() async throws -> [SegmentRewriteRecoveryAction] {
-        []
+        recoveryScanCount += 1
+        return []
     }
+
+    func recoveryScans() -> Int { recoveryScanCount }
 
     func finishInterruptedSegmentRewriteRecovery(segmentID: VideoSegmentID) async throws {}
 
@@ -325,6 +329,32 @@ final class RewriteRetryPolicyTests: XCTestCase {
         database = nil
         queue = nil
         storage = nil
+    }
+
+    func testRecoveryNeverScansWhileAnotherRewriteIsActive() async throws {
+        let blockingStorage = BlockingRewriteStorage()
+        let blockingQueue = FrameProcessingQueue(database: database, storage: blockingStorage,
+            processing: RewriteRetryNoopProcessing(), search: RewriteRetryNoopSearch(),
+            config: ProcessingQueueConfig(workerCount: 1, maxRetryAttempts: 3, maxQueueSize: 1000))
+        let fixture = try await insertVideoFixture(frameCount: 2)
+        let frameID = try await insertFrameReference(segmentID: fixture.segmentID, videoID: fixture.videoID,
+            timestamp: fixture.timestamp, frameIndexInSegment: 0)
+        let siblingID = try await insertFrameReference(segmentID: fixture.segmentID, videoID: fixture.videoID,
+            timestamp: fixture.timestamp.addingTimeInterval(1), frameIndexInSegment: 1)
+        try await database.updateFrameProcessingStatus(frameID: siblingID.value,
+            status: FrameProcessingStatus.completed.rawValue)
+        try await database.updateFrameProcessingStatus(frameID: frameID.value,
+            status: FrameProcessingStatus.rewritePending.rawValue, rewritePurpose: "deletion")
+        let rewrite = Task { try await blockingQueue.processPendingRewrites(for: fixture.videoID.value) }
+        await blockingStorage.waitForFirstRewriteToStart()
+        await blockingQueue.startWorkers()
+        await blockingQueue.recoverPendingRewritesIfPossible()
+        let scansDuringRewrite = await blockingStorage.recoveryScans()
+        // Release before asserting so a failed regression cannot strand a worker.
+        await blockingStorage.releaseFirstRewrite()
+        _ = try await rewrite.value
+        await blockingQueue.stopWorkers()
+        XCTAssertEqual(scansDuringRewrite, 0)
     }
 
     func testFailedRewriteRetriesOnceThenStopsRetryingAutomatically() async throws {

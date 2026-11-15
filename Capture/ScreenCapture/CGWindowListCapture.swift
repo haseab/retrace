@@ -899,7 +899,7 @@ public actor CGWindowListCapture {
                 conferenceWindowContexts: ConferenceWindowSelection(
                     contexts: [], visibleWindowIDs: [], redactedWindowIDs: []
                 ),
-                captureBlockReason: captureBlockReason
+                captureBlockReason: "window_list_unavailable"
             )
         }
 
@@ -1713,8 +1713,8 @@ public actor CGWindowListCapture {
             [.optionOnScreenOnly, .excludeDesktopElements],
             kCGNullWindowID
         ) as? [[String: Any]] else {
-            guard let image = CGDisplayCreateImage(displayID) else { return nil }
-            return FilteredCaptureResult(image: image, visibleExcludedWindowIDs: [])
+            Log.warning("[Filtering] Dropping frame because the exclusion window list is unavailable", category: .capture)
+            return nil
         }
 
         if forceMasking {
@@ -1751,10 +1751,8 @@ public actor CGWindowListCapture {
             }
         }
 
-        // If we filtered everything, capture just desktop
         if includedWindowIDs.isEmpty {
-            guard let image = CGDisplayCreateImage(displayID) else { return nil }
-            return FilteredCaptureResult(image: image, visibleExcludedWindowIDs: [])
+            return captureWithMasking(displayID: displayID, excludedWindowIDs: excludedWindowIDs, windowList: windowList)
         }
 
         let displayBounds = CGDisplayBounds(displayID)
@@ -1873,54 +1871,22 @@ public actor CGWindowListCapture {
 
         // Build ordered list of window bounds (front to back, as returned by CGWindowListCopyWindowInfo)
         // Windows earlier in the list are in front of windows later in the list
-        var windowBoundsInOrder: [(windowID: CGWindowID, rect: CGRect, isExcluded: Bool)] = []
-
-        for windowInfo in windowList {
-            guard let windowID = windowInfo[kCGWindowNumber as String] as? CGWindowID,
-                  let boundsDict = windowInfo[kCGWindowBounds as String] as? [String: Any],
-                  let x = boundsDict["X"] as? CGFloat,
-                  let y = boundsDict["Y"] as? CGFloat,
-                  let width = boundsDict["Width"] as? CGFloat,
-                  let height = boundsDict["Height"] as? CGFloat else {
-                continue
-            }
-
-            // Only consider layer 0 windows (normal app windows)
-            let layer = windowInfo[kCGWindowLayer as String] as? Int ?? 0
-            guard layer == 0 else { continue }
-
-            // Convert to image coordinates and scale
-            let rect = CGRect(
-                x: (x - displayBounds.origin.x) * scale,
-                y: (y - displayBounds.origin.y) * scale,
-                width: width * scale,
-                height: height * scale
-            )
-
-            windowBoundsInOrder.append((windowID, rect, excludedWindowIDs.contains(windowID)))
-        }
-
-        // Calculate visible regions for each excluded window
-        // For each excluded window, subtract all windows that are in front of it
+        // Mask the complete excluded-window bounds, even beneath overlapping windows:
+        // windows in front may be translucent, so subtracting them can expose protected pixels.
         var visibleExcludedRegions: [(windowID: CGWindowID, rect: CGRect)] = []
-
-        for (index, window) in windowBoundsInOrder.enumerated() {
-            guard window.isExcluded else { continue }
-
-            // Start with the full window rect
-            var visibleRegions = [window.rect]
-
-            // Subtract all windows in front of this one (earlier in the list)
-            for frontIndex in 0..<index {
-                let frontWindow = windowBoundsInOrder[frontIndex]
-                visibleRegions = subtractRect(frontWindow.rect, from: visibleRegions)
-            }
-
-            // Add remaining visible regions to mask list
-            for region in visibleRegions where region.width > 1 && region.height > 1 {
-                visibleExcludedRegions.append((window.windowID, region))
-                Log.debug("[Masking] Visible region for window \(window.windowID): \(region)", category: .capture)
-            }
+        for info in windowList {
+            guard let id = info[kCGWindowNumber as String] as? CGWindowID,
+                  excludedWindowIDs.contains(id) else { continue }
+            guard let dictionary = info[kCGWindowBounds as String] as? [String: Any],
+                  let bounds = CGRect(dictionaryRepresentation: dictionary as CFDictionary),
+                  bounds.minX.isFinite, bounds.minY.isFinite, bounds.width.isFinite, bounds.height.isFinite,
+                  bounds.width > 0, bounds.height > 0 else { return nil }
+            let visible = bounds.intersection(displayBounds)
+            guard !visible.isNull, !visible.isEmpty else { continue }
+            visibleExcludedRegions.append((id, CGRect(
+                x: (visible.minX - displayBounds.minX) * scale,
+                y: (visible.minY - displayBounds.minY) * scale,
+                width: visible.width * scale, height: visible.height * scale)))
         }
 
         // If no visible regions to mask, return the full capture
@@ -1929,82 +1895,11 @@ public actor CGWindowListCapture {
             return FilteredCaptureResult(image: fullScreenImage, visibleExcludedWindowIDs: [])
         }
 
-        // Create a new image with visible excluded regions blurred
-        let width = fullScreenImage.width
-        let height = fullScreenImage.height
-
-        guard let colorSpace = fullScreenImage.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB),
-              let context = CGContext(
-                data: nil,
-                width: width,
-                height: height,
-                bitsPerComponent: 8,
-                bytesPerRow: width * 4,
-                space: colorSpace,
-                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-              ) else {
-            Log.error("[Masking] Failed to create graphics context", category: .capture)
-            return FilteredCaptureResult(image: fullScreenImage, visibleExcludedWindowIDs: [])
-        }
-
-        // Draw the full screen image
-        context.draw(fullScreenImage, in: CGRect(x: 0, y: 0, width: width, height: height))
-
-        let fullImageRect = CGRect(x: 0, y: 0, width: width, height: height)
-        guard let blurredImage = makeBlurredRedactionImage(from: fullScreenImage) else {
-            Log.error("[Masking] Failed to create blurred redaction image", category: .capture)
-            return FilteredCaptureResult(image: fullScreenImage, visibleExcludedWindowIDs: [])
-        }
-
-        var maskPaths: [CGPath] = []
-        for (_, rect) in visibleExcludedRegions {
-            // Flip Y coordinate for CGContext (origin is bottom-left)
-            let flippedRect = CGRect(
-                x: rect.origin.x,
-                y: CGFloat(height) - rect.origin.y - rect.height,
-                width: rect.width,
-                height: rect.height
-            )
-
-            let strokeInset = redactionBorderWidth / 2
-            let blurRect = flippedRect.insetBy(dx: strokeInset, dy: strokeInset)
-            guard blurRect.width > 1, blurRect.height > 1 else { continue }
-
-            let maskPath = CGPath(
-                roundedRect: blurRect,
-                cornerWidth: redactionMaskCornerRadius,
-                cornerHeight: redactionMaskCornerRadius,
-                transform: nil
-            )
-            maskPaths.append(maskPath)
-        }
-
-        if maskPaths.isEmpty {
-            Log.info("[Masking] Visible regions were too small after insetting, skipping blur masking", category: .capture)
-            return FilteredCaptureResult(image: fullScreenImage, visibleExcludedWindowIDs: [])
-        }
-
-        // Composite the blurred source once using a combined clip across all masked regions.
-        context.saveGState()
-        for maskPath in maskPaths {
-            context.addPath(maskPath)
-        }
-        context.clip()
-        context.draw(blurredImage, in: fullImageRect)
-        context.restoreGState()
-
-        context.saveGState()
-        context.setStrokeColor(CGColor(red: 1, green: 1, blue: 1, alpha: 0.35))
-        context.setLineWidth(redactionBorderWidth)
-        for maskPath in maskPaths {
-            context.addPath(maskPath)
-        }
-        context.strokePath()
-        context.restoreGState()
-
-        guard let maskedImage = context.makeImage() else {
-            Log.error("[Masking] Failed to create masked image", category: .capture)
-            return FilteredCaptureResult(image: fullScreenImage, visibleExcludedWindowIDs: [])
+        guard let maskedImage = ExcludedWindowMasker.mask(
+            fullScreenImage, regions: visibleExcludedRegions.map(\.rect), blur: makeBlurredRedactionImage
+        ) else {
+            Log.warning("[Masking] Dropping frame because excluded-window protection failed", category: .capture)
+            return nil
         }
 
         let visibleExcludedWindowIDs = Set(visibleExcludedRegions.map { $0.windowID })

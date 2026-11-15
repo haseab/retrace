@@ -645,3 +645,7 @@ With junction tables and proper indexes:
 - **Database size**: ~500MB metadata/month + ~150GB text regions + ~50MB junctions
 
 Trade-off: Slightly more complex writes (populate junction tables + text regions), but **massive** read speedups and professional UI.
+
+## Stored keyword protection mode
+
+The existing `node.encryptedText` column stores either the reversible protected-text payload or the exact non-recoverable marker `rtx-permanent-v1`. Permanent markers keep nodes masked and discoverable for rewrite scheduling, but must be excluded from missing-master-key recovery checks. Propagate mode into `PendingNodeRedactionJob` and `SegmentRedactionTarget`; no schema migration is needed. Active query files use the declared SQLCipher module, avoiding mixed system SQLite/SQLCipher headers.

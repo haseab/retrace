@@ -14,6 +14,35 @@ import os.log
 /// Log.info("Frame processed", category: .processing)
 /// Log.error("Failed to encode", category: .storage, error: someError)
 /// ```
+/// Logging interpolation removes free-form values before they reach any logging sink.
+/// Counts and booleans remain available for diagnostics; strings, collections, URLs and errors do not.
+public struct PrivacyLogMessage: ExpressibleByStringInterpolation, Sendable {
+    public let text: String
+    public init(stringLiteral value: String) { text = value }
+    public init(stringInterpolation: StringInterpolation) { text = stringInterpolation.text }
+    public init(redacting value: String) { text = "[private message]" }
+
+    public struct StringInterpolation: StringInterpolationProtocol, Sendable {
+        var text = ""
+        public init(literalCapacity: Int, interpolationCount: Int) { text.reserveCapacity(literalCapacity) }
+        public mutating func appendLiteral(_ literal: String) { text += literal }
+        public mutating func appendInterpolation<T>(_ value: T) {
+            switch value {
+            case let v as Bool: text += v ? "true" : "false"
+            case let v as Int: text += String(v)
+            case let v as Int64: text += String(v)
+            case let v as UInt64: text += String(v)
+            case let v as Int32: text += String(v)
+            case let v as UInt32: text += String(v)
+            case let v as UInt: text += String(v)
+            case let v as Double: text += v.isFinite ? String(v) : "nonfinite"
+            case let v as Float: text += v.isFinite ? String(v) : "nonfinite"
+            default: text += "[private]"
+            }
+        }
+    }
+}
+
 public enum Log {
 
     // MARK: - Categories
@@ -65,7 +94,13 @@ public enum Log {
     // MARK: - Log File (for fast feedback diagnostics)
 
     /// Path to the log file - persists across crashes
-    public static let logFilePath = NSHomeDirectory() + "/Library/Logs/Retrace/retrace.log"
+    public static let logFilePath = ProcessInfo.processInfo.environment["RETRACE_LOG_PATH"]
+        ?? NSHomeDirectory() + "/Library/Logs/Retrace/retrace.log"
+    public static func isPrivacySafeLogEntry(_ line: String) -> Bool {
+        line.range(of: #"^\[[0-9TZ:.+\-]+\] \[[^\]\r\n]+\] \[[^\]\r\n]+\] [^\r\n:]+:[0-9]+ - \[privacy-v1\] "#,
+                   options: .regularExpression) != nil
+    }
+
     /// Get recent logs from the log file (fast file read, no OSLogStore)
     public static func getRecentLogs(maxCount: Int = 200) -> [String] {
         LogFile.shared.readLastLines(count: maxCount)
@@ -83,71 +118,71 @@ public enum Log {
     /// Debug level - verbose information for development
     /// Only appears in Console.app when "Include Debug Messages" is enabled
     public static func debug(
-        _ message: String,
+        _ message: PrivacyLogMessage,
         category: Category = .app,
         file: String = #file,
         function: String = #function,
         line: Int = #line
     ) {
         let logger = category.logger
-        logger.debug("\(message, privacy: .public)")
+        logger.debug("\(message.text, privacy: .private)")
 
         if printToConsole {
-            printFormatted(level: "DEBUG", message: message, category: category, file: file, line: line)
+            printFormatted(level: "DEBUG", message: message.text, category: category, file: file, line: line)
         }
     }
 
     /// Info level - general information about app operation
     public static func info(
-        _ message: String,
+        _ message: PrivacyLogMessage,
         category: Category = .app,
         file: String = #file,
         function: String = #function,
         line: Int = #line
     ) {
         let logger = category.logger
-        logger.info("\(message, privacy: .public)")
+        logger.info("\(message.text, privacy: .private)")
 
         if printToConsole {
-            printFormatted(level: "INFO", message: message, category: category, file: file, line: line)
+            printFormatted(level: "INFO", message: message.text, category: category, file: file, line: line)
         }
     }
 
     /// Notice level - important events worth noting
     public static func notice(
-        _ message: String,
+        _ message: PrivacyLogMessage,
         category: Category = .app,
         file: String = #file,
         function: String = #function,
         line: Int = #line
     ) {
         let logger = category.logger
-        logger.notice("\(message, privacy: .public)")
+        logger.notice("\(message.text, privacy: .private)")
 
         if printToConsole {
-            printFormatted(level: "NOTICE", message: message, category: category, file: file, line: line)
+            printFormatted(level: "NOTICE", message: message.text, category: category, file: file, line: line)
         }
     }
 
     /// Warning level - something unexpected but recoverable
     public static func warning(
-        _ message: String,
+        _ message: PrivacyLogMessage,
         category: Category = .app,
         file: String = #file,
         function: String = #function,
         line: Int = #line
     ) {
         let logger = category.logger
-        logger.warning("\(message, privacy: .public)")
+        logger.warning("\(message.text, privacy: .private)")
 
         if printToConsole {
-            printFormatted(level: "⚠️ WARN", message: message, category: category, file: file, line: line)
+            printFormatted(level: "⚠️ WARN", message: message.text, category: category, file: file, line: line)
         }
     }
 
     /// Error level - something failed
     public static func error(
-        _ message: String,
+        _ message: PrivacyLogMessage,
         category: Category = .app,
         error: Error? = nil,
         file: String = #file,
@@ -155,10 +190,10 @@ public enum Log {
         line: Int = #line
     ) {
         let logger = category.logger
-        let errorDetail = error.map { " | Error: \($0.localizedDescription)" } ?? ""
-        let fullMessage = "\(message)\(errorDetail)"
+        let errorDetail = error.map { " | errorCode=\(($0 as NSError).code)" } ?? ""
+        let fullMessage = message.text + errorDetail
 
-        logger.error("\(fullMessage, privacy: .public)")
+        logger.error("\(fullMessage, privacy: .private)")
 
         if printToConsole {
             printFormatted(level: "❌ ERROR", message: fullMessage, category: category, file: file, line: line)
@@ -167,7 +202,7 @@ public enum Log {
 
     /// Critical/Fault level - app may crash or be in undefined state
     public static func critical(
-        _ message: String,
+        _ message: PrivacyLogMessage,
         category: Category = .app,
         error: Error? = nil,
         file: String = #file,
@@ -175,14 +210,70 @@ public enum Log {
         line: Int = #line
     ) {
         let logger = category.logger
-        let errorDetail = error.map { " | Error: \($0.localizedDescription)" } ?? ""
-        let fullMessage = "\(message)\(errorDetail)"
+        let errorDetail = error.map { " | errorCode=\(($0 as NSError).code)" } ?? ""
+        let fullMessage = message.text + errorDetail
 
-        logger.critical("\(fullMessage, privacy: .public)")
+        logger.critical("\(fullMessage, privacy: .private)")
 
         if printToConsole {
             printFormatted(level: "🔥 CRITICAL", message: fullMessage, category: category, file: file, line: line)
         }
+    }
+
+    @_disfavoredOverload
+    public static func debug(
+        _ message: String, category: Category = .app,
+        file: String = #file, function: String = #function, line: Int = #line
+    ) {
+        debug(PrivacyLogMessage(redacting: message), category: category, file: file, function: function, line: line)
+    }
+
+    @_disfavoredOverload
+    public static func info(
+        _ message: String, category: Category = .app,
+        file: String = #file, function: String = #function, line: Int = #line
+    ) {
+        info(PrivacyLogMessage(redacting: message), category: category, file: file, function: function, line: line)
+    }
+
+    @_disfavoredOverload
+    public static func notice(
+        _ message: String, category: Category = .app,
+        file: String = #file, function: String = #function, line: Int = #line
+    ) {
+        notice(PrivacyLogMessage(redacting: message), category: category, file: file, function: function, line: line)
+    }
+
+    @_disfavoredOverload
+    public static func warning(
+        _ message: String, category: Category = .app,
+        file: String = #file, function: String = #function, line: Int = #line
+    ) {
+        warning(PrivacyLogMessage(redacting: message), category: category, file: file, function: function, line: line)
+    }
+
+    @_disfavoredOverload
+    public static func error(
+        _ message: String, category: Category = .app, error: Error? = nil,
+        file: String = #file, function: String = #function, line: Int = #line
+    ) {
+        Self.error(PrivacyLogMessage(redacting: message), category: category, error: error, file: file, function: function, line: line)
+    }
+
+    @_disfavoredOverload
+    public static func critical(
+        _ message: String, category: Category = .app, error: Error? = nil,
+        file: String = #file, function: String = #function, line: Int = #line
+    ) {
+        critical(PrivacyLogMessage(redacting: message), category: category, error: error, file: file, function: function, line: line)
+    }
+
+    @_disfavoredOverload
+    public static func verbose(
+        _ message: String, category: Category = .app,
+        file: String = #file, function: String = #function, line: Int = #line
+    ) {
+        verbose(PrivacyLogMessage(redacting: message), category: category, file: file, function: function, line: line)
     }
 
     // MARK: - Performance Logging
@@ -197,7 +288,7 @@ public enum Log {
         let result = try block()
         let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000
 
-        debug("\(operation) completed in \(String(format: "%.2f", elapsed))ms", category: category)
+        debug("\(operation) completed in \(elapsed)ms", category: category)
         return result
     }
 
@@ -211,7 +302,7 @@ public enum Log {
         let result = try await block()
         let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000
 
-        debug("\(operation) completed in \(String(format: "%.2f", elapsed))ms", category: category)
+        debug("\(operation) completed in \(elapsed)ms", category: category)
         return result
     }
 
@@ -247,15 +338,15 @@ public enum Log {
             summaryEvery: max(1, summaryEvery)
         )
 
-        let latest = String(format: "%.1f", valueMs)
+        let latest = valueMs
         if let criticalThresholdMs, valueMs >= criticalThresholdMs {
             critical(
-                "[PERF] \(metric) slow sample: \(latest)ms (critical >= \(String(format: "%.1f", criticalThresholdMs))ms)",
+                "[PERF] \(metric) slow sample: \(latest)ms (critical >= \(criticalThresholdMs)ms)",
                 category: category
             )
         } else if let warningThresholdMs, valueMs >= warningThresholdMs {
             warning(
-                "[PERF] \(metric) slow sample: \(latest)ms (warning >= \(String(format: "%.1f", warningThresholdMs))ms)",
+                "[PERF] \(metric) slow sample: \(latest)ms (warning >= \(warningThresholdMs)ms)",
                 category: category
             )
         }
@@ -263,7 +354,7 @@ public enum Log {
         guard snapshot.shouldEmitSummary else { return }
 
         info(
-            "[PERF] \(metric) n=\(snapshot.sampleCount) total=\(snapshot.totalCount) latest=\(String(format: "%.1f", snapshot.latestMs))ms p50=\(String(format: "%.1f", snapshot.p50Ms))ms p95=\(String(format: "%.1f", snapshot.p95Ms))ms min=\(String(format: "%.1f", snapshot.minMs))ms max=\(String(format: "%.1f", snapshot.maxMs))ms",
+            "[PERF] \(metric) n=\(snapshot.sampleCount) total=\(snapshot.totalCount) latest=\(snapshot.latestMs)ms p50=\(snapshot.p50Ms)ms p95=\(snapshot.p95Ms)ms min=\(snapshot.minMs)ms max=\(snapshot.maxMs)ms",
             category: category
         )
     }
@@ -301,23 +392,23 @@ public enum Log {
         line: Int
     ) -> String {
         let filename = (file as NSString).lastPathComponent
-        return "[\(timestamp())] [\(level)] [\(category.rawValue)] \(filename):\(line) - \(message)"
+        return "[\(timestamp())] [\(level)] [\(category.rawValue)] \(filename):\(line) - [privacy-v1] \(message)"
     }
 
     /// Console-only debug log — prints to stdout but NOT to retrace.log.
     /// Use for high-frequency per-frame logs that would spam the log file.
     public static func verbose(
-        _ message: String,
+        _ message: PrivacyLogMessage,
         category: Category = .app,
         file: String = #file,
         function: String = #function,
         line: Int = #line
     ) {
         let logger = category.logger
-        logger.debug("\(message, privacy: .public)")
+        logger.debug("\(message.text, privacy: .private)")
 
         if printToConsole {
-            printFormatted(level: "DEBUG", message: message, category: category, file: file, line: line, consoleOnly: true)
+            printFormatted(level: "DEBUG", message: message.text, category: category, file: file, line: line, consoleOnly: true)
         }
     }
 }
@@ -389,8 +480,8 @@ private final class LogFile: @unchecked Sendable {
     private let maxFileSize: Int64 = 50 * 1024 * 1024  // 50MB max, then rotate
 
     private init() {
-        let logDir = NSHomeDirectory() + "/Library/Logs/Retrace"
-        self.fileURL = URL(fileURLWithPath: logDir + "/retrace.log")
+        self.fileURL = URL(fileURLWithPath: Log.logFilePath)
+        let logDir = fileURL.deletingLastPathComponent().path
 
         // Create directory if needed
         try? FileManager.default.createDirectory(
@@ -398,6 +489,17 @@ private final class LogFile: @unchecked Sendable {
             withIntermediateDirectories: true,
             attributes: nil
         )
+
+        // Discard legacy diagnostics that may contain captured content. Read only a header,
+        // never the potentially large log, and leave privacy-safe logs intact.
+        for url in [fileURL, fileURL.deletingPathExtension().appendingPathExtension("old.log")] {
+            guard let handle = try? FileHandle(forReadingFrom: url) else { continue }
+            let prefix = try? handle.read(upToCount: 512)
+            try? handle.close()
+            if let prefix, !Log.isPrivacySafeLogEntry(String(decoding: prefix, as: UTF8.self).components(separatedBy: "\n").first ?? "") {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
 
         // Open file handle for appending
         if !FileManager.default.fileExists(atPath: fileURL.path) {

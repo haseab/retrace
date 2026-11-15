@@ -455,6 +455,10 @@ public struct OCRNodeWithText: Identifiable, Equatable, Sendable {
         self.isRedacted = isRedacted
     }
 
+    public var isPermanentlyRedacted: Bool {
+        isRedacted && PhraseRedactionMode(storedText: encryptedText) == .permanent
+    }
+
     public func replacingText(_ text: String) -> OCRNodeWithText {
         OCRNodeWithText(
             id: id,

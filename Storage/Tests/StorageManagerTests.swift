@@ -694,6 +694,35 @@ final class StorageManagerTests: XCTestCase {
         try? FileManager.default.removeItem(at: root)
     }
 
+    func testPermanentRewriteRemovesPixelsWithoutAKeyAndPreservesSiblingPixels() async throws {
+        let root = makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let storage = StorageManager(storageRoot: root)
+        try await storage.initialize(config: makeStorageConfig(root: root))
+        let writer = try await storage.createSegmentWriter()
+        let segmentID = await writer.segmentID
+        try await writer.appendFrame(makePatternedCapturedFrame(targetRect: CGRect(x: 16, y: 16, width: 32, height: 32)))
+        _ = try await writer.finalize()
+        let beforeImage = try decodeJPEG(try await storage.readFrame(segmentID: segmentID, frameIndex: 0))
+        let before = try BGRAImageUtilities.makeData(from: beforeImage)
+        let plan = SegmentRewritePlan(redactions: [SegmentFrameRedaction(frameID: 42, frameIndex: 0, targets: [
+            SegmentRedactionTarget(frameID: 42, nodeID: 7,
+                normalizedRect: CGRect(x: 0.25, y: 0.25, width: 0.5, height: 0.5), mode: .permanent)
+        ])])
+        XCTAssertFalse(plan.requiresRedactionSecret)
+        try await storage.applySegmentRewrite(segmentID: segmentID, plan: plan, secret: nil)
+        let afterImage = try decodeJPEG(try await storage.readFrame(segmentID: segmentID, frameIndex: 0))
+        let after = try BGRAImageUtilities.makeData(from: afterImage)
+        let protected = extractPatch(from: after, imageWidth: afterImage.width, rect: CGRect(x: 20,y: 20,width: 24,height: 24))
+        let rgb = protected.enumerated().filter { $0.offset % 4 != 3 }.map { Double($0.element) }
+        XCTAssertLessThan(rgb.reduce(0, +) / Double(rgb.count), 12)
+        let control = CGRect(x: 0,y: 0,width: 12,height: 12)
+        XCTAssertLessThan(averageAbsoluteDifference(
+            extractPatch(from: before,imageWidth: beforeImage.width,rect: control),
+            extractPatch(from: after,imageWidth: afterImage.width,rect: control)), 12)
+        try await storage.finishInterruptedSegmentRewriteRecovery(segmentID: segmentID)
+    }
+
     func testApplySegmentRewriteBlacksTargetedFramesAndLeavesUntouchedFramesMateriallyStable() async throws {
         let root = makeTempRoot()
         let storage = StorageManager(storageRoot: root)

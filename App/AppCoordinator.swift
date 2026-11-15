@@ -459,11 +459,17 @@ actor TimelineStillDiskWriter {
                 let destinationURL = destinationResolver(request.frameID)
                 do {
                     let jpegData = try encoder(request.frame)
+                    let privacyDefaults = UserDefaults(suiteName: ReversibleOCRScrambler.settingsSuiteName) ?? .standard
+                    guard !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { continue }
                     try FileManager.default.createDirectory(
                         at: destinationURL.deletingLastPathComponent(),
                         withIntermediateDirectories: true
                     )
                     try jpegData.write(to: destinationURL, options: [.atomic])
+                    if PhraseRedactionMode.isEnabled(in: privacyDefaults) {
+                        try? FileManager.default.removeItem(at: destinationURL)
+                        continue
+                    }
                     await self.recordWriteSuccess(directory: destinationURL.deletingLastPathComponent())
                 } catch {
                     await self.recordWriteFailure(
@@ -2673,6 +2679,7 @@ public actor AppCoordinator {
         frameID: Int64,
         frame: CapturedFrame
     ) async {
+        guard !PhraseRedactionMode.isEnabled(in: Self.userDefaultsSuite) else { return }
         await timelineStillDiskWriter.enqueue(frameID: frameID, frame: frame)
     }
 
@@ -3172,7 +3179,8 @@ public actor AppCoordinator {
         let defaults = Self.userDefaultsSuite
         let hasMasterKey = MasterKeyManager.hasMasterKey()
         let phraseLevelRedactionEnabled =
-            defaults.object(forKey: Self.phraseLevelRedactionEnabledKey) as? Bool ?? false
+            (defaults.object(forKey: Self.phraseLevelRedactionEnabledKey) as? Bool ?? false)
+                && PhraseRedactionMode.load(from: defaults) == .scramble
 
         var hasProtectedRedactionData = false
         var hasPendingRedactionRewrites = false
@@ -3187,10 +3195,7 @@ public actor AppCoordinator {
         }
 
         do {
-            let pendingVideoIDs = try await services.database.getVideoIDsWithPendingNodeRedactions(
-                includeRetryableFailures: true
-            )
-            hasPendingRedactionRewrites = !pendingVideoIDs.isEmpty
+            hasPendingRedactionRewrites = try await services.database.hasPendingScrambleRedactions()
         } catch {
             Log.error(
                 "[AppCoordinator] Failed to inspect pending phrase-redaction rewrites: \(error.localizedDescription)",

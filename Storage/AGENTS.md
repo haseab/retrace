@@ -347,3 +347,7 @@ throw StorageError.insufficientDiskSpace
 6. Write tests for encoding and encryption
 
 Start with the HEVC encoder since that's the core complexity, then add encryption on top.
+
+## Permanent keyword redaction
+
+`SegmentRedactionTarget.mode` is captured from stored node metadata, not current settings. Permanent targets overwrite the whole patch with opaque black and require no secret; scramble targets retain the existing keyed permutation. Invalid rectangles or patch extraction failures abort the atomic rewrite. Mixed plans require a secret if any target uses scrambling. Recovery keeps the existing write/swap/commit cleanup contract.
