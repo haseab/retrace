@@ -44,6 +44,7 @@ Database/
     ├── RetentionVideoDeletionTests.swift # Real migrated SQLite retention guards and injected failure
     ├── DatabaseManagerTests.swift
     ├── EdgeCaseTests.swift
+    ├── ProcessingQueueBatchTests.swift # Atomic backlog enqueue, statement reuse and eligibility checks
     ├── FrameBatchDeletionTests.swift # Batched retention deletion, real SQLite/FTS, rollback and shared documents
     ├── FTSManagerTests.swift
     ├── IntegrationTests.swift
@@ -659,3 +660,8 @@ The existing `node.encryptedText` column stores either the reversible protected-
 - Retention, recent-frame deletion, and explicit frame-ID deletion share `FrameQueries` batching: at most 500 IDs per statement, reduced to the connection's SQLite variable limit. Preserve the existing requested-ID count semantics for explicit IDs.
 - Delete affected `doc_segment` links in batches, then delete only affected FTS documents with no remaining links (including audio-only links). Never sweep unrelated orphan documents. Chunk document IDs separately because a frame may have many documents.
 - Keep the complete operation in one transaction; when a caller owns a transaction, leave commit/rollback to that caller. Existing foreign-key cascades remain responsible for nodes, processing queue rows and frame anchors. No schema migration or new user action/metric is introduced.
+
+### Batched OCR queue insertion
+
+- `enqueueFramesForProcessing` uses one actor call, one reusable prepared INSERT, and a savepoint that commits as one standalone transaction or nests inside an existing transaction. Missing/non-pending frames and write failures roll back the complete batch, leaving pre-existing queue entries intact.
+- Preserve the single-frame API's eligibility (`processingStatus = 0`), priority, zero retry count, timestamp behavior, and duplicate-ID behavior. The single-frame path does not acquire an additional explicit transaction.

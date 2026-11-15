@@ -3986,41 +3986,59 @@ public actor DatabaseManager: DatabaseProtocol {
 
     // MARK: - Processing Queue Operations
 
-    /// Enqueue a frame for OCR processing
-    /// Only enqueues frames with processingStatus = 0 (pending)
+    /// Enqueue a frame for OCR processing. Only pending frames are eligible.
     public func enqueueFrameForProcessing(frameID: Int64, priority: Int = 0) async throws {
         guard let db = db else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
+        try enqueueProcessingFrames(db: db, frameIDs: [frameID], priority: priority)
+    }
 
-        // Only enqueue if processingStatus = 0 (pending)
+    /// Enqueue a backlog atomically with one prepared insert. Duplicates retain
+    /// the single-frame API's behavior; any missing/ineligible frame fails the batch.
+    public func enqueueFramesForProcessing(frameIDs: [Int64], priority: Int = 0) async throws {
+        guard !frameIDs.isEmpty else { return }
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        // SAVEPOINT/RELEASE is one transaction when standalone, and keeps a
+        // caller-owned transaction open while isolating a failed batch's writes.
+        try executeImmediateSQL("SAVEPOINT retrace_enqueue_batch;", db: db)
+        do {
+            try enqueueProcessingFrames(db: db, frameIDs: frameIDs, priority: priority)
+            try executeImmediateSQL("RELEASE retrace_enqueue_batch;", db: db)
+        } catch {
+            try? executeImmediateSQL("ROLLBACK TO retrace_enqueue_batch;", db: db)
+            try? executeImmediateSQL("RELEASE retrace_enqueue_batch;", db: db)
+            throw error
+        }
+    }
+
+    private func enqueueProcessingFrames(db: OpaquePointer, frameIDs: [Int64], priority: Int) throws {
         let sql = """
             INSERT INTO processing_queue (frameId, enqueuedAt, priority, retryCount)
             SELECT ?, ?, ?, 0
             FROM frame
             WHERE id = ? AND processingStatus = 0;
-        """
-
+            """
         var stmt: OpaquePointer?
         defer { sqlite3_finalize(stmt) }
-
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
             throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
         }
-
-        sqlite3_bind_int64(stmt, 1, frameID)
-        sqlite3_bind_double(stmt, 2, Date().timeIntervalSince1970)
-        sqlite3_bind_int(stmt, 3, Int32(priority))
-        sqlite3_bind_int64(stmt, 4, frameID)
-
-        guard sqlite3_step(stmt) == SQLITE_DONE else {
-            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
-        }
-
-        // Check if any row was actually inserted
-        let changes = sqlite3_changes(db)
-        if changes == 0 {
-            throw DatabaseError.queryFailed(query: sql, underlying: "Frame \(frameID) not eligible for processing (processingStatus != 0)")
+        for frameID in frameIDs {
+            sqlite3_bind_int64(stmt, 1, frameID)
+            sqlite3_bind_double(stmt, 2, Date().timeIntervalSince1970)
+            sqlite3_bind_int(stmt, 3, Int32(priority))
+            sqlite3_bind_int64(stmt, 4, frameID)
+            guard sqlite3_step(stmt) == SQLITE_DONE else {
+                throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+            }
+            guard sqlite3_changes(db) == 1 else {
+                throw DatabaseError.queryFailed(query: sql, underlying: "Frame \(frameID) not eligible for processing (processingStatus != 0)")
+            }
+            sqlite3_reset(stmt)
+            sqlite3_clear_bindings(stmt)
         }
     }
 

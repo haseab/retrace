@@ -137,8 +137,10 @@ final class FrameBatchDeletionTests: XCTestCase {
 
     private func seed(_ db: OpaquePointer, count: Int) throws {
         try execute(db, """
-            WITH RECURSIVE n(id) AS (VALUES(1) UNION ALL SELECT id+1 FROM n WHERE id<\(count))
+            WITH RECURSIVE n(id) AS (VALUES(1) UNION ALL SELECT id+1 FROM n WHERE id<?)
             INSERT INTO frame(id,createdAt,imageFileName) SELECT id,1000,'frame' FROM n;
+            """, bindings: [Int64(count)])
+        try execute(db, """
             INSERT INTO searchRanking(rowid,text) SELECT id,'expiredtoken' FROM frame;
             INSERT INTO doc_segment(docid,segmentId,frameId) SELECT id,0,id FROM frame;
             """)
@@ -161,7 +163,19 @@ final class FrameBatchDeletionTests: XCTestCase {
         }
     }
 
-    private func execute(_ db: OpaquePointer, _ sql: String) throws {
+    private func execute(_ db: OpaquePointer, _ sql: String, bindings: [Int64] = []) throws {
+        if !bindings.isEmpty {
+            var statement: OpaquePointer?
+            defer { sqlite3_finalize(statement) }
+            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+                throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+            }
+            for (index, value) in bindings.enumerated() { sqlite3_bind_int64(statement, Int32(index + 1), value) }
+            guard sqlite3_step(statement) == SQLITE_DONE else {
+                throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+            }
+            return
+        }
         guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else {
             throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
         }

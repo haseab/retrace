@@ -410,3 +410,7 @@ Start with Vision OCR since it's the core functionality, then add Accessibility 
 Read `PhraseRedactionMode` once when protecting OCR output and store the mode per node. Permanent matches retain masked text and only the permanent marker, never encrypted originals. Scramble matches without a master key must fail before search indexing. Rewrite scheduling uses each stored target mode; permanent-only plans run without a key. Use the shared keyword settings parser (including legacy comma/newline rules). Purge stale timeline stills/search thumbnails in both normal commit and committed startup recovery after a successful video rewrite, before marking it complete, and publish `PhraseRedactionMode.didFinishNotification` to invalidate UI image caches.
 
 Recovery scanning must wait for all active rewrites and block new rewrite reservations until the scan finishes. Recheck the scanning gate after database awaits before reserving an encoder.
+
+### Batch enqueue
+
+`FrameProcessingQueue.enqueueBatch` passes the whole ID list to `DatabaseManager.enqueueFramesForProcessing` in one await. Increase `currentQueueDepth` only after the database commits the whole batch; empty batches are no-ops and failures add nothing. `RewriteRetryPolicyTests.testEnqueueBatchIsAtomicAndUsesDatabaseBatch` exercises this wiring against migrated SQLite. This is maintenance of an existing action; no new daily metric is needed.
