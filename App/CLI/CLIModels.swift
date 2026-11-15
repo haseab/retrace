@@ -907,16 +907,17 @@ public struct CLIStatusOutput: Codable, Sendable, Equatable {
 }
 
 public struct CLIStatusPipeline: Codable, Sendable, Equatable {
-    public let isRunning: Bool
-    public let framesProcessed: Int
-    public let errorCount: Int
+    public let runtimeStatus = "unavailable: live app state is not queried"
+    public let isRunning: Bool?
+    public let framesProcessed: Int?
+    public let errorCount: Int?
     public let startTime: Date?
     public let latestFrameTimestamp: Date?
 
     public init(
-        isRunning: Bool,
-        framesProcessed: Int,
-        errorCount: Int,
+        isRunning: Bool?,
+        framesProcessed: Int?,
+        errorCount: Int?,
         startTime: Date?,
         latestFrameTimestamp: Date?
     ) {
@@ -1650,13 +1651,15 @@ public struct CLIInspectSearchStatisticsOutput: Codable, Sendable, Equatable {
 }
 
 public struct CLIInspectSystemOutput: Codable, Sendable, Equatable {
+    public let processScope = "cli_process; power describes this machine"
     public let process: CLIInspectProcessOutput
     public let pipeline: CLIStatusPipeline
-    public let isCapturing: Bool
+    public let isCapturing: Bool?
     public let database: CLIInspectDatabaseOutput
-    public let capture: CLIInspectCaptureOutput
-    public let processing: CLIInspectProcessingOutput
-    public let search: CLIInspectSearchStatisticsOutput
+    public let capture: CLIInspectCaptureOutput?
+    public let processing: CLIInspectProcessingOutput?
+    public let search: CLIInspectSearchStatisticsOutput?
+    public let runtimeStatus = "unavailable: live app queue and encoding state are not queried"
     public let queue: CLIInspectQueueStatisticsOutput?
     public let encoding: CLIInspectEncodingOutput?
     public let power: CLIInspectPowerOutput
@@ -1665,11 +1668,11 @@ public struct CLIInspectSystemOutput: Codable, Sendable, Equatable {
     public init(
         process: CLIInspectProcessOutput,
         pipeline: CLIStatusPipeline,
-        isCapturing: Bool,
+        isCapturing: Bool?,
         database: CLIInspectDatabaseOutput,
-        capture: CLIInspectCaptureOutput,
-        processing: CLIInspectProcessingOutput,
-        search: CLIInspectSearchStatisticsOutput,
+        capture: CLIInspectCaptureOutput?,
+        processing: CLIInspectProcessingOutput?,
+        search: CLIInspectSearchStatisticsOutput?,
         queue: CLIInspectQueueStatisticsOutput?,
         encoding: CLIInspectEncodingOutput?,
         power: CLIInspectPowerOutput,
@@ -1690,6 +1693,7 @@ public struct CLIInspectSystemOutput: Codable, Sendable, Equatable {
 }
 
 public struct CLIInspectOCROutput: Codable, Sendable, Equatable {
+    public let runtimeStatus = "unavailable: live app queue and encoding state are not queried"
     public let queue: CLIInspectQueueStatisticsOutput?
     public let encoding: CLIInspectEncodingOutput?
     public let power: CLIInspectPowerOutput
@@ -1715,6 +1719,7 @@ public struct CLIInspectOCROutput: Codable, Sendable, Equatable {
 }
 
 public struct CLIInspectQueueOutput: Codable, Sendable, Equatable {
+    public let runtimeStatus = "unavailable: live app queue and encoding state are not queried"
     public let queue: CLIInspectQueueStatisticsOutput?
     public let encoding: CLIInspectEncodingOutput?
     public let power: CLIInspectPowerOutput

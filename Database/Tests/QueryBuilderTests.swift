@@ -1,5 +1,5 @@
 import XCTest
-import SQLite3
+import SQLCipher
 import Darwin
 import Shared
 @testable import Database

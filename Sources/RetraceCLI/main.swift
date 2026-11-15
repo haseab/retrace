@@ -7,6 +7,8 @@ import Shared
 struct RetraceCLIExecutable {
     static func main() async {
         Log.disableConsolePrinting()
-        exit(await RetraceCLI.run(arguments: CommandLine.arguments))
+        let code = await RetraceCLI.run(arguments: CommandLine.arguments)
+        await Log.flush()
+        exit(code)
     }
 }

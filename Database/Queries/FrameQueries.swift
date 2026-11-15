@@ -156,7 +156,7 @@ public enum FrameQueries {
 
         sqlite3_bind_int64(statement, 1, frameId)
 
-        guard sqlite3_step(statement) == SQLITE_ROW else {
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else {
             return nil
         }
 
@@ -213,7 +213,7 @@ public enum FrameQueries {
 
         sqlite3_bind_int64(statement, 1, frameId)
         var rows: [FrameInPageURLRow] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             rows.append(
                 FrameInPageURLRow(
                     order: Int(sqlite3_column_int64(statement, 0)),
@@ -247,7 +247,7 @@ public enum FrameQueries {
 
         sqlite3_bind_int64(statement, 1, frameId)
 
-        guard sqlite3_step(statement) == SQLITE_ROW else {
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else {
             return nil
         }
 
@@ -677,7 +677,7 @@ public enum FrameQueries {
         }
 
         bindTextStatement(selectStatement, text: url)
-        guard sqlite3_step(selectStatement) == SQLITE_ROW else {
+        guard try SQLiteReadStep.next(selectStatement) == SQLITE_ROW else {
             throw DatabaseError.queryFailed(
                 query: "SELECT id FROM in_page_url_text",
                 underlying: "Missing shared in-page URL text row"
@@ -843,7 +843,7 @@ public enum FrameQueries {
             throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
         }
 
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             guard let name = sqlite3_column_text(statement, 1).map({ String(cString: $0) }) else {
                 continue
             }
@@ -870,7 +870,7 @@ public enum FrameQueries {
         }
 
         sqlite3_bind_text(statement, 1, table, -1, SQLITE_TRANSIENT)
-        return sqlite3_step(statement) == SQLITE_ROW
+        return try SQLiteReadStep.next(statement) == SQLITE_ROW
     }
 
     // MARK: - Select by ID
@@ -898,7 +898,7 @@ public enum FrameQueries {
 
         sqlite3_bind_int64(statement, 1, id.value)
 
-        guard sqlite3_step(statement) == SQLITE_ROW else {
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else {
             return nil
         }
 
@@ -940,7 +940,7 @@ public enum FrameQueries {
         sqlite3_bind_int(statement, 3, Int32(limit))
 
         var frames: [FrameReference] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             let frame = try parseFrameRow(statement: statement!)
             frames.append(frame)
         }
@@ -981,7 +981,7 @@ public enum FrameQueries {
         sqlite3_bind_int(statement, 2, Int32(limit))
 
         var frames: [FrameReference] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             let frame = try parseFrameRow(statement: statement!)
             frames.append(frame)
         }
@@ -1022,7 +1022,7 @@ public enum FrameQueries {
         sqlite3_bind_int(statement, 2, Int32(limit))
 
         var frames: [FrameReference] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             let frame = try parseFrameRow(statement: statement!)
             frames.append(frame)
         }
@@ -1057,7 +1057,7 @@ public enum FrameQueries {
         sqlite3_bind_int(statement, 1, Int32(limit))
 
         var frames: [FrameReference] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             let frame = try parseFrameRow(statement: statement!)
             frames.append(frame)
         }
@@ -1100,7 +1100,7 @@ public enum FrameQueries {
         sqlite3_bind_int(statement, 3, Int32(offset))
 
         var frames: [FrameReference] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             let frame = try parseFrameRow(statement: statement!)
             frames.append(frame)
         }
@@ -1137,7 +1137,7 @@ public enum FrameQueries {
         sqlite3_bind_int(statement, 1, Int32(limit))
 
         var frames: [FrameReference] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             let frame = try parseFrameRow(statement: statement!)
             frames.append(frame)
         }
@@ -1197,7 +1197,7 @@ public enum FrameQueries {
         bindSelection(selectionStatement)
 
         var frameIDs: [Int64] = []
-        while sqlite3_step(selectionStatement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(selectionStatement) == SQLITE_ROW {
             frameIDs.append(sqlite3_column_int64(selectionStatement, 0))
         }
 
@@ -1215,9 +1215,11 @@ public enum FrameQueries {
         }
 
         do {
-            for frameID in frameIDs {
-                try FTSQueries.deleteForFrame(db: db, frameId: frameID)
-                try deleteFrameRow(db: db, frameID: frameID)
+            let batchSize = FTSQueries.deletionBatchSize(db: db)
+            for start in stride(from: 0, to: frameIDs.count, by: batchSize) {
+                let batch = Array(frameIDs[start..<min(start + batchSize, frameIDs.count)])
+                try FTSQueries.deleteForFrames(db: db, frameIDs: batch)
+                try deleteFrameRows(db: db, frameIDs: batch)
             }
 
             if managesOwnTransaction {
@@ -1233,8 +1235,9 @@ public enum FrameQueries {
         return frameIDs.count
     }
 
-    private static func deleteFrameRow(db: OpaquePointer, frameID: Int64) throws {
-        let sql = "DELETE FROM frame WHERE id = ?;"
+    private static func deleteFrameRows(db: OpaquePointer, frameIDs: [Int64]) throws {
+        let placeholders = frameIDs.map { _ in "?" }.joined(separator: ",")
+        let sql = "DELETE FROM frame WHERE id IN (\(placeholders));"
         var statement: OpaquePointer?
         defer {
             sqlite3_finalize(statement)
@@ -1247,7 +1250,9 @@ public enum FrameQueries {
             )
         }
 
-        sqlite3_bind_int64(statement, 1, frameID)
+        for (index, id) in frameIDs.enumerated() {
+            sqlite3_bind_int64(statement, Int32(index + 1), id)
+        }
 
         guard sqlite3_step(statement) == SQLITE_DONE else {
             throw DatabaseError.queryFailed(
@@ -1284,7 +1289,7 @@ public enum FrameQueries {
         sqlite3_bind_int64(statement, 1, startMs)
         sqlite3_bind_int64(statement, 2, endMs)
 
-        return sqlite3_step(statement) == SQLITE_ROW
+        return try SQLiteReadStep.next(statement) == SQLITE_ROW
     }
 
     /// Get frame ID near the given timestamp (millisecond window)
@@ -1320,7 +1325,7 @@ public enum FrameQueries {
         sqlite3_bind_int64(statement, 2, endMs)
         sqlite3_bind_int64(statement, 3, targetMs)
 
-        if sqlite3_step(statement) == SQLITE_ROW {
+        if try SQLiteReadStep.next(statement) == SQLITE_ROW {
             return sqlite3_column_int64(statement, 0)
         }
         return nil
@@ -1343,7 +1348,7 @@ public enum FrameQueries {
             )
         }
 
-        guard sqlite3_step(statement) == SQLITE_ROW else {
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else {
             return 0
         }
 
@@ -1494,7 +1499,7 @@ public enum FrameQueries {
         sqlite3_bind_int(statement, 3, Int32(limit))
 
         var results: [FrameWithVideoInfo] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             let frameWithVideoInfo = try parseFrameWithVideoInfoRow(
                 statement: statement!,
                 storageRoot: storageRoot
@@ -1542,7 +1547,7 @@ public enum FrameQueries {
         sqlite3_bind_int(statement, 1, Int32(limit))
 
         var results: [FrameWithVideoInfo] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             let frameWithVideoInfo = try parseFrameWithVideoInfoRow(
                 statement: statement!,
                 storageRoot: storageRoot
@@ -1591,7 +1596,7 @@ public enum FrameQueries {
         sqlite3_bind_int(statement, 2, Int32(limit))
 
         var results: [FrameWithVideoInfo] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             let frameWithVideoInfo = try parseFrameWithVideoInfoRow(
                 statement: statement!,
                 storageRoot: storageRoot
@@ -1640,7 +1645,7 @@ public enum FrameQueries {
         sqlite3_bind_int(statement, 2, Int32(limit))
 
         var results: [FrameWithVideoInfo] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             let frameWithVideoInfo = try parseFrameWithVideoInfoRow(
                 statement: statement!,
                 storageRoot: storageRoot
@@ -1680,7 +1685,7 @@ public enum FrameQueries {
 
         sqlite3_bind_int64(statement, 1, id.value)
 
-        guard sqlite3_step(statement) == SQLITE_ROW else {
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else {
             return nil
         }
 
@@ -1805,7 +1810,7 @@ public enum FrameQueries {
         }
 
         var dates: [Date] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             let timestampMs = sqlite3_column_int64(statement, 0)
             let date = Schema.timestampToDate(timestampMs)
             // Normalize to start of day in local timezone
@@ -1850,7 +1855,7 @@ public enum FrameQueries {
         sqlite3_bind_int64(statement, 2, endMs)
 
         var hours: [Date] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             let timestampMs = sqlite3_column_int64(statement, 0)
             let timestamp = Schema.timestampToDate(timestampMs)
             // Normalize to start of hour

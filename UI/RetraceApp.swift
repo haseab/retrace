@@ -268,6 +268,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var isHandlingSystemWake = false
     private var pendingDeeplinkURLs: [URL] = []
     private var shouldShowDashboardAfterInitialization = false
+    private var pendingAutomaticDashboardRevealSource: String?
+    private let dashboardRevealScheduler = DashboardRevealScheduler.shared
     private var isActivationRevealInFlight = false
     private var isInitialized = false
     private var isTerminationFlushInProgress = false
@@ -279,7 +281,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private static let devDeeplinkEnvKey = "RETRACE_DEV_DEEPLINK_URL"
     private static let externalDashboardRevealNotification = Notification.Name("io.retrace.app.externalDashboardReveal")
     private static let cliImageExportNotification = CLIImageExportIPC.requestNotification
-    private static let quitConfirmationPreferenceKey = "quitConfirmationPreference"
     private static let showDockIconPreferenceKey = "showDockIcon"
     private static let dashboardShortcutDefaultsKey = "dashboardShortcutConfig"
     private static let recordingShortcutDefaultsKey = "recordingShortcutConfig"
@@ -290,11 +291,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private static let singleInstanceLockRetryDelay: Duration = .milliseconds(100)
     nonisolated private static let watchdogSleepSuspensionSeconds: TimeInterval = 12 * 60 * 60
     nonisolated private static let watchdogWakeGracePeriodSeconds: TimeInterval = 60
-    private enum QuitTerminationPreference: String {
-        case ask
-        case quit
-        case runInBackground
-    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Check if another instance is already running. Relaunches still need to
@@ -796,9 +792,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 requestDashboardReveal(source: "pendingExternalDashboardReveal")
                 shouldShowDashboardAfterInitialization = false
             } else if !didHandleInitialDeeplink {
-                // Show dashboard on first launch (only if no deeplinks)
-                DashboardWindowController.shared.show()
+                // A launch URL can arrive just after initialization completes.
+                // Give it the same precedence as a URL opening a running app.
+                scheduleAutomaticDashboardReveal(
+                    source: pendingAutomaticDashboardRevealSource ?? "initialLaunch"
+                )
             }
+            pendingAutomaticDashboardRevealSource = nil
 
         } catch {
             Log.error("[AppDelegate] Failed to initialize: \(error)", category: .app)
@@ -925,28 +925,24 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        Task { @MainActor in
-            Log.info("[LaunchSurface] applicationShouldHandleReopen hasVisibleWindows=\(flag) state=\(launchSurfaceStateSnapshot())", category: .app)
-            logGhostAppCheck("applicationShouldHandleReopen hasVisibleWindows=\(flag)")
-            requestDashboardReveal(source: "applicationShouldHandleReopen")
-        }
+        Log.info("[LaunchSurface] applicationShouldHandleReopen hasVisibleWindows=\(flag) state=\(launchSurfaceStateSnapshot())", category: .app)
+        logGhostAppCheck("applicationShouldHandleReopen hasVisibleWindows=\(flag)")
+        scheduleAutomaticDashboardReveal(source: "applicationShouldHandleReopen")
         return true
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
-        Task { @MainActor in
-            self.installMainMenuIfNeeded()
-            CrashRecoveryManager.shared.refreshUserFacingStatus()
-            let shouldReveal = shouldRevealDashboardForActivation()
-            Log.info("[LaunchSurface] applicationDidBecomeActive shouldReveal=\(shouldReveal) state=\(launchSurfaceStateSnapshot())", category: .app)
-            logGhostAppCheck("applicationDidBecomeActive shouldReveal=\(shouldReveal)")
+        self.installMainMenuIfNeeded()
+        CrashRecoveryManager.shared.refreshUserFacingStatus()
+        let shouldReveal = shouldRevealDashboardForActivation()
+        Log.info("[LaunchSurface] applicationDidBecomeActive shouldReveal=\(shouldReveal) state=\(launchSurfaceStateSnapshot())", category: .app)
+        logGhostAppCheck("applicationDidBecomeActive shouldReveal=\(shouldReveal)")
 
-            guard shouldReveal, !isActivationRevealInFlight else { return }
+        guard shouldReveal, !isActivationRevealInFlight else { return }
 
-            isActivationRevealInFlight = true
-            requestDashboardReveal(source: "applicationDidBecomeActive")
-            isActivationRevealInFlight = false
-        }
+        isActivationRevealInFlight = true
+        scheduleAutomaticDashboardReveal(source: "applicationDidBecomeActive")
+        isActivationRevealInFlight = false
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -958,15 +954,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return .terminateLater
         }
 
-        switch terminationPreferenceForCurrentRequest() {
-        case .quit:
+        if bypassQuitConfirmationPromptOnce {
+            bypassQuitConfirmationPromptOnce = false
             beginTerminationFlush()
             return .terminateLater
-        case .runInBackground:
-            runInBackgroundInsteadOfQuitting()
-            return .terminateCancel
-        case .ask:
-            break
         }
 
         isTerminationDecisionInProgress = true
@@ -987,20 +978,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Darwin.exit(EXIT_SUCCESS)
     }
 
-    private func terminationPreferenceForCurrentRequest() -> QuitTerminationPreference {
-        if bypassQuitConfirmationPromptOnce {
-            bypassQuitConfirmationPromptOnce = false
-            return .quit
-        }
-
-        guard let rawValue = settingsStore.string(forKey: Self.quitConfirmationPreferenceKey),
-              let storedPreference = QuitTerminationPreference(rawValue: rawValue) else {
-            return .ask
-        }
-
-        return storedPreference
-    }
-
     private func beginTerminationFlush() {
         guard !isTerminationFlushInProgress else { return }
 
@@ -1019,7 +996,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Use terminateLater to avoid blocking the main thread during shutdown.
         Task { @MainActor [weak self] in
             await CrashRecoveryManager.shared.prepareForExpectedExit()
+            await ProcessCPUMonitor.shared.stopAndFlush()
             _ = await TimelineWindowController.shared.forceRecordSessionMetrics(timeoutMs: 350)
+            Log.info("[AppDelegate] Application terminating", category: .app)
+            await Log.flush()
             self?.isTerminationFlushInProgress = false
             NSApp.reply(toApplicationShouldTerminate: true)
         }
@@ -1028,16 +1008,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func presentQuitConfirmationAlert() {
         Log.info("[AppDelegate] Presenting standard quit confirmation alert", category: .app)
 
-        let alert = NSAlert()
-        alert.alertStyle = .warning
-        alert.icon = NSApp.applicationIconImage
-        alert.messageText = "Are you sure you want to quit Retrace?"
-        alert.informativeText = "Quitting Retrace will stop any active capture and end ongoing recording. You can keep Retrace running in the background without interruption."
-        alert.showsSuppressionButton = true
-        alert.suppressionButton?.title = "Don't ask again"
-        alert.addButton(withTitle: "Quit Retrace")
-        alert.addButton(withTitle: "Run Retrace in Background")
-        alert.addButton(withTitle: "Cancel")
+        let alert = Self.makeQuitConfirmationAlert(applicationIcon: NSApp.applicationIconImage)
         styleQuitAlertPrimaryButton(alert, context: "initial")
         scheduleQuitButtonStyleEnforcement(for: alert, context: "quit-confirmation")
 
@@ -1045,7 +1016,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             alert.beginSheetModal(for: anchorWindow) { [weak self] response in
                 Task { @MainActor in
                     guard let self else { return }
-                    self.handleQuitAlertResponse(response, dontAskAgain: alert.suppressionButton?.state == .on)
+                    self.handleQuitAlertResponse(response)
                 }
             }
             return
@@ -1053,18 +1024,30 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         NSApp.activate(ignoringOtherApps: true)
         let response = alert.runModal()
-        handleQuitAlertResponse(response, dontAskAgain: alert.suppressionButton?.state == .on)
+        handleQuitAlertResponse(response)
     }
 
-    private func handleQuitAlertResponse(_ response: NSApplication.ModalResponse, dontAskAgain: Bool) {
+    static func makeQuitConfirmationAlert(applicationIcon: NSImage?) -> NSAlert {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.icon = applicationIcon
+        alert.messageText = "Are you sure you want to quit Retrace?"
+        alert.informativeText = "Quitting Retrace will stop any active capture and end ongoing recording. You can keep Retrace running in the background without interruption."
+        alert.addButton(withTitle: "Quit Retrace")
+        alert.addButton(withTitle: "Run Retrace in Background")
+        alert.addButton(withTitle: "Cancel")
+        return alert
+    }
+
+    private func handleQuitAlertResponse(_ response: NSApplication.ModalResponse) {
         let result: QuitConfirmationResult
         switch response {
         case .alertFirstButtonReturn:
-            result = QuitConfirmationResult(action: .quit, dontAskAgain: dontAskAgain)
+            result = QuitConfirmationResult(action: .quit)
         case .alertSecondButtonReturn:
-            result = QuitConfirmationResult(action: .runInBackground, dontAskAgain: dontAskAgain)
+            result = QuitConfirmationResult(action: .runInBackground)
         default:
-            result = QuitConfirmationResult(action: .cancel, dontAskAgain: dontAskAgain)
+            result = QuitConfirmationResult(action: .cancel)
         }
         handleQuitConfirmationResult(result)
     }
@@ -1134,17 +1117,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func handleQuitConfirmationResult(_ result: QuitConfirmationResult) {
         isTerminationDecisionInProgress = false
-
-        if result.dontAskAgain {
-            switch result.action {
-            case .quit:
-                settingsStore.set(QuitTerminationPreference.quit.rawValue, forKey: Self.quitConfirmationPreferenceKey)
-            case .runInBackground:
-                settingsStore.set(QuitTerminationPreference.runInBackground.rawValue, forKey: Self.quitConfirmationPreferenceKey)
-            case .cancel:
-                break
-            }
-        }
 
         switch result.action {
         case .quit:
@@ -2340,7 +2312,26 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @MainActor
+    private func scheduleAutomaticDashboardReveal(source: String) {
+        dashboardRevealScheduler.schedule { [weak self] in
+            guard let self else { return }
+            // URL delivery and timeline presentation may have changed the state
+            // since the activation callback. Recheck before revealing anything.
+            if source == "applicationDidBecomeActive", !self.shouldRevealDashboardForActivation() {
+                return
+            }
+            if self.isInitialized {
+                self.requestDashboardReveal(source: source)
+            } else {
+                self.pendingAutomaticDashboardRevealSource = source
+            }
+        }
+    }
+
+    @MainActor
     private func requestDashboardReveal(source: String) {
+        dashboardRevealScheduler.cancelPendingReveal()
+        dashboardRevealScheduler.finishDeeplinkPresentation()
         logGhostAppCheck("requestDashboardReveal start source=\(source)")
         if isInitialized {
             Log.info("[LaunchSurface] requestDashboardReveal source=\(source) before state=\(launchSurfaceStateSnapshot())", category: .app)
@@ -2459,6 +2450,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func setupGhostAppLoggingObservers() {
         NotificationCenter.default.addObserver(
             self,
+            selector: #selector(handleTimelineDeeplinkDidOpen(_:)),
+            name: .timelineDidOpen,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
             selector: #selector(handleGhostAppDashboardDidClose(_:)),
             name: .dashboardDidClose,
             object: nil
@@ -2509,7 +2506,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
-        let notificationRequestID = CLIImageExportIPC.requestID(from: notification)
+        guard let notificationRequestID = CLIImageExportIPC.requestID(from: notification) else { return }
 
         Task(priority: .userInitiated) { [weak self] in
             guard let self else { return }
@@ -2522,23 +2519,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func processCLIImageExportRequest(
         requestPath: String,
-        notificationRequestID: String?
+        notificationRequestID: String
     ) async {
         let requestURL = URL(fileURLWithPath: requestPath)
         let request: CLIImageExportRequest
 
         do {
-            request = try CLIImageExportIPC.loadRequest(from: requestURL)
+            request = try await Task.detached(priority: .userInitiated) {
+                try CLIImageExportIPC.loadRequest(from: requestURL, expectedRequestID: notificationRequestID)
+            }.value
         } catch {
-            let requestID = notificationRequestID ?? UUID().uuidString
-            await writeCLIImageExportResponse(
-                CLIImageExportResponse(
-                    requestID: requestID,
-                    outputPath: "",
-                    byteCount: nil,
-                    errorMessage: "Failed to load image export request: \(error.localizedDescription)"
-                )
-            )
+            Log.warning("[CLIImageExport] Ignoring invalid export request", category: .app)
             return
         }
 
@@ -2584,7 +2575,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func writeCLIImageExportResponse(_ response: CLIImageExportResponse) async {
         do {
-            _ = try CLIImageExportIPC.writeResponse(response)
+            _ = try await Task.detached { try CLIImageExportIPC.writeResponse(response) }.value
         } catch {
             Log.error(
                 "[CLIImageExport] Failed to write response for request \(response.requestID): \(error)",
@@ -2599,7 +2590,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    @objc private func handleTimelineDeeplinkDidOpen(_ notification: Notification) {
+        dashboardRevealScheduler.finishDeeplinkPresentation()
+    }
+
     @objc private func handleGhostAppTimelineDidClose(_ notification: Notification) {
+        dashboardRevealScheduler.finishDeeplinkPresentation()
         Task { @MainActor in
             logGhostAppCheck("notification timelineDidClose")
         }
@@ -2666,6 +2662,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @MainActor
     private func shouldRevealDashboardForActivation() -> Bool {
+        guard !dashboardRevealScheduler.isPresentingDeeplink else { return false }
         guard isInitialized else { return false }
         guard !isTerminationDecisionInProgress else { return false }
         guard !isTerminationFlushInProgress else { return false }
@@ -2683,6 +2680,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         Self.isApplicationTerminating = true
+        dashboardRevealScheduler.cancelPendingReveal()
         // Keep the single-instance lock until the process actually exits.
         // Releasing it here lets a fresh launch race against a half-dead instance
         // that still appears in NSWorkspace.runningApplications.
@@ -2711,14 +2709,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         DistributedNotificationCenter.default().removeObserver(self)
         ProcessCPUMonitor.shared.stop()
         HotkeyManager.shared.shutdown()
-
-        Log.info("[AppDelegate] Application terminating", category: .app)
     }
     // MARK: - URL Handling
 
     func application(_ application: NSApplication, open urls: [URL]) {
         Log.info("[AppDelegate] Received URLs: \(urls), isInitialized: \(isInitialized)", category: .app)
         for url in urls {
+            // Cancel the automatic fallback synchronously, before hopping to a
+            // Task or waiting for initialization. Explicit dashboard links still
+            // open through their normal route below.
+            if DeeplinkHandler.route(for: url) != nil {
+                dashboardRevealScheduler.beginDeeplinkPresentation()
+                pendingAutomaticDashboardRevealSource = nil
+            }
             if isInitialized {
                 Task { @MainActor in
                     self.handleDeeplink(url)
@@ -2736,8 +2739,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let route = DeeplinkHandler.route(for: url) else {
             return
         }
+        dashboardRevealScheduler.beginDeeplinkPresentation()
+        pendingAutomaticDashboardRevealSource = nil
 
         switch route {
+        case let .dashboard(dateRange):
+            DashboardWindowController.shared.openDeeplink(dateRange: dateRange)
+            dashboardRevealScheduler.finishDeeplinkPresentation()
+
         case let .timeline(state):
             Log.info("[AppDelegate] Opening timeline deeplink at timestamp: \(String(describing: state.timestamp)) frameID=\(state.frameID.map(String.init) ?? "nil")", category: .app)
             if let frameID = state.frameID {
@@ -2754,6 +2763,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 state: state,
                 source: "AppDelegate.openURLs"
             )
+        }
+        // An already-open timeline does not emit another didOpen notification.
+        if TimelineWindowController.shared.isVisible {
+            dashboardRevealScheduler.finishDeeplinkPresentation()
         }
     }
 
@@ -2808,7 +2821,6 @@ private enum QuitConfirmationAction {
 
 private struct QuitConfirmationResult {
     let action: QuitConfirmationAction
-    let dontAskAgain: Bool
 }
 
 // MARK: - URL Handling

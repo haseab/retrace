@@ -545,7 +545,10 @@ final class CLIArgumentParserTests: XCTestCase {
             defaults.removePersistentDomain(forName: suiteName)
         }
 
-        let service = RetraceCLIService(defaults: defaults)
+        let service = RetraceCLIService(defaults: defaults, coordinatorFactory: {
+            XCTFail("Config must not initialize database or storage")
+            throw CLIError.usage("Unexpected coordinator initialization")
+        })
         let output = try await service.configGet(CLIConfigKeyRequest(key: "captureIntervalSeconds"))
 
         XCTAssertEqual(output.entry.key, "capture.interval")
@@ -561,7 +564,10 @@ final class CLIArgumentParserTests: XCTestCase {
             defaults.removePersistentDomain(forName: suiteName)
         }
 
-        let service = RetraceCLIService(defaults: defaults)
+        let service = RetraceCLIService(defaults: defaults, coordinatorFactory: {
+            XCTFail("Config must not initialize database or storage")
+            throw CLIError.usage("Unexpected coordinator initialization")
+        })
 
         let setOutput = try await service.configSet(
             CLIConfigSetRequest(key: "capture.interval", value: "5")
@@ -599,4 +605,28 @@ final class CLIArgumentParserTests: XCTestCase {
         XCTAssertEqual(output.subcommands.map(\.name), ["list", "get", "set", "reset"])
         XCTAssertTrue(output.notes.contains("shared_user_defaults"))
     }
+    func testConfigRejectsUnsafeStorageAndEncryptionWrites() async throws {
+        let suite = "CLIConfigSafetyTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let service = RetraceCLIService(defaults: defaults, coordinatorFactory: {
+            XCTFail("Config must not initialize services")
+            throw CLIError.usage("Unexpected initialization")
+        })
+        for key in ["customRetraceDBLocation", "customRewindDBLocation", "encryptionEnabled"] {
+            do {
+                _ = try await service.configSet(CLIConfigSetRequest(key: key, value: key == "encryptionEnabled" ? "false" : "/tmp/other"))
+                XCTFail("Unsafe write accepted")
+            } catch { }
+            do {
+                _ = try await service.configReset(CLIConfigKeyRequest(key: key))
+                XCTFail("Unsafe reset accepted")
+            } catch { }
+            XCTAssertNil(defaults.object(forKey: key))
+        }
+        for _ in 0..<140 { _ = try await service.configList() }
+        let pending = defaults.stringArray(forKey: "cliPendingMetrics") ?? []
+        XCTAssertEqual(pending.count, 128)
+    }
+
 }

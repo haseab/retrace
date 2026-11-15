@@ -84,6 +84,7 @@ public struct DashboardView: View {
     @State private var selectedApp: AppUsageData? = nil
     @State private var selectedWindow: WindowUsageData? = nil
     @State private var showSessionsSheet = false
+    @State private var usageActionRequest: DashboardUsageActionRequest?
     @State private var showSystemMonitor = false
     @State private var showAppUsageDatePopover = false
     @State private var appUsageDateFocusRequestID: UUID?
@@ -303,6 +304,7 @@ public struct DashboardView: View {
         guard appUsageRangeShortcutMonitor == nil else { return }
 
         appUsageRangeShortcutMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [self] event in
+            guard usageActionRequest == nil else { return event }
             guard event.window?.windowNumber == DashboardWindowController.shared.window?.windowNumber else {
                 return event
             }
@@ -375,6 +377,7 @@ public struct DashboardView: View {
         viewModel.showAccessibilityWarning
             || viewModel.showScreenRecordingWarning
             || launchOnLoginReminderManager.shouldShowReminder
+            || viewModel.conferencePrivacyBanner != nil
             || crashRecoveryBannerModel.state != nil
             || viewModel.unexpectedRecordingStop != nil
             || viewModel.storageHealthBanner != nil
@@ -446,6 +449,10 @@ public struct DashboardView: View {
                                 launchOnLoginReminderManager.dismissReminder()
                             }
                         )
+                    }
+
+                    if viewModel.conferencePrivacyBanner != nil {
+                        ConferencePrivacyDashboardBanner()
                     }
 
                     if let statusBanner = crashRecoveryBannerModel.state {
@@ -614,6 +621,11 @@ public struct DashboardView: View {
                 .id(feedbackPresentationID)
             .environmentObject(coordinatorWrapper)
         }
+        .sheet(item: $usageActionRequest) { request in
+            DashboardUsageConfirmationView(viewModel: viewModel, request: request) {
+                usageActionRequest = nil
+            }
+        }
         .background(
             ZStack {
                 // Theme-aware base background color
@@ -626,7 +638,7 @@ public struct DashboardView: View {
         )
         .background(
             Button("") {
-                Task { await viewModel.loadStatistics() }
+                Task { await viewModel.loadStatistics(reason: "manual_refresh") }
             }
             .keyboardShortcut("r", modifiers: .command)
             .frame(width: 0, height: 0)
@@ -644,14 +656,16 @@ public struct DashboardView: View {
             if !hasLoadedInitialData {
                 hasLoadedInitialData = true
                 Log.debug("[Dashboard] Initial load - first appearance", category: .ui)
-                await viewModel.loadStatistics()
+                if !viewModel.hasLoadedStatistics {
+                    await viewModel.loadStatistics(reason: "initial_appearance")
+                }
             } else {
                 Log.debug("[Dashboard] Tab switch - skipping reload", category: .ui)
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: .dashboardDidBecomeKey)) { _ in
             Log.debug("[Dashboard] Window became key - refreshing", category: .ui)
-            Task { await viewModel.loadStatistics() }
+            Task { await viewModel.loadStatistics(reason: "window_became_key") }
         }
         .onReceive(NotificationCenter.default.publisher(for: .dashboardDidOpen)) { _ in
             viewModel.isWindowVisible = true
@@ -1518,6 +1532,9 @@ public struct DashboardView: View {
                     },
                     onWindowTapped: { app, window in
                         handleWindowTapped(app, window)
+                    },
+                    onUsageAction: { target, action in
+                        usageActionRequest = DashboardUsageActionRequest(target: target, action: action)
                     }
                 )
                 .id(
@@ -1530,6 +1547,9 @@ public struct DashboardView: View {
                     totalTime: viewModel.totalWeeklyTime,
                     onAppTapped: { app in
                         handleAppTapped(app)
+                    },
+                    onUsageAction: { target, action in
+                        usageActionRequest = DashboardUsageActionRequest(target: target, action: action)
                     }
                 )
                 .id(
@@ -2398,6 +2418,57 @@ private struct UnexpectedRecordingStopBanner: View {
             RoundedRectangle(cornerRadius: 8)
                 .stroke(Color.orange.opacity(0.3), lineWidth: 1)
         )
+    }
+}
+
+private struct ConferencePrivacyDashboardBanner: View {
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(Color.white.opacity(0.14))
+                    .frame(width: 36, height: 36)
+
+                Image(systemName: "eye.slash.fill")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(.white)
+            }
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Video calls are automatically blurred to protect the privacy of others.")
+                    .font(.retraceCaptionBold)
+                    .foregroundColor(.white)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .minimumScaleFactor(0.94)
+
+                Text("Go to the menu bar icon options to disable blurring (must disable each time you join a call)")
+                    .font(.retraceCaption2)
+                    .foregroundColor(Color.white.opacity(0.92))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .minimumScaleFactor(0.94)
+            }
+
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(
+            LinearGradient(
+                colors: [
+                    Color(red: 0.12, green: 0.35, blue: 0.85).opacity(0.32),
+                    Color(red: 0.10, green: 0.24, blue: 0.63).opacity(0.24)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(Color(red: 0.43, green: 0.68, blue: 1.0).opacity(0.45), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 }
 

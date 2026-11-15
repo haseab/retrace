@@ -13,6 +13,8 @@ public extension NSNotification.Name {
     static let storageLow = NSNotification.Name("StorageLow")
     /// Storage space is critically low (< 1GB), may auto-stop recording
     static let storageCriticalLow = NSNotification.Name("StorageCriticalLow")
+    /// Storage space recovered to a healthy level (>= 5GB)
+    static let storageHealthy = NSNotification.Name("StorageHealthy")
     /// I/O latency is critically high (> 500ms)
     static let storageSlowIO = NSNotification.Name("StorageSlowIO")
     /// Storage volume mounted (used to trigger cache validation)
@@ -67,7 +69,6 @@ public final class StorageHealthMonitor: @unchecked Sendable {
     private var spinupCount = 0
 
     // Disk space state
-    private var lastDiskSpaceWarningTime: Date?
     private var lastDiskCheckFailureLogTime: Date?
     private var lastAvailableGB: Double = 0
 
@@ -102,10 +103,10 @@ public final class StorageHealthMonitor: @unchecked Sendable {
     // MARK: - Public API
 
     /// Start monitoring storage health for the given path.
-    /// Call this when pipeline starts.
+    /// Call this when pipeline starts, or again to update the critical-error callback.
     public func startMonitoring(
         storagePath: String,
-        onCriticalError: @escaping () async -> Void
+        onCriticalError: (() async -> Void)? = nil
     ) {
         var shouldStart = false
 
@@ -113,20 +114,19 @@ public final class StorageHealthMonitor: @unchecked Sendable {
         if !isMonitoring {
             isMonitoring = true
             shouldStart = true
-
             self.storagePath = storagePath
             self.storageURL = URL(fileURLWithPath: storagePath)
             self.keepAliveURL = self.storageURL?.appendingPathComponent(".retrace_keepalive")
-            self.onCriticalError = onCriticalError
 
             // Reset stats
             recentLatencies.removeAll()
             slowWriteCount = 0
             criticalWriteCount = 0
             spinupCount = 0
-            lastDiskSpaceWarningTime = nil
             lastDiskCheckFailureLogTime = nil
         }
+
+        self.onCriticalError = onCriticalError
         lock.unlock()
 
         guard shouldStart else { return }
@@ -139,7 +139,7 @@ public final class StorageHealthMonitor: @unchecked Sendable {
 
     }
 
-    /// Stop monitoring. Call this when pipeline stops.
+    /// Stop monitoring. Call this when the app no longer needs storage-health signals.
     public func stopMonitoring() {
         let taskToCancel: Task<Void, Never>?
         let observersToRemove: [NSObjectProtocol]
@@ -335,7 +335,6 @@ public final class StorageHealthMonitor: @unchecked Sendable {
     private func checkDiskSpace() async {
         let snapshot = snapshot()
         guard snapshot.isMonitoring, let storageURL = snapshot.storageURL else { return }
-
         do {
             let availableBytes = try DiskSpaceMonitor.availableBytes(at: storageURL)
             let availableGB = Double(availableBytes) / (1024 * 1024 * 1024)
@@ -343,18 +342,18 @@ public final class StorageHealthMonitor: @unchecked Sendable {
             updateLastAvailableGB(availableGB)
 
             if availableGB < Config.stopThresholdGB {
-                postNotification(.storageCriticalLow, object: ["availableGB": availableGB, "shouldStop": true])
                 if let callback = snapshot.onCriticalError {
+                    postNotification(.storageCriticalLow, object: ["availableGB": availableGB, "shouldStop": true])
                     await callback()
-                }
-            } else if availableGB < Config.criticalThresholdGB {
-                if shouldShowThrottledWarning() {
+                } else {
                     postNotification(.storageCriticalLow, object: ["availableGB": availableGB, "shouldStop": false])
                 }
+            } else if availableGB < Config.criticalThresholdGB {
+                postNotification(.storageCriticalLow, object: ["availableGB": availableGB, "shouldStop": false])
             } else if availableGB < Config.warningThresholdGB {
-                if shouldShowThrottledWarning() {
-                    postNotification(.storageLow, object: ["availableGB": availableGB])
-                }
+                postNotification(.storageLow, object: ["availableGB": availableGB])
+            } else {
+                postNotification(.storageHealthy, object: ["availableGB": availableGB])
             }
         } catch {
             if shouldLogDiskCheckFailure() {
@@ -396,20 +395,6 @@ public final class StorageHealthMonitor: @unchecked Sendable {
         lock.lock()
         lastAvailableGB = gb
         lock.unlock()
-    }
-
-    /// Check if we should show a warning (throttled to once per 5 minutes)
-    private func shouldShowThrottledWarning() -> Bool {
-        let now = Date()
-        lock.lock()
-        defer { lock.unlock() }
-
-        let lastWarning = lastDiskSpaceWarningTime
-        if lastWarning == nil || now.timeIntervalSince(lastWarning!) > 300 {
-            lastDiskSpaceWarningTime = now
-            return true
-        }
-        return false
     }
 
     private func shouldLogDiskCheckFailure(now: Date = Date()) -> Bool {

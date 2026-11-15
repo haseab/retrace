@@ -4,6 +4,14 @@ import AppKit
 
 @MainActor
 final class PhraseLevelRedactionInteractionTests: XCTestCase {
+    func testPermanentRedactionTooltipDoesNotOfferReveal() {
+        let state = SimpleTimelineViewModel.phraseLevelRedactionTooltipState(
+            for: 7, isRevealed: false, isPermanent: true
+        )
+        XCTAssertEqual(state, .permanent)
+        XCTAssertFalse(state?.isInteractive ?? true)
+    }
+
     func testRedactedNodesUsePointingHandCursorInTextSelectionOverlay() {
         let mode = TextSelectionView.preferredCursorMode(
             at: CGPoint(x: 40, y: 24),

@@ -59,9 +59,18 @@ public class PauseReminderWindowController: NSObject, ObservableObject {
     private func showWindow() {
         guard pauseReminderManager != nil else { return }
 
+        let appWasHidden = NSApp.isHidden
+        if appWasHidden {
+            NSApp.unhideWithoutActivation()
+        }
+
         // If window already exists, just show it
         if let existingWindow = window {
-            existingWindow.orderFront(nil)
+            existingWindow.orderFrontRegardless()
+            Log.info(
+                "[PauseReminderWindowController] Reusing reminder panel appWasHidden=\(appWasHidden)",
+                category: .ui
+            )
             return
         }
 
@@ -89,9 +98,9 @@ public class PauseReminderWindowController: NSObject, ObservableObject {
         )
 
         // Create the window
-        let window = NSWindow(
+        let window = PauseReminderPanel(
             contentRect: NSRect(x: 0, y: 0, width: windowWidth, height: windowHeight),
-            styleMask: [.borderless],
+            styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
@@ -101,7 +110,8 @@ public class PauseReminderWindowController: NSObject, ObservableObject {
         window.level = .floating  // Float above other windows but below screen saver
         window.hasShadow = false  // We handle shadows in SwiftUI
         window.isMovableByWindowBackground = false
-        window.collectionBehavior = [.canJoinAllSpaces, .stationary]
+        window.hidesOnDeactivate = false
+        window.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary, .stationary]
 
         // Set the SwiftUI content
         window.contentView = NSHostingView(rootView: contentView)
@@ -111,7 +121,7 @@ public class PauseReminderWindowController: NSObject, ObservableObject {
 
         // Show the window with animation
         window.alphaValue = 0
-        window.orderFront(nil)
+        window.orderFrontRegardless()
 
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.3
@@ -120,7 +130,10 @@ public class PauseReminderWindowController: NSObject, ObservableObject {
         }
 
         self.window = window
-        Log.debug("[PauseReminderWindowController] Window shown", category: .ui)
+        Log.info(
+            "[PauseReminderWindowController] Reminder panel shown appWasHidden=\(appWasHidden)",
+            category: .ui
+        )
     }
 
     /// Hide the pause reminder window
@@ -166,4 +179,8 @@ public class PauseReminderWindowController: NSObject, ObservableObject {
     public var isVisible: Bool {
         window?.isVisible == true
     }
+}
+
+private final class PauseReminderPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
 }

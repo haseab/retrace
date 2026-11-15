@@ -41,4 +41,54 @@ final class CLIImageExportIPCTests: XCTestCase {
         XCTAssertEqual(loadedResponse.errorMessage, response.errorMessage)
         XCTAssertLessThan(abs(loadedResponse.completedAt.timeIntervalSince(response.completedAt)), 0.01)
     }
+    func testRejectsTraversalAndExternalRequestPaths() throws {
+        let request = CLIImageExportRequest(requestID: "../../outside", frameID: 1, outputPath: "/tmp/test.jpg", overwrite: false)
+        XCTAssertThrowsError(try CLIImageExportIPC.stageRequest(request))
+        XCTAssertThrowsError(try CLIImageExportIPC.writeResponse(CLIImageExportResponse(requestID: request.requestID, outputPath: "", byteCount: nil, errorMessage: "test")))
+        let external = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try JSONEncoder().encode(request).write(to: external)
+        defer { try? FileManager.default.removeItem(at: external) }
+        XCTAssertThrowsError(try CLIImageExportIPC.loadRequest(from: external))
+    }
+
+    func testRejectsMismatchedNotificationAndStaleRequests() throws {
+        let request = CLIImageExportRequest(frameID: 1, outputPath: "/tmp/test.jpg", overwrite: false)
+        let url = try CLIImageExportIPC.stageRequest(request)
+        defer { CLIImageExportIPC.cleanup(requestID: request.requestID) }
+        XCTAssertThrowsError(try CLIImageExportIPC.loadRequest(from: url, expectedRequestID: UUID().uuidString))
+        let stale = CLIImageExportRequest(frameID: 1, outputPath: "/tmp/test.jpg", overwrite: false, createdAt: Date().addingTimeInterval(-300))
+        XCTAssertThrowsError(try CLIImageExportIPC.stageRequest(stale))
+        XCTAssertThrowsError(try CLIImageExportIPC.stageRequest(CLIImageExportRequest(frameID: 1, outputPath: "relative.jpg", overwrite: false)))
+    }
+
+    func testRejectsSymlinkAndOversizedPayloads() throws {
+        let request = CLIImageExportRequest(frameID: 1, outputPath: "/tmp/test.jpg", overwrite: false)
+        let url = try CLIImageExportIPC.stageRequest(request)
+        defer { CLIImageExportIPC.cleanup(requestID: request.requestID) }
+        let external = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try Data("{}".utf8).write(to: external)
+        defer { try? FileManager.default.removeItem(at: external) }
+        try FileManager.default.removeItem(at: url)
+        try FileManager.default.createSymbolicLink(at: url, withDestinationURL: external)
+        XCTAssertThrowsError(try CLIImageExportIPC.loadRequest(from: url))
+        try FileManager.default.removeItem(at: url)
+        try Data(repeating: 32, count: 32769).write(to: url)
+        XCTAssertThrowsError(try CLIImageExportIPC.loadRequest(from: url))
+    }
+
+    func testRejectsPayloadIDsThatDoNotMatchTheirFiles() throws {
+        let request = CLIImageExportRequest(frameID: 1, outputPath: "/tmp/test.jpg", overwrite: false)
+        let url = try CLIImageExportIPC.stageRequest(request)
+        defer { CLIImageExportIPC.cleanup(requestID: request.requestID) }
+        let other = CLIImageExportRequest(frameID: 2, outputPath: "/tmp/test.jpg", overwrite: false)
+        let encoder = JSONEncoder()
+        CLIDateCoding.configure(encoder)
+        try encoder.encode(other).write(to: url)
+        XCTAssertThrowsError(try CLIImageExportIPC.loadRequest(from: url))
+
+        let responseURL = try CLIImageExportIPC.writeResponse(CLIImageExportResponse(requestID: request.requestID, outputPath: "/tmp/test.jpg", byteCount: 1, errorMessage: nil))
+        try encoder.encode(CLIImageExportResponse(requestID: other.requestID, outputPath: "/tmp/test.jpg", byteCount: 1, errorMessage: nil)).write(to: responseURL)
+        XCTAssertThrowsError(try CLIImageExportIPC.loadResponse(for: request.requestID))
+    }
+
 }

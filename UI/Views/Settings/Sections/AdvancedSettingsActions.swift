@@ -67,7 +67,7 @@ extension SettingsView {
         refreshRetraceCLIStatus()
 
         if enabled {
-            showSettingsToast("Retrace CLI enabled. Install the terminal command to use `retrace` in Terminal.")
+            showSettingsToast("CLI installation controls shown. Install the command below to use `retrace` in Terminal.")
         }
     }
 
@@ -101,7 +101,7 @@ extension SettingsView {
     private func performRetraceCLILauncherOperation(
         action: CLILauncherOperationResult.Action,
         successMessage: String,
-        operation: @escaping (CLILauncherManager) throws -> CLILauncherOperationResult
+        operation: @escaping @Sendable (CLILauncherManager) throws -> CLILauncherOperationResult
     ) {
         guard !isPerformingRetraceCLILauncherOperation else { return }
 
@@ -111,7 +111,9 @@ extension SettingsView {
 
         Task {
             do {
-                let result = try operation(manager)
+                let result = try await Task.detached(priority: .userInitiated) {
+                    try operation(manager)
+                }.value
                 let statusAfter = manager.status()
 
                 await MainActor.run {

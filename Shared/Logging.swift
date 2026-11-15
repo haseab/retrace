@@ -14,12 +14,41 @@ import os.log
 /// Log.info("Frame processed", category: .processing)
 /// Log.error("Failed to encode", category: .storage, error: someError)
 /// ```
+/// Logging interpolation removes free-form values before they reach any logging sink.
+/// Counts and booleans remain available for diagnostics; strings, collections, URLs and errors do not.
+public struct PrivacyLogMessage: ExpressibleByStringInterpolation, Sendable {
+    public let text: String
+    public init(stringLiteral value: String) { text = value }
+    public init(stringInterpolation: StringInterpolation) { text = stringInterpolation.text }
+    public init(redacting value: String) { text = "[private message]" }
+
+    public struct StringInterpolation: StringInterpolationProtocol, Sendable {
+        var text = ""
+        public init(literalCapacity: Int, interpolationCount: Int) { text.reserveCapacity(literalCapacity) }
+        public mutating func appendLiteral(_ literal: String) { text += literal }
+        public mutating func appendInterpolation<T>(_ value: T) {
+            switch value {
+            case let v as Bool: text += v ? "true" : "false"
+            case let v as Int: text += String(v)
+            case let v as Int64: text += String(v)
+            case let v as UInt64: text += String(v)
+            case let v as Int32: text += String(v)
+            case let v as UInt32: text += String(v)
+            case let v as UInt: text += String(v)
+            case let v as Double: text += v.isFinite ? String(v) : "nonfinite"
+            case let v as Float: text += v.isFinite ? String(v) : "nonfinite"
+            default: text += "[private]"
+            }
+        }
+    }
+}
+
 public enum Log {
 
     // MARK: - Categories
 
     /// Log categories for different modules
-    public enum Category: String {
+    public enum Category: String, Sendable {
         case app = "App"
         case capture = "Capture"
         case storage = "Storage"
@@ -51,143 +80,188 @@ public enum Log {
         return iso8601Formatter.string(from: date)
     }
 
-    /// Whether to also print to console (always true for both DEBUG and release builds)
-    /// This ensures logs are always written to stdout for export capabilities
-    private static var printToConsole = true
-
-    /// Enable console printing in release builds (for debugging)
+    /// Console output is opt-in in release builds and runs on the background writer.
     public static func enableConsolePrinting() {
-        #if !DEBUG
-        printToConsole = true
-        #endif
+        LogFile.shared.enableConsolePrinting()
+    }
+
+    /// Fixed event names keep aggregation bounded and prevent captured content entering summaries.
+    public enum RoutineEvent: String, Sendable, CaseIterable {
+        case ocrProcessed = "OCR processed"
+        case ocrExcluded = "OCR excluded"
+        case captureKept = "Capture kept"
+        case captureDeduplicated = "Capture deduplicated"
+        case captureArraySucceeded = "Array capture succeeded"
+        case captureMasked = "Capture masked"
+        case captureMaskNotNeeded = "Capture masking not needed"
+
+        fileprivate var category: Category {
+            switch self {
+            case .ocrProcessed, .ocrExcluded: return .processing
+            default: return .capture
+            }
+        }
+    }
+
+    /// Count repetitive successes in memory; one summary per active event each minute.
+    public static func recordRoutine(_ event: RoutineEvent, count: Int = 1, durationMs: Double? = nil) {
+        LogFile.shared.recordRoutine(event, count: count, durationMs: durationMs)
     }
 
     /// Disable console printing for machine-readable command surfaces such as the CLI.
     public static func disableConsolePrinting() {
-        printToConsole = false
+        LogFile.shared.disableConsolePrinting()
     }
 
     // MARK: - Log File (for fast feedback diagnostics)
 
     /// Path to the log file - persists across crashes
-    public static let logFilePath = NSHomeDirectory() + "/Library/Logs/Retrace/retrace.log"
-    /// Get recent logs from the log file (fast file read, no OSLogStore)
-    public static func getRecentLogs(maxCount: Int = 200) -> [String] {
-        LogFile.shared.readLastLines(count: maxCount)
+    public static let logFilePath = ProcessInfo.processInfo.environment["RETRACE_LOG_PATH"]
+        ?? NSHomeDirectory() + "/Library/Logs/Retrace/retrace.log"
+    public static func isPrivacySafeLogEntry(_ line: String) -> Bool {
+        line.range(of: #"^\[[0-9TZ:.+\-]+\] \[[^\]\r\n]+\] \[[^\]\r\n]+\] [^\r\n:]+:[0-9]+ - \[privacy-v1\] "#,
+                   options: .regularExpression) != nil
     }
 
-    /// Get recent error logs only
-    public static func getRecentErrors(maxCount: Int = 50) -> [String] {
-        LogFile.shared.readLastLines(count: maxCount * 2).filter {
-            $0.contains("[ERROR]") || $0.contains("[WARN]") || $0.contains("[CRITICAL]")
-        }.suffix(maxCount).map { $0 }
+    /// Flush without blocking the caller's executor, e.g. before feedback export or quit.
+    public static func flush() async {
+        await LogFile.shared.flush()
+    }
+
+    public static func getRecentLogs(maxCount: Int = 200) async -> [String] {
+        await LogFile.shared.readLastLines(count: maxCount)
+    }
+
+    public static func getRecentErrors(maxCount: Int = 50) async -> [String] {
+        await LogFile.shared.readLastLines(count: maxCount, errorsOnly: true)
     }
 
     // MARK: - Log Levels
 
-    /// Debug level - verbose information for development
-    /// Only appears in Console.app when "Include Debug Messages" is enabled
     public static func debug(
-        _ message: String,
+        _ message: @autoclosure () -> PrivacyLogMessage,
         category: Category = .app,
         file: String = #file,
         function: String = #function,
         line: Int = #line
     ) {
-        let logger = category.logger
-        logger.debug("\(message, privacy: .public)")
-
-        if printToConsole {
-            printFormatted(level: "DEBUG", message: message, category: category, file: file, line: line)
-        }
+        #if DEBUG
+        enqueue(level: .debug, message: message().text, category: category, file: file, line: line)
+        #endif
     }
 
-    /// Info level - general information about app operation
     public static func info(
-        _ message: String,
+        _ message: PrivacyLogMessage,
         category: Category = .app,
         file: String = #file,
         function: String = #function,
         line: Int = #line
     ) {
-        let logger = category.logger
-        logger.info("\(message, privacy: .public)")
-
-        if printToConsole {
-            printFormatted(level: "INFO", message: message, category: category, file: file, line: line)
-        }
+        enqueue(level: .info, message: message.text, category: category, file: file, line: line)
     }
 
-    /// Notice level - important events worth noting
     public static func notice(
-        _ message: String,
+        _ message: PrivacyLogMessage,
         category: Category = .app,
         file: String = #file,
         function: String = #function,
         line: Int = #line
     ) {
-        let logger = category.logger
-        logger.notice("\(message, privacy: .public)")
-
-        if printToConsole {
-            printFormatted(level: "NOTICE", message: message, category: category, file: file, line: line)
-        }
+        enqueue(level: .notice, message: message.text, category: category, file: file, line: line)
     }
 
-    /// Warning level - something unexpected but recoverable
     public static func warning(
-        _ message: String,
+        _ message: PrivacyLogMessage,
         category: Category = .app,
         file: String = #file,
         function: String = #function,
         line: Int = #line
     ) {
-        let logger = category.logger
-        logger.warning("\(message, privacy: .public)")
-
-        if printToConsole {
-            printFormatted(level: "⚠️ WARN", message: message, category: category, file: file, line: line)
-        }
+        enqueue(level: .warning, message: message.text, category: category, file: file, line: line)
     }
 
-    /// Error level - something failed
     public static func error(
-        _ message: String,
+        _ message: PrivacyLogMessage,
         category: Category = .app,
         error: Error? = nil,
         file: String = #file,
         function: String = #function,
         line: Int = #line
     ) {
-        let logger = category.logger
-        let errorDetail = error.map { " | Error: \($0.localizedDescription)" } ?? ""
-        let fullMessage = "\(message)\(errorDetail)"
-
-        logger.error("\(fullMessage, privacy: .public)")
-
-        if printToConsole {
-            printFormatted(level: "❌ ERROR", message: fullMessage, category: category, file: file, line: line)
-        }
+        let detail = error.map { " | errorCode=\(($0 as NSError).code)" } ?? ""
+        enqueue(level: .error, message: message.text + detail, category: category, file: file, line: line)
     }
 
-    /// Critical/Fault level - app may crash or be in undefined state
     public static func critical(
-        _ message: String,
+        _ message: PrivacyLogMessage,
         category: Category = .app,
         error: Error? = nil,
         file: String = #file,
         function: String = #function,
         line: Int = #line
     ) {
-        let logger = category.logger
-        let errorDetail = error.map { " | Error: \($0.localizedDescription)" } ?? ""
-        let fullMessage = "\(message)\(errorDetail)"
+        let detail = error.map { " | errorCode=\(($0 as NSError).code)" } ?? ""
+        enqueue(level: .critical, message: message.text + detail, category: category, file: file, line: line)
+    }
 
-        logger.critical("\(fullMessage, privacy: .public)")
+    @_disfavoredOverload
+    public static func debug(
+        _ message: @autoclosure () -> String, category: Category = .app,
+        file: String = #file, function: String = #function, line: Int = #line
+    ) {
+        #if DEBUG
+        debug(PrivacyLogMessage(redacting: message()), category: category, file: file, function: function, line: line)
+        #endif
+    }
 
-        if printToConsole {
-            printFormatted(level: "🔥 CRITICAL", message: fullMessage, category: category, file: file, line: line)
-        }
+    @_disfavoredOverload
+    public static func info(
+        _ message: String, category: Category = .app,
+        file: String = #file, function: String = #function, line: Int = #line
+    ) {
+        info(PrivacyLogMessage(redacting: message), category: category, file: file, function: function, line: line)
+    }
+
+    @_disfavoredOverload
+    public static func notice(
+        _ message: String, category: Category = .app,
+        file: String = #file, function: String = #function, line: Int = #line
+    ) {
+        notice(PrivacyLogMessage(redacting: message), category: category, file: file, function: function, line: line)
+    }
+
+    @_disfavoredOverload
+    public static func warning(
+        _ message: String, category: Category = .app,
+        file: String = #file, function: String = #function, line: Int = #line
+    ) {
+        warning(PrivacyLogMessage(redacting: message), category: category, file: file, function: function, line: line)
+    }
+
+    @_disfavoredOverload
+    public static func error(
+        _ message: String, category: Category = .app, error: Error? = nil,
+        file: String = #file, function: String = #function, line: Int = #line
+    ) {
+        Self.error(PrivacyLogMessage(redacting: message), category: category, error: error, file: file, function: function, line: line)
+    }
+
+    @_disfavoredOverload
+    public static func critical(
+        _ message: String, category: Category = .app, error: Error? = nil,
+        file: String = #file, function: String = #function, line: Int = #line
+    ) {
+        critical(PrivacyLogMessage(redacting: message), category: category, error: error, file: file, function: function, line: line)
+    }
+
+    @_disfavoredOverload
+    public static func verbose(
+        _ message: @autoclosure () -> String, category: Category = .app,
+        file: String = #file, function: String = #function, line: Int = #line
+    ) {
+        #if DEBUG
+        verbose(PrivacyLogMessage(redacting: message()), category: category, file: file, function: function, line: line)
+        #endif
     }
 
     // MARK: - Performance Logging
@@ -202,7 +276,7 @@ public enum Log {
         let result = try block()
         let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000
 
-        debug("\(operation) completed in \(String(format: "%.2f", elapsed))ms", category: category)
+        debug("\(operation) completed in \(elapsed)ms", category: category)
         return result
     }
 
@@ -216,7 +290,7 @@ public enum Log {
         let result = try await block()
         let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000
 
-        debug("\(operation) completed in \(String(format: "%.2f", elapsed))ms", category: category)
+        debug("\(operation) completed in \(elapsed)ms", category: category)
         return result
     }
 
@@ -252,15 +326,15 @@ public enum Log {
             summaryEvery: max(1, summaryEvery)
         )
 
-        let latest = String(format: "%.1f", valueMs)
+        let latest = valueMs
         if let criticalThresholdMs, valueMs >= criticalThresholdMs {
             critical(
-                "[PERF] \(metric) slow sample: \(latest)ms (critical >= \(String(format: "%.1f", criticalThresholdMs))ms)",
+                "[PERF] \(metric) slow sample: \(latest)ms (critical >= \(criticalThresholdMs)ms)",
                 category: category
             )
         } else if let warningThresholdMs, valueMs >= warningThresholdMs {
             warning(
-                "[PERF] \(metric) slow sample: \(latest)ms (warning >= \(String(format: "%.1f", warningThresholdMs))ms)",
+                "[PERF] \(metric) slow sample: \(latest)ms (warning >= \(warningThresholdMs)ms)",
                 category: category
             )
         }
@@ -268,62 +342,34 @@ public enum Log {
         guard snapshot.shouldEmitSummary else { return }
 
         info(
-            "[PERF] \(metric) n=\(snapshot.sampleCount) total=\(snapshot.totalCount) latest=\(String(format: "%.1f", snapshot.latestMs))ms p50=\(String(format: "%.1f", snapshot.p50Ms))ms p95=\(String(format: "%.1f", snapshot.p95Ms))ms min=\(String(format: "%.1f", snapshot.minMs))ms max=\(String(format: "%.1f", snapshot.maxMs))ms",
+            "[PERF] \(metric) n=\(snapshot.sampleCount) total=\(snapshot.totalCount) latest=\(snapshot.latestMs)ms p50=\(snapshot.p50Ms)ms p95=\(snapshot.p95Ms)ms min=\(snapshot.minMs)ms max=\(snapshot.maxMs)ms",
             category: category
         )
     }
 
     // MARK: - Private Helpers
 
-    private static func printFormatted(
-        level: String,
-        message: String,
-        category: Category,
-        file: String,
-        line: Int,
+    private static func enqueue(
+        level: LogLevel, message: String, category: Category, file: String, line: Int,
         consoleOnly: Bool = false
     ) {
-        let formattedLog = formattedLogEntry(
-            level: level,
-            message: message,
-            category: category,
-            file: file,
-            line: line
-        )
-        print(formattedLog)
-
-        if !consoleOnly {
-            // Also write to log file for persistence across crashes
-            LogFile.shared.append(formattedLog)
-        }
+        LogFile.shared.append(LogEntry(
+            level: level, message: message, category: category, file: file, line: line,
+            consoleOnly: consoleOnly
+        ))
     }
 
-    private static func formattedLogEntry(
-        level: String,
-        message: String,
-        category: Category,
-        file: String,
-        line: Int
-    ) -> String {
-        let filename = (file as NSString).lastPathComponent
-        return "[\(timestamp())] [\(level)] [\(category.rawValue)] \(filename):\(line) - \(message)"
-    }
-
-    /// Console-only debug log — prints to stdout but NOT to retrace.log.
-    /// Use for high-frequency per-frame logs that would spam the log file.
+    /// Detailed development diagnostics are compiled out of release builds, including interpolation.
     public static func verbose(
-        _ message: String,
+        _ message: @autoclosure () -> PrivacyLogMessage,
         category: Category = .app,
         file: String = #file,
         function: String = #function,
         line: Int = #line
     ) {
-        let logger = category.logger
-        logger.debug("\(message, privacy: .public)")
-
-        if printToConsole {
-            printFormatted(level: "DEBUG", message: message, category: category, file: file, line: line, consoleOnly: true)
-        }
+        #if DEBUG
+        enqueue(level: .debug, message: message().text, category: category, file: file, line: line, consoleOnly: true)
+        #endif
     }
 }
 
@@ -383,87 +429,319 @@ private final class LatencyRecorder: @unchecked Sendable {
 
 // MARK: - Log File
 
-/// Writes logs to a file for persistence and fast retrieval
-/// Used for feedback diagnostics (avoids slow OSLogStore)
-private final class LogFile: @unchecked Sendable {
-    static let shared = LogFile()
+enum LogLevel: String, Sendable {
+    case debug = "DEBUG", info = "INFO", notice = "NOTICE", warning = "WARN", error = "ERROR", critical = "CRITICAL"
+    var isUrgent: Bool { self == .error || self == .critical }
+}
+
+struct LogEntry: Sendable {
+    let date = Date()
+    let level: LogLevel
+    var message: String
+    let category: Log.Category
+    var file: String = #file
+    var line: Int = #line
+    var consoleOnly = false
+
+    var formatted: String {
+        let filename = (file as NSString).lastPathComponent
+        return "[\(Log.timestamp(from: date))] [\(level.rawValue)] [\(category.rawValue)] \(filename):\(line) - [privacy-v1] \(message)"
+    }
+}
+
+/// One serial worker owns all sinks and file handles. The ingress lock only protects
+/// a bounded memory buffer; file I/O, formatting and console output never hold it.
+final class LogFile: @unchecked Sendable {
+    static let shared = LogFile(fileURL: URL(fileURLWithPath: Log.logFilePath))
 
     private let fileURL: URL
+    private let queue: DispatchQueue
+    private let timer: DispatchSourceTimer
     private let lock = NSLock()
+    private let maximumFileBytes: Int
+    private let maximumBufferedBytes: Int
+    private let flushInterval: TimeInterval
+    private let emitToSystemLog: Bool
+    private var pending: [LogEntry] = []
+    private var pendingBytes = 0
+    private var dropped = 0
+    private var immediateDrainScheduled = false
+    private var consoleEnabled = false
+    private struct RoutineBucket {
+        var events = 0
+        var units = 0
+        var durationSamples = 0
+        var totalMs = 0.0
+        var maximumMs = 0.0
+    }
+    private var routineBuckets: [Log.RoutineEvent: RoutineBucket] = [:]
+    private var routineDeadline: TimeInterval?
+    private let routineInterval: TimeInterval
+
+    // Accessed exclusively on queue:
+    private var initialized = false
     private var fileHandle: FileHandle?
-    private let maxFileSize: Int64 = 50 * 1024 * 1024  // 50MB max, then rotate
+    private var fileBytes = 0
 
-    private init() {
-        let logDir = NSHomeDirectory() + "/Library/Logs/Retrace"
-        self.fileURL = URL(fileURLWithPath: logDir + "/retrace.log")
-
-        // Create directory if needed
-        try? FileManager.default.createDirectory(
-            atPath: logDir,
-            withIntermediateDirectories: true,
-            attributes: nil
-        )
-
-        // Open file handle for appending
-        if !FileManager.default.fileExists(atPath: fileURL.path) {
-            FileManager.default.createFile(atPath: fileURL.path, contents: nil, attributes: nil)
-        }
-        fileHandle = try? FileHandle(forWritingTo: fileURL)
-        fileHandle?.seekToEndOfFile()
+    init(
+        fileURL: URL,
+        queue: DispatchQueue = DispatchQueue(label: "io.retrace.diagnostic-writer", qos: .utility),
+        maximumFileBytes: Int = 50 * 1024 * 1024,
+        maximumBufferedBytes: Int = 1024 * 1024,
+        flushInterval: TimeInterval = 2,
+        routineInterval: TimeInterval = 60,
+        emitToSystemLog: Bool = true
+    ) {
+        self.fileURL = fileURL
+        self.queue = queue
+        self.maximumFileBytes = maximumFileBytes
+        self.maximumBufferedBytes = maximumBufferedBytes
+        self.flushInterval = flushInterval
+        self.routineInterval = routineInterval
+        self.emitToSystemLog = emitToSystemLog
+        self.timer = DispatchSource.makeTimerSource(queue: queue)
+        #if DEBUG
+        consoleEnabled = true
+        #endif
+        timer.schedule(deadline: .distantFuture)
+        timer.setEventHandler { [weak self] in self?.drain() }
+        timer.resume()
     }
 
-    func append(_ entry: String) {
+    deinit {
+        timer.cancel()
+        try? fileHandle?.close()
+    }
+
+    func disableConsolePrinting() {
+        lock.lock()
+        consoleEnabled = false
+        lock.unlock()
+    }
+
+    func enableConsolePrinting() {
+        lock.lock()
+        consoleEnabled = true
+        lock.unlock()
+    }
+
+    var bufferState: (bytes: Int, dropped: Int) {
         lock.lock()
         defer { lock.unlock() }
+        return (pendingBytes, dropped)
+    }
 
-        guard let data = (entry + "\n").data(using: .utf8) else { return }
+    func append(_ entry: LogEntry) {
+        // Bound each message as well as the backlog. No unsanitized values enter this buffer.
+        var bounded = entry
+        bounded.message = String(decoding: entry.message.utf8.prefix(16 * 1024), as: UTF8.self)
+        let cost = bounded.message.utf8.count + bounded.file.utf8.count + 256
+        lock.lock()
+        defer { lock.unlock() }
+        let wasEmpty = pending.isEmpty && dropped == 0
+        // Reserve a quarter of the budget for errors and critical events during routine-log floods.
+        let budget = bounded.level.isUrgent ? maximumBufferedBytes : maximumBufferedBytes * 3 / 4
+        if pendingBytes + cost <= budget && pending.count < (bounded.level.isUrgent ? 2048 : 1536) {
+            pending.append(bounded)
+            pendingBytes += cost
+        } else {
+            dropped += 1
+        }
+        if wasEmpty {
+            timer.schedule(deadline: .now() + flushInterval, leeway: .milliseconds(100))
+        }
+        if (bounded.level.isUrgent || pendingBytes >= min(64 * 1024, maximumBufferedBytes * 3 / 4)) && !immediateDrainScheduled {
+            immediateDrainScheduled = true
+            queue.async { [weak self] in self?.drain() }
+        }
+    }
 
-        // Check if we need to rotate
-        if let handle = fileHandle {
-            let currentSize = handle.offsetInFile
-            if currentSize > maxFileSize {
-                rotateLog()
+    func recordRoutine(_ event: Log.RoutineEvent, count: Int, durationMs: Double?) {
+        lock.lock()
+        defer { lock.unlock() }
+        var bucket = routineBuckets[event, default: RoutineBucket()]
+        bucket.events += 1
+        bucket.units += max(0, count)
+        if let durationMs, durationMs.isFinite, durationMs >= 0 {
+            bucket.durationSamples += 1
+            bucket.totalMs += durationMs
+            bucket.maximumMs = max(bucket.maximumMs, durationMs)
+        }
+        routineBuckets[event] = bucket
+        if routineDeadline == nil {
+            routineDeadline = ProcessInfo.processInfo.systemUptime + routineInterval
+            if pending.isEmpty && dropped == 0 {
+                timer.schedule(deadline: .now() + routineInterval, leeway: .seconds(1))
             }
         }
-
-        // Write to file
-        if fileHandle == nil {
-            fileHandle = try? FileHandle(forWritingTo: fileURL)
-            fileHandle?.seekToEndOfFile()
-        }
-        try? fileHandle?.write(contentsOf: data)
     }
 
-    private func rotateLog() {
-        // Close current handle
-        try? fileHandle?.close()
+    func flush() async {
+        await withCheckedContinuation { continuation in
+            queue.async {
+                self.drain(includeRoutineSummary: true)
+                try? self.fileHandle?.synchronize()
+                continuation.resume()
+            }
+        }
+    }
+
+    private func initializeFile() throws {
+        guard !initialized else { return }
+        try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        // Preserve the privacy migration: discard unsafe current AND rotated legacy logs.
+        for url in [fileURL, oldURL] {
+            guard let handle = try? FileHandle(forReadingFrom: url) else { continue }
+            let prefix = try? handle.read(upToCount: 512)
+            try? handle.close()
+            if let prefix, !prefix.isEmpty,
+               !Log.isPrivacySafeLogEntry(String(decoding: prefix, as: UTF8.self).components(separatedBy: "\n").first ?? "") {
+                try FileManager.default.removeItem(at: url)
+            }
+        }
+        initialized = true
+    }
+
+    private var oldURL: URL { fileURL.deletingPathExtension().appendingPathExtension("old.log") }
+
+    private func openFile() throws {
+        try initializeFile()
+        guard fileHandle == nil else { return }
+        if !FileManager.default.fileExists(atPath: fileURL.path) {
+            guard FileManager.default.createFile(atPath: fileURL.path, contents: nil) else {
+                throw CocoaError(.fileWriteUnknown)
+            }
+        }
+        let handle = try FileHandle(forWritingTo: fileURL)
+        fileBytes = Int(try handle.seekToEnd())
+        fileHandle = handle
+    }
+
+    private func rotate() throws {
+        try fileHandle?.close()
         fileHandle = nil
-
-        // Rename current log to .old (overwrite any existing .old)
-        let oldURL = fileURL.deletingPathExtension().appendingPathExtension("old.log")
-        try? FileManager.default.removeItem(at: oldURL)
-        try? FileManager.default.moveItem(at: fileURL, to: oldURL)
-
-        // Create new log file
-        FileManager.default.createFile(atPath: fileURL.path, contents: nil, attributes: nil)
-        fileHandle = try? FileHandle(forWritingTo: fileURL)
+        if FileManager.default.fileExists(atPath: oldURL.path) { try FileManager.default.removeItem(at: oldURL) }
+        try FileManager.default.moveItem(at: fileURL, to: oldURL)
+        try openFile()
     }
 
-    func readLastLines(count: Int) -> [String] {
+    private func drain(includeRoutineSummary: Bool = false) {
         lock.lock()
-        defer { lock.unlock() }
-
-        // Flush any pending writes
-        try? fileHandle?.synchronize()
-
-        guard let data = try? Data(contentsOf: fileURL),
-              let content = String(data: data, encoding: .utf8) else {
-            return []
+        var entries = pending
+        let omitted = dropped
+        let printToConsole = consoleEnabled
+        pending = []
+        pendingBytes = 0
+        dropped = 0
+        immediateDrainScheduled = false
+        let now = ProcessInfo.processInfo.systemUptime
+        var summaries: [Log.RoutineEvent: RoutineBucket] = [:]
+        if let deadline = routineDeadline, includeRoutineSummary || now >= deadline {
+            summaries = routineBuckets
+            routineBuckets = [:]
+            routineDeadline = nil
         }
+        if let deadline = routineDeadline {
+            timer.schedule(deadline: .now() + max(0, deadline - now), leeway: .seconds(1))
+        } else {
+            timer.schedule(deadline: .distantFuture)
+        }
+        lock.unlock()
+        for event in Log.RoutineEvent.allCases {
+            guard let bucket = summaries[event] else { continue }
+            var message = "[Routine] \(event.rawValue): events=\(bucket.events) units=\(bucket.units)"
+            if bucket.durationSamples > 0 {
+                message += " averageMs=\(bucket.totalMs / Double(bucket.durationSamples)) maximumMs=\(bucket.maximumMs)"
+            }
+            entries.append(LogEntry(level: .info, message: message, category: event.category))
+        }
+        if omitted > 0 {
+            entries.append(LogEntry(level: .warning, message: "[Logging] Dropped \(omitted) messages because the diagnostic buffer was full", category: .app))
+        }
+        guard !entries.isEmpty else { return }
+        let formattedEntries = entries.map { ($0, $0.formatted) }
+        for (entry, formatted) in formattedEntries {
+            if emitToSystemLog {
+                let logger = entry.category.logger
+                switch entry.level {
+                case .debug: logger.debug("\(entry.message, privacy: .private)")
+                case .info: logger.info("\(entry.message, privacy: .private)")
+                case .notice: logger.notice("\(entry.message, privacy: .private)")
+                case .warning: logger.warning("\(entry.message, privacy: .private)")
+                case .error: logger.error("\(entry.message, privacy: .private)")
+                case .critical: logger.critical("\(entry.message, privacy: .private)")
+                }
+            }
+            if printToConsole { print(formatted) }
+        }
+        var batch = Data()
+        do {
+            try openFile()
+            for (entry, formatted) in formattedEntries {
+                guard !entry.consoleOnly else { continue }
+                let data = Data((formatted + "\n").utf8)
+                // Never split a line between rotated files.
+                if fileBytes + batch.count + data.count > maximumFileBytes {
+                    if !batch.isEmpty {
+                        try fileHandle?.write(contentsOf: batch)
+                        fileBytes += batch.count
+                        batch.removeAll(keepingCapacity: true)
+                    }
+                    try rotate()
+                }
+                batch.append(data)
+            }
+            if !batch.isEmpty {
+                try fileHandle?.write(contentsOf: batch)
+                fileBytes += batch.count
+            }
+        } catch {
+            try? fileHandle?.close()
+            fileHandle = nil
+            // Never recursively log a writer failure. Unified logging is still available.
+            Logger(subsystem: "io.retrace.app", category: "Logging").error("Diagnostic file write failed; errorCode=\((error as NSError).code)")
+        }
+    }
 
-        let lines = content.components(separatedBy: "\n").filter { !$0.isEmpty }
-        let startIndex = max(0, lines.count - count)
-        return Array(lines[startIndex...])
+    func readLastLines(count: Int, errorsOnly: Bool = false) async -> [String] {
+        guard count > 0 else { return [] }
+        return await withCheckedContinuation { continuation in
+            queue.async {
+                self.drain(includeRoutineSummary: true)
+                do {
+                    try self.initializeFile()
+                    // Read bounded chunks backwards, rather than loading a 50 MiB file for 200 lines.
+                    var lines: [String] = []
+                    for url in [self.fileURL, self.oldURL] {
+                        guard let handle = try? FileHandle(forReadingFrom: url) else { continue }
+                        defer { try? handle.close() }
+                        var offset = try handle.seekToEnd()
+                        var fragment = Data()
+                        while offset > 0 && lines.count < count {
+                            let size = min(offset, 64 * 1024)
+                            offset -= size
+                            try handle.seek(toOffset: offset)
+                            var chunk = try handle.read(upToCount: Int(size)) ?? Data()
+                            chunk.append(fragment)
+                            let parts = chunk.split(separator: 10, omittingEmptySubsequences: false)
+                            fragment = offset > 0 ? Data(parts.first ?? Data()) : Data()
+                            let complete = offset > 0 ? parts.dropFirst() : parts[...]
+                            for part in complete.reversed() where !part.isEmpty {
+                                let line = String(decoding: part, as: UTF8.self)
+                                guard Log.isPrivacySafeLogEntry(line) else { continue }
+                                if errorsOnly && !["[ERROR]", "[WARN]", "[CRITICAL]", "[❌ ERROR]", "[⚠️ WARN]", "[🔥 CRITICAL]", "[FAULT]"].contains(where: line.contains) { continue }
+                                lines.append(line)
+                                if lines.count == count { break }
+                            }
+                        }
+                        if lines.count == count { break }
+                    }
+                    continuation.resume(returning: Array(lines.reversed()))
+                } catch {
+                    continuation.resume(returning: [])
+                }
+            }
+        }
     }
 }
 

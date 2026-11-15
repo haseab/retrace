@@ -2,6 +2,34 @@ import XCTest
 @testable import Capture
 
 final class BrowserURLAppleScriptCoordinatorTests: XCTestCase {
+    @MainActor
+    func testStrictAppleScriptWindowSelectionUsesUniqueMatchingTab() throws {
+        let cases = [
+            (#"return selectWindowURL({"News", "Weekly sync"}, {"https://example.com", "https://meet.google.com/abc-defg-hij"}, "Weekly sync")"#, "https://meet.google.com/abc-defg-hij"),
+            (#"return selectWindowURL({"Weekly sync", "Weekly sync"}, {"https://one.example", "https://two.example"}, "Weekly sync")"#, "__STRICT_TITLE_MISMATCH__"),
+            (#"return selectWindowURL({"Weekly sync", "Weekly sync"}, {"", "https://other.example"}, "Weekly sync")"#, "__STRICT_TITLE_MISMATCH__"),
+            (#"return selectWindowURL({"News"}, {"https://example.com"}, "Weekly sync")"#, "__STRICT_TITLE_MISMATCH__"),
+            (#"return selectWindowURL({missing value, "Weekly sync"}, {missing value, "https://meet.google.com/abc-defg-hij"}, "weekly sync")"#, "https://meet.google.com/abc-defg-hij")
+        ]
+        for (invocation, expected) in cases {
+            let script = try XCTUnwrap(NSAppleScript(source: BrowserURLExtractor.strictWindowURLSelectionHandler + "\n" + invocation))
+            var error: NSDictionary?
+            let result = script.executeAndReturnError(&error)
+            XCTAssertNil(error)
+            XCTAssertEqual(result.stringValue, expected)
+        }
+    }
+
+    func testStrictWindowSelectionRejectsMissingAndAmbiguousTitles() {
+        XCTAssertEqual(BrowserURLExtractor.matchingWindowIndex(
+            titles: ["News", "Meet - abc-defg-hij"], requestedTitle: "Meet - abc-defg-hij"
+        ), 1)
+        XCTAssertNil(BrowserURLExtractor.matchingWindowIndex(titles: ["News"], requestedTitle: "Weekly sync"))
+        XCTAssertNil(BrowserURLExtractor.matchingWindowIndex(titles: ["Meet", "Meet"], requestedTitle: "Meet"))
+        XCTAssertNil(BrowserURLExtractor.matchingWindowIndex(titles: ["News"], requestedTitle: nil))
+        XCTAssertEqual(BrowserURLExtractor.matchingWindowIndex(titles: ["Weekly sync - Safari"], requestedTitle: "Weekly sync"), 0)
+        XCTAssertNil(BrowserURLExtractor.matchingWindowIndex(titles: ["Weekly sync", "Weekly sync - Safari"], requestedTitle: "Weekly sync"))
+    }
 
     actor RunnerProbe {
         private var callCount = 0
@@ -505,6 +533,35 @@ final class BrowserURLAppleScriptCoordinatorTests: XCTestCase {
                 for: "com.vivaldi.Vivaldi"
             ),
             "https://www.youtube.com/watch?v=abc123"
+        )
+    }
+
+    func testNormalizedWindowTitleForWindowMatchCollapsesWhitespace() {
+        XCTAssertEqual(
+            BrowserURLExtractor.normalizedWindowTitleForWindowMatch("  Meet   -   abc-defg-hij \n "),
+            "Meet - abc-defg-hij"
+        )
+        XCTAssertNil(BrowserURLExtractor.normalizedWindowTitleForWindowMatch("   "))
+    }
+
+    func testChromiumWindowTitleMatchesRequestedWindowAllowsBrowserSuffixForm() {
+        XCTAssertTrue(
+            BrowserURLExtractor.chromiumWindowTitleMatchesRequestedWindow(
+                windowTitle: "Daily Standup",
+                requestedWindowCacheKey: "Google Meet - Daily Standup"
+            )
+        )
+        XCTAssertTrue(
+            BrowserURLExtractor.chromiumWindowTitleMatchesRequestedWindow(
+                windowTitle: "Meet - abc-defg-hij",
+                requestedWindowCacheKey: "Meet - abc-defg-hij"
+            )
+        )
+        XCTAssertFalse(
+            BrowserURLExtractor.chromiumWindowTitleMatchesRequestedWindow(
+                windowTitle: "Meet - abc-defg-hij",
+                requestedWindowCacheKey: "Meet - xyz-qrst-uvw"
+            )
         )
     }
 }

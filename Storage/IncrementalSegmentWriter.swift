@@ -5,10 +5,10 @@ import Shared
 /// Segment writer with write-ahead logging
 ///
 /// Features:
-/// - Writes raw frames to WAL before encoding (crash-safe)
+/// - Persists original pixels in a losslessly compressed WAL before encoding
 /// - Encoder writes frames incrementally to video file
 /// - WAL enables crash recovery - frames can be re-encoded from WAL on restart
-/// - Video file becomes readable only after finalize(), but WAL ensures no data loss
+/// - WAL supplies original pixels for OCR while video fragments are being flushed
 public actor IncrementalSegmentWriter: SegmentWriter {
     public let segmentID: VideoSegmentID
     public private(set) var frameCount: Int = 0
@@ -66,7 +66,7 @@ public actor IncrementalSegmentWriter: SegmentWriter {
         // Track I/O latency for storage health monitoring
         let writeStart = CFAbsoluteTimeGetCurrent()
 
-        // STEP 1: Write to WAL first (crash-safe persistence)
+        // STEP 1: Persist a lossless WAL record before video encoding
         // This is the critical durability guarantee - frames are safe even if app crashes
         if walSession == nil {
             let session = try await walManager.createSession(videoID: segmentID)
@@ -97,7 +97,7 @@ public actor IncrementalSegmentWriter: SegmentWriter {
         }
 
         // STEP 3: Encode frame to video
-        // AVAssetWriter writes data incrementally, but file won't be playable until finalize()
+        // AVAssetWriter makes the video readable incrementally as fragments flush.
         let pixelBufferToken = await StorageVideoEncodingMemoryLedger.beginPixelBuffer(
             width: frame.width,
             height: frame.height

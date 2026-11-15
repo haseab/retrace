@@ -128,7 +128,12 @@ private struct CLIConfigDescriptor {
 }
 
 public actor RetraceCLIService {
-    private let coordinator: AppCoordinator
+    private var storedCoordinator: AppCoordinator?
+    private let coordinatorFactory: @Sendable () throws -> AppCoordinator
+    private var coordinator: AppCoordinator {
+        guard let storedCoordinator else { preconditionFailure("CLI services have not been initialized") }
+        return storedCoordinator
+    }
     private let resultStore: CLIResultStore
     private let defaults: UserDefaults
     private let timeParser: CLITimeParser
@@ -153,13 +158,15 @@ public actor RetraceCLIService {
     }
 
     init(
-        coordinator: AppCoordinator = AppCoordinator(),
+        coordinator: AppCoordinator? = nil,
         resultStore: CLIResultStore = CLIResultStore(),
         defaults: UserDefaults = UserDefaults(suiteName: retraceCLISettingsSuiteName) ?? .standard,
         timeParser: CLITimeParser = CLITimeParser(),
-        imageExportHost: any CLIImageExportHosting = AppHostedCLIImageExportHost()
+        imageExportHost: any CLIImageExportHosting = AppHostedCLIImageExportHost(),
+        coordinatorFactory: @escaping @Sendable () throws -> AppCoordinator = { AppCoordinator() }
     ) {
-        self.coordinator = coordinator
+        self.storedCoordinator = coordinator
+        self.coordinatorFactory = coordinatorFactory
         self.resultStore = resultStore
         self.defaults = defaults
         self.timeParser = timeParser
@@ -175,7 +182,6 @@ public actor RetraceCLIService {
     public func status() async throws -> CLIStatusOutput {
         try await ensureInitialized()
 
-        let pipelineStatus = await coordinator.getStatus()
         let latestFrameTimestamp = try await coordinator.getMostRecentFrameTimestamp()
         let quickStats = try await coordinator.getDatabaseStatisticsQuick()
         let totalCapturedDuration = try await coordinator.getTotalCapturedDuration()
@@ -197,10 +203,10 @@ public actor RetraceCLIService {
 
         return CLIStatusOutput(
             pipeline: CLIStatusPipeline(
-                isRunning: pipelineStatus.isRunning,
-                framesProcessed: pipelineStatus.framesProcessed,
-                errorCount: pipelineStatus.errors,
-                startTime: pipelineStatus.startTime,
+                isRunning: nil,
+                framesProcessed: nil,
+                errorCount: nil,
+                startTime: nil,
                 latestFrameTimestamp: latestFrameTimestamp
             ),
             storage: CLIStatusStorage(
@@ -294,7 +300,7 @@ public actor RetraceCLIService {
 
         try? await coordinator.recordMetricEvent(
             metricType: .searches,
-            metadata: request.queryText
+            metadata: nil
         )
 
         if request.filterCount > 0,
@@ -559,7 +565,7 @@ public actor RetraceCLIService {
                     "Use `retrace <command> --help` or `retrace help <command>` for command-specific details."
                 ],
                 subcommands: [
-                    CLIHelpSubcommandOutput(name: "status", summary: "Show storage, database, and capture status."),
+                    CLIHelpSubcommandOutput(name: "status", summary: "Show database and storage status; live app state is unavailable."),
                     CLIHelpSubcommandOutput(name: "apps", summary: "List known app bundle IDs for filter discovery."),
                     CLIHelpSubcommandOutput(name: "search", summary: "Search past content and metadata."),
                     CLIHelpSubcommandOutput(name: "jump", summary: "Resolve a time and return the nearest frame."),
@@ -868,7 +874,6 @@ public actor RetraceCLIService {
             .sorted { $0.key < $1.key }
             .map { configEntryOutput(for: $0) }
 
-        try? await ensureInitialized()
         try? await recordCLICommandMetric(
             command: "config_list",
             payload: [
@@ -888,7 +893,6 @@ public actor RetraceCLIService {
     public func configGet(_ request: CLIConfigKeyRequest) async throws -> CLIConfigGetOutput {
         let descriptor = try configDescriptor(for: request.key)
 
-        try? await ensureInitialized()
         try? await recordCLICommandMetric(
             command: "config_get",
             payload: [
@@ -906,6 +910,7 @@ public actor RetraceCLIService {
 
     public func configSet(_ request: CLIConfigSetRequest) async throws -> CLIConfigSetOutput {
         let descriptor = try configDescriptor(for: request.key)
+        try requireCLIWritable(descriptor)
         let previousValue = descriptor.currentValue(in: defaults)
         let newValue = try parsedConfigValue(
             request.value,
@@ -917,7 +922,6 @@ public actor RetraceCLIService {
 
         let updatedEntry = configEntryOutput(for: descriptor)
 
-        try? await ensureInitialized()
         try? await recordCLICommandMetric(
             command: "config_set",
             payload: [
@@ -939,12 +943,12 @@ public actor RetraceCLIService {
 
     public func configReset(_ request: CLIConfigKeyRequest) async throws -> CLIConfigResetOutput {
         let descriptor = try configDescriptor(for: request.key)
+        try requireCLIWritable(descriptor)
         let previousValue = descriptor.currentValue(in: defaults)
         defaults.removeObject(forKey: descriptor.defaultsKey)
 
         let updatedEntry = configEntryOutput(for: descriptor)
 
-        try? await ensureInitialized()
         try? await recordCLICommandMetric(
             command: "config_reset",
             payload: [
@@ -1085,7 +1089,7 @@ public actor RetraceCLIService {
         try await ensureInitialized()
 
         let resolvedSelection = try await resolveFrameSelection(request.selector)
-        let outputPath = NSString(string: request.outputPath).expandingTildeInPath
+        let outputPath = URL(fileURLWithPath: NSString(string: request.outputPath).expandingTildeInPath).standardizedFileURL.path
 
         if FileManager.default.fileExists(atPath: outputPath), !request.overwrite {
             throw CLIError.outputAlreadyExists(outputPath)
@@ -1137,12 +1141,10 @@ public actor RetraceCLIService {
         try await ensureInitialized()
 
         let appStats = try await coordinator.getStatistics()
-        let pipelineStatus = await coordinator.getStatus()
-        let queueStats = await coordinator.getQueueStatistics()
-        let encodingStats = await coordinator.getEncodingStatistics()
+        let queueStats: QueueStatistics? = nil
+        let encodingStats: (queueDepth: Int, pendingCount: Int)? = nil
         let powerState = coordinator.getCurrentPowerState()
         let memorySnapshot = await MemoryLedger.snapshot(waitForPendingUpdates: false)
-        let isCapturing = await coordinator.isCapturing()
 
         try? await recordCLICommandMetric(
             command: "inspect_system",
@@ -1156,17 +1158,17 @@ public actor RetraceCLIService {
         return CLIInspectSystemOutput(
             process: inspectProcessOutput(),
             pipeline: CLIStatusPipeline(
-                isRunning: pipelineStatus.isRunning,
-                framesProcessed: pipelineStatus.framesProcessed,
-                errorCount: pipelineStatus.errors,
-                startTime: pipelineStatus.startTime,
+                isRunning: nil,
+                framesProcessed: nil,
+                errorCount: nil,
+                startTime: nil,
                 latestFrameTimestamp: appStats.database.newestFrameDate
             ),
-            isCapturing: isCapturing,
+            isCapturing: nil,
             database: inspectDatabaseOutput(from: appStats.database),
-            capture: inspectCaptureOutput(from: appStats.capture),
-            processing: inspectProcessingOutput(from: appStats.processing),
-            search: inspectSearchOutput(from: appStats.search),
+            capture: nil,
+            processing: nil,
+            search: nil,
             queue: queueStats.map { inspectQueueOutput(from: $0) },
             encoding: encodingStats.map { inspectEncodingOutput(from: $0) },
             power: inspectPowerOutput(from: powerState),
@@ -1177,15 +1179,13 @@ public actor RetraceCLIService {
     public func inspectOCR() async throws -> CLIInspectOCROutput {
         try await ensureInitialized()
 
-        async let queueStatsTask = coordinator.getQueueStatistics()
-        async let encodingStatsTask = coordinator.getEncodingStatistics()
+        let queueStats: QueueStatistics? = nil
+        let encodingStats: (queueDepth: Int, pendingCount: Int)? = nil
         async let processedPerMinuteTask = coordinator.getFramesProcessedPerMinute(lastMinutes: 10)
         async let encodedPerMinuteTask = coordinator.getFramesEncodedPerMinute(lastMinutes: 10)
         async let rewrittenPerMinuteTask = coordinator.getFramesRewrittenPerMinute(lastMinutes: 10)
 
         let powerState = coordinator.getCurrentPowerState()
-        let queueStats = await queueStatsTask
-        let encodingStats = await encodingStatsTask
         let processedPerMinute = try await processedPerMinuteTask
         let encodedPerMinute = try await encodedPerMinuteTask
         let rewrittenPerMinute = try await rewrittenPerMinuteTask
@@ -1212,8 +1212,8 @@ public actor RetraceCLIService {
     public func inspectQueue() async throws -> CLIInspectQueueOutput {
         try await ensureInitialized()
 
-        let queueStats = await coordinator.getQueueStatistics()
-        let encodingStats = await coordinator.getEncodingStatistics()
+        let queueStats: QueueStatistics? = nil
+        let encodingStats: (queueDepth: Int, pendingCount: Int)? = nil
         let powerState = coordinator.getCurrentPowerState()
 
         try? await recordCLICommandMetric(
@@ -1709,7 +1709,7 @@ public actor RetraceCLIService {
 
     private static let configPersistenceModel = "shared_user_defaults"
     private static let configRuntimeBehaviorNote =
-        "CLI config commands write shared settings only. Running Retrace windows usually pick up UI-facing defaults automatically, but capture, OCR, storage, and login-item behaviors may need the app to refresh or restart before the effect is visible."
+        "Storage locations and encryption must be changed in Settings. CLI config commands write shared settings only. Running Retrace windows usually pick up UI-facing defaults automatically, but capture, OCR, storage, and login-item behaviors may need the app to refresh or restart before the effect is visible."
 
     private static let configDescriptors: [CLIConfigDescriptor] = [
         CLIConfigDescriptor(
@@ -2306,10 +2306,33 @@ public actor RetraceCLIService {
         }
     }
 
+    private func requireCLIWritable(_ descriptor: CLIConfigDescriptor) throws {
+        guard !["customRetraceDBLocation", "customRewindDBLocation", "encryptionEnabled"].contains(descriptor.defaultsKey) else {
+            throw CLIError.usage("Change \(descriptor.key) in Retrace Settings so its validation and migration steps run.")
+        }
+    }
+
     private func ensureInitialized() async throws {
         guard !isInitialized else { return }
-        try await coordinator.initializeForCLI()
+        if storedCoordinator == nil { storedCoordinator = try coordinatorFactory() }
+        try await coordinator.initializeForCLI(includeRewind: defaults.bool(forKey: "useRewindData"))
         isInitialized = true
+        await Self.flushPendingMetrics(coordinator: coordinator, defaults: defaults)
+    }
+
+    // Called only once a CLI query or normal app startup has initialized the database.
+    public static func flushPendingMetrics(
+        coordinator: AppCoordinator,
+        defaults: UserDefaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+    ) async {
+        var pending = defaults.stringArray(forKey: "cliPendingMetrics") ?? []
+        while let metadata = pending.first {
+            do {
+                try await coordinator.recordMetricEvent(metricType: .cliCommandInvoked, metadata: metadata)
+                pending.removeFirst()
+                defaults.set(pending, forKey: "cliPendingMetrics")
+            } catch { break }
+        }
     }
 
     private func nearestFrame(to date: Date) async throws -> (matched: FrameReference?, previous: FrameReference?, next: FrameReference?) {
@@ -3125,10 +3148,16 @@ public actor RetraceCLIService {
     }
 
     private func recordCLICommandMetric(command: String, payload: [String: Any]) async throws {
-        try await coordinator.recordMetricEvent(
-            metricType: .cliCommandInvoked,
-            metadata: Self.metricMetadata(payload.merging(["command": command]) { _, new in new })
-        )
+        let safeKeys: Set<String> = ["source", "key", "changed", "entryCount", "resultCount", "limit", "offset", "filterCount", "hasWebsiteFilter", "hasQueueStats", "hasEncodingStats", "frameID", "byteCount"]
+        let safePayload = payload.filter { safeKeys.contains($0.key) }
+        let metadata = Self.metricMetadata(safePayload.merging(["command": command]) { _, new in new })
+        if isInitialized {
+            try await coordinator.recordMetricEvent(metricType: .cliCommandInvoked, metadata: metadata)
+        } else if let metadata {
+            var pending = defaults.stringArray(forKey: "cliPendingMetrics") ?? []
+            pending.append(metadata)
+            defaults.set(Array(pending.suffix(128)), forKey: "cliPendingMetrics")
+        }
     }
 
     private static func metricMetadata(_ payload: [String: Any]) -> String? {

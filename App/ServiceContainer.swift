@@ -371,7 +371,7 @@ public actor ServiceContainer {
 
     /// Initialize the minimal read/query surface needed for CLI commands.
     /// Skips processing workers, retention, and other background activity.
-    public func initializeForCLI() async throws {
+    public func initializeForCLI(includeRewind: Bool? = nil) async throws {
         guard !isInitialized else {
             Log.warning("ServiceContainer already initialized", category: .app)
             return
@@ -408,7 +408,7 @@ public actor ServiceContainer {
         )
 
         let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
-        if defaults.bool(forKey: "useRewindData") {
+        if includeRewind ?? defaults.bool(forKey: "useRewindData") {
             await configureRewindSource(adapter: adapter)
         }
 

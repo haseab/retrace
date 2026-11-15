@@ -1,4 +1,5 @@
 import XCTest
+import AVFoundation
 import AppKit
 import ApplicationServices
 import Shared
@@ -19,12 +20,21 @@ final class AccessibilityInspectorTest: XCTestCase {
     private var logFileHandle: FileHandle?
     private let linkDetector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)
     private let appInfoProvider = AppInfoProvider()
+    private let conferenceFaceBlurProcessor = ConferenceFaceBlurProcessor()
 
     // Interactive inspector should only run when explicitly opted in.
     private let interactiveInspectorEnabled = ProcessInfo.processInfo.environment["RUN_INTERACTIVE_ACCESSIBILITY_INSPECTOR"] == "1"
+    private let interactiveFaceInspectorEnabled = ProcessInfo.processInfo.environment["RUN_INTERACTIVE_FACE_INSPECTOR"] == "1"
 
     // Set AX_VERBOSE=1 to see detailed extraction attempts (noisy)
     private let verboseLogging = ProcessInfo.processInfo.environment["AX_VERBOSE"] == "1"
+    private lazy var faceInspectorIntervalSeconds: TimeInterval = {
+        let rawValue = ProcessInfo.processInfo.environment["FACE_INSPECTOR_INTERVAL_SECONDS"] ?? ""
+        guard let parsed = TimeInterval(rawValue), parsed >= 0.25 else {
+            return 2.0
+        }
+        return parsed
+    }()
     private let defaultKeywordNeedles = ["private", "incognito", "inprivate", "private browsing", "guest", "secret"]
     private let keywordCandidateAttributes: [CFString] = [
         kAXTitleAttribute as CFString,
@@ -163,6 +173,7 @@ final class AccessibilityInspectorTest: XCTestCase {
         var lastBodyLinkObservations: [AXLinkObservation] = []
         var lastKeywordObservations: [AXKeywordObservation] = []
         var lastWindowSnapshots: [AXWindowSnapshot] = []
+        var lastWindowServerDiagnostics: CGWindowDiagnostics?
 
         // Monitor indefinitely until Ctrl+C
         let startTime = Date()
@@ -178,7 +189,8 @@ final class AccessibilityInspectorTest: XCTestCase {
                     data.appleScriptModeProbe != lastAppleScriptModeProbe ||
                     data.bodyLinkObservations != lastBodyLinkObservations ||
                     data.keywordObservations != lastKeywordObservations ||
-                    data.windowSnapshots != lastWindowSnapshots {
+                    data.windowSnapshots != lastWindowSnapshots ||
+                    data.windowServerDiagnostics != lastWindowServerDiagnostics {
                     log("\n⏱  \(String(format: "%.1f", Date().timeIntervalSince(startTime)))s")
                     log("📱 App Bundle ID:  \(data.appBundleID)")
                     log("📝 App Name:       \(data.appName)")
@@ -243,6 +255,37 @@ final class AccessibilityInspectorTest: XCTestCase {
                             log("   ... \(data.windowSnapshots.count - 8) additional window snapshot(s)")
                         }
                     }
+                    log("🧭 Mission Control: \(data.windowServerDiagnostics.missionControlState.summary)")
+                    log("🪟 CGWindowList Top: \(data.windowServerDiagnostics.topWindows.count)")
+                    if data.windowServerDiagnostics.topWindows.isEmpty {
+                        log("   (none)")
+                    } else {
+                        for (index, snapshot) in data.windowServerDiagnostics.topWindows.prefix(8).enumerated() {
+                            log("   [\(index + 1)] owner=\(snapshot.ownerName)\(snapshot.bundleID.map { " bundle=\($0)" } ?? "") layer=\(snapshot.layer) alpha=\(String(format: "%.2f", snapshot.alpha))")
+                            log("       windowID=\(snapshot.windowID) pid=\(snapshot.ownerPID) name=\(snapshot.windowName ?? "(none)")")
+                            if let boundsPreview = snapshot.boundsPreview {
+                                log("       bounds=\(boundsPreview)")
+                            }
+                        }
+                        if data.windowServerDiagnostics.topWindows.count > 8 {
+                            log("   ... \(data.windowServerDiagnostics.topWindows.count - 8) additional top window(s)")
+                        }
+                    }
+                    log("🎯 Relevant CGWindows: \(data.windowServerDiagnostics.relevantWindows.count)")
+                    if data.windowServerDiagnostics.relevantWindows.isEmpty {
+                        log("   (none)")
+                    } else {
+                        for (index, snapshot) in data.windowServerDiagnostics.relevantWindows.prefix(8).enumerated() {
+                            log("   [\(index + 1)] owner=\(snapshot.ownerName)\(snapshot.bundleID.map { " bundle=\($0)" } ?? "") layer=\(snapshot.layer)")
+                            log("       windowID=\(snapshot.windowID) pid=\(snapshot.ownerPID) name=\(snapshot.windowName ?? "(none)")")
+                            if let boundsPreview = snapshot.boundsPreview {
+                                log("       bounds=\(boundsPreview)")
+                            }
+                        }
+                        if data.windowServerDiagnostics.relevantWindows.count > 8 {
+                            log("   ... \(data.windowServerDiagnostics.relevantWindows.count - 8) additional relevant window(s)")
+                        }
+                    }
                     if let method = data.urlExtractionMethod {
                         log("   └─ Method:      \(method)")
                     }
@@ -261,6 +304,7 @@ final class AccessibilityInspectorTest: XCTestCase {
                     lastBodyLinkObservations = data.bodyLinkObservations
                     lastKeywordObservations = data.keywordObservations
                     lastWindowSnapshots = data.windowSnapshots
+                    lastWindowServerDiagnostics = data.windowServerDiagnostics
                 }
             }
 
@@ -269,6 +313,108 @@ final class AccessibilityInspectorTest: XCTestCase {
 
         // Note: This code won't be reached, but kept for completeness
         // fileHandle.closeFile()
+    }
+
+    /// Run this test and move apps/windows with faces on-screen to inspect Vision face detections.
+    func testShowFaceDetectionInspectorDialog() async throws {
+        guard interactiveFaceInspectorEnabled else {
+            throw XCTSkip("Interactive-only test. Set RUN_INTERACTIVE_FACE_INSPECTOR=1 to run manually.")
+        }
+
+        let outputPath = "/tmp/face_detection_inspector_output.txt"
+        FileManager.default.createFile(atPath: outputPath, contents: nil)
+        logFileHandle = FileHandle(forWritingAtPath: outputPath)!
+        defer {
+            logFileHandle?.closeFile()
+            logFileHandle = nil
+        }
+
+        func log(_ message: String) {
+            let line = message + "\n"
+            logFileHandle?.write(line.data(using: .utf8)!)
+            print(message)
+        }
+
+        log("\n╔══════════════════════════════════════════════════════════════════════════════╗")
+        log("║                  VNDetectFaceRectanglesRequest Inspector                    ║")
+        log("║                                                                              ║")
+        log("║  This test captures the active display every \(String(format: "%.2f", faceInspectorIntervalSeconds))s and runs Vision face detection. ║")
+        log("║  Output includes face count and ROI state for the active display.            ║")
+        log("║                                                                              ║")
+        log("║  Output file: \(outputPath)                               ║")
+        log("║  Run: tail -f \(outputPath)                               ║")
+        log("╚══════════════════════════════════════════════════════════════════════════════╝\n")
+
+        if !CGPreflightScreenCaptureAccess() {
+            log("⚠️  SCREEN RECORDING PERMISSION REQUIRED")
+            log("   Go to: System Settings → Privacy & Security → Screen Recording")
+            log("   Enable access for your test runner or Xcode\n")
+
+            let granted = CGRequestScreenCaptureAccess()
+            if !granted {
+                XCTFail("Screen recording permission denied. Enable it in System Settings.")
+                return
+            }
+
+            log("   Waiting for permission grant...")
+            try await Task.sleep(for: .nanoseconds(Int64(2_000_000_000)), clock: .continuous)
+        }
+
+        log("✅ Screen recording permission granted\n")
+        let configuredSplitPreset = faceInspectorConfiguredSplitPreset()
+        log("🧩 FACE_INSPECTOR_MODE: \(configuredSplitPreset.modeDisplayLabel)")
+        log("Available modes:")
+        for preset in FaceInspectorROISplitPreset.allCases {
+            log("   \(preset.modeDisplayLabel)")
+        }
+        log("Set with: FACE_INSPECTOR_MODE=<mode_number>")
+        log("Sampling every \(String(format: "%.2f", faceInspectorIntervalSeconds))s (press Ctrl+C to stop)...\n")
+        log(String(repeating: "─", count: 80))
+
+        let displayMonitor = DisplayMonitor()
+        let startTime = Date()
+
+        while !Task.isCancelled {
+            let sample = await captureFaceDetectionSample(
+                using: displayMonitor,
+                splitPreset: configuredSplitPreset
+            )
+            log("\n⏱  \(String(format: "%.1f", sample.capturedAt.timeIntervalSince(startTime)))s")
+            log("🖥  Display ID:     \(sample.displayID) (\(sample.imageWidth)x\(sample.imageHeight))")
+            log("🔐 AX Permission:  \(sample.hasAccessibilityPermission ? "granted" : "not granted; using main display fallback when needed")")
+            log("📱 App Bundle ID:  \(sample.appBundleID ?? "unknown")")
+            log("📝 App Name:       \(sample.appName ?? "Unknown App")")
+            log("🪟 Window Title:   \(sample.windowTitle ?? "(none)")")
+            log("🧩 ROI Split:      \(sample.splitPresetTitle)")
+            log("🛡  Policy:        \(sample.policySummary)")
+            log("🎯 ROI:            \(sample.regionOfInterestSummary)")
+
+            if let error = sample.errorDescription {
+                log("❌ Detection:      \(error)")
+            } else {
+                log("🙂 Faces:          \(sample.faces.count)")
+                log("⏳ Detection:      \(String(format: "%.2f", sample.detectionDurationMs)) ms (\(sample.detectionModeDescription))")
+
+                if sample.faces.isEmpty {
+                    log("   No faces detected.")
+                } else {
+                    for (index, face) in sample.faces.enumerated() {
+                        log("   [\(index + 1)] normalized(bottom-left) x=\(formatFaceCoordinate(face.normalizedRect.minX)) y=\(formatFaceCoordinate(face.normalizedRect.minY)) w=\(formatFaceCoordinate(face.normalizedRect.width)) h=\(formatFaceCoordinate(face.normalizedRect.height))")
+                        if let pixelRect = face.pixelRectTopLeft {
+                            log("       pixels(top-left, display-local) x=\(Int(pixelRect.minX)) y=\(Int(pixelRect.minY)) w=\(Int(pixelRect.width)) h=\(Int(pixelRect.height))")
+                        } else {
+                            log("       pixels(top-left, display-local) unavailable")
+                        }
+                    }
+                }
+            }
+
+            log(String(repeating: "─", count: 80))
+            try await Task.sleep(
+                for: .nanoseconds(Int64(faceInspectorIntervalSeconds * 1_000_000_000)),
+                clock: .continuous
+            )
+        }
     }
 
     // MARK: - Accessibility Data Capture
@@ -301,6 +447,7 @@ final class AccessibilityInspectorTest: XCTestCase {
         var bodyLinkObservations: [AXLinkObservation] = []
         var keywordObservations: [AXKeywordObservation] = []
         var windowSnapshots: [AXWindowSnapshot] = []
+        let windowServerDiagnostics = captureWindowServerDiagnostics()
 
         // Get focused window
         if let focusedWindow: AXUIElement = getAttributeValue(appElement, attribute: kAXFocusedWindowAttribute as CFString) {
@@ -352,8 +499,380 @@ final class AccessibilityInspectorTest: XCTestCase {
             appleScriptModeProbe: appleScriptModeProbe,
             bodyLinkObservations: bodyLinkObservations,
             keywordObservations: keywordObservations,
-            windowSnapshots: windowSnapshots
+            windowSnapshots: windowSnapshots,
+            windowServerDiagnostics: windowServerDiagnostics
         )
+    }
+
+    private func captureFaceDetectionSample(
+        using displayMonitor: DisplayMonitor,
+        splitPreset: FaceInspectorROISplitPreset
+    ) async -> FaceDetectionSample {
+        let (displayID, hasAccessibilityPermission) = await displayMonitor.getActiveDisplayIDWithPermissionStatus()
+        let metadata = await appInfoProvider.getFrontmostAppInfo(
+            includeBrowserURL: true,
+            preferredDisplayID: displayID
+        )
+        let policyMatch = conferencePolicyMatch(
+            appBundleID: metadata.appBundleID,
+            browserURL: metadata.browserURL,
+            windowTitle: metadata.windowName
+        )
+        guard let image = CGDisplayCreateImage(displayID) else {
+            return FaceDetectionSample(
+                capturedAt: Date(),
+                displayID: displayID,
+                imageWidth: 0,
+                imageHeight: 0,
+                hasAccessibilityPermission: hasAccessibilityPermission,
+                appBundleID: metadata.appBundleID,
+                appName: metadata.appName,
+                windowTitle: metadata.windowName,
+                splitPresetTitle: splitPreset.modeDisplayLabel,
+                policySummary: conferencePolicySummary(
+                    appBundleID: metadata.appBundleID,
+                    browserURL: metadata.browserURL,
+                    windowTitle: metadata.windowName
+                ),
+                regionOfInterestSummary: "unavailable (failed to capture display image)",
+                detectionDurationMs: 0,
+                detectionModeDescription: ConferenceFaceBlurResult.DetectionMode.fullFrame.rawValue,
+                faces: [],
+                errorDescription: "failed to capture display image"
+            )
+        }
+
+        do {
+            let splitPlan = faceInspectorSplitPlan(
+                for: splitPreset,
+                policyMatch: policyMatch,
+                displayID: displayID
+            )
+            let startedAt = CFAbsoluteTimeGetCurrent()
+            var normalizedFaceRects: [CGRect] = []
+
+            for requestRect in splitPlan.requestRects {
+                let blurResult = try await conferenceFaceBlurProcessor.blurFaces(
+                    in: image,
+                    regionOfInterest: requestRect,
+                    configuration: .inspectorSinglePass
+                )
+                normalizedFaceRects.append(contentsOf: blurResult.normalizedFaceRects)
+            }
+
+            let deduplicatedNormalizedFaceRects = deduplicatedRects(
+                normalizedFaceRects,
+                overlapThreshold: 0.72
+            )
+            let detectionDurationMs = max(0, (CFAbsoluteTimeGetCurrent() - startedAt) * 1000)
+
+            return FaceDetectionSample(
+                capturedAt: Date(),
+                displayID: displayID,
+                imageWidth: image.width,
+                imageHeight: image.height,
+                hasAccessibilityPermission: hasAccessibilityPermission,
+                appBundleID: metadata.appBundleID,
+                appName: metadata.appName,
+                windowTitle: metadata.windowName,
+                splitPresetTitle: splitPreset.modeDisplayLabel,
+                policySummary: policyMatch.map { "\($0.kind.displayName) via \($0.matchedBy)" } ?? "none (full-frame detector)",
+                regionOfInterestSummary: splitPlan.summary,
+                detectionDurationMs: detectionDurationMs,
+                detectionModeDescription: splitPlan.modeDescription,
+                faces: deduplicatedNormalizedFaceRects.map {
+                    DetectedFaceBox(
+                        normalizedRect: $0,
+                        pixelRectTopLeft: topLeftPixelRect(
+                            from: $0,
+                            imageWidth: image.width,
+                            imageHeight: image.height
+                        )
+                    )
+                },
+                errorDescription: nil
+            )
+        } catch {
+            return FaceDetectionSample(
+                capturedAt: Date(),
+                displayID: displayID,
+                imageWidth: image.width,
+                imageHeight: image.height,
+                hasAccessibilityPermission: hasAccessibilityPermission,
+                appBundleID: metadata.appBundleID,
+                appName: metadata.appName,
+                windowTitle: metadata.windowName,
+                splitPresetTitle: splitPreset.modeDisplayLabel,
+                policySummary: conferencePolicySummary(
+                    appBundleID: metadata.appBundleID,
+                    browserURL: metadata.browserURL,
+                    windowTitle: metadata.windowName
+                ),
+                regionOfInterestSummary: "unavailable (\(error.localizedDescription))",
+                detectionDurationMs: 0,
+                detectionModeDescription: "error",
+                faces: [],
+                errorDescription: String(describing: error)
+            )
+        }
+    }
+
+    private func topLeftPixelRect(
+        from normalizedRect: CGRect,
+        imageWidth: Int,
+        imageHeight: Int
+    ) -> CGRect? {
+        guard imageWidth > 0, imageHeight > 0 else {
+            return nil
+        }
+
+        let width = CGFloat(imageWidth)
+        let height = CGFloat(imageHeight)
+        let minX = max(0, normalizedRect.minX * width)
+        let maxX = min(width, normalizedRect.maxX * width)
+        let minY = max(0, (1 - normalizedRect.maxY) * height)
+        let maxY = min(height, (1 - normalizedRect.minY) * height)
+        let rect = CGRect(
+            x: minX,
+            y: minY,
+            width: max(0, maxX - minX),
+            height: max(0, maxY - minY)
+        ).integral
+
+        guard rect.width > 1, rect.height > 1 else {
+            return nil
+        }
+
+        return rect
+    }
+
+    private func topLeftPixelRect(
+        fromImageRect rect: CGRect,
+        imageWidth: Int,
+        imageHeight: Int
+    ) -> CGRect? {
+        guard imageWidth > 0, imageHeight > 0 else {
+            return nil
+        }
+
+        let width = CGFloat(imageWidth)
+        let height = CGFloat(imageHeight)
+        let bounded = rect.intersection(CGRect(x: 0, y: 0, width: width, height: height)).integral
+        guard bounded.width > 1, bounded.height > 1 else {
+            return nil
+        }
+
+        return CGRect(
+            x: bounded.minX,
+            y: height - bounded.maxY,
+            width: bounded.width,
+            height: bounded.height
+        ).integral
+    }
+
+    private func conferencePolicyMatch(
+        appBundleID: String?,
+        browserURL: String?,
+        windowTitle: String?
+    ) -> ConferenceSessionMatch? {
+        ConferenceSessionPrivacyPolicy.match(
+            appBundleID: appBundleID,
+            browserURL: browserURL,
+            windowName: windowTitle,
+            hasActiveMediaCapture: hasActiveMediaCapture()
+        )
+    }
+
+    private func conferencePolicySummary(
+        appBundleID: String?,
+        browserURL: String?,
+        windowTitle: String?
+    ) -> String {
+        conferencePolicyMatch(
+            appBundleID: appBundleID,
+            browserURL: browserURL,
+            windowTitle: windowTitle
+        ).map { "\($0.kind.displayName) via \($0.matchedBy)" } ?? "none (full-frame detector)"
+    }
+
+    private func faceInspectorRegionOfInterest(
+        for policyMatch: ConferenceSessionMatch?,
+        displayID: CGDirectDisplayID
+    ) -> CGRect? {
+        guard policyMatch != nil,
+              let frontApp = NSWorkspace.shared.frontmostApplication else {
+            return nil
+        }
+
+        let windowBounds = PermissionMonitor.shared.safeGetWindowFrame(for: frontApp.processIdentifier)
+            ?? faceInspectorWindowBoundsFromWindowList(for: frontApp.processIdentifier)
+        return CGWindowListCapture.ConferenceROIPlanner.normalizedVisionRegionOfInterest(
+            windowBounds: windowBounds,
+            displayBounds: CGDisplayBounds(displayID)
+        )
+    }
+
+    private func faceInspectorWindowBoundsFromWindowList(for pid: pid_t) -> CGRect? {
+        guard let windowList = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements],
+            kCGNullWindowID
+        ) as? [[String: Any]] else {
+            return nil
+        }
+
+        for windowInfo in windowList {
+            guard let ownerPID = windowInfo[kCGWindowOwnerPID as String] as? pid_t,
+                  ownerPID == pid else {
+                continue
+            }
+
+            let layer = windowInfo[kCGWindowLayer as String] as? Int ?? 0
+            if layer != 0 {
+                continue
+            }
+
+            let isOnScreen = windowInfo[kCGWindowIsOnscreen as String] as? Bool ?? false
+            if !isOnScreen {
+                continue
+            }
+
+            guard let boundsDict = windowInfo[kCGWindowBounds as String] as? [String: Any],
+                  let bounds = CGRect(dictionaryRepresentation: boundsDict as CFDictionary) else {
+                continue
+            }
+
+            return bounds
+        }
+
+        return nil
+    }
+
+    private func faceInspectorRegionOfInterestSummary(
+        _ regionOfInterest: CGRect?,
+        imageWidth: Int? = nil,
+        imageHeight: Int? = nil
+    ) -> String {
+        guard let regionOfInterest else {
+            return "full frame"
+        }
+
+        guard let imageWidth, let imageHeight else {
+            return "normalized x=\(formatFaceCoordinate(regionOfInterest.minX)) y=\(formatFaceCoordinate(regionOfInterest.minY)) w=\(formatFaceCoordinate(regionOfInterest.width)) h=\(formatFaceCoordinate(regionOfInterest.height))"
+        }
+
+        guard let pixelRect = topLeftPixelRect(
+            from: regionOfInterest,
+            imageWidth: imageWidth,
+            imageHeight: imageHeight
+        ) else {
+            return "normalized x=\(formatFaceCoordinate(regionOfInterest.minX)) y=\(formatFaceCoordinate(regionOfInterest.minY)) w=\(formatFaceCoordinate(regionOfInterest.width)) h=\(formatFaceCoordinate(regionOfInterest.height))"
+        }
+
+        return "normalized x=\(formatFaceCoordinate(regionOfInterest.minX)) y=\(formatFaceCoordinate(regionOfInterest.minY)) w=\(formatFaceCoordinate(regionOfInterest.width)) h=\(formatFaceCoordinate(regionOfInterest.height)); pixels x=\(Int(pixelRect.minX)) y=\(Int(pixelRect.minY)) w=\(Int(pixelRect.width)) h=\(Int(pixelRect.height))"
+    }
+
+    private func faceInspectorSplitPlan(
+        for splitPreset: FaceInspectorROISplitPreset,
+        policyMatch: ConferenceSessionMatch?,
+        displayID: CGDirectDisplayID
+    ) -> FaceInspectorSplitPlan {
+        switch splitPreset {
+        case .policyAuto:
+            let roi = faceInspectorRegionOfInterest(
+                for: policyMatch,
+                displayID: displayID
+            )
+            let summary = faceInspectorRegionOfInterestSummary(roi)
+            return FaceInspectorSplitPlan(
+                requestRects: [roi ?? CGRect(x: 0, y: 0, width: 1, height: 1)],
+                summary: summary,
+                modeDescription: roi == nil ? "policy_auto/full_frame" : "policy_auto/roi"
+            )
+        case .fullFrame:
+            return FaceInspectorSplitPlan(
+                requestRects: [CGRect(x: 0, y: 0, width: 1, height: 1)],
+                summary: "full frame (1 request)",
+                modeDescription: "full_frame"
+            )
+        case let .gridSelection(selection):
+            let requestRects = faceInspectorGridRequestRects(selection: selection)
+            return FaceInspectorSplitPlan(
+                requestRects: requestRects,
+                summary: "\(selection.title) (\(requestRects.count) request\(requestRects.count == 1 ? "" : "s"))",
+                modeDescription: "roi_split/\(selection.debugIdentifier)"
+            )
+        }
+    }
+
+    private func faceInspectorGridRequestRects(
+        selection: FaceInspectorGridSelection
+    ) -> [CGRect] {
+        selection.selectedCellIndices.map { index in
+            let row = index / selection.columns
+            let column = index % selection.columns
+            let cellWidth = 1.0 / CGFloat(selection.columns)
+            let cellHeight = 1.0 / CGFloat(selection.rows)
+            let baseRect = CGRect(
+                x: CGFloat(column) * cellWidth,
+                y: CGFloat(selection.rows - row - 1) * cellHeight,
+                width: cellWidth,
+                height: cellHeight
+            )
+            let expandedRect = baseRect.insetBy(
+                dx: -(cellWidth * selection.overlapFraction),
+                dy: -(cellHeight * selection.overlapFraction)
+            )
+            let clampedMinX = max(0, min(1, expandedRect.minX))
+            let clampedMinY = max(0, min(1, expandedRect.minY))
+            let clampedMaxX = max(clampedMinX, min(1, expandedRect.maxX))
+            let clampedMaxY = max(clampedMinY, min(1, expandedRect.maxY))
+            return CGRect(
+                x: clampedMinX,
+                y: clampedMinY,
+                width: clampedMaxX - clampedMinX,
+                height: clampedMaxY - clampedMinY
+            )
+        }
+    }
+
+    private func deduplicatedRects(
+        _ rects: [CGRect],
+        overlapThreshold: CGFloat
+    ) -> [CGRect] {
+        let sortedRects = rects.sorted {
+            ($0.width * $0.height) > ($1.width * $1.height)
+        }
+
+        var deduplicated: [CGRect] = []
+        for rect in sortedRects {
+            let shouldSkip = deduplicated.contains { existingRect in
+                let intersection = rect.intersection(existingRect)
+                guard !intersection.isNull, intersection.width > 0, intersection.height > 0 else {
+                    return false
+                }
+
+                let rectArea = rect.width * rect.height
+                let existingArea = existingRect.width * existingRect.height
+                let denominator = max(1, min(rectArea, existingArea))
+                return (intersection.width * intersection.height) / denominator >= overlapThreshold
+            }
+
+            if !shouldSkip {
+                deduplicated.append(rect)
+            }
+        }
+
+        return deduplicated
+    }
+
+    private func hasActiveMediaCapture() -> Bool {
+        let cameraInUse = AVCaptureDevice.default(for: .video)?.isInUseByAnotherApplication ?? false
+        let microphoneInUse = AVCaptureDevice.default(for: .audio)?.isInUseByAnotherApplication ?? false
+        return cameraInUse || microphoneInUse
+    }
+
+    private func formatFaceCoordinate(_ value: CGFloat) -> String {
+        String(format: "%.4f", value)
     }
 
     private func getAttributeValue<T>(_ element: AXUIElement, attribute: CFString) -> T? {
@@ -1447,6 +1966,162 @@ final class AccessibilityInspectorTest: XCTestCase {
 
         return nil
     }
+
+    private func captureWindowServerDiagnostics() -> CGWindowDiagnostics {
+        guard let windowList = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements],
+            kCGNullWindowID
+        ) as? [[String: Any]] else {
+            return CGWindowDiagnostics(
+                topWindows: [],
+                relevantWindows: [],
+                missionControlState: .inactive(reason: "window-list-unavailable")
+            )
+        }
+
+        var bundleIDCache: [pid_t: String?] = [:]
+        let snapshots = windowList.compactMap { windowInfo -> CGWindowServerSnapshot? in
+            guard let windowID = windowInfo[kCGWindowNumber as String] as? CGWindowID else {
+                return nil
+            }
+
+            let ownerPID = windowInfo[kCGWindowOwnerPID as String] as? pid_t ?? 0
+            let ownerName = windowInfo[kCGWindowOwnerName as String] as? String ?? "unknown"
+            let windowName = normalizedWindowName(windowInfo[kCGWindowName as String] as? String)
+            let layer = windowInfo[kCGWindowLayer as String] as? Int ?? 0
+            let alpha = windowInfo[kCGWindowAlpha as String] as? Double ?? 0
+
+            let bundleID: String?
+            if let cachedBundleID = bundleIDCache[ownerPID] {
+                bundleID = cachedBundleID
+            } else {
+                let resolvedBundleID = NSRunningApplication(processIdentifier: ownerPID)?.bundleIdentifier
+                bundleIDCache[ownerPID] = resolvedBundleID
+                bundleID = resolvedBundleID
+            }
+
+            return CGWindowServerSnapshot(
+                windowID: UInt32(windowID),
+                ownerPID: ownerPID,
+                ownerName: ownerName,
+                bundleID: bundleID,
+                windowName: windowName,
+                layer: layer,
+                alpha: alpha,
+                boundsPreview: boundsPreview(from: windowInfo)
+            )
+        }
+
+        let topWindows = Array(snapshots.prefix(12))
+        let relevantWindows = relevantWindowSnapshots(from: snapshots)
+        return CGWindowDiagnostics(
+            topWindows: topWindows,
+            relevantWindows: relevantWindows,
+            missionControlState: missionControlState(from: topWindows)
+        )
+    }
+
+    private func normalizedWindowName(_ value: String?) -> String? {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty else {
+            return nil
+        }
+        return value
+    }
+
+    private func boundsPreview(from windowInfo: [String: Any]) -> String? {
+        guard let boundsDictionary = windowInfo[kCGWindowBounds as String] as? [String: Any],
+              let rect = CGRect(dictionaryRepresentation: boundsDictionary as CFDictionary) else {
+            return nil
+        }
+
+        return "{x=\(Int(rect.minX)), y=\(Int(rect.minY)), w=\(Int(rect.width)), h=\(Int(rect.height))}"
+    }
+
+    private func relevantWindowSnapshots(from snapshots: [CGWindowServerSnapshot]) -> [CGWindowServerSnapshot] {
+        var results: [CGWindowServerSnapshot] = []
+        var seenWindowIDs = Set<UInt32>()
+
+        for snapshot in snapshots {
+            let normalizedOwner = snapshot.ownerName.lowercased()
+            let normalizedBundle = snapshot.bundleID?.lowercased() ?? ""
+            let normalizedWindowName = snapshot.windowName?.lowercased() ?? ""
+            let isRelevant =
+                normalizedBundle == "us.zoom.xos" ||
+                normalizedBundle == "com.apple.dock" ||
+                normalizedBundle == "com.apple.windowmanager" ||
+                normalizedOwner.contains("zoom") ||
+                normalizedOwner.contains("dock") ||
+                normalizedOwner.contains("windowmanager") ||
+                normalizedWindowName.contains("zoom") ||
+                normalizedWindowName.contains("meeting") ||
+                normalizedWindowName.contains("mission control") ||
+                normalizedWindowName.contains("desktop")
+
+            guard isRelevant, seenWindowIDs.insert(snapshot.windowID).inserted else {
+                continue
+            }
+
+            results.append(snapshot)
+        }
+
+        return Array(results.prefix(12))
+    }
+
+    private func missionControlState(from topWindows: [CGWindowServerSnapshot]) -> MissionControlState {
+        let missionControlBundles: Set<String> = [
+            "com.apple.dock",
+            "com.apple.windowmanager"
+        ]
+        let missionControlTitleMarkers = [
+            "mission control",
+            "desktop",
+            "space",
+            "stage manager",
+            "expose"
+        ]
+
+        if let windowManagerSurface = topWindows.first(where: {
+            $0.bundleID?.lowercased() == "com.apple.windowmanager" ||
+                $0.ownerName.caseInsensitiveCompare("WindowManager") == .orderedSame
+        }) {
+            return .likelyActive(
+                reason: "windowmanager-surface",
+                ownerName: windowManagerSurface.ownerName,
+                bundleID: windowManagerSurface.bundleID
+            )
+        }
+
+        if let titledSystemSurface = topWindows.first(where: { snapshot in
+            guard missionControlBundles.contains(snapshot.bundleID?.lowercased() ?? "") else {
+                return false
+            }
+            let normalizedTitle = snapshot.windowName?.lowercased() ?? ""
+            return missionControlTitleMarkers.contains(where: normalizedTitle.contains)
+        }) {
+            return .likelyActive(
+                reason: "dock-or-windowmanager-titled-surface",
+                ownerName: titledSystemSurface.ownerName,
+                bundleID: titledSystemSurface.bundleID
+            )
+        }
+
+        let topSystemSurfaceCount = topWindows.prefix(6).filter {
+            missionControlBundles.contains($0.bundleID?.lowercased() ?? "")
+        }.count
+        if topSystemSurfaceCount >= 2 {
+            let leadingSystemSurface = topWindows.first {
+                missionControlBundles.contains($0.bundleID?.lowercased() ?? "")
+            }
+            return .likelyActive(
+                reason: "multiple-system-compositor-surfaces",
+                ownerName: leadingSystemSurface?.ownerName,
+                bundleID: leadingSystemSurface?.bundleID
+            )
+        }
+
+        return .inactive(reason: "no-mission-control-signal")
+    }
 }
 
 // MARK: - Data Structure
@@ -1463,6 +2138,7 @@ private struct AccessibilityData {
     let bodyLinkObservations: [AXLinkObservation]
     let keywordObservations: [AXKeywordObservation]
     let windowSnapshots: [AXWindowSnapshot]
+    let windowServerDiagnostics: CGWindowDiagnostics
 
     var uniqueBodyLinks: [String] {
         var seen = Set<String>()
@@ -1476,6 +2152,186 @@ private struct AccessibilityData {
     var keywordHitsByNeedle: [String: [AXKeywordObservation]] {
         Dictionary(grouping: keywordObservations, by: \.needle)
     }
+}
+
+private struct CGWindowDiagnostics: Hashable {
+    let topWindows: [CGWindowServerSnapshot]
+    let relevantWindows: [CGWindowServerSnapshot]
+    let missionControlState: MissionControlState
+}
+
+private struct CGWindowServerSnapshot: Hashable {
+    let windowID: UInt32
+    let ownerPID: pid_t
+    let ownerName: String
+    let bundleID: String?
+    let windowName: String?
+    let layer: Int
+    let alpha: Double
+    let boundsPreview: String?
+}
+
+private enum MissionControlState: Hashable {
+    case likelyActive(reason: String, ownerName: String?, bundleID: String?)
+    case inactive(reason: String)
+
+    var summary: String {
+        switch self {
+        case let .likelyActive(reason, ownerName, bundleID):
+            let ownerSummary = ownerName ?? bundleID ?? "unknown"
+            let bundleSummary = bundleID.map { " bundle=\($0)" } ?? ""
+            return "likely active (\(reason); owner=\(ownerSummary)\(bundleSummary))"
+        case let .inactive(reason):
+            return "not detected (\(reason))"
+        }
+    }
+}
+
+private enum FaceInspectorROISplitPreset: CaseIterable, Sendable, Equatable {
+    case policyAuto
+    case fullFrame
+    case gridSelection(FaceInspectorGridSelection)
+
+    static var allCases: [FaceInspectorROISplitPreset] {
+        [
+            .policyAuto,
+            .fullFrame,
+            .gridSelection(.rows2x1),
+            .gridSelection(.grid2x2),
+            .gridSelection(.grid2x3),
+            .gridSelection(.rows3x1),
+            .gridSelection(.centerOf3x3),
+            .gridSelection(.grid4x4),
+        ]
+    }
+
+    var title: String {
+        switch self {
+        case .policyAuto:
+            return "Policy Auto"
+        case .fullFrame:
+            return "Full Frame"
+        case let .gridSelection(selection):
+            return selection.title
+        }
+    }
+
+    var modeNumber: Int {
+        (Self.allCases.firstIndex(of: self) ?? 0) + 1
+    }
+
+    var modeDisplayLabel: String {
+        "Mode \(modeNumber): \(title)"
+    }
+
+    static func configuredFromEnvironment(
+        _ environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> FaceInspectorROISplitPreset {
+        let rawValue = environment["FACE_INSPECTOR_MODE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard let modeNumber = Int(rawValue),
+              allCases.indices.contains(modeNumber - 1) else {
+            return .policyAuto
+        }
+
+        return allCases[modeNumber - 1]
+    }
+}
+
+private func faceInspectorConfiguredSplitPreset() -> FaceInspectorROISplitPreset {
+    FaceInspectorROISplitPreset.configuredFromEnvironment()
+}
+
+private struct FaceInspectorGridSelection: Sendable, Equatable {
+    let title: String
+    let debugIdentifier: String
+    let rows: Int
+    let columns: Int
+    let selectedCellIndices: [Int]
+    let overlapFraction: CGFloat
+
+    static let rows2x1 = FaceInspectorGridSelection(
+        title: "2x1 Rows",
+        debugIdentifier: "2x1_rows",
+        rows: 2,
+        columns: 1,
+        selectedCellIndices: [0, 1],
+        overlapFraction: 0.08
+    )
+
+    static let grid2x2 = FaceInspectorGridSelection(
+        title: "2x2 Grid",
+        debugIdentifier: "2x2_grid",
+        rows: 2,
+        columns: 2,
+        selectedCellIndices: [0, 1, 2, 3],
+        overlapFraction: 0.08
+    )
+
+    static let grid2x3 = FaceInspectorGridSelection(
+        title: "2x3 Grid",
+        debugIdentifier: "2x3_grid",
+        rows: 2,
+        columns: 3,
+        selectedCellIndices: Array(0..<6),
+        overlapFraction: 0.09
+    )
+
+    static let rows3x1 = FaceInspectorGridSelection(
+        title: "3x1 Rows",
+        debugIdentifier: "3x1_rows",
+        rows: 3,
+        columns: 1,
+        selectedCellIndices: [0, 1, 2],
+        overlapFraction: 0.08
+    )
+
+    static let centerOf3x3 = FaceInspectorGridSelection(
+        title: "3x3 Center Tile",
+        debugIdentifier: "3x3_center",
+        rows: 3,
+        columns: 3,
+        selectedCellIndices: [4],
+        overlapFraction: 0.08
+    )
+
+    static let grid4x4 = FaceInspectorGridSelection(
+        title: "4x4 Grid",
+        debugIdentifier: "4x4_grid",
+        rows: 4,
+        columns: 4,
+        selectedCellIndices: Array(0..<16),
+        overlapFraction: 0.06
+    )
+}
+
+private struct FaceInspectorSplitPlan: Sendable {
+    let requestRects: [CGRect]
+    let summary: String
+    let modeDescription: String
+}
+
+private struct FaceDetectionSample: Sendable {
+    let capturedAt: Date
+    let displayID: UInt32
+    let imageWidth: Int
+    let imageHeight: Int
+    let hasAccessibilityPermission: Bool
+    let appBundleID: String?
+    let appName: String?
+    let windowTitle: String?
+    let splitPresetTitle: String
+    let policySummary: String
+    let regionOfInterestSummary: String
+    let detectionDurationMs: Double
+    let detectionModeDescription: String
+    let faces: [DetectedFaceBox]
+    let errorDescription: String?
+}
+
+private struct DetectedFaceBox: Sendable {
+    let normalizedRect: CGRect
+    let pixelRectTopLeft: CGRect?
 }
 
 private struct AppleScriptExecutionResult: Hashable {

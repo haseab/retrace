@@ -2124,7 +2124,8 @@ struct FrameWithURLOverlay<Content: View>: View {
                             rect: rect,
                             tooltipState: SimpleTimelineViewModel.phraseLevelRedactionTooltipState(
                                 for: viewModel.currentTimelineFrame?.processingStatus ?? -1,
-                                isRevealed: viewModel.revealedRedactedNodePatches[node.id] != nil
+                                isRevealed: viewModel.revealedRedactedNodePatches[node.id] != nil,
+                            isPermanent: node.isPermanentlyRedacted
                             )
                         )
                     }
@@ -2145,7 +2146,8 @@ struct FrameWithURLOverlay<Content: View>: View {
                         rect: rect,
                         tooltipState: SimpleTimelineViewModel.phraseLevelRedactionTooltipState(
                             for: viewModel.currentTimelineFrame?.processingStatus ?? -1,
-                            isRevealed: viewModel.revealedRedactedNodePatches[node.id] != nil
+                            isRevealed: viewModel.revealedRedactedNodePatches[node.id] != nil,
+                            isPermanent: node.isPermanentlyRedacted
                         )
                     )
                 }
@@ -3094,7 +3096,7 @@ struct RedactionTooltipOverlay: View {
         state: SimpleTimelineViewModel.PhraseLevelRedactionTooltipState
     ) {
         switch state {
-        case .queued:
+        case .queued, .permanent:
             break
         case .reveal, .hide:
             onToggleReveal(node)

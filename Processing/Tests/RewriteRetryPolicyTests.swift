@@ -3,6 +3,7 @@ import Foundation
 import CoreGraphics
 import Shared
 import Database
+import SQLCipher
 @testable import Processing
 
 private actor RewriteRetryNoopSearch: SearchProtocol {
@@ -190,6 +191,7 @@ private actor FailingRewriteStorage: StorageProtocol, RewriteAttemptCountingStor
 
 private actor BlockingRewriteStorage: StorageProtocol, RewriteAttemptCountingStorage {
     private var rewriteAttemptCount = 0
+    private var recoveryScanCount = 0
     private var firstRewriteStarted = false
     private var firstRewriteStartContinuations: [CheckedContinuation<Void, Never>] = []
     private var firstRewriteReleaseContinuation: CheckedContinuation<Void, Never>?
@@ -248,8 +250,11 @@ private actor BlockingRewriteStorage: StorageProtocol, RewriteAttemptCountingSto
     }
 
     func recoverInterruptedSegmentRewrites() async throws -> [SegmentRewriteRecoveryAction] {
-        []
+        recoveryScanCount += 1
+        return []
     }
+
+    func recoveryScans() -> Int { recoveryScanCount }
 
     func finishInterruptedSegmentRewriteRecovery(segmentID: VideoSegmentID) async throws {}
 
@@ -325,6 +330,72 @@ final class RewriteRetryPolicyTests: XCTestCase {
         database = nil
         queue = nil
         storage = nil
+    }
+
+    func testDatabaseReadFailureDoesNotAuthorizeFrameDeletion() async throws {
+        let connection = await database.getConnection()
+        let db = try XCTUnwrap(connection)
+        XCTAssertEqual(sqlite3_exec(db, """
+            INSERT INTO segment(id,bundleID,startDate,endDate,type) VALUES(1,'example',0,10,0);
+            INSERT INTO video(id,height,width,path,fileSize,frameRate,processingState) VALUES(1,64,64,'segments/123',100,30,0);
+            INSERT INTO frame(id,createdAt,imageFileName,segmentId,videoId,videoFrameIndex) VALUES(1,1,'one',1,1,0);
+            """, nil, nil, nil), SQLITE_OK)
+        sqlite3_set_authorizer(db, { _, action, table, _, _, _ in
+            if action == SQLITE_READ, let table, String(cString: table) == "video" { return SQLITE_DENY }
+            return SQLITE_OK
+        }, nil)
+        let shouldDelete = await queue.verifyFrameIsUnrecoverable(
+            frameID: 1, error: StorageError.fileReadFailed(path: "segments/123", underlying: "Video file is empty")
+        )
+        sqlite3_set_authorizer(db, nil, nil)
+        XCTAssertFalse(shouldDelete)
+        let retained = try await database.getFrame(id: FrameID(value: 1))
+        XCTAssertNotNil(retained)
+    }
+
+    func testEnqueueBatchIsAtomicAndUsesDatabaseBatch() async throws {
+        let connection = await database.getConnection()
+        let db = try XCTUnwrap(connection)
+        let sql = "INSERT INTO frame(id,createdAt,imageFileName,processingStatus) VALUES (1,1000,'one',0),(2,2000,'two',0);"
+        guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+        do {
+            try await queue.enqueueBatch(frameIDs: [1,2,999], priority: 7)
+            XCTFail("Expected the invalid frame to reject the whole batch")
+        } catch {}
+        let failedDepth = try await database.getProcessingQueueDepth()
+        XCTAssertEqual(failedDepth, 0, "The Processing entry point must not retain a partially enqueued prefix")
+        try await queue.enqueueBatch(frameIDs: [1,2], priority: 7)
+        try await queue.enqueueBatch(frameIDs: [])
+        let depth = try await database.getProcessingQueueDepth()
+        XCTAssertEqual(depth, 2)
+    }
+
+    func testRecoveryNeverScansWhileAnotherRewriteIsActive() async throws {
+        let blockingStorage = BlockingRewriteStorage()
+        let blockingQueue = FrameProcessingQueue(database: database, storage: blockingStorage,
+            processing: RewriteRetryNoopProcessing(), search: RewriteRetryNoopSearch(),
+            config: ProcessingQueueConfig(workerCount: 1, maxRetryAttempts: 3, maxQueueSize: 1000))
+        let fixture = try await insertVideoFixture(frameCount: 2)
+        let frameID = try await insertFrameReference(segmentID: fixture.segmentID, videoID: fixture.videoID,
+            timestamp: fixture.timestamp, frameIndexInSegment: 0)
+        let siblingID = try await insertFrameReference(segmentID: fixture.segmentID, videoID: fixture.videoID,
+            timestamp: fixture.timestamp.addingTimeInterval(1), frameIndexInSegment: 1)
+        try await database.updateFrameProcessingStatus(frameID: siblingID.value,
+            status: FrameProcessingStatus.completed.rawValue)
+        try await database.updateFrameProcessingStatus(frameID: frameID.value,
+            status: FrameProcessingStatus.rewritePending.rawValue, rewritePurpose: "deletion")
+        let rewrite = Task { try await blockingQueue.processPendingRewrites(for: fixture.videoID.value) }
+        await blockingStorage.waitForFirstRewriteToStart()
+        await blockingQueue.startWorkers()
+        await blockingQueue.recoverPendingRewritesIfPossible()
+        let scansDuringRewrite = await blockingStorage.recoveryScans()
+        // Release before asserting so a failed regression cannot strand a worker.
+        await blockingStorage.releaseFirstRewrite()
+        _ = try await rewrite.value
+        await blockingQueue.stopWorkers()
+        XCTAssertEqual(scansDuringRewrite, 0)
     }
 
     func testFailedRewriteRetriesOnceThenStopsRetryingAutomatically() async throws {

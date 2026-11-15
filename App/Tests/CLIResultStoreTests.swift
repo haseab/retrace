@@ -127,22 +127,25 @@ final class CLIServiceSearchIntegrationTests: XCTestCase {
     }
 
     func testSearchUsesSeededDatabaseFiltersAndStoresNormalizedResults() async throws {
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
-        let previousUseRewindData = defaults.object(forKey: "useRewindData")
-        defaults.set(false, forKey: "useRewindData")
-        defer {
-            if let previousUseRewindData {
-                defaults.set(previousUseRewindData, forKey: "useRewindData")
-            } else {
-                defaults.removeObject(forKey: "useRewindData")
-            }
-        }
-
         let tempDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         let resultStore = CLIResultStore(fileURL: tempDirectory.appendingPathComponent("results.json"))
-        let serviceDefaults = UserDefaults(suiteName: "cli-search-tests-\(UUID().uuidString)")!
-        let services = ServiceContainer(inMemory: true)
+        let suiteName = "cli-search-tests-\(UUID().uuidString)"
+        let serviceDefaults = UserDefaults(suiteName: suiteName)!
+        defer {
+            serviceDefaults.removePersistentDomain(forName: suiteName)
+            try? FileManager.default.removeItem(at: tempDirectory)
+        }
+        let services = ServiceContainer(
+            databasePath: "file:cli-test-\(UUID().uuidString)?mode=memory&cache=shared",
+            storageConfig: StorageConfig(
+                storageRootPath: tempDirectory.path,
+                retentionDays: nil,
+                maxStorageGB: nil,
+                segmentDurationSeconds: 300
+            ),
+            storageCrashReportDirectory: tempDirectory.appendingPathComponent("crashes").path
+        )
         let coordinator = AppCoordinator(services: services)
 
         defer {
@@ -151,7 +154,7 @@ final class CLIServiceSearchIntegrationTests: XCTestCase {
             }
         }
 
-        try await coordinator.initializeForCLI()
+        try await coordinator.initializeForCLI(includeRewind: false)
 
         let database = await services.database
         let baseDate = Date(timeIntervalSince1970: 1_776_100_000)
@@ -196,6 +199,7 @@ final class CLIServiceSearchIntegrationTests: XCTestCase {
             browserURL: "https://openai.com/app-miss"
         )
 
+        serviceDefaults.set(["{\"source\":\"cli\",\"command\":\"config_list\",\"entryCount\":1}"], forKey: "cliPendingMetrics")
         let service = RetraceCLIService(
             coordinator: coordinator,
             resultStore: resultStore,
@@ -243,6 +247,31 @@ final class CLIServiceSearchIntegrationTests: XCTestCase {
         XCTAssertEqual(storedResults.queryText, "needle")
         XCTAssertEqual(storedResults.results, output.results)
         XCTAssertEqual(try resultStore.resolveLatestSearchResult(id: 1), result)
+
+        XCTAssertEqual(serviceDefaults.stringArray(forKey: "cliPendingMetrics"), [])
+        let metricEvents = try await coordinator.getRecentMetricEvents(limit: 100)
+        XCTAssertTrue(metricEvents.contains { $0.details["command"] == "config_list" })
+        let status = try await service.status()
+        XCTAssertNil(status.pipeline.isRunning)
+        XCTAssertNil(status.pipeline.framesProcessed)
+        XCTAssertTrue(status.pipeline.runtimeStatus.contains("unavailable"))
+        XCTAssertEqual(status.statistics.frameCount, 5)
+        let system = try await service.inspectSystem()
+        XCTAssertNil(system.isCapturing)
+        XCTAssertNil(system.capture)
+        XCTAssertNil(system.processing)
+        XCTAssertNil(system.search)
+        XCTAssertTrue(system.processScope.contains("cli_process"))
+        let queue = try await service.inspectQueue()
+        XCTAssertNil(queue.queue)
+        XCTAssertNil(queue.encoding)
+        XCTAssertTrue(queue.runtimeStatus.contains("unavailable"))
+        let ocr = try await service.inspectOCR()
+        XCTAssertNil(ocr.queue)
+        XCTAssertNil(ocr.encoding)
+        XCTAssertTrue(ocr.framesProcessedPerMinute.isEmpty) // Seeded frames are older than the ten-minute window.
+        await service.shutdown()
+
     }
 
     private func seedFrameRecord(

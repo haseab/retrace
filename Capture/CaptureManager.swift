@@ -74,6 +74,17 @@ protocol ScreenCaptureBackend: Actor {
     func stopCapture() async throws
     func updateConfig(_ config: CaptureConfig) async throws
     func captureFrame(displayID: CGDirectDisplayID) async -> CapturedFrame?
+    func captureCandidate(displayID: CGDirectDisplayID) async -> CaptureFrameCandidate?
+    func disableFaceBlurForConferenceCall(callID: String) async -> Bool
+    func setOnConferenceFramePrivacyEvent(
+        _ callback: (@Sendable (ConferenceFramePrivacyEvent) async -> Void)?
+    ) async
+}
+
+extension ScreenCaptureBackend {
+    func captureCandidate(displayID: CGDirectDisplayID) async -> CaptureFrameCandidate? {
+        await captureFrame(displayID: displayID).map { CaptureFrameCandidate(frame: $0) }
+    }
 }
 
 protocol CaptureDisplayMonitoring: Actor {
@@ -173,9 +184,11 @@ public actor CaptureManager: CaptureProtocol {
     private let deduplicator: FrameDeduplicator
     private let appInfoProvider: any CaptureAppInfoProviding
     private let schedulingConfiguration: CaptureSchedulingConfiguration
+    private let permissionCheck: @Sendable () async -> Bool
     private let now: @Sendable () -> Date
 
     private var currentConfig: CaptureConfig
+    private var lastKeptCandidate: CaptureFrameCandidate?
     private var lastKeptFrame: CapturedFrame?
     private var lastKeptMousePosition: CGPoint?
     private var _isCapturing = false
@@ -214,6 +227,7 @@ public actor CaptureManager: CaptureProtocol {
     nonisolated(unsafe) public var onCaptureStopped: (@Sendable () async -> Void)?
     nonisolated(unsafe) public var onCaptureObserved: (@Sendable (Date, String) async -> Void)?
     nonisolated(unsafe) public var onMouseClickCaptureOutcome: (@Sendable (MouseClickCaptureOutcome, Date) async -> Void)?
+    private var onConferenceFramePrivacyEvent: (@Sendable (ConferenceFramePrivacyEvent) async -> Void)?
 
     public init(config: CaptureConfig = .default) {
         let displayMonitor = DisplayMonitor()
@@ -225,6 +239,7 @@ public actor CaptureManager: CaptureProtocol {
         self.deduplicator = FrameDeduplicator()
         self.appInfoProvider = AppInfoProvider()
         self.schedulingConfiguration = .production
+        self.permissionCheck = { await PermissionChecker.hasScreenRecordingPermission() }
         self.now = { Date() }
     }
 
@@ -237,7 +252,8 @@ public actor CaptureManager: CaptureProtocol {
         deduplicator: FrameDeduplicator = FrameDeduplicator(),
         appInfoProvider: any CaptureAppInfoProviding = AppInfoProvider(),
         schedulingConfiguration: CaptureSchedulingConfiguration = .production,
-        now: @escaping @Sendable () -> Date = { Date() }
+        now: @escaping @Sendable () -> Date = { Date() },
+        permissionCheck: @escaping @Sendable () async -> Bool = { await PermissionChecker.hasScreenRecordingPermission() }
     ) {
         self.currentConfig = config
         self.cgWindowListCapture = cgWindowListCapture
@@ -247,11 +263,12 @@ public actor CaptureManager: CaptureProtocol {
         self.deduplicator = deduplicator
         self.appInfoProvider = appInfoProvider
         self.schedulingConfiguration = schedulingConfiguration
+        self.permissionCheck = permissionCheck
         self.now = now
     }
 
     public func hasPermission() async -> Bool {
-        await PermissionChecker.hasScreenRecordingPermission()
+        await permissionCheck()
     }
 
     public func requestPermission() async -> Bool {
@@ -281,6 +298,9 @@ public actor CaptureManager: CaptureProtocol {
             config: config,
             displayID: activeDisplayID
         )
+        await cgWindowListCapture.setOnConferenceFramePrivacyEvent { [weak self] event in
+            await self?.onConferenceFramePrivacyEvent?(event)
+        }
 
         _isCapturing = true
         resetCaptureState()
@@ -310,12 +330,14 @@ public actor CaptureManager: CaptureProtocol {
 
         await displaySwitchMonitor.stopMonitoring()
         await mouseClickMonitor.stopMonitoring()
+        await cgWindowListCapture.setOnConferenceFramePrivacyEvent(nil)
         try await cgWindowListCapture.stopCapture()
 
         dedupedFrameContinuation?.finish()
         dedupedFrameContinuation = nil
         _frameStream = nil
 
+        lastKeptCandidate = nil
         lastKeptFrame = nil
         lastKeptMousePosition = nil
         lastAcceptedWindowChangeSignature = nil
@@ -377,6 +399,16 @@ public actor CaptureManager: CaptureProtocol {
         try await displayMonitor.getFocusedDisplay()
     }
 
+    public func disableFaceBlurForConferenceCall(callID: String) async -> Bool {
+        await cgWindowListCapture.disableFaceBlurForConferenceCall(callID: callID)
+    }
+
+    public func setOnConferenceFramePrivacyEvent(
+        _ callback: (@Sendable (ConferenceFramePrivacyEvent) async -> Void)?
+    ) {
+        onConferenceFramePrivacyEvent = callback
+    }
+
     public func getStatistics() -> CaptureStatistics {
         stats
     }
@@ -397,6 +429,7 @@ public actor CaptureManager: CaptureProtocol {
         latestWindowChangeEvent = nil
         deferredDisplaySyncTask?.cancel()
         deferredDisplaySyncTask = nil
+        lastKeptCandidate = nil
         lastKeptFrame = nil
         lastKeptMousePosition = nil
         lastAcceptedWindowChangeSignature = nil
@@ -678,14 +711,14 @@ public actor CaptureManager: CaptureProtocol {
         let displayID = await displayIDForCapture(trigger: capture.trigger)
         currentCaptureDisplayID = displayID
 
-        let frame = await cgWindowListCapture.captureFrame(displayID: displayID)
+        let candidate = await cgWindowListCapture.captureCandidate(displayID: displayID)
         let captureAttemptCompletedAt = now()
-        if let frame {
+        if let candidate {
             lastActualCaptureTime = captureAttemptCompletedAt
             if let windowChangeEvent = capture.windowChangeEvent {
                 let shouldDropFrame = shouldDropWindowChangeCapture(
                     event: windowChangeEvent,
-                    capturedMetadata: frame.metadata
+                    capturedMetadata: candidate.metadata
                 )
                 if shouldDropFrame {
                     scheduleNextIntervalCapture(from: captureAttemptCompletedAt)
@@ -699,7 +732,23 @@ public actor CaptureManager: CaptureProtocol {
             if let windowChangeSignature = capture.windowChangeSignature {
                 lastAcceptedWindowChangeSignature = windowChangeSignature
             }
-            await handleCapturedFrame(frame, trigger: capture.trigger)
+            // An exact native-pixel duplicate would have similarity 1. Reuse the
+            // prior BGRA bytes and preserve the normal mouse/threshold decision.
+            // Near duplicates still go through the existing renderer/comparator.
+            let reusablePixels: Data?
+            if currentConfig.adaptiveCaptureEnabled,
+               currentConfig.deduplicationThreshold < 1,
+               let previous = lastKeptCandidate,
+               candidate.hasIdenticalPixels(to: previous) {
+                reusablePixels = lastKeptFrame?.imageData
+            } else {
+                reusablePixels = nil
+            }
+            if let frame = candidate.materialize(reusingPixels: reusablePixels),
+               await handleCapturedFrame(frame, trigger: capture.trigger) {
+                lastKeptCandidate = candidate
+                updateCaptureMemoryLedger(currentFrameBytes: 0)
+            }
             scheduleNextIntervalCapture(from: captureAttemptCompletedAt)
         } else {
             scheduleNextIntervalCapture(from: max(captureAttemptStartedAt, captureAttemptCompletedAt))
@@ -839,7 +888,9 @@ public actor CaptureManager: CaptureProtocol {
     private func handleCapturedFrame(
         _ frame: CapturedFrame,
         trigger: CaptureTrigger
-    ) async {
+    ) async -> Bool {
+        guard _isCapturing else { return false }
+        var retained = false
         updateCaptureMemoryLedger(currentFrameBytes: Int64(frame.imageData.count))
         defer {
             updateCaptureMemoryLedger(currentFrameBytes: 0)
@@ -855,11 +906,7 @@ public actor CaptureManager: CaptureProtocol {
 
         if currentConfig.adaptiveCaptureEnabled {
             let similarity = lastKeptFrame.map { deduplicator.computeSimilarity(frame, $0) }
-            let keepBySimilarity = deduplicator.shouldKeepFrame(
-                frame,
-                comparedTo: lastKeptFrame,
-                threshold: currentConfig.deduplicationThreshold
-            )
+            let keepBySimilarity = similarity.map { $0 <= currentConfig.deduplicationThreshold } ?? true
             let keepByMouseMovement = Self.shouldKeepFrameForMouseMovement(
                 enabled: currentConfig.keepFramesOnMouseMovement,
                 previousMousePosition: lastKeptMousePosition,
@@ -868,6 +915,7 @@ public actor CaptureManager: CaptureProtocol {
             let shouldKeep = keepBySimilarity || keepByMouseMovement
 
             if shouldKeep {
+                retained = true
                 lastKeptFrame = frame
                 lastKeptMousePosition = currentMousePosition
                 let enrichedFrame = await enrichFrameMetadata(frame, trigger: trigger)
@@ -885,7 +933,8 @@ public actor CaptureManager: CaptureProtocol {
                     reportMouseClickOutcome(.captured)
                 }
 
-                Log.info(
+                Log.recordRoutine(.captureKept)
+                Log.debug(
                     Self.deduplicationAnalysisLogMessage(
                         triggerDescription: triggerDescription,
                         similarity: similarity,
@@ -909,7 +958,8 @@ public actor CaptureManager: CaptureProtocol {
                     reportMouseClickOutcome(.deduped)
                 }
 
-                Log.info(
+                Log.recordRoutine(.captureDeduplicated)
+                Log.debug(
                     Self.deduplicationAnalysisLogMessage(
                         triggerDescription: triggerDescription,
                         similarity: similarity,
@@ -932,6 +982,7 @@ public actor CaptureManager: CaptureProtocol {
                 captureStartTime: stats.captureStartTime,
                 lastFrameTime: enrichedFrame.timestamp
             )
+            retained = true
             lastKeptFrame = frame
             lastKeptMousePosition = currentMousePosition
 
@@ -939,7 +990,8 @@ public actor CaptureManager: CaptureProtocol {
                 reportMouseClickOutcome(.captured)
             }
 
-            Log.info(
+            Log.recordRoutine(.captureKept)
+            Log.debug(
                 Self.deduplicationAnalysisLogMessage(
                     triggerDescription: triggerDescription,
                     similarity: nil,
@@ -951,6 +1003,7 @@ public actor CaptureManager: CaptureProtocol {
                 category: .capture
             )
         }
+        return retained
     }
 
     private func reportMouseClickOutcome(_ outcome: MouseClickCaptureOutcome) {
@@ -972,6 +1025,10 @@ public actor CaptureManager: CaptureProtocol {
     private func updateCaptureMemoryLedger(currentFrameBytes: Int64) {
         let normalizedCurrentFrameBytes = max(0, currentFrameBytes)
         let lastKeptFrameBytes = Int64(lastKeptFrame?.imageData.count ?? 0)
+        let nativeBytes = lastKeptCandidate?.retainedImageBytes ?? 0
+        MemoryLedger.set(tag: "capture.dedup.nativeImage", bytes: nativeBytes,
+                         count: nativeBytes > 0 ? 1 : 0, unit: "images",
+                         function: "capture.deduplication", kind: "native-image")
 
         MemoryLedger.set(
             tag: Self.memoryLedgerCurrentFrameTag,

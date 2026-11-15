@@ -6,6 +6,7 @@ import Shared
 import App
 import Database
 import Processing
+import SwiftyChrono
 import UniformTypeIdentifiers
 import ImageIO
 
@@ -876,11 +877,14 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     enum PhraseLevelRedactionTooltipState: Equatable {
         case queued
+        case permanent
         case reveal
         case hide
 
         var title: String {
             switch self {
+            case .permanent:
+                return "Permanently redacted"
             case .queued:
                 return "Queued..."
             case .reveal:
@@ -892,6 +896,8 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         var tooltipText: String {
             switch self {
+            case .permanent:
+                return "Permanently redacted"
             case .queued:
                 return "Queued..."
             case .reveal:
@@ -903,7 +909,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         var isInteractive: Bool {
             switch self {
-            case .queued:
+            case .queued, .permanent:
                 return false
             case .reveal, .hide:
                 return true
@@ -2377,24 +2383,11 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     /// Disk-backed timeline frame buffer metadata (payload bytes are stored in Library/Caches).
-    private var diskFrameBufferIndex: [FrameID: DiskFrameBufferEntry] = [:] {
-        didSet {
-            let oldCount = oldValue.count
-            let newCount = diskFrameBufferIndex.count
-            diskFrameBufferBytes = diskFrameBufferIndex.values.reduce(into: Int64(0)) { total, entry in
-                total += entry.sizeBytes
-            }
-            if oldCount != newCount {
-                if Self.isVerboseTimelineLoggingEnabled {
-                    Log.debug(
-                        "[Memory] diskFrameBuffer changed: \(oldCount) → \(newCount) frames (\(Self.formatBytes(diskFrameBufferBytes)))",
-                        category: .ui
-                    )
-                }
-            }
-        }
-    }
-    private var diskFrameBufferBytes: Int64 = 0
+    private var diskFrameBufferIndex = ByteCountedCacheIndex<FrameID, DiskFrameBufferEntry>(cost: { $0.sizeBytes })
+    private var diskFrameBufferBytes: Int64 { diskFrameBufferIndex.totalBytes }
+    private var diskFrameBufferGeneration: UInt64 = 0
+    private let diskFrameBufferEpoch = PreviewCacheEpoch()
+    private var diskFrameBufferEntryEpochs = PreviewCacheEntryEpochs<FrameID>()
     private var diskFrameBufferAccessSequence: UInt64 = 0
     private let diskFrameBufferDirectoryURL: URL
 
@@ -2479,6 +2472,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     private static func makeInMemoryJPEGFrameCache() -> NSCache<NSNumber, NSData> {
         let cache = NSCache<NSNumber, NSData>()
         cache.countLimit = inMemoryJPEGFrameCacheCountLimit
+        cache.totalCostLimit = 64 * 1024 * 1024
         return cache
     }
 
@@ -2734,6 +2728,27 @@ public class SimpleTimelineViewModel: ObservableObject {
             searchViewModel.suppressRecentEntriesForNextOverlayOpen()
         }
 
+        NotificationCenter.default.addObserver(
+            forName: PhraseRedactionMode.didFinishNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                self.cancelForegroundFrameLoad(reason: "redaction completed")
+                self.cancelCacheExpansion(reason: "redaction completed")
+                self.unavailableFrameDiskLookupTask?.cancel()
+                self.unavailableFrameDiskLookupTask = nil
+                self.diskFrameBufferGeneration &+= 1
+                self.diskFrameBufferEpoch.invalidate()
+                self.diskFrameBufferEntryEpochs.invalidateAll()
+                self.diskFrameBufferIndex.removeAll()
+                self.inMemoryJPEGFrameCache.removeAllObjects()
+                self.hotWindowRange = nil
+                self.clearCurrentFrameOverlayPresentation()
+                self.clearCurrentImagePresentation()
+                self.loadImageIfNeeded()
+            }
+        }
+
         // Listen for data source changes (e.g., Rewind data toggled)
         Log.debug("[SimpleTimelineViewModel] Setting up dataSourceDidChange observer", category: .ui)
         NotificationCenter.default.addObserver(
@@ -2985,6 +3000,8 @@ public class SimpleTimelineViewModel: ObservableObject {
         for frameID: FrameID,
         logPrefix: String
     ) async -> NSImage? {
+        let privacyDefaults = UserDefaults(suiteName: ReversibleOCRScrambler.settingsSuiteName) ?? .standard
+        guard !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { return nil }
         let fileURL = timelineDiskFrameBufferFileURL(for: frameID)
         guard FileManager.default.fileExists(atPath: fileURL.path) else {
             return nil
@@ -2995,6 +3012,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                 try Data(contentsOf: fileURL, options: [.mappedIfSafe])
             }.value
 
+            guard !Task.isCancelled, !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { return nil }
             guard let image = NSImage(data: data) else {
                 Log.warning(
                     "\(logPrefix) Failed to decode timeline disk-buffer preview for frame \(frameID.value)",
@@ -3028,7 +3046,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     private func initializeDiskFrameBuffer() {
         diskFrameBufferAccessSequence = 0
-        diskFrameBufferIndex = [:]
+        diskFrameBufferIndex.removeAll()
         diskFrameBufferInitializationTask?.cancel()
 
         let directoryURL = diskFrameBufferDirectoryURL
@@ -3122,27 +3140,29 @@ public class SimpleTimelineViewModel: ObservableObject {
         removeExternalFiles: Bool = false
     ) -> (removedFromIndex: Int, removedFromDisk: Int, preservedExternal: Int) {
         guard !frameIDs.isEmpty else { return (0, 0, 0) }
+        diskFrameBufferEntryEpochs.invalidate(frameIDs)
 
         var removedFromIndex = 0
         var removedFromDisk = 0
         var preservedExternal = 0
+        var removals: [URL] = []
         removeInMemoryJPEGFrameData(frameIDs)
         for frameID in frameIDs {
             if let entry = diskFrameBufferIndex.removeValue(forKey: frameID) {
                 removedFromIndex += 1
-                let shouldRemoveFile = removeExternalFiles || entry.origin == .timelineManaged
-                if shouldRemoveFile {
-                    try? FileManager.default.removeItem(at: entry.fileURL)
+                if removeExternalFiles || entry.origin == .timelineManaged {
+                    removals.append(entry.fileURL)
                     removedFromDisk += 1
                 } else {
                     preservedExternal += 1
                 }
             }
         }
+        PreviewCacheDiskWorker.shared.removeFiles(removals)
 
         if Self.isVerboseTimelineLoggingEnabled {
             Log.info(
-                "[Memory] Removed frame-buffer entries reason=\(reason) removedFromIndex=\(removedFromIndex) removedFromDisk=\(removedFromDisk) preservedExternal=\(preservedExternal)",
+                "[Memory] Removed frame-buffer entries reason=\(reason) removedFromIndex=\(removedFromIndex) queuedForDiskRemoval=\(removedFromDisk) preservedExternal=\(preservedExternal)",
                 category: .ui
             )
         }
@@ -3150,6 +3170,9 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     private func clearDiskFrameBuffer(reason: String) {
+        diskFrameBufferGeneration &+= 1
+        diskFrameBufferEpoch.invalidate()
+        diskFrameBufferEntryEpochs.invalidateAll()
         unavailableFrameDiskLookupTask?.cancel()
         unavailableFrameDiskLookupTask = nil
         cancelForegroundFrameLoad(reason: "clearDiskFrameBuffer.\(reason)")
@@ -3173,14 +3196,14 @@ public class SimpleTimelineViewModel: ObservableObject {
             preservedExternalIndexed = result.preservedExternal
         }
         let removeAllUnindexedFiles = shouldRemoveAllUnindexedDiskFrameBufferFiles(for: reason)
-        let removedUnindexedFiles = clearUnindexedDiskFrameBufferFiles(
+        clearUnindexedDiskFrameBufferFiles(
             reason: reason,
             removeAll: removeAllUnindexedFiles
         )
-        if removedIndexedFiles > 0 || removedUnindexedFiles > 0 || removeAllUnindexedFiles || preservedExternalIndexed > 0 {
+        if removedIndexedFiles > 0 || removeAllUnindexedFiles || preservedExternalIndexed > 0 {
             let mode = removeAllUnindexedFiles ? "all" : "prune-old"
             Log.info(
-                "[Timeline-DiskBuffer] clear reason=\(reason) indexedBefore=\(indexedBefore) removedIndexed=\(removedIndexedFiles) removedIndexedFromDisk=\(removedIndexedFromDisk) preservedExternalIndexed=\(preservedExternalIndexed) removedUnindexed=\(removedUnindexedFiles) mode=\(mode)",
+                "[Timeline-DiskBuffer] clear reason=\(reason) indexedBefore=\(indexedBefore) removedIndexed=\(removedIndexedFiles) queuedIndexedDiskRemoval=\(removedIndexedFromDisk) preservedExternalIndexed=\(preservedExternalIndexed) unindexedCleanupQueued=true mode=\(mode)",
                 category: .ui
             )
         }
@@ -3190,47 +3213,9 @@ public class SimpleTimelineViewModel: ObservableObject {
         reason == "data source reload"
     }
 
-    private func clearUnindexedDiskFrameBufferFiles(
-        reason: String,
-        removeAll: Bool
-    ) -> Int {
-        do {
-            let resourceKeys: Set<URLResourceKey> = [.isRegularFileKey, .contentModificationDateKey]
-            let files = try FileManager.default.contentsOfDirectory(
-                at: diskFrameBufferDirectoryURL,
-                includingPropertiesForKeys: Array(resourceKeys),
-                options: [.skipsHiddenFiles]
-            )
-            let cutoffDate = removeAll
-                ? nil
-                : Date().addingTimeInterval(-Self.diskFrameBufferUnindexedPruneAgeSeconds)
-            var removedCount = 0
-            for fileURL in files {
-                let values = try? fileURL.resourceValues(forKeys: resourceKeys)
-                guard values?.isRegularFile == true else { continue }
-                guard Self.frameID(fromDiskFrameFileURL: fileURL) != nil else { continue }
-                if let cutoffDate,
-                   let contentModifiedAt = values?.contentModificationDate,
-                   contentModifiedAt >= cutoffDate {
-                    continue
-                }
-                try? FileManager.default.removeItem(at: fileURL)
-                removedCount += 1
-            }
-            if removedCount > 0, Self.isVerboseTimelineLoggingEnabled {
-                Log.info(
-                    "[Timeline-DiskBuffer] Removed \(removedCount) unindexed disk-buffer files (\(reason))",
-                    category: .ui
-                )
-            }
-            return removedCount
-        } catch {
-            Log.warning(
-                "[Timeline-DiskBuffer] Failed to clear unindexed disk-buffer files (\(reason)): \(error)",
-                category: .ui
-            )
-            return 0
-        }
+    private func clearUnindexedDiskFrameBufferFiles(reason: String, removeAll: Bool) {
+        let cutoff = removeAll ? Date() : Date().addingTimeInterval(-Self.diskFrameBufferUnindexedPruneAgeSeconds)
+        PreviewCacheDiskWorker.shared.pruneTimelineFiles(in: diskFrameBufferDirectoryURL, olderThan: cutoff)
     }
 
     private func describeHotWindowRange() -> String {
@@ -3356,6 +3341,8 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     private func readFrameDataFromDiskFrameBuffer(frameID: FrameID) async -> Data? {
+        let privacyDefaults = UserDefaults(suiteName: ReversibleOCRScrambler.settingsSuiteName) ?? .standard
+        guard !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { return nil }
         await awaitDiskFrameBufferInitializationIfNeeded()
         let existingEntry = diskFrameBufferIndex[frameID]
         let fileURL = existingEntry?.fileURL ?? diskFrameBufferURL(for: frameID)
@@ -3367,18 +3354,17 @@ public class SimpleTimelineViewModel: ObservableObject {
             return cachedData
         }
 
-        guard FileManager.default.fileExists(atPath: fileURL.path) else {
-            if existingEntry != nil {
-                removeDiskFrameBufferEntries([frameID], reason: "read missing file")
-            }
-            return nil
-        }
-
+        let generation = diskFrameBufferGeneration
+        let entryEpoch = diskFrameBufferEntryEpochs.epoch(for: frameID)
+        let entryToken = entryEpoch.current
+        defer { diskFrameBufferEntryEpochs.finish(frameID, epoch: entryEpoch, keep: diskFrameBufferIndex[frameID] != nil) }
         do {
             let data = try await Task.detached(priority: .userInitiated) {
                 try Data(contentsOf: fileURL, options: [.mappedIfSafe])
             }.value
 
+            guard !Task.isCancelled, generation == diskFrameBufferGeneration, entryEpoch.matches(entryToken),
+                  !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { return nil }
             if existingEntry != nil {
                 touchDiskFrameBufferEntry(frameID)
             } else {
@@ -3394,36 +3380,43 @@ public class SimpleTimelineViewModel: ObservableObject {
             storeInMemoryJPEGFrameData(data, frameID: frameID)
             return data
         } catch {
-            removeDiskFrameBufferEntries([frameID], reason: "read failure")
+            guard generation == diskFrameBufferGeneration, entryEpoch.matches(entryToken) else { return nil }
+            if existingEntry != nil {
+                removeDiskFrameBufferEntries([frameID], reason: "read failure")
+            }
             return nil
         }
     }
 
     private func storeFrameDataInDiskFrameBuffer(frameID: FrameID, data: Data) async {
+        let privacyDefaults = UserDefaults(suiteName: ReversibleOCRScrambler.settingsSuiteName) ?? .standard
+        guard !Task.isCancelled, !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { return }
         await awaitDiskFrameBufferInitializationIfNeeded()
+        guard !Task.isCancelled else { return }
         let fileURL = diskFrameBufferURL(for: frameID)
-        do {
-            try await Task.detached(priority: .utility) {
-                try FileManager.default.createDirectory(
-                    at: fileURL.deletingLastPathComponent(),
-                    withIntermediateDirectories: true
-                )
-                try data.write(to: fileURL, options: [.atomic])
-            }.value
-
-            diskFrameBufferAccessSequence &+= 1
-            let entry = DiskFrameBufferEntry(
-                fileURL: fileURL,
-                sizeBytes: Int64(data.count),
-                lastAccessSequence: diskFrameBufferAccessSequence,
-                origin: .timelineManaged
-            )
-            diskFrameBufferIndex[frameID] = entry
-            storeInMemoryJPEGFrameData(data, frameID: frameID)
-
-        } catch {
-            Log.warning("[Timeline-DiskBuffer] Failed to write frame \(frameID.value) to disk buffer: \(error)", category: .ui)
+        let generation = diskFrameBufferGeneration
+        let epoch = diskFrameBufferEpoch
+        let token = epoch.current
+        let entryEpoch = diskFrameBufferEntryEpochs.epoch(for: frameID)
+        let entryToken = entryEpoch.current
+        defer { diskFrameBufferEntryEpochs.finish(frameID, epoch: entryEpoch, keep: diskFrameBufferIndex[frameID] != nil) }
+        let wrote = await withCheckedContinuation { continuation in
+            PreviewCacheDiskWorker.shared.enqueueWrite(data, to: fileURL, allowed: {
+                epoch.matches(token) && entryEpoch.matches(entryToken) && !PhraseRedactionMode.isEnabled(in: privacyDefaults)
+            }, completion: { continuation.resume(returning: $0) })
         }
+        guard wrote, !Task.isCancelled, generation == diskFrameBufferGeneration, entryEpoch.matches(entryToken),
+              !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { return }
+
+        diskFrameBufferAccessSequence &+= 1
+        let entry = DiskFrameBufferEntry(
+            fileURL: fileURL,
+            sizeBytes: Int64(data.count),
+            lastAccessSequence: diskFrameBufferAccessSequence,
+            origin: .timelineManaged
+        )
+        diskFrameBufferIndex[frameID] = entry
+        storeInMemoryJPEGFrameData(data, frameID: frameID)
     }
 
     private func inMemoryJPEGFrameCacheKey(for frameID: FrameID) -> NSNumber {
@@ -3444,7 +3437,8 @@ public class SimpleTimelineViewModel: ObservableObject {
     private func storeInMemoryJPEGFrameData(_ data: Data, frameID: FrameID) {
         inMemoryJPEGFrameCache.setObject(
             data as NSData,
-            forKey: inMemoryJPEGFrameCacheKey(for: frameID)
+            forKey: inMemoryJPEGFrameCacheKey(for: frameID),
+            cost: data.count
         )
     }
 
@@ -10565,13 +10559,14 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     static func phraseLevelRedactionTooltipState(
         for processingStatus: Int,
-        isRevealed: Bool
+        isRevealed: Bool,
+        isPermanent: Bool = false
     ) -> PhraseLevelRedactionTooltipState? {
         switch processingStatus {
         case 5, 6:
             return .queued
         case 2, 7:
-            return isRevealed ? .hide : .reveal
+            return isPermanent ? .permanent : (isRevealed ? .hide : .reveal)
         default:
             return nil
         }
@@ -11222,7 +11217,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Open the URL in the default browser
     public func openURLInBrowser() {
         guard let box = urlBoundingBox,
-              let url = URL(string: box.url) else {
+              let url = CapturedURLPolicy.webURL(box.url) else {
             return
         }
 
@@ -11252,7 +11247,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             "[BrowserLinkOpen] resolved frameId=\(timelineFrame.frame.id.value) finalURL=\(finalURLString)",
             category: .ui
         )
-        guard let finalURL = URL(string: finalURLString) else {
+        guard let finalURL = CapturedURLPolicy.webURL(finalURLString) else {
             Log.warning(
                 "[BrowserLinkOpen] invalid final URL frameId=\(timelineFrame.frame.id.value) finalURL=\(finalURLString)",
                 category: .ui
@@ -11583,7 +11578,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     @discardableResult
     public func openHyperlinkMatch(_ match: OCRHyperlinkMatch) -> Bool {
         guard let resolvedURLString = resolvedHyperlinkURLString(for: match),
-              let url = URL(string: resolvedURLString) else {
+              let url = CapturedURLPolicy.webURL(resolvedURLString) else {
             return false
         }
         let coordinator = self.coordinator
@@ -12014,7 +12009,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     public func togglePhraseLevelRedactionReveal(for node: OCRNodeWithText) {
-        guard node.isRedacted else { return }
+        guard node.isRedacted, !node.isPermanentlyRedacted else { return }
         guard let frame = currentTimelineFrame?.frame else { return }
         guard Self.isSuccessfulProcessingStatus(currentTimelineFrame?.processingStatus ?? -1) else { return }
         guard let secret = ReversibleOCRScrambler.currentAppWideSecret() else { return }
@@ -14965,7 +14960,152 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Parse natural language date strings
     private func parseNaturalLanguageDate(_ text: String, now: Date = Date()) -> Date? {
-        NaturalLanguageDateParser().date(from: text, now: now)
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let calendar = Calendar.current
+        let lowercasedInput = trimmed.lowercased()
+        let collapsedInput = lowercasedInput.replacingOccurrences(
+            of: #"\s+"#,
+            with: " ",
+            options: .regularExpression
+        )
+        let normalizedRelativeInput = normalizeRelativeDateShorthand(collapsedInput)
+        let normalizedWithCompactTimes = normalizeCompactTimeFormat(normalizedRelativeInput)
+
+        if normalizedRelativeInput.range(of: #"^start of (the )?day$"#, options: .regularExpression) != nil {
+            return calendar.startOfDay(for: now)
+        }
+
+        func finalizeParsedDate(_ parsedDate: Date) -> Date {
+            let anchorMode = inferDateSearchAnchorMode(for: normalizedWithCompactTimes)
+            let dateForYearAdjustment = normalizedAnchorDate(parsedDate, mode: anchorMode, calendar: calendar)
+
+            var normalized = adjustYearlessAbsoluteFutureDateToRecentPastIfNeeded(
+                dateForYearAdjustment,
+                input: normalizedRelativeInput,
+                now: now,
+                calendar: calendar
+            )
+            normalized = adjustTimeOnlyFutureDateToRecentPastIfNeeded(
+                normalized,
+                input: normalizedRelativeInput,
+                now: now,
+                calendar: calendar
+            )
+            return normalizedAnchorDate(normalized, mode: anchorMode, calendar: calendar)
+        }
+
+        // Bias bare compact numeric input like "2024" toward 20:24 before
+        // standalone year parsing can claim it.
+        if let timeOnlyDate = parseTimeOnly(normalizedRelativeInput, relativeTo: now) {
+            return finalizeParsedDate(timeOnlyDate)
+        }
+
+        if let dateWithLeadingTime = parseDateWithLeadingTimeComponent(
+            normalizedWithCompactTimes,
+            now: now,
+            calendar: calendar
+        ) {
+            return finalizeParsedDate(dateWithLeadingTime)
+        }
+
+        if let standaloneMonthDate = parseStandaloneMonthReference(
+            normalizedRelativeInput,
+            now: now,
+            calendar: calendar
+        ) {
+            return finalizeParsedDate(standaloneMonthDate)
+        }
+
+        if let standaloneYearDate = parseStandaloneYearReference(
+            normalizedRelativeInput,
+            now: now,
+            calendar: calendar
+        ) {
+            return finalizeParsedDate(standaloneYearDate)
+        }
+
+        // === PRIMARY: SwiftyChrono NLP Parser ===
+        // Try SwiftyChrono first for comprehensive natural language parsing
+        // Handles: "next Friday", "3 days from now", "last Monday", "in 2 weeks", etc.
+        let chrono = Chrono()
+        let chronoInputs = normalizedWithCompactTimes == trimmed
+            ? [trimmed]
+            : [normalizedWithCompactTimes, trimmed]
+        for chronoInput in chronoInputs {
+            // SwiftyChrono understands "in N units"; otherwise "N units from now" can match only "now".
+            let normalizedChronoInput = chronoInput.replacingOccurrences(
+                of: #"^(\d+\s+(?:seconds?|min(?:ute)?s?|hours?|days?|weeks?|months?|years?))\s+from\s+now\b"#,
+                with: "in $1",
+                options: [.regularExpression, .caseInsensitive]
+            )
+            if let result = chrono.parse(text: normalizedChronoInput, refDate: now, opt: [:]).first?.start.date {
+                let normalized = finalizeParsedDate(result)
+                return normalized
+            }
+        }
+
+        // === FALLBACK: Time-only and absolute date parsing ===
+        // SwiftyChrono handles all relative dates (X days/weeks/months/years ago, yesterday, etc.)
+        // We only need fallback for compact time formats and explicit date strings
+        let trimmedLower = normalizedRelativeInput
+
+        // Normalize compact time formats before passing to NSDataDetector.
+        // Examples:
+        // - "827am yesterday" -> "8:27am yesterday"
+        // - "feb 28 1417" -> "feb 28 14:17"
+        let normalizedText = normalizedWithCompactTimes
+
+        // Try macOS's built-in natural language date parser (handles "dec 15 3pm", "tomorrow at 5", etc.)
+        let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.date.rawValue)
+        if let detector = detector {
+            let range = NSRange(normalizedText.startIndex..., in: normalizedText)
+            if let match = detector.firstMatch(in: normalizedText, options: [], range: range),
+               let date = match.date {
+                return finalizeParsedDate(date)
+            }
+        }
+
+        // Try various explicit date formatters as fallback
+        let formatStrings = [
+            "MMM d yyyy h:mm a",      // "Dec 16 2024 6:05 PM"
+            "MMM d yyyy h:mma",       // "Dec 16 2024 6:05PM"
+            "MMM d yyyy ha",          // "Dec 16 2024 6PM"
+            "MMM d h:mm a",           // "Dec 16 6:05 PM"
+            "MMM d h:mma",            // "Dec 16 6:05PM"
+            "MMM d ha",               // "Dec 16 6PM"
+            "MMM d h a",              // "Dec 16 6 PM"
+            "MM/dd/yyyy h:mm a",      // "12/16/2024 6:05 PM"
+            "MM/dd h:mm a",           // "12/16 6:05 PM"
+            "yyyy-MM-dd HH:mm",       // "2024-12-16 18:05"
+            "yyyy-MM-dd'T'HH:mm:ss",  // ISO 8601
+            "MMM yyyy",               // "Jul 2025"
+            "MMMM yyyy",              // "July 2025"
+            "MMM d",                  // "Dec 16" (assumes current year, noon)
+            "MMMM d",                 // "December 16"
+        ]
+
+        for formatString in formatStrings {
+            let df = DateFormatter()
+            df.dateFormat = formatString
+            df.timeZone = .current
+            df.defaultDate = now  // Use current date for missing components
+
+            // Try original text first
+            if let date = df.date(from: text) {
+                return finalizeParsedDate(date)
+            }
+            // Try lowercased
+            if let date = df.date(from: trimmedLower) {
+                return finalizeParsedDate(date)
+            }
+            // Try with first letter capitalized (for month names)
+            let capitalized = trimmedLower.prefix(1).uppercased() + trimmedLower.dropFirst()
+            if let date = df.date(from: capitalized) {
+                return finalizeParsedDate(date)
+            }
+        }
+
+        return nil
     }
 
 #if DEBUG
@@ -15361,8 +15501,12 @@ public class SimpleTimelineViewModel: ObservableObject {
             return .firstFrameInHour
         }
 
+        let hasAbsoluteCalendarDateToken = normalizedRelativeInput.range(
+            of: #"\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2}(?:st|nd|rd|th)?(?:(?:,\s*|\s+)\d{4})?\b|\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b|\b\d{4}-\d{1,2}-\d{1,2}\b"#,
+            options: .regularExpression
+        ) != nil
         let hasCalendarDateToken = normalizedRelativeInput.range(
-            of: #"\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b|\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b"#,
+            of: #"\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b|\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b|\b\d{4}-\d{1,2}-\d{1,2}\b"#,
             options: .regularExpression
         ) != nil
         let hasDayLevelNaturalLanguageToken = normalizedRelativeInput.range(
@@ -15376,10 +15520,22 @@ public class SimpleTimelineViewModel: ObservableObject {
         let hasDateLikeToken = hasCalendarDateToken
             || hasDayLevelNaturalLanguageToken
             || hasDayLevelRelativeOffsetToken
-        let hasExplicitTime = normalizedWithCompactTimes.range(
-            of: #"\b\d{1,2}:\d{2}\b|\b\d{1,2}\s*(am|pm)\b|\b\d{3,4}\s*(am|pm)\b|\bnoon\b|\bmidnight\b"#,
+        let hasMinutePrecisionTime = normalizedWithCompactTimes.range(
+            of: #"\b\d{1,2}:\d{2}\s*(?:am|pm|a|p)?\b"#,
             options: .regularExpression
         ) != nil
+        let hasHourPrecisionTime = normalizedWithCompactTimes.range(
+            of: #"\b\d{1,2}\s*(?:am|pm|a|p)\b|\bnoon\b|\bmidnight\b"#,
+            options: .regularExpression
+        ) != nil
+        let hasExplicitTime = hasMinutePrecisionTime || hasHourPrecisionTime
+
+        // Absolute calendar dates with a soft hour reference like "Apr 16 9pm"
+        // should land on the first frame in that hour. Minute-precision inputs
+        // like "Apr 16 9:00pm" stay exact.
+        if hasAbsoluteCalendarDateToken && hasHourPrecisionTime && !hasMinutePrecisionTime {
+            return .firstFrameInHour
+        }
 
         if hasDateLikeToken && !hasExplicitTime {
             return .firstFrameInDay
@@ -15470,7 +15626,8 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     private func shouldCoerceYearlessAbsoluteDateToPast(_ input: String) -> Bool {
-        let normalizedInput = normalizeRelativeDateShorthand(input)
+        // Classify years after compact times such as "1417" have become "14:17".
+        let normalizedInput = normalizeCompactTimeFormat(normalizeRelativeDateShorthand(input))
         // Keep relative expressions as-is (tomorrow/next/last/etc).
         if normalizedInput.range(
             of: #"\b(today|tomorrow|yesterday|next|last|ago|this|now|tonight)\b|from now"#,

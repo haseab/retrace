@@ -10,7 +10,11 @@ You are responsible for the **Capture** module of Retrace. Your job is to implem
 Capture/
 ├── CaptureManager.swift           # Main CaptureProtocol implementation
 ├── ScreenCapture/
+│   ├── CaptureFrameCandidate.swift # Defer BGRA materialization for exact native duplicates
 │   ├── CGWindowListCapture.swift  # Legacy CGWindowList API wrapper
+│   ├── ExcludedWindowMasker.swift # Full-bounds masking; failure returns no screenshot
+│   ├── PrivateWindowDetector.swift # Private-window accessibility heuristics
+│   ├── ConferenceFaceBlurProcessor.swift # Vision face detection + irreversible conference-call face blur
 │   ├── DisplayMonitor.swift       # Track available displays
 │   ├── DisplaySwitchMonitor.swift # Detect display changes
 │   ├── MouseClickMonitor.swift    # Post-dispatch left-click capture monitor
@@ -22,10 +26,19 @@ Capture/
 │   └── PerceptualHash.swift       # dHash (difference hash) for comparison
 ├── Metadata/
 │   ├── AppInfoProvider.swift      # Get active app info via NSWorkspace
-│   └── BrowserURLExtractor.swift  # Extract URL from browsers (AX API)
+│   ├── ForegroundWindowSelection.swift # Reject sharing helpers and background processes for attribution
+│   ├── BrowserURLExtractor.swift  # Extract URL from browsers (AX API)
+│   ├── ConferenceCallActivityProvider.swift # Bounded window-specific active-call accessibility lookup
+│   └── ConferenceSessionPrivacyPolicy.swift # Conferencing-session rules + session-scoped consent
 └── Tests/
+    ├── WindowLookupReuseTests.swift # Lookup reuse, failure handling and real graphics/file regression checks
     ├── AccessibilityInspectorTest.swift
     ├── BrowserURLAppleScriptCoordinatorTests.swift
+    ├── ExcludedWindowMaskerTests.swift # Pixel coverage and injected render-failure regression coverage
+    ├── ForegroundWindowSelectionTests.swift
+    ├── ConferenceROIPlannerTests.swift
+    ├── ConferenceSessionPrivacyPolicyTests.swift
+    ├── CaptureFrameCandidateTests.swift # Committed screenshot pixel/layout comparison
     ├── CaptureTriggerSchedulingTests.swift
     └── DeduplicationTests.swift
 ```
@@ -481,3 +494,9 @@ throw CaptureError.captureSessionFailed(underlying: error.localizedDescription)
 4. Read `CaptureManager.swift` - protocol conformance + pipeline
 
 The implementation is complete. Focus on understanding the existing code rather than rewriting.
+
+- CaptureFrameCandidate is module-local and contains the already privacy-filtered CGImage. Only exact pixel/render-property equality permits BGRA reuse. Keep near-duplicate thresholds and mouse-movement decisions unchanged; account for the single retained native image.
+
+### Capture window-list reuse
+
+Exclusion classification collects normal on-screen, non-transparent window IDs from its all-window snapshot, in window-server order, and removes excluded IDs before array capture. The successful array path does not fetch a second window list. Do not reuse old bounds for masking: privacy/AX checks can suspend while windows move. Forced masking, known-broken arrays, empty included arrays, and array failure must fetch fresh on-screen geometry and drop the frame if unavailable. No snapshot is cached across captures. Existing full-bounds masking and masking-failure behavior remain unchanged.

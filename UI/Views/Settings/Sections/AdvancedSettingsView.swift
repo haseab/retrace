@@ -135,8 +135,8 @@ extension SettingsView {
                     .foregroundColor(.retraceSecondary)
 
                 ModernToggleRow(
-                    title: "Enable Retrace CLI",
-                    subtitle: "Expose the `retrace` command by installing `/usr/local/bin/retrace` from this app",
+                    title: "Show CLI installation controls",
+                    subtitle: "Install or repair the terminal command below. Turning this off does not uninstall an existing command.",
                     isOn: $enableRetraceCLI
                 )
                 .onChange(of: enableRetraceCLI) { enabled in

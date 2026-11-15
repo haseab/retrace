@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import Darwin
 
 public struct CLIImageExportRequest: Codable, Sendable, Equatable {
     public let requestID: String
@@ -62,49 +63,112 @@ public enum CLIImageExportIPC {
         !NSRunningApplication.runningApplications(withBundleIdentifier: appBundleIdentifier).isEmpty
     }
 
-    public static func stageRequest(_ request: CLIImageExportRequest) throws -> URL {
-        let requestURL = requestFileURL(for: request.requestID)
-        try FileManager.default.createDirectory(at: ipcDirectoryURL, withIntermediateDirectories: true)
+    private static let maximumPayloadBytes = 32_768
 
-        let encoder = JSONEncoder()
-        CLIDateCoding.configure(encoder)
-        let data = try encoder.encode(request)
-        try data.write(to: requestURL, options: .atomic)
-        return requestURL
+    private static func validateID(_ id: String) throws {
+        guard let uuid = UUID(uuidString: id), uuid.uuidString == id else {
+            throw CLIImageExportTransportError.invalidRequest
+        }
     }
 
-    public static func loadRequest(from requestURL: URL) throws -> CLIImageExportRequest {
-        let data = try Data(contentsOf: requestURL)
+    private static func validateRequest(_ request: CLIImageExportRequest) throws {
+        try validateID(request.requestID)
+        let age = Date().timeIntervalSince(request.createdAt)
+        guard request.frameID > 0, request.outputPath.hasPrefix("/"),
+              !request.outputPath.contains("\u{0}"), age >= -10, age < 60 else {
+            throw CLIImageExportTransportError.invalidRequest
+        }
+    }
+
+    // Both IPC directories belong to this user and must never be symlinks.
+    private static func prepareDirectory() throws {
+        for directory in [ipcDirectoryURL.deletingLastPathComponent(), ipcDirectoryURL] {
+            if mkdir(directory.path, 0o700) != 0 && errno != EEXIST {
+                throw CLIImageExportTransportError.invalidRequest
+            }
+            var info = stat()
+            guard lstat(directory.path, &info) == 0, info.st_uid == getuid(),
+                  info.st_mode & S_IFMT == S_IFDIR else {
+                throw CLIImageExportTransportError.invalidRequest
+            }
+            guard chmod(directory.path, 0o700) == 0 else {
+                throw CLIImageExportTransportError.invalidRequest
+            }
+        }
+    }
+
+    private static func readPayload(at url: URL) throws -> Data {
+        try prepareDirectory()
+        let descriptor = open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
+        guard descriptor >= 0 else { throw CLIImageExportTransportError.invalidRequest }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        defer { try? handle.close() }
+        var info = stat()
+        guard fstat(descriptor, &info) == 0, info.st_uid == getuid(),
+              info.st_mode & S_IFMT == S_IFREG, info.st_size <= maximumPayloadBytes else {
+            throw CLIImageExportTransportError.invalidRequest
+        }
+        let data = try handle.read(upToCount: maximumPayloadBytes + 1) ?? Data()
+        guard data.count <= maximumPayloadBytes else { throw CLIImageExportTransportError.invalidRequest }
+        return data
+    }
+
+    private static func writePayload<T: Encodable>(_ payload: T, to url: URL) throws {
+        try prepareDirectory()
+        let encoder = JSONEncoder()
+        CLIDateCoding.configure(encoder)
+        let data = try encoder.encode(payload)
+        guard data.count <= maximumPayloadBytes else { throw CLIImageExportTransportError.invalidRequest }
+        try data.write(to: url, options: .atomic)
+        guard chmod(url.path, 0o600) == 0 else { throw CLIImageExportTransportError.invalidRequest }
+    }
+
+    public static func stageRequest(_ request: CLIImageExportRequest) throws -> URL {
+        try validateRequest(request)
+        let url = try requestFileURL(for: request.requestID)
+        try writePayload(request, to: url)
+        return url
+    }
+
+    public static func loadRequest(from requestURL: URL, expectedRequestID: String? = nil) throws -> CLIImageExportRequest {
+        let id = String(requestURL.lastPathComponent.dropLast(".request.json".count))
+        let expectedURL = try requestFileURL(for: id)
+        guard requestURL.path == expectedURL.path, expectedRequestID == nil || expectedRequestID == id else {
+            throw CLIImageExportTransportError.invalidRequest
+        }
         let decoder = JSONDecoder()
         CLIDateCoding.configure(decoder)
-        return try decoder.decode(CLIImageExportRequest.self, from: data)
+        let request = try decoder.decode(CLIImageExportRequest.self, from: readPayload(at: expectedURL))
+        try validateRequest(request)
+        guard request.requestID == id else { throw CLIImageExportTransportError.invalidRequest }
+        return request
     }
 
     public static func writeResponse(_ response: CLIImageExportResponse) throws -> URL {
-        let responseURL = responseFileURL(for: response.requestID)
-        try FileManager.default.createDirectory(at: ipcDirectoryURL, withIntermediateDirectories: true)
-
-        let encoder = JSONEncoder()
-        CLIDateCoding.configure(encoder)
-        let data = try encoder.encode(response)
-        try data.write(to: responseURL, options: .atomic)
-        return responseURL
+        let url = try responseFileURL(for: response.requestID)
+        try writePayload(response, to: url)
+        return url
     }
 
     public static func loadResponse(for requestID: String) throws -> CLIImageExportResponse {
-        let data = try Data(contentsOf: responseFileURL(for: requestID))
+        let url = try responseFileURL(for: requestID)
         let decoder = JSONDecoder()
         CLIDateCoding.configure(decoder)
-        return try decoder.decode(CLIImageExportResponse.self, from: data)
+        let response = try decoder.decode(CLIImageExportResponse.self, from: readPayload(at: url))
+        guard response.requestID == requestID else { throw CLIImageExportTransportError.invalidRequest }
+        return response
     }
 
     public static func cleanup(requestID: String) {
-        let fileManager = FileManager.default
-        try? fileManager.removeItem(at: requestFileURL(for: requestID))
-        try? fileManager.removeItem(at: responseFileURL(for: requestID))
+        guard let requestURL = try? requestFileURL(for: requestID),
+              let responseURL = try? responseFileURL(for: requestID),
+              (try? prepareDirectory()) != nil else { return }
+        try? FileManager.default.removeItem(at: requestURL)
+        try? FileManager.default.removeItem(at: responseURL)
     }
 
     public static func postRequestNotification(requestID: String, requestURL: URL) {
+        guard let expectedURL = try? requestFileURL(for: requestID), expectedURL == requestURL else { return }
         DistributedNotificationCenter.default().postNotificationName(
             requestNotification,
             object: nil,
@@ -124,12 +188,14 @@ public enum CLIImageExportIPC {
         notification.userInfo?[requestIDUserInfoKey] as? String
     }
 
-    public static func requestFileURL(for requestID: String) -> URL {
-        ipcDirectoryURL.appendingPathComponent("\(requestID).request.json", isDirectory: false)
+    public static func requestFileURL(for requestID: String) throws -> URL {
+        try validateID(requestID)
+        return ipcDirectoryURL.appendingPathComponent("\(requestID).request.json", isDirectory: false)
     }
 
-    public static func responseFileURL(for requestID: String) -> URL {
-        ipcDirectoryURL.appendingPathComponent("\(requestID).response.json", isDirectory: false)
+    public static func responseFileURL(for requestID: String) throws -> URL {
+        try validateID(requestID)
+        return ipcDirectoryURL.appendingPathComponent("\(requestID).response.json", isDirectory: false)
     }
 
     private static var ipcDirectoryURL: URL {
@@ -141,7 +207,7 @@ public enum CLIImageExportIPC {
     fileprivate static func awaitResponse(for requestID: String) async throws -> CLIImageExportResponse {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: responseTimeout)
-        let responseURL = responseFileURL(for: requestID)
+        let responseURL = try responseFileURL(for: requestID)
 
         while clock.now < deadline {
             if FileManager.default.fileExists(atPath: responseURL.path) {
@@ -157,6 +223,7 @@ public enum CLIImageExportIPC {
 
 enum CLIImageExportTransportError: Error, Sendable, Equatable {
     case timeout(String)
+    case invalidRequest
 }
 
 protocol CLIImageExportHosting: Sendable {

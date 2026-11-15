@@ -694,6 +694,35 @@ final class StorageManagerTests: XCTestCase {
         try? FileManager.default.removeItem(at: root)
     }
 
+    func testPermanentRewriteRemovesPixelsWithoutAKeyAndPreservesSiblingPixels() async throws {
+        let root = makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let storage = StorageManager(storageRoot: root)
+        try await storage.initialize(config: makeStorageConfig(root: root))
+        let writer = try await storage.createSegmentWriter()
+        let segmentID = await writer.segmentID
+        try await writer.appendFrame(makePatternedCapturedFrame(targetRect: CGRect(x: 16, y: 16, width: 32, height: 32)))
+        _ = try await writer.finalize()
+        let beforeImage = try decodeJPEG(try await storage.readFrame(segmentID: segmentID, frameIndex: 0))
+        let before = try BGRAImageUtilities.makeData(from: beforeImage)
+        let plan = SegmentRewritePlan(redactions: [SegmentFrameRedaction(frameID: 42, frameIndex: 0, targets: [
+            SegmentRedactionTarget(frameID: 42, nodeID: 7,
+                normalizedRect: CGRect(x: 0.25, y: 0.25, width: 0.5, height: 0.5), mode: .permanent)
+        ])])
+        XCTAssertFalse(plan.requiresRedactionSecret)
+        try await storage.applySegmentRewrite(segmentID: segmentID, plan: plan, secret: nil)
+        let afterImage = try decodeJPEG(try await storage.readFrame(segmentID: segmentID, frameIndex: 0))
+        let after = try BGRAImageUtilities.makeData(from: afterImage)
+        let protected = extractPatch(from: after, imageWidth: afterImage.width, rect: CGRect(x: 20,y: 20,width: 24,height: 24))
+        let rgb = protected.enumerated().filter { $0.offset % 4 != 3 }.map { Double($0.element) }
+        XCTAssertLessThan(rgb.reduce(0, +) / Double(rgb.count), 12)
+        let control = CGRect(x: 0,y: 0,width: 12,height: 12)
+        XCTAssertLessThan(averageAbsoluteDifference(
+            extractPatch(from: before,imageWidth: beforeImage.width,rect: control),
+            extractPatch(from: after,imageWidth: afterImage.width,rect: control)), 12)
+        try await storage.finishInterruptedSegmentRewriteRecovery(segmentID: segmentID)
+    }
+
     func testApplySegmentRewriteBlacksTargetedFramesAndLeavesUntouchedFramesMateriallyStable() async throws {
         let root = makeTempRoot()
         let storage = StorageManager(storageRoot: root)
@@ -923,6 +952,455 @@ final class StorageManagerTests: XCTestCase {
         XCTAssertTrue(actionsAfterCleanup.isEmpty)
 
         try? FileManager.default.removeItem(at: root)
+    }
+
+    /// Exercise the WAL with a committed screenshot, including padded rows, rather than
+    /// relying on synthetic solid pixels to prove lossless image persistence.
+    private func makeWALScreenshotFrame(timestamp: Date = Date(timeIntervalSince1970: 1_720_000_000)) throws -> CapturedFrame {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let source = try XCTUnwrap(
+            CGImageSourceCreateWithURL(
+                root.appendingPathComponent("UI/Assets.xcassets/InPageURLInstructions.imageset/safari_instructions.png") as CFURL,
+                nil
+            ))
+        let image = try XCTUnwrap(CGImageSourceCreateImageAtIndex(source, 0, nil))
+        let width = 512
+        let height = max(1, image.height * width / image.width)
+        let bytesPerRow = width * 4 + 16
+        var data = Data(repeating: 0xA5, count: bytesPerRow * height)
+        try data.withUnsafeMutableBytes { bytes in
+            let context = try XCTUnwrap(
+                CGContext(
+                    data: bytes.baseAddress, width: width, height: height,
+                    bitsPerComponent: 8, bytesPerRow: bytesPerRow,
+                    space: CGColorSpaceCreateDeviceRGB(),
+                    bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+                ))
+            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        }
+        return CapturedFrame(
+            timestamp: timestamp, imageData: data, width: width, height: height,
+            bytesPerRow: bytesPerRow,
+            metadata: FrameMetadata(
+                appBundleID: "com.apple.Safari", appName: "Safari", windowName: "Instructions — 窗口",
+                browserURL: "https://example.com/instructions", displayID: 7
+            )
+        )
+    }
+
+    private func appendLegacyWALFrame(_ frame: CapturedFrame, to url: URL) throws {
+        var record = Data()
+        func append<T: FixedWidthInteger>(_ value: T) {
+            var littleEndian = value.littleEndian
+            withUnsafeBytes(of: &littleEndian) { record.append(contentsOf: $0) }
+        }
+        let strings = [
+            frame.metadata.appBundleID, frame.metadata.appName,
+            frame.metadata.windowName, frame.metadata.browserURL
+        ].map { Data(($0 ?? "").utf8) }
+        append(frame.timestamp.timeIntervalSince1970.bitPattern)
+        append(UInt32(frame.width))
+        append(UInt32(frame.height))
+        append(UInt32(frame.bytesPerRow))
+        append(UInt32(frame.imageData.count))
+        append(frame.metadata.displayID)
+        for string in strings { append(UInt16(string.count)) }
+        for string in strings { record.append(string) }
+        record.append(frame.imageData)
+        let handle = try FileHandle(forWritingTo: url)
+        defer { try? handle.close() }
+        try handle.seekToEnd()
+        try handle.write(contentsOf: record)
+    }
+
+    func testWALMetadataDoesNotRewriteForEachScreenshotAndRecoversStaleCount() async throws {
+        let root = makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let manager = WALManager(walRoot: root)
+        var session = try await manager.createSession(videoID: VideoSegmentID(value: 491))
+        let url = session.sessionDir.appendingPathComponent("metadata.json")
+        let initial = try Data(contentsOf: url)
+        let frame = try makeWALScreenshotFrame()
+        try await manager.appendFrame(frame, to: &session)
+        XCTAssertEqual(try Data(contentsOf: url), initial)
+        try await manager.updateDurableVideoState(videoID: session.videoID, readableFrameCount: 1, durableVideoFileSizeBytes: 777)
+        let checkpoint = try Data(contentsOf: url)
+        try await manager.appendFrame(frame, to: &session)
+        XCTAssertEqual(try Data(contentsOf: url), checkpoint)
+        let restarted = WALManager(walRoot: root)
+        let recovered = try await restarted.listActiveSessions()
+        XCTAssertEqual(recovered.first?.metadata.frameCount, 2)
+        XCTAssertEqual(recovered.first?.metadata.width, frame.width)
+        XCTAssertEqual(recovered.first?.metadata.durableReadableFrameCount, 1)
+        XCTAssertEqual(recovered.first?.metadata.durableVideoFileSizeBytes, 777)
+        let last = try await restarted.readFrame(videoID: session.videoID, frameIndex: 1)
+        XCTAssertEqual(last.imageData, frame.imageData)
+    }
+
+    func testWALSeekFailureClosesWriterAndPreservesRecoverableFrames() async throws {
+        // Exercise both a newly opened writer and a reused writer with a real record.
+        final class FailingSeek: @unchecked Sendable {
+            private let lock = NSLock()
+            private var calls = 0
+            private var failedHandle: FileHandle?
+            let failureCall: Int
+
+            init(failureCall: Int) { self.failureCall = failureCall }
+
+            func seek(_ handle: FileHandle) throws -> UInt64 {
+                lock.lock()
+                defer { lock.unlock() }
+                calls += 1
+                if calls == failureCall {
+                    failedHandle = handle
+                    throw NSError(domain: NSPOSIXErrorDomain, code: Int(EIO))
+                }
+                return try handle.seekToEnd()
+            }
+
+            func handleThatFailed() -> FileHandle? {
+                lock.lock()
+                defer { lock.unlock() }
+                return failedHandle
+            }
+        }
+
+        for failureCall in [1, 2] {
+            let root = makeTempRoot()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let failure = FailingSeek(failureCall: failureCall)
+            let manager = WALManager(
+                walRoot: root, metadataCheckpointInterval: 30,
+                seekForAppend: { try failure.seek($0) }
+            )
+            var session = try await manager.createSession(videoID: VideoSegmentID(value: 495))
+            let frame = try makeWALScreenshotFrame()
+            if failureCall == 2 {
+                try await manager.appendFrame(frame, to: &session)
+                try await manager.registerFrameID(videoID: session.videoID, frameID: 7100, frameIndex: 0)
+            }
+            let bytesBeforeFailure = try Data(contentsOf: session.framesURL)
+            do {
+                try await manager.appendFrame(frame, to: &session)
+                XCTFail("Expected injected seek failure")
+            } catch {
+                XCTAssertTrue(error is StorageError)
+            }
+            let afterFailure = await manager.debugIndexAndWriterCounts()
+            XCTAssertEqual(afterFailure.activeWriters, 0)
+            let failedHandle = try XCTUnwrap(failure.handleThatFailed())
+            XCTAssertThrowsError(try failedHandle.offset())
+            XCTAssertEqual(try Data(contentsOf: session.framesURL), bytesBeforeFailure)
+            XCTAssertEqual(session.metadata.frameCount, failureCall - 1)
+
+            try await manager.appendFrame(frame, to: &session)
+            let afterRetry = await manager.debugIndexAndWriterCounts()
+            XCTAssertEqual(afterRetry.writerOpens, 2)
+            XCTAssertEqual(afterRetry.activeWriters, 1)
+            let restarted = WALManager(walRoot: root)
+            let recovered = try await restarted.listActiveSessions()
+            XCTAssertEqual(recovered.first?.metadata.frameCount, failureCall)
+            for index in 0..<failureCall {
+                let read = try await restarted.readFrame(videoID: session.videoID, frameIndex: index)
+                XCTAssertEqual(read.imageData, frame.imageData)
+            }
+            if failureCall == 2 {
+                let mapped = try await restarted.readFrame(videoID: session.videoID, frameID: 7100, fallbackFrameIndex: 99)
+                XCTAssertEqual(mapped.imageData, frame.imageData)
+            }
+            try await manager.clearAllSessions()
+        }
+    }
+
+    func testWALWriterHandlesAreBoundedAndReopenAfterEviction() async throws {
+        let root = makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let manager = WALManager(walRoot: root)
+        let frame = try makeWALScreenshotFrame()
+        var first = try await manager.createSession(videoID: VideoSegmentID(value: 500))
+        try await manager.appendFrame(frame, to: &first)
+        for id in 501...512 {
+            var session = try await manager.createSession(videoID: VideoSegmentID(value: Int64(id)))
+            try await manager.appendFrame(frame, to: &session)
+        }
+        let counts = await manager.debugIndexAndWriterCounts()
+        XCTAssertEqual(counts.activeWriters, 8)
+        try await manager.appendFrame(frame, to: &first)
+        try await manager.registerFrameID(videoID: first.videoID, frameID: 7001, frameIndex: 1)
+        let reopened = try await manager.readFrame(videoID: first.videoID, frameID: 7001, fallbackFrameIndex: 99)
+        XCTAssertEqual(reopened.imageData, frame.imageData)
+        try await manager.clearAllSessions()
+        let cleared = await manager.debugIndexAndWriterCounts()
+        XCTAssertEqual(cleared.activeWriters, 0)
+    }
+
+    func testWALAppendAndRegisterKeepsIncrementalIndexAndSingleWriter() async throws {
+        let root = makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let manager = WALManager(walRoot: root)
+        var session = try await manager.createSession(videoID: VideoSegmentID(value: 493))
+        let frame = try makeWALScreenshotFrame()
+        for index in 0..<20 {
+            try await manager.appendFrame(frame, to: &session)
+            try await manager.registerFrameID(videoID: session.videoID, frameID: Int64(9000 + index), frameIndex: index)
+        }
+        let counts = await manager.debugIndexAndWriterCounts()
+        XCTAssertEqual(counts.indexBuilds, 0)
+        XCTAssertEqual(counts.writerOpens, 1)
+        let restarted = WALManager(walRoot: root)
+        let recovered = try await restarted.readFrame(videoID: session.videoID, frameID: 9019, fallbackFrameIndex: 99)
+        XCTAssertEqual(recovered.imageData, frame.imageData)
+        try await manager.finalizeSession(session)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: session.sessionDir.path))
+    }
+
+    func testWALPeriodicMetadataCheckpointPreservesDurableFrontier() async throws {
+        let root = makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let manager = WALManager(walRoot: root, metadataCheckpointInterval: 0)
+        var session = try await manager.createSession(videoID: VideoSegmentID(value: 492))
+        let frame = try makeWALScreenshotFrame()
+        try await manager.appendFrame(frame, to: &session)
+        try await manager.updateDurableVideoState(videoID: session.videoID, readableFrameCount: 1, durableVideoFileSizeBytes: 888)
+        try await manager.appendFrame(frame, to: &session)
+        let data = try Data(contentsOf: session.sessionDir.appendingPathComponent("metadata.json"))
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let persisted = try decoder.decode(WALMetadata.self, from: data)
+        XCTAssertEqual(persisted.frameCount, 2)
+        XCTAssertEqual(persisted.durableReadableFrameCount, 1)
+        XCTAssertEqual(persisted.durableVideoFileSizeBytes, 888)
+    }
+
+    func testWALCompressesScreenshotLosslesslyAndSupportsMappedRandomAccessAfterRestart() async throws {
+        let root = makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let manager = WALManager(walRoot: root)
+        var session = try await manager.createSession(videoID: VideoSegmentID(value: 401))
+        let first = try makeWALScreenshotFrame()
+        let second = try makeWALScreenshotFrame(timestamp: first.timestamp.addingTimeInterval(2))
+        try await manager.appendFrame(first, to: &session)
+        try await manager.registerFrameID(videoID: session.videoID, frameID: 9001, frameIndex: 0)
+        try await manager.appendFrame(second, to: &session)
+        try await manager.registerFrameID(videoID: session.videoID, frameID: 9002, frameIndex: 1)
+
+        let storedBytes = try await manager.framesFileSize(for: session)
+        XCTAssertLessThan(storedBytes, Int64(first.imageData.count + second.imageData.count) / 2)
+        let restarted = WALManager(walRoot: root)
+        for (id, expected) in [(Int64(9002), second), (Int64(9001), first)] {
+            let actual = try await restarted.readFrame(videoID: session.videoID, frameID: id, fallbackFrameIndex: 99)
+            XCTAssertEqual(actual.imageData, expected.imageData)
+            XCTAssertEqual(actual.bytesPerRow, expected.bytesPerRow)
+            XCTAssertEqual(actual.timestamp, expected.timestamp)
+            XCTAssertEqual(actual.metadata, expected.metadata)
+        }
+    }
+
+    func testWALReadsLegacyRawRecordsAlongsideNewRecordsWithoutMetadataSidecar() async throws {
+        let root = makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let manager = WALManager(walRoot: root)
+        var session = try await manager.createSession(videoID: VideoSegmentID(value: 402))
+        let legacy = try makeWALScreenshotFrame()
+        let current = try makeWALScreenshotFrame(timestamp: legacy.timestamp.addingTimeInterval(2))
+        try appendLegacyWALFrame(legacy, to: session.framesURL)
+        try await manager.appendFrame(current, to: &session)
+        try FileManager.default.removeItem(at: session.sessionDir.appendingPathComponent("metadata.json"))
+
+        let restarted = WALManager(walRoot: root)
+        let sessions = try await restarted.listActiveSessions()
+        XCTAssertEqual(sessions.first?.metadata.frameCount, 2)
+        let frames = try await restarted.readFrames(from: session)
+        XCTAssertEqual(frames.map(\.imageData), [legacy.imageData, current.imageData])
+        XCTAssertEqual(frames.map(\.timestamp), [legacy.timestamp, current.timestamp])
+    }
+
+    func testWALRejectsDamagedFrameChecksum() async throws {
+        let root = makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let manager = WALManager(walRoot: root)
+        var session = try await manager.createSession(videoID: VideoSegmentID(value: 403))
+        try await manager.appendFrame(try makeWALScreenshotFrame(), to: &session)
+        let handle = try FileHandle(forUpdating: session.framesURL)
+        defer { try? handle.close() }
+        // V2 records keep a SHA-256 digest at byte 16; changing it must fail closed.
+        try handle.seek(toOffset: 16)
+        let original = try XCTUnwrap(try handle.read(upToCount: 1)?.first)
+        try handle.seek(toOffset: 16)
+        try handle.write(contentsOf: Data([original ^ 0xFF]))
+        do {
+            _ = try await manager.readFrame(videoID: session.videoID, frameIndex: 0)
+            XCTFail("Expected a damaged checksum to be rejected")
+        } catch let error as StorageError {
+            guard case .fileReadFailed(_, let reason) = error else { return XCTFail("Unexpected error: \(error)") }
+            XCTAssertTrue(reason.contains("checksum"))
+        }
+    }
+
+    func testWALBulkReadUsesDecodedByteBudgetBeforeLoadingPixels() async throws {
+        let root = makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let manager = WALManager(walRoot: root)
+        var session = try await manager.createSession(videoID: VideoSegmentID(value: 404))
+        let frame = try makeWALScreenshotFrame()
+        try await manager.appendFrame(frame, to: &session)
+        try await manager.appendFrame(frame, to: &session)
+        let budget = Int64(frame.imageData.count)
+        let fileSize = try await manager.framesFileSize(for: session)
+        XCTAssertLessThan(fileSize, budget)
+        await manager.resetDebugRawReadOffsets(for: session.videoID)
+        do {
+            _ = try await manager.readFrames(from: session, maximumDecodedBytes: budget)
+            XCTFail("A compressed file must not bypass the decoded image budget")
+        } catch let error as StorageError {
+            guard case .fileReadFailed(_, let reason) = error else { return XCTFail("Unexpected error: \(error)") }
+            XCTAssertTrue(reason.contains("decoded byte budget"))
+        }
+        let loadedOffsets = await manager.debugRawReadOffsets(for: session.videoID)
+        XCTAssertTrue(loadedOffsets.isEmpty, "Reject oversized eager reads before decoding any frame")
+        let singleFrame = try await manager.readFrame(videoID: session.videoID, frameIndex: 1)
+        XCTAssertEqual(singleFrame.imageData, frame.imageData)
+    }
+
+    func testWALTruncatedCompressedPayloadPreservesCompletePrefix() async throws {
+        let root = makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let manager = WALManager(walRoot: root)
+        var session = try await manager.createSession(videoID: VideoSegmentID(value: 405))
+        let frame = try makeWALScreenshotFrame()
+        try await manager.appendFrame(frame, to: &session)
+        try await manager.registerFrameID(videoID: session.videoID, frameID: 9001, frameIndex: 0)
+        try await manager.appendFrame(frame, to: &session)
+        let size = try await manager.framesFileSize(for: session)
+        let handle = try FileHandle(forWritingTo: session.framesURL)
+        try handle.truncate(atOffset: UInt64(size - 1))
+        try handle.close()
+        let restarted = WALManager(walRoot: root)
+        let count = try await restarted.recoverableFrameCount(for: session)
+        XCTAssertEqual(count, 1)
+        let recovered = try await restarted.readFrame(videoID: session.videoID, frameID: 9001, fallbackFrameIndex: 99)
+        XCTAssertEqual(recovered.imageData, frame.imageData)
+    }
+
+    func testWALRejectsInvalidCodecAndDecodedLengthWithoutAllocatingPixels() async throws {
+        let root = makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        for (offset, reason) in [(UInt64(8), "codec"), (UInt64(12), "size")] {
+            let manager = WALManager(walRoot: root)
+            var session = try await manager.createSession(videoID: VideoSegmentID(value: Int64(offset)))
+            try await manager.appendFrame(try makeWALScreenshotFrame(), to: &session)
+            let handle = try FileHandle(forWritingTo: session.framesURL)
+            try handle.seek(toOffset: offset)
+            try handle.write(contentsOf: Data(repeating: 0xFF, count: 4))
+            try handle.close()
+            do {
+                _ = try await manager.readFrame(videoID: session.videoID, atOffset: 0)
+                XCTFail("Expected invalid \(reason) to fail")
+            } catch let error as StorageError {
+                guard case .fileReadFailed(_, let message) = error else { return XCTFail("Unexpected error: \(error)") }
+                XCTAssertTrue(message.contains(reason))
+            }
+        }
+    }
+
+    func testWALUnknownCodecMustNotBeTreatedAsTruncatedTail() async throws {
+        let root = makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let manager = WALManager(walRoot: root)
+        var session = try await manager.createSession(videoID: VideoSegmentID(value: 407))
+        let frame = try makeWALScreenshotFrame()
+        try await manager.appendFrame(frame, to: &session)
+        let firstRecordSize = try await manager.framesFileSize(for: session)
+        try await manager.appendFrame(frame, to: &session)
+        let handle = try FileHandle(forWritingTo: session.framesURL)
+        try handle.seek(toOffset: UInt64(firstRecordSize) + 8)
+        try handle.write(contentsOf: Data(repeating: 0xFF, count: 4))
+        try handle.close()
+        do {
+            _ = try await manager.recoverableFrameCount(for: session)
+            XCTFail("Unsupported records must fail closed so recovery retains their bytes")
+        } catch let error as StorageError {
+            guard case .fileReadFailed(_, let message) = error else { return XCTFail("Unexpected error: \(error)") }
+            XCTAssertTrue(message.contains("codec"))
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: session.framesURL.path))
+    }
+
+    func testWALMalformedJournalWithMissingOrStaleMetadataDoesNotBlockHealthyRecovery() async throws {
+        let root = makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let manager = WALManager(walRoot: root)
+        let frame = try makeWALScreenshotFrame()
+        var damagedRecords: [Int64: Data] = [:]
+        for (index, offset) in [UInt64(8), 8, 56, 56].enumerated() {
+            var session = try await manager.createSession(videoID: VideoSegmentID(value: Int64(410 + index)))
+            try await manager.appendFrame(frame, to: &session)
+            let handle = try FileHandle(forWritingTo: session.framesURL)
+            try handle.seek(toOffset: offset)
+            try handle.write(contentsOf: Data(repeating: 0xFF, count: 4))
+            try handle.close()
+            damagedRecords[session.videoID.value] = try Data(contentsOf: session.framesURL)
+            let metadataURL = session.sessionDir.appendingPathComponent("metadata.json")
+            if index.isMultiple(of: 2) {
+                try FileManager.default.removeItem(at: metadataURL)
+            } else {
+                var staleMetadata = session.metadata
+                staleMetadata.width = 0
+                staleMetadata.height = 0
+                let encoder = JSONEncoder()
+                encoder.dateEncodingStrategy = .iso8601
+                try encoder.encode(staleMetadata).write(to: metadataURL)
+            }
+        }
+        var healthy = try await manager.createSession(videoID: VideoSegmentID(value: 420))
+        try await manager.appendFrame(frame, to: &healthy)
+
+        let listed = try await manager.listActiveSessions()
+        XCTAssertEqual(listed.map(\.videoID), [healthy.videoID])
+        let retained = try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
+        for (videoID, expectedBytes) in damagedRecords {
+            let directory = try XCTUnwrap(retained.first { $0.lastPathComponent.hasPrefix("retained_segment_\(videoID)_") })
+            XCTAssertEqual(try Data(contentsOf: directory.appendingPathComponent("frames.bin")), expectedBytes)
+        }
+
+        let database = try await makeDatabase(name: "malformed_wal_isolation")
+        let storage = RecoveryTestStorage(
+            writerPlans: [.init(failAfter: nil)],
+            existingFrameCounts: [healthy.videoID.value: 0],
+            validVideoIDs: [healthy.videoID.value]
+        )
+        let recovery = makeRecoveryManager(walManager: manager, storage: storage, database: database)
+        let result = try await recovery.recoverAll()
+        XCTAssertEqual(result.sessionsRecovered, 1)
+        XCTAssertEqual(result.framesRecovered, 1)
+        try await database.close()
+    }
+
+    func testWALIncompressiblePixelsUseChecksummedRawFallback() async throws {
+        let root = makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let manager = WALManager(walRoot: root)
+        var session = try await manager.createSession(videoID: VideoSegmentID(value: 406))
+        var state: UInt64 = 0x0123_4567_89AB_CDEF
+        let pixels = Data(
+            (0..<(64 * 64 * 4)).map { _ in
+                state ^= state << 13
+                state ^= state >> 7
+                state ^= state << 17
+                return UInt8(truncatingIfNeeded: state)
+            })
+        let frame = CapturedFrame(timestamp: Date(), imageData: pixels, width: 64, height: 64, bytesPerRow: 256)
+        try await manager.appendFrame(frame, to: &session)
+        let stats = await manager.compressionStatistics(videoID: session.videoID)
+        XCTAssertEqual(stats?.compressedFrameCount, 0)
+        XCTAssertEqual(stats?.rawBytes, Int64(pixels.count))
+        let result = try await manager.readFrame(videoID: session.videoID, frameIndex: 0)
+        XCTAssertEqual(result.imageData, pixels)
+        XCTAssertEqual(stats?.storedBytes, Int64(pixels.count + 84))
+        try await manager.finalizeSession(session)
+        let clearedStats = await manager.compressionStatistics(videoID: session.videoID)
+        XCTAssertNil(clearedStats)
     }
 
     func testRecoverableFrameCountIgnoresTruncatedTailFrame() async throws {
@@ -2619,15 +3097,18 @@ final class StorageManagerTests: XCTestCase {
         let sessionVideoID = VideoSegmentID(value: 900)
         var session = try await walManager.createSession(videoID: sessionVideoID)
         let start = Date(timeIntervalSince1970: 1_710_000_000)
+        // Keep genuine display-sized pixels: the WAL now rejects inconsistent
+        // dimensions/stride before allocating or decompressing. Reuse this buffer
+        // so the batching regression itself doesn't retain 200 raw screenshots.
+        let sourceFrame = makeCapturedFrame(width: 3440, height: 1440)
 
         for index in 0..<200 {
             try await walManager.appendFrame(
-                makeCapturedFrame(
-                    width: 3440,
-                    height: 1440,
-                    bytesPerRow: 4,
-                    imageByteCount: 4,
-                    timestamp: start.addingTimeInterval(Double(index))
+                CapturedFrame(
+                    timestamp: start.addingTimeInterval(Double(index)),
+                    imageData: sourceFrame.imageData,
+                    width: sourceFrame.width, height: sourceFrame.height,
+                    bytesPerRow: sourceFrame.bytesPerRow, metadata: sourceFrame.metadata
                 ),
                 to: &session
             )

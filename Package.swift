@@ -267,7 +267,8 @@ let package = Package(
         .executableTarget(
             name: "RetraceCLI",
             dependencies: [
-                "App"
+                "App",
+                "Shared"
             ],
             path: "Sources/RetraceCLI"
         ),

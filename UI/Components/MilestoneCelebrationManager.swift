@@ -244,6 +244,7 @@ public class MilestoneCelebrationManager: ObservableObject {
         do {
             let lastCountedTimestamp = getLastCountedTimestamp()
             let cumulativeTime = Self.settingsStore.double(forKey: Self.cumulativeScreenTimeKey)
+            let liveDatabaseDuration = try await coordinator.getTotalCapturedDuration()
 
             // Get duration of segments created after the last checkpoint
             let newDuration: TimeInterval
@@ -251,14 +252,19 @@ public class MilestoneCelebrationManager: ObservableObject {
                 newDuration = try await coordinator.getCapturedDurationAfter(date: lastTimestamp)
             } else {
                 // First time - count all existing segments
-                newDuration = try await coordinator.getTotalCapturedDuration()
+                newDuration = liveDatabaseDuration
             }
 
-            // Update cumulative time if there's new time
-            if newDuration > 0 {
-                let updatedCumulative = cumulativeTime + newDuration
+            let updatedCumulative = CumulativeScreenTimeTracker.reconciledCumulativeDuration(
+                storedCumulativeDuration: cumulativeTime,
+                incrementalDuration: newDuration,
+                liveDatabaseDuration: liveDatabaseDuration
+            )
+
+            if updatedCumulative > cumulativeTime {
                 Self.settingsStore.set(updatedCumulative, forKey: Self.cumulativeScreenTimeKey)
-                Log.debug("[MilestoneCelebrationManager] Added \(newDuration / 3600)h, cumulative: \(updatedCumulative / 3600)h", category: .ui)
+                let reconciledIncrementalDuration = updatedCumulative - cumulativeTime
+                Log.debug("[MilestoneCelebrationManager] Synced \(reconciledIncrementalDuration / 3600)h, cumulative: \(updatedCumulative / 3600)h", category: .ui)
             }
 
             // Update checkpoint to now

@@ -206,6 +206,9 @@ public struct ContentView: View {
         Log.info("[ContentView] handleDeeplink route=\(String(describing: route))", category: .ui)
 
         switch route {
+        case let .dashboard(dateRange):
+            DashboardWindowController.shared.openDeeplink(dateRange: dateRange)
+
         case let .search(state):
             // Open fullscreen timeline and apply deeplink search state.
             TimelineWindowController.shared.showSearch(
