@@ -33,7 +33,8 @@ Database/
 │   ├── V16_ProcessingQueueFrameIDIndex.swift
 │   ├── V17_FrameCaptureTrigger.swift
 │   ├── V18_DailyMetricsRecencyIndex.swift
-│   └── V19_FrameEncodedAt.swift
+│   ├── V19_FrameEncodedAt.swift
+│   └── V20_PartialProcessingStatusIndex.swift # Exclude OCR-completed frames from status index
 ├── Queries/
 │   ├── FrameQueries.swift     # Frame CRUD operations
 │   ├── SegmentQueries.swift   # Segment CRUD operations
@@ -44,6 +45,7 @@ Database/
     ├── RetentionVideoDeletionTests.swift # Real migrated SQLite retention guards and injected failure
     ├── DatabaseManagerTests.swift
     ├── EdgeCaseTests.swift
+    ├── ProcessingStatusIndexTests.swift # V19 upgrade, index population and production query plans
     ├── ProcessingQueueBatchTests.swift # Atomic backlog enqueue, statement reuse and eligibility checks
     ├── FrameBatchDeletionTests.swift # Batched retention deletion, real SQLite/FTS, rollback and shared documents
     ├── FTSManagerTests.swift
@@ -665,3 +667,7 @@ The existing `node.encryptedText` column stores either the reversible protected-
 
 - `enqueueFramesForProcessing` uses one actor call, one reusable prepared INSERT, and a savepoint that commits as one standalone transaction or nests inside an existing transaction. Missing/non-pending frames and write failures roll back the complete batch, leaving pre-existing queue entries intact.
 - Preserve the single-frame API's eligibility (`processingStatus = 0`), priority, zero retry count, timestamp behavior, and duplicate-ID behavior. The single-frame path does not acquire an additional explicit transaction.
+
+### Partial processing-status index
+
+V20 replaces `idx_frame_processing_status` with `ON frame(processingStatus) WHERE processingStatus != 2`. Add the explicit `!= 2` conjunct to status-driven unfinished-work queries: SQLite does not infer it from `= 0` or `IN (...)`. Do not add it to primary-key/timeline reads that need completed frames. V6's completed-frame backfill runs before this migration while the full index still exists. Status 7 (rewritten), retry/failed states, and future non-2 values remain indexed; NULL rows remain stored but are excluded by the predicate. MigrationRunner applies the replacement atomically and only once; dropping the full index frees reusable database pages without running VACUUM.
