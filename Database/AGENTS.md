@@ -44,6 +44,7 @@ Database/
     ├── RetentionVideoDeletionTests.swift # Real migrated SQLite retention guards and injected failure
     ├── DatabaseManagerTests.swift
     ├── EdgeCaseTests.swift
+    ├── FrameBatchDeletionTests.swift # Batched retention deletion, real SQLite/FTS, rollback and shared documents
     ├── FTSManagerTests.swift
     ├── IntegrationTests.swift
     ├── OCRPipelineTests.swift
@@ -652,3 +653,9 @@ Trade-off: Slightly more complex writes (populate junction tables + text regions
 The existing `node.encryptedText` column stores either the reversible protected-text payload or the exact non-recoverable marker `rtx-permanent-v1`. Permanent markers keep nodes masked and discoverable for rewrite scheduling, but must be excluded from missing-master-key recovery checks. Propagate mode into `PendingNodeRedactionJob` and `SegmentRedactionTarget`; no schema migration is needed. Active query files use the declared SQLCipher module, avoiding mixed system SQLite/SQLCipher headers.
 
 - Retention video deletion uses an atomic DELETE guarded by processingState=0 and absence of frame references. Report an already absent row as success for journal retry, but propagate SQLite errors before any file deletion.
+
+### Batched frame deletion
+
+- Retention, recent-frame deletion, and explicit frame-ID deletion share `FrameQueries` batching: at most 500 IDs per statement, reduced to the connection's SQLite variable limit. Preserve the existing requested-ID count semantics for explicit IDs.
+- Delete affected `doc_segment` links in batches, then delete only affected FTS documents with no remaining links (including audio-only links). Never sweep unrelated orphan documents. Chunk document IDs separately because a frame may have many documents.
+- Keep the complete operation in one transaction; when a caller owns a transaction, leave commit/rollback to that caller. Existing foreign-key cascades remain responsible for nodes, processing queue rows and frame anchors. No schema migration or new user action/metric is introduced.

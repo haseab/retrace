@@ -1215,9 +1215,11 @@ public enum FrameQueries {
         }
 
         do {
-            for frameID in frameIDs {
-                try FTSQueries.deleteForFrame(db: db, frameId: frameID)
-                try deleteFrameRow(db: db, frameID: frameID)
+            let batchSize = FTSQueries.deletionBatchSize(db: db)
+            for start in stride(from: 0, to: frameIDs.count, by: batchSize) {
+                let batch = Array(frameIDs[start..<min(start + batchSize, frameIDs.count)])
+                try FTSQueries.deleteForFrames(db: db, frameIDs: batch)
+                try deleteFrameRows(db: db, frameIDs: batch)
             }
 
             if managesOwnTransaction {
@@ -1233,8 +1235,9 @@ public enum FrameQueries {
         return frameIDs.count
     }
 
-    private static func deleteFrameRow(db: OpaquePointer, frameID: Int64) throws {
-        let sql = "DELETE FROM frame WHERE id = ?;"
+    private static func deleteFrameRows(db: OpaquePointer, frameIDs: [Int64]) throws {
+        let placeholders = frameIDs.map { _ in "?" }.joined(separator: ",")
+        let sql = "DELETE FROM frame WHERE id IN (\(placeholders));"
         var statement: OpaquePointer?
         defer {
             sqlite3_finalize(statement)
@@ -1247,7 +1250,9 @@ public enum FrameQueries {
             )
         }
 
-        sqlite3_bind_int64(statement, 1, frameID)
+        for (index, id) in frameIDs.enumerated() {
+            sqlite3_bind_int64(statement, Int32(index + 1), id)
+        }
 
         guard sqlite3_step(statement) == SQLITE_DONE else {
             throw DatabaseError.queryFailed(
