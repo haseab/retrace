@@ -199,6 +199,7 @@ final class MasterKeyManagerTests: XCTestCase {
         var queriedServices: [String] = []
         var addedService: String?
         var addedData: Data?
+        var synchronizedKey: Data?
 
         let loadedKey = try MasterKeyManager.loadMasterKey(
             copyMatching: { query, result in
@@ -207,7 +208,10 @@ final class MasterKeyManagerTests: XCTestCase {
 
                 switch service {
                 case MasterKeyManager.keychainService:
-                    return errSecItemNotFound
+                    guard let synchronizedKey,
+                          (query as NSDictionary)[kSecAttrSynchronizable as String] as? Bool == true else { return errSecItemNotFound }
+                    result?.pointee = synchronizedKey as CFTypeRef
+                    return errSecSuccess
                 case MasterKeyManager.legacyKeychainService:
                     result?.pointee = legacyKeyData as CFTypeRef
                     return errSecSuccess
@@ -220,6 +224,7 @@ final class MasterKeyManagerTests: XCTestCase {
                 let dictionary = query as NSDictionary
                 addedService = dictionary[kSecAttrService as String] as? String
                 addedData = dictionary[kSecValueData as String] as? Data
+                synchronizedKey = addedData
                 return errSecSuccess
             }
         )
@@ -227,7 +232,7 @@ final class MasterKeyManagerTests: XCTestCase {
         XCTAssertEqual(loadedKey, legacyKeyData)
         XCTAssertEqual(
             queriedServices,
-            [MasterKeyManager.keychainService, MasterKeyManager.legacyKeychainService]
+            [MasterKeyManager.keychainService, MasterKeyManager.keychainService, MasterKeyManager.legacyKeychainService, MasterKeyManager.keychainService]
         )
         XCTAssertEqual(addedService, MasterKeyManager.keychainService)
         XCTAssertEqual(addedData, legacyKeyData)
@@ -301,6 +306,111 @@ final class MasterKeyManagerTests: XCTestCase {
             deletedServices,
             [MasterKeyManager.keychainService, MasterKeyManager.legacyKeychainService]
         )
+    }
+
+    func testStoragePolicyIgnoresLegacyLocalOnlyPreference() {
+        let defaults = makeDefaults()
+        defaults.set("local_only", forKey: MasterKeyManager.storagePolicyDefaultsKey)
+        XCTAssertEqual(MasterKeyManager.storagePolicy(defaults: defaults), .iCloudKeychain)
+    }
+
+    func testLocalMasterKeyIsCopiedToSynchronizableStorageWithoutChangingBytes() throws {
+        let original = Data((0..<32).map { UInt8($0) })
+        var synced: Data?
+        let loaded = try MasterKeyManager.loadMasterKey(
+            account: "migration-test",
+            copyMatching: { query, result in
+                let fields = query as NSDictionary
+                guard fields[kSecAttrService as String] as? String == MasterKeyManager.keychainService else { return errSecItemNotFound }
+                let sync = fields[kSecAttrSynchronizable as String] as? Bool
+                let key = sync == true ? synced : original
+                guard let key else { return errSecItemNotFound }
+                result?.pointee = key as CFTypeRef
+                return errSecSuccess
+            },
+            addItem: { query, _ in
+                let fields = query as NSDictionary
+                XCTAssertEqual(fields[kSecAttrSynchronizable as String] as? Bool, true)
+                XCTAssertEqual(fields[kSecAttrAccessible as String] as? String, kSecAttrAccessibleAfterFirstUnlock as String)
+                synced = fields[kSecValueData as String] as? Data
+                return errSecSuccess
+            }
+        )
+        XCTAssertEqual(loaded, original)
+        XCTAssertEqual(synced, original)
+        XCTAssertEqual(MasterKeyManager.recoveryPhrase(for: loaded), MasterKeyManager.recoveryPhrase(for: original))
+    }
+
+    func testSyncFailureDoesNotReturnOrReplaceLocalKey() {
+        let original = Data(repeating: 7, count: 32)
+        var addedData: Data?
+        XCTAssertThrowsError(try MasterKeyManager.loadMasterKey(
+            account: "failed-migration-test",
+            copyMatching: { query, result in
+                let fields = query as NSDictionary
+                guard fields[kSecAttrService as String] as? String == MasterKeyManager.keychainService,
+                      fields[kSecAttrSynchronizable as String] as? Bool != true else { return errSecItemNotFound }
+                result?.pointee = original as CFTypeRef
+                return errSecSuccess
+            },
+            addItem: { query, _ in
+                addedData = (query as NSDictionary)[kSecValueData as String] as? Data
+                return errSecMissingEntitlement
+            }
+        ))
+        XCTAssertEqual(addedData, original)
+    }
+
+    func testConflictingCloudAndLocalKeysAreNotOverwritten() {
+        var attemptedWrite = false
+        XCTAssertThrowsError(try MasterKeyManager.loadMasterKey(
+            account: "conflict-test",
+            copyMatching: { query, result in
+                let fields = query as NSDictionary
+                guard fields[kSecAttrService as String] as? String == MasterKeyManager.keychainService else { return errSecItemNotFound }
+                let sync = fields[kSecAttrSynchronizable as String] as? Bool == true
+                result?.pointee = Data(repeating: sync ? 1 : 2, count: 32) as CFTypeRef
+                return errSecSuccess
+            },
+            addItem: { _, _ in attemptedWrite = true; return errSecSuccess }
+        ))
+        XCTAssertFalse(attemptedWrite)
+    }
+
+    func testDuplicateCloudItemMustMatchTheExistingLocalKey() {
+        var synced: Data?
+        let original = Data(repeating: 1, count: 32)
+        XCTAssertThrowsError(try MasterKeyManager.loadMasterKey(
+            account: "duplicate-test",
+            copyMatching: { query, result in
+                let fields = query as NSDictionary
+                guard fields[kSecAttrService as String] as? String == MasterKeyManager.keychainService else { return errSecItemNotFound }
+                let key = fields[kSecAttrSynchronizable as String] as? Bool == true ? synced : original
+                guard let key else { return errSecItemNotFound }
+                result?.pointee = key as CFTypeRef
+                return errSecSuccess
+            },
+            addItem: { _, _ in synced = Data(repeating: 2, count: 32); return errSecDuplicateItem }
+        ))
+    }
+
+    func testUnverifiedSyncCopyIsNotReportedAsAMissingMasterKey() {
+        XCTAssertThrowsError(try MasterKeyManager.loadMasterKey(
+            account: "readback-failure-test",
+            copyMatching: { query, result in
+                let fields = query as NSDictionary
+                guard fields[kSecAttrService as String] as? String == MasterKeyManager.keychainService,
+                      fields[kSecAttrSynchronizable as String] as? Bool != true else { return errSecItemNotFound }
+                result?.pointee = Data(repeating: 7, count: 32) as CFTypeRef
+                return errSecSuccess
+            },
+            addItem: { _, _ in errSecSuccess }
+        )) { error in
+            guard case MasterKeyManagerError.keychainStoreFailed = error else {
+                XCTFail("A failed readback must not permit generation of a replacement key")
+                return
+            }
+        }
     }
 
     private func makeDefaults() -> UserDefaults {

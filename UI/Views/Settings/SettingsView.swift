@@ -34,9 +34,9 @@ private enum MasterKeyProtectedFeature: String, Identifiable {
     var setupPromptMessage: String {
         switch self {
         case .phraseLevelRedaction:
-            return "Turning on keyword redaction requires a master key. Choose whether Retrace stores it only on this Mac or syncs it with iCloud Keychain."
+            return "Turning on keyword redaction requires a master key. Retrace stores it with iCloud Keychain synchronization enabled."
         case .databaseEncryption:
-            return "Encrypting the database now uses the same master key as protected redaction. Choose whether Retrace stores it only on this Mac or syncs it with iCloud Keychain."
+            return "Encrypting the database now uses the same master key as protected redaction. Retrace stores it with iCloud Keychain synchronization enabled."
         }
     }
 
@@ -548,7 +548,7 @@ public struct SettingsView: View {
     @State private var detectedDatabaseEncryptionState: DatabaseFileEncryptionState = .missing
     @State private var recoveryPhraseImportText = ""
     @State private var recoveryPhraseImportError: String?
-    @State private var recoveryPhraseRestorePolicy: MasterKeyStoragePolicy = .localOnly
+    @State private var recoveryPhraseRestorePolicy: MasterKeyStoragePolicy = .iCloudKeychain
 
     // App coordinator for deletion operations
     @EnvironmentObject private var coordinatorWrapper: AppCoordinatorWrapper
@@ -1110,7 +1110,7 @@ public struct SettingsView: View {
 
                 Text(
                     masterKeySetupSession?.storagePolicy == .iCloudKeychain
-                        ? "Stored in iCloud Keychain"
+                        ? "Configured for iCloud Keychain"
                         : "Stored in Keychain on this Mac"
                 )
                     .font(.retraceCaption)
@@ -1151,7 +1151,7 @@ public struct SettingsView: View {
 
                 Text(
                     session.storagePolicy == .iCloudKeychain
-                        ? "iCloud Keychain sync is enabled, but this recovery phrase is still your fallback if the synced copy is unavailable."
+                        ? "iCloud Keychain synchronization is configured. Keep this phrase as a fallback if the synced copy is unavailable."
                         : "This is the only recovery path if the Keychain copy on this Mac is lost."
                 )
                     .font(.retraceCaption)
@@ -1417,19 +1417,7 @@ public struct SettingsView: View {
 
         Task { @MainActor in
             do {
-                guard let storagePolicy = MasterKeyPromptUI.presentStoragePolicyPrompt(
-                    title: "Choose Master Key Storage",
-                    message: "Store the master key only on this Mac or sync it with iCloud Keychain. Retrace will still show a recovery phrase backup."
-                ) else {
-                    pendingMasterKeyFeature = nil
-                    isCreatingMasterKey = false
-                    recordMasterKeyMetric(
-                        action: "create_cancelled",
-                        source: feature.metricSource,
-                        metadata: ["reason": "storage_policy_cancelled"]
-                    )
-                    return
-                }
+                let storagePolicy = MasterKeyStoragePolicy.iCloudKeychain
 
                 let result = try await MasterKeyManager.createMasterKeyIfNeededAsync(
                     defaults: settingsStore,
@@ -8822,11 +8810,8 @@ extension SettingsView {
                 .font(.retraceCaption)
                 .foregroundColor(.retraceSecondary)
 
-            Picker("Restore To", selection: $recoveryPhraseRestorePolicy) {
-                Text("This Mac Only").tag(MasterKeyStoragePolicy.localOnly)
-                Text("iCloud Keychain").tag(MasterKeyStoragePolicy.iCloudKeychain)
-            }
-            .pickerStyle(.segmented)
+            Text("The restored key will use iCloud Keychain synchronization.")
+                .font(.retraceCaption)
 
             TextEditor(text: $recoveryPhraseImportText)
                 .font(.retraceCaption)

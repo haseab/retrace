@@ -4,6 +4,7 @@ import LocalAuthentication
 import Security
 
 public enum MasterKeyStoragePolicy: String, Codable, CaseIterable, Sendable {
+    // Retained only to decode legacy preferences; new writes always synchronize.
     case localOnly = "local_only"
     case iCloudKeychain = "icloud_keychain"
 
@@ -64,6 +65,7 @@ public enum MasterKeyManagerError: LocalizedError, Sendable {
     case keychainDeleteFailed(OSStatus)
     case trustedApplicationCreateFailed(OSStatus)
     case accessCreateFailed(OSStatus)
+    case conflictingICloudKey
 
     public var errorDescription: String? {
         switch self {
@@ -82,13 +84,15 @@ public enum MasterKeyManagerError: LocalizedError, Sendable {
         case .settingsDecryptionFailed(let underlying):
             return "Failed to decrypt the protected settings payload: \(underlying)"
         case .keychainStoreFailed(let status):
-            return "Failed to save the master key to Keychain (status: \(status))."
+            return "Could not save the master key for iCloud Keychain synchronization (status: \(status)). No local-only replacement was created."
         case .keychainLoadFailed(let status):
             return "Failed to load the master key from Keychain (status: \(status))."
         case .keychainDeleteFailed(let status):
             return "Failed to delete the master key from Keychain (status: \(status))."
         case .trustedApplicationCreateFailed(let status):
             return "Failed to create a trusted application entry for the master key (status: \(status))."
+        case .conflictingICloudKey:
+            return "The iCloud and local Retrace master keys differ. Neither key was replaced. Recover the key for this library before continuing."
         case .accessCreateFailed(let status):
             return "Failed to create access rules for the master key (status: \(status))."
         }
@@ -202,16 +206,16 @@ public enum MasterKeyManager {
         storagePolicy: MasterKeyStoragePolicy? = nil,
         keychainAccount: String = keychainAccount
     ) throws -> MasterKeyCreationResult {
-        if hasMasterKey(account: keychainAccount) {
-            return MasterKeyCreationResult(
-                created: false,
-                recoveryPhrase: nil,
-                storagePolicy: nil
-            )
+        do {
+            _ = try loadMasterKey(account: keychainAccount)
+            return MasterKeyCreationResult(created: false, recoveryPhrase: nil, storagePolicy: .iCloudKeychain)
+        } catch MasterKeyManagerError.keychainLoadFailed(let status) where status == errSecItemNotFound {
+            // Only a confirmed missing item allows generation. Locked/unavailable
+            // Keychain errors propagate without minting replacement key material.
         }
 
         let defaults = resolvedDefaults(defaults)
-        let resolvedStoragePolicy = storagePolicy ?? Self.storagePolicy(defaults: defaults)
+        let resolvedStoragePolicy = MasterKeyStoragePolicy.iCloudKeychain
         let masterKeyData = randomMasterKeyData()
         let created = try saveMasterKeyIfAbsent(
             masterKeyData,
@@ -279,34 +283,56 @@ public enum MasterKeyManager {
             return cachedKey
         }
 
-        if let canonicalKey = try loadMasterKey(
-            service: keychainService,
-            account: account,
-            copyMatching: copyMatching
-        ) {
-            if account == keychainAccount {
-                cacheMasterKey(canonicalKey)
-            }
-            return canonicalKey
+        let synchronizedKey = try loadMasterKey(
+            service: keychainService, account: account,
+            synchronizable: true, copyMatching: copyMatching
+        )
+        let localCanonicalKey = try loadMasterKey(
+            service: keychainService, account: account,
+            synchronizable: false, copyMatching: copyMatching
+        )
+        let localKey: Data?
+        if let localCanonicalKey {
+            localKey = localCanonicalKey
+        } else {
+            localKey = try loadMasterKey(
+                service: legacyKeychainService, account: account,
+                copyMatching: copyMatching
+            )
         }
 
-        guard let legacyKey = try loadMasterKey(
-            service: legacyKeychainService,
-            account: account,
-            copyMatching: copyMatching
-        ) else {
-            if account == keychainAccount {
-                cacheHasMasterKeyValue(false)
+        if let synchronizedKey {
+            guard localKey == nil || localKey == synchronizedKey else {
+                throw MasterKeyManagerError.conflictingICloudKey
             }
+            if account == keychainAccount { cacheMasterKey(synchronizedKey) }
+            return synchronizedKey
+        }
+
+        guard let localKey else {
             throw MasterKeyManagerError.keychainLoadFailed(errSecItemNotFound)
         }
-
-        if account == keychainAccount {
-            cacheMasterKey(legacyKey)
+        // Copy the exact existing bytes. Keep the old item for rollback; never
+        // delete a usable key before the synchronizable copy can be read back.
+        _ = try saveMasterKeyIfAbsent(
+            localKey, service: keychainService, account: account,
+            storagePolicy: .iCloudKeychain, addItem: addItem
+        )
+        guard let verifiedKey = try loadMasterKey(
+            service: keychainService, account: account,
+            synchronizable: true, copyMatching: copyMatching
+        ) else {
+            if account == keychainAccount { clearCache() }
+            throw MasterKeyManagerError.keychainStoreFailed(errSecItemNotFound)
         }
-        promoteLegacyMasterKeyIfNeeded(legacyKey, account: account, addItem: addItem)
-        return legacyKey
+        guard verifiedKey == localKey else {
+            if account == keychainAccount { clearCache() }
+            throw MasterKeyManagerError.conflictingICloudKey
+        }
+        if account == keychainAccount { cacheMasterKey(verifiedKey) }
+        return verifiedKey
     }
+
 
     public static func currentScrambleSecret() -> String? {
         if let cachedSecret = cachedScrambleSecretValue() {
@@ -337,12 +363,8 @@ public enum MasterKeyManager {
     }
 
     public static func storagePolicy(defaults: UserDefaults? = nil) -> MasterKeyStoragePolicy {
-        let defaults = resolvedDefaults(defaults)
-        guard let rawValue = defaults.string(forKey: storagePolicyDefaultsKey),
-              let policy = MasterKeyStoragePolicy(rawValue: rawValue) else {
-            return .localOnly
-        }
-        return policy
+        // A stored legacy preference must not create another device-only key.
+        .iCloudKeychain
     }
 
     public static func protectPhraseLevelRedactionPhrases(_ phrases: [String]) throws -> String {
@@ -473,13 +495,16 @@ public enum MasterKeyManager {
         storagePolicy: MasterKeyStoragePolicy? = nil,
         keychainAccount: String = keychainAccount
     ) throws -> Bool {
-        guard !hasMasterKey(account: keychainAccount) else {
+        do {
+            _ = try loadMasterKey(account: keychainAccount)
             return false
+        } catch MasterKeyManagerError.keychainLoadFailed(let status) where status == errSecItemNotFound {
+            // Keep an inaccessible existing key intact; restore only if missing.
         }
 
         let keyData = try keyData(fromRecoveryPhrase: phrase)
         let defaults = resolvedDefaults(defaults)
-        let resolvedStoragePolicy = storagePolicy ?? Self.storagePolicy(defaults: defaults)
+        let resolvedStoragePolicy = MasterKeyStoragePolicy.iCloudKeychain
         let created = try saveMasterKeyIfAbsent(
             keyData,
             service: keychainService,
@@ -535,7 +560,7 @@ public enum MasterKeyManager {
     public static func recoveryDocumentText(
         recoveryPhrase: String,
         createdAt: Date = Date(),
-        storagePolicy: MasterKeyStoragePolicy = .localOnly
+        storagePolicy: MasterKeyStoragePolicy = .iCloudKeychain
     ) -> String {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -683,7 +708,7 @@ public enum MasterKeyManager {
             keyData,
             service: keychainService,
             account: keychainAccount,
-            storagePolicy: .localOnly,
+            storagePolicy: .iCloudKeychain,
             addItem: SecItemAdd
         )
     }
@@ -734,9 +759,6 @@ public enum MasterKeyManager {
         guard status == errSecSuccess else {
             throw MasterKeyManagerError.keychainStoreFailed(status)
         }
-        if account == keychainAccount {
-            cacheMasterKey(keyData)
-        }
         return true
     }
 
@@ -747,6 +769,7 @@ public enum MasterKeyManager {
     private static func makeLookupQuery(
         service: String,
         account: String,
+        synchronizable: Bool? = nil,
         returnAttributes: Bool = false,
         authenticationContext: LAContext? = nil
     ) -> [String: Any] {
@@ -758,6 +781,7 @@ public enum MasterKeyManager {
             kSecMatchLimit as String: kSecMatchLimitOne
         ]
 
+        if let synchronizable { query[kSecAttrSynchronizable as String] = synchronizable }
         if returnAttributes {
             query[kSecReturnAttributes as String] = true
         } else {
@@ -788,8 +812,8 @@ public enum MasterKeyManager {
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
             kSecValueData as String: keyData,
-            kSecAttrAccessible as String: storagePolicy.accessibleAttribute,
-            kSecAttrSynchronizable as String: storagePolicy.isSynchronizable
+            kSecAttrAccessible as String: MasterKeyStoragePolicy.iCloudKeychain.accessibleAttribute,
+            kSecAttrSynchronizable as String: true
         ]
     }
 
@@ -805,11 +829,12 @@ public enum MasterKeyManager {
     private static func loadMasterKey(
         service: String,
         account: String,
+        synchronizable: Bool? = nil,
         copyMatching: (CFDictionary, UnsafeMutablePointer<CFTypeRef?>?) -> OSStatus
     ) throws -> Data? {
         var result: CFTypeRef?
         let status = copyMatching(
-            makeLookupQuery(service: service, account: account) as CFDictionary,
+            makeLookupQuery(service: service, account: account, synchronizable: synchronizable) as CFDictionary,
             &result
         )
 
@@ -826,27 +851,6 @@ public enum MasterKeyManager {
         }
 
         return keyData
-    }
-
-    private static func promoteLegacyMasterKeyIfNeeded(
-        _ keyData: Data,
-        account: String,
-        addItem: (CFDictionary, UnsafeMutablePointer<CFTypeRef?>?) -> OSStatus
-    ) {
-        do {
-            _ = try saveMasterKeyIfAbsent(
-                keyData,
-                service: keychainService,
-                account: account,
-                storagePolicy: .localOnly,
-                addItem: addItem
-            )
-        } catch {
-            Log.warning(
-                "[MasterKeyManager] Failed to promote legacy master key into canonical v2 item: \(error.localizedDescription)",
-                category: .app
-            )
-        }
     }
 
     private static func cacheMasterKey(_ keyData: Data) {

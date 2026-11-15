@@ -225,13 +225,7 @@ enum MasterKeyRedactionFlowCoordinator {
             return nil
         }
 
-        guard let storagePolicy = MasterKeyPromptUI.presentStoragePolicyPrompt(
-            title: "Choose Master Key Storage",
-            message: "Store the master key only on this Mac or sync it through iCloud Keychain. Retrace will still show a recovery phrase backup."
-        ) else {
-            recordMetric(metrics.createCancelled, ["reason": "storage_policy_cancelled"])
-            return nil
-        }
+        let storagePolicy = MasterKeyStoragePolicy.iCloudKeychain
 
         recordMetric(metrics.createConfirmed, ["storagePolicy": storagePolicy.rawValue])
 
@@ -321,24 +315,14 @@ enum MasterKeyPromptUI {
                     showRecoveryErrorAlert("Enter the recovery phrase or import the TXT file.")
                     continue
                 }
-                guard let storagePolicy = presentStoragePolicyPrompt(
-                    title: "Restore Master Key To",
-                    message: "Choose where Retrace should restore this master key."
-                ) else {
-                    continue
-                }
+                let storagePolicy = MasterKeyStoragePolicy.iCloudKeychain
                 return .recover(text: recoveryText, method: .manualText, storagePolicy: storagePolicy)
             case .alertSecondButtonReturn:
                 onImportSelection?()
                 guard let importedText = importRecoveryTextFile() else {
                     continue
                 }
-                guard let storagePolicy = presentStoragePolicyPrompt(
-                    title: "Restore Master Key To",
-                    message: "Choose where Retrace should restore this master key."
-                ) else {
-                    continue
-                }
+                let storagePolicy = MasterKeyStoragePolicy.iCloudKeychain
                 return .recover(text: importedText, method: .txtImport, storagePolicy: storagePolicy)
             default:
                 return .cancel
@@ -377,30 +361,6 @@ enum MasterKeyPromptUI {
         } catch {
             showRecoveryErrorAlert("Couldn't save the recovery phrase.")
             return .failed
-        }
-    }
-
-    static func presentStoragePolicyPrompt(
-        title: String,
-        message: String,
-        icon: NSImage? = nil
-    ) -> MasterKeyStoragePolicy? {
-        let alert = NSAlert()
-        alert.alertStyle = .informational
-        alert.icon = icon ?? NSApp.applicationIconImage
-        alert.messageText = title
-        alert.informativeText = message
-        alert.addButton(withTitle: "This Mac Only")
-        alert.addButton(withTitle: "iCloud Keychain")
-        alert.addButton(withTitle: "Cancel")
-
-        switch alert.runModal() {
-        case .alertFirstButtonReturn:
-            return .localOnly
-        case .alertSecondButtonReturn:
-            return .iCloudKeychain
-        default:
-            return nil
         }
     }
 

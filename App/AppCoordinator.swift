@@ -412,6 +412,13 @@ public actor AppCoordinator {
     /// Initialize all services
     public func initialize() async throws {
         Log.info("Initializing AppCoordinator...", category: .app)
+        // Upgrade existing local master keys without generating new key material.
+        // Plaintext libraries can still open if synchronization storage is unavailable;
+        // protected operations report the actual Keychain error when attempted.
+        if await MasterKeyManager.hasMasterKeyAsync() {
+            do { _ = try await MasterKeyManager.loadMasterKeyAsync() }
+            catch { Log.warning("Could not prepare master key for iCloud Keychain: \(error.localizedDescription)", category: .app) }
+        }
         try await services.initialize()
         await flushDeferredMetricEventsIfNeeded()
 

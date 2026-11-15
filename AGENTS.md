@@ -67,7 +67,7 @@ retrace/
 │   ├── Logging.swift            # Central log utility (Log.debug/info/warning/error)
 │   ├── AppPaths.swift           # Application path configuration
 │   ├── BGRAImageUtilities.swift # Shared BGRA conversion + patch extraction helpers
-│   ├── MasterKeyManager.swift   # Keychain-backed master key creation + recovery phrase export
+│   ├── MasterKeyManager.swift   # iCloud-synchronizable master keys, legacy local-key migration, and recovery phrases
 │   ├── ReversibleOCRScrambler.swift # Deterministic reversible OCR patch scrambling + text protection
 │   ├── Models/                  # Data types used across modules
 │   │   ├── Frame.swift          # FrameID, CapturedFrame, VideoSegment

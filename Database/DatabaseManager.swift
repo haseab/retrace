@@ -2946,30 +2946,6 @@ public actor DatabaseManager: DatabaseProtocol {
         }
     }
 
-    /// Save encryption key to Keychain
-    private func saveKeyToKeychain(_ key: Data, service: String, account: String) throws {
-        // Use kSecAttrAccessibleAfterFirstUnlock with kSecAttrSynchronizable = false
-        // This prevents the keychain password prompt on every app launch
-        // kSecAttrSynchronizable = false ensures it stays local and doesn't prompt for iCloud Keychain
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecValueData as String: key,
-            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock,
-            kSecAttrSynchronizable as String: false  // Don't sync to iCloud, stay local
-        ]
-
-        // Delete existing item first
-        SecItemDelete(query as CFDictionary)
-
-        // Add new item
-        let status = SecItemAdd(query as CFDictionary, nil)
-        guard status == errSecSuccess else {
-            throw DatabaseError.connectionFailed(underlying: "Failed to save encryption key to Keychain (status: \(status))")
-        }
-    }
-
     /// Load encryption key from Keychain
     private func loadKeyFromKeychain(service: String, account: String) throws -> Data {
         let query: [String: Any] = [
@@ -3011,7 +2987,7 @@ public actor DatabaseManager: DatabaseProtocol {
     public static func saveDatabaseKeyToKeychain(
         _ key: Data,
         account: String = AppPaths.keychainAccount,
-        storagePolicy: MasterKeyStoragePolicy = .localOnly
+        storagePolicy: MasterKeyStoragePolicy = .iCloudKeychain
     ) throws {
         try saveKeyToKeychainStatic(
             key,
@@ -4094,15 +4070,15 @@ private extension DatabaseManager {
         _ key: Data,
         service: String,
         account: String,
-        storagePolicy: MasterKeyStoragePolicy = .localOnly
+        storagePolicy: MasterKeyStoragePolicy = .iCloudKeychain
     ) throws {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
             kSecValueData as String: key,
-            kSecAttrAccessible as String: storagePolicy.accessibleAttribute,
-            kSecAttrSynchronizable as String: storagePolicy.isSynchronizable
+            kSecAttrAccessible as String: MasterKeyStoragePolicy.iCloudKeychain.accessibleAttribute,
+            kSecAttrSynchronizable as String: true
         ]
 
         SecItemDelete([

@@ -2413,7 +2413,7 @@ private struct StartupRecoveryKeyRestoreView: View {
 
     @State private var recoveryPhraseText = ""
     @State private var recoveryError: String?
-    @State private var storagePolicy: MasterKeyStoragePolicy = .localOnly
+    @State private var storagePolicy: MasterKeyStoragePolicy = .iCloudKeychain
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -2424,11 +2424,8 @@ private struct StartupRecoveryKeyRestoreView: View {
                 .font(.body)
                 .foregroundStyle(.secondary)
 
-            Picker("Restore To", selection: $storagePolicy) {
-                Text("This Mac Only").tag(MasterKeyStoragePolicy.localOnly)
-                Text("iCloud Keychain").tag(MasterKeyStoragePolicy.iCloudKeychain)
-            }
-            .pickerStyle(.segmented)
+            Text("The restored key will use iCloud Keychain synchronization.")
+                .font(.body)
 
             TextEditor(text: $recoveryPhraseText)
                 .font(.system(.body, design: .monospaced))
