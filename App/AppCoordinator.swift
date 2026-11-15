@@ -2021,11 +2021,19 @@ public actor AppCoordinator {
     }
 
     /// Main pipeline: Capture → Storage → Processing → Database → Search
-    /// Uses Rewind-style multi-resolution video writing
-    private func runPipeline() async {
+    /// Uses Rewind-style multi-resolution video writing. Injected streams let regression
+    /// tests exercise the real writer/database path without capture permissions, shared
+    /// preview-cache writes, or persisted stop notifications.
+    func runPipeline(
+        frameStream suppliedFrameStream: AsyncStream<CapturedFrame>? = nil,
+        cacheCapturedStills: Bool = true,
+        reportUnexpectedStops: Bool = true
+    ) async {
         Log.info("Pipeline processing started", category: .app)
 
-        let frameStream = await services.capture.frameStream
+        let frameStream: AsyncStream<CapturedFrame>
+        if let suppliedFrameStream { frameStream = suppliedFrameStream }
+        else { frameStream = await services.capture.frameStream }
         var writersByResolution: [String: VideoWriterState] = [:]
         var pendingUnexpectedStop: PendingUnexpectedRecordingStop?
         var lastPipelineMemoryLogAt = Date.distantPast
@@ -2149,6 +2157,9 @@ public actor AppCoordinator {
                 }
 
                 writerState.frameCount += 1
+                // Encoding already succeeded. Preserve its count and pending work even
+                // when a later metadata/readability/enqueue operation throws.
+                defer { writersByResolution[resolutionKey] = writerState }
 
                 if writerState.width == 0 {
                     writerState.width = await writerState.writer.frameWidth
@@ -2180,10 +2191,9 @@ public actor AppCoordinator {
                     frameID: frameID,
                     capturedFrame: frame
                 )
-                await writeCapturedFrameStillToTimelineDiskCache(
-                    frameID: frameID,
-                    frame: frame
-                )
+                if cacheCapturedStills {
+                    await writeCapturedFrameStillToTimelineDiskCache(frameID: frameID, frame: frame)
+                }
                 scheduleInPageURLMetadataCaptureIfNeeded(
                     frameID: frameID,
                     frameMetadata: frame.metadata
@@ -2261,11 +2271,12 @@ public actor AppCoordinator {
                 // Mark frames as readable and enqueue for OCR if they've been flushed to disk
                 while let firstFrame = writerState.pendingFrames.first,
                       firstFrame.frameIndexInSegment < flushedCount {
-                    let frameToEnqueue = writerState.pendingFrames.removeFirst()
-                    // Mark frame as readable now that it's confirmed flushed to video file
+                    let frameToEnqueue = firstFrame
+                    // Keep pending work until both database operations succeed.
                     try await services.database.markFrameReadable(frameID: frameToEnqueue.frameID)
                     recordReadableFrameProgress(at: Date())
                     try await processingQueue.enqueue(frameID: frameToEnqueue.frameID)
+                    writerState.pendingFrames.removeFirst()
                 }
 
                 if flushedCount > writerState.persistedReadableFrameCount {
@@ -2423,7 +2434,7 @@ public actor AppCoordinator {
             currentSegmentID = nil
         }
 
-        if let pendingUnexpectedStop {
+        if let pendingUnexpectedStop, reportUnexpectedStops {
             let state = await recordUnexpectedRecordingStop(pendingUnexpectedStop)
             finalizePipelineStopped(persistState: true, clearCaptureTask: false)
             await MainActor.run {

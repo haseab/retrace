@@ -855,7 +855,7 @@ public actor DatabaseManager: DatabaseProtocol {
         sqlite3_bind_int64(statement, 1, frameID.value)
 
         var results: [OCRNodeWithText] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             let id = Int(sqlite3_column_int64(statement, 0))
             let nodeOrder = Int(sqlite3_column_int(statement, 1))
             let leftX = sqlite3_column_double(statement, 4)
@@ -1257,7 +1257,7 @@ public actor DatabaseManager: DatabaseProtocol {
         }
 
         var tags: [Tag] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             let id = sqlite3_column_int64(statement, 0)
             guard let namePtr = sqlite3_column_text(statement, 1) else { continue }
             let name = String(cString: namePtr)
@@ -1318,7 +1318,7 @@ public actor DatabaseManager: DatabaseProtocol {
         let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
         sqlite3_bind_text(statement, 1, name, -1, SQLITE_TRANSIENT)
 
-        guard sqlite3_step(statement) == SQLITE_ROW else {
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else {
             return nil
         }
 
@@ -1433,7 +1433,7 @@ public actor DatabaseManager: DatabaseProtocol {
 
         sqlite3_bind_int64(statement, 1, tagId.value)
 
-        guard sqlite3_step(statement) == SQLITE_ROW else {
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else {
             throw DatabaseError.queryFailed(
                 query: sql,
                 underlying: String(cString: sqlite3_errmsg(db))
@@ -1469,7 +1469,7 @@ public actor DatabaseManager: DatabaseProtocol {
         sqlite3_bind_int64(statement, 1, segmentId.value)
 
         var tags: [Tag] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             let id = sqlite3_column_int64(statement, 0)
             guard let namePtr = sqlite3_column_text(statement, 1) else { continue }
             let name = String(cString: namePtr)
@@ -1502,7 +1502,7 @@ public actor DatabaseManager: DatabaseProtocol {
         }
 
         var segmentIds: Set<SegmentID> = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             let id = sqlite3_column_int64(statement, 0)
             segmentIds.insert(SegmentID(value: id))
         }
@@ -1528,7 +1528,7 @@ public actor DatabaseManager: DatabaseProtocol {
         }
 
         var map: [Int64: Set<Int64>] = [:]
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             let segmentId = sqlite3_column_int64(statement, 0)
             let tagId = sqlite3_column_int64(statement, 1)
 
@@ -1563,7 +1563,7 @@ public actor DatabaseManager: DatabaseProtocol {
         }
 
         var map: [Int64: Int] = [:]
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             let segmentId = sqlite3_column_int64(statement, 0)
             let count = Int(sqlite3_column_int64(statement, 1))
             map[segmentId] = count
@@ -1764,7 +1764,7 @@ public actor DatabaseManager: DatabaseProtocol {
             sqlite3_bind_int64(statement, 1, segmentId.value)
 
             var comments: [SegmentComment] = []
-            while sqlite3_step(statement) == SQLITE_ROW {
+            while try SQLiteReadStep.next(statement) == SQLITE_ROW {
                 comments.append(parseSegmentComment(statement: statement!))
             }
 
@@ -1847,7 +1847,7 @@ public actor DatabaseManager: DatabaseProtocol {
             }
 
             var linkedComments: [LinkedSegmentComment] = []
-            while sqlite3_step(statement) == SQLITE_ROW {
+            while try SQLiteReadStep.next(statement) == SQLITE_ROW {
                 let comment = parseSegmentComment(statement: statement!)
                 let preferredSegmentID = SegmentID(value: sqlite3_column_int64(statement, 7))
                 linkedComments.append(
@@ -1908,7 +1908,7 @@ public actor DatabaseManager: DatabaseProtocol {
             browserURL: String?,
             referenceTimestamp: Date
         )] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             let comment = parseSegmentComment(statement: statement!)
             let segmentIDValue = sqlite3_column_int64(statement, 7)
             let appBundleID = sqlite3_column_text(statement, 8).map { String(cString: $0) }
@@ -1971,7 +1971,7 @@ public actor DatabaseManager: DatabaseProtocol {
         sqlite3_bind_int64(statement, 3, Int64(cappedOffset))
 
         var comments: [SegmentComment] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             comments.append(parseSegmentComment(statement: statement!))
         }
 
@@ -2053,7 +2053,7 @@ public actor DatabaseManager: DatabaseProtocol {
             referenceTimestamp: Date
         )] = []
 
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             let comment = parseSegmentComment(statement: statement!)
             let segmentIDValue = sqlite3_column_int64(statement, 7)
             let appBundleID = sqlite3_column_text(statement, 8).map { String(cString: $0) }
@@ -2110,7 +2110,7 @@ public actor DatabaseManager: DatabaseProtocol {
         }
 
         sqlite3_bind_int64(statement, 1, commentId.value)
-        guard sqlite3_step(statement) == SQLITE_ROW else {
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else {
             return nil
         }
 
@@ -2141,7 +2141,7 @@ public actor DatabaseManager: DatabaseProtocol {
         }
 
         sqlite3_bind_int64(statement, 1, segmentId.value)
-        guard sqlite3_step(statement) == SQLITE_ROW else {
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else {
             return nil
         }
 
@@ -2167,7 +2167,7 @@ public actor DatabaseManager: DatabaseProtocol {
         }
 
         sqlite3_bind_int64(statement, 1, commentID)
-        guard sqlite3_step(statement) == SQLITE_ROW else {
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else {
             return nil
         }
 
@@ -2236,7 +2236,7 @@ public actor DatabaseManager: DatabaseProtocol {
 
         sqlite3_bind_int64(statement, 1, commentId)
 
-        guard sqlite3_step(statement) == SQLITE_ROW else {
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else {
             return []
         }
 
@@ -2272,7 +2272,7 @@ public actor DatabaseManager: DatabaseProtocol {
         sqlite3_bind_int64(statement, 1, segmentId)
 
         var commentIDs: [Int64] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             commentIDs.append(sqlite3_column_int64(statement, 0))
         }
 
@@ -2289,7 +2289,7 @@ public actor DatabaseManager: DatabaseProtocol {
         }
 
         sqlite3_bind_int64(statement, 1, commentId)
-        guard sqlite3_step(statement) == SQLITE_ROW else {
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else {
             throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
         }
 
@@ -2514,7 +2514,7 @@ public actor DatabaseManager: DatabaseProtocol {
         sqlite3_bind_int64(statement, 1, videoID)
 
         var jobs: [PendingFrameDeletionJob] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             jobs.append(
                 PendingFrameDeletionJob(
                     frameID: sqlite3_column_int64(statement, 0),
@@ -2555,7 +2555,7 @@ public actor DatabaseManager: DatabaseProtocol {
         }
 
         var videoIDs: [Int64] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             videoIDs.append(sqlite3_column_int64(statement, 0))
         }
 
@@ -2637,7 +2637,7 @@ public actor DatabaseManager: DatabaseProtocol {
             }
 
             sqlite3_bind_int64(statement, 1, videoID)
-            guard sqlite3_step(statement) == SQLITE_ROW else { return 0 }
+            guard try SQLiteReadStep.next(statement) == SQLITE_ROW else { return 0 }
             return Int(sqlite3_column_int(statement, 0))
         }
 
@@ -2721,7 +2721,7 @@ public actor DatabaseManager: DatabaseProtocol {
 
             var immediatelyDeletedFrameIDs: [Int64] = []
             var scheduledJobs: [PendingFrameDeletionJob] = []
-            while sqlite3_step(selectStatement) == SQLITE_ROW {
+            while try SQLiteReadStep.next(selectStatement) == SQLITE_ROW {
                 let frameID = sqlite3_column_int64(selectStatement, 0)
                 if sqlite3_column_type(selectStatement, 1) == SQLITE_NULL {
                     immediatelyDeletedFrameIDs.append(frameID)
@@ -2829,7 +2829,7 @@ public actor DatabaseManager: DatabaseProtocol {
         sqlite3_bind_int64(statement, 1, Schema.dateToTimestamp(date))
 
         var frameIDs: [Int64] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             frameIDs.append(sqlite3_column_int64(statement, 0))
         }
 
@@ -2861,7 +2861,7 @@ public actor DatabaseManager: DatabaseProtocol {
                     sqlite3_bind_int64(statement, 1, plan.videoID)
 
                     var collectedIDs: [Int64] = []
-                    while sqlite3_step(statement) == SQLITE_ROW {
+                    while try SQLiteReadStep.next(statement) == SQLITE_ROW {
                         collectedIDs.append(sqlite3_column_int64(statement, 0))
                     }
                     deletionFrameIDs = collectedIDs
@@ -3013,7 +3013,7 @@ public actor DatabaseManager: DatabaseProtocol {
         sqlite3_bind_int64(statement, 1, videoID)
 
         var jobs: [PendingNodeRedactionJob] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             let frameID = sqlite3_column_int64(statement, 0)
             let frameIndex = Int(sqlite3_column_int(statement, 1))
             let nodeID = Int(sqlite3_column_int64(statement, 2))
@@ -3074,7 +3074,7 @@ public actor DatabaseManager: DatabaseProtocol {
         }
 
         var videoIDs: [Int64] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             videoIDs.append(sqlite3_column_int64(statement, 0))
         }
 
@@ -3106,7 +3106,7 @@ public actor DatabaseManager: DatabaseProtocol {
             )
         }
 
-        guard sqlite3_step(statement) == SQLITE_ROW else {
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else {
             throw DatabaseError.queryFailed(
                 query: sql,
                 underlying: String(cString: sqlite3_errmsg(db))
@@ -3184,7 +3184,7 @@ public actor DatabaseManager: DatabaseProtocol {
         }
 
         sqlite3_bind_int64(statement, 1, videoID)
-        return sqlite3_step(statement) == SQLITE_ROW
+        return try SQLiteReadStep.next(statement) == SQLITE_ROW
     }
 
     public func isVideoFinalized(videoID: Int64) async throws -> Bool {
@@ -3210,7 +3210,7 @@ public actor DatabaseManager: DatabaseProtocol {
         }
 
         sqlite3_bind_int64(statement, 1, videoID)
-        guard sqlite3_step(statement) == SQLITE_ROW else { return false }
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else { return false }
         return sqlite3_column_int(statement, 0) == 0
     }
 
@@ -3382,7 +3382,7 @@ public actor DatabaseManager: DatabaseProtocol {
 
         var snapshots: [(date: Date, dbBytes: Int64, walBytes: Int64, sampledAt: Date)] = []
 
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             guard let localDayTextPointer = sqlite3_column_text(statement, 0),
                   let snapshotDate = Self.parseLocalDay(String(cString: localDayTextPointer)) else {
                 continue
@@ -3478,7 +3478,7 @@ public actor DatabaseManager: DatabaseProtocol {
             )
         }
 
-        guard sqlite3_step(statement) == SQLITE_ROW else {
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else {
             throw DatabaseError.queryFailed(query: sql, underlying: "No result row")
         }
 
@@ -3594,7 +3594,7 @@ public actor DatabaseManager: DatabaseProtocol {
         guard sqlite3_prepare_v2(db, checkSQL, -1, &checkStmt, nil) == SQLITE_OK else { return }
 
         // If we already have entries in sqlite_sequence, we've already inserted data - don't offset
-        if sqlite3_step(checkStmt) == SQLITE_ROW {
+        if try SQLiteReadStep.next(checkStmt) == SQLITE_ROW {
             let count = sqlite3_column_int(checkStmt, 0)
             if count > 0 {
                 Log.debug("[DatabaseManager] AUTOINCREMENT already initialized, skipping offset", category: .database)
@@ -3631,7 +3631,7 @@ public actor DatabaseManager: DatabaseProtocol {
 
         var maxFrameID: Int64 = 0
         if sqlite3_prepare_v2(rewindDB, maxFrameSQL, -1, &maxFrameStmt, nil) == SQLITE_OK,
-           sqlite3_step(maxFrameStmt) == SQLITE_ROW {
+           try SQLiteReadStep.next(maxFrameStmt) == SQLITE_ROW {
             maxFrameID = sqlite3_column_int64(maxFrameStmt, 0)
         }
 
@@ -3642,7 +3642,7 @@ public actor DatabaseManager: DatabaseProtocol {
 
         var maxVideoID: Int64 = 0
         if sqlite3_prepare_v2(rewindDB, maxVideoSQL, -1, &maxVideoStmt, nil) == SQLITE_OK,
-           sqlite3_step(maxVideoStmt) == SQLITE_ROW {
+           try SQLiteReadStep.next(maxVideoStmt) == SQLITE_ROW {
             maxVideoID = sqlite3_column_int64(maxVideoStmt, 0)
         }
 
@@ -3719,7 +3719,7 @@ public actor DatabaseManager: DatabaseProtocol {
             )
         }
 
-        guard sqlite3_step(statement) == SQLITE_ROW else {
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else {
             return (nil, nil)
         }
 
@@ -4073,7 +4073,7 @@ public actor DatabaseManager: DatabaseProtocol {
                         throw DatabaseError.queryFailed(query: selectSql, underlying: String(cString: sqlite3_errmsg(db)))
                     }
 
-                    guard sqlite3_step(selectStmt) == SQLITE_ROW else {
+                    guard try SQLiteReadStep.next(selectStmt) == SQLITE_ROW else {
                         selection = nil
                         try executeImmediateSQL("COMMIT;", db: db)
                         transactionOpen = false
@@ -4160,7 +4160,7 @@ public actor DatabaseManager: DatabaseProtocol {
         defer { sqlite3_finalize(stmt) }
 
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK,
-              sqlite3_step(stmt) == SQLITE_ROW else {
+              try SQLiteReadStep.next(stmt) == SQLITE_ROW else {
             throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
         }
 
@@ -4178,7 +4178,7 @@ public actor DatabaseManager: DatabaseProtocol {
         defer { sqlite3_finalize(stmt) }
 
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK,
-              sqlite3_step(stmt) == SQLITE_ROW else {
+              try SQLiteReadStep.next(stmt) == SQLITE_ROW else {
             throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
         }
 
@@ -4214,7 +4214,7 @@ public actor DatabaseManager: DatabaseProtocol {
         var rewritePending = 0
         var rewriteProcessing = 0
 
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        while try SQLiteReadStep.next(stmt) == SQLITE_ROW {
             let status = Int(sqlite3_column_int(stmt, 0))
             let count = Int(sqlite3_column_int(stmt, 1))
             if status == 0 {
@@ -4270,7 +4270,7 @@ public actor DatabaseManager: DatabaseProtocol {
         }
 
         var frameIDs: [Int64] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        while try SQLiteReadStep.next(stmt) == SQLITE_ROW {
             frameIDs.append(sqlite3_column_int64(stmt, 0))
         }
 
@@ -4347,7 +4347,7 @@ public actor DatabaseManager: DatabaseProtocol {
             sqlite3_bind_int64(stmt, 2, cutoffMs)
 
             var result: [Int: Int] = [:]
-            while sqlite3_step(stmt) == SQLITE_ROW {
+            while try SQLiteReadStep.next(stmt) == SQLITE_ROW {
                 let minuteOffset = Int(sqlite3_column_int(stmt, 0))
                 let count = Int(sqlite3_column_int(stmt, 1))
                 if minuteOffset >= 0 && minuteOffset < lastMinutes {
@@ -4485,7 +4485,7 @@ public actor DatabaseManager: DatabaseProtocol {
 
         sqlite3_bind_int64(stmt, 1, frameID)
 
-        guard sqlite3_step(stmt) == SQLITE_ROW else {
+        guard try SQLiteReadStep.next(stmt) == SQLITE_ROW else {
             return nil // Frame not found
         }
 
@@ -4528,7 +4528,7 @@ public actor DatabaseManager: DatabaseProtocol {
             throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
         }
 
-        guard sqlite3_step(stmt) == SQLITE_ROW else { return 0 }
+        guard try SQLiteReadStep.next(stmt) == SQLITE_ROW else { return 0 }
         return Int(sqlite3_column_int64(stmt, 0))
     }
 
@@ -4557,7 +4557,7 @@ public actor DatabaseManager: DatabaseProtocol {
 
         sqlite3_bind_int64(stmt, 1, cutoffMs)
 
-        guard sqlite3_step(stmt) == SQLITE_ROW else { return 0 }
+        guard try SQLiteReadStep.next(stmt) == SQLITE_ROW else { return 0 }
         return Int(sqlite3_column_int64(stmt, 0))
     }
 
@@ -4575,7 +4575,7 @@ public actor DatabaseManager: DatabaseProtocol {
             throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
         }
 
-        guard sqlite3_step(stmt) == SQLITE_ROW else { return 0 }
+        guard try SQLiteReadStep.next(stmt) == SQLITE_ROW else { return 0 }
         return Int(sqlite3_column_int64(stmt, 0))
     }
 
@@ -4604,7 +4604,7 @@ public actor DatabaseManager: DatabaseProtocol {
             }
 
             var results: [Int64: Int] = [:]
-            while sqlite3_step(stmt) == SQLITE_ROW {
+            while try SQLiteReadStep.next(stmt) == SQLITE_ROW {
                 let frameID = sqlite3_column_int64(stmt, 0)
                 let status = Int(sqlite3_column_int(stmt, 1))
                 results[frameID] = status
@@ -4630,7 +4630,7 @@ public actor DatabaseManager: DatabaseProtocol {
 
         sqlite3_bind_int64(stmt, 1, frameID)
 
-        return sqlite3_step(stmt) == SQLITE_ROW
+        return try SQLiteReadStep.next(stmt) == SQLITE_ROW
     }
 
     /// Get the queue position for a frame (1-based, where 1 = next to be processed)
@@ -4652,7 +4652,7 @@ public actor DatabaseManager: DatabaseProtocol {
 
         sqlite3_bind_int64(targetStmt, 1, frameID)
 
-        guard sqlite3_step(targetStmt) == SQLITE_ROW else {
+        guard try SQLiteReadStep.next(targetStmt) == SQLITE_ROW else {
             return nil // Frame not in queue
         }
 
@@ -4675,7 +4675,7 @@ public actor DatabaseManager: DatabaseProtocol {
         sqlite3_bind_int(positionStmt, 2, priority)
         sqlite3_bind_double(positionStmt, 3, enqueuedAt)
 
-        guard sqlite3_step(positionStmt) == SQLITE_ROW else {
+        guard try SQLiteReadStep.next(positionStmt) == SQLITE_ROW else {
             return nil
         }
 
@@ -4708,7 +4708,7 @@ public actor DatabaseManager: DatabaseProtocol {
             sqlite3_bind_int(stmt, 1, Int32(limit))
 
             var frameIDs: [Int64] = []
-            while sqlite3_step(stmt) == SQLITE_ROW {
+            while try SQLiteReadStep.next(stmt) == SQLITE_ROW {
                 frameIDs.append(sqlite3_column_int64(stmt, 0))
             }
 
@@ -4736,7 +4736,7 @@ public actor DatabaseManager: DatabaseProtocol {
                 throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
             }
 
-            guard sqlite3_step(stmt) == SQLITE_ROW else {
+            guard try SQLiteReadStep.next(stmt) == SQLITE_ROW else {
                 return 0
             }
 
@@ -4764,7 +4764,7 @@ public actor DatabaseManager: DatabaseProtocol {
             throw DatabaseError.queryFailed(query: tablesSql, underlying: String(cString: sqlite3_errmsg(db)))
         }
 
-        while sqlite3_step(tablesStmt) == SQLITE_ROW {
+        while try SQLiteReadStep.next(tablesStmt) == SQLITE_ROW {
             guard let namePtr = sqlite3_column_text(tablesStmt, 0) else { continue }
             let tableName = String(cString: namePtr)
 
@@ -4779,7 +4779,7 @@ public actor DatabaseManager: DatabaseProtocol {
             var pragmaStmt: OpaquePointer?
 
             if sqlite3_prepare_v2(db, pragmaSql, -1, &pragmaStmt, nil) == SQLITE_OK {
-                while sqlite3_step(pragmaStmt) == SQLITE_ROW {
+                while try SQLiteReadStep.next(pragmaStmt) == SQLITE_ROW {
                     let colName = sqlite3_column_text(pragmaStmt, 1).map { String(cString: $0) } ?? "?"
                     let colType = sqlite3_column_text(pragmaStmt, 2).map { String(cString: $0) } ?? "?"
                     let notNull = sqlite3_column_int(pragmaStmt, 3) != 0
@@ -4808,7 +4808,7 @@ public actor DatabaseManager: DatabaseProtocol {
             return result + "Error loading indexes\n"
         }
 
-        while sqlite3_step(indexStmt) == SQLITE_ROW {
+        while try SQLiteReadStep.next(indexStmt) == SQLITE_ROW {
             let name = sqlite3_column_text(indexStmt, 0).map { String(cString: $0) } ?? "?"
             let table = sqlite3_column_text(indexStmt, 1).map { String(cString: $0) } ?? "?"
             result += "  \(name) ON \(table)\n"

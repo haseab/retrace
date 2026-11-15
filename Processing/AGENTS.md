@@ -414,3 +414,5 @@ Recovery scanning must wait for all active rewrites and block new rewrite reserv
 ### Batch enqueue
 
 `FrameProcessingQueue.enqueueBatch` passes the whole ID list to `DatabaseManager.enqueueFramesForProcessing` in one await. Increase `currentQueueDepth` only after the database commits the whole batch; empty batches are no-ops and failures add nothing. `RewriteRetryPolicyTests.testEnqueueBatchIsAtomicAndUsesDatabaseBatch` exercises this wiring against migrated SQLite. This is maintenance of an existing action; no new daily metric is needed.
+
+When checking whether a frame is unrecoverable, a failed video-row lookup must not authorize deletion. Only a successful missing-row result establishes that the video row is absent. `RewriteRetryPolicyTests.testDatabaseReadFailureDoesNotAuthorizeFrameDeletion` covers a denied read against real SQLite.

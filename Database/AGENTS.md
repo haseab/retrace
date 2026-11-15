@@ -44,6 +44,7 @@ Database/
     ├── AsyncQueuePipelineTests.swift
     ├── RetentionVideoDeletionTests.swift # Real migrated SQLite retention guards and injected failure
     ├── DatabaseManagerTests.swift
+    ├── SQLiteReadSafetyTests.swift # Text-buffer lifetime, missing/error distinction and bounded lock retries
     ├── EdgeCaseTests.swift
     ├── ProcessingStatusIndexTests.swift # V19 upgrade, index population and production query plans
     ├── ProcessingQueueBatchTests.swift # Atomic backlog enqueue, statement reuse and eligibility checks
@@ -671,3 +672,9 @@ The existing `node.encryptedText` column stores either the reversible protected-
 ### Partial processing-status index
 
 V20 replaces `idx_frame_processing_status` with `ON frame(processingStatus) WHERE processingStatus != 2`. Add the explicit `!= 2` conjunct to status-driven unfinished-work queries: SQLite does not infer it from `= 0` or `IN (...)`. Do not add it to primary-key/timeline reads that need completed frames. V6's completed-frame backfill runs before this migration while the full index still exists. Status 7 (rewritten), retry/failed states, and future non-2 values remain indexed; NULL rows remain stored but are excluded by the predicate. MigrationRunner applies the replacement atomically and only once; dropping the full index frees reusable database pages without running VACUUM.
+
+### Safe read iteration and text binding
+
+- Bind temporary Swift/Foundation text using `SQLITE_TRANSIENT` (the destructor sentinel `unsafeBitCast(-1, to: sqlite3_destructor_type.self)`). SQLite must own a copy until the statement is finalized or rebound.
+- Core frame/video/app and DatabaseManager SELECTs use `SQLiteReadStep.next`. Only `SQLITE_DONE` means no more rows; other errors must propagate rather than returning missing/empty/partial data.
+- Retry a busy/locked read once, only before its first row, using the existing connection timeout. Never retry interruption, I/O/corruption errors, writes, or restart a result set after rows have been returned.

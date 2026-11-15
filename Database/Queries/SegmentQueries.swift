@@ -208,7 +208,7 @@ enum SegmentQueries {
         sqlite3_bind_int(statement, 1, Int32(width))
         sqlite3_bind_int(statement, 2, Int32(height))
 
-        guard sqlite3_step(statement) == SQLITE_ROW else {
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else {
             return nil
         }
 
@@ -250,7 +250,7 @@ enum SegmentQueries {
         }
 
         var results: [UnfinalisedVideo] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             let id = sqlite3_column_int64(statement, 0)
             guard let pathText = sqlite3_column_text(statement, 1) else { continue }
             let path = String(cString: pathText)
@@ -293,7 +293,7 @@ enum SegmentQueries {
 
         sqlite3_bind_int64(statement, 1, id.value)
 
-        guard sqlite3_step(statement) == SQLITE_ROW else {
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else {
             return nil
         }
 
@@ -329,7 +329,7 @@ enum SegmentQueries {
         sqlite3_bind_text(statement, 3, "*/\(stem)", -1, SQLITE_TRANSIENT)
         sqlite3_bind_text(statement, 4, "*/\(stem).mp4", -1, SQLITE_TRANSIENT)
 
-        guard sqlite3_step(statement) == SQLITE_ROW else {
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else {
             return nil
         }
 
@@ -364,7 +364,7 @@ enum SegmentQueries {
         let timestampMs = Schema.dateToTimestamp(timestamp)
         sqlite3_bind_int64(statement, 1, timestampMs)
 
-        guard sqlite3_step(statement) == SQLITE_ROW else {
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else {
             return nil
         }
 
@@ -403,7 +403,7 @@ enum SegmentQueries {
         sqlite3_bind_int64(statement, 2, Schema.dateToTimestamp(endDate))
 
         var segments: [VideoSegment] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             let segment = try parseVideoRow(statement: statement!)
             segments.append(segment)
         }
@@ -484,7 +484,7 @@ enum SegmentQueries {
             )
         }
 
-        guard sqlite3_step(statement) == SQLITE_ROW else {
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else {
             return 0
         }
 
@@ -506,7 +506,7 @@ enum SegmentQueries {
             )
         }
 
-        guard sqlite3_step(statement) == SQLITE_ROW else {
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else {
             return 0
         }
 

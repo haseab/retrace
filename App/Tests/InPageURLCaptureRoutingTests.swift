@@ -361,6 +361,26 @@ final class DBStorageSnapshotEstimateTests: XCTestCase {
 }
 
 final class DataAdapterRewindBoundaryTests: XCTestCase {
+    func testTimelinePreparationFailuresAreNotEmptyResults() async throws {
+        let pool = SQLiteReadConnectionPool(label: "broken_timeline", sharedConnection: BrokenDatabaseConnection())
+        let fixture = try await makeFixture(cutoffDate: .distantPast, retraceReadConnectionPool: pool)
+        do {
+            do {
+                _ = try await fixture.adapter.getMostRecentFramesWithVideoInfo()
+                XCTFail("Expected database preparation failure")
+            } catch DatabaseConnectionError.notConnected {}
+            do {
+                _ = try await fixture.adapter.getFramesWithVideoInfo(from: Date(timeIntervalSince1970: 1), to: .distantFuture)
+                XCTFail("Expected database preparation failure")
+            } catch DatabaseConnectionError.notConnected {}
+            try await close(fixture)
+        } catch {
+            try? await close(fixture)
+            throw error
+        }
+    }
+
+
     private final class BrokenDatabaseConnection: DatabaseConnection, @unchecked Sendable {
         func getConnection() -> OpaquePointer? {
             nil
