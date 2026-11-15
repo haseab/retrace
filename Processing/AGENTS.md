@@ -421,9 +421,8 @@ When checking whether a frame is unrecoverable, a failed video-row lookup must n
 
 ### Window title attribution
 
-After phrase redaction, `FrameProcessingQueue` validates dedicated capture evidence using
-existing main/chrome OCR regions; do not run extra OCR or current-time AX queries here.
-OCR bounds are top-left frame pixels; capture evidence regions are top-left normalized.
-Publish only confirmed titles to the frame-owned segment and FTS metadata. Missing/changed
-AX, excluded OCR, unavailable title geometry or mismatched OCR leave screenshots retained
-and titles unassigned. Emit `window_title_validation` outcome metrics without title text.
+After phrase redaction, validate dedicated capture evidence using existing main/chrome OCR;
+never run another OCR pass or current-time AX here. Caption/selected-tab geometry excludes
+body/sidebar mentions. Persist title/score/reason on the frame; never rename its segment.
+Only scores >=9 enter FTS title metadata. Scores 10/9/7/5/0 follow root policy. Missing geometry
+cannot support OCR recovery. Emit outcome and integer confidence metrics without title text.

@@ -35,7 +35,7 @@ public enum DailyMetricsQueries {
         case timelineOpens = "timeline_opens"
         case searches = "searches"
         case textCopies = "text_copies"
-        case windowTitleValidation = "window_title_validation" // JSON {outcome}; no titles or URLs
+        case windowTitleValidation = "window_title_validation" // JSON {outcome, confidence?}; no titles or URLs
 
         // New metrics for Retrace Wrapped
         case imageCopies = "image_copies"

@@ -1584,6 +1584,13 @@ public actor DataAdapter {
         let videoCurrentTimeColumn: String
     }
 
+    /// Read-only Rewind libraries have no confidence evidence. Keep their displayed title,
+    /// but never manufacture a high-confidence title match.
+    private static func windowTitleColumn(source: FrameSource, trustedOnly: Bool = false) -> String {
+        if source == .rewind { return trustedOnly ? "NULL" : "s.windowName" }
+        return FrameQueries.windowTitleSQL(trustedOnly: trustedOnly)
+    }
+
     private static func frameWithVideoProjection(
         source: FrameSource,
         tableAlias: String
@@ -1641,13 +1648,13 @@ public actor DataAdapter {
         videoAlias: String
     ) -> String {
         if source == .rewind {
-            return "\(videoAlias).path, \(videoAlias).frameRate, \(videoAlias).width, \(videoAlias).height, 0 as videoProcessingState, NULL as videoFileSize, NULL as videoFrameCount, NULL as videoReencodedAt"
+            return "\(videoAlias).path, \(videoAlias).frameRate, \(videoAlias).width, \(videoAlias).height, 0 as videoProcessingState, NULL as videoFileSize, NULL as videoFrameCount, NULL as videoReencodedAt, NULL as windowTitleConfidence, NULL as windowTitleValidationOutcome"
         }
 
         return """
             \(videoAlias).path, \(videoAlias).frameRate, \(videoAlias).width, \(videoAlias).height,
             \(videoAlias).processingState as videoProcessingState, \(videoAlias).fileSize as videoFileSize, \(videoAlias).frameCount as videoFrameCount,
-            (SELECT MAX(fr.rewrittenAt) FROM frame fr WHERE fr.videoId = \(frameAlias).videoId) as videoReencodedAt
+            (SELECT MAX(fr.rewrittenAt) FROM frame fr WHERE fr.videoId = \(frameAlias).videoId) as videoReencodedAt, \(frameAlias).windowTitleConfidence, \(frameAlias).windowTitleValidationOutcome
             """
     }
 
@@ -1706,7 +1713,7 @@ public actor DataAdapter {
                 \(projection.redactionReasonColumn),
                 \(projection.captureTriggerColumn),
                 s.bundleID,
-                s.windowName,
+                \(Self.windowTitleColumn(source: config.source)),
                 s.browserUrl,
                 \(projection.mousePositionColumn),
                 \(projection.scrollPositionColumn),
@@ -1786,10 +1793,10 @@ public actor DataAdapter {
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, \(projection.encodedAtColumn), \(projection.processingStatusColumn), \(projection.redactionReasonColumn),
                    \(projection.captureTriggerColumn),
-                   s.bundleID, s.windowName, s.browserUrl, \(projection.mousePositionColumn), \(projection.scrollPositionColumn), \(projection.videoCurrentTimeColumn),
+                   s.bundleID, \(Self.windowTitleColumn(source: config.source)), s.browserUrl, \(projection.mousePositionColumn), \(projection.scrollPositionColumn), \(projection.videoCurrentTimeColumn),
                    \(Self.videoInfoProjection(source: config.source, frameAlias: "f", videoAlias: "v"))
             FROM (
-                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, \(subqueryProjection.encodedAtColumn), \(subqueryProjection.processingStatusColumn), \(subqueryProjection.redactionReasonColumn), \(subqueryProjection.captureTriggerColumn), \(subqueryProjection.mousePositionColumn), \(subqueryProjection.scrollPositionColumn), \(subqueryProjection.videoCurrentTimeColumn)
+                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, \(subqueryProjection.encodedAtColumn), \(subqueryProjection.processingStatusColumn), \(subqueryProjection.redactionReasonColumn), \(subqueryProjection.captureTriggerColumn), \(subqueryProjection.mousePositionColumn), \(subqueryProjection.scrollPositionColumn), \(subqueryProjection.videoCurrentTimeColumn), \(config.source == .rewind ? "NULL AS resolvedWindowTitle, NULL AS windowTitleValidationOutcome, 0 AS windowTitleConfidence" : "resolvedWindowTitle, windowTitleValidationOutcome, windowTitleConfidence")
                 FROM frame
                 \(boundaryWhereClause)
                 ORDER BY createdAt DESC
@@ -1840,7 +1847,7 @@ public actor DataAdapter {
 
         // Sparse metadata filters are often selective; use a segment-first query shape so SQLite doesn't
         // scan the full frame table just to satisfy ORDER BY createdAt LIMIT N.
-        if hasSegmentMetadataFilter && !hasSelectedTagFilters && filters.hiddenFilter != .onlyHidden {
+        if hasSegmentMetadataFilter && !hasWindowNameFilter && !hasSelectedTagFilters && filters.hiddenFilter != .onlyHidden {
             return try Self.queryMostRecentFramesWithSegmentMetadataFilterSegmentFirst(
                 limit: limit,
                 connection: connection,
@@ -1869,7 +1876,7 @@ public actor DataAdapter {
             \(filterComponents.combinedCTE)
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, \(projection.encodedAtColumn), \(projection.processingStatusColumn), \(projection.redactionReasonColumn),
                    \(projection.captureTriggerColumn),
-                   s.bundleID, s.windowName, s.browserUrl, \(projection.mousePositionColumn), \(projection.scrollPositionColumn), \(projection.videoCurrentTimeColumn),
+                   s.bundleID, \(Self.windowTitleColumn(source: config.source)), s.browserUrl, \(projection.mousePositionColumn), \(projection.scrollPositionColumn), \(projection.videoCurrentTimeColumn),
                    \(Self.videoInfoProjection(source: config.source, frameAlias: "f", videoAlias: "v"))
             FROM frame f
             INNER JOIN segment s ON f.segmentId = s.id
@@ -1987,13 +1994,6 @@ public actor DataAdapter {
             whereConditions: &segmentWhereClauses,
             bindValues: &segmentMetadataBindValues
         )
-        Self.appendMetadataStringFilter(
-            columnName: "s2.windowName",
-            parsedFilter: windowNameFilter,
-            whereConditions: &segmentWhereClauses,
-            bindValues: &segmentMetadataBindValues
-        )
-
         let segmentWhereClause = segmentWhereClauses.joined(separator: " AND ")
         whereClauses.append("""
             f.segmentId IN (
@@ -2041,7 +2041,7 @@ public actor DataAdapter {
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, \(projection.encodedAtColumn), \(projection.processingStatusColumn), \(projection.redactionReasonColumn),
                    \(projection.captureTriggerColumn),
-                   s.bundleID, s.windowName, s.browserUrl, \(projection.mousePositionColumn), \(projection.scrollPositionColumn), \(projection.videoCurrentTimeColumn),
+                   s.bundleID, \(Self.windowTitleColumn(source: config.source)), s.browserUrl, \(projection.mousePositionColumn), \(projection.scrollPositionColumn), \(projection.videoCurrentTimeColumn),
                    \(Self.videoInfoProjection(source: config.source, frameAlias: "f", videoAlias: "v"))
             FROM frame f
             INNER JOIN segment s ON f.segmentId = s.id
@@ -2124,7 +2124,7 @@ public actor DataAdapter {
             \(filterComponents.combinedCTE)
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, \(projection.encodedAtColumn), \(projection.processingStatusColumn), \(projection.redactionReasonColumn),
                    \(projection.captureTriggerColumn),
-                   s.bundleID, s.windowName, s.browserUrl, \(projection.mousePositionColumn), \(projection.scrollPositionColumn), \(projection.videoCurrentTimeColumn),
+                   s.bundleID, \(Self.windowTitleColumn(source: config.source)), s.browserUrl, \(projection.mousePositionColumn), \(projection.scrollPositionColumn), \(projection.videoCurrentTimeColumn),
                    \(Self.videoInfoProjection(source: config.source, frameAlias: "f", videoAlias: "v"))
             FROM frame f
             INNER JOIN segment s ON f.segmentId = s.id
@@ -2197,7 +2197,7 @@ public actor DataAdapter {
             \(filterComponents.combinedCTE)
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, \(projection.encodedAtColumn), \(projection.processingStatusColumn), \(projection.redactionReasonColumn),
                    \(projection.captureTriggerColumn),
-                   s.bundleID, s.windowName, s.browserUrl, \(projection.mousePositionColumn), \(projection.scrollPositionColumn), \(projection.videoCurrentTimeColumn),
+                   s.bundleID, \(Self.windowTitleColumn(source: config.source)), s.browserUrl, \(projection.mousePositionColumn), \(projection.scrollPositionColumn), \(projection.videoCurrentTimeColumn),
                    \(Self.videoInfoProjection(source: config.source, frameAlias: "f", videoAlias: "v"))
             FROM frame f
             INNER JOIN segment s ON f.segmentId = s.id
@@ -2276,7 +2276,7 @@ public actor DataAdapter {
             \(filterComponents.combinedCTE)
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, \(projection.encodedAtColumn), \(projection.processingStatusColumn), \(projection.redactionReasonColumn),
                    \(projection.captureTriggerColumn),
-                   s.bundleID, s.windowName, s.browserUrl, \(projection.mousePositionColumn), \(projection.scrollPositionColumn), \(projection.videoCurrentTimeColumn),
+                   s.bundleID, \(Self.windowTitleColumn(source: config.source)), s.browserUrl, \(projection.mousePositionColumn), \(projection.scrollPositionColumn), \(projection.videoCurrentTimeColumn),
                    \(Self.videoInfoProjection(source: config.source, frameAlias: "f", videoAlias: "v"))
             FROM frame f
             INNER JOIN segment s ON f.segmentId = s.id
@@ -2375,10 +2375,10 @@ public actor DataAdapter {
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, \(projection.encodedAtColumn), \(projection.processingStatusColumn), \(projection.redactionReasonColumn),
                    \(projection.captureTriggerColumn),
-                   s.bundleID, s.windowName, s.browserUrl, \(projection.mousePositionColumn), \(projection.scrollPositionColumn), \(projection.videoCurrentTimeColumn),
+                   s.bundleID, \(Self.windowTitleColumn(source: config.source)), s.browserUrl, \(projection.mousePositionColumn), \(projection.scrollPositionColumn), \(projection.videoCurrentTimeColumn),
                    \(Self.videoInfoProjection(source: config.source, frameAlias: "f", videoAlias: "v"))
             FROM (
-                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, \(subqueryProjection.encodedAtColumn), \(subqueryProjection.processingStatusColumn), \(subqueryProjection.redactionReasonColumn), \(subqueryProjection.captureTriggerColumn), \(subqueryProjection.mousePositionColumn), \(subqueryProjection.scrollPositionColumn), \(subqueryProjection.videoCurrentTimeColumn)
+                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, \(subqueryProjection.encodedAtColumn), \(subqueryProjection.processingStatusColumn), \(subqueryProjection.redactionReasonColumn), \(subqueryProjection.captureTriggerColumn), \(subqueryProjection.mousePositionColumn), \(subqueryProjection.scrollPositionColumn), \(subqueryProjection.videoCurrentTimeColumn), \(config.source == .rewind ? "NULL AS resolvedWindowTitle, NULL AS windowTitleValidationOutcome, 0 AS windowTitleConfidence" : "resolvedWindowTitle, windowTitleValidationOutcome, windowTitleConfidence")
                 FROM frame
                 WHERE \(whereClause)
                 ORDER BY createdAt DESC
@@ -2479,10 +2479,10 @@ public actor DataAdapter {
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, \(projection.encodedAtColumn), \(projection.processingStatusColumn), \(projection.redactionReasonColumn),
                    \(projection.captureTriggerColumn),
-                   s.bundleID, s.windowName, s.browserUrl, \(projection.mousePositionColumn), \(projection.scrollPositionColumn), \(projection.videoCurrentTimeColumn),
+                   s.bundleID, \(Self.windowTitleColumn(source: config.source)), s.browserUrl, \(projection.mousePositionColumn), \(projection.scrollPositionColumn), \(projection.videoCurrentTimeColumn),
                    \(Self.videoInfoProjection(source: config.source, frameAlias: "f", videoAlias: "v"))
             FROM (
-                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, \(subqueryProjection.encodedAtColumn), \(subqueryProjection.processingStatusColumn), \(subqueryProjection.redactionReasonColumn), \(subqueryProjection.captureTriggerColumn), \(subqueryProjection.mousePositionColumn), \(subqueryProjection.scrollPositionColumn), \(subqueryProjection.videoCurrentTimeColumn)
+                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, \(subqueryProjection.encodedAtColumn), \(subqueryProjection.processingStatusColumn), \(subqueryProjection.redactionReasonColumn), \(subqueryProjection.captureTriggerColumn), \(subqueryProjection.mousePositionColumn), \(subqueryProjection.scrollPositionColumn), \(subqueryProjection.videoCurrentTimeColumn), \(config.source == .rewind ? "NULL AS resolvedWindowTitle, NULL AS windowTitleValidationOutcome, 0 AS windowTitleConfidence" : "resolvedWindowTitle, windowTitleValidationOutcome, windowTitleConfidence")
                 FROM frame
                 WHERE \(whereClause)
                 ORDER BY createdAt ASC
@@ -2552,7 +2552,7 @@ public actor DataAdapter {
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, \(projection.encodedAtColumn), \(projection.processingStatusColumn), \(projection.redactionReasonColumn),
                    \(projection.captureTriggerColumn),
-                   s.bundleID, s.windowName, s.browserUrl, \(projection.mousePositionColumn), \(projection.scrollPositionColumn), \(projection.videoCurrentTimeColumn),
+                   s.bundleID, \(Self.windowTitleColumn(source: config.source)), s.browserUrl, \(projection.mousePositionColumn), \(projection.scrollPositionColumn), \(projection.videoCurrentTimeColumn),
                    \(Self.videoInfoProjection(source: config.source, frameAlias: "f", videoAlias: "v"))
             FROM frame f
             LEFT JOIN segment s ON f.segmentId = s.id
@@ -3182,7 +3182,7 @@ public actor DataAdapter {
         // Advanced metadata filters (single-value legacy and encoded multi-value include/exclude).
         let windowNameFilter = decodeMetadataStringFilter(query.filters.windowNameFilter)
         Self.appendMetadataStringFilter(
-            columnName: "s.windowName",
+            columnName: Self.windowTitleColumn(source: config.source, trustedOnly: true),
             parsedFilter: windowNameFilter,
             whereConditions: &outerWhereConditions,
             bindValues: &outerBindValues
@@ -3332,7 +3332,7 @@ public actor DataAdapter {
                     \(redactionReasonColumn),
                     \(captureTriggerColumn),
                     s.bundleID AS bundle_id,
-                    s.windowName AS window_name,
+                    \(Self.windowTitleColumn(source: config.source)) AS window_name,
                     s.browserUrl AS browser_url,
                     r.rank AS rank,
                     r.docid AS docid
@@ -3676,7 +3676,7 @@ public actor DataAdapter {
         // Advanced metadata filters (single-value legacy and encoded multi-value include/exclude).
         let windowNameFilter = decodeMetadataStringFilter(query.filters.windowNameFilter)
         Self.appendMetadataStringFilter(
-            columnName: "s.windowName",
+            columnName: Self.windowTitleColumn(source: config.source, trustedOnly: true),
             parsedFilter: windowNameFilter,
             whereConditions: &whereConditions,
             bindValues: &bindValues
@@ -3865,7 +3865,7 @@ public actor DataAdapter {
                         \(redactionReasonColumn),
                         \(captureTriggerColumn),
                         s.bundleID AS bundle_id,
-                        s.windowName AS window_name,
+                        \(Self.windowTitleColumn(source: config.source)) AS window_name,
                         s.browserUrl AS browser_url,
                         d.docid AS docid
                     FROM fts_docs d
@@ -3897,7 +3897,7 @@ public actor DataAdapter {
                         \(redactionReasonColumn),
                         \(captureTriggerColumn),
                         s.bundleID AS bundle_id,
-                        s.windowName AS window_name,
+                        \(Self.windowTitleColumn(source: config.source)) AS window_name,
                         s.browserUrl AS browser_url,
                         ds.docid AS docid
                     FROM fts_matches fts
@@ -3942,7 +3942,7 @@ public actor DataAdapter {
                         \(redactionReasonColumn),
                         \(captureTriggerColumn),
                         s.bundleID AS bundle_id,
-                        s.windowName AS window_name,
+                        \(Self.windowTitleColumn(source: config.source)) AS window_name,
                         s.browserUrl AS browser_url,
                         ds.docid AS docid
                     FROM doc_segment ds
@@ -4321,6 +4321,9 @@ public actor DataAdapter {
         whereConditions: inout [String],
         bindValues: inout [String]
     ) {
+        if parsedFilter.hasActiveFilters, columnName == "NULL" || columnName.contains("windowTitleConfidence") {
+            whereConditions.append("(\(columnName)) IS NOT NULL")
+        }
         for term in parsedFilter.includeTerms {
             guard let predicate = metadataStringFilterPredicate(columnName: columnName, term: term, negate: false) else {
                 continue
@@ -4687,7 +4690,7 @@ public actor DataAdapter {
             bindValues: &metadataBindValues
         )
         Self.appendMetadataStringFilter(
-            columnName: "s.windowName",
+            columnName: Self.windowTitleColumn(source: config.source, trustedOnly: true),
             parsedFilter: windowNameFilter,
             whereConditions: &whereClauses,
             bindValues: &metadataBindValues
@@ -4922,7 +4925,9 @@ public actor DataAdapter {
             redactionReason: redactionReason,
             captureTrigger: captureTrigger,
             displayID: 0,
-            mousePosition: mousePosition.map { CGPoint(x: $0.x, y: $0.y) }
+            mousePosition: mousePosition.map { CGPoint(x: $0.x, y: $0.y) },
+            windowTitleConfidence: sqlite3_column_type(statement, 23) == SQLITE_NULL ? nil : Int(sqlite3_column_int(statement, 23)),
+            windowTitleValidationOutcome: Self.getTextOrNil(statement, 24)
         )
 
         let frame = FrameReference(

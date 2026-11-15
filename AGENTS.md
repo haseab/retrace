@@ -77,7 +77,7 @@ retrace/
 │   ├── MasterKeyManager.swift   # Keychain-backed master key creation + recovery phrase export
 │   ├── ReversibleOCRScrambler.swift # Deterministic reversible OCR patch scrambling + text protection
 │   ├── Models/                  # Data types used across modules
-│   │   ├── WindowTitleValidation.swift # Capture boundary evidence and word-level OCR matching
+│   │   ├── WindowTitleValidation.swift # Capture evidence, caption geometry and word-level OCR matching
 │   │   ├── Frame.swift          # FrameID, CapturedFrame, VideoSegment
 │   │   ├── Text.swift           # ExtractedText, OCRTextRegion
 │   │   ├── TextRegion.swift     # OCR text region types
@@ -556,11 +556,19 @@ _This file follows the AGENTS.md standard for AI agent guidance. Last updated: 2
 
 ## Capture window-title validation
 
-New native captures keep an optional `WindowTitleEvidence` in a dedicated frame column
-(V21 migration), independent of in-page URL metadata. Capture takes a fresh AX window
-observation immediately before pixels, suspends 150ms, then takes another. Late metadata
-enrichment must not restore pending titles. Existing OCR verifies the full caption or
-selected browser tab; ambiguous/unreadable frames remain stored with an unassigned title.
-Each pending frame owns a segment so delayed OCR cannot rename neighbouring frames.
-Legacy/imported frames are unchanged. Run `python3 scripts/validate_window_titles.py` on
-Command Line Tools hosts without XCTest, in addition to a normal App target build.
+New native captures retain `WindowTitleEvidence` separately from in-page URL metadata (V21).
+AX before → screenshot → async 150ms wait → AX after supplies capture evidence; the second
+read observes identity changes too. Existing privacy-sanitized OCR resolves each frame's
+`resolvedWindowTitle`, integer `windowTitleConfidence` and reason (V22). Keep normal shared
+segments and all screenshots. Never rename a shared segment during OCR.
+
+Scores: exact/explicit matching ellipsis 10; plausible spelling 9; OCR-recovered caption 7;
+ambiguous/unreadable with AX fallback 5; pending/unavailable 0. If AX changes, a unique OCR
+match selects the matching boundary at 10. A missing boundary caps OCR support at 7.
+These are policy scores, not probabilities.
+Only confidence >=9 participates in title-specific filters, title-only FTS matches and
+window-title dashboard grouping. Historical/imported titles stay readable but have unknown
+confidence and cannot satisfy title filters. OCR-content search remains available.
+The APP coordinator owns this cross-module change across Shared/Capture/Processing/Database/App.
+Run `python3 scripts/validate_window_titles.py` on Command Line Tools hosts without XCTest,
+in addition to a normal App target build.

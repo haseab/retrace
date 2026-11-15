@@ -335,7 +335,9 @@ enum AppSegmentQueries {
                 WHERE bundleID = ?
                   AND startDate <= ?
                   AND endDate >= ?
-                  AND windowName = ?
+                  AND EXISTS (SELECT 1 FROM frame f
+                      WHERE f.segmentId = segment.id
+                        AND \(FrameQueries.windowTitleSQL(segment: "segment", trustedOnly: true)) = ?)
                 ORDER BY startDate DESC
                 LIMIT ? OFFSET ?
                 """
@@ -575,11 +577,11 @@ enum AppSegmentQueries {
                                             END
                                         ELSE browserUrl
                                     END
-                                ELSE windowName
+                                ELSE \(FrameQueries.windowTitleSQL(trustedOnly: true))
                             END
-                        ELSE windowName
+                        ELSE \(FrameQueries.windowTitleSQL(trustedOnly: true))
                     END) as unique_count
-                FROM segment s
+                FROM segment s JOIN frame f ON f.segmentId=s.id
                 WHERE startDate >= ? AND startDate <= ?
                     AND NOT EXISTS (
                         SELECT 1 FROM segment_tag st
@@ -728,7 +730,7 @@ enum AppSegmentQueries {
                         f.createdAt,
                         s.bundleID,
                         s.id as segmentId,
-                        s.windowName,
+                        \(FrameQueries.windowTitleSQL(trustedOnly: true)) AS windowName,
                         s.browserUrl,
                         CASE
                             WHEN s.browserUrl IS NOT NULL AND s.browserUrl != '' THEN
@@ -869,7 +871,7 @@ enum AppSegmentQueries {
                         f.createdAt,
                         s.bundleID,
                         s.id as segmentId,
-                        s.windowName as item_name
+                        \(FrameQueries.windowTitleSQL(trustedOnly: true)) as item_name
                     FROM frame f
                     JOIN segment s ON f.segmentId = s.id
                     WHERE f.createdAt >= ? AND f.createdAt <= ?
@@ -994,7 +996,7 @@ enum AppSegmentQueries {
                     f.createdAt,
                     s.bundleID,
                     s.id as segmentId,
-                    s.windowName as tab_name,
+                    \(FrameQueries.windowTitleSQL(trustedOnly: true)) as tab_name,
                     s.browserUrl as url
                 FROM frame f
                 JOIN segment s ON f.segmentId = s.id
@@ -1089,7 +1091,7 @@ enum AppSegmentQueries {
                     f.createdAt,
                     s.bundleID,
                     s.id as segmentId,
-                    s.windowName as tab_name,
+                    \(FrameQueries.windowTitleSQL(trustedOnly: true)) as tab_name,
                     s.browserUrl as url,
                     CASE
                         WHEN s.browserUrl IS NOT NULL AND s.browserUrl != '' THEN

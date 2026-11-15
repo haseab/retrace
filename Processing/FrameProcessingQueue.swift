@@ -1269,7 +1269,7 @@ public actor FrameProcessingQueue {
                 regions: sanitized.regions, chromeRegions: sanitized.chromeRegions,
                 fullText: sanitized.fullText, chromeText: sanitized.chromeText,
                 metadata: FrameMetadata(appBundleID: m.appBundleID, appName: m.appName,
-                    windowName: validation.title, browserURL: m.browserURL,
+                    windowName: validation.confidence >= 9 ? validation.title : nil, browserURL: m.browserURL,
                     redactionReason: m.redactionReason, captureTrigger: m.captureTrigger,
                     displayID: m.displayID, mousePosition: m.mousePosition))
         } else {
@@ -1284,9 +1284,9 @@ public actor FrameProcessingQueue {
         )
 
         if let validation = titleValidation {
-            try await databaseManager.resolveWindowTitle(frameID: FrameID(value: frameID), title: validation.title)
+            try await databaseManager.resolveWindowTitle(frameID: FrameID(value: frameID), title: validation.title, confidence: validation.confidence, outcome: validation.outcome)
             try? await databaseManager.recordMetricEvent(metricType: .windowTitleValidation,
-                metadata: "{\"outcome\":\"\(validation.outcome)\"}")
+                metadata: "{\"outcome\":\"\(validation.outcome)\",\"confidence\":\(validation.confidence)}")
         }
 
         // Insert OCR nodes for both main and chrome regions so any FTS hit can be highlighted.

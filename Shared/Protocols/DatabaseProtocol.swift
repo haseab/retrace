@@ -64,8 +64,8 @@ public protocol DatabaseProtocol: Actor {
     func getFrameMetadata(frameID: FrameID) async throws -> String?
 
     func getWindowTitleEvidence(frameID: FrameID) async throws -> WindowTitleEvidence?
-    /// Only updates a segment exclusively owned by this frame. Nil leaves it unassigned.
-    func resolveWindowTitle(frameID: FrameID, title: String?) async throws
+    /// Updates only this frame’s resolved title, integer confidence and validation reason.
+    func resolveWindowTitle(frameID: FrameID, title: String?, confidence: Int, outcome: String) async throws
 
     /// Get processing status for multiple frames in a single query
     /// Returns dictionary of frameID -> processingStatus
@@ -482,7 +482,7 @@ public struct OCRNodeWithText: Identifiable, Equatable, Sendable {
 // Legacy/import-only database implementations do not create capture evidence.
 extension DatabaseProtocol {
     public func getWindowTitleEvidence(frameID: FrameID) async throws -> WindowTitleEvidence? { nil }
-    public func resolveWindowTitle(frameID: FrameID, title: String?) async throws {
+    public func resolveWindowTitle(frameID: FrameID, title: String?, confidence: Int, outcome: String) async throws {
         throw DatabaseError.queryFailed(query: "resolve_window_title", underlying: "Unsupported database implementation")
     }
 }

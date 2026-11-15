@@ -1158,7 +1158,7 @@ public actor CaptureManager: CaptureProtocol {
             enrichedMetadata = FrameMetadata(
                 appBundleID: frame.metadata.appBundleID ?? frontmostMetadata.appBundleID,
                 appName: frame.metadata.appName ?? frontmostMetadata.appName,
-                windowName: frame.metadata.windowTitleEvidence == nil ? (frame.metadata.windowName ?? frontmostMetadata.windowName) : nil,
+                windowName: frame.metadata.windowName ?? frontmostMetadata.windowName,
                 browserURL: frame.metadata.browserURL ?? frontmostMetadata.browserURL,
                 redactionReason: redactionReason,
                 captureTrigger: captureTrigger,

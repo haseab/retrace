@@ -5,12 +5,12 @@ import Shared
 /// Fresh, uncached focused-window AX title, bound to the visible CG window.
 /// Synchronous AX work runs off the UI actor.
 struct WindowTitleBoundaryReader: Sendable {
-    func read(displayID: CGDirectDisplayID, expectedPID: Int32, expectedWindowID: UInt32? = nil) async -> WindowTitleObservation? {
+    func read(displayID: CGDirectDisplayID, expectedPID: Int32? = nil, expectedWindowID: UInt32? = nil, allowedWindowIDs: Set<UInt32>? = nil) async -> WindowTitleObservation? {
         let front = await MainActor.run { () -> (Int32, String?)? in
             guard let app = NSWorkspace.shared.frontmostApplication else { return nil }
             return (app.processIdentifier, app.bundleIdentifier)
         }
-        guard let (pid, bundleID) = front, pid == expectedPID, pid != ProcessInfo.processInfo.processIdentifier,
+        guard let (pid, bundleID) = front, (expectedPID == nil || pid == expectedPID), pid != ProcessInfo.processInfo.processIdentifier,
               !ForegroundWindowSelection.isComputerUse(bundleID: bundleID), AXIsProcessTrusted() else { return nil }
         let started = ProcessInfo.processInfo.systemUptime
         defer { Log.recordLatency("capture.window_title_ax", valueMs: (ProcessInfo.processInfo.systemUptime - started) * 1000, category: .capture) }
@@ -19,6 +19,7 @@ struct WindowTitleBoundaryReader: Sendable {
               let visible = windows.first(where: {
                   ForegroundWindowSelection.isEligible($0, foregroundPID: pid, bundleID: bundleID, displayBounds: display)
               }), let id = visible[kCGWindowNumber as String] as? UInt32,
+              (allowedWindowIDs == nil || allowedWindowIDs!.contains(id)),
               let dictionary = visible[kCGWindowBounds as String] as? [String: Any],
               let bounds = CGRect(dictionaryRepresentation: dictionary as CFDictionary),
               expectedWindowID == nil || expectedWindowID == id else { return nil }

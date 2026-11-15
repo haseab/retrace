@@ -34,7 +34,9 @@ Database/
 │   ├── V17_FrameCaptureTrigger.swift
 │   ├── V18_DailyMetricsRecencyIndex.swift
 │   ├── V19_FrameEncodedAt.swift
-│   └── V20_PartialProcessingStatusIndex.swift # Exclude OCR-completed frames from status index
+│   ├── V20_PartialProcessingStatusIndex.swift # Exclude OCR-completed frames from status index
+│   ├── V21_WindowTitleEvidence.swift # Durable capture boundaries
+│   └── V22_WindowTitleConfidence.swift # Per-frame title, integer score and reason
 ├── Queries/
 │   ├── FrameQueries.swift     # Frame CRUD operations
 │   ├── SegmentQueries.swift   # Segment CRUD operations
@@ -43,7 +45,7 @@ Database/
 └── Tests/
     ├── AsyncQueuePipelineTests.swift
     ├── RetentionVideoDeletionTests.swift # Real migrated SQLite retention guards and injected failure
-    ├── WindowTitleAttributionTests.swift # Evidence persistence, URL isolation and shared-segment guard
+    ├── WindowTitleAttributionTests.swift # Evidence persistence, URL isolation and per-frame confidence
     ├── ProcessingStatusIndexTests.swift # V20 migration and backlog query coverage
     ├── DatabaseManagerTests.swift
     ├── SQLiteReadSafetyTests.swift # Text-buffer lifetime, missing/error distinction and bounded lock retries
@@ -681,10 +683,11 @@ V20 replaces `idx_frame_processing_status` with `ON frame(processingStatus) WHER
 - Core frame/video/app and DatabaseManager SELECTs use `SQLiteReadStep.next`. Only `SQLITE_DONE` means no more rows; other errors must propagate rather than returning missing/empty/partial data.
 - Retry a busy/locked read once, only before its first row, using the existing connection timeout. Never retry interruption, I/O/corruption errors, writes, or restart a result set after rows have been returned.
 
-### Window-title evidence (V21)
+### Window-title evidence and confidence (V21/V22)
 
-`frame.captureWindowTitleEvidence` is optional Codable capture evidence, stored separately
-from replaceable in-page URL `frame.metadata`. Legacy rows remain NULL. `resolveWindowTitle`
-may rename only the segment exclusively owned by the evidence-bearing frame; never update
-shared/legacy sessions. Capture creates one pending segment per frame. Title text is absent
-until existing OCR validates it; uncertain frames and pixels remain stored.
+Evidence lives independently of URL metadata. Validation writes only the frame's resolved title,
+integer confidence (0–10) and reason; normal segments remain shared and unchanged. Keep all
+screenshots. `FrameQueries.windowTitleSQL` centralizes display versus confidence >=9 matching.
+Do not filter uncertain frames before computing LAG/LEAD intervals. Legacy confidence defaults
+to 0, not a fabricated verification score. Title-only FTS matches require >=9 while body OCR
+hits survive at any title confidence. Coordinate query changes with App/DataAdapter.

@@ -34,6 +34,6 @@ final class WindowTitleValidatorTests: XCTestCase {
                        bounds: CGRect(x: 51.2, y: 720, width: 384, height: 21.6))
         ])
         XCTAssertEqual(WindowTitleValidator.validate(.init(before: observation, after: observation), text: text, width: 2560, height: 1440).outcome,
-                       "ocr_disagreement")
+                       "ocr_recovered")
     }
 }

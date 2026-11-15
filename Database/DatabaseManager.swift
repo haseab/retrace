@@ -782,9 +782,9 @@ public actor DatabaseManager: DatabaseProtocol {
         }
     }
 
-    public func resolveWindowTitle(frameID: FrameID, title: String?) async throws {
+    public func resolveWindowTitle(frameID: FrameID, title: String?, confidence: Int, outcome: String) async throws {
         try withTracedDatabaseOperation("resolve_window_title") { db in
-            try FrameQueries.resolveWindowTitle(db: db, frameID: frameID.value, title: title)
+            try FrameQueries.resolveWindowTitle(db: db, frameID: frameID.value, title: title, confidence: confidence, outcome: outcome)
         }
     }
 

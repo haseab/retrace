@@ -505,7 +505,10 @@ Exclusion classification collects normal on-screen, non-transparent window IDs f
 ### Capture title evidence
 
 `CGWindowListCapture` owns fresh AX before/screenshot/150ms/AX after ordering.
-It stores evidence, not an asserted title. Preserve this evidence through materialization
-and enrichment; do not fill pending `windowName` from a later app/AX lookup. Cancellation,
+It stores a captured candidate title and evidence at unknown confidence. Preserve both through
+materialization; do not replace them from a later app/AX lookup. The post read observes the actual
+focused identity, including changes, within the screenshot privacy plan’s admitted window IDs.
+Excluded/redacted or newly unclassified windows cannot supply title evidence. A CG caption region can support OCR-only recovery for
+non-browser windows; browser recovery requires selected-tab geometry. Cancellation,
 stop/restart, display switches, configuration changes and screen lock invalidate in-flight
 candidates. AX queries stay off main; a bounded lookup failure leaves attribution unknown.

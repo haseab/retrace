@@ -94,6 +94,8 @@ public actor FTSManager: FTSProtocol {
         // Bind FTS query
         sqlite3_bind_text(statement, bindIndex, query, -1, SQLITE_TRANSIENT)
         bindIndex += 1
+        sqlite3_bind_text(statement, bindIndex, "{text otherText} : (\(query))", -1, SQLITE_TRANSIENT)
+        bindIndex += 1
 
         // Bind filter parameters
         if let startDate = filters.startDate {
@@ -189,6 +191,8 @@ public actor FTSManager: FTSProtocol {
         var bindIndex: Int32 = 1
 
         sqlite3_bind_text(statement, bindIndex, query, -1, SQLITE_TRANSIENT)
+        bindIndex += 1
+        sqlite3_bind_text(statement, bindIndex, "{text otherText} : (\(query))", -1, SQLITE_TRANSIENT)
         bindIndex += 1
 
         if let startDate = filters.startDate {
@@ -288,7 +292,7 @@ public actor FTSManager: FTSProtocol {
         // FTS table stores content directly (no external content table needed for search)
         var sql = """
             SELECT
-                searchRanking.rowid, ds.frameId, f.createdAt, s.bundleID, s.windowName,
+                searchRanking.rowid, ds.frameId, f.createdAt, s.bundleID, \(FrameQueries.windowTitleSQL(trustedOnly: true)),
                 bm25(searchRanking) as rank,
                 f.videoId, f.videoFrameIndex,
                 snippet(searchRanking, -1, '<mark>', '</mark>', '...', 16) AS snippet
@@ -301,6 +305,9 @@ public actor FTSManager: FTSProtocol {
             JOIN frame f ON ds.frameId = f.id
             JOIN segment s ON f.segmentId = s.id
             WHERE searchRanking MATCH ?
+              AND (f.windowTitleConfidence >= 9 OR searchRanking.rowid IN (
+                  SELECT rowid FROM searchRanking WHERE searchRanking MATCH ?
+              ))
             """
 
         // Add time filters (using frame.createdAt)
@@ -314,17 +321,17 @@ public actor FTSManager: FTSProtocol {
 
         // Add app filtering (using segment.bundleID and segment.windowName)
         if let appBundleIDs = filters.appBundleIDs, !appBundleIDs.isEmpty {
-            let placeholders = appBundleIDs.map { _ in "(s.bundleID LIKE ? OR s.windowName LIKE ?)" }.joined(separator: " OR ")
+            let placeholders = appBundleIDs.map { _ in "(s.bundleID LIKE ? OR \(FrameQueries.windowTitleSQL(trustedOnly: true)) LIKE ?)" }.joined(separator: " OR ")
             sql += " AND (\(placeholders))"
         }
 
         if let excludedAppBundleIDs = filters.excludedAppBundleIDs, !excludedAppBundleIDs.isEmpty {
-            let placeholders = excludedAppBundleIDs.map { _ in "(s.bundleID NOT LIKE ? AND s.windowName NOT LIKE ?)" }.joined(separator: " AND ")
+            let placeholders = excludedAppBundleIDs.map { _ in "(s.bundleID NOT LIKE ? AND \(FrameQueries.windowTitleSQL(trustedOnly: true)) NOT LIKE ?)" }.joined(separator: " AND ")
             sql += " AND (\(placeholders))"
         }
 
         if filters.windowNameFilter?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
-            sql += " AND s.windowName LIKE ?"
+            sql += " AND \(FrameQueries.windowTitleSQL(trustedOnly: true)) LIKE ?"
         }
 
         if filters.browserUrlFilter?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
@@ -349,6 +356,9 @@ public actor FTSManager: FTSProtocol {
             JOIN frame f ON ds.frameId = f.id
             JOIN segment s ON f.segmentId = s.id
             WHERE searchRanking MATCH ?
+              AND (f.windowTitleConfidence >= 9 OR searchRanking.rowid IN (
+                  SELECT rowid FROM searchRanking WHERE searchRanking MATCH ?
+              ))
             """
 
         if filters.startDate != nil {
@@ -360,17 +370,17 @@ public actor FTSManager: FTSProtocol {
         }
 
         if let appBundleIDs = filters.appBundleIDs, !appBundleIDs.isEmpty {
-            let placeholders = appBundleIDs.map { _ in "(s.bundleID LIKE ? OR s.windowName LIKE ?)" }.joined(separator: " OR ")
+            let placeholders = appBundleIDs.map { _ in "(s.bundleID LIKE ? OR \(FrameQueries.windowTitleSQL(trustedOnly: true)) LIKE ?)" }.joined(separator: " OR ")
             sql += " AND (\(placeholders))"
         }
 
         if let excludedAppBundleIDs = filters.excludedAppBundleIDs, !excludedAppBundleIDs.isEmpty {
-            let placeholders = excludedAppBundleIDs.map { _ in "(s.bundleID NOT LIKE ? AND s.windowName NOT LIKE ?)" }.joined(separator: " AND ")
+            let placeholders = excludedAppBundleIDs.map { _ in "(s.bundleID NOT LIKE ? AND \(FrameQueries.windowTitleSQL(trustedOnly: true)) NOT LIKE ?)" }.joined(separator: " AND ")
             sql += " AND (\(placeholders))"
         }
 
         if filters.windowNameFilter?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
-            sql += " AND s.windowName LIKE ?"
+            sql += " AND \(FrameQueries.windowTitleSQL(trustedOnly: true)) LIKE ?"
         }
 
         if filters.browserUrlFilter?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
@@ -382,7 +392,7 @@ public actor FTSManager: FTSProtocol {
 
     private func parseSearchResult(statement: OpaquePointer) -> FTSMatch {
         // Column order from query:
-        // searchRanking.rowid, ds.frameId, f.createdAt, s.bundleID, s.windowName, rank, f.videoId, f.videoFrameIndex, snippet
+        // searchRanking.rowid, ds.frameId, f.createdAt, s.bundleID, \(FrameQueries.windowTitleSQL(trustedOnly: true)), rank, f.videoId, f.videoFrameIndex, snippet
 
         // Column 0: document id (searchRanking.rowid)
         let documentID = sqlite3_column_int64(statement, 0)

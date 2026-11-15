@@ -108,7 +108,8 @@ actor MigrationRunner {
             V18_DailyMetricsRecencyIndex(),
             V19_FrameEncodedAt(),
             V20_PartialProcessingStatusIndex(),
-            V21_WindowTitleEvidence()
+            V21_WindowTitleEvidence(),
+            V22_WindowTitleConfidence()
         ]
     }
 

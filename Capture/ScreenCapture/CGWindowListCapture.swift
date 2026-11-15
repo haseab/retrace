@@ -610,10 +610,13 @@ public actor CGWindowListCapture {
 
         let generation = titleCaptureGeneration
         let titleReader = WindowTitleBoundaryReader()
+        // Both observations must belong to windows admitted by the screenshot's privacy plan.
+        let titleAllowedWindowIDs = Set(exclusionResult.includedCaptureWindowIDs)
+            .subtracting(exclusionResult.redactedWindowIDs)
         let titleBefore: WindowTitleObservation?
         if let pid = exclusionResult.visibleWindowContext?.ownerPID {
             // The fresh AX/CG pair chooses the window within the privacy plan's app.
-            titleBefore = await titleReader.read(displayID: displayID, expectedPID: pid)
+            titleBefore = await titleReader.read(displayID: displayID, expectedPID: pid, allowedWindowIDs: titleAllowedWindowIDs)
         } else {
             titleBefore = nil
         }
@@ -634,15 +637,21 @@ public actor CGWindowListCapture {
         catch { return nil }
         guard isActive, titleCaptureGeneration == generation, !Task.isCancelled,
               screenLockStateMonitor.captureBlockReason() == nil else { return nil }
-        let titleAfter: WindowTitleObservation?
-        if let before = titleBefore {
-            titleAfter = await titleReader.read(displayID: displayID, expectedPID: before.pid,
-                                                expectedWindowID: before.windowID)
-        } else {
-            titleAfter = nil
-        }
+        // Observe the actual post-capture window, including identity changes.
+        let titleAfter = await titleReader.read(displayID: displayID, allowedWindowIDs: titleAllowedWindowIDs)
         guard isActive, titleCaptureGeneration == generation else { return nil }
-        let titleEvidence = WindowTitleEvidence(before: titleBefore, after: titleAfter)
+        let displayBounds = CGDisplayBounds(displayID)
+        let fallbackTitleRegion: CGRect?
+        if let context = exclusionResult.visibleWindowContext,
+           !BrowserURLExtractor.isBrowser(context.appBundleID ?? ""),
+           let bounds = context.windowBounds, displayBounds.width > 0, displayBounds.height > 0 {
+            let caption = CGRect(x: bounds.minX + 80, y: bounds.minY, width: max(0, bounds.width - 160), height: 32).intersection(displayBounds)
+            fallbackTitleRegion = caption.isNull ? nil : CGRect(
+                x: (caption.minX - displayBounds.minX) / displayBounds.width,
+                y: (caption.minY - displayBounds.minY) / displayBounds.height,
+                width: caption.width / displayBounds.width, height: caption.height / displayBounds.height)
+        } else { fallbackTitleRegion = nil }
+        let titleEvidence = WindowTitleEvidence(before: titleBefore, after: titleAfter, fallbackTitleRegion: fallbackTitleRegion)
         var cgImage = captureResult.image
         let displaySurfaceBytes = Self.estimatedImageSurfaceBytes(width: cgImage.width, height: cgImage.height)
         lastDisplaySurfaceBytes = displaySurfaceBytes
@@ -685,7 +694,7 @@ public actor CGWindowListCapture {
         // Conference blur detection may use a fallback overlay context separately.
         let frameMetadataAppBundleID = redactionSummary?.appBundleID ?? visibleWindowContext?.appBundleID
         let frameMetadataAppName = redactionSummary?.appName ?? visibleWindowContext?.appName
-        let frameMetadataWindowName: String? = nil // Assigned only after existing OCR confirms the AX boundaries.
+        let frameMetadataWindowName: String? = redactionSummary == nil ? (titleBefore?.title ?? visibleWindowContext?.windowName) : nil
         let boundaryMatchesContext = titleBefore?.windowID == visibleWindowContext?.windowID &&
             titleAfter?.windowID == titleBefore?.windowID &&
             titleBefore?.pid == titleAfter?.pid && titleBefore?.title == titleAfter?.title &&

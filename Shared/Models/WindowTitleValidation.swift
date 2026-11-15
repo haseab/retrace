@@ -18,8 +18,9 @@ public struct WindowTitleObservation: Codable, Sendable, Equatable {
 public struct WindowTitleEvidence: Codable, Sendable, Equatable {
     public let before: WindowTitleObservation?
     public let after: WindowTitleObservation?
-    public init(before: WindowTitleObservation?, after: WindowTitleObservation?) {
-        self.before = before; self.after = after
+    public let fallbackTitleRegion: CGRect?
+    public init(before: WindowTitleObservation?, after: WindowTitleObservation?, fallbackTitleRegion: CGRect? = nil) {
+        self.before = before; self.after = after; self.fallbackTitleRegion = fallbackTitleRegion
     }
 }
 
@@ -48,6 +49,21 @@ public enum WindowTitleWords {
         let a = tokens(title), b = tokens(ocr)
         guard !a.isEmpty, a.count == b.count, a.count <= 128 else { return false }
         return zip(a, b).allSatisfy { wordMatches($0.0, $0.1) }
+    }
+
+    /// Only explicit ellipsis is truncation evidence; a missing suffix alone is not.
+    public static func matchesTruncated(_ title: String, _ ocr: String) -> Bool {
+        let normalized = normalized(ocr).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard normalized.hasSuffix("…") || normalized.hasSuffix("...") else { return false }
+        let prefix = normalized.replacingOccurrences(of: #"[.…]+$"#, with: "", options: .regularExpression)
+        let full = tokens(title), partial = tokens(prefix)
+        guard !partial.isEmpty, partial.count <= full.count else { return false }
+        for i in partial.indices {
+            if i == partial.count - 1 {
+                guard full[i].hasPrefix(partial[i]) else { return false }
+            } else if full[i] != partial[i] { return false }
+        }
+        return true
     }
 
     private static func wordMatches(_ x: String, _ y: String) -> Bool {

@@ -4,10 +4,10 @@ from pathlib import Path
 import subprocess, tempfile, sys
 try:
     root = Path(__file__).resolve().parents[1]
-    subprocess.run(['swift', 'build', '--target', 'Capture'], cwd=root, check=True)
+    subprocess.run(['swift', 'build', '--target', 'App'], cwd=root, check=True)
     build = Path(subprocess.check_output(['swift', 'build', '--show-bin-path'], cwd=root, text=True).strip())
     subprocess.run(['swift', 'build', '--target', 'Database'], cwd=root, check=True)
-    objects = [str(p) for target in ['Shared', 'Database', 'SQLCipher', 'Capture'] for p in (build / (target + '.build')).rglob('*.o')]
+    objects = [str(p) for target in ['Shared', 'Database', 'SQLCipher', 'Capture', 'App', 'Storage', 'Search', 'Processing', 'Migration'] for p in (build / (target + '.build')).rglob('*.o')]
     with tempfile.TemporaryDirectory(prefix='retrace-title-checks-') as temp:
         executable = str(Path(temp) / 'checks')
         subprocess.run(['swiftc', '-parse-as-library', '-target', 'arm64-apple-macosx13.0', '-swift-version', '5',
