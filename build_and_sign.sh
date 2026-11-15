@@ -72,6 +72,12 @@ mkdir -p "$APP_BUNDLE/Contents/Library/LaunchAgents"
 
 # Copy executable
 cp "$BUILD_DIR/Retrace" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
+CLI_EXECUTABLE="$BUILD_DIR/RetraceCLI"
+if [ ! -f "$CLI_EXECUTABLE" ]; then
+    echo "❌ Expected CLI executable not found at $CLI_EXECUTABLE"
+    exit 1
+fi
+cp "$CLI_EXECUTABLE" "$APP_BUNDLE/Contents/MacOS/RetraceCLI"
 
 # Copy bundled crash recovery helper assets used by the app's launch agent flow.
 CRASH_RECOVERY_HELPER="$BUILD_DIR/RetraceCrashRecoveryHelper"
@@ -143,6 +149,9 @@ done
 # Sign nested helper executables before the containing app.
 if [ -f "$APP_BUNDLE/Contents/Library/Helpers/RetraceCrashRecoveryHelper" ]; then
     codesign --force --sign - "$APP_BUNDLE/Contents/Library/Helpers/RetraceCrashRecoveryHelper"
+fi
+if [ -f "$APP_BUNDLE/Contents/MacOS/RetraceCLI" ]; then
+    codesign --force --sign - "$APP_BUNDLE/Contents/MacOS/RetraceCLI"
 fi
 
 # Sign the app bundle with ad-hoc signature and entitlements

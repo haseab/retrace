@@ -133,6 +133,8 @@ enum FeedbackRecentMetricSupport {
         for metricType: DailyMetricsQueries.MetricType
     ) -> String {
         switch metricType {
+        case .cliCommandInvoked:
+            return "CLI command invoked"
         case .searches:
             return "Search submitted"
         case .helpOpened:
@@ -210,6 +212,11 @@ enum FeedbackRecentMetricSupport {
         }
 
         switch metricType {
+        case .cliCommandInvoked:
+            return allowlistedDetails(
+                from: payload,
+                keys: ["command", "source", "resultCount", "hasFilters", "outcome"]
+            )
         case .inPageURLHover, .inPageURLClick, .inPageURLRightClick, .inPageURLCopyLink:
             return linkInteractionDetails(from: payload)
         case .timelineAutoDismissed:
@@ -259,6 +266,7 @@ enum FeedbackRecentMetricSupport {
                 keys: [
                     "source",
                     "action",
+                    "command",
                     "outcome",
                     "trigger",
                     "status",

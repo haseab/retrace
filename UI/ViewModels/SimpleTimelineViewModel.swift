@@ -6,7 +6,6 @@ import Shared
 import App
 import Database
 import Processing
-import SwiftyChrono
 import UniformTypeIdentifiers
 import ImageIO
 
@@ -8273,21 +8272,16 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Apply deeplink search state from `retrace://search`.
     /// This resets stale query/filter state first, then applies deeplink values.
-    public func applySearchDeeplink(query: String?, appBundleID: String?, source: String = "unknown") {
+    public func applySearchDeeplink(state: CLIDeeplinkSearchState, source: String = "unknown") async {
         let deeplinkID = String(UUID().uuidString.prefix(8))
         let normalizedQuery: String? = {
-            guard let query else { return nil }
+            guard let query = state.queryText else { return nil }
             let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? nil : trimmed
-        }()
-        let normalizedAppBundleID: String? = {
-            guard let appBundleID else { return nil }
-            let trimmed = appBundleID.trimmingCharacters(in: .whitespacesAndNewlines)
             return trimmed.isEmpty ? nil : trimmed
         }()
 
         Log.info(
-            "[SearchDeeplink][\(deeplinkID)] begin source=\(source), query=\(normalizedQuery ?? "nil"), app=\(normalizedAppBundleID ?? "nil")",
+            "[SearchDeeplink][\(deeplinkID)] begin source=\(source), query=\(normalizedQuery ?? "nil"), apps=\(state.appBundleIDs.joined(separator: ",")), tags=\(state.tagIDs.map(String.init).joined(separator: ",")) ranges=\(state.dateRanges.count)",
             category: .ui
         )
         openSearchOverlay()
@@ -8296,19 +8290,50 @@ public class SimpleTimelineViewModel: ObservableObject {
         searchViewModel.cancelSearch()
         searchViewModel.searchQuery = ""
         searchViewModel.clearAllFilters()
+        searchViewModel.resetSearchOrderToDefault()
 
-        if let normalizedAppBundleID {
-            searchViewModel.setAppFilter(normalizedAppBundleID)
+        if !state.appBundleIDs.isEmpty {
+            searchViewModel.selectedAppFilters = Set(state.appBundleIDs)
+            searchViewModel.appFilterMode = state.appFilterMode
+        }
+
+        if !state.tagIDs.isEmpty {
+            searchViewModel.selectedTags = Set(state.tagIDs)
+            searchViewModel.tagFilterMode = state.tagFilterMode
+        }
+
+        searchViewModel.hiddenFilter = state.hiddenFilter
+        searchViewModel.commentFilter = state.commentFilter
+        searchViewModel.setDateRanges(state.dateRanges)
+        searchViewModel.windowNameTerms = state.windowNameTerms
+        searchViewModel.windowNameExcludedTerms = state.windowNameExcludedTerms
+        searchViewModel.windowNameFilterMode =
+            (state.windowNameTerms.isEmpty && !state.windowNameExcludedTerms.isEmpty) ? .exclude : .include
+        searchViewModel.browserUrlTerms = state.browserURLTerms
+        searchViewModel.browserUrlExcludedTerms = state.browserURLExcludedTerms
+        searchViewModel.browserUrlFilterMode =
+            (state.browserURLTerms.isEmpty && !state.browserURLExcludedTerms.isEmpty) ? .exclude : .include
+
+        switch state.sort {
+        case .relevance:
+            searchViewModel.searchMode = .relevant
+            searchViewModel.sortOrder = .newestFirst
+        case .newest:
+            searchViewModel.searchMode = .all
+            searchViewModel.sortOrder = .newestFirst
+        case .oldest:
+            searchViewModel.searchMode = .all
+            searchViewModel.sortOrder = .oldestFirst
         }
 
         guard let normalizedQuery else {
-            Log.info("[SearchDeeplink][\(deeplinkID)] completed with no query (app=\(normalizedAppBundleID ?? "nil"))", category: .ui)
+            Log.info("[SearchDeeplink][\(deeplinkID)] completed with no query", category: .ui)
             return
         }
 
         searchViewModel.searchQuery = normalizedQuery
         searchViewModel.submitSearch(trigger: "deeplink:\(source)")
-        Log.info("[SearchDeeplink][\(deeplinkID)] submitted query='\(normalizedQuery)' app=\(normalizedAppBundleID ?? "nil")", category: .ui)
+        Log.info("[SearchDeeplink][\(deeplinkID)] submitted query='\(normalizedQuery)'", category: .ui)
     }
 
     // MARK: - State Cache Methods
@@ -14688,6 +14713,20 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
     }
 
+    /// Search for a frame by its ID and navigate to it.
+    /// Returns true if frame was found and navigation succeeded.
+    public func navigateToFrameID(
+        _ frameID: Int64,
+        includeHiddenSegments: Bool = false,
+        showFailureUI: Bool = true
+    ) async -> Bool {
+        await searchForFrameID(
+            frameID,
+            includeHiddenSegments: includeHiddenSegments,
+            showFailureUI: showFailureUI
+        )
+    }
+
     /// Search for a frame by its ID and navigate to it
     /// Returns true if frame was found and navigation succeeded
     private func searchForFrameID(
@@ -14926,146 +14965,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Parse natural language date strings
     private func parseNaturalLanguageDate(_ text: String, now: Date = Date()) -> Date? {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        let calendar = Calendar.current
-        let lowercasedInput = trimmed.lowercased()
-        let collapsedInput = lowercasedInput.replacingOccurrences(
-            of: #"\s+"#,
-            with: " ",
-            options: .regularExpression
-        )
-        let normalizedRelativeInput = normalizeRelativeDateShorthand(collapsedInput)
-        let normalizedWithCompactTimes = normalizeCompactTimeFormat(normalizedRelativeInput)
-
-        if normalizedRelativeInput.range(of: #"^start of (the )?day$"#, options: .regularExpression) != nil {
-            return calendar.startOfDay(for: now)
-        }
-
-        func finalizeParsedDate(_ parsedDate: Date) -> Date {
-            let anchorMode = inferDateSearchAnchorMode(for: normalizedWithCompactTimes)
-            let dateForYearAdjustment = normalizedAnchorDate(parsedDate, mode: anchorMode, calendar: calendar)
-
-            var normalized = adjustYearlessAbsoluteFutureDateToRecentPastIfNeeded(
-                dateForYearAdjustment,
-                input: normalizedRelativeInput,
-                now: now,
-                calendar: calendar
-            )
-            normalized = adjustTimeOnlyFutureDateToRecentPastIfNeeded(
-                normalized,
-                input: normalizedRelativeInput,
-                now: now,
-                calendar: calendar
-            )
-            return normalizedAnchorDate(normalized, mode: anchorMode, calendar: calendar)
-        }
-
-        // Bias bare compact numeric input like "2024" toward 20:24 before
-        // standalone year parsing can claim it.
-        if let timeOnlyDate = parseTimeOnly(normalizedRelativeInput, relativeTo: now) {
-            return finalizeParsedDate(timeOnlyDate)
-        }
-
-        if let dateWithLeadingTime = parseDateWithLeadingTimeComponent(
-            normalizedWithCompactTimes,
-            now: now,
-            calendar: calendar
-        ) {
-            return finalizeParsedDate(dateWithLeadingTime)
-        }
-
-        if let standaloneMonthDate = parseStandaloneMonthReference(
-            normalizedRelativeInput,
-            now: now,
-            calendar: calendar
-        ) {
-            return finalizeParsedDate(standaloneMonthDate)
-        }
-
-        if let standaloneYearDate = parseStandaloneYearReference(
-            normalizedRelativeInput,
-            now: now,
-            calendar: calendar
-        ) {
-            return finalizeParsedDate(standaloneYearDate)
-        }
-
-        // === PRIMARY: SwiftyChrono NLP Parser ===
-        // Try SwiftyChrono first for comprehensive natural language parsing
-        // Handles: "next Friday", "3 days from now", "last Monday", "in 2 weeks", etc.
-        let chrono = Chrono()
-        let chronoInputs = normalizedWithCompactTimes == trimmed
-            ? [trimmed]
-            : [normalizedWithCompactTimes, trimmed]
-        for chronoInput in chronoInputs {
-            if let result = chrono.parse(text: chronoInput, refDate: now, opt: [:]).first?.start.date {
-                let normalized = finalizeParsedDate(result)
-                return normalized
-            }
-        }
-
-        // === FALLBACK: Time-only and absolute date parsing ===
-        // SwiftyChrono handles all relative dates (X days/weeks/months/years ago, yesterday, etc.)
-        // We only need fallback for compact time formats and explicit date strings
-        let trimmedLower = normalizedRelativeInput
-
-        // Normalize compact time formats before passing to NSDataDetector.
-        // Examples:
-        // - "827am yesterday" -> "8:27am yesterday"
-        // - "feb 28 1417" -> "feb 28 14:17"
-        let normalizedText = normalizedWithCompactTimes
-
-        // Try macOS's built-in natural language date parser (handles "dec 15 3pm", "tomorrow at 5", etc.)
-        let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.date.rawValue)
-        if let detector = detector {
-            let range = NSRange(normalizedText.startIndex..., in: normalizedText)
-            if let match = detector.firstMatch(in: normalizedText, options: [], range: range),
-               let date = match.date {
-                return finalizeParsedDate(date)
-            }
-        }
-
-        // Try various explicit date formatters as fallback
-        let formatStrings = [
-            "MMM d yyyy h:mm a",      // "Dec 16 2024 6:05 PM"
-            "MMM d yyyy h:mma",       // "Dec 16 2024 6:05PM"
-            "MMM d yyyy ha",          // "Dec 16 2024 6PM"
-            "MMM d h:mm a",           // "Dec 16 6:05 PM"
-            "MMM d h:mma",            // "Dec 16 6:05PM"
-            "MMM d ha",               // "Dec 16 6PM"
-            "MMM d h a",              // "Dec 16 6 PM"
-            "MM/dd/yyyy h:mm a",      // "12/16/2024 6:05 PM"
-            "MM/dd h:mm a",           // "12/16 6:05 PM"
-            "yyyy-MM-dd HH:mm",       // "2024-12-16 18:05"
-            "yyyy-MM-dd'T'HH:mm:ss",  // ISO 8601
-            "MMM yyyy",               // "Jul 2025"
-            "MMMM yyyy",              // "July 2025"
-            "MMM d",                  // "Dec 16" (assumes current year, noon)
-            "MMMM d",                 // "December 16"
-        ]
-
-        for formatString in formatStrings {
-            let df = DateFormatter()
-            df.dateFormat = formatString
-            df.timeZone = .current
-            df.defaultDate = now  // Use current date for missing components
-
-            // Try original text first
-            if let date = df.date(from: text) {
-                return finalizeParsedDate(date)
-            }
-            // Try lowercased
-            if let date = df.date(from: trimmedLower) {
-                return finalizeParsedDate(date)
-            }
-            // Try with first letter capitalized (for month names)
-            let capitalized = trimmedLower.prefix(1).uppercased() + trimmedLower.dropFirst()
-            if let date = df.date(from: capitalized) {
-                return finalizeParsedDate(date)
-            }
-        }
-
-        return nil
+        NaturalLanguageDateParser().date(from: text, now: now)
     }
 
 #if DEBUG

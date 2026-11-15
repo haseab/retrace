@@ -32,6 +32,7 @@ public enum DailyMetricsQueries {
         case timelineOpens = "timeline_opens"
         case searches = "searches"
         case textCopies = "text_copies"
+        case cliCommandInvoked = "cli_command_invoked"  // metadata: JSON {command, source, ...}
 
         // New metrics for Retrace Wrapped
         case imageCopies = "image_copies"
@@ -120,6 +121,7 @@ public enum DailyMetricsQueries {
         case debugCrashTriggered = "debug_crash_triggered"
         case crashAutoRestart = "crash_auto_restart"  // metadata: JSON {source}
         case rewindCutoffDateUpdated = "rewind_cutoff_date_updated"  // metadata: JSON {cutoffTimestampMs}
+        case terminalCommandAction = "terminal_command_action"  // metadata: JSON {source, action, outcome, status, usedPrivileges?, error?}
 
         // Delete actions
         case frameDeleted = "frame_deleted"

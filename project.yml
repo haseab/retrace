@@ -49,6 +49,12 @@ targets:
         copy:
           destination: wrapper
           subpath: Contents/Library/Helpers
+      - target: RetraceCLI
+        embed: true
+        codeSign: true
+        copy:
+          destination: wrapper
+          subpath: Contents/MacOS
       - target: CrashRecoverySupport
       - target: Shared
       - target: App
@@ -89,6 +95,26 @@ targets:
         PRODUCT_NAME: RetraceCrashRecoveryHelper
         GENERATE_INFOPLIST_FILE: YES
         PRODUCT_BUNDLE_IDENTIFIER: io.retrace.app.crashrecoveryhelper
+        SKIP_INSTALL: YES
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "Developer ID Application"
+        DEVELOPMENT_TEAM: 5X5W7C3L9D
+        CODE_SIGNING_REQUIRED: YES
+        CODE_SIGNING_ALLOWED: YES
+
+  RetraceCLI:
+    type: tool
+    platform: macOS
+    sources:
+      - path: Sources/RetraceCLI
+    dependencies:
+      - target: App
+      - target: Shared
+    settings:
+      base:
+        PRODUCT_NAME: RetraceCLI
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: io.retrace.app.cli
         SKIP_INSTALL: YES
         CODE_SIGN_STYLE: Manual
         CODE_SIGN_IDENTITY: "Developer ID Application"

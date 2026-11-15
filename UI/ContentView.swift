@@ -206,18 +206,18 @@ public struct ContentView: View {
         Log.info("[ContentView] handleDeeplink route=\(String(describing: route))", category: .ui)
 
         switch route {
-        case let .search(query, timestamp, appBundleID):
+        case let .search(state):
             // Open fullscreen timeline and apply deeplink search state.
             TimelineWindowController.shared.showSearch(
-                query: query,
-                timestamp: timestamp,
-                appBundleID: appBundleID,
+                state: state,
                 source: "ContentView.onOpenURL"
             )
 
-        case .timeline(let timestamp):
+        case let .timeline(state):
             // Open fullscreen timeline at specific timestamp
-            if let timestamp = timestamp {
+            if let frameID = state.frameID {
+                TimelineWindowController.shared.showAndNavigate(toFrameID: frameID, fallbackTimestamp: state.timestamp)
+            } else if let timestamp = state.timestamp {
                 TimelineWindowController.shared.showAndNavigate(to: timestamp)
             } else {
                 TimelineWindowController.shared.show()

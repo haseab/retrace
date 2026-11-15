@@ -92,6 +92,7 @@ enum SettingsDefaults {
 
     static let showFrameIDs = false
     static let enableFrameIDSearch = false
+    static let enableRetraceCLI = false
     static let showOCRDebugOverlay = false
     static let showVideoControls = false
     static let showMenuBarCaptureFeedback = false

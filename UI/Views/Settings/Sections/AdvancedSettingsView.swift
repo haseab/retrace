@@ -126,10 +126,77 @@ extension SettingsView {
                 isOn: $enableFrameIDSearch
             )
 
-            // Temporarily disabled while overlay diffing behavior is under investigation.
-
             Divider()
                 .padding(.vertical, 8)
+
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Terminal")
+                    .font(.retraceCaption2Medium)
+                    .foregroundColor(.retraceSecondary)
+
+                ModernToggleRow(
+                    title: "Enable Retrace CLI",
+                    subtitle: "Expose the `retrace` command by installing `/usr/local/bin/retrace` from this app",
+                    isOn: $enableRetraceCLI
+                )
+                .onChange(of: enableRetraceCLI) { enabled in
+                    handleRetraceCLIToggleChanged(enabled)
+                }
+
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 8) {
+                        Circle()
+                            .fill(retraceCLIStatusColor)
+                            .frame(width: 8, height: 8)
+
+                        Text(retraceCLIStatusTitle)
+                            .font(.retraceCalloutMedium)
+                            .foregroundColor(.retracePrimary)
+                    }
+
+                    Text(retraceCLIStatus.detail)
+                        .font(.retraceCaption2)
+                        .foregroundColor(.retraceSecondary)
+
+                    buildInfoRow(label: "Command", value: retraceCLIStatus.launcherPath)
+                    buildInfoRow(label: "Bundled CLI", value: retraceCLIStatus.bundledCLIExecutablePath)
+                }
+
+                HStack(spacing: 10) {
+                    ModernButton(
+                        title: isPerformingRetraceCLILauncherOperation ? "Installing..." : "Install",
+                        icon: "terminal",
+                        style: .secondary
+                    ) {
+                        installRetraceCLILauncher()
+                    }
+                    .disabled(!canInstallRetraceCLI)
+
+                    ModernButton(
+                        title: isPerformingRetraceCLILauncherOperation ? "Repairing..." : "Repair",
+                        icon: "wrench.and.screwdriver",
+                        style: .secondary
+                    ) {
+                        repairRetraceCLILauncher()
+                    }
+                    .disabled(!canRepairRetraceCLI)
+
+                    ModernButton(
+                        title: isPerformingRetraceCLILauncherOperation ? "Removing..." : "Remove",
+                        icon: "trash",
+                        style: .secondary
+                    ) {
+                        removeRetraceCLILauncher()
+                    }
+                    .disabled(!canRemoveRetraceCLI)
+                }
+
+                Text("After installation, run `retrace help` in Terminal. `/Applications/Retrace.app` is the supported install location.")
+                    .font(.retraceCaption2)
+                    .foregroundColor(.retraceSecondary.opacity(0.75))
+            }
+
+            // Temporarily disabled while overlay diffing behavior is under investigation.
 
             ModernButton(title: "Show Database Schema", icon: "doc.text", style: .secondary) {
                 loadDatabaseSchema()
@@ -147,6 +214,9 @@ extension SettingsView {
                     resetMasterKeyForDebug()
                 }
             }
+        }
+        .task {
+            refreshRetraceCLIStatus()
         }
     }
 

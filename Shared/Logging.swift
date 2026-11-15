@@ -62,6 +62,11 @@ public enum Log {
         #endif
     }
 
+    /// Disable console printing for machine-readable command surfaces such as the CLI.
+    public static func disableConsolePrinting() {
+        printToConsole = false
+    }
+
     // MARK: - Log File (for fast feedback diagnostics)
 
     /// Path to the log file - persists across crashes

@@ -1852,16 +1852,30 @@ public class TimelineWindowController: NSObject {
         }
     }
 
-    /// Show timeline and apply deeplink search state (`q`, `app`, `t`/`timestamp`).
-    public func showSearch(query: String?, timestamp: Date?, appBundleID: String?, source: String = "unknown") {
+    public func showAndNavigate(toFrameID frameID: Int64, fallbackTimestamp: Date? = nil) {
+        if let fallbackTimestamp {
+            showAndNavigate(to: fallbackTimestamp)
+        } else {
+            show()
+        }
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let viewModel = await self.awaitTimelineViewModelReady()
+            _ = await viewModel.navigateToFrameID(frameID, showFailureUI: true)
+        }
+    }
+
+    /// Show timeline and apply deeplink search state.
+    public func showSearch(state: CLIDeeplinkSearchState, source: String = "unknown") {
         deeplinkSearchInvocationCounter += 1
         let invocationID = deeplinkSearchInvocationCounter
         Log.info(
-            "[DeeplinkSearch] Invocation #\(invocationID) source=\(source), query=\(query ?? "nil"), timestamp=\(String(describing: timestamp)), app=\(appBundleID ?? "nil")",
+            "[DeeplinkSearch] Invocation #\(invocationID) source=\(source), query=\(state.queryText ?? "nil"), timestamp=\(String(describing: state.timestamp)), apps=\(state.appBundleIDs.joined(separator: ","))",
             category: .ui
         )
 
-        if let timestamp {
+        if let timestamp = state.timestamp {
             showAndNavigate(to: timestamp)
         } else {
             show()
@@ -1876,7 +1890,7 @@ public class TimelineWindowController: NSObject {
             let viewModel = await self.awaitTimelineViewModelReady()
 
             Log.info("[DeeplinkSearch] Invocation #\(invocationID) applying deeplink payload", category: .ui)
-            viewModel.applySearchDeeplink(query: query, appBundleID: appBundleID, source: source)
+            await viewModel.applySearchDeeplink(state: state, source: source)
         }
     }
 
