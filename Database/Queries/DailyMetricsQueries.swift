@@ -78,6 +78,7 @@ public enum DailyMetricsQueries {
         case masterKeyFlow = "master_key_flow"  // metadata: JSON {action, source, ...}
         case phraseLevelRedactionRulesUpdated = "phrase_level_redaction_rules_updated"
         case phraseLevelRedactionReveal = "phrase_level_redaction_reveal"
+        case phraseLevelRedactionSettingsReveal = "phrase_level_redaction_settings_reveal"  // metadata: JSON {outcome, phraseCount?, error?, surface}
         case phraseLevelRedactionQueuedHover = "phrase_level_redaction_queued_hover"  // metadata: JSON {nodeID, frameID, processingStatus}
         case privateWindowRedactionToggle = "private_window_redaction_toggle"
         case systemMonitorSettingsOpened = "system_monitor_settings_opened"

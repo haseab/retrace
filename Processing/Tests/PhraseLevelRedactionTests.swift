@@ -186,6 +186,43 @@ final class PhraseLevelRedactionTests: XCTestCase {
         )
     }
 
+    func testStoredPhraseLevelRedactionPhrasesLoadProtectedPayload() throws {
+        let defaults = makeDefaults()
+        let masterKeyData = Data((0..<32).map { UInt8(($0 * 5) % 255) })
+        let phrases = ["hunter2", "123-45-6789"]
+        let payload = try MasterKeyManager.protectedPhraseLevelRedactionPayload(
+            for: phrases,
+            masterKeyData: masterKeyData
+        )
+        defaults.set(payload, forKey: "phraseLevelRedactionPhrases")
+
+        XCTAssertEqual(
+            FrameProcessingQueue.storedPhraseLevelRedactionPhrasesForTesting(
+                defaults: defaults,
+                masterKeyData: masterKeyData
+            ),
+            phrases
+        )
+    }
+
+    func testStoredPhraseLevelRedactionPhrasesMigratesLegacyPlaintextPayload() throws {
+        let defaults = makeDefaults()
+        let masterKeyData = Data((0..<32).map { UInt8(($0 * 9) % 255) })
+        defaults.set("[\"hunter2\",\"123-45-6789\"]", forKey: "phraseLevelRedactionPhrases")
+
+        XCTAssertEqual(
+            FrameProcessingQueue.storedPhraseLevelRedactionPhrasesForTesting(
+                defaults: defaults,
+                masterKeyData: masterKeyData
+            ),
+            ["hunter2", "123-45-6789"]
+        )
+
+        let storedPayload = try XCTUnwrap(defaults.string(forKey: "phraseLevelRedactionPhrases"))
+        XCTAssertTrue(MasterKeyManager.isProtectedPhraseLevelRedactionPayload(storedPayload))
+        XCTAssertFalse(storedPayload.contains("hunter2"))
+    }
+
     private func makeExtractedText(
         frameID: FrameID = FrameID(value: 42),
         regions: [String],
@@ -244,5 +281,12 @@ final class PhraseLevelRedactionTests: XCTestCase {
             .replacingOccurrences(of: "+", with: "-")
             .replacingOccurrences(of: "/", with: "_")
             .replacingOccurrences(of: "=", with: "")
+    }
+
+    private func makeDefaults() -> UserDefaults {
+        let suiteName = "PhraseLevelRedactionTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
+        return defaults
     }
 }

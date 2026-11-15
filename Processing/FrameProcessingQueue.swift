@@ -1508,7 +1508,7 @@ public actor FrameProcessingQueue {
         let defaults = UserDefaults(suiteName: ReversibleOCRScrambler.settingsSuiteName) ?? .standard
         let preliminaryResult = Self.applyPhraseLevelRedaction(
             to: extracted,
-            phrases: loadPhraseLevelRedactionPhrases(defaults: defaults)
+            phrases: Self.loadPhraseLevelRedactionPhrases(defaults: defaults)
         )
 
         guard !preliminaryResult.redactedCombinedNodeOrders.isEmpty else {
@@ -1702,23 +1702,106 @@ public actor FrameProcessingQueue {
         )
     }
 
-    private func loadPhraseLevelRedactionPhrases(defaults: UserDefaults) -> [NormalizedPhraseRedactionPhrase] {
-        guard let raw = defaults.string(forKey: Self.phraseRedactionPhrasesDefaultsKey),
-              !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+    private static func loadPhraseLevelRedactionPhrases(
+        defaults: UserDefaults,
+        masterKeyData: Data? = nil
+    ) -> [NormalizedPhraseRedactionPhrase] {
+        let storedPhrases = decodedPhraseLevelRedactionPhrases(
+            defaults: defaults,
+            masterKeyData: masterKeyData
+        )
+        guard isPhraseLevelRedactionEnabled(defaults: defaults, hasStoredPhrases: !storedPhrases.isEmpty) else {
+            return []
+        }
+        return normalizedRedactionPhrases(storedPhrases)
+    }
+
+    private static func decodedPhraseLevelRedactionPhrases(
+        defaults: UserDefaults,
+        masterKeyData: Data? = nil
+    ) -> [String] {
+        guard let raw = defaults.string(forKey: phraseRedactionPhrasesDefaultsKey) else {
             return []
         }
 
-        guard Self.isPhraseLevelRedactionEnabled(defaults: defaults, hasStoredPhrases: true) else { return [] }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
 
-        if let data = raw.data(using: .utf8),
-           let decoded = try? JSONDecoder().decode([String].self, from: data) {
-            return Self.normalizedRedactionPhrases(decoded)
+        if MasterKeyManager.isProtectedPhraseLevelRedactionPayload(trimmed) {
+            do {
+                if let masterKeyData {
+                    return try MasterKeyManager.phraseLevelRedactionPhrases(
+                        fromProtectedPayload: trimmed,
+                        masterKeyData: masterKeyData
+                    )
+                }
+                return try MasterKeyManager.unprotectPhraseLevelRedactionPhrases(trimmed)
+            } catch {
+                Log.warning(
+                    "[PhraseRedaction] Failed to decrypt protected phrase list: \(error.localizedDescription)",
+                    category: .processing
+                )
+                return []
+            }
         }
 
-        let fallback = raw
+        let legacyPhrases = legacyPhraseLevelRedactionPhrases(from: trimmed)
+        migrateLegacyPhraseLevelRedactionPhrasesIfPossible(
+            legacyPhrases,
+            defaults: defaults,
+            masterKeyData: masterKeyData
+        )
+        return legacyPhrases
+    }
+
+    private static func legacyPhraseLevelRedactionPhrases(from raw: String) -> [String] {
+        if let data = raw.data(using: .utf8),
+           let decoded = try? JSONDecoder().decode([String].self, from: data) {
+            return decoded
+        }
+
+        return raw
             .split(whereSeparator: { $0 == "," || $0 == "\n" })
             .map(String.init)
-        return Self.normalizedRedactionPhrases(fallback)
+    }
+
+    private static func migrateLegacyPhraseLevelRedactionPhrasesIfPossible(
+        _ phrases: [String],
+        defaults: UserDefaults,
+        masterKeyData: Data? = nil
+    ) {
+        guard !phrases.isEmpty else { return }
+
+        let protectedPayload: String
+        do {
+            if let masterKeyData {
+                protectedPayload = try MasterKeyManager.protectedPhraseLevelRedactionPayload(
+                    for: phrases,
+                    masterKeyData: masterKeyData
+                )
+            } else {
+                guard MasterKeyManager.hasMasterKey() else { return }
+                protectedPayload = try MasterKeyManager.protectPhraseLevelRedactionPhrases(phrases)
+            }
+        } catch {
+            Log.warning(
+                "[PhraseRedaction] Failed to migrate legacy phrase list into protected storage: \(error.localizedDescription)",
+                category: .processing
+            )
+            return
+        }
+
+        defaults.set(protectedPayload, forKey: phraseRedactionPhrasesDefaultsKey)
+    }
+
+    static func storedPhraseLevelRedactionPhrasesForTesting(
+        defaults: UserDefaults,
+        masterKeyData: Data? = nil
+    ) -> [String] {
+        decodedPhraseLevelRedactionPhrases(
+            defaults: defaults,
+            masterKeyData: masterKeyData
+        )
     }
 
     private static func isPhraseLevelRedactionEnabled(

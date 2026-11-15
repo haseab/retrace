@@ -31,4 +31,18 @@ final class InPageURLSettingsTests: XCTestCase {
         XCTAssertTrue(bundleIDs.contains("org.mozilla.firefoxdeveloperedition"))
         XCTAssertTrue(bundleIDs.contains("org.mozilla.nightly"))
     }
+
+    func testPhraseLevelRedactionRevealLabelsRequireLocalAuthenticationCopy() {
+        XCTAssertEqual(
+            SettingsView.phraseLevelRedactionRevealButtonLabel(isUnlocked: false),
+            "Reveal with Touch ID or Password"
+        )
+        XCTAssertEqual(
+            SettingsView.phraseLevelRedactionRevealButtonLabel(isUnlocked: true),
+            "Hide Protected List"
+        )
+        XCTAssertTrue(
+            SettingsView.phraseLevelRedactionProtectedListMessage().contains("Touch ID")
+        )
+    }
 }

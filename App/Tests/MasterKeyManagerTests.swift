@@ -18,6 +18,44 @@ final class MasterKeyManagerTests: XCTestCase {
         XCTAssertEqual(phrase.split(whereSeparator: \.isWhitespace).count, 22)
     }
 
+    func testProtectedPhraseLevelRedactionPayloadRoundTrips() throws {
+        let masterKeyData = Data((0..<32).map { UInt8(($0 * 7) % 255) })
+        let phrases = ["hunter2", "123-45-6789"]
+
+        let payload = try MasterKeyManager.protectedPhraseLevelRedactionPayload(
+            for: phrases,
+            masterKeyData: masterKeyData
+        )
+
+        XCTAssertTrue(MasterKeyManager.isProtectedPhraseLevelRedactionPayload(payload))
+        XCTAssertFalse(payload.contains("hunter2"))
+        XCTAssertEqual(
+            try MasterKeyManager.phraseLevelRedactionPhrases(
+                fromProtectedPayload: payload,
+                masterKeyData: masterKeyData
+            ),
+            phrases
+        )
+    }
+
+    func testProtectedPhraseLevelRedactionPayloadRejectsTampering() throws {
+        let masterKeyData = Data((0..<32).map { UInt8($0) })
+        let payload = try MasterKeyManager.protectedPhraseLevelRedactionPayload(
+            for: ["sensitive phrase"],
+            masterKeyData: masterKeyData
+        )
+        var tampered = payload
+        tampered.removeLast()
+        tampered.append(payload.hasSuffix("A") ? "B" : "A")
+
+        XCTAssertThrowsError(
+            try MasterKeyManager.phraseLevelRedactionPhrases(
+                fromProtectedPayload: tampered,
+                masterKeyData: masterKeyData
+            )
+        )
+    }
+
     func testRecoveryPhraseRejectsChecksumMismatch() throws {
         let keyData = Data((0..<32).map { UInt8($0) })
         var words = MasterKeyManager.recoveryPhrase(for: keyData)

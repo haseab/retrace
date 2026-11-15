@@ -405,6 +405,12 @@ public actor StorageManager: StorageProtocol {
         var lastAccessTime: Date
     }
 
+    private struct FrameExtractionAssetContext {
+        let asset: AVAsset
+        let symlinkURL: URL?
+        let retainedResourceLoaderDelegate: AnyObject?
+    }
+
     /// Cache for segment file paths, keyed by segment ID
     /// Avoids expensive directory enumeration on every frame read
     private var segmentPathCache: [Int64: URL] = [:]
@@ -604,8 +610,8 @@ public actor StorageManager: StorageProtocol {
                 // Create and configure the generator
                 let generator = AVAssetImageGenerator(asset: assetContext.asset)
                 generator.appliesPreferredTrackTransform = true
-                generator.requestedTimeToleranceAfter = .zero
-                generator.requestedTimeToleranceBefore = .zero
+                generator.requestedTimeToleranceAfter = CMTime.zero
+                generator.requestedTimeToleranceBefore = CMTime.zero
 
                 // Cache the generator
                 generatorCache[cacheKey] = GeneratorCacheEntry(
@@ -662,6 +668,58 @@ public actor StorageManager: StorageProtocol {
 
         // Should never reach here, but just in case
         throw StorageError.fileReadFailed(path: videoURL.path, underlying: "Frame extraction failed after retries")
+    }
+
+    private func isEncryptedFragmentBundleDirectory(at videoURL: URL) -> Bool {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: videoURL.path, isDirectory: &isDirectory) else {
+            return false
+        }
+        return isDirectory.boolValue
+    }
+
+    private func makeFrameExtractionAssetContext(for videoURL: URL) throws -> FrameExtractionAssetContext {
+        if isEncryptedFragmentBundleDirectory(at: videoURL) {
+            throw StorageError.fileReadFailed(
+                path: videoURL.path,
+                underlying: "Encrypted fragment bundle frame extraction is not implemented"
+            )
+        }
+
+        let assetOptions: [String: Any] = [
+            AVURLAssetPreferPreciseDurationAndTimingKey: true
+        ]
+
+        if videoURL.pathExtension.lowercased() == "mp4" {
+            return FrameExtractionAssetContext(
+                asset: AVURLAsset(url: videoURL, options: assetOptions),
+                symlinkURL: nil,
+                retainedResourceLoaderDelegate: nil
+            )
+        }
+
+        let tempDirectory = appSupportRootURL.appendingPathComponent("temp", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: tempDirectory, withIntermediateDirectories: true)
+        } catch {
+            throw StorageError.directoryCreationFailed(path: tempDirectory.path)
+        }
+
+        let symlinkURL = tempDirectory.appendingPathComponent("\(UUID().uuidString).mp4")
+        do {
+            try FileManager.default.createSymbolicLink(at: symlinkURL, withDestinationURL: videoURL)
+        } catch {
+            throw StorageError.fileWriteFailed(
+                path: symlinkURL.path,
+                underlying: "Failed to create frame extraction symlink: \(error.localizedDescription)"
+            )
+        }
+
+        return FrameExtractionAssetContext(
+            asset: AVURLAsset(url: symlinkURL, options: assetOptions),
+            symlinkURL: symlinkURL,
+            retainedResourceLoaderDelegate: nil
+        )
     }
 
     /// Evict oldest generators when cache is full

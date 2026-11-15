@@ -56,6 +56,9 @@ public enum MasterKeyManagerError: LocalizedError, Sendable {
     case invalidRecoveryPhraseWordCount(Int)
     case invalidRecoveryPhraseWord(String)
     case invalidRecoveryPhraseChecksum
+    case invalidProtectedSettingsPayload
+    case settingsEncryptionFailed(underlying: String)
+    case settingsDecryptionFailed(underlying: String)
     case keychainStoreFailed(OSStatus)
     case keychainLoadFailed(OSStatus)
     case keychainDeleteFailed(OSStatus)
@@ -72,6 +75,12 @@ public enum MasterKeyManagerError: LocalizedError, Sendable {
             return "The recovery phrase contains an unknown word: \(word)."
         case .invalidRecoveryPhraseChecksum:
             return "The recovery phrase checksum does not match."
+        case .invalidProtectedSettingsPayload:
+            return "The protected settings payload is invalid."
+        case .settingsEncryptionFailed(let underlying):
+            return "Failed to encrypt the protected settings payload: \(underlying)"
+        case .settingsDecryptionFailed(let underlying):
+            return "Failed to decrypt the protected settings payload: \(underlying)"
         case .keychainStoreFailed(let status):
             return "Failed to save the master key to Keychain (status: \(status))."
         case .keychainLoadFailed(let status):
@@ -105,6 +114,8 @@ public enum MasterKeyManager {
     private static var cachedScrambleSecret: String?
     private static var cachedLegacyScrambleSecret: String?
     private static var cachedHasMasterKey: Bool?
+    private static let protectedSettingsPayloadPrefix = "rtcfg1."
+    private static let phraseLevelRedactionSettingsPurpose = "phrase-level-redaction-phrases"
 
     private static let onsetSyllables = [
         "b", "c", "d", "f",
@@ -334,6 +345,60 @@ public enum MasterKeyManager {
         return policy
     }
 
+    public static func protectPhraseLevelRedactionPhrases(_ phrases: [String]) throws -> String {
+        let masterKeyData = try loadMasterKey()
+        return try protectedPhraseLevelRedactionPayload(
+            for: phrases,
+            masterKeyData: masterKeyData
+        )
+    }
+
+    public static func unprotectPhraseLevelRedactionPhrases(_ payload: String) throws -> [String] {
+        let masterKeyData = try loadMasterKey()
+        return try phraseLevelRedactionPhrases(
+            fromProtectedPayload: payload,
+            masterKeyData: masterKeyData
+        )
+    }
+
+    package static func isProtectedPhraseLevelRedactionPayload(_ payload: String) -> Bool {
+        payload.hasPrefix(protectedSettingsPayloadPrefix)
+    }
+
+    package static func protectedPhraseLevelRedactionPayload(
+        for phrases: [String],
+        masterKeyData: Data
+    ) throws -> String {
+        let data: Data
+        do {
+            data = try JSONEncoder().encode(phrases)
+        } catch {
+            throw MasterKeyManagerError.settingsEncryptionFailed(underlying: error.localizedDescription)
+        }
+
+        return try protectedSettingsPayload(
+            data,
+            purpose: phraseLevelRedactionSettingsPurpose,
+            masterKeyData: masterKeyData
+        )
+    }
+
+    package static func phraseLevelRedactionPhrases(
+        fromProtectedPayload payload: String,
+        masterKeyData: Data
+    ) throws -> [String] {
+        let data = try unprotectedSettingsPayload(
+            payload,
+            purpose: phraseLevelRedactionSettingsPurpose,
+            masterKeyData: masterKeyData
+        )
+
+        do {
+            return try JSONDecoder().decode([String].self, from: data)
+        } catch {
+            throw MasterKeyManagerError.settingsDecryptionFailed(underlying: error.localizedDescription)
+        }
+    }
     public static func recoveryPhrase(for keyData: Data) -> String {
         precondition(keyData.count == keyByteCount)
 
@@ -555,6 +620,62 @@ public enum MasterKeyManager {
         defaults.removeObject(forKey: createdAtDefaultsKey)
         defaults.removeObject(forKey: lastShownRecoveryDefaultsKey)
         defaults.removeObject(forKey: storagePolicyDefaultsKey)
+    }
+
+    private static func protectedSettingsPayload(
+        _ payload: Data,
+        purpose: String,
+        masterKeyData: Data
+    ) throws -> String {
+        do {
+            let sealedBox = try AES.GCM.seal(
+                payload,
+                using: settingsProtectionKey(
+                    purpose: purpose,
+                    masterKeyData: masterKeyData
+                ),
+                authenticating: Data(purpose.utf8)
+            )
+            guard let combined = sealedBox.combined else {
+                throw MasterKeyManagerError.invalidProtectedSettingsPayload
+            }
+            return protectedSettingsPayloadPrefix + base64URLEncode(combined)
+        } catch let error as MasterKeyManagerError {
+            throw error
+        } catch {
+            throw MasterKeyManagerError.settingsEncryptionFailed(underlying: error.localizedDescription)
+        }
+    }
+
+    private static func unprotectedSettingsPayload(
+        _ payload: String,
+        purpose: String,
+        masterKeyData: Data
+    ) throws -> Data {
+        guard isProtectedPhraseLevelRedactionPayload(payload) else {
+            throw MasterKeyManagerError.invalidProtectedSettingsPayload
+        }
+
+        let encodedPayload = String(payload.dropFirst(protectedSettingsPayloadPrefix.count))
+        guard let combined = base64URLDecode(encodedPayload) else {
+            throw MasterKeyManagerError.invalidProtectedSettingsPayload
+        }
+
+        do {
+            let sealedBox = try AES.GCM.SealedBox(combined: combined)
+            return try AES.GCM.open(
+                sealedBox,
+                using: settingsProtectionKey(
+                    purpose: purpose,
+                    masterKeyData: masterKeyData
+                ),
+                authenticating: Data(purpose.utf8)
+            )
+        } catch let error as MasterKeyManagerError {
+            throw error
+        } catch {
+            throw MasterKeyManagerError.settingsDecryptionFailed(underlying: error.localizedDescription)
+        }
     }
 
     private static func saveMasterKeyIfAbsent(_ keyData: Data) throws -> Bool {
@@ -810,6 +931,18 @@ public enum MasterKeyManager {
         cacheLock.unlock()
     }
 
+    private static func settingsProtectionKey(
+        purpose: String,
+        masterKeyData: Data
+    ) -> SymmetricKey {
+        var material = Data("retrace.settings.".utf8)
+        material.append(Data(purpose.utf8))
+        material.append(0)
+        material.append(masterKeyData)
+        let digest = SHA256.hash(data: material)
+        return SymmetricKey(data: Data(digest))
+    }
+
     static func trustedApplicationPath(bundlePath: String, executablePath: String?) -> String? {
         guard !bundlePath.isEmpty else { return executablePath }
         if bundlePath.hasSuffix(".app") {
@@ -908,5 +1041,34 @@ private extension Data {
 
     func hexEncodedString() -> String {
         map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+private extension MasterKeyManager {
+    static func base64URLEncode(_ data: Data) -> String {
+        data.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+
+    static func base64URLDecode(_ encoded: String) -> Data? {
+        let remainder = encoded.count % 4
+        let padding: String
+        switch remainder {
+        case 0:
+            padding = ""
+        case 2:
+            padding = "=="
+        case 3:
+            padding = "="
+        default:
+            return nil
+        }
+
+        let padded = encoded
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/") + padding
+        return Data(base64Encoded: padded)
     }
 }

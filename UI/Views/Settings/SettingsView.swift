@@ -9,6 +9,7 @@ import SQLCipher
 import ServiceManagement
 import Darwin
 import Carbon
+import LocalAuthentication
 import UniformTypeIdentifiers
 
 /// Shared UserDefaults store for consistent settings across debug/release builds
@@ -56,6 +57,12 @@ private struct MasterKeySetupSession: Identifiable {
     let storagePolicy: MasterKeyStoragePolicy
     let continuesWithDatabaseEncryption: Bool
     var step: Step = .created
+}
+
+private enum PhraseLevelRedactionRevealAuthResult: Equatable {
+    case success
+    case cancelled
+    case failed(String)
 }
 
 // MARK: - Settings Defaults (Single Source of Truth)
@@ -362,6 +369,9 @@ public struct SettingsView: View {
     @State private var phraseLevelRedactionInput = ""
     @State private var phraseLevelRedactionEnabled = SettingsDefaults.phraseLevelRedactionEnabled
     @State private var phraseLevelRedactionToggleInitialized = false
+    @State private var revealedPhraseLevelRedactionPhrases: [String]?
+    @State private var isUnlockingPhraseLevelRedactionPhrases = false
+    @State private var phraseLevelRedactionUnlockError: String?
     @State private var hasMasterKeyInKeychain = false
     @State private var pendingMasterKeyFeature: MasterKeyProtectedFeature?
     @State private var masterKeySetupSession: MasterKeySetupSession?
@@ -1273,10 +1283,13 @@ public struct SettingsView: View {
     private func initializeProtectedFeatureStateIfNeeded() {
         guard !phraseLevelRedactionToggleInitialized else { return }
 
+        hasMasterKeyInKeychain = MasterKeyManager.hasMasterKey()
+        migratePhraseLevelRedactionPhrasesToProtectedStorageIfNeeded()
+
         if let storedValue = settingsStore.object(forKey: phraseLevelRedactionEnabledDefaultsKey) as? Bool {
             phraseLevelRedactionEnabled = storedValue
         } else {
-            phraseLevelRedactionEnabled = !phraseLevelRedactionPhrases.isEmpty
+            phraseLevelRedactionEnabled = Self.hasStoredPhraseLevelRedactionPayload(phraseLevelRedactionPhrasesRaw)
         }
 
         phraseLevelRedactionToggleInitialized = true
@@ -1329,6 +1342,7 @@ public struct SettingsView: View {
         }
 
         phraseLevelRedactionEnabled = false
+        lockPhraseLevelRedactionPhraseList()
         settingsStore.set(false, forKey: phraseLevelRedactionEnabledDefaultsKey)
         Task { @MainActor in
             showSettingsToast("Keyword redaction disabled")
@@ -4555,16 +4569,12 @@ public struct SettingsView: View {
         }
     }
 
-    private var phraseLevelRedactionPhrases: [String] {
-        if let data = phraseLevelRedactionPhrasesRaw.data(using: .utf8),
-           let decoded = try? JSONDecoder().decode([String].self, from: data) {
-            return normalizePhraseLevelRedactionPhrases(decoded)
-        }
+    private var hasStoredPhraseLevelRedactionPhrases: Bool {
+        Self.hasStoredPhraseLevelRedactionPayload(phraseLevelRedactionPhrasesRaw)
+    }
 
-        let fallback = phraseLevelRedactionPhrasesRaw
-            .split(whereSeparator: { $0 == "," || $0 == "\n" })
-            .map(String.init)
-        return normalizePhraseLevelRedactionPhrases(fallback)
+    private var isPhraseLevelRedactionListUnlocked: Bool {
+        revealedPhraseLevelRedactionPhrases != nil
     }
 
     @ViewBuilder
@@ -4587,6 +4597,8 @@ public struct SettingsView: View {
 
     @ViewBuilder
     private var phraseLevelRedactionCard: some View {
+        let visiblePhrases = revealedPhraseLevelRedactionPhrases ?? []
+
         ModernSettingsCard(title: "Phrase Level Redaction", icon: "text.viewfinder") {
             VStack(alignment: .leading, spacing: 14) {
                 Text("Redact matching OCR text with reversible scrambling from manual keywords.")
@@ -4638,17 +4650,17 @@ public struct SettingsView: View {
                             }
                         }
 
-                        if phraseLevelRedactionPhrases.isEmpty {
+                        if !hasStoredPhraseLevelRedactionPhrases {
                             Text("No keywords configured yet.")
                                 .font(.retraceCaption)
                                 .foregroundColor(.retraceSecondary.opacity(0.8))
-                        } else {
+                        } else if isPhraseLevelRedactionListUnlocked {
                             LazyVGrid(
                                 columns: [GridItem(.adaptive(minimum: 170), spacing: 8)],
                                 alignment: .leading,
                                 spacing: 8
                             ) {
-                                ForEach(phraseLevelRedactionPhrases, id: \.self) { phrase in
+                                ForEach(visiblePhrases, id: \.self) { phrase in
                                     HStack(spacing: 8) {
                                         Text(phrase)
                                             .font(.retraceCaption)
@@ -4679,6 +4691,44 @@ public struct SettingsView: View {
                                     )
                                 }
                             }
+
+                            Button(Self.phraseLevelRedactionRevealButtonLabel(isUnlocked: true)) {
+                                lockPhraseLevelRedactionPhraseList()
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                        } else {
+                            VStack(alignment: .leading, spacing: 10) {
+                                HStack(alignment: .top, spacing: 10) {
+                                    Image(systemName: "lock.shield")
+                                        .font(.system(size: 13, weight: .semibold))
+                                        .foregroundColor(.retraceSecondary)
+
+                                    Text(Self.phraseLevelRedactionProtectedListMessage())
+                                        .font(.retraceCaption)
+                                        .foregroundColor(.retraceSecondary.opacity(0.9))
+                                }
+
+                                HStack(spacing: 10) {
+                                    Button(Self.phraseLevelRedactionRevealButtonLabel(isUnlocked: false)) {
+                                        unlockPhraseLevelRedactionPhraseList()
+                                    }
+                                    .buttonStyle(.borderedProminent)
+                                    .controlSize(.small)
+                                    .disabled(isUnlockingPhraseLevelRedactionPhrases)
+
+                                    if isUnlockingPhraseLevelRedactionPhrases {
+                                        ProgressView()
+                                            .controlSize(.small)
+                                    }
+                                }
+
+                                if let phraseLevelRedactionUnlockError {
+                                    Text(phraseLevelRedactionUnlockError)
+                                        .font(.retraceCaption)
+                                        .foregroundColor(.retraceDanger)
+                                }
+                            }
                         }
                     }
                 }
@@ -4702,35 +4752,149 @@ public struct SettingsView: View {
         return normalized
     }
 
+    private func loadPhraseLevelRedactionPhrasesFromStorage() throws -> [String] {
+        try Self.phraseLevelRedactionPhrases(fromStoredValue: phraseLevelRedactionPhrasesRaw)
+    }
+
+    private func encodedPhraseLevelRedactionPhrases(_ phrases: [String]) throws -> String {
+        let normalized = normalizePhraseLevelRedactionPhrases(phrases)
+        guard !normalized.isEmpty else { return "[]" }
+
+        if hasMasterKeyInKeychain {
+            return try MasterKeyManager.protectPhraseLevelRedactionPhrases(normalized)
+        }
+
+        let data = try JSONEncoder().encode(normalized)
+        guard let encoded = String(data: data, encoding: .utf8) else {
+            throw MasterKeyManagerError.settingsEncryptionFailed(underlying: "UTF-8 encoding failed.")
+        }
+        return encoded
+    }
+
+    private func migratePhraseLevelRedactionPhrasesToProtectedStorageIfNeeded() {
+        guard hasMasterKeyInKeychain else { return }
+        guard hasStoredPhraseLevelRedactionPhrases else { return }
+        guard !MasterKeyManager.isProtectedPhraseLevelRedactionPayload(phraseLevelRedactionPhrasesRaw) else { return }
+
+        do {
+            phraseLevelRedactionPhrasesRaw = try encodedPhraseLevelRedactionPhrases(
+                Self.legacyPhraseLevelRedactionPhrases(from: phraseLevelRedactionPhrasesRaw)
+            )
+        } catch {
+            Log.warning(
+                "[SettingsView] Failed to migrate phrase rules into protected storage: \(error.localizedDescription)",
+                category: .ui
+            )
+        }
+    }
+
     private func persistPhraseLevelRedactionPhrases(_ phrases: [String], action: String) {
         let normalized = normalizePhraseLevelRedactionPhrases(phrases)
-        if let data = try? JSONEncoder().encode(normalized),
-           let encoded = String(data: data, encoding: .utf8) {
-            phraseLevelRedactionPhrasesRaw = encoded
+        do {
+            phraseLevelRedactionPhrasesRaw = try encodedPhraseLevelRedactionPhrases(normalized)
+            if isPhraseLevelRedactionListUnlocked {
+                revealedPhraseLevelRedactionPhrases = normalized
+            }
+            phraseLevelRedactionUnlockError = nil
             Task { @MainActor in
                 showSettingsToast("Keyword redaction rules updated")
             }
             recordPhraseLevelRedactionRulesMetric(action: action, phraseCount: normalized.count)
-            return
+        } catch {
+            Task { @MainActor in
+                showSettingsToast("Couldn't update protected keywords", isError: true)
+            }
+            Log.error("[SettingsView] Failed to persist protected keywords: \(error)", category: .ui)
         }
-        phraseLevelRedactionPhrasesRaw = "[]"
     }
 
     private func addPhraseLevelRedactionPhrase() {
         guard phraseLevelRedactionEnabled else { return }
         let input = phraseLevelRedactionInput.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !input.isEmpty else { return }
-        var phrases = phraseLevelRedactionPhrases
-        phrases.append(input)
-        persistPhraseLevelRedactionPhrases(phrases, action: "add")
+        let currentPhrases: [String]
+        do {
+            currentPhrases = try loadPhraseLevelRedactionPhrasesFromStorage()
+        } catch {
+            showSettingsToast("Restore the master key before editing protected keywords", isError: true)
+            Log.warning("[SettingsView] Failed to load protected keywords for add: \(error)", category: .ui)
+            return
+        }
+        var updatedPhrases = currentPhrases
+        updatedPhrases.append(input)
+        persistPhraseLevelRedactionPhrases(updatedPhrases, action: "add")
         phraseLevelRedactionInput = ""
     }
 
     private func removePhraseLevelRedactionPhrase(_ phrase: String) {
         guard phraseLevelRedactionEnabled else { return }
-        var phrases = phraseLevelRedactionPhrases
-        phrases.removeAll { $0.caseInsensitiveCompare(phrase) == .orderedSame }
-        persistPhraseLevelRedactionPhrases(phrases, action: "remove")
+        let currentPhrases: [String]
+        do {
+            currentPhrases = try loadPhraseLevelRedactionPhrasesFromStorage()
+        } catch {
+            showSettingsToast("Restore the master key before editing protected keywords", isError: true)
+            Log.warning("[SettingsView] Failed to load protected keywords for removal: \(error)", category: .ui)
+            return
+        }
+        var updatedPhrases = currentPhrases
+        updatedPhrases.removeAll { $0.caseInsensitiveCompare(phrase) == .orderedSame }
+        persistPhraseLevelRedactionPhrases(updatedPhrases, action: "remove")
+    }
+
+    private func unlockPhraseLevelRedactionPhraseList() {
+        guard !isUnlockingPhraseLevelRedactionPhrases else { return }
+
+        phraseLevelRedactionUnlockError = nil
+        isUnlockingPhraseLevelRedactionPhrases = true
+
+        Task {
+            let authResult = await Self.authenticatePhraseLevelRedactionReveal()
+
+            switch authResult {
+            case .success:
+                do {
+                    let phrases = try loadPhraseLevelRedactionPhrasesFromStorage()
+                    await MainActor.run {
+                        revealedPhraseLevelRedactionPhrases = phrases
+                        isUnlockingPhraseLevelRedactionPhrases = false
+                    }
+                    recordPhraseLevelRedactionSettingsRevealMetric(
+                        outcome: "success",
+                        phraseCount: phrases.count
+                    )
+                } catch {
+                    let message = "Restore the master key before revealing protected keywords."
+                    await MainActor.run {
+                        isUnlockingPhraseLevelRedactionPhrases = false
+                        phraseLevelRedactionUnlockError = message
+                    }
+                    recordPhraseLevelRedactionSettingsRevealMetric(
+                        outcome: "failed",
+                        error: error.localizedDescription
+                    )
+                }
+            case .cancelled:
+                await MainActor.run {
+                    isUnlockingPhraseLevelRedactionPhrases = false
+                }
+                recordPhraseLevelRedactionSettingsRevealMetric(outcome: "cancelled")
+            case .failed(let message):
+                await MainActor.run {
+                    isUnlockingPhraseLevelRedactionPhrases = false
+                    phraseLevelRedactionUnlockError = message
+                }
+                recordPhraseLevelRedactionSettingsRevealMetric(
+                    outcome: "failed",
+                    error: message
+                )
+            }
+        }
+    }
+
+    private func lockPhraseLevelRedactionPhraseList() {
+        revealedPhraseLevelRedactionPhrases = nil
+        isUnlockingPhraseLevelRedactionPhrases = false
+        phraseLevelRedactionUnlockError = nil
     }
 
     private func recordPhraseLevelRedactionRulesMetric(action: String, phraseCount: Int) {
@@ -4742,6 +4906,30 @@ public struct SettingsView: View {
             let metadata = Self.inPageURLMetricMetadata(payload)
             try? await coordinatorWrapper.coordinator.recordMetricEvent(
                 metricType: .phraseLevelRedactionRulesUpdated,
+                metadata: metadata
+            )
+        }
+    }
+
+    private func recordPhraseLevelRedactionSettingsRevealMetric(
+        outcome: String,
+        phraseCount: Int? = nil,
+        error: String? = nil
+    ) {
+        Task {
+            var payload: [String: Any] = [
+                "outcome": outcome,
+                "surface": "settings"
+            ]
+            if let phraseCount {
+                payload["phraseCount"] = phraseCount
+            }
+            if let error {
+                payload["error"] = error
+            }
+            let metadata = Self.inPageURLMetricMetadata(payload)
+            try? await coordinatorWrapper.coordinator.recordMetricEvent(
+                metricType: .phraseLevelRedactionSettingsReveal,
                 metadata: metadata
             )
         }
@@ -11942,6 +12130,7 @@ extension SettingsView {
         settingsStore.set(SettingsDefaults.phraseLevelRedactionEnabled, forKey: phraseLevelRedactionEnabledDefaultsKey)
         phraseLevelRedactionPhrasesRaw = SettingsDefaults.phraseLevelRedactionPhrases
         phraseLevelRedactionInput = ""
+        lockPhraseLevelRedactionPhraseList()
         excludeSafariPrivate = SettingsDefaults.excludeSafariPrivate
         excludeChromeIncognito = SettingsDefaults.excludeChromeIncognito
 
@@ -11985,6 +12174,8 @@ extension SettingsView {
                 animateMasterKeyCreatedState = false
                 phraseLevelRedactionEnabled = false
                 settingsStore.set(false, forKey: phraseLevelRedactionEnabledDefaultsKey)
+                phraseLevelRedactionPhrasesRaw = SettingsDefaults.phraseLevelRedactionPhrases
+                lockPhraseLevelRedactionPhraseList()
 
                 showSettingsToast(
                     removed ? "Master key reset for this Mac" : "No master key was stored on this Mac"
@@ -12291,6 +12482,126 @@ private struct DatabaseSchemaView: View {
         .frame(width: 600, height: 500)
         .background(Color.retraceBackground)
         .cornerRadius(12)
+    }
+}
+
+extension SettingsView {
+    nonisolated static func phraseLevelRedactionRevealButtonLabel(isUnlocked: Bool) -> String {
+        isUnlocked ? "Hide Protected List" : "Reveal with Touch ID or Password"
+    }
+
+    nonisolated static func phraseLevelRedactionProtectedListMessage() -> String {
+        "The saved keyword list is hidden until you verify your identity with Touch ID or your Mac password."
+    }
+
+    nonisolated static func hasStoredPhraseLevelRedactionPayload(_ raw: String) -> Bool {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !trimmed.isEmpty && trimmed != "[]"
+    }
+
+    nonisolated static func legacyPhraseLevelRedactionPhrases(from raw: String) -> [String] {
+        if let data = raw.data(using: .utf8),
+           let decoded = try? JSONDecoder().decode([String].self, from: data) {
+            return normalizeStoredPhraseLevelRedactionPhrases(decoded)
+        }
+
+        return normalizeStoredPhraseLevelRedactionPhrases(
+            raw
+                .split(whereSeparator: { $0 == "," || $0 == "\n" })
+                .map(String.init)
+        )
+    }
+
+    static func phraseLevelRedactionPhrases(fromStoredValue raw: String) throws -> [String] {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != "[]" else { return [] }
+
+        if MasterKeyManager.isProtectedPhraseLevelRedactionPayload(trimmed) {
+            return normalizeStoredPhraseLevelRedactionPhrases(
+                try MasterKeyManager.unprotectPhraseLevelRedactionPhrases(trimmed)
+            )
+        }
+
+        return legacyPhraseLevelRedactionPhrases(from: trimmed)
+    }
+
+    nonisolated private static func normalizeStoredPhraseLevelRedactionPhrases(_ phrases: [String]) -> [String] {
+        var seen: Set<String> = []
+        var normalized: [String] = []
+        normalized.reserveCapacity(phrases.count)
+
+        for phrase in phrases {
+            let trimmed = phrase.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            let dedupeKey = trimmed.lowercased()
+            guard seen.insert(dedupeKey).inserted else { continue }
+            normalized.append(trimmed)
+        }
+
+        return normalized
+    }
+
+    fileprivate static func authenticatePhraseLevelRedactionReveal() async -> PhraseLevelRedactionRevealAuthResult {
+        let context = LAContext()
+        context.localizedCancelTitle = "Cancel"
+
+        var authError: NSError?
+        guard context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &authError) else {
+            return .failed(
+                phraseLevelRedactionAuthenticationFailureMessage(from: authError)
+            )
+        }
+
+        return await withCheckedContinuation { continuation in
+            context.evaluatePolicy(
+                .deviceOwnerAuthentication,
+                localizedReason: "Reveal the protected keyword redaction phrases in Retrace Settings."
+            ) { success, error in
+                if success {
+                    continuation.resume(returning: .success)
+                    return
+                }
+
+                if let laError = error as? LAError {
+                    switch laError.code {
+                    case .userCancel, .appCancel, .systemCancel, .userFallback:
+                        continuation.resume(returning: .cancelled)
+                        return
+                    default:
+                        break
+                    }
+                }
+
+                continuation.resume(
+                    returning: .failed(
+                        phraseLevelRedactionAuthenticationFailureMessage(from: error)
+                    )
+                )
+            }
+        }
+    }
+
+    nonisolated private static func phraseLevelRedactionAuthenticationFailureMessage(from error: Error?) -> String {
+        guard let error else {
+            return "Couldn't verify your identity."
+        }
+
+        if let laError = error as? LAError {
+            switch laError.code {
+            case .biometryLockout:
+                return "Touch ID is locked. Use your Mac password to continue."
+            case .biometryNotAvailable:
+                return "Touch ID isn't available on this Mac. Use your password instead."
+            case .passcodeNotSet:
+                return "Set a Mac password before revealing protected keywords."
+            case .authenticationFailed:
+                return "Authentication failed. Try again."
+            default:
+                break
+            }
+        }
+
+        return error.localizedDescription
     }
 }
 
