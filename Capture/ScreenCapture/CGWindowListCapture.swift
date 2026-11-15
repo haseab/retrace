@@ -443,6 +443,7 @@ public actor CGWindowListCapture {
     }
 
     private struct ExclusionComputationResult: Sendable {
+        let includedCaptureWindowIDs: [CGWindowID]
         let excludedWindowIDs: Set<CGWindowID>
         let redactedWindowIDs: Set<CGWindowID>
         let redactionContextByWindowID: [CGWindowID: RedactionWindowContext]
@@ -452,7 +453,8 @@ public actor CGWindowListCapture {
         let captureBlockReason: String?
     }
 
-    private struct FilteredCaptureResult {
+    // CGImage is an immutable Core Graphics object safe to transfer after rendering.
+    struct FilteredCaptureResult: @unchecked Sendable {
         let image: CGImage
         let visibleExcludedWindowIDs: Set<CGWindowID>
     }
@@ -603,6 +605,7 @@ public actor CGWindowListCapture {
         guard let captureResult = captureWithFiltering(
             displayID: displayID,
             excludedWindowIDs: excludedIDs,
+            includedWindowIDs: exclusionResult.includedCaptureWindowIDs,
             forceMasking: !exclusionResult.redactedWindowIDs.isEmpty
         ) else {
             Log.warning("[CGWindowListCapture] Failed to capture CGImage for displayID=\(displayID), excludedCount=\(excludedIDs.count)", category: .capture)
@@ -864,6 +867,7 @@ public actor CGWindowListCapture {
         systemMediaCaptureState: SystemMediaCaptureState
     ) async -> ExclusionComputationResult {
         var excludedIDs = Set<CGWindowID>()
+        var captureEligibleWindowIDs: [CGWindowID] = []
         var redactedWindowIDs = Set<CGWindowID>()
         var redactionContextByWindowID: [CGWindowID: RedactionWindowContext] = [:]
         var redactionWindowOrder: [CGWindowID] = []
@@ -886,6 +890,7 @@ public actor CGWindowListCapture {
             kCGNullWindowID
         ) as? [[String: Any]] else {
             return ExclusionComputationResult(
+                includedCaptureWindowIDs: [],
                 excludedWindowIDs: excludedIDs,
                 redactedWindowIDs: redactedWindowIDs,
                 redactionContextByWindowID: redactionContextByWindowID,
@@ -972,6 +977,9 @@ public actor CGWindowListCapture {
             }
 
             let layer = windowInfo[kCGWindowLayer as String] as? Int ?? 0
+            if layer == 0 && alpha > 0 && isOnScreen {
+                captureEligibleWindowIDs.append(windowID)
+            }
             let normalizedWindowName = normalizedWindowTitle(windowName)
             let appName = appDisplayName(ownerName: ownerName, bundleID: bundleID)
             let isCaptureEligible = isCaptureEligible(
@@ -1357,6 +1365,7 @@ public actor CGWindowListCapture {
         )
 
         return ExclusionComputationResult(
+            includedCaptureWindowIDs: captureEligibleWindowIDs.filter { !excludedIDs.contains($0) },
             excludedWindowIDs: excludedIDs,
             redactedWindowIDs: redactedWindowIDs,
             redactionContextByWindowID: redactionContextByWindowID,
@@ -1691,63 +1700,33 @@ public actor CGWindowListCapture {
         )
     }
 
-    /// Capture with window filtering using CGWindowListCreateImageFromArray
-    private func captureWithFiltering(
+    /// Reuse normal on-screen window IDs from exclusion classification. Array
+    /// capture resolves those IDs' current images; masking still needs fresh bounds.
+    func captureWithFiltering(
         displayID: CGWindowID,
         excludedWindowIDs: Set<CGWindowID>,
-        forceMasking: Bool
+        includedWindowIDs: [CGWindowID],
+        forceMasking: Bool,
+        copyOnScreenWindows: @Sendable () -> [[String: Any]]? = {
+            CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]
+        },
+        captureArray: @Sendable (CGRect, CFArray) -> CGImage? = { bounds, windows in
+            CGImage(windowListFromArrayScreenBounds: bounds, windowArray: windows, imageOption: [.bestResolution])
+        },
+        captureDisplay: @Sendable (CGDirectDisplayID) -> CGImage? = { CGDisplayCreateImage($0) }
     ) -> FilteredCaptureResult? {
-        // If no exclusions, use simple display capture
         if excludedWindowIDs.isEmpty {
-            guard let image = CGDisplayCreateImage(displayID) else { return nil }
+            guard let image = captureDisplay(displayID) else { return nil }
             return FilteredCaptureResult(image: image, visibleExcludedWindowIDs: [])
         }
 
-        // Get all on-screen windows
-        guard let windowList = CGWindowListCopyWindowInfo(
-            [.optionOnScreenOnly, .excludeDesktopElements],
-            kCGNullWindowID
-        ) as? [[String: Any]] else {
-            Log.warning("[Filtering] Dropping frame because the exclusion window list is unavailable", category: .capture)
-            return nil
-        }
-
-        if forceMasking {
-            return captureWithMasking(displayID: displayID, excludedWindowIDs: excludedWindowIDs, windowList: windowList)
-        }
-
-        // Build list of window IDs to include (everything except excluded)
-        // CRITICAL: Only include windows with layer == 0 (normal app windows)
-        // System windows with extreme layer values (e.g., -2147483601) can cause
-        // CGWindowListCreateImageFromArray to return nil
-        var includedWindowIDs: [CGWindowID] = []
-
-        for windowInfo in windowList {
-            guard let windowID = windowInfo[kCGWindowNumber as String] as? CGWindowID else { continue }
-
-            // Filter out system/desktop/overlay windows by checking layer
-            // Layer 0 = normal application windows
-            // Non-zero layers are typically system windows that can break the API
-            let layer = windowInfo[kCGWindowLayer as String] as? Int ?? 0
-            if layer != 0 {
-                Log.debug("[Filtering] Skipping window \(windowID) with layer \(layer)", category: .capture)
-                continue
+        if forceMasking || arrayCaptureBroken || includedWindowIDs.isEmpty {
+            guard let windowList = copyOnScreenWindows() else {
+                Log.warning("[Filtering] Dropping frame because the exclusion window list is unavailable", category: .capture)
+                return nil
             }
-
-            // Also verify window has valid properties
-            let alpha = windowInfo[kCGWindowAlpha as String] as? Double ?? 0
-            let isOnScreen = windowInfo[kCGWindowIsOnscreen as String] as? Bool ?? false
-            if alpha <= 0 || !isOnScreen {
-                continue
-            }
-
-            if !excludedWindowIDs.contains(windowID) {
-                includedWindowIDs.append(windowID)
-            }
-        }
-
-        if includedWindowIDs.isEmpty {
-            return captureWithMasking(displayID: displayID, excludedWindowIDs: excludedWindowIDs, windowList: windowList)
+            return captureWithMasking(displayID: displayID, excludedWindowIDs: excludedWindowIDs,
+                windowList: windowList, captureDisplay: captureDisplay)
         }
 
         let displayBounds = CGDisplayBounds(displayID)
@@ -1757,53 +1736,31 @@ public actor CGWindowListCapture {
         Log.debug("[Filtering] Included window IDs: \(includedWindowIDs.prefix(10))...", category: .capture)
         Log.debug("[Filtering] Excluded window IDs: \(excludedWindowIDs)", category: .capture)
 
-        // Log details about included windows
-        #if DEBUG
-        for windowInfo in windowList {
-            guard let windowID = windowInfo[kCGWindowNumber as String] as? CGWindowID else { continue }
-            if includedWindowIDs.contains(windowID) {
-                let name = windowInfo[kCGWindowName as String] as? String ?? "(no name)"
-                let owner = windowInfo[kCGWindowOwnerName as String] as? String ?? "(no owner)"
-                let layer = windowInfo[kCGWindowLayer as String] as? Int ?? -1
-                let bounds = windowInfo[kCGWindowBounds as String] as? [String: Any]
-                let alpha = windowInfo[kCGWindowAlpha as String] as? Double ?? -1
-                let onScreen = windowInfo[kCGWindowIsOnscreen as String] as? Bool ?? false
-                Log.debug("[Filtering] Including window \(windowID): '\(name)' from \(owner), layer=\(layer), alpha=\(alpha), onScreen=\(onScreen), bounds=\(bounds ?? [:])", category: .capture)
-            }
-        }
-
-        #endif
-
         // Create CFArray of window IDs properly - must be CGWindowID (UInt32) wrapped as NSNumber/CFNumber
         let windowNumbers: [NSNumber] = includedWindowIDs.map { NSNumber(value: $0) }
         let windowArray: CFArray = windowNumbers as CFArray
 
         Log.debug("[Filtering] Created CFArray with \(CFArrayGetCount(windowArray)) elements", category: .capture)
 
-        // If we already know array capture is broken on this system, skip straight to fallback
-        if arrayCaptureBroken {
-            return captureWithMasking(displayID: displayID, excludedWindowIDs: excludedWindowIDs, windowList: windowList)
-        }
-
         // Try the array-based capture first
-        if let image = CGImage(
-            windowListFromArrayScreenBounds: displayBounds,
-            windowArray: windowArray,
-            imageOption: [.bestResolution]
-        ) {
+        if let image = captureArray(displayBounds, windowArray) {
             Log.recordRoutine(.captureArraySucceeded)
             return FilteredCaptureResult(image: image, visibleExcludedWindowIDs: [])
+        }
+
+        // Array capture failed. Refresh geometry only now: privacy/AX checks can
+        // suspend while windows move, so masking must not reuse the initial bounds.
+        arrayCaptureBroken = true
+        guard let windowList = copyOnScreenWindows() else {
+            Log.warning("[Filtering] Dropping frame because the exclusion window list is unavailable", category: .capture)
+            return nil
         }
 
         // Array capture failed - run diagnostic ONCE to log which windows fail
         Log.warning("[Filtering] Array capture failed on macOS, testing individual windows (one-time diagnostic)...", category: .capture)
         for windowID in includedWindowIDs {
             let singleArray: CFArray = [NSNumber(value: windowID)] as CFArray
-            if CGImage(
-                windowListFromArrayScreenBounds: displayBounds,
-                windowArray: singleArray,
-                imageOption: [.bestResolution]
-            ) == nil {
+            if captureArray(displayBounds, singleArray) == nil {
                 let info = windowList.first { ($0[kCGWindowNumber as String] as? CGWindowID) == windowID }
                 let name = info?[kCGWindowName as String] as? String ?? "(no name)"
                 let owner = info?[kCGWindowOwnerName as String] as? String ?? "(no owner)"
@@ -1813,10 +1770,9 @@ public actor CGWindowListCapture {
 
         // Mark as broken so we skip directly to fallback on future captures
         Log.warning("[Filtering] CGWindowListCreateImageFromArray is broken on this macOS version. Using masking fallback permanently.", category: .capture)
-        arrayCaptureBroken = true
 
         // FALLBACK: Capture full screen and mask out excluded windows
-        return captureWithMasking(displayID: displayID, excludedWindowIDs: excludedWindowIDs, windowList: windowList)
+        return captureWithMasking(displayID: displayID, excludedWindowIDs: excludedWindowIDs, windowList: windowList, captureDisplay: captureDisplay)
     }
 
     /// Fallback capture method: capture full screen and mask out VISIBLE portions of excluded windows
@@ -1825,10 +1781,11 @@ public actor CGWindowListCapture {
     private func captureWithMasking(
         displayID: CGWindowID,
         excludedWindowIDs: Set<CGWindowID>,
-        windowList: [[String: Any]]
+        windowList: [[String: Any]],
+        captureDisplay: @Sendable (CGDirectDisplayID) -> CGImage?
     ) -> FilteredCaptureResult? {
         // Capture the full screen first
-        guard let fullScreenImage = CGDisplayCreateImage(displayID) else {
+        guard let fullScreenImage = captureDisplay(displayID) else {
             Log.error("[Masking] Failed to capture full screen", category: .capture)
             return nil
         }

@@ -25,6 +25,7 @@ Storage/
 │   ├── WALManager.swift         # Versioned lossless/raw records, checksums, random reads, decoded byte limits
 │   └── RecoveryManager.swift    # Crash recovery and durable video-prefix reuse
 └── Tests/
+    ├── EncoderFileInspectionTests.swift # Lookup reuse, failure handling and real graphics/file regression checks
     ├── DirectoryManagerTests.swift
     ├── TemporaryVideoLinkTests.swift # Real file/link lifecycle regression
     ├── StorageManagerTests.swift
@@ -362,3 +363,7 @@ Start with the HEVC encoder since that's the core complexity, then add encryptio
 
 - Maintain an eight-entry LRU of WAL writer handles and extend offsets incrementally within an active session, but force validation scans for recovery. Close handles on session removal/reset and failed appends.
 - Local video readers use TemporaryVideoLink through a defer covering every return/error; cached AVAssetImageGenerator links remain alive until generator eviction.
+
+### Encoder output inspection
+
+Keep the pre-append existence check for recovery before writing the next frame. After append, `outputFileSizeIfPresent` performs one attributes lookup for both missing-file detection and fragment size/frontier tracking. Missing paths trigger immediate recreation; empty existing files are not missing. Other metadata I/O failures propagate without treating the file as deleted or recreating the writer. Fragment thresholds and durable-frontier accounting remain unchanged.
