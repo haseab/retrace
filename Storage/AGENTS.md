@@ -54,7 +54,7 @@ Location: `AppPaths.storageRoot` (default: `~/Library/Application Support/Retrac
 ├── wal/active_segment_{videoID}/
 │   ├── frames.bin                 # Independently compressed image records
 │   ├── frame_id_map.bin           # Database frame ID -> record offset
-│   └── metadata.json              # Recoverable segment metadata and durable frontier
+│   └── metadata.json              # Periodic screenshot metadata checkpoints and immediate durable video frontier
 └── temp/                          # Temporary files
 ```
 
@@ -351,3 +351,9 @@ Start with the HEVC encoder since that's the core complexity, then add encryptio
 ## Permanent keyword redaction
 
 `SegmentRedactionTarget.mode` is captured from stored node metadata, not current settings. Permanent targets overwrite the whole patch with opaque black and require no secret; scramble targets retain the existing keyed permutation. Invalid rectangles or patch extraction failures abort the atomic rewrite. Mixed plans require a secret if any target uses scrambling. Recovery keeps the existing write/swap/commit cleanup contract.
+
+### Screenshot metadata checkpoints
+
+- Frame count/dimensions are reconstructible from `frames.bin`; checkpoint them at most once per 30 seconds during append instead of rewriting `metadata.json` for each screenshot.
+- Durable video frontier updates still persist immediately. Merge them into later session-copy checkpoints so the persisted frontier never regresses.
+- Recovery reconciles even structurally valid stale metadata against the complete WAL record prefix, preserving its durable frontier. Missing metadata remains recoverable. Checkpoint state is cleared with all other session caches.

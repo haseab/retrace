@@ -28,6 +28,20 @@ final class FeedbackExportTests: XCTestCase {
         )
     }
 
+    func testQueueDiagnosticErrorsRemainAvailableForFeedback() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let lines = [
+            "[2026-04-05T01:05:25Z] [ERROR] [Processing] FrameProcessingQueue.swift:1 - [privacy-v1] [Queue-DIAG] Worker failed errorCode=5",
+            "[2026-04-05T01:05:26Z] [WARN] [Processing] FrameProcessingQueue.swift:2 - [privacy-v1] [Queue-Rewrite] Cleanup failed errorCode=5",
+            "[2026-04-05T01:05:27Z] [🔥 CRITICAL] [UI] Timeline.swift:3 - [privacy-v1] [Timeline-Memory] Allocation failed"
+        ]
+        try (lines.joined(separator: "\n") + "\n").write(to: url, atomically: true, encoding: .utf8)
+        let snapshot = FeedbackService.collectFeedbackLogSnapshotWithErrors(rawLimit: 0, fileURL: url, groupedLimitPerFamily: 0, errorLimit: 10)
+        XCTAssertEqual(snapshot.recentErrors, lines)
+        XCTAssertEqual(FeedbackService.filteredFeedbackLogEntries(lines), lines)
+    }
+
     func testLegacyLogContentIsNeverIncludedInFeedback() {
         let legacy = "[2026-04-05T01:05:25Z] [INFO] [UI] Search.swift:1 - token=PRIVATE_FEEDBACK_CANARY"
         XCTAssertTrue(FeedbackService.filteredFeedbackLogEntries([legacy]).isEmpty)

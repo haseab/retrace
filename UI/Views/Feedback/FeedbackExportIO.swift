@@ -30,19 +30,21 @@ extension FeedbackService {
     // MARK: - Export
 
     /// Export diagnostics as a shareable text file
-    public func exportDiagnostics() -> URL? {
-        let diagnostics = collectDiagnostics()
+    public func exportDiagnostics() async -> URL? {
+        let diagnostics = await collectDiagnosticsAsync()
         let content = diagnostics.formattedText()
 
         let fileName = "retrace-diagnostics-\(Log.timestamp()).txt"
         let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
 
-        do {
-            try content.write(to: tempURL, atomically: true, encoding: .utf8)
-            return tempURL
-        } catch {
-            return nil
-        }
+        return await Task.detached(priority: .userInitiated) {
+            do {
+                try content.write(to: tempURL, atomically: true, encoding: .utf8)
+                return tempURL
+            } catch {
+                return nil
+            }
+        }.value
     }
 
     public func exportFeedbackReport(

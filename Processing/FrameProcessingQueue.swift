@@ -1161,7 +1161,7 @@ public actor FrameProcessingQueue {
                     totalProcessed += 1
 
                     let elapsed = Date().timeIntervalSince(startTime)
-                    Log.info("[Queue-DIAG] Worker \(id) COMPLETED frame \(queuedFrame.frameID) in \(String(format: "%.2f", elapsed))s", category: .processing)
+                    Log.recordRoutine(.ocrProcessed, durationMs: elapsed * 1000)
 
                     // Apply rate limiting delay after successful processing
                     if minDelayBetweenFramesNs > 0 {
@@ -1219,7 +1219,7 @@ public actor FrameProcessingQueue {
         if !shouldProcessOCR(forBundleID: bundleID) {
             // Mark as completed (no OCR needed for this app)
             try await updateFrameProcessingStatus(frameID, status: .completed)
-            Log.debug("[Queue] Frame \(frameID) skipped - app \(bundleID ?? "unknown") excluded from OCR", category: .processing)
+            Log.recordRoutine(.ocrExcluded)
             return .skippedByAppFilter
         }
 

@@ -71,7 +71,7 @@ retrace/
 │   └── validate_darkwake_watchdog.sh # Automated darkwake watchdog regression validation
 │
 ├── Shared/                      # CRITICAL: Shared types and protocols
-│   ├── Logging.swift            # PrivacyLogMessage removes free-form interpolations before console/file/unified logs
+│   ├── Logging.swift            # Privacy-safe bounded background logging, batching, routine summaries and async flush
 │   ├── AppPaths.swift           # Application path configuration
 │   ├── BGRAImageUtilities.swift # Shared BGRA conversion + patch extraction helpers
 │   ├── MasterKeyManager.swift   # Keychain-backed master key creation + recovery phrase export
@@ -168,6 +168,7 @@ retrace/
 │   └── Tests/
 │       ├── FeedbackRecentMetricSupportTests.swift # Feedback-export metric sanitization coverage
 │       ├── InPageURLCaptureRoutingTests.swift
+│       ├── DiagnosticLoggingTests.swift # Background log writes, bounded buffering, flush, summaries and release suppression
 │       ├── PrivacyProtectionTests.swift # Logging privacy, permanent pixel removal, and redaction mode defaults
 │       ├── MasterKeyManagerTests.swift
 │       ├── ServiceContainerRewindCutoffTests.swift # Rewind cutoff defaults and latest-frame probe coverage
@@ -508,3 +509,10 @@ _This file follows the AGENTS.md standard for AI agent guidance. Last updated: 2
 - Excluded-window masking failures drop the frame. Full excluded bounds are protected, including overlapped/translucent areas and edges.
 - `PrivacyLogMessage` strips free-form interpolated values before every logging sink; only primitive numbers and booleans are retained. Preformatted `String` messages are removed as a whole. Do not bypass this by explicitly constructing string literals from captured content.
 - Legacy diagnostic logs are discarded on logger initialization and are excluded from feedback reads, including the error channel. Raw capture-time previews are bypassed while keyword protection is enabled and stale preview copies are invalidated after rewrite.
+
+### Diagnostic logging write policy
+
+- Release `Log.debug` and `Log.verbose` calls do not evaluate their messages. Keep lifecycle events, unusual outcomes, warnings and errors; record routine capture/OCR successes through the fixed `Log.RoutineEvent` counters.
+- All console, unified-log and diagnostic-file sinks run on a serial background queue. Admission only takes a short memory lock. Buffer limits reserve space for errors; overflow produces a count-only warning rather than unbounded memory growth.
+- Retained messages flush after two seconds or 64 KiB; errors request an immediate background drain. Active routine counters summarize once per minute and on explicit flush. Idle logging has no repeating timer wakeup.
+- Await `Log.flush()` before asynchronous feedback snapshots and normal quit. Feedback export must not synchronously wait on the writer from the main thread. A hard crash can lose the pending batch.

@@ -766,3 +766,5 @@ Focus on getting the timeline + search working first before polishing dashboard/
 - While keyword protection is enabled, timeline/search disk previews are bypassed. Completed rewrites invalidate preview images without resetting timeline filters or search queries.
 
 - Visible search cards reload thumbnails with a generation-keyed task after rewrite invalidation; keep card identity stable.
+
+- Async feedback collection awaits the background logger flush before reading the diagnostic file; normal termination awaits the same flush without blocking main. Keep queue diagnostic errors in feedback even when routine queue-detail messages are dropped.
