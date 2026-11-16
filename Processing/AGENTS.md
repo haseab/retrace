@@ -27,12 +27,15 @@ Processing/
 │   ├── TileGridConfig.swift       # Tile grid tuning
 │   └── TileOCRProcessor.swift     # Tile OCR processing helpers
 ├── Accessibility/
+│   ├── AccessibilityOCRCorrector.swift # Capture-time AX token correction, including Unicode combining marks
 │   ├── AccessibilityService.swift  # AccessibilityProtocol implementation
 │   └── TextElementFilter.swift     # Filter relevant text elements
 │
 ├── TextMerger/
 │   └── TextMerger.swift            # Combine OCR + AX results
 └── Tests/
+    ├── AccessibilityVisionIntegrationTests.swift # Real Vision fixture and Unicode normalization regressions
+    ├── Fixtures/AXSmallText.rtf                 # Sanitized document used by Vision integration checks
     ├── ExtractRequestInstrumentationTests.swift # Region tail aggregation and coordinator helper coverage
     ├── InPageURLMetadataResolutionTests.swift # In-page URL metadata retry and rewrite scheduling regression coverage
     ├── OCRMemoryBackpressurePolicyTests.swift # OCR memory backpressure threshold/default coverage

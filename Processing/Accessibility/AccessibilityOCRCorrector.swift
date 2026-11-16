@@ -3,7 +3,9 @@ import Shared
 
 /// Replaces matched OCR tokens only. AX-only text and OCR reading order are preserved.
 public enum AccessibilityOCRCorrector {
-    private static let pattern = try! NSRegularExpression(pattern: "[\\p{L}\\p{N}]+")
+    // Combining marks belong to the preceding letter/number. Splitting them off
+    // can turn canonically equivalent AX text into a spelling regression.
+    private static let pattern = try! NSRegularExpression(pattern: "[\\p{L}\\p{N}][\\p{L}\\p{N}\\p{M}]*")
     private static func tokens(_ text: String) -> [(String, NSRange)] {
         let ns = text as NSString
         return pattern.matches(in: text, range: NSRange(location: 0, length: ns.length)).map { (ns.substring(with: $0.range), $0.range) }

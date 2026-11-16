@@ -37,4 +37,32 @@ final class AccessibilityVisionIntegrationTests: XCTestCase {
         let originalBounds = Set(raw.map(\.bounds))
         XCTAssertTrue((result.regions + result.chromeRegions).allSatisfy { originalBounds.contains($0.bounds) })
     }
+    func testDecomposedAccessibilityAccentDoesNotDowngradeCorrectVisionText() async throws {
+        let reference = "Please review the cafe\u{301} menu before confirming your reservation."
+        let width = 1800, height = 130, stride = width * 4
+        var pixels = Data(count: stride * height)
+        pixels.withUnsafeMutableBytes { raw in
+            let context = CGContext(data: raw.baseAddress, width: width, height: height,
+                                    bitsPerComponent: 8, bytesPerRow: stride, space: CGColorSpaceCreateDeviceRGB(),
+                                    bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)!
+            context.setFillColor(CGColor(gray: 1, alpha: 1))
+            context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+            let text = NSAttributedString(string: reference, attributes: [
+                .font: NSFont.systemFont(ofSize: 28), .foregroundColor: NSColor.black
+            ])
+            context.textPosition = CGPoint(x: 25, y: 60)
+            CTLineDraw(CTLineCreateWithAttributedString(text), context)
+        }
+        let raw = try await VisionOCR().recognizeText(imageData: pixels, width: width, height: height,
+                                                      bytesPerRow: stride, config: .default)
+        XCTAssertEqual(raw.map(\.text).joined(separator: " ").precomposedStringWithCanonicalMapping,
+                       reference.precomposedStringWithCanonicalMapping)
+        let snapshot = AccessibilitySnapshot(capturedAt: Date(), elements: [
+            .init(text: reference, bounds: CGRect(x: 0, y: 0, width: width, height: height), precise: false)
+        ])
+        let corrected = raw.map { AccessibilityOCRCorrector.correct($0, snapshot: snapshot) }
+        XCTAssertEqual(corrected.map(\.text), raw.map(\.text))
+        XCTAssertEqual(corrected.map(\.bounds), raw.map(\.bounds))
+    }
+
 }
