@@ -42,7 +42,9 @@ public enum AccessibilityOCRCorrector {
                 }
                 guard boundariesMatch else { continue }
                 let output = NSMutableString(string: region.text)
-                for i in changed.reversed() { output.replaceCharacters(in: source[i].1, with: target[offset+i].0) }
+                // Match Vision's composed accent representation instead of introducing
+                // extra combining scalars into existing index-offset conventions.
+                for i in changed.reversed() { output.replaceCharacters(in: source[i].1, with: target[offset+i].0.precomposedStringWithCanonicalMapping) }
                 alternatives.insert(output as String)
             }
         }

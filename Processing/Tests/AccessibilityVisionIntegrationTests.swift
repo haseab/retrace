@@ -65,4 +65,21 @@ final class AccessibilityVisionIntegrationTests: XCTestCase {
         XCTAssertEqual(corrected.map(\.bounds), raw.map(\.bounds))
     }
 
+    func testRecordedAccentCorrectionDoesNotIntroduceSQLiteOffsetDrift() {
+        // Actual Vision output from the bundled Dev capture, before AX correction.
+        let bounds = CGRect(x: 1045, y: 703, width: 395, height: 19)
+        let region = TextRegion(frameID: .init(value: 37),
+                                text: "Please review the cafe menu before contirming your reservation.", bounds: bounds)
+        let reference = "Please review the cafe\u{301} menu before confirming your reservation."
+        let snapshot = AccessibilitySnapshot(capturedAt: Date(), elements: [
+            .init(text: reference, bounds: bounds, precise: false)
+        ])
+        let corrected = AccessibilityOCRCorrector.correct(region, snapshot: snapshot)
+        XCTAssertEqual(Array(corrected.text.utf8), Array(reference.precomposedStringWithCanonicalMapping.utf8))
+        // SQLite counts Unicode scalars; existing node offsets use Swift characters.
+        // A decomposed Latin accent must not add a scalar and shift later nodes.
+        XCTAssertEqual(corrected.text.unicodeScalars.count, corrected.text.count)
+        XCTAssertEqual(corrected.bounds, region.bounds)
+    }
+
 }
