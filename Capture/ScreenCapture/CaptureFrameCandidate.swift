@@ -8,9 +8,11 @@ struct CaptureFrameCandidate: Sendable {
     let image: CGImage?
     let timestamp: Date
     let metadata: FrameMetadata
+    let accessibilitySnapshot: AccessibilitySnapshot?
     private let existingFrame: CapturedFrame?
 
-    init(image: CGImage, timestamp: Date, metadata: FrameMetadata) {
+    init(image: CGImage, timestamp: Date, metadata: FrameMetadata, accessibilitySnapshot: AccessibilitySnapshot? = nil) {
+        self.accessibilitySnapshot = accessibilitySnapshot
         self.image = image
         self.timestamp = timestamp
         self.metadata = metadata
@@ -18,6 +20,7 @@ struct CaptureFrameCandidate: Sendable {
     }
 
     init(frame: CapturedFrame) {
+        accessibilitySnapshot = frame.accessibilitySnapshot
         image = nil
         timestamp = frame.timestamp
         metadata = frame.metadata
@@ -48,7 +51,7 @@ struct CaptureFrameCandidate: Sendable {
         if let existingFrame { return existingFrame }
         guard let image, let data = pixels ?? Self.convertCGImageToBGRAData(image) else { return nil }
         return CapturedFrame(timestamp: timestamp, imageData: data, width: image.width,
-                             height: image.height, bytesPerRow: image.width * 4, metadata: metadata)
+                             height: image.height, bytesPerRow: image.width * 4, metadata: metadata, accessibilitySnapshot: accessibilitySnapshot)
     }
 
     private static func convertCGImageToBGRAData(_ cgImage: CGImage) -> Data? {

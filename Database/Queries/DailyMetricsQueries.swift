@@ -32,6 +32,8 @@ public enum DailyMetricsQueries {
 
     /// Standard metric type identifiers
     public enum MetricType: String, Sendable {
+        // metadata: JSON {phase: processed, frames: Int, unavailable: Int}; batched once per minute and stop; no captured text or URLs.
+        case accessibilityCorrection = "accessibility_correction"
         case timelineOpens = "timeline_opens"
         case searches = "searches"
         case textCopies = "text_copies"

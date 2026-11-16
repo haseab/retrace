@@ -554,3 +554,12 @@ _This file follows the AGENTS.md standard for AI agent guidance. Last updated: 2
 - Orphan-node scans require actual frame deletions. Routine DB storage sampling runs every 15 minutes; orphan-video polling runs every 10 minutes in addition to startup recovery. These are maintenance fixes, not new user actions requiring new daily metrics.
 
 - Ordinary timeline-cache misses do not advance the global cache epoch. Entry eviction invalidates only that frame; keep per-frame epochs alive while reads/writes overlap and release miss-only epochs when the final operation finishes. Clear/redaction still invalidates all work.
+
+### Capture-time accessibility correction
+
+- `Shared/Models/AccessibilitySnapshot.swift` is the bounded screenshot-pixel AX reference/encryption model. `CapturedFrame` carries it through native capture.
+- `Capture/Metadata/AccessibilitySnapshotCollector.swift` samples the matched visible primary window immediately after capture (750 nodes, 60 ms best-effort deadline, 128 KiB encoded cap). Unsupported/hidden/secure/occluded content is skipped; AX is never required for recording. This is not an atomic macOS screenshot/AX transaction or all-window AX coverage.
+- `Database/Queries/AccessibilitySnapshotQueries.swift` installs the additive auxiliary table and cleanup triggers independently of numbered migrations, preserving compatibility with the pending encryption V21. Frame and encrypted snapshot/status insert atomically. The existing recoverable master key is created if absent; key failures store availability only. Raw AX never enters logs or diagnostic metrics.
+- OCR uses the saved reference only, before keyword redaction/indexing. `Processing/Accessibility/AccessibilityOCRCorrector.swift` preserves OCR geometry/order and adds no AX-only text. Reliable alignment can correct letters, numbers, names, and identifier tokens. Ambiguous matches stay unchanged.
+- Saved AX payloads survive pending/retry/restart and clear atomically when OCR completes, fails permanently, or stages redaction. Frame deletion removes the reference even when foreign-key enforcement is disabled. Reprocessing completed frames therefore has no old AX reference.
+- Pending/active OCR across all videos takes priority over starting video rewrites; active rewrites finish normally. Correction metrics contain counts only, batched once per minute and worker stop.

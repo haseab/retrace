@@ -1062,6 +1062,7 @@ public actor FrameProcessingQueue {
         guard isRunning else { return }
 
         isRunning = false
+        await flushAccessibilityMetrics()
 
         Log.info("[Queue] Stopping workers...", category: .processing)
 
@@ -1159,6 +1160,10 @@ public actor FrameProcessingQueue {
                     }
 
                     totalProcessed += 1
+                    if try await !databaseManager.hasFramesAwaitingOCR() {
+                        await drainPendingRewritesIfPossible(includeInProgressJobs: false,
+                            includeRetryableFailures: false, trigger: "ocr-backlog-drained")
+                    }
 
                     let elapsed = Date().timeIntervalSince(startTime)
                     Log.recordRoutine(.ocrProcessed, durationMs: elapsed * 1000)
@@ -1330,6 +1335,11 @@ public actor FrameProcessingQueue {
             )
         }
 
+        axProcessedSinceMetric += 1
+        if Date().timeIntervalSince(lastAXMetricAt) >= 60 {
+            await flushAccessibilityMetrics()
+        }
+
         // Video rewrites run only on finalized segments. Defer the actual rewrite
         // until OCR has quiesced for the whole video so we only re-encode once.
         if frameWithInfo.videoInfo?.isVideoFinalized ?? true {
@@ -1422,7 +1432,17 @@ public actor FrameProcessingQueue {
         )
         let extractedText: ExtractedText
         do {
-            extractedText = try await processing.extractText(from: capturedFrame)
+            let snapshot: AccessibilitySnapshot?
+            do { snapshot = try await databaseManager.getAccessibilitySnapshot(frameID: frameID) }
+            catch {
+                // Missing/replaced key must not stall normal OCR. Never sample live AX.
+                snapshot = nil
+                axUnavailableSinceMetric += 1
+            }
+            let historicalFrame = CapturedFrame(timestamp: capturedFrame.timestamp, imageData: capturedFrame.imageData,
+                width: capturedFrame.width, height: capturedFrame.height, bytesPerRow: capturedFrame.bytesPerRow,
+                metadata: capturedFrame.metadata, accessibilitySnapshot: snapshot)
+            extractedText = try await processing.extractText(from: historicalFrame)
             let postExtractSnapshot = await MemoryLedger.snapshot(waitForPendingUpdates: true)
             let extractResidualBytes = max(
                 0,
@@ -2711,6 +2731,9 @@ public actor FrameProcessingQueue {
         isAutomaticRetryOfFailedRewrite: Bool = false
     ) async throws -> PendingRewriteDispatchOutcome {
         guard !isRewriteRecoveryScanning else { return .deferred(.rewriteAlreadyInProgress) }
+        // OCR includes capture-time AX correction. Prioritize the entire OCR backlog
+        // over starting another expensive video rewrite (including other segments).
+        if try await databaseManager.hasFramesAwaitingOCR() { return .deferred(.pendingOCR) }
         if isRewriteSchedulingSuspended {
             Log.debug(
                 "[Queue-Rewrite] Deferring segment rewrite for video \(videoDatabaseID) while timeline interaction is active",
@@ -2735,6 +2758,10 @@ public actor FrameProcessingQueue {
             )
             return .deferred(.pendingOCR)
         }
+
+        // Work can arrive while the rewrite plan is loaded. Recheck before reserving
+        // the encoder; a rewrite already running is allowed to finish normally.
+        if try await databaseManager.hasFramesAwaitingOCR() { return .deferred(.pendingOCR) }
 
         // Database awaits above can yield to a recovery scan. Reserve the live
         // rewrite only after checking again, with no await between check and insert.
@@ -3029,6 +3056,20 @@ public actor FrameProcessingQueue {
                 category: .processing
             )
         }
+    }
+
+    private var axUnavailableSinceMetric = 0
+    private var axProcessedSinceMetric = 0
+    private var lastAXMetricAt = Date()
+    private func flushAccessibilityMetrics() async {
+        guard axProcessedSinceMetric > 0 else { return }
+        let count = axProcessedSinceMetric
+        let unavailable = axUnavailableSinceMetric
+        axProcessedSinceMetric = 0; axUnavailableSinceMetric = 0; lastAXMetricAt = Date()
+        do {
+            try await databaseManager.recordMetricEvent(metricType: .accessibilityCorrection,
+                metadata: "{\"phase\":\"processed\",\"frames\":\(count),\"unavailable\":\(unavailable)}")
+        } catch { axProcessedSinceMetric += count; axUnavailableSinceMetric += unavailable }
     }
 
     // MARK: - Status Management

@@ -2184,7 +2184,7 @@ public actor AppCoordinator {
                     metadata: frame.metadata,
                     source: .native
                 )
-                let frameID = try await services.database.insertFrame(frameRef)
+                let frameID = try await services.database.insertFrame(frameRef, accessibilitySnapshot: frame.accessibilitySnapshot)
                 let acceptedAt = Date()
                 recordAcceptedFrameProgress(at: acceptedAt)
                 await persistGlobalMousePositionIfNeeded(

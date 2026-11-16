@@ -469,6 +469,7 @@ public actor DatabaseManager: DatabaseProtocol {
         Log.debug("[DatabaseManager] Running migrations...", category: .database)
         let migrationRunner = MigrationRunner(db: db!)
         try await migrationRunner.runMigrations()
+        try AccessibilitySnapshotQueries.ensureSchema(db: db!)
         Log.debug("[DatabaseManager] Migrations complete", category: .database)
 
         try FrameQueries.ensureInPageURLSchema(db: db!)
@@ -602,6 +603,39 @@ public actor DatabaseManager: DatabaseProtocol {
     public func insertFrame(_ frame: FrameReference) async throws -> Int64 {
         try withTracedDatabaseOperation("insert_frame") { db in
             try FrameQueries.insert(db: db, frame: frame)
+        }
+    }
+
+    public func insertFrame(_ frame: FrameReference, accessibilitySnapshot: AccessibilitySnapshot?) async throws -> Int64 {
+        try withTracedDatabaseOperation("insert_frame_with_ax") { db in
+            try AccessibilitySnapshotQueries.execute(db, "BEGIN IMMEDIATE;")
+            do {
+                let id = try FrameQueries.insert(db: db, frame: frame)
+                try AccessibilitySnapshotQueries.insert(db: db, frameID: id, snapshot: accessibilitySnapshot)
+                try AccessibilitySnapshotQueries.execute(db, "COMMIT;")
+                return id
+            } catch {
+                try? AccessibilitySnapshotQueries.execute(db, "ROLLBACK;")
+                throw error
+            }
+        }
+    }
+
+    public func hasFramesAwaitingOCR() async throws -> Bool {
+        try withTracedDatabaseOperation("has_pending_ocr") { db in
+            let sql = "SELECT 1 FROM frame WHERE processingStatus != 2 AND processingStatus IN (0,1) LIMIT 1;"
+            var statement: OpaquePointer?
+            defer { sqlite3_finalize(statement) }
+            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+                throw DatabaseError.queryFailed(query: sql, underlying: "Pending OCR lookup failed")
+            }
+            return try SQLiteReadStep.next(statement) == SQLITE_ROW
+        }
+    }
+
+    public func getAccessibilitySnapshot(frameID: Int64) async throws -> AccessibilitySnapshot? {
+        try withTracedDatabaseOperation("get_frame_ax") { db in
+            try AccessibilitySnapshotQueries.load(db: db, frameID: frameID)
         }
     }
 
