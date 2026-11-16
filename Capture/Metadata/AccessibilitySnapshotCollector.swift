@@ -19,9 +19,9 @@ enum AccessibilitySnapshotCollector {
 
         let app = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(app, 0.01)
-        guard let value = attribute(app, kAXFocusedWindowAttribute), CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
-        let window = value as! AXUIElement
-        guard let initialBounds = rect(window), approximatelyEqual(initialBounds, expectedBounds) else { return nil }
+        let expectedTitle = windows[targetIndex][kCGWindowName as String] as? String
+        guard let window = matchedWindow(app, bounds: expectedBounds, title: expectedTitle, startedAt: start),
+              let initialBounds = rect(window) else { return nil }
         let title = attribute(window, kAXTitleAttribute) as? String
         var stack: [(AXUIElement, Int)] = [(window, 0)]
         var result: [AccessibilitySnapshot.Element] = []
@@ -70,7 +70,7 @@ enum AccessibilitySnapshotCollector {
             }
 
         }
-        guard let current = attribute(app, kAXFocusedWindowAttribute), CFEqual(current, window),
+        guard let currentWindows = windowList(app), currentWindows.contains(where: { CFEqual($0, window) }),
               rect(window) == initialBounds, (attribute(window, kAXTitleAttribute) as? String) == title else { return nil }
         Log.recordLatency("capture.accessibility_snapshot", valueMs: Date().timeIntervalSince(start)*1000, category: .capture)
         return AccessibilitySnapshot(capturedAt: capturedAt, elements: result, truncated: truncated)
@@ -86,8 +86,28 @@ enum AccessibilitySnapshotCollector {
                                                          parameter, &text) == .success else { return nil }
         return (text as? String).map { String($0.prefix(12000)) }
     }
-    private static func approximatelyEqual(_ a: CGRect, _ b: CGRect) -> Bool {
-        abs(a.minX-b.minX) < 2 && abs(a.minY-b.minY) < 2 && abs(a.width-b.width) < 2 && abs(a.height-b.height) < 2
+    private static func windowList(_ app: AXUIElement) -> [AXUIElement]? {
+        // Bound the window list too; never pick an arbitrary candidate when truncated.
+        var count: CFIndex = 0
+        guard AXUIElementGetAttributeValueCount(app, kAXWindowsAttribute as CFString, &count) == .success,
+              count > 0, count <= 64 else { return nil }
+        var values: CFArray?
+        guard AXUIElementCopyAttributeValues(app, kAXWindowsAttribute as CFString, 0, count, &values) == .success,
+              let windows = values as? [AXUIElement], windows.count == count else { return nil }
+        return windows
+    }
+    private static func matchedWindow(_ app: AXUIElement, bounds: CGRect, title: String?, startedAt: Date) -> AXUIElement? {
+        guard let windows = windowList(app) else { return nil }
+        var geometries: [CGRect?] = []
+        var titles: [String?] = []
+        for window in windows {
+            guard Date().timeIntervalSince(startedAt) < 0.06 else { return nil }
+            geometries.append(rect(window))
+            titles.append(attribute(window, kAXTitleAttribute) as? String)
+        }
+        guard let index = AccessibilityWindowMatcher.uniqueIndex(bounds: geometries, titles: titles,
+                                                                 expectedBounds: bounds, expectedTitle: title) else { return nil }
+        return windows[index]
     }
     private static func attribute(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
         var result: CFTypeRef?
