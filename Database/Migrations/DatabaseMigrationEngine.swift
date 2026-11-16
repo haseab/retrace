@@ -526,22 +526,16 @@ public actor DatabaseMigrationEngine {
             try applySQLCipherKey(sourceKey, to: db)
         }
 
-        let targetKeySQL: String
+        let targetKey: Data?
         if toEncrypted {
-            let targetAccount = job.keychainAccount ?? AppPaths.keychainAccount
-            let targetKey = try DatabaseManager.loadDatabaseKeyFromKeychain(
-                account: targetAccount,
+            targetKey = try DatabaseManager.loadDatabaseKeyFromKeychain(
+                account: job.keychainAccount ?? AppPaths.keychainAccount,
                 source: job.keyMaterialSource
             )
-            targetKeySQL = "\"x'\(targetKey.hexEncodedString())'\""
         } else {
-            targetKeySQL = "''"
+            targetKey = nil
         }
-
-        try executeSQL(
-            db: db,
-            sql: "ATTACH DATABASE '\(targetPath.sqlEscaped())' AS migrated KEY \(targetKeySQL);"
-        )
+        try DatabaseManager.attachMigrationDatabase(at: targetPath, keyData: targetKey, to: db)
         if toEncrypted {
             try executeSQL(
                 db: db,

@@ -2973,15 +2973,61 @@ public actor DatabaseManager: DatabaseProtocol {
         account: String = AppPaths.keychainAccount,
         source: DatabaseKeyMaterialSource? = nil
     ) throws -> Data {
-        if let source {
-            return try keyData(for: source, account: account)
-        }
+        try loadDatabaseKey(
+            account: account, source: source,
+            loadLegacy: { try loadKeyFromKeychainStatic(service: AppPaths.keychainService, account: $0) },
+            loadMasterDerived: { try MasterKeyManager.derivedKeyData(for: .databaseEncryption, account: $0) }
+        )
+    }
 
-        if let candidate = databaseKeyCandidates(for: account).first {
-            return candidate.keyData
-        }
+    static func masterKeyAccount(for databaseAccount: String) -> String {
+        databaseAccount == AppPaths.keychainAccount ? MasterKeyManager.keychainAccount : databaseAccount
+    }
 
-        throw DatabaseError.connectionFailed(underlying: "Failed to load encryption key from Keychain")
+    static func loadDatabaseKey(
+        account: String,
+        source: DatabaseKeyMaterialSource?,
+        loadLegacy: (String) throws -> Data,
+        loadMasterDerived: (String) throws -> Data
+    ) throws -> Data {
+        switch source {
+        case .legacyDatabaseKey:
+            return try loadLegacy(account)
+        case .masterKeyDerived:
+            return try loadMasterDerived(masterKeyAccount(for: account))
+        case nil:
+            if let legacy = try? loadLegacy(account) { return legacy }
+            return try loadMasterDerived(masterKeyAccount(for: account))
+        }
+    }
+
+    static func saveKeyToKeychainStatic(
+        _ key: Data,
+        service: String = AppPaths.keychainService,
+        account: String = AppPaths.keychainAccount,
+        storagePolicy: MasterKeyStoragePolicy = .iCloudKeychain,
+        addItem: (CFDictionary, UnsafeMutablePointer<CFTypeRef?>?) -> OSStatus = SecItemAdd,
+        updateItem: (CFDictionary, CFDictionary) -> OSStatus = SecItemUpdate
+    ) throws {
+        let identity: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecAttrSynchronizable as String: true
+        ]
+        let changes: [String: Any] = [
+            kSecValueData as String: key,
+            kSecAttrAccessible as String: MasterKeyStoragePolicy.iCloudKeychain.accessibleAttribute
+        ]
+        let query = identity.merging(changes) { _, new in new }
+        let added = addItem(query as CFDictionary, nil)
+        // Update is atomic: an update failure preserves the previous item.
+        // A device-only legacy item is retained if this creates a synced copy.
+        let status = added == errSecDuplicateItem
+            ? updateItem(identity as CFDictionary, changes as CFDictionary) : added
+        guard status == errSecSuccess else {
+            throw DatabaseError.connectionFailed(underlying: "Failed to save encryption key to iCloud Keychain (status: \(status))")
+        }
     }
 
     public static func saveDatabaseKeyToKeychain(
@@ -3010,12 +3056,12 @@ public actor DatabaseManager: DatabaseProtocol {
             case .legacyDatabaseKey:
                 return hasKeyInKeychainStatic(service: AppPaths.keychainService, account: account)
             case .masterKeyDerived:
-                return MasterKeyManager.hasMasterKey(account: account)
+                return MasterKeyManager.hasMasterKey(account: masterKeyAccount(for: account))
             }
         }
 
         return hasKeyInKeychainStatic(service: AppPaths.keychainService, account: account)
-            || MasterKeyManager.hasMasterKey(account: account)
+            || MasterKeyManager.hasMasterKey(account: masterKeyAccount(for: account))
     }
 
     @discardableResult
@@ -3071,10 +3117,32 @@ public actor DatabaseManager: DatabaseProtocol {
         _ keyData: Data,
         to db: OpaquePointer
     ) throws {
-        let keyHex = keyData.map { String(format: "%02hhx", $0) }.joined()
-        try executeSQLStatic("PRAGMA key = \"x'\(keyHex)'\";", db: db)
+        // This SQLCipher package does not expose sqlite3_key in its Swift
+        // module. Do not send the sensitive PRAGMA through query-error helpers.
+        let rawKey = "x'" + keyData.map { String(format: "%02hhx", $0) }.joined() + "'"
+        let status = sqlite3_exec(db, "PRAGMA key = \"\(rawKey)\";", nil, nil, nil)
+        guard status == SQLITE_OK else {
+            throw DatabaseError.connectionFailed(underlying: "Could not configure encrypted database (status: \(status))")
+        }
         try executeSQLStatic("PRAGMA cipher_compatibility = \(retraceSQLCipherCompatibility);", db: db)
         _ = try queryIntStatic("SELECT count(*) FROM sqlite_master;", db: db)
+    }
+
+    static func attachMigrationDatabase(at path: String, keyData: Data?, to db: OpaquePointer) throws {
+        let sql = "ATTACH DATABASE ? AS migrated KEY ?;"
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+        let key = keyData.map { "x'" + $0.map { String(format: "%02hhx", $0) }.joined() + "'" } ?? ""
+        guard sqlite3_bind_text(statement, 1, path, -1, SQLITE_TRANSIENT) == SQLITE_OK,
+              sqlite3_bind_text(statement, 2, key, -1, SQLITE_TRANSIENT) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: sql, underlying: "Could not bind migration database parameters")
+        }
+        guard sqlite3_step(statement) == SQLITE_DONE else {
+            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
     }
 
     public nonisolated static func resolveDatabaseConnection(
@@ -3093,7 +3161,7 @@ public actor DatabaseManager: DatabaseProtocol {
             }
 
             for account in candidateAccounts {
-                if MasterKeyManager.hasMasterKey(account: account) {
+                if MasterKeyManager.hasMasterKey(account: masterKeyAccount(for: account)) {
                     return DatabaseConnectionResolution(
                         mode: .encrypted,
                         keychainAccount: account,
@@ -4004,7 +4072,7 @@ private extension DatabaseManager {
 
         if let masterDerivedKey = try? MasterKeyManager.derivedKeyData(
             for: .databaseEncryption,
-            account: account
+            account: masterKeyAccount(for: account)
         ) {
             candidates.append(
                 DatabaseKeyCandidate(
@@ -4015,18 +4083,6 @@ private extension DatabaseManager {
         }
 
         return candidates
-    }
-
-    static func keyData(
-        for source: DatabaseKeyMaterialSource,
-        account: String
-    ) throws -> Data {
-        switch source {
-        case .legacyDatabaseKey:
-            return try loadKeyFromKeychainStatic(service: AppPaths.keychainService, account: account)
-        case .masterKeyDerived:
-            return try MasterKeyManager.derivedKeyData(for: .databaseEncryption, account: account)
-        }
     }
 
     static func orderedUniqueAccounts(_ accounts: [String]) -> [String] {
@@ -4066,50 +4122,25 @@ private extension DatabaseManager {
         return Int(sqlite3_column_int(statement, 0))
     }
 
-    static func saveKeyToKeychainStatic(
-        _ key: Data,
-        service: String,
-        account: String,
-        storagePolicy: MasterKeyStoragePolicy = .iCloudKeychain
-    ) throws {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecValueData as String: key,
-            kSecAttrAccessible as String: MasterKeyStoragePolicy.iCloudKeychain.accessibleAttribute,
-            kSecAttrSynchronizable as String: true
-        ]
-
-        SecItemDelete([
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecAttrSynchronizable as String: kSecAttrSynchronizableAny
-        ] as CFDictionary)
-
-        let status = SecItemAdd(query as CFDictionary, nil)
-        guard status == errSecSuccess else {
-            throw DatabaseError.connectionFailed(underlying: "Failed to save encryption key to Keychain (status: \(status))")
-        }
-    }
-
     static func loadKeyFromKeychainStatic(service: String, account: String) throws -> Data {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecAttrSynchronizable as String: kSecAttrSynchronizableAny,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
-
-        var result: AnyObject?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-        guard status == errSecSuccess, let data = result as? Data else {
-            throw DatabaseError.connectionFailed(underlying: "Failed to load encryption key from Keychain")
+        for synchronizable: Any in [true, kSecAttrSynchronizableAny] {
+            let query: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: service,
+                kSecAttrAccount as String: account,
+                kSecAttrSynchronizable as String: synchronizable,
+                kSecReturnData as String: true,
+                kSecMatchLimit as String: kSecMatchLimitOne
+            ]
+            var result: AnyObject?
+            let status = SecItemCopyMatching(query as CFDictionary, &result)
+            if status == errSecItemNotFound { continue }
+            guard status == errSecSuccess, let data = result as? Data else {
+                throw DatabaseError.connectionFailed(underlying: "Failed to load encryption key from Keychain (status: \(status))")
+            }
+            return data
         }
-        return data
+        throw DatabaseError.connectionFailed(underlying: "Encryption key not found in Keychain")
     }
 
     static func deleteKeyFromKeychainStatic(service: String, account: String) {

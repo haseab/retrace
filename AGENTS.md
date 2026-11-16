@@ -103,9 +103,16 @@ retrace/
 │   │   ├── DatabaseMigrationEngine.swift # Unified encrypt/decrypt/schema migration engine
 │   │   ├── DatabaseMigrationJob.swift    # Persisted migration job + recovery phrase models
 │   │   ├── V15_NodeRedactionFlag.swift   # Protected OCR text + rewrite metadata migration
-│   │   └── V16_DatabaseIdentity.swift    # DB lineage/vault metadata + fork reconciliation
+│   │   ├── V16_ProcessingQueueFrameIDIndex.swift # Main hot-path indexes
+│   │   ├── V17_FrameCaptureTrigger.swift # Capture trigger metadata
+│   │   ├── V18_DailyMetricsRecencyIndex.swift # Recent metrics index
+│   │   ├── V19_FrameEncodedAt.swift # Encoded frame timing
+│   │   ├── V20_PartialProcessingStatusIndex.swift # Pending OCR index
+│   │   └── V21_DatabaseIdentity.swift    # DB lineage/vault metadata + fork reconciliation
 │   ├── Queries/                 # Query implementations
 │   └── Tests/
+│       ├── EncryptionReadinessTests.swift # Real encrypted SQLite round trips and key/error fault cases
+│       ├── EncryptionMigrationLineageTests.swift # Fresh/main/legacy-branch schema upgrades
 │       └── DatabaseMigrationEngineTests.swift # Migration sizing + recovery phrase coverage
 │
 ├── Storage/                     # File I/O, HEVC encoding

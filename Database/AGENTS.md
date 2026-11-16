@@ -31,12 +31,19 @@ Database/
 │   ├── V13_RemoveInPageURLRects.swift
 │   ├── V14_DBStorageSnapshot.swift
 │   ├── V15_NodeRedactionFlag.swift
-│   └── V16_DatabaseIdentity.swift
+│   ├── V16_ProcessingQueueFrameIDIndex.swift
+│   ├── V17_FrameCaptureTrigger.swift
+│   ├── V18_DailyMetricsRecencyIndex.swift
+│   ├── V19_FrameEncodedAt.swift
+│   ├── V20_PartialProcessingStatusIndex.swift
+│   └── V21_DatabaseIdentity.swift
 ├── Queries/
 │   ├── FrameQueries.swift     # Frame CRUD operations
 │   ├── SegmentQueries.swift   # Segment CRUD operations
 │   └── DocumentQueries.swift  # Document/FTS operations
 └── Tests/
+    ├── EncryptionReadinessTests.swift # Real encrypted round trips and key/error fault cases
+    ├── EncryptionMigrationLineageTests.swift # Fresh and forked/main schema upgrades
     ├── DatabaseMigrationEngineTests.swift # Migration sizing + recovery phrase tests
     ├── DatabaseManagerTests.swift
     └── FTSManagerTests.swift
@@ -637,3 +644,5 @@ With junction tables and proper indexes:
 - **Database size**: ~500MB metadata/month + ~150GB text regions + ~50MB junctions
 
 Trade-off: Slightly more complex writes (populate junction tables + text regions), but **massive** read speedups and professional UI.
+
+Encryption readiness: migrations 16–20 retain main's meanings; V21 adds identity and backfills the old encryption-branch V16 index gap. Tests: `EncryptionReadinessTests.swift` and `EncryptionMigrationLineageTests.swift`. Key-bearing SQL uses a non-logging key PRAGMA or bound ATTACH parameters; legacy key replacement uses atomic update.

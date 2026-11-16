@@ -3009,7 +3009,12 @@ final class DatabaseManagerTests: XCTestCase {
             V13_RemoveInPageURLRects(),
             V14_DBStorageSnapshot(),
             V15_NodeRedactionFlag(),
-            V16_DatabaseIdentity()
+            V16_ProcessingQueueFrameIDIndex(),
+            V17_FrameCaptureTrigger(),
+            V18_DailyMetricsRecencyIndex(),
+            V19_FrameEncodedAt(),
+            V20_PartialProcessingStatusIndex(),
+            V21_DatabaseIdentity()
         ]
 
         for migration in migrations where migration.version <= version {

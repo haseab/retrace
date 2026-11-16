@@ -8976,7 +8976,7 @@ extension SettingsView {
 
             switch databaseMigrationKind {
             case .encrypt:
-                migrationKeychainAccount = AppPaths.keychainAccount
+                migrationKeychainAccount = MasterKeyManager.keychainAccount
                 migrationKeyMaterialSource = .masterKeyDerived
             case .decrypt:
                 let resolution = try DatabaseManager.resolveDatabaseConnection(
