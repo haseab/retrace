@@ -61,6 +61,7 @@ retrace/
 │   └── ISSUE_TEMPLATE/
 │       └── bug_report.yml       # GitHub bug report form aligned with AI issue template
 ├── AI_ISSUE_TEMPLATE.md         # Canonical markdown template for AI-authored bug reports
+├── SECURITY.md                  # Private vulnerability reporting policy
 ├── README.md                    # Human-readable project overview
 ├── CONTRIBUTING.md              # Contribution guidelines
 ├── Package.swift                # Swift Package Manager configuration
