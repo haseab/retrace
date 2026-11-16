@@ -191,7 +191,7 @@ public struct OnboardingView: View {
 
     // Rewind data flow state
     @State private var hasRewindData: Bool? = nil
-    @State private var wantsRewindData: Bool? = (UserDefaults(suiteName: "io.retrace.app") ?? .standard).object(forKey: "useRewindData") as? Bool
+    @State private var wantsRewindData: Bool? = (UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard).object(forKey: "useRewindData") as? Bool
     @State private var rewindDataSizeGB: Double? = nil
     @State private var detectedRewindCutoffDate: Date? = nil
 
@@ -4501,7 +4501,7 @@ public struct OnboardingView: View {
 
     @MainActor
     private func loadPersistedAutomationPreflightStatuses() -> [String: AutomationPreflightStatus] {
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
         guard let rawStatuses = defaults.dictionary(forKey: Self.automationPreflightStatusesKey) as? [String: String] else {
             return [:]
         }
@@ -4518,7 +4518,7 @@ public struct OnboardingView: View {
 
     @MainActor
     private func persistAutomationPreflightStatuses() {
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
         let persistableStatuses: [String: String] = automationPreflightStatusByBundleID.compactMapValues { status in
             switch status {
             case .granted, .skipped, .denied:

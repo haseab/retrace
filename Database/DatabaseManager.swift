@@ -3784,7 +3784,7 @@ public actor DatabaseManager: DatabaseProtocol {
 
         // Check if encryption is enabled in UserDefaults
         // Default to false (disabled) - user must explicitly enable it during onboarding
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
         let encryptionEnabled = defaults.object(forKey: "encryptionEnabled") as? Bool ?? false
 
         // For unencrypted databases, simply don't set any PRAGMA key.

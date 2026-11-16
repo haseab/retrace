@@ -1,64 +1,58 @@
 #!/bin/bash
-
-# Build and run Retrace in DEBUG mode with hot reloading support
-# Usage: ./dev.sh
-
-set -e
-
-BUILD_CONFIG="debug"
-
-# ---------------------------------------------------------------------------
-# Parse version metadata from project.yml
-# ---------------------------------------------------------------------------
-MARKETING_VERSION=$(grep 'MARKETING_VERSION' project.yml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-BUILD_NUMBER=$(grep 'CURRENT_PROJECT_VERSION' project.yml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-: "${MARKETING_VERSION:=0.0.0}"
-: "${BUILD_NUMBER:=0}"
-
-# ---------------------------------------------------------------------------
-# Collect build metadata for standalone SwiftPM dev runs
-# ---------------------------------------------------------------------------
-GIT_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
-GIT_COMMIT_FULL=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
-GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
-BUILD_DATE=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
-REMOTE_URL=$(git remote get-url origin 2>/dev/null || true)
-FORK_NAME=$(printf "%s" "$REMOTE_URL" | sed -E 's#^(git@github\.com:|ssh://git@github\.com/|https://github\.com/)##; s#\.git$##')
-
-echo "🔨 Building Retrace v${MARKETING_VERSION} (DEBUG)..."
-echo "   commit: ${GIT_COMMIT} (${GIT_BRANCH})"
-swift build -c debug
-
-echo ""
-echo "🚀 Starting Retrace..."
-echo ""
-
-# Convenience preflight for local dev: if another instance currently holds the
-# app's single-instance lock, skip launching a duplicate and return the shell.
-LOCK_PATH="/tmp/io.retrace.app.instance.lock"
-if perl -MFcntl=':DEFAULT,:flock' -e '
-my $path = shift;
-sysopen(my $fh, $path, O_RDWR | O_CREAT) or exit 2;
-exit(flock($fh, LOCK_EX | LOCK_NB) ? 0 : 1);
-' "$LOCK_PATH"; then
-    LOCK_CHECK_STATUS=0
-else
-    LOCK_CHECK_STATUS=$?
+# Build the persistent, signed development app. --build-only installs without launching.
+set -euo pipefail
+cd "$(dirname "$0")"
+RETRACE_BUILD_PATH="${RETRACE_BUILD_PATH:-$PWD/.build}"
+RETRACE_DEV_APP="/Applications/Retrace Dev.app"
+if [[ "${1:-}" != "" && "${1:-}" != "--build-only" ]]; then
+    echo 'Usage: ./dev.sh [--build-only]' >&2
+    exit 1
 fi
-
-if [ "$LOCK_CHECK_STATUS" -eq 1 ]; then
-    echo "ℹ️ Another Retrace instance is already running; skipping duplicate launch."
-    exit 0
+RETRACE_DEV_IDENTITY="${RETRACE_DEV_SIGNING_IDENTITY:-$(security find-identity -v -p codesigning | awk '/Apple Development:/ { print $2; exit }')}"
+if [[ -z "$RETRACE_DEV_IDENTITY" ]]; then
+    echo 'A certificate-backed development signing identity is required. Set RETRACE_DEV_SIGNING_IDENTITY if needed.' >&2
+    exit 1
 fi
-
-# Run the executable directly for hot reload support
-RETRACE_VERSION="$MARKETING_VERSION" \
-RETRACE_BUILD_NUMBER="$BUILD_NUMBER" \
-RETRACE_GIT_COMMIT="$GIT_COMMIT" \
-RETRACE_GIT_COMMIT_FULL="$GIT_COMMIT_FULL" \
-RETRACE_GIT_BRANCH="$GIT_BRANCH" \
-RETRACE_BUILD_DATE="$BUILD_DATE" \
-RETRACE_BUILD_CONFIG="$BUILD_CONFIG" \
-RETRACE_IS_DEV_BUILD="true" \
-RETRACE_FORK_NAME="$FORK_NAME" \
-.build/debug/Retrace
+if lsof -t "$RETRACE_DEV_APP/Contents/MacOS/Retrace Dev" >/dev/null 2>&1; then
+    echo 'Quit Retrace Dev before replacing its bundle. Production Retrace can stay open.' >&2
+    exit 1
+fi
+swift build -c debug --disable-sandbox --product Retrace --scratch-path "$RETRACE_BUILD_PATH"
+RETRACE_BIN_PATH="$(swift build -c debug --show-bin-path --scratch-path "$RETRACE_BUILD_PATH")"
+RETRACE_STAGE="$(mktemp -d "${TMPDIR:-/tmp}/retrace-dev.XXXXXX")"
+trap 'rm -rf "$RETRACE_STAGE"' EXIT
+python3 - "$PWD" "$RETRACE_BIN_PATH" "$RETRACE_STAGE" <<'PY'
+import pathlib, plistlib, re, shutil, subprocess, sys
+root, binaries, stage = map(pathlib.Path, sys.argv[1:])
+contents = stage/'Retrace Dev.app'/'Contents'
+(contents/'MacOS').mkdir(parents=True)
+(contents/'Resources').mkdir()
+(contents/'Frameworks').mkdir()
+shutil.copy2(binaries/'Retrace', contents/'MacOS'/'Retrace Dev')
+shutil.copytree(binaries/'Retrace_Retrace.bundle', contents/'Resources'/'Retrace_Retrace.bundle')
+shutil.copy2(root/'AppIcon.icns', contents/'Resources'/'AppIcon.icns')
+framework = next(pathlib.Path(binaries.parents[1]/'artifacts').rglob('Sparkle.framework'))
+shutil.copytree(framework, contents/'Frameworks'/'Sparkle.framework', symlinks=True)
+with (root/'UI'/'Info.plist').open('rb') as f: info=plistlib.load(f)
+info={k:v for k,v in info.items() if not(isinstance(v,str) and '$(' in v)}
+project = (root/'project.yml').read_text()
+version = re.search(r'MARKETING_VERSION:\s*"?([^"\s]+)', project).group(1)
+build = re.search(r'CURRENT_PROJECT_VERSION:\s*"?([^"\s]+)', project).group(1)
+info.update(CFBundleIdentifier='io.retrace.app.dev', CFBundleExecutable='Retrace Dev',
+            CFBundleName='Retrace Dev', CFBundleDisplayName='Retrace Dev', CFBundlePackageType='APPL',
+            CFBundleShortVersionString=version, CFBundleVersion=build, CFBundleIconFile='AppIcon',
+            RetraceIsDevBuild=True, SUEnableAutomaticChecks=False, SUAutomaticallyUpdate=False,
+            RetraceGitBranch=subprocess.check_output(['git','branch','--show-current'],text=True).strip(),
+            RetraceGitCommit=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
+            CFBundleURLTypes=[{'CFBundleURLName':'io.retrace.app.dev','CFBundleURLSchemes':['retrace-dev']}])
+with (contents/'Info.plist').open('wb') as f: plistlib.dump(info,f)
+PY
+install_name_tool -add_rpath @executable_path/../Frameworks "$RETRACE_STAGE/Retrace Dev.app/Contents/MacOS/Retrace Dev"
+codesign --force --deep --sign "$RETRACE_DEV_IDENTITY" "$RETRACE_STAGE/Retrace Dev.app"
+codesign --verify --deep --strict "$RETRACE_STAGE/Retrace Dev.app"
+ditto "$RETRACE_STAGE/Retrace Dev.app" "$RETRACE_DEV_APP"
+codesign --verify --deep --strict "$RETRACE_DEV_APP"
+echo "Installed signed development app: $RETRACE_DEV_APP"
+if [[ "${1:-}" != "--build-only" ]]; then
+    open "$RETRACE_DEV_APP"
+fi

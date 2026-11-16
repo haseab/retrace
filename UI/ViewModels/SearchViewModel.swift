@@ -509,19 +509,19 @@ public class SearchViewModel: ObservableObject {
 
     /// File path for cached other apps data
     private static nonisolated var cachedOtherAppsPath: URL {
-        let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
+        let cacheDir = AppPaths.cacheDirectory
         return cacheDir.appendingPathComponent("other_apps_cache.json")
     }
 
     /// File path for cached search results data
     private static nonisolated var cachedSearchResultsPath: URL {
-        let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
+        let cacheDir = AppPaths.cacheDirectory
         return cacheDir.appendingPathComponent("search_results_cache.json")
     }
 
     /// File path for disk-backed search thumbnails.
     private static nonisolated var cachedSearchThumbnailsDirectory: URL {
-        let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
+        let cacheDir = AppPaths.cacheDirectory
         return cacheDir.appendingPathComponent("search_thumbnails_v1", isDirectory: true)
     }
 

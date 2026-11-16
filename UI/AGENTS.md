@@ -781,3 +781,5 @@ Timeline index touches do not rescan sizes. JPEG NSCache entries have compressed
 - `UI/Components/CapturedURLPolicy.swift` allows HTTP(S) URLs with a host for captured browser/OCR links. Apply it before NSWorkspace/browser lookup in every captured-link open path. Existing comment-authored links are outside this policy. `HyperlinkResolutionTests` covers allowed and rejected schemes.
 
 - PreviewCacheEntryEpochs in PreviewCacheMaintenance.swift isolates frame eviction from unrelated reads/writes. Release read-miss epochs after all overlapping operations finish; keep whole-cache invalidation for clear/redaction.
+
+Bundled development runs use `AppPaths` to isolate settings, library, Keychain service, logs, preview caches and instance locks for `io.retrace.app.dev`. Never launch a dev build against hardcoded production domains. The production crash-recovery launch agent stays disarmed in the dev app; debugging one app must not manage the other app’s helper.

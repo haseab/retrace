@@ -221,7 +221,7 @@ public struct OCRPowerSettingsSnapshot: Sendable {
     }
 
     public static func fromDefaults(
-        _ defaults: UserDefaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        _ defaults: UserDefaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
     ) -> OCRPowerSettingsSnapshot {
         OCRPowerSettingsSnapshot(
             ocrEnabled: defaults.object(forKey: "ocrEnabled") as? Bool ?? true,
@@ -1314,7 +1314,7 @@ public actor AppCoordinator {
     private static let phraseLevelRedactionEnabledKey = "phraseLevelRedactionEnabled"
     private static let abandonedMissingMasterKeyRewritePurpose = "redaction_missing_master_key_abandoned"
     /// Use a fixed suite name so it works regardless of how the app is launched (swift build vs .app bundle)
-    private static let userDefaultsSuite = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+    private static let userDefaultsSuite = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
 
     /// Save recording state to UserDefaults for persistence across app restarts
     private nonisolated func saveRecordingState(_ isRecording: Bool) {
@@ -2589,7 +2589,7 @@ public actor AppCoordinator {
         let cachesDirectory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
             ?? FileManager.default.temporaryDirectory
         return cachesDirectory
-            .appendingPathComponent("io.retrace.app", isDirectory: true)
+            .appendingPathComponent(AppPaths.settingsSuiteName, isDirectory: true)
             .appendingPathComponent("TimelineFrameBuffer", isDirectory: true)
     }
 
@@ -5375,7 +5375,7 @@ public actor AppCoordinator {
     }
 
     private static func isInPageURLCollectionEnabled() -> Bool {
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
         guard defaults.object(forKey: inPageURLCollectionExperimentalKey) != nil else {
             return false
         }
@@ -5383,7 +5383,7 @@ public actor AppCoordinator {
     }
 
     private static func isMousePositionCollectionEnabled() -> Bool {
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
         guard defaults.object(forKey: captureMousePositionKey) != nil else {
             return true
         }

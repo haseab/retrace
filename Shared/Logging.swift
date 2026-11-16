@@ -112,7 +112,7 @@ public enum Log {
 
     /// Path to the log file - persists across crashes
     public static let logFilePath = ProcessInfo.processInfo.environment["RETRACE_LOG_PATH"]
-        ?? NSHomeDirectory() + "/Library/Logs/Retrace/retrace.log"
+        ?? NSHomeDirectory() + "/Library/Logs/\(AppPaths.applicationSupportName)/retrace.log"
     public static func isPrivacySafeLogEntry(_ line: String) -> Bool {
         line.range(of: #"^\[[0-9TZ:.+\-]+\] \[[^\]\r\n]+\] \[[^\]\r\n]+\] [^\r\n:]+:[0-9]+ - \[privacy-v1\] "#,
                    options: .regularExpression) != nil

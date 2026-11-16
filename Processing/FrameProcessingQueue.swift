@@ -2921,7 +2921,7 @@ public actor FrameProcessingQueue {
         try await Task.detached(priority: .utility) {
             let manager = FileManager.default
             for id in Set(frameIDs) {
-                let path = cachesDirectory.appendingPathComponent("io.retrace.app/TimelineFrameBuffer/\(id).jpg")
+                let path = cachesDirectory.appendingPathComponent("\(AppPaths.settingsSuiteName)/TimelineFrameBuffer/\(id).jpg")
                 if manager.fileExists(atPath: path.path) { try manager.removeItem(at: path) }
             }
             let thumbnails = cachesDirectory.appendingPathComponent("search_thumbnails_v1")

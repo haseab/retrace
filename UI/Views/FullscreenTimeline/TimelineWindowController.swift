@@ -179,7 +179,7 @@ public class TimelineWindowController: NSObject {
     private static let velocitySampleWindow: CFAbsoluteTime = 0.08
     /// Live-mode scroll suppression window (seconds) applied on open.
     private static let liveScrollSuppressDuration: CFAbsoluteTime = 0.30
-    private static let timelineSettingsStore = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+    private static let timelineSettingsStore = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
 
     /// Accumulated wrong-axis and right-axis scroll magnitudes for orientation mismatch detection
     private var wrongAxisScrollAccum: CGFloat = 0

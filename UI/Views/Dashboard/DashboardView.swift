@@ -44,7 +44,7 @@ private enum LayoutSize {
 private let dashboardMaxWidth: CGFloat = 1100
 /// Shared breakpoint for compact dashboard-style layouts.
 let dashboardCompactLayoutThreshold: CGFloat = 850
-private let dashboardSettingsStore: UserDefaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+private let dashboardSettingsStore: UserDefaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
 
 private struct RecordingIndicatorAnchorPreferenceKey: PreferenceKey {
     static var defaultValue: Anchor<CGRect>? = nil

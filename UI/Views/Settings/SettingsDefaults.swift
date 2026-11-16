@@ -3,7 +3,7 @@ import Shared
 import App
 
 /// Shared UserDefaults store for consistent settings across debug/release builds.
-let settingsStore: UserDefaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+let settingsStore: UserDefaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
 let rewindCutoffDateDefaultsKey = "rewindCutoffDate"
 let phraseLevelRedactionEnabledDefaultsKey = "phraseLevelRedactionEnabled"
 let menuBarCaptureFeedbackDefaultsKey = "showMenuBarCaptureFeedback"

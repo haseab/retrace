@@ -277,15 +277,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var bypassQuitConfirmationPromptOnce = false
     private var singleInstanceLockFileDescriptor: CInt = -1
     private var aboutWindowController: NSWindowController?
-    private let settingsStore = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+    private let settingsStore = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
     private static let devDeeplinkEnvKey = "RETRACE_DEV_DEEPLINK_URL"
-    private static let externalDashboardRevealNotification = Notification.Name("io.retrace.app.externalDashboardReveal")
+    private static let externalDashboardRevealNotification = Notification.Name("\(AppPaths.settingsSuiteName).externalDashboardReveal")
     private static let showDockIconPreferenceKey = "showDockIcon"
     private static let dashboardShortcutDefaultsKey = "dashboardShortcutConfig"
     private static let recordingShortcutDefaultsKey = "recordingShortcutConfig"
     private static let systemMonitorShortcutDefaultsKey = "systemMonitorShortcutConfig"
-    private static let canonicalBundleIdentifier = "io.retrace.app"
-    private static let singleInstanceLockPath = "/tmp/io.retrace.app.instance.lock"
+    private static let canonicalBundleIdentifier = AppPaths.settingsSuiteName
+    private static let singleInstanceLockPath = "/tmp/\(AppPaths.settingsSuiteName).instance.lock"
     private static let relaunchLockRetryAttempts = 30
     private static let singleInstanceLockRetryDelay: Duration = .milliseconds(100)
     nonisolated private static let watchdogSleepSuspensionSeconds: TimeInterval = 12 * 60 * 60
@@ -1275,7 +1275,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Returns true if app should continue, false if user chose to quit
     @MainActor
     private func checkStoragePathAvailable() async -> Bool {
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
 
         // Only check if user has set a custom path (not new users)
         guard let customPath = defaults.string(forKey: "customRetraceDBLocation") else {

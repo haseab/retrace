@@ -6,7 +6,7 @@ import Foundation
 /// The same key + frameID + nodeID always produces the same permutation.
 public enum ReversibleOCRScrambler {
     private static let protectedTextPrefix = "rtx1."
-    public static let settingsSuiteName = "io.retrace.app"
+    public static let settingsSuiteName = AppPaths.settingsSuiteName
 
     /// Returns the current scramble secret derived from the Keychain-backed
     /// master key. Protected features must provision the master key before
