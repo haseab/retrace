@@ -820,7 +820,7 @@ extension CaptureConfig {
 extension ProcessingConfig {
     public static var `default`: ProcessingConfig {
         ProcessingConfig(
-            accessibilityEnabled: false,  // Disabled - reads live screen, not video frames
+            accessibilityEnabled: true,  // Correct OCR using saved capture-time references only
             ocrAccuracyLevel: .accurate,
             recognitionLanguages: ["en-US"],
             minimumConfidence: 0.5
