@@ -26,14 +26,16 @@ enum AppRelaunch {
 
     /// Relaunch the app after an unexpected crash/watchdog-triggered termination.
     static func relaunchForCrashRecovery(
-        source: CrashRecoverySupport.RelaunchSource = .watchdogAutoQuit
+        source: CrashRecoverySupport.RelaunchSource = .watchdogAutoQuit,
+        recoveryState: WatchdogRecoveryState? = nil
     ) {
-        relaunch(markAsCrashRecovery: true, crashRecoverySource: source)
+        relaunch(markAsCrashRecovery: true, crashRecoverySource: source, recoveryState: recoveryState)
     }
 
     private static func relaunch(
         markAsCrashRecovery: Bool,
-        crashRecoverySource: CrashRecoverySupport.RelaunchSource?
+        crashRecoverySource: CrashRecoverySupport.RelaunchSource?,
+        recoveryState: WatchdogRecoveryState? = nil
     ) {
         let currentLaunchTarget = CrashRecoverySupport.currentLaunchTarget()
         let appPath = preferredRelaunchPath(currentLaunchTarget: currentLaunchTarget)
@@ -42,7 +44,8 @@ enum AppRelaunch {
             atPath: appPath,
             markAsCrashRecovery: markAsCrashRecovery,
             currentLaunchTarget: currentLaunchTarget,
-            crashRecoverySource: crashRecoverySource
+            crashRecoverySource: crashRecoverySource,
+            recoveryState: recoveryState
         )
     }
 
@@ -101,8 +104,10 @@ enum AppRelaunch {
         atPath path: String,
         markAsCrashRecovery: Bool,
         currentLaunchTarget: CrashRecoverySupport.LaunchTarget? = CrashRecoverySupport.currentLaunchTarget(),
-        crashRecoverySource: CrashRecoverySupport.RelaunchSource?
+        crashRecoverySource: CrashRecoverySupport.RelaunchSource?,
+        recoveryState: WatchdogRecoveryState? = nil
     ) {
+        guard recoveryState?.isRecoveryAllowed != false else { return }
         let normalizedPath = path.trimmingCharacters(in: .whitespacesAndNewlines)
         let launchMode = launchMode(forPath: normalizedPath)
         let pendingRestartDebuggingSession = CrashRecoverySupport.markRestartDebuggingPendingForNextLaunch()
@@ -160,7 +165,8 @@ enum AppRelaunch {
             atPath: resolvedLaunchTargetPath,
             launchMode: launchMode,
             markAsCrashRecovery: markAsCrashRecovery,
-            crashRecoverySource: crashRecoverySource
+            crashRecoverySource: crashRecoverySource,
+            recoveryState: recoveryState
         )
     }
 
@@ -288,7 +294,8 @@ enum AppRelaunch {
         atPath path: String,
         launchMode: LaunchMode,
         markAsCrashRecovery: Bool,
-        crashRecoverySource: CrashRecoverySupport.RelaunchSource?
+        crashRecoverySource: CrashRecoverySupport.RelaunchSource?,
+        recoveryState: WatchdogRecoveryState? = nil
     ) {
         // Fallback for environments where the bundled helper is unavailable or the main actor is unavailable.
         let launchCommand = fallbackLaunchCommand(
@@ -306,12 +313,27 @@ enum AppRelaunch {
         let task = Process()
         task.launchPath = "/bin/bash"
         task.arguments = ["-c", script]
-        let preparedHelperSuppression = prepareDisconnectSuppressionForShellFallback()
+        var preparedHelperSuppression = false
 
         do {
-            try task.run()
-            Log.info(tagged("[AppRelaunch] Terminating for relaunch via shell fallback"), category: .app)
-            Darwin.exit(0)
+            let launchAndExit: () throws -> Void = {
+                preparedHelperSuppression = prepareDisconnectSuppressionForShellFallback()
+                try task.run()
+                Log.info(tagged("[AppRelaunch] Terminating for relaunch via shell fallback"), category: .app)
+                Darwin.exit(0)
+            }
+            if let recoveryState {
+                // Recheck after xattr/script preparation, at the actual launch.
+                if try !recoveryState.performRecoveryIfAllowed(launchAndExit) {
+                    UserDefaults.standard.removeObject(forKey: "isRelaunching")
+                    _ = CrashRecoverySupport.clearPendingCrashRecoveryLaunchSource()
+                    if launchMode == .openTerminal {
+                        try? FileManager.default.removeItem(atPath: path)
+                    }
+                }
+            } else {
+                try launchAndExit()
+            }
         } catch {
             if preparedHelperSuppression {
                 _ = CrashRecoverySupport.clearDisconnectSuppression()

@@ -100,6 +100,7 @@ UI/
 │   ├── CapturedURLPolicy.swift # HTTP(S)-only captured-link dispatch validation
 │   ├── MasterKeyRedactionFlowCoordinator.swift # Shared missing-master-key prompt/recovery coordinator
 │   ├── BoundingBoxOverlay.swift         # Text region highlighting
+│   ├── WatchdogRecoveryState.swift      # Synchronous expected-exit guard shared with watchdog recovery
 │   ├── CrashRecoveryManager.swift       # App-side SMAppService/XPC lifecycle manager
 │   ├── SessionTimeline.swift            # App session visualization
 │   ├── DeeplinkHandler.swift            # Search, timeline, and exact dashboard date/time URL routing
@@ -781,3 +782,5 @@ Timeline index touches do not rescan sizes. JPEG NSCache entries have compressed
 - `UI/Components/CapturedURLPolicy.swift` allows HTTP(S) URLs with a host for captured browser/OCR links. Apply it before NSWorkspace/browser lookup in every captured-link open path. Existing comment-authored links are outside this policy. `HyperlinkResolutionTests` covers allowed and rejected schemes.
 
 - PreviewCacheEntryEpochs in PreviewCacheMaintenance.swift isolates frame eviction from unrelated reads/writes. Release read-miss epochs after all overlapping operations finish; keep whole-cache invalidation for clear/redaction.
+
+- `Tests/QuitRecoveryTests.swift` covers intentional quit cancellation of pending watchdog recovery.
