@@ -831,42 +831,42 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     category: .ui
                 )
 
-                let hangSamplePath = await CrashRecoveryManager.captureWatchdogHangSample(
-                    trigger: "watchdog_auto_quit"
-                )
-                // A user may have confirmed Quit while the helper was sampling.
-                guard Self.watchdogRecoveryState.isRecoveryAllowed else { return }
-                if hangSamplePath != nil {
-                    Log.info("[Watchdog] Helper captured watchdog hang sample for watchdog report merge", category: .ui)
-                } else {
-                    Log.warning("[Watchdog] Helper hang sample was unavailable before auto-quit", category: .ui)
-                }
+                await Self.watchdogRecoveryState.recoverAfterDiagnostics {
+                    await CrashRecoveryManager.captureWatchdogHangSample(trigger: "watchdog_auto_quit")
+                } recover: { hangSamplePath in
+                    if hangSamplePath != nil {
+                        Log.info("[Watchdog] Helper captured watchdog hang sample for watchdog report merge", category: .ui)
+                    } else {
+                        Log.warning("[Watchdog] Helper hang sample was unavailable before auto-quit", category: .ui)
+                    }
 
-                EmergencyDiagnostics.capture(
-                    trigger: "watchdog_auto_quit",
-                    supplementalReportPaths: hangSamplePath.map { [$0] } ?? [],
-                    cleanupSupplementalReports: true
-                )
-
-                guard Self.watchdogRecoveryState.isRecoveryAllowed else { return }
-                let relaunchDecision = CrashRecoverySupport.evaluateAndRecordCrashAutoRestart()
-                guard relaunchDecision.shouldRelaunch else {
-                    Log.critical(
-                        "[Watchdog] Auto-relaunch suppressed to prevent restart loop (\(relaunchDecision.recentCount) relaunches in last 5 minutes). Exiting without relaunch.",
-                        category: .ui
+                    EmergencyDiagnostics.capture(
+                        trigger: "watchdog_auto_quit",
+                        supplementalReportPaths: hangSamplePath.map { [$0] } ?? [],
+                        cleanupSupplementalReports: true
                     )
-                    Darwin.exit(0)
-                }
 
-                // Ensure we still terminate if relaunch scheduling fails unexpectedly.
-                DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 3.0) {
                     guard Self.watchdogRecoveryState.isRecoveryAllowed else { return }
-                    Log.critical("[Watchdog] Relaunch did not complete after auto-quit trigger. Force exiting.", category: .ui)
-                    Darwin.exit(0)
-                }
+                    let relaunchDecision = CrashRecoverySupport.evaluateAndRecordCrashAutoRestart()
+                    guard relaunchDecision.shouldRelaunch else {
+                        Log.critical(
+                            "[Watchdog] Auto-relaunch suppressed to prevent restart loop (\(relaunchDecision.recentCount) relaunches in last 5 minutes). Exiting without relaunch.",
+                            category: .ui
+                        )
+                        Self.watchdogRecoveryState.performRecoveryIfAllowed { Darwin.exit(0) }
+                        return
+                    }
 
-                guard Self.watchdogRecoveryState.isRecoveryAllowed else { return }
-                AppRelaunch.relaunchForCrashRecovery()
+                    // Ensure we still terminate if relaunch scheduling fails unexpectedly.
+                    DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 3.0) {
+                        guard Self.watchdogRecoveryState.isRecoveryAllowed else { return }
+                        Log.critical("[Watchdog] Relaunch did not complete after auto-quit trigger. Force exiting.", category: .ui)
+                        Self.watchdogRecoveryState.performRecoveryIfAllowed { Darwin.exit(0) }
+                    }
+
+                    guard Self.watchdogRecoveryState.isRecoveryAllowed else { return }
+                    AppRelaunch.relaunchForCrashRecovery(recoveryState: Self.watchdogRecoveryState)
+                }
             }
         }
     }
