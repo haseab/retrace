@@ -428,11 +428,7 @@ struct DashboardContentView: View {
             appearanceRefreshTick &+= 1
         }
         .onReceive(NotificationCenter.default.publisher(for: .toggleSettings)) { _ in
-            // Toggle: if on settings go to dashboard, otherwise go to settings
-            withAnimation(.easeInOut(duration: 0.2)) {
-                selectedView = selectedView == .settings ? .dashboard : .settings
-            }
-            updateDashboardWindowTitle()
+            toggleSettings()
         }
         .onReceive(NotificationCenter.default.publisher(for: .openSettings)) { _ in
             initialSettingsTab = nil
@@ -543,6 +539,14 @@ struct DashboardContentView: View {
             FeedbackFormView()
                 .environmentObject(coordinatorWrapper)
         }
+    }
+
+    private func toggleSettings() {
+        // Keep this state transition outside the large view-builder expression.
+        withAnimation(.easeInOut(duration: 0.2)) {
+            selectedView = selectedView == .settings ? .dashboard : .settings
+        }
+        updateDashboardWindowTitle()
     }
 
     @ViewBuilder
