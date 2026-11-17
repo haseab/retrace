@@ -5,14 +5,16 @@ import Shared
 @testable import Database
 
 final class AccessibilitySnapshotTests: XCTestCase {
-    func testEncryptedSnapshotAuthenticationAndSizeLimit() throws {
-        let snapshot = AccessibilitySnapshot(capturedAt: Date(), elements: [.init(text: "private canary", bounds: .zero, precise: false)])
-        let key = Data(repeating: 42, count: 32)
-        let sealed = try snapshot.sealed(masterKey: key, identity: "frame:1")
-        XCTAssertNil(String(data: sealed, encoding: .utf8)?.range(of: "private canary"))
-        XCTAssertEqual(try AccessibilitySnapshot.open(sealed, masterKey: key, identity: "frame:1"), snapshot)
-        XCTAssertThrowsError(try AccessibilitySnapshot.open(sealed, masterKey: key, identity: "frame:2"))
-        XCTAssertThrowsError(try AccessibilitySnapshot.open(sealed, masterKey: Data(repeating: 1,count: 32), identity: "frame:1"))
+    func testSnapshotJSONRoundTripAndSizeLimit() throws {
+        let snapshot = AccessibilitySnapshot(capturedAt: Date(), elements: [.init(text: "synthetic reference", bounds: .zero, precise: false)])
+        let data = try snapshot.encoded()
+        XCTAssertTrue(try XCTUnwrap(String(data: data, encoding: .utf8)).contains("synthetic reference"))
+        XCTAssertEqual(try AccessibilitySnapshot.decode(data), snapshot)
+        let oversized = AccessibilitySnapshot(capturedAt: Date(), elements: [.init(
+            text: String(repeating: "x", count: AccessibilitySnapshot.maximumBytes), bounds: .zero, precise: false)])
+        XCTAssertThrowsError(try oversized.encoded())
+        XCTAssertThrowsError(try AccessibilitySnapshot.decode(Data(repeating: 0, count: AccessibilitySnapshot.maximumBytes + 1)))
+        XCTAssertThrowsError(try AccessibilitySnapshot.decode(Data([0, 1, 2])))
     }
 
     func testSnapshotLifecycleAndAtomicFrameInsertion() async throws {
@@ -41,16 +43,21 @@ final class AccessibilitySnapshotTests: XCTestCase {
         let id = try await database.insertFrame(frame, accessibilitySnapshot: nil)
         XCTAssertEqual(try count("SELECT COUNT(*) FROM frame_accessibility WHERE frame_id=\(id) AND state='unavailable'"), 1)
         let snapshot = AccessibilitySnapshot(capturedAt: Date(), elements: [.init(text: "private reference", bounds: .zero, precise: false)])
-        let key = Data(repeating: 42, count: 32)
         try execute("DELETE FROM frame_accessibility WHERE frame_id=\(id);")
-        try AccessibilitySnapshotQueries.insert(db: db, frameID: id, snapshot: snapshot, keyProvider: { key })
-        XCTAssertEqual(try AccessibilitySnapshotQueries.load(db: db, frameID: id, keyProvider: { key }), snapshot)
+        try AccessibilitySnapshotQueries.insert(db: db, frameID: id, snapshot: snapshot)
+        XCTAssertEqual(try AccessibilitySnapshotQueries.load(db: db, frameID: id), snapshot)
+        XCTAssertEqual(try count("SELECT COUNT(*) FROM frame_accessibility WHERE CAST(payload AS TEXT) LIKE '%private reference%'"), 1)
+        // Unreadable references from earlier encrypted builds must fall back to OCR.
+        try execute("UPDATE frame_accessibility SET payload=X'00010203' WHERE frame_id=\(id);")
+        XCTAssertNil(try AccessibilitySnapshotQueries.load(db: db, frameID: id))
+        try execute("DELETE FROM frame_accessibility WHERE frame_id=\(id);")
+        try AccessibilitySnapshotQueries.insert(db: db, frameID: id, snapshot: snapshot)
         try await database.updateFrameProcessingStatus(frameID: id, status: 0, rewritePurpose: nil)
         let pending = try await database.hasFramesAwaitingOCR()
         XCTAssertTrue(pending)
-        XCTAssertEqual(try AccessibilitySnapshotQueries.load(db: db, frameID: id, keyProvider: { key }), snapshot)
+        XCTAssertEqual(try AccessibilitySnapshotQueries.load(db: db, frameID: id), snapshot)
         try await database.updateFrameProcessingStatus(frameID: id, status: 5, rewritePurpose: "redaction")
-        XCTAssertNil(try AccessibilitySnapshotQueries.load(db: db, frameID: id, keyProvider: { key }))
+        XCTAssertNil(try AccessibilitySnapshotQueries.load(db: db, frameID: id))
         let pendingAfter = try await database.hasFramesAwaitingOCR()
         XCTAssertFalse(pendingAfter)
         try execute("CREATE TRIGGER reject_ax BEFORE INSERT ON frame_accessibility BEGIN SELECT RAISE(ABORT,'test'); END;")

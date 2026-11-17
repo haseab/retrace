@@ -619,7 +619,7 @@ public actor CGWindowListCapture {
             ? AccessibilitySnapshotCollector.collect(
                 pid: axContext?.ownerPID, windowID: axContext?.windowID, windowBounds: axContext?.windowBounds,
                 displayBounds: CGDisplayBounds(displayID), width: captureResult.image.width,
-                height: captureResult.image.height, capturedAt: screenshotTime)
+                height: captureResult.image.height, capturedAt: screenshotTime, capturedImage: captureResult.image)
             : nil
         var cgImage = captureResult.image
         let displaySurfaceBytes = Self.estimatedImageSurfaceBytes(width: cgImage.width, height: cgImage.height)

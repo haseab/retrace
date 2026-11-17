@@ -1,6 +1,5 @@
 import Foundation
 import CoreGraphics
-import CryptoKit
 
 /// Capture-time reference only. Bounds use screenshot pixels, top-left origin.
 public struct AccessibilitySnapshot: Codable, Sendable, Equatable {
@@ -20,19 +19,15 @@ public struct AccessibilitySnapshot: Codable, Sendable, Equatable {
     }
     public static let maximumBytes = 131072
 
-    /// Domain-separated encryption, with frame identity authenticated to prevent swapping snapshots.
-    public func sealed(masterKey: Data, identity: String) throws -> Data {
+    /// References share the enclosing database's storage/encryption policy.
+    public func encoded() throws -> Data {
         let data = try JSONEncoder().encode(self)
         guard data.count <= Self.maximumBytes else { throw SnapshotError.tooLarge }
-        return try AES.GCM.seal(data, using: Self.key(masterKey), authenticating: Data(identity.utf8)).combined!
+        return data
     }
-    public static func open(_ data: Data, masterKey: Data, identity: String) throws -> Self {
-        guard data.count <= maximumBytes + 28 else { throw SnapshotError.tooLarge }
-        let plain = try AES.GCM.open(AES.GCM.SealedBox(combined: data), using: key(masterKey), authenticating: Data(identity.utf8))
-        return try JSONDecoder().decode(Self.self, from: plain)
-    }
-    private static func key(_ bytes: Data) -> SymmetricKey {
-        HKDF<SHA256>.deriveKey(inputKeyMaterial: SymmetricKey(data: bytes), salt: Data("retrace.ax.v1".utf8), info: Data("capture-reference".utf8), outputByteCount: 32)
+    public static func decode(_ data: Data) throws -> Self {
+        guard data.count <= maximumBytes else { throw SnapshotError.tooLarge }
+        return try JSONDecoder().decode(Self.self, from: data)
     }
     public enum SnapshotError: Error { case tooLarge }
 }

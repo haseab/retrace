@@ -5,6 +5,7 @@ import Shared
 /// Auxiliary, idempotent schema: deliberately independent of numbered migrations
 /// so the in-flight encrypted-database migration can still apply its V21 identity step.
 enum AccessibilitySnapshotQueries {
+    // Retain the historical payload limit and key_unavailable state for existing tables.
     static func ensureSchema(db: OpaquePointer) throws {
         try execute(db, """
         CREATE TABLE IF NOT EXISTS frame_accessibility (
@@ -22,15 +23,15 @@ enum AccessibilitySnapshotQueries {
         END;
         """)
     }
-    static func insert(db: OpaquePointer, frameID: Int64, snapshot: AccessibilitySnapshot?, keyProvider: () throws -> Data = captureKey) throws {
+    static func insert(db: OpaquePointer, frameID: Int64, snapshot: AccessibilitySnapshot?) throws {
         var payload: Data?
         var state = "unavailable"
         if let snapshot {
             do {
-                // The same recoverable key used by protected OCR; never write AX plaintext.
-                payload = try snapshot.sealed(masterKey: keyProvider(), identity: "frame:\(frameID)")
+                // Store bounded JSON under the enclosing database policy; no separate key.
+                payload = try snapshot.encoded()
                 state = "saved"
-            } catch { state = "key_unavailable" }
+            } catch { state = "unavailable" }
         }
         let sql = "INSERT INTO frame_accessibility(frame_id,payload,state) VALUES (?,?,?);"
         let stmt = try prepare(db,sql); defer { sqlite3_finalize(stmt) }
@@ -40,19 +41,19 @@ enum AccessibilitySnapshotQueries {
         sqlite3_bind_text(stmt,3,state,-1,unsafeBitCast(-1,to:sqlite3_destructor_type.self))
         guard sqlite3_step(stmt) == SQLITE_DONE else { throw failure() }
     }
-    static func load(db: OpaquePointer, frameID: Int64, keyProvider: () throws -> Data = MasterKeyManager.loadMasterKey) throws -> AccessibilitySnapshot? {
+    static func load(db: OpaquePointer, frameID: Int64) throws -> AccessibilitySnapshot? {
         let stmt = try prepare(db,"SELECT payload FROM frame_accessibility WHERE frame_id=?;")
         defer { sqlite3_finalize(stmt) }; sqlite3_bind_int64(stmt,1,frameID)
         let rc = sqlite3_step(stmt)
         if rc == SQLITE_DONE { return nil }
         guard rc == SQLITE_ROW else { throw failure() }
         guard let bytes = sqlite3_column_blob(stmt,0) else { return nil }
-        let data = Data(bytes:bytes,count:Int(sqlite3_column_bytes(stmt,0)))
-        return try AccessibilitySnapshot.open(data,masterKey:keyProvider(),identity:"frame:\(frameID)")
-    }
-    static func captureKey() throws -> Data {
-        _ = try MasterKeyManager.createMasterKeyIfNeeded()
-        return try MasterKeyManager.loadMasterKey()
+        let count = Int(sqlite3_column_bytes(stmt,0))
+        guard count <= AccessibilitySnapshot.maximumBytes else { return nil }
+        let data = Data(bytes:bytes,count:count)
+        // Earlier development builds stored encrypted blobs. Skip those (and
+        // malformed references) and use ordinary OCR, without opening Keychain.
+        return try? AccessibilitySnapshot.decode(data)
     }
     static func execute(_ db: OpaquePointer, _ sql: String) throws {
         guard sqlite3_exec(db,sql,nil,nil,nil) == SQLITE_OK else { throw failure() }

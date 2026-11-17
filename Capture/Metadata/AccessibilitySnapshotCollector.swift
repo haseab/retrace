@@ -7,7 +7,7 @@ import Shared
 /// the wall-clock deadline is best effort because a single system call can overrun it.
 enum AccessibilitySnapshotCollector {
     static func collect(pid: pid_t?, windowID: CGWindowID?, windowBounds: CGRect?, displayBounds: CGRect,
-                        width: Int, height: Int, capturedAt: Date) -> AccessibilitySnapshot? {
+                        width: Int, height: Int, capturedAt: Date, capturedImage: CGImage) -> AccessibilitySnapshot? {
         guard AXIsProcessTrusted(), let pid, let windowID, let expectedBounds = windowBounds else { return nil }
         let start = Date()
         guard let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]],
@@ -19,8 +19,9 @@ enum AccessibilitySnapshotCollector {
 
         let app = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(app, 0.01)
+        let applicationName = windows[targetIndex][kCGWindowOwnerName as String] as? String
         let expectedTitle = windows[targetIndex][kCGWindowName as String] as? String
-        guard let window = matchedWindow(app, bounds: expectedBounds, title: expectedTitle, startedAt: start),
+        guard let window = matchedWindow(app, bounds: expectedBounds, title: expectedTitle, applicationName: applicationName, startedAt: start),
               let initialBounds = rect(window) else { return nil }
         let title = attribute(window, kAXTitleAttribute) as? String
         var stack: [(AXUIElement, Int)] = [(window, 0)]
@@ -46,7 +47,7 @@ enum AccessibilitySnapshotCollector {
                         ?? (attribute(element, kAXTitleAttribute) as? String) ?? ""
                     text = String(content.prefix(12000))
                 }
-                if !text.isEmpty, bounds.width > 0, bounds.height > 0, initialBounds.contains(bounds), displayBounds.contains(bounds), !occluders.contains(where: { $0.intersects(bounds) }) {
+                if !text.isEmpty, bounds.width > 0, bounds.height > 0, initialBounds.contains(bounds), displayBounds.contains(bounds) {
                     let pixelBounds = CGRect(x: (bounds.minX-displayBounds.minX)*sx, y: (bounds.minY-displayBounds.minY)*sy,
                                              width: bounds.width*sx, height: bounds.height*sy)
                     let precise = role != "AXTextArea" && bounds.height*sy <= 45
@@ -69,6 +70,31 @@ enum AccessibilitySnapshotCollector {
                 }
             }
 
+        }
+        // Verify overlapping regions against the frame, not the overlay's bounding box.
+        // A second image is only needed when at least one candidate may be covered.
+        func screenRect(_ item: AccessibilitySnapshot.Element) -> CGRect {
+            CGRect(x: item.bounds.minX / sx + displayBounds.minX,
+                   y: item.bounds.minY / sy + displayBounds.minY,
+                   width: item.bounds.width / sx, height: item.bounds.height / sy)
+        }
+        func overlaps(_ item: AccessibilitySnapshot.Element) -> Bool {
+            occluders.contains { $0.intersects(screenRect(item)) }
+        }
+        if result.contains(where: overlaps) {
+            let windowImage = CGWindowListCreateImage(displayBounds, .optionIncludingWindow, windowID,
+                                                      [.boundsIgnoreFraming, .bestResolution])
+            let verificationStart = Date()
+            var remainingPixels = 2_000_000
+            result = result.filter { item in
+                guard overlaps(item) else { return true }
+                guard Date().timeIntervalSince(verificationStart) < 0.05, let windowImage else {
+                    truncated = true
+                    return false
+                }
+                return AccessibilityPixelVisibility.matches(captured: capturedImage, window: windowImage,
+                    rect: item.bounds, remainingPixels: &remainingPixels)
+            }
         }
         guard let currentWindows = windowList(app), currentWindows.contains(where: { CFEqual($0, window) }),
               rect(window) == initialBounds, (attribute(window, kAXTitleAttribute) as? String) == title else { return nil }
@@ -96,7 +122,7 @@ enum AccessibilitySnapshotCollector {
               let windows = values as? [AXUIElement], windows.count == count else { return nil }
         return windows
     }
-    private static func matchedWindow(_ app: AXUIElement, bounds: CGRect, title: String?, startedAt: Date) -> AXUIElement? {
+    private static func matchedWindow(_ app: AXUIElement, bounds: CGRect, title: String?, applicationName: String?, startedAt: Date) -> AXUIElement? {
         guard let windows = windowList(app) else { return nil }
         var geometries: [CGRect?] = []
         var titles: [String?] = []
@@ -106,7 +132,7 @@ enum AccessibilitySnapshotCollector {
             titles.append(attribute(window, kAXTitleAttribute) as? String)
         }
         guard let index = AccessibilityWindowMatcher.uniqueIndex(bounds: geometries, titles: titles,
-                                                                 expectedBounds: bounds, expectedTitle: title) else { return nil }
+                                                                 expectedBounds: bounds, expectedTitle: title, applicationName: applicationName) else { return nil }
         return windows[index]
     }
     private static func attribute(_ element: AXUIElement, _ name: String) -> CFTypeRef? {

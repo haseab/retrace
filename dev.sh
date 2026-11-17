@@ -21,9 +21,9 @@ swift build -c debug --disable-sandbox --product Retrace --scratch-path "$RETRAC
 RETRACE_BIN_PATH="$(swift build -c debug --show-bin-path --scratch-path "$RETRACE_BUILD_PATH")"
 RETRACE_STAGE="$(mktemp -d "${TMPDIR:-/tmp}/retrace-dev.XXXXXX")"
 trap 'rm -rf "$RETRACE_STAGE"' EXIT
-python3 - "$PWD" "$RETRACE_BIN_PATH" "$RETRACE_STAGE" <<'PY'
+python3 - "$PWD" "$RETRACE_BIN_PATH" "$RETRACE_STAGE" "$RETRACE_BUILD_PATH" <<'PY'
 import pathlib, plistlib, re, shutil, subprocess, sys
-root, binaries, stage = map(pathlib.Path, sys.argv[1:])
+root, binaries, stage, build_root = map(pathlib.Path, sys.argv[1:])
 contents = stage/'Retrace Dev.app'/'Contents'
 (contents/'MacOS').mkdir(parents=True)
 (contents/'Resources').mkdir()
@@ -31,7 +31,7 @@ contents = stage/'Retrace Dev.app'/'Contents'
 shutil.copy2(binaries/'Retrace', contents/'MacOS'/'Retrace Dev')
 shutil.copytree(binaries/'Retrace_Retrace.bundle', contents/'Resources'/'Retrace_Retrace.bundle')
 shutil.copy2(root/'AppIcon.icns', contents/'Resources'/'AppIcon.icns')
-framework = next(pathlib.Path(binaries.parents[1]/'artifacts').rglob('Sparkle.framework'))
+framework = next((build_root/'artifacts').rglob('Sparkle.framework'))
 shutil.copytree(framework, contents/'Frameworks'/'Sparkle.framework', symlinks=True)
 with (root/'UI'/'Info.plist').open('rb') as f: info=plistlib.load(f)
 info={k:v for k,v in info.items() if not(isinstance(v,str) and '$(' in v)}
@@ -50,8 +50,22 @@ PY
 install_name_tool -add_rpath @executable_path/../Frameworks "$RETRACE_STAGE/Retrace Dev.app/Contents/MacOS/Retrace Dev"
 codesign --force --deep --sign "$RETRACE_DEV_IDENTITY" "$RETRACE_STAGE/Retrace Dev.app"
 codesign --verify --deep --strict "$RETRACE_STAGE/Retrace Dev.app"
-ditto "$RETRACE_STAGE/Retrace Dev.app" "$RETRACE_DEV_APP"
-codesign --verify --deep --strict "$RETRACE_DEV_APP"
+# Replace the bundle rather than merging resources left by older build layouts.
+python3 - "$RETRACE_STAGE/Retrace Dev.app" "$RETRACE_DEV_APP" <<'INSTALL'
+import pathlib, shutil, subprocess, sys, uuid
+source, destination = map(pathlib.Path, sys.argv[1:])
+previous = destination.with_name('.retrace-dev-previous-' + uuid.uuid4().hex)
+if destination.exists(): destination.rename(previous)
+try:
+    subprocess.run(['ditto', str(source), str(destination)], check=True)
+    subprocess.run(['codesign', '--verify', '--deep', '--strict', str(destination)], check=True)
+except BaseException:
+    if destination.exists(): shutil.rmtree(destination)
+    if previous.exists(): previous.rename(destination)
+    raise
+else:
+    if previous.exists(): shutil.rmtree(previous)
+INSTALL
 echo "Installed signed development app: $RETRACE_DEV_APP"
 if [[ "${1:-}" != "--build-only" ]]; then
     open "$RETRACE_DEV_APP"

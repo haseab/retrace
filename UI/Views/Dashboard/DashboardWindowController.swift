@@ -429,8 +429,13 @@ struct DashboardContentView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .toggleSettings)) { _ in
             // Toggle: if on settings go to dashboard, otherwise go to settings
+            let targetView: DashboardSelectedView
+            switch selectedView {
+            case .settings: targetView = .dashboard
+            default: targetView = .settings
+            }
             withAnimation(.easeInOut(duration: 0.2)) {
-                selectedView = selectedView == .settings ? .dashboard : .settings
+                selectedView = targetView
             }
             updateDashboardWindowTitle()
         }

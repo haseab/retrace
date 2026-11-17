@@ -1435,13 +1435,13 @@ public actor FrameProcessingQueue {
             let snapshot: AccessibilitySnapshot?
             do { snapshot = try await databaseManager.getAccessibilitySnapshot(frameID: frameID) }
             catch {
-                // Missing/replaced key must not stall normal OCR. Never sample live AX.
+                // Unreadable saved references must not stall normal OCR. Never sample live AX.
                 snapshot = nil
                 axUnavailableSinceMetric += 1
             }
             let historicalFrame = CapturedFrame(timestamp: capturedFrame.timestamp, imageData: capturedFrame.imageData,
                 width: capturedFrame.width, height: capturedFrame.height, bytesPerRow: capturedFrame.bytesPerRow,
-                metadata: capturedFrame.metadata, accessibilitySnapshot: snapshot)
+                metadata: frameRef.metadata, accessibilitySnapshot: snapshot)
             extractedText = try await processing.extractText(from: historicalFrame)
             let postExtractSnapshot = await MemoryLedger.snapshot(waitForPendingUpdates: true)
             let extractResidualBytes = max(
