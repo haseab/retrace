@@ -128,7 +128,7 @@ retrace/
 │   ├── ScreenCapture/           # Screen capture implementation
 │   │   ├── CaptureFrameCandidate.swift # Native-image exact-duplicate check before BGRA materialization
 │   │   └── ConferenceFaceBlurProcessor.swift # Vision face detection + irreversible conference-call face blur
-│   ├── Deduplication/           # Perceptual hash deduplication
+│   ├── Deduplication/           # Pixel-sampling deduplication
 │   ├── Metadata/                # AppInfoProvider, BrowserURLExtractor
 │   │   ├── ConferenceCallActivityProvider.swift # Window-specific active-call accessibility controls
 │   │   └── ConferenceSessionPrivacyPolicy.swift # Conferencing-app rules + call-session consent tracking
