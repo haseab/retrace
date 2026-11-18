@@ -93,6 +93,7 @@ public struct CapturedFrame: Sendable {
     public let height: Int
     public let bytesPerRow: Int
     public let metadata: FrameMetadata
+    public let accessibilitySnapshot: AccessibilitySnapshot?
 
     public init(
         timestamp: Date = Date(),
@@ -100,7 +101,8 @@ public struct CapturedFrame: Sendable {
         width: Int,
         height: Int,
         bytesPerRow: Int,
-        metadata: FrameMetadata = .empty
+        metadata: FrameMetadata = .empty,
+        accessibilitySnapshot: AccessibilitySnapshot? = nil
     ) {
         self.timestamp = timestamp
         self.imageData = imageData
@@ -108,6 +110,7 @@ public struct CapturedFrame: Sendable {
         self.height = height
         self.bytesPerRow = bytesPerRow
         self.metadata = metadata
+        self.accessibilitySnapshot = accessibilitySnapshot
     }
 }
 

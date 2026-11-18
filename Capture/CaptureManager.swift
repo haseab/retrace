@@ -1176,7 +1176,8 @@ public actor CaptureManager: CaptureProtocol {
             width: frame.width,
             height: frame.height,
             bytesPerRow: frame.bytesPerRow,
-            metadata: enrichedMetadata
+            metadata: enrichedMetadata,
+            accessibilitySnapshot: frame.accessibilitySnapshot
         )
     }
 

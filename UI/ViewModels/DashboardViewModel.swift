@@ -258,7 +258,7 @@ public class DashboardViewModel: ObservableObject {
     // MARK: - Dependencies
 
     private let coordinator: AppCoordinator
-    private let settingsStore = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+    private let settingsStore = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
     private var cancellables = Set<AnyCancellable>()
     private var refreshTimer: DispatchSourceTimer?
     /// Prevents the 2s poll from clobbering optimistic toggle UI while start/stop is in flight.

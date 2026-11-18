@@ -2,6 +2,10 @@ import XCTest
 @testable import Capture
 
 final class BrowserURLAppleScriptCoordinatorTests: XCTestCase {
+    func testMissingAutomationTargetIsRejectedWithoutRequestingPermission() {
+        XCTAssertFalse(BrowserURLExtractor.hasAutomationAuthorization(bundleID: "io.retrace.tests.nonexistent-browser"))
+    }
+
     @MainActor
     func testStrictAppleScriptWindowSelectionUsesUniqueMatchingTab() throws {
         let cases = [

@@ -90,7 +90,7 @@ public actor RetentionManager {
     /// Get the current retention policy from user settings
     /// Returns nil if retention is set to "Forever" (0 days)
     public nonisolated func getRetentionDays() -> Int? {
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
         let days = defaults.integer(forKey: "retentionDays")
         return days == 0 ? nil : days
     }
@@ -112,7 +112,7 @@ public actor RetentionManager {
         // Exclusions disabled - always return empty set
         return []
         // Original code (commented out):
-        // let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        // let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
         // guard let appsString = defaults.string(forKey: "retentionExcludedApps"), !appsString.isEmpty else {
         //     return []
         // }
@@ -125,7 +125,7 @@ public actor RetentionManager {
         // Exclusions disabled - always return empty set
         return []
         // Original code (commented out):
-        // let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        // let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
         // guard let tagsString = defaults.string(forKey: "retentionExcludedTagIds"), !tagsString.isEmpty else {
         //     return []
         // }
@@ -138,7 +138,7 @@ public actor RetentionManager {
         // Exclusions disabled - never exclude hidden items
         return false
         // Original code (commented out):
-        // let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        // let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
         // return defaults.bool(forKey: "retentionExcludeHidden")
     }
 

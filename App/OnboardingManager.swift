@@ -2,7 +2,7 @@ import Foundation
 import Shared
 
 /// Shared UserDefaults store for consistent settings across debug/release builds
-private let settingsDefaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+private let settingsDefaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
 
 /// Manages first-launch onboarding flow
 /// Tracks whether user has completed the current onboarding flow

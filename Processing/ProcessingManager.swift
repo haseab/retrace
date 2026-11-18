@@ -77,7 +77,10 @@ public actor ProcessingManager: ProcessingProtocol {
                 from: frame,
                 instrumentation: instrumentation
             )
-            let ocrRegions = ocrExtraction.regions
+            let ocrRegions = ocrExtraction.regions.map { region in
+                guard config.accessibilityEnabled, let snapshot = frame.accessibilitySnapshot else { return region }
+                return AccessibilityOCRCorrector.correct(region, snapshot: snapshot)
+            }
             let ocrStage = await instrumentation.recordOCRStage(
                 ocrRegions: ocrRegions,
                 schedulesReturnResidualProbes: ocrExtraction.mode == .fullFrame
@@ -196,42 +199,11 @@ public actor ProcessingManager: ProcessingProtocol {
                 mainRegions.append(region)
             }
         }
-        // Extract accessibility text (if enabled and permitted)
-        var axResult: AccessibilityResult? = nil
-        var axText: String? = nil
-        if config.accessibilityEnabled {
-            let hasPermission = await accessibility.hasPermission()
-            if hasPermission {
-                do {
-                    axResult = try await accessibility.getFocusedAppText()
-                    axText = axResult?.textElements.map(\.text).joined(separator: " ")
-                } catch {
-                    Log.debug("[ProcessingManager] Accessibility text extraction failed (non-critical): \(error.localizedDescription)", category: .processing)
-                    axResult = nil
-                }
-            }
-        }
-        // Build OCR text from main regions only (chrome text stored separately)
-        let ocrText = mainRegions.map(\.text).joined(separator: " ")
+        // AX corrections have already been applied to the OCR regions. Never query
+        // the current foreground app for a historical frame or append AX-only text.
+        let fullText = mainRegions.map(\.text).joined(separator: " ")
         let chromeText = chromeRegions.map(\.text).joined(separator: " ")
-
-        // Merge OCR and accessibility text
-        let fullText = merger.mergeText(ocrText: ocrText, accessibilityText: axText)
-
-        // Merge accessibility metadata with existing metadata
-        // Preserve browserURL from capture phase if accessibility doesn't provide one
-        var metadata = frameMetadata
-        if let axResult = axResult {
-            metadata = FrameMetadata(
-                appBundleID: axResult.appInfo.bundleID,
-                appName: axResult.appInfo.name,
-                windowName: axResult.appInfo.windowName,
-                browserURL: axResult.appInfo.browserURL ?? frameMetadata.browserURL,
-                redactionReason: frameMetadata.redactionReason,
-                captureTrigger: frameMetadata.captureTrigger,
-                displayID: frameMetadata.displayID
-            )
-        }
+        let metadata = frameMetadata
 
         // Create ExtractedText with separated main/chrome regions
         // Note: CapturedFrame doesn't have an ID yet (assigned by database on insert)

@@ -5,7 +5,7 @@ import Shared
 import App
 import UniformTypeIdentifiers
 
-private let timelineSettingsStore: UserDefaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+private let timelineSettingsStore: UserDefaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
 
 /// Redesigned fullscreen timeline view with scrolling tape and fixed playhead
 /// The timeline tape moves left/right while the playhead stays fixed in center
@@ -1644,7 +1644,7 @@ class DoubleBufferedVideoView: NSView {
         #if DEBUG
         return true
         #else
-        return (UserDefaults(suiteName: "io.retrace.app") ?? .standard)
+        return (UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard)
             .bool(forKey: "retrace.debug.filteredSeekDiagnostics")
         #endif
     }()
@@ -1965,7 +1965,7 @@ class DoubleBufferedVideoView: NSView {
     }
 
     private func configuredSeekToleranceFrames() -> Int {
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
         if let value = defaults.object(forKey: "retrace.debug.timelineSeekToleranceFrames") as? NSNumber {
             return max(0, value.intValue)
         }
@@ -10595,7 +10595,7 @@ struct TagSubmenuRow: View {
 
 /// Floating vertical card panel for timeline filtering
 /// Shared UserDefaults store for accessing settings
-private let filterPanelSettingsStore = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+private let filterPanelSettingsStore = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
 
 struct FilterPanel: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel
