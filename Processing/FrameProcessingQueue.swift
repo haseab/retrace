@@ -491,6 +491,9 @@ public actor FrameProcessingQueue {
     private let processing: ProcessingProtocol
     private let search: SearchProtocol
 
+    /// Defaults to the real master key; tests supply their fixture key without Keychain access.
+    private let appWideSecretProvider: @Sendable () -> String?
+
     private let config: ProcessingQueueConfig
     private var workers: [Task<Void, Never>] = []
     private var isRunning = false
@@ -569,13 +572,17 @@ public actor FrameProcessingQueue {
         storage: StorageProtocol,
         processing: ProcessingProtocol,
         search: SearchProtocol,
-        config: ProcessingQueueConfig = .default
+        config: ProcessingQueueConfig = .default,
+        appWideSecretProvider: @escaping @Sendable () -> String? = {
+            ReversibleOCRScrambler.currentAppWideSecret()
+        }
     ) {
         self.databaseManager = database
         self.storage = storage
         self.processing = processing
         self.search = search
         self.config = config
+        self.appWideSecretProvider = appWideSecretProvider
     }
 
     // MARK: - Power Configuration
@@ -2312,7 +2319,7 @@ public actor FrameProcessingQueue {
         }
 
         let mode = PhraseRedactionMode.load(from: defaults)
-        let secret = mode == .scramble ? ReversibleOCRScrambler.currentAppWideSecret() : nil
+        let secret = mode == .scramble ? appWideSecretProvider() : nil
         guard mode == .permanent || secret != nil else {
             throw ProcessingError.ocrFailed(underlying: "Phrase redaction requires the unavailable master key; retrying without indexing")
         }
@@ -2798,7 +2805,7 @@ public actor FrameProcessingQueue {
         }
 
         let actualSegmentID = try parseActualSegmentID(from: videoSegment.relativePath)
-        let secret = ReversibleOCRScrambler.currentAppWideSecret()
+        let secret = appWideSecretProvider()
         let executablePlan: VideoRewritePlan
 
         if plan.segmentRewritePlan.requiresRedactionSecret && secret == nil {
