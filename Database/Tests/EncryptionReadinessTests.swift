@@ -6,6 +6,64 @@ import Shared
 @testable import Database
 
 final class EncryptionReadinessTests: XCTestCase {
+    func testConnectionKeyErrorsRedactSecretsAcrossDiagnosticFormats() throws {
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(":memory:", &db), SQLITE_OK)
+        defer { sqlite3_close(db) }
+        let handle = try XCTUnwrap(db)
+        // Force a real key/rekey failure without depending on a wrong password
+        // causing PRAGMA key itself to fail (it usually does not).
+        sqlite3_set_authorizer(handle, { _, action, _, _, _, _ in
+            action == SQLITE_PRAGMA ? SQLITE_DENY : SQLITE_OK
+        }, nil)
+        let connections: [any DatabaseConnection] = [SQLiteConnection(db: handle), SQLCipherConnection(db: handle)]
+        for sql in [
+            "PRAGMA key = 'password-canary-32';",
+            "pRaGmA\n main.rekey = \"x'abcdef0123456789'\";",
+            "PRAGMA /* configuration */ key = 'password-canary-32';"
+        ] {
+            for connection in connections {
+                for prepare in [false, true] {
+                    do {
+                        if prepare {
+                            let statement = try connection.prepare(sql: sql)
+                            connection.finalize(statement)
+                        } else {
+                            try connection.execute(sql: sql)
+                        }
+                        XCTFail("Expected authorizer rejection")
+                    } catch {
+                        for diagnostic in [String(describing: error), String(reflecting: error), error.localizedDescription] {
+                            XCTAssertFalse(diagnostic.contains("password-canary-32"))
+                            XCTAssertFalse(diagnostic.contains("abcdef0123456789"))
+                            XCTAssertTrue(diagnostic.contains("redacted"))
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    func testRawConnectionErrorsRedactParserEchoAndPreserveOrdinaryDiagnostics() throws {
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(":memory:", &db), SQLITE_OK)
+        defer { sqlite3_close(db) }
+        let handle = try XCTUnwrap(db)
+        let sql = "PRAGMA key = parser_secret_canary invalid;"
+        XCTAssertNotEqual(sqlite3_exec(handle, sql, nil, nil, nil), SQLITE_OK)
+        let message = String(cString: sqlite3_errmsg(handle))
+        // The newer read-connection factory on main constructs this shared error
+        // directly. Protect it even when the caller supplies unsanitized SQL.
+        let error = DatabaseConnectionError.executionFailed(sql: sql, error: message)
+        for diagnostic in [String(describing: error), String(reflecting: error), error.localizedDescription] {
+            XCTAssertFalse(diagnostic.contains("parser_secret_canary"))
+            XCTAssertTrue(diagnostic.contains("redacted"))
+        }
+        XCTAssertThrowsError(try SQLiteConnection(db: handle).execute(sql: "SELECT * FROM absent_table")) { error in
+            XCTAssertTrue(String(describing: error).contains("absent_table"))
+        }
+    }
+
     func testDefaultDatabaseKeyUsesTheCanonicalMasterAccountAndOpensEncryptedData() throws {
         let master = Data((0..<32).map { UInt8($0) })
         let expected = MasterKeyManager.derivedKeyData(from: master, purpose: .databaseEncryption)

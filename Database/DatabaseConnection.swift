@@ -29,7 +29,7 @@ public protocol DatabaseConnection: Sendable {
 
 // MARK: - Database Errors
 
-public enum DatabaseConnectionError: Error, CustomStringConvertible {
+public enum DatabaseConnectionError: Error, CustomStringConvertible, CustomDebugStringConvertible, LocalizedError {
     case statementPreparationFailed(sql: String, error: String)
     case executionFailed(sql: String, error: String)
     case transactionFailed(error: String)
@@ -38,14 +38,29 @@ public enum DatabaseConnectionError: Error, CustomStringConvertible {
     public var description: String {
         switch self {
         case .statementPreparationFailed(let sql, let error):
-            return "Failed to prepare statement '\(sql)': \(error)"
+            let diagnostic = Self.safeSQLDiagnostic(sql: sql, error: error)
+            return "Failed to prepare statement '\(diagnostic.sql)': \(diagnostic.error)"
         case .executionFailed(let sql, let error):
-            return "Failed to execute '\(sql)': \(error)"
+            let diagnostic = Self.safeSQLDiagnostic(sql: sql, error: error)
+            return "Failed to execute '\(diagnostic.sql)': \(diagnostic.error)"
         case .transactionFailed(let error):
             return "Transaction failed: \(error)"
         case .notConnected:
             return "Database not connected"
         }
+    }
+
+    public var debugDescription: String { description }
+    public var errorDescription: String? { description }
+
+    /// Key setup SQL contains secrets. SQLite parser errors can echo them too.
+    /// Match conservatively, including schema-qualified and commented pragmas;
+    /// retaining SQL diagnostics for ordinary statements is still useful.
+    static func safeSQLDiagnostic(sql: String, error: String) -> (sql: String, error: String) {
+        let hasPragma = sql.range(of: #"\bpragma\b"#, options: [.regularExpression, .caseInsensitive]) != nil
+        let hasKey = sql.range(of: #"\b(?:key|rekey)\b"#, options: [.regularExpression, .caseInsensitive]) != nil
+        guard hasPragma && hasKey else { return (sql, error) }
+        return ("PRAGMA key = <redacted>;", "SQLCipher key operation failed (details redacted)")
     }
 }
 
@@ -73,7 +88,8 @@ public final class SQLiteConnection: DatabaseConnection, @unchecked Sendable {
 
         guard result == SQLITE_OK else {
             let error = String(cString: sqlite3_errmsg(db))
-            throw DatabaseConnectionError.statementPreparationFailed(sql: sql, error: error)
+            let diagnostic = DatabaseConnectionError.safeSQLDiagnostic(sql: sql, error: error)
+            throw DatabaseConnectionError.statementPreparationFailed(sql: diagnostic.sql, error: diagnostic.error)
         }
 
         return statement
@@ -88,7 +104,8 @@ public final class SQLiteConnection: DatabaseConnection, @unchecked Sendable {
         let result = sqlite3_exec(db, sql, nil, nil, nil)
         guard result == SQLITE_OK else {
             let error = String(cString: sqlite3_errmsg(db))
-            throw DatabaseConnectionError.executionFailed(sql: sql, error: error)
+            let diagnostic = DatabaseConnectionError.safeSQLDiagnostic(sql: sql, error: error)
+            throw DatabaseConnectionError.executionFailed(sql: diagnostic.sql, error: diagnostic.error)
         }
 
         return Int(sqlite3_changes(db))
@@ -137,7 +154,8 @@ public final class SQLCipherConnection: DatabaseConnection, @unchecked Sendable 
 
         guard result == SQLITE_OK else {
             let error = String(cString: sqlite3_errmsg(db))
-            throw DatabaseConnectionError.statementPreparationFailed(sql: sql, error: error)
+            let diagnostic = DatabaseConnectionError.safeSQLDiagnostic(sql: sql, error: error)
+            throw DatabaseConnectionError.statementPreparationFailed(sql: diagnostic.sql, error: diagnostic.error)
         }
 
         return statement
@@ -152,7 +170,8 @@ public final class SQLCipherConnection: DatabaseConnection, @unchecked Sendable 
         let result = sqlite3_exec(db, sql, nil, nil, nil)
         guard result == SQLITE_OK else {
             let error = String(cString: sqlite3_errmsg(db))
-            throw DatabaseConnectionError.executionFailed(sql: sql, error: error)
+            let diagnostic = DatabaseConnectionError.safeSQLDiagnostic(sql: sql, error: error)
+            throw DatabaseConnectionError.executionFailed(sql: diagnostic.sql, error: diagnostic.error)
         }
 
         return Int(sqlite3_changes(db))
