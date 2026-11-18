@@ -1446,10 +1446,22 @@ public actor FrameProcessingQueue {
                 snapshot = nil
                 axUnavailableSinceMetric += 1
             }
+            var historicalMetadata = frameRef.metadata
+            do { historicalMetadata.ocrRegions = try await databaseManager.getFrameOCRRegions(frameID: frameID) }
+            catch { historicalMetadata.ocrRegions = nil }
             let historicalFrame = CapturedFrame(timestamp: capturedFrame.timestamp, imageData: capturedFrame.imageData,
                 width: capturedFrame.width, height: capturedFrame.height, bytesPerRow: capturedFrame.bytesPerRow,
-                metadata: frameRef.metadata, accessibilitySnapshot: snapshot)
-            extractedText = try await processing.extractText(from: historicalFrame)
+                metadata: historicalMetadata, accessibilitySnapshot: snapshot)
+            do {
+                extractedText = try await processing.extractText(from: historicalFrame)
+            } catch {
+                windowOCRFailures += 1
+                throw error
+            }
+            windowOCRFrames += 1
+            windowOCRLayoutRegions += historicalMetadata.ocrRegions?.count ?? 0
+            if historicalMetadata.ocrRegions == nil { windowOCRFallbackFrames += 1 }
+            windowOCRMilliseconds += (CFAbsoluteTimeGetCurrent() - ocrStartTime) * 1000
             let postExtractSnapshot = await MemoryLedger.snapshot(waitForPendingUpdates: true)
             let extractResidualBytes = max(
                 0,
@@ -3065,10 +3077,34 @@ public actor FrameProcessingQueue {
         }
     }
 
+    private var windowOCRFailures = 0
+    private var windowOCRFrames = 0
+    private var windowOCRLayoutRegions = 0
+    private var windowOCRFallbackFrames = 0
+    private var windowOCRMilliseconds: Double = 0
+
+    private func flushWindowOCRMetrics() async {
+        guard windowOCRFrames + windowOCRFailures > 0 else { return }
+        let frames = windowOCRFrames, regions = windowOCRLayoutRegions, fallback = windowOCRFallbackFrames
+        let milliseconds = windowOCRMilliseconds
+        let failures = windowOCRFailures
+        windowOCRFailures = 0
+        windowOCRFrames = 0; windowOCRLayoutRegions = 0; windowOCRFallbackFrames = 0; windowOCRMilliseconds = 0
+        do {
+            let metadata = "{\"frames\":\(frames),\"failures\":\(failures),\"layoutRegions\":\(regions),\"fallbackFrames\":\(fallback),\"processingMilliseconds\":\(milliseconds)}"
+            try await databaseManager.recordMetricEvent(metricType: .windowOCR, metadata: metadata)
+        } catch {
+            windowOCRFailures += failures
+            windowOCRFrames += frames; windowOCRLayoutRegions += regions
+            windowOCRFallbackFrames += fallback; windowOCRMilliseconds += milliseconds
+        }
+    }
+
     private var axUnavailableSinceMetric = 0
     private var axProcessedSinceMetric = 0
     private var lastAXMetricAt = Date()
     private func flushAccessibilityMetrics() async {
+        await flushWindowOCRMetrics()
         guard axProcessedSinceMetric > 0 else { return }
         let count = axProcessedSinceMetric
         let unavailable = axUnavailableSinceMetric

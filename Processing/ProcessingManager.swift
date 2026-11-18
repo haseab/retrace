@@ -40,6 +40,8 @@ public actor ProcessingManager: ProcessingProtocol {
     // Region-based OCR state
     private var fullFrameCache: FullFrameOCRCache?
     private var previousFrame: CapturedFrame?
+    private var extractingFrame = false
+    private var extractionWaiters: [CheckedContinuation<Void, Never>] = []
     private var useRegionBasedOCR: Bool = true
 
 
@@ -70,6 +72,11 @@ public actor ProcessingManager: ProcessingProtocol {
 
 
     public func extractText(from frame: CapturedFrame) async throws -> ExtractedText {
+        // Actor methods reenter across OCR awaits. Keep the previous pixels and OCR cache
+        // in one ordered frame transaction while requests within a frame can run concurrently.
+        await beginFrameExtraction()
+        defer { endFrameExtraction() }
+        try Task.checkCancellation()
         let instrumentation = await ProcessingExtractRequestInstrumentation.begin()
         let startTime = Date()
         do {
@@ -106,6 +113,16 @@ public actor ProcessingManager: ProcessingProtocol {
             await instrumentation.finish()
             throw error
         }
+    }
+
+    private func beginFrameExtraction() async {
+        if !extractingFrame { extractingFrame = true; return }
+        await withCheckedContinuation { extractionWaiters.append($0) }
+    }
+
+    private func endFrameExtraction() {
+        if extractionWaiters.isEmpty { extractingFrame = false }
+        else { extractionWaiters.removeFirst().resume() }
     }
 
     private func extractOCRRegions(
@@ -305,15 +322,14 @@ public actor ProcessingManager: ProcessingProtocol {
     /// Enable or disable region-based OCR
     /// When enabled, only changed regions are OCR'd for energy efficiency
     /// Tiles are used for change detection only - bounding boxes remain paragraph-level
-    public func setRegionBasedOCR(enabled: Bool) {
+    public func setRegionBasedOCR(enabled: Bool) async {
+        await beginFrameExtraction()
+        defer { endFrameExtraction() }
         useRegionBasedOCR = enabled
         if !enabled {
-            // Clear cache and previous frame when disabled
-            Task {
-                await fullFrameCache?.invalidateAll()
-                await self.updateMemoryLedger()
-            }
+            await fullFrameCache?.invalidateAll()
             previousFrame = nil
+            await updateMemoryLedger()
         }
     }
 
@@ -324,6 +340,8 @@ public actor ProcessingManager: ProcessingProtocol {
 
     /// Invalidate the OCR cache (useful when significant UI changes occur)
     public func invalidateTileCache() async {
+        await beginFrameExtraction()
+        defer { endFrameExtraction() }
         await fullFrameCache?.invalidateAll()
         previousFrame = nil
         await updateMemoryLedger()

@@ -23,6 +23,9 @@ public protocol DatabaseProtocol: Actor {
     func insertFrame(_ frame: FrameReference) async throws -> Int64
     func insertFrame(_ frame: FrameReference, accessibilitySnapshot: AccessibilitySnapshot?) async throws -> Int64
 
+    /// Saved capture-time geometry for OCR; nil for older/imported frames.
+    func getFrameOCRRegions(frameID: Int64) async throws -> [CGRect]?
+
     /// Get a frame by ID
     func getFrame(id: FrameID) async throws -> FrameReference?
 
@@ -478,6 +481,7 @@ public struct OCRNodeWithText: Identifiable, Equatable, Sendable {
 
 // Compatibility for alternate data sources which do not record native screenshots.
 public extension DatabaseProtocol {
+    func getFrameOCRRegions(frameID: Int64) async throws -> [CGRect]? { nil }
     func insertFrame(_ frame: FrameReference, accessibilitySnapshot: AccessibilitySnapshot?) async throws -> Int64 {
         try await insertFrame(frame)
     }

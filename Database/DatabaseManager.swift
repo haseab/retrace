@@ -470,6 +470,7 @@ public actor DatabaseManager: DatabaseProtocol {
         let migrationRunner = MigrationRunner(db: db!)
         try await migrationRunner.runMigrations()
         try AccessibilitySnapshotQueries.ensureSchema(db: db!)
+        try FrameOCRRegionQueries.ensureSchema(db: db!)
         Log.debug("[DatabaseManager] Migrations complete", category: .database)
 
         try FrameQueries.ensureInPageURLSchema(db: db!)
@@ -612,6 +613,7 @@ public actor DatabaseManager: DatabaseProtocol {
             do {
                 let id = try FrameQueries.insert(db: db, frame: frame)
                 try AccessibilitySnapshotQueries.insert(db: db, frameID: id, snapshot: accessibilitySnapshot)
+                try FrameOCRRegionQueries.insert(db: db, frameID: id, regions: frame.metadata.ocrRegions)
                 try AccessibilitySnapshotQueries.execute(db, "COMMIT;")
                 return id
             } catch {
@@ -630,6 +632,12 @@ public actor DatabaseManager: DatabaseProtocol {
                 throw DatabaseError.queryFailed(query: sql, underlying: "Pending OCR lookup failed")
             }
             return try SQLiteReadStep.next(statement) == SQLITE_ROW
+        }
+    }
+
+    public func getFrameOCRRegions(frameID: Int64) async throws -> [CGRect]? {
+        try withTracedDatabaseOperation("get_frame_ocr_regions") { db in
+            try FrameOCRRegionQueries.load(db: db, frameID: frameID)
         }
     }
 
