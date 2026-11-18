@@ -423,3 +423,7 @@ When checking whether a frame is unrecoverable, a failed video-row lookup must n
 Capture-time AX: `Accessibility/AccessibilityOCRCorrector.swift` corrects OCR tokens using saved screenshot references, preserving geometry and reading order without appending AX-only text. `Tests/AccessibilityCorrectionTests.swift` covers actual observed Vision errors, numeric corrections and ambiguity/location rejection. ProcessingManager must never sample live AX while processing historical frames. Correction runs before phrase protection, indexing and video rewriting.
 
 `Tests/AccessibilityVisionIntegrationTests.swift` rasterizes the sanitized TextEdit `Tests/Fixtures/AXSmallText.rtf` fixture with CoreText and runs real production Vision/ProcessingManager extraction, checking captured metadata, geometry preservation and no AX-only completion. Tests require the full XCTest toolchain and access to macOS Vision services.
+
+### Rewrite test isolation
+
+`FrameProcessingQueue` defaults to the Keychain-backed master-key provider. Rewrite tests inject a fixture key or an explicit missing key; never alter the user's Keychain to arrange a test. Preserve the distinction between scrambled rewrites (require a key) and permanent-only rewrites (do not). Async rewrite waits must have deadlines that return even when the underlying continuation ignores cancellation, and test storage gates must be released during teardown.
