@@ -74,10 +74,10 @@ let package = Package(
         ),
         .testTarget(
             name: "DatabaseTests",
-            // Storage/Processing/Search are imported by AsyncQueuePipelineTests. Undeclared,
-            // a cold build races and fails with "no such module 'Processing'" -- it only ever
-            // worked because another target happened to build them first.
-            dependencies: ["Database", "Shared", "Storage", "Processing", "Search"],
+            dependencies: [
+                "Database", "Shared", "Storage", "Processing", "Search",
+                .product(name: "SQLCipher", package: "swift-sqlcipher")
+            ],
             path: "Database/Tests",
             exclude: [
                 "_future"  // Release 2+ tests
@@ -145,7 +145,10 @@ let package = Package(
         ),
         .testTarget(
             name: "ProcessingTests",
-            dependencies: ["Processing", "Shared", "Database", "Storage"],
+            dependencies: [
+                "Processing", "Shared", "Database", "Storage",
+                .product(name: "SQLCipher", package: "swift-sqlcipher")
+            ],
             path: "Processing/Tests",
             resources: [.copy("Fixtures")]
             // ⚠️ RELEASE 2 ONLY - Whisper cSettings and linkerSettings removed for Release 1
@@ -214,7 +217,8 @@ let package = Package(
                 "App",
                 "Database",
                 "Shared",
-                "Storage"
+                "Storage",
+                .product(name: "SQLCipher", package: "swift-sqlcipher")
             ],
             path: "App/Tests"
             // ⚠️ RELEASE 2 ONLY - Whisper cSettings and linkerSettings removed for Release 1
