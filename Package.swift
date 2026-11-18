@@ -74,7 +74,10 @@ let package = Package(
         ),
         .testTarget(
             name: "DatabaseTests",
-            dependencies: ["Database", "Shared"],
+            dependencies: [
+                "Database", "Shared", "Storage", "Processing", "Search",
+                .product(name: "SQLCipher", package: "swift-sqlcipher")
+            ],
             path: "Database/Tests",
             exclude: [
                 "_future"  // Release 2+ tests
@@ -142,7 +145,10 @@ let package = Package(
         ),
         .testTarget(
             name: "ProcessingTests",
-            dependencies: ["Processing", "Shared", "Database", "Storage"],
+            dependencies: [
+                "Processing", "Shared", "Database", "Storage",
+                .product(name: "SQLCipher", package: "swift-sqlcipher")
+            ],
             path: "Processing/Tests",
             resources: [.copy("Fixtures")]
             // ⚠️ RELEASE 2 ONLY - Whisper cSettings and linkerSettings removed for Release 1
@@ -210,7 +216,9 @@ let package = Package(
             dependencies: [
                 "App",
                 "Database",
-                "Shared"
+                "Shared",
+                "Storage",
+                .product(name: "SQLCipher", package: "swift-sqlcipher")
             ],
             path: "App/Tests"
             // ⚠️ RELEASE 2 ONLY - Whisper cSettings and linkerSettings removed for Release 1
@@ -285,7 +293,7 @@ let package = Package(
         ),
         .testTarget(
             name: "RetraceTests",
-            dependencies: ["Retrace", "CrashRecoverySupport", "Shared", "App"],
+            dependencies: ["Retrace", "CrashRecoverySupport", "Shared", "App", "Processing"],
             path: "UI/Tests"
             // ⚠️ RELEASE 2 ONLY - Whisper cSettings and linkerSettings removed for Release 1
         ),
