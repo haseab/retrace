@@ -52,7 +52,7 @@ public class LaunchOnLoginReminderManager: ObservableObject {
     private static let lastCountedTimestampKey = "retraceLastCountedTimestamp"
 
     /// UserDefaults suite for app settings
-    private static let settingsStore = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+    private static let settingsStore = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
 
     // MARK: - Private State
 

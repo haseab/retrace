@@ -153,7 +153,7 @@ public enum SQLiteReadOnlyConnectionFactory {
     }
 
     private static func loadRetraceDatabaseKeyIfEnabled() throws -> Data? {
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
         let encryptionEnabled = defaults.object(forKey: "encryptionEnabled") as? Bool ?? false
         guard encryptionEnabled else {
             return nil

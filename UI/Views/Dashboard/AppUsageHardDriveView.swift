@@ -7,6 +7,7 @@ struct AppUsageHardDriveView: View {
     let apps: [AppUsageData]
     let totalTime: TimeInterval
     var onAppTapped: ((AppUsageData) -> Void)? = nil
+    var onUsageAction: ((DashboardUsageTarget, DashboardUsageAction) -> Void)? = nil
     @State private var hoveredApp: AppUsageData? = nil
     @State private var hoverDebounceTask: DispatchWorkItem? = nil
 
@@ -142,6 +143,9 @@ struct AppUsageHardDriveView: View {
         }
         .onTapGesture {
             onAppTapped?(item.app)
+        }
+        .contextMenu {
+            DashboardUsageMenu(target: .app(item.app), onAction: onUsageAction)
         }
     }
 

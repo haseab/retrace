@@ -1609,6 +1609,27 @@ final class DatabaseManagerTests: XCTestCase {
         }
     }
 
+    func testPermanentMarkerFlowsIntoRewritePlanAndDoesNotRequireMasterKeyRecovery() async throws {
+        let frameID = try await insertTestFrame(browserURL: nil)
+        try await database.insertNodes(frameID: frameID,
+            nodes: [(textOffset: 0, textLength: 6, bounds: CGRect(x: 10,y: 10,width: 120,height: 24),windowIndex: nil)],
+            encryptedTexts: [0: PhraseRedactionMode.permanentTextMarker],frameWidth: 1_000,frameHeight: 1_000)
+        try await database.updateFrameProcessingStatus(frameID: frameID.value, status: 5, rewritePurpose: "redaction")
+        let videoIDs = try await database.getVideoIDsWithPendingNodeRedactions()
+        let videoID = try XCTUnwrap(videoIDs.first)
+        let jobs = try await database.getPendingNodeRedactionJobs(videoID: videoID)
+        XCTAssertEqual(jobs.first?.mode, .permanent)
+        let optionalPlan = try await database.buildVideoRewritePlan(videoID: videoID)
+        let plan = try XCTUnwrap(optionalPlan)
+        XCTAssertFalse(plan.segmentRewritePlan.requiresRedactionSecret)
+        let needsRecovery = try await database.hasProtectedPhraseRedactionData()
+        let pendingScramble = try await database.hasPendingScrambleRedactions()
+        XCTAssertFalse(needsRecovery)
+        XCTAssertFalse(pendingScramble)
+        let nodes = try await database.getOCRNodesWithText(frameID: frameID)
+        XCTAssertTrue(nodes.first?.isPermanentlyRedacted ?? false)
+    }
+
     func testHasProtectedPhraseRedactionDataReturnsTrueWhenEncryptedNodesExist() async throws {
         let frameID = try await insertTestFrame(browserURL: nil)
         let hasProtectedDataBeforeInsert = try await database.hasProtectedPhraseRedactionData()

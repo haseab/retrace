@@ -19,6 +19,13 @@ final class TimelineKeyboardShortcutDecisionTests: XCTestCase {
         super.tearDown()
     }
 
+    func testFrameTextScanShortcutRequiresCommandShiftO() {
+        XCTAssertTrue(TimelineWindowController.isFrameTextScanShortcut(keyCode: 31, modifiers: [.command, .shift]))
+        XCTAssertFalse(TimelineWindowController.isFrameTextScanShortcut(keyCode: 31, modifiers: [.command]))
+        XCTAssertFalse(TimelineWindowController.isFrameTextScanShortcut(keyCode: 31, modifiers: [.command, .shift, .option]))
+        XCTAssertFalse(TimelineWindowController.isFrameTextScanShortcut(keyCode: 15, modifiers: [.command, .shift]))
+    }
+
     func testShouldHandleKeyboardShortcutsWhenTimelineVisibleAndFrontmost() {
         XCTAssertTrue(
             TimelineWindowController.shouldHandleTimelineKeyboardShortcuts(

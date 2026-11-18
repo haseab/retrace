@@ -109,7 +109,7 @@ extension DatabaseConfig {
         if let formatter = dateFormatter {
             // TEXT binding (Rewind)
             let iso = formatter.string(from: date)
-            sqlite3_bind_text(statement, index, (iso as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(statement, index, (iso as NSString).utf8String, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
         } else {
             // INTEGER binding (Retrace)
             let ms = Int64(date.timeIntervalSince1970 * 1000)

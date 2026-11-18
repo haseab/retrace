@@ -1,11 +1,14 @@
 import Foundation
-import SQLite3
+import SQLCipher
 import Shared
 
 // MARK: - Daily Metrics Queries
 
-/// SQL queries for daily_metrics table
-/// Tracks engagement events (timeline opens, searches, text copies) as individual rows
+/// SQL queries for daily_metrics table.
+/// Tracks engagement events (timeline opens, searches, text copies) as individual rows.
+/// Privacy boundary: this table is local, on-device user analytics for Retrace features.
+/// It is not a third-party/developer analytics pipeline; data only leaves the device when
+/// the user explicitly exports/shares diagnostics.
 /// Owner: DATABASE agent
 public enum DailyMetricsQueries {
 
@@ -29,6 +32,8 @@ public enum DailyMetricsQueries {
 
     /// Standard metric type identifiers
     public enum MetricType: String, Sendable {
+        // metadata: JSON {phase: processed, frames: Int, unavailable: Int}; batched once per minute and stop; no captured text or URLs.
+        case accessibilityCorrection = "accessibility_correction"
         case timelineOpens = "timeline_opens"
         case searches = "searches"
         case textCopies = "text_copies"
@@ -43,6 +48,8 @@ public enum DailyMetricsQueries {
         case scrubDistance = "scrub_distance"  // metadata: distance in pixels per session
         case searchDialogOpens = "search_dialog_opens"
         case timelineAutoDismissed = "timeline_auto_dismissed"  // metadata: JSON {trigger: "app_activation", activatedBundleID?}
+        // metadata: JSON {source: button|keyboard, outcome: started|succeeded|no_text|failed|protected, live: Bool}. No recognized text.
+        case timelineTextScan = "timeline_text_scan"
         case ocrReprocessRequests = "ocr_reprocess_requests"
         case arrowKeyNavigation = "arrow_key_navigation"  // metadata: "left" or "right"
         case shiftDragZoomRegion = "shift_drag_zoom_region"  // metadata: JSON {region, screenSize}
@@ -55,6 +62,9 @@ public enum DailyMetricsQueries {
         case dateSearchOutcome = "date_search_outcome"
         // Timeline tagging/comments/playback metrics
         case segmentHide = "segment_hide"
+        // metadata: JSON {source, action: hide|delete, phase: prepared|submitted|succeeded|failed,
+        // segmentCount, frameCount, rangeStartMs, rangeEndMs}. No titles or URLs.
+        case dashboardUsageAction = "dashboard_usage_action"
         case segmentUnhide = "segment_unhide"
         case tagSubmenuOpen = "tag_submenu_open"
         case tagToggleOnBlock = "tag_toggle_on_block"
@@ -83,6 +93,7 @@ public enum DailyMetricsQueries {
         case dockIconVisibilityToggle = "dock_icon_visibility_toggle"  // metadata: JSON {enabled, source}
         case redactionRulesUpdated = "redaction_rules_updated"
         case masterKeyFlow = "master_key_flow"  // metadata: JSON {action, source, ...}
+        case phraseLevelRedactionModeUpdated = "phrase_level_redaction_mode_updated" // metadata: JSON {mode: scramble|permanent, source}
         case phraseLevelRedactionRulesUpdated = "phrase_level_redaction_rules_updated"
         case phraseLevelRedactionReveal = "phrase_level_redaction_reveal"
         case phraseLevelRedactionQueuedHover = "phrase_level_redaction_queued_hover"  // metadata: JSON {nodeID, frameID, processingStatus}
@@ -98,6 +109,9 @@ public enum DailyMetricsQueries {
         case mouseClickCaptureToggle = "mouse_click_capture_toggle"
         case captureIntervalUpdated = "capture_interval_updated"  // metadata: JSON {seconds, mode, source}
         case videoQualityUpdated = "video_quality_updated"
+        // JSON {action, outcome, source, conferenceKind?}; excludes call IDs, titles and URLs.
+        // Capture outcomes are recorded on transitions, not on every frame.
+        case conferencePrivacy = "conference_privacy"
         case inPageURLPermissionProbe = "in_page_url_permission_probe"
         case inPageURLVerification = "in_page_url_verification"
         case inPageURLHover = "in_page_url_hover"  // metadata: JSON {url, linkText, nodeID}
@@ -108,6 +122,10 @@ public enum DailyMetricsQueries {
         case feedbackReportExport = "feedback_report_export"  // metadata: JSON {outcome, source, feedbackType, includeLogs, includeScreenshot, exportedFileCount}
         case watchdogCrashBannerAction = "watchdog_crash_banner_action"  // metadata: JSON {action, fileName, reportAgeSeconds}
         case walFailureBannerAction = "wal_failure_banner_action"  // metadata: JSON {action, fileName, reportAgeSeconds}
+        // One aggregate per finalized recording segment. storedBytes includes record headers;
+        // rawBytes counts the original pixel bytes, excluding metadata sidecars and ID maps.
+        // metadata: JSON {codec, outcome, frameCount, compressedFrameCount, rawBytes, storedBytes, compressionMilliseconds}
+        case walCompression = "wal_compression"
         case unexpectedRecordingStopAction = "unexpected_recording_stop_action"  // metadata: JSON {action, reason, ...}
         case storageHealthBannerAction = "storage_health_banner_action"  // metadata: JSON {action, severity, availableGB, shouldStop}
         case crashRecoveryApprovalBannerAction = "crash_recovery_approval_banner_action"  // metadata: JSON {action, status}
@@ -179,10 +197,11 @@ public enum DailyMetricsQueries {
         db: OpaquePointer,
         metricType: MetricType,
         from startDate: Date,
-        to endDate: Date
+        to endDate: Date,
+        preserveTimeBounds: Bool = false
     ) throws -> [(date: Date, value: Int64)] {
-        let startTimestamp = startOfDay(startDate)
-        let endTimestamp = endOfDay(endDate)
+        let startTimestamp = preserveTimeBounds ? Int64(startDate.timeIntervalSince1970 * 1000) : startOfDay(startDate)
+        let endTimestamp = preserveTimeBounds ? Int64(endDate.timeIntervalSince1970 * 1000) : endOfDay(endDate)
 
         let sql = """
             SELECT

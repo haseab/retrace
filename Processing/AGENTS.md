@@ -27,12 +27,15 @@ Processing/
 │   ├── TileGridConfig.swift       # Tile grid tuning
 │   └── TileOCRProcessor.swift     # Tile OCR processing helpers
 ├── Accessibility/
+│   ├── AccessibilityOCRCorrector.swift # Capture-time AX token correction, including Unicode combining marks
 │   ├── AccessibilityService.swift  # AccessibilityProtocol implementation
 │   └── TextElementFilter.swift     # Filter relevant text elements
 │
 ├── TextMerger/
 │   └── TextMerger.swift            # Combine OCR + AX results
 └── Tests/
+    ├── AccessibilityVisionIntegrationTests.swift # Real Vision fixture and Unicode normalization regressions
+    ├── Fixtures/AXSmallText.rtf                 # Sanitized document used by Vision integration checks
     ├── ExtractRequestInstrumentationTests.swift # Region tail aggregation and coordinator helper coverage
     ├── InPageURLMetadataResolutionTests.swift # In-page URL metadata retry and rewrite scheduling regression coverage
     ├── OCRMemoryBackpressurePolicyTests.swift # OCR memory backpressure threshold/default coverage
@@ -404,3 +407,23 @@ throw ProcessingError.imageConversionFailed
 5. Write tests with sample images
 
 Start with Vision OCR since it's the core functionality, then add Accessibility support.
+
+## Keyword redaction processing
+
+Read `PhraseRedactionMode` once when protecting OCR output and store the mode per node. Permanent matches retain masked text and only the permanent marker, never encrypted originals. Scramble matches without a master key must fail before search indexing. Rewrite scheduling uses each stored target mode; permanent-only plans run without a key. Use the shared keyword settings parser (including legacy comma/newline rules). Purge stale timeline stills/search thumbnails in both normal commit and committed startup recovery after a successful video rewrite, before marking it complete, and publish `PhraseRedactionMode.didFinishNotification` to invalidate UI image caches.
+
+Recovery scanning must wait for all active rewrites and block new rewrite reservations until the scan finishes. Recheck the scanning gate after database awaits before reserving an encoder.
+
+### Batch enqueue
+
+`FrameProcessingQueue.enqueueBatch` passes the whole ID list to `DatabaseManager.enqueueFramesForProcessing` in one await. Increase `currentQueueDepth` only after the database commits the whole batch; empty batches are no-ops and failures add nothing. `RewriteRetryPolicyTests.testEnqueueBatchIsAtomicAndUsesDatabaseBatch` exercises this wiring against migrated SQLite. This is maintenance of an existing action; no new daily metric is needed.
+
+When checking whether a frame is unrecoverable, a failed video-row lookup must not authorize deletion. Only a successful missing-row result establishes that the video row is absent. `RewriteRetryPolicyTests.testDatabaseReadFailureDoesNotAuthorizeFrameDeletion` covers a denied read against real SQLite.
+
+Capture-time AX: `Accessibility/AccessibilityOCRCorrector.swift` corrects OCR tokens using saved screenshot references, preserving geometry and reading order without appending AX-only text. `Tests/AccessibilityCorrectionTests.swift` covers actual observed Vision errors, numeric corrections and ambiguity/location rejection. ProcessingManager must never sample live AX while processing historical frames. Correction runs before phrase protection, indexing and video rewriting.
+
+`Tests/AccessibilityVisionIntegrationTests.swift` rasterizes the sanitized TextEdit `Tests/Fixtures/AXSmallText.rtf` fixture with CoreText and runs real production Vision/ProcessingManager extraction, checking captured metadata, geometry preservation and no AX-only completion. Tests require the full XCTest toolchain and access to macOS Vision services.
+
+### Rewrite test isolation
+
+`FrameProcessingQueue` defaults to the Keychain-backed master-key provider. Rewrite tests inject a fixture key or an explicit missing key; never alter the user's Keychain to arrange a test. Preserve the distinction between scrambled rewrites (require a key) and permanent-only rewrites (do not). Async rewrite waits must have deadlines that return even when the underlying continuation ignores cancellation, and test storage gates must be released during teardown.

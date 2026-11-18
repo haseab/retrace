@@ -128,7 +128,7 @@ public class MilestoneCelebrationManager: ObservableObject {
     // MARK: - Configuration
 
     /// UserDefaults suite for app settings
-    private static let settingsStore = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+    private static let settingsStore = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
 
     /// Key for storing cumulative screen time (survives database resets)
     private static let cumulativeScreenTimeKey = "retraceCumulativeScreenTimeSeconds"
@@ -150,7 +150,7 @@ public class MilestoneCelebrationManager: ObservableObject {
     /// Get the current color theme (respects user's preference)
     /// Marked nonisolated because it only reads from thread-safe UserDefaults
     public nonisolated static func getCurrentTheme() -> ColorTheme {
-        let settingsStore = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let settingsStore = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
         #if DEBUG
         if let rawValue = settingsStore.string(forKey: "retraceDebugThemeOverride"),
            let theme = ColorTheme(rawValue: rawValue) {
@@ -167,7 +167,7 @@ public class MilestoneCelebrationManager: ObservableObject {
 
     /// Get the user's color theme preference
     public nonisolated static func getColorThemePreference() -> ColorTheme {
-        let settingsStore = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let settingsStore = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
         if let rawValue = settingsStore.string(forKey: "retraceColorThemePreference"),
            let theme = ColorTheme(rawValue: rawValue) {
             return theme
@@ -177,7 +177,7 @@ public class MilestoneCelebrationManager: ObservableObject {
 
     /// Set the user's color theme preference
     public nonisolated static func setColorThemePreference(_ theme: ColorTheme) {
-        let settingsStore = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let settingsStore = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
         settingsStore.set(theme.rawValue, forKey: "retraceColorThemePreference")
         // Post notification so views can update
         DispatchQueue.main.async {
@@ -189,7 +189,7 @@ public class MilestoneCelebrationManager: ObservableObject {
     /// Set the debug theme override (shared across all views)
     /// Marked nonisolated because it only writes to thread-safe UserDefaults
     public nonisolated static func setDebugThemeOverride(_ theme: ColorTheme?) {
-        let settingsStore = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let settingsStore = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
         if let theme = theme {
             settingsStore.set(theme.rawValue, forKey: "retraceDebugThemeOverride")
         } else {
@@ -199,7 +199,7 @@ public class MilestoneCelebrationManager: ObservableObject {
 
     /// Get the debug theme override
     public nonisolated static func getDebugThemeOverride() -> ColorTheme? {
-        let settingsStore = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let settingsStore = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
         guard let rawValue = settingsStore.string(forKey: "retraceDebugThemeOverride") else {
             return nil
         }

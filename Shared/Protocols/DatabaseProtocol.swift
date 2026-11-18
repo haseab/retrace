@@ -21,6 +21,7 @@ public protocol DatabaseProtocol: Actor {
 
     /// Insert a new frame reference and return the auto-generated ID
     func insertFrame(_ frame: FrameReference) async throws -> Int64
+    func insertFrame(_ frame: FrameReference, accessibilitySnapshot: AccessibilitySnapshot?) async throws -> Int64
 
     /// Get a frame by ID
     func getFrame(id: FrameID) async throws -> FrameReference?
@@ -455,6 +456,10 @@ public struct OCRNodeWithText: Identifiable, Equatable, Sendable {
         self.isRedacted = isRedacted
     }
 
+    public var isPermanentlyRedacted: Bool {
+        isRedacted && PhraseRedactionMode(storedText: encryptedText) == .permanent
+    }
+
     public func replacingText(_ text: String) -> OCRNodeWithText {
         OCRNodeWithText(
             id: id,
@@ -468,5 +473,12 @@ public struct OCRNodeWithText: Identifiable, Equatable, Sendable {
             encryptedText: encryptedText,
             isRedacted: isRedacted
         )
+    }
+}
+
+// Compatibility for alternate data sources which do not record native screenshots.
+public extension DatabaseProtocol {
+    func insertFrame(_ frame: FrameReference, accessibilitySnapshot: AccessibilitySnapshot?) async throws -> Int64 {
+        try await insertFrame(frame)
     }
 }

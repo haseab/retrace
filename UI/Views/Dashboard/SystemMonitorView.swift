@@ -1940,7 +1940,7 @@ class SystemMonitorViewModel: ObservableObject {
     }
 
     private func updateStats() async {
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
 
         // Get queue statistics
         if let stats = await dataProvider.getQueueStatistics() {

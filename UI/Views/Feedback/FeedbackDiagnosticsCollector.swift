@@ -78,6 +78,7 @@ extension FeedbackService {
     public func collectDiagnosticsAsync() async -> DiagnosticInfo {
         await Task.detached(priority: .userInitiated) { [self] in
             let baseFields = collectBaseDiagnosticsFields()
+            await Log.flush()
             let logSnapshot = Self.collectFeedbackLogSnapshotWithErrors(
                 rawLimit: Self.diagnosticsLogLimit,
                 errorLimit: 50
@@ -100,6 +101,7 @@ extension FeedbackService {
     public func collectDiagnosticsAsync(with stats: DiagnosticInfo.DatabaseStats) async -> DiagnosticInfo {
         await Task.detached(priority: .userInitiated) { [self] in
             let baseFields = collectBaseDiagnosticsFields()
+            await Log.flush()
             let logSnapshot = Self.collectFeedbackLogSnapshotWithErrors(
                 rawLimit: Self.diagnosticsLogLimit,
                 errorLimit: 50
@@ -141,6 +143,7 @@ extension FeedbackService {
         )
 
         let rawLogBudget = Self.submissionRawLogBudget(memorySummaryCount: memorySummaryLogs.count)
+        await Log.flush()
         let logSnapshot = Self.collectFeedbackLogSnapshotWithErrors(
             rawLimit: rawLogBudget,
             errorLimit: 50
@@ -159,6 +162,7 @@ extension FeedbackService {
     public func collectDiagnosticsQuickAsync(with stats: DiagnosticInfo.DatabaseStats) async -> DiagnosticInfo {
         await Task.detached(priority: .userInitiated) { [self] in
             let baseFields = collectBaseDiagnosticsFields()
+            await Log.flush()
             let logSnapshot = Self.collectFeedbackLogSnapshotWithErrors(
                 rawLimit: Self.diagnosticsLogLimit,
                 errorLimit: 20
@@ -297,7 +301,7 @@ extension FeedbackService {
     /// For list-type settings (excluded apps, OCR filtered apps), only the *count* is reported.
     /// Path settings are reduced to a boolean "is custom path set?" flag.
     private func collectSanitizedSettingsSnapshot() -> [String: String] {
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
 
         var settings: [String: String] = [:]
 
