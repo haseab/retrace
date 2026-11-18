@@ -636,8 +636,41 @@ public actor CGWindowListCapture {
         // Bracket the desktop capture before AX discovery or face processing can
         // delay the second source snapshot. Changed content/geometry is untrusted.
         let validatedWindowSources = validateConferenceWindowSources(sourcesBeforeCapture)
-        // Snapshot immediately after capture, before potentially slow face processing.
-        // Skip protected frames; AX must never recover content deliberately masked out.
+        // Best-effort capture-time OCR geometry. No AX calls, text or per-window captures.
+        let geometryStart = CFAbsoluteTimeGetCurrent()
+        let ocrRegions = (CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements],
+            kCGNullWindowID) as? [[String: Any]]).flatMap {
+                let displayBounds = CGDisplayBounds(displayID)
+                var utilityByPID: [pid_t: Bool] = [:]
+                var ignoredWindowIDs = Set<CGWindowID>()
+                for window in $0 {
+                    guard let pid = window[kCGWindowOwnerPID as String] as? pid_t,
+                          let id = window[kCGWindowNumber as String] as? CGWindowID,
+                          pid != ProcessInfo.processInfo.processIdentifier,
+                          pid != exclusionResult.visibleWindowContext?.ownerPID else { continue }
+                    let isUtility = utilityByPID[pid] ?? {
+                        let app = NSRunningApplication(processIdentifier: pid)
+                        return app?.activationPolicy != .regular
+                    }()
+                    utilityByPID[pid] = isUtility
+                    guard isUtility,
+                          let dict = window[kCGWindowBounds as String] as? [String: Any],
+                          let bounds = CGRect(dictionaryRepresentation: dict as CFDictionary) else { continue }
+                    let clipped = bounds.intersection(displayBounds)
+                    // Background accessory/system apps can publish a screen-sized,
+                    // nearly empty surface. It is not another application document.
+                    if !clipped.isNull,
+                       clipped.width * clipped.height >= displayBounds.width * displayBounds.height * 0.9 {
+                        ignoredWindowIDs.insert(id)
+                    }
+                }
+                return WindowOCRGeometry.normalizedRegions(windows: $0, displayBounds: displayBounds,
+                    imageSize: CGSize(width: captureResult.image.width, height: captureResult.image.height),
+                    excludedWindowIDs: excludedIDs, ignoredWindowIDs: ignoredWindowIDs)
+            }
+        Log.recordLatency("capture.ocr_geometry", valueMs: (CFAbsoluteTimeGetCurrent() - geometryStart) * 1000,
+            category: .capture, summaryEvery: 100)
+        // AX must never recover content deliberately masked out.
         let axContext = exclusionResult.visibleWindowContext
         let axSnapshot = axContext.map { !excludedIDs.contains($0.windowID) && !exclusionResult.redactedWindowIDs.contains($0.windowID) } == true
             ? AccessibilitySnapshotCollector.collect(
@@ -717,7 +750,8 @@ public actor CGWindowListCapture {
                 windowName: frameMetadataWindowName,
                 browserURL: frameMetadataBrowserURL,
                 redactionReason: redactionSummary?.reason,
-                displayID: UInt32(displayID)
+                displayID: UInt32(displayID),
+                ocrRegions: ocrRegions
             ),
             accessibilitySnapshot: axSnapshot
         )

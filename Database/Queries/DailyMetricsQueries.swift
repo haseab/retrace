@@ -32,6 +32,10 @@ public enum DailyMetricsQueries {
 
     /// Standard metric type identifiers
     public enum MetricType: String, Sendable {
+        // Count-only OCR processing aggregates; geometry and recognized text are never included.
+        // metadata: {frames, failures, layoutRegions, fallbackFrames, processingMilliseconds}
+        case windowOCR = "window_ocr"
+
         // metadata: JSON {phase: processed, frames: Int, unavailable: Int}; batched once per minute and stop; no captured text or URLs.
         case accessibilityCorrection = "accessibility_correction"
         case timelineOpens = "timeline_opens"

@@ -78,7 +78,8 @@ retrace/
 │   ├── MasterKeyManager.swift   # Keychain-backed master key creation + recovery phrase export
 │   ├── ReversibleOCRScrambler.swift # Deterministic reversible OCR patch scrambling + text protection
 │   ├── Models/                  # Data types used across modules
-│   │   ├── Frame.swift          # FrameID, CapturedFrame, VideoSegment
+│   │   ├── Frame.swift          # FrameID, CapturedFrame, VideoSegment, optional normalized OCR geometry
+│   │   ├── AccessibilitySnapshot.swift # Bounded saved capture-time OCR correction references
 │   │   ├── Text.swift           # ExtractedText, OCRTextRegion
 │   │   ├── TextRegion.swift     # OCR text region types
 │   │   ├── Search.swift         # SearchQuery, SearchResult
@@ -108,7 +109,7 @@ retrace/
 │   ├── IDMappingService.swift   # ID mapping between sources
 │   ├── Schema.swift             # Current schema definition
 │   ├── Migrations/              # Schema migration scripts
-│   ├── Queries/                 # Query implementations
+│   ├── Queries/                 # Query implementations, including FrameOCRRegionQueries.swift
 │   └── Tests/                  # Includes RetentionVideoDeletionTests (real SQLite guard/failure cases)
 │
 ├── Storage/                     # File I/O, HEVC encoding
@@ -129,7 +130,7 @@ retrace/
 │   │   ├── CaptureFrameCandidate.swift # Native-image exact-duplicate check before BGRA materialization
 │   │   └── ConferenceFaceBlurProcessor.swift # Vision face detection + irreversible conference-call face blur
 │   ├── Deduplication/           # Pixel-sampling deduplication
-│   ├── Metadata/                # AppInfoProvider, BrowserURLExtractor
+│   ├── Metadata/                # AppInfoProvider, BrowserURLExtractor, WindowOCRGeometry.swift
 │   │   ├── ConferenceCallActivityProvider.swift # Window-specific active-call accessibility controls
 │   │   └── ConferenceSessionPrivacyPolicy.swift # Conferencing-app rules + call-session consent tracking
 │   └── Tests/                  # Includes CaptureFrameCandidateTests (real screenshot pixels)
@@ -139,7 +140,7 @@ retrace/
 │   ├── ProcessingManager.swift
 │   ├── FrameProcessingQueue.swift # Async frame processing queue
 │   ├── URLExtractor.swift       # URL extraction from OCR text
-│   ├── OCR/                     # Vision framework OCR
+│   ├── OCR/                     # Vision framework OCR, including WindowOCR.swift region isolation
 │   ├── Accessibility/           # Accessibility API integration
 │   ├── TextMerger/              # Text merging utilities
 │   └── Tests/
@@ -565,3 +566,7 @@ _This file follows the AGENTS.md standard for AI agent guidance. Last updated: 2
 - Pending/active OCR across all videos takes priority over starting video rewrites; active rewrites finish normally. Correction metrics contain counts only, batched once per minute and worker stop.
 
 Bundled development runs use `AppPaths` to isolate settings, library, Keychain service, logs, preview caches and instance locks for `io.retrace.app.dev`. Never launch a dev build against hardcoded production domains. The production crash-recovery launch agent stays disarmed in the dev app; debugging one app must not manage the other app’s helper.
+
+### Window-aware OCR coordination
+
+Capture, Shared, Database and Processing jointly carry geometry-only, front-to-back application-window bounds in `FrameMetadata.ocrRegions` from image acquisition to historical OCR. No new shared type is introduced: the optional rectangles use existing CoreGraphics types. The database protocol exposes saved geometry without changing existing metadata JSON used by browser links. Each meaningfully visible normal application window creates one masked OCR crop; fully covered windows, tiny slivers, system layers and desktop fragments create no requests. Versioned saved geometry rejects the superseded fragment layout. Recognition operates solely on privacy-filtered screenshots; tests use CoreGraphics/CoreText pixels, real Vision and SQLite.

@@ -1156,7 +1156,8 @@ public actor CaptureManager: CaptureProtocol {
                 browserURL: frame.metadata.browserURL ?? frontmostMetadata.browserURL,
                 redactionReason: redactionReason,
                 captureTrigger: captureTrigger,
-                displayID: preservedDisplayID
+                displayID: preservedDisplayID,
+                ocrRegions: frame.metadata.ocrRegions
             )
         } else {
             enrichedMetadata = FrameMetadata(
@@ -1166,7 +1167,8 @@ public actor CaptureManager: CaptureProtocol {
                 browserURL: nil,
                 redactionReason: redactionReason,
                 captureTrigger: captureTrigger,
-                displayID: preservedDisplayID
+                displayID: preservedDisplayID,
+                ocrRegions: frame.metadata.ocrRegions
             )
         }
 
