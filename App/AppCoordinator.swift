@@ -24,6 +24,91 @@ public enum CaptureObservedNotification {
     public static let didObserve = Notification.Name("CaptureObserved")
 }
 
+public enum ConferenceConsentStateNotification {
+    public static let didChange = Notification.Name("ConferenceConsentStateDidChange")
+}
+
+public struct ConferenceConsentMenuState: Sendable, Equatable {
+    public static let visibilityInterval: TimeInterval = 8
+
+    public let callID: String
+    public let title: String
+    public let lastObservedAt: Date
+    public let isBlurBypassedForConsent: Bool
+    public let consentSessionID: String?
+
+    public var canDisableFaceBlur: Bool { consentSessionID != nil && !isBlurBypassedForConsent }
+
+    public init(
+        callID: String,
+        title: String,
+        lastObservedAt: Date,
+        isBlurBypassedForConsent: Bool,
+        consentSessionID: String? = nil
+    ) {
+        self.callID = callID
+        self.title = title
+        self.lastObservedAt = lastObservedAt
+        self.isBlurBypassedForConsent = isBlurBypassedForConsent
+        self.consentSessionID = consentSessionID
+    }
+
+    public func isVisible(at now: Date = Date()) -> Bool {
+        now.timeIntervalSince(lastObservedAt) <= Self.visibilityInterval
+    }
+
+    public var notificationUserInfo: [AnyHashable: Any] {
+        var payload: [String: Any] = [
+            "callID": callID,
+            "title": title,
+            "lastObservedAt": lastObservedAt.timeIntervalSince1970,
+            "isBlurBypassedForConsent": isBlurBypassedForConsent
+        ]
+        payload["consentSessionID"] = consentSessionID
+        return payload
+    }
+
+    public static func from(notificationUserInfo: [AnyHashable: Any]?) -> ConferenceConsentMenuState? {
+        guard let callID = notificationUserInfo?["callID"] as? String,
+              let title = notificationUserInfo?["title"] as? String,
+              let lastObservedAtSeconds = notificationUserInfo?["lastObservedAt"] as? TimeInterval,
+              let isBlurBypassedForConsent = notificationUserInfo?["isBlurBypassedForConsent"] as? Bool else {
+            return nil
+        }
+
+        return ConferenceConsentMenuState(
+            callID: callID,
+            title: title,
+            lastObservedAt: Date(timeIntervalSince1970: lastObservedAtSeconds),
+            isBlurBypassedForConsent: isBlurBypassedForConsent,
+            consentSessionID: notificationUserInfo?["consentSessionID"] as? String
+        )
+    }
+}
+
+struct ConferenceConsentMenuSelectionCandidate: Sendable, Equatable {
+    let state: ConferenceConsentMenuState
+    let menuSelectionPriority: Int
+}
+
+struct ConferencePrivacyMetricState: Sendable {
+    private struct Observation: Sendable {
+        let outcome: String
+        let timestamp: Date
+    }
+    private var observations: [String: Observation] = [:]
+
+    mutating func shouldRecord(callID: String, outcome: String, at timestamp: Date) -> Bool {
+        if let previous = observations[callID], timestamp < previous.timestamp { return false }
+        observations = observations.filter {
+            timestamp.timeIntervalSince($0.value.timestamp) <= ConferenceConsentMenuState.visibilityInterval
+        }
+        let previous = observations[callID]
+        observations[callID] = Observation(outcome: outcome, timestamp: timestamp)
+        return previous?.outcome != outcome
+    }
+}
+
 public enum VisibleBlockBoundaryDirection: String, Sendable {
     case start
     case end
@@ -136,7 +221,7 @@ public struct OCRPowerSettingsSnapshot: Sendable {
     }
 
     public static func fromDefaults(
-        _ defaults: UserDefaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        _ defaults: UserDefaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
     ) -> OCRPowerSettingsSnapshot {
         OCRPowerSettingsSnapshot(
             ocrEnabled: defaults.object(forKey: "ocrEnabled") as? Bool ?? true,
@@ -257,12 +342,19 @@ public final class PipelineStatusHolder: @unchecked Sendable {
 /// This path is lossy by design: when disk/JPEG work falls behind, we prefer
 /// dropping older pending stills over retaining unbounded raw frame memory.
 actor TimelineStillDiskWriter {
+    struct CleanupPolicy: Sendable {
+        var interval: TimeInterval = 60
+        var maxAge: TimeInterval = 20 * 60
+        var maxBytes: Int64 = 2 * 1024 * 1024 * 1024
+    }
+
     struct Diagnostics: Sendable {
         var enqueuedCount = 0
         var writtenCount = 0
         var droppedCount = 0
         var failureCount = 0
         var terminatedEnqueueCount = 0
+        var cleanupCount = 0
     }
 
     private struct WriteRequest: Sendable {
@@ -273,14 +365,19 @@ actor TimelineStillDiskWriter {
     typealias DestinationResolver = @Sendable (Int64) -> URL
     typealias Encoder = @Sendable (CapturedFrame) throws -> Data
     typealias WarningLogger = @Sendable (String) -> Void
+    typealias ProcessingStatuses = @Sendable ([Int64]) async throws -> [Int64: Int]
 
     private let destinationResolver: DestinationResolver
     private let encoder: Encoder
     private let warningLogger: WarningLogger
+    private let cleanupPolicy: CleanupPolicy
+    private let processingStatuses: ProcessingStatuses
     private let stream: AsyncStream<WriteRequest>
     private let continuation: AsyncStream<WriteRequest>.Continuation
 
     private var workerTask: Task<Void, Never>?
+    private var cleanupTask: Task<Void, Never>?
+    private var lastCleanupUptime: TimeInterval?
     private var diagnostics = Diagnostics()
     private var isClosed = false
 
@@ -288,7 +385,9 @@ actor TimelineStillDiskWriter {
         bufferLimit: Int,
         destinationResolver: @escaping DestinationResolver,
         encoder: @escaping Encoder,
-        warningLogger: @escaping WarningLogger
+        warningLogger: @escaping WarningLogger,
+        cleanupPolicy: CleanupPolicy = CleanupPolicy(),
+        processingStatuses: @escaping ProcessingStatuses = { _ in [:] }
     ) {
         let (stream, continuation) = AsyncStream<WriteRequest>.makeStream(
             bufferingPolicy: .bufferingNewest(bufferLimit)
@@ -296,6 +395,8 @@ actor TimelineStillDiskWriter {
         self.destinationResolver = destinationResolver
         self.encoder = encoder
         self.warningLogger = warningLogger
+        self.cleanupPolicy = cleanupPolicy
+        self.processingStatuses = processingStatuses
         self.stream = stream
         self.continuation = continuation
     }
@@ -332,6 +433,9 @@ actor TimelineStillDiskWriter {
         }
 
         isClosed = true
+        // A large old cache must not hold shutdown hostage. The sweep checks cancellation
+        // between entries and after every database await; no further sweep can be scheduled.
+        cleanupTask?.cancel()
         continuation.finish()
         if let workerTask {
             await workerTask.value
@@ -350,31 +454,197 @@ actor TimelineStillDiskWriter {
         let destinationResolver = self.destinationResolver
         let encoder = self.encoder
         let warningLogger = self.warningLogger
-
         workerTask = Task.detached(priority: .utility) {
             for await request in stream {
+                let destinationURL = destinationResolver(request.frameID)
                 do {
-                    let destinationURL = destinationResolver(request.frameID)
                     let jpegData = try encoder(request.frame)
+                    let privacyDefaults = UserDefaults(suiteName: ReversibleOCRScrambler.settingsSuiteName) ?? .standard
+                    guard !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { continue }
                     try FileManager.default.createDirectory(
                         at: destinationURL.deletingLastPathComponent(),
                         withIntermediateDirectories: true
                     )
                     try jpegData.write(to: destinationURL, options: [.atomic])
-                    await self.recordWriteSuccess()
+                    if PhraseRedactionMode.isEnabled(in: privacyDefaults) {
+                        try? FileManager.default.removeItem(at: destinationURL)
+                        continue
+                    }
+                    await self.recordWriteSuccess(directory: destinationURL.deletingLastPathComponent())
                 } catch {
                     await self.recordWriteFailure(
                         frameID: request.frameID,
                         error: error,
                         warningLogger: warningLogger
                     )
+                    // In particular, a full disk must not prevent the cleanup that frees space.
+                    await self.scheduleCleanupIfNeeded(directory: destinationURL.deletingLastPathComponent())
                 }
             }
         }
     }
 
-    private func recordWriteSuccess() {
+    private func scheduleCleanupIfNeeded(directory: URL) {
+        guard !isClosed, cleanupTask == nil else { return }
+        let uptime = ProcessInfo.processInfo.systemUptime
+        guard lastCleanupUptime.map({ uptime - $0 >= cleanupPolicy.interval }) ?? true else { return }
+        let policy = cleanupPolicy
+        let statuses = processingStatuses
+        let logger = warningLogger
+        cleanupTask = Task.detached(priority: .background) { [weak self] in
+            await Self.pruneCache(directory: directory, policy: policy, processingStatuses: statuses, warningLogger: logger)
+            await self?.didFinishCleanup()
+        }
+    }
+
+    private func didFinishCleanup() {
+        lastCleanupUptime = ProcessInfo.processInfo.systemUptime
+        cleanupTask = nil
+        diagnostics.cleanupCount += 1
+    }
+
+    private struct CacheEntry {
+        let url: URL
+        let frameID: Int64
+        let modified: Date
+        let bytes: Int64
+    }
+
+    /// The byte budget is best effort: unreadable/unknown frames are protected, even over budget.
+    /// Run independently of the still writer, query bounded batches, and never await this on shutdown.
+    nonisolated private static func pruneCache(
+        directory: URL,
+        policy: CleanupPolicy,
+        processingStatuses: ProcessingStatuses,
+        warningLogger: WarningLogger
+    ) async {
+        let manager = FileManager.default
+        let keys: Set<URLResourceKey> = [.isRegularFileKey, .isSymbolicLinkKey, .contentModificationDateKey, .fileSizeKey]
+        var failureCount = 0
+        guard let files = manager.enumerator(
+            at: directory,
+            includingPropertiesForKeys: Array(keys),
+            options: [.skipsHiddenFiles, .skipsSubdirectoryDescendants],
+            errorHandler: { _, _ in
+                failureCount += 1
+                return !Task.isCancelled
+            }
+        ) else {
+            warningLogger("[Timeline-DiskBuffer] Capture cache cleanup could not enumerate directory")
+            return
+        }
+
+        let cutoff = Date().addingTimeInterval(-policy.maxAge)
+        var retained: [CacheEntry] = []
+        var batch: [CacheEntry] = []
+        var totalBytes: Int64 = 0
+        var protectedBytes: Int64 = 0
+        var removedCount = 0
+        var removedBytes: Int64 = 0
+
+        func remove(_ entry: CacheEntry) -> Bool {
+            guard !Task.isCancelled else { return false }
+            do {
+                // The timeline may atomically replace an old cached image while we await the DB.
+                // Preserve replacements until a later sweep rather than unlinking a fresh preview.
+                var currentURL = entry.url
+                currentURL.removeAllCachedResourceValues()
+                let current = try currentURL.resourceValues(forKeys: keys)
+                guard current.isRegularFile == true, current.isSymbolicLink != true,
+                      current.contentModificationDate == entry.modified,
+                      current.fileSize == Int(entry.bytes) else { return false }
+                try manager.removeItem(at: entry.url)
+                removedCount += 1
+                removedBytes += entry.bytes
+                return true
+            } catch let error as NSError where error.domain == NSCocoaErrorDomain &&
+                (error.code == NSFileNoSuchFileError || error.code == NSFileReadNoSuchFileError) {
+                return true // Timeline cleanup removed it concurrently.
+            } catch {
+                failureCount += 1
+                return false
+            }
+        }
+
+        func processBatch() async throws {
+            try Task.checkCancellation()
+            let statuses = try await processingStatuses(batch.map(\.frameID))
+            try Task.checkCancellation()
+            for entry in batch {
+                try Task.checkCancellation()
+                totalBytes += entry.bytes
+                // Status 4 has no readable video yet. Unknown rows/statuses and in-progress
+                // rewrites are also retained. Lookup failure aborts the sweep without guessing.
+                guard let status = statuses[entry.frameID], [0, 1, 2, 3, 7, 8].contains(status) else {
+                    protectedBytes += entry.bytes
+                    continue
+                }
+                if entry.modified < cutoff, remove(entry) {
+                    totalBytes -= entry.bytes
+                } else {
+                    retained.append(entry)
+                }
+            }
+            batch.removeAll(keepingCapacity: true)
+            await Task.yield()
+        }
+
+        do {
+            for case let url as URL in files {
+                try Task.checkCancellation()
+                guard url.pathExtension == "jpg",
+                      let frameID = Int64(url.deletingPathExtension().lastPathComponent) else { continue }
+                do {
+                    let values = try url.resourceValues(forKeys: keys)
+                    guard values.isRegularFile == true, values.isSymbolicLink != true,
+                          let modified = values.contentModificationDate,
+                          let size = values.fileSize else { continue }
+                    batch.append(CacheEntry(url: url, frameID: frameID, modified: modified, bytes: Int64(size)))
+                } catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError {
+                    continue
+                } catch {
+                    failureCount += 1
+                }
+                if batch.count >= 128 { try await processBatch() }
+            }
+            if !batch.isEmpty { try await processBatch() }
+            try Task.checkCancellation()
+
+            if totalBytes > policy.maxBytes {
+                // Recheck eligibility in bounded batches before size eviction: a rewrite may
+                // have begun since enumeration. Most recent entries are evicted last.
+                let oldestFirst = retained.sorted { $0.modified < $1.modified }
+                for offset in stride(from: 0, to: oldestFirst.count, by: 128) {
+                    guard totalBytes > policy.maxBytes else { break }
+                    try Task.checkCancellation()
+                    let candidates = oldestFirst[offset..<min(offset + 128, oldestFirst.count)]
+                    let statuses = try await processingStatuses(candidates.map(\.frameID))
+                    try Task.checkCancellation()
+                    for entry in candidates {
+                        guard totalBytes > policy.maxBytes else { break }
+                        guard let status = statuses[entry.frameID], [0, 1, 2, 3, 7, 8].contains(status) else { continue }
+                        if remove(entry) { totalBytes -= entry.bytes }
+                    }
+                    await Task.yield()
+                }
+            }
+        } catch is CancellationError {
+            return
+        } catch {
+            warningLogger("[Timeline-DiskBuffer] Capture cache cleanup stopped: \(error); preserving unchecked stills")
+            return
+        }
+        if removedCount > 0 || totalBytes > policy.maxBytes {
+            Log.info("[Timeline-DiskBuffer] Capture cache cleanup removed=\(removedCount) reclaimedBytes=\(removedBytes) remainingBytes=\(totalBytes) protectedBytes=\(protectedBytes)", category: .app)
+        }
+        if failureCount > 0 {
+            warningLogger("[Timeline-DiskBuffer] Capture cache cleanup failures=\(failureCount); will retry on next sweep")
+        }
+    }
+
+    private func recordWriteSuccess(directory: URL) {
         diagnostics.writtenCount += 1
+        scheduleCleanupIfNeeded(directory: directory)
     }
 
     private func recordWriteFailure(
@@ -571,11 +841,15 @@ public actor AppCoordinator {
     private static let memoryLedgerSummaryIntervalSeconds: TimeInterval = 30
     private static let memoryLedgerPendingRawFramesTag = "app.capture.pendingRawFrames"
     private static let memoryLedgerActiveWritersTag = "app.capture.activeWriters"
-    private static let dbStorageSnapshotIntervalNanoseconds: Int64 = 60_000_000_000
+    private static let dbStorageSnapshotIntervalNanoseconds: Int64 = 900_000_000_000
     private static let timelineDiskCacheJPEGCompressionQuality: CGFloat = 0.80
     private static let timelineStillWriterBufferLimit = 4
+    static let conferenceConsentMenuStateRetentionInterval = ConferenceConsentMenuState.visibilityInterval
 
     private let timelineStillDiskWriter: TimelineStillDiskWriter
+    private var latestConferenceConsentMenuState: ConferenceConsentMenuState?
+    private var conferenceConsentMenuStateByCallID: [String: ConferenceConsentMenuSelectionCandidate] = [:]
+    private var conferencePrivacyMetricState = ConferencePrivacyMetricState()
     private var unexpectedRecordingStopState: UnexpectedRecordingStopState?
     private var hasLoadedUnexpectedRecordingStopState = false
     private var unexpectedRecordingStopCounters = UnexpectedRecordingStopCounters()
@@ -600,6 +874,9 @@ public actor AppCoordinator {
             },
             warningLogger: { message in
                 Log.warning(message, category: .app)
+            },
+            processingStatuses: { frameIDs in
+                try await services.database.getFrameProcessingStatuses(frameIDs: frameIDs)
             }
         )
         Log.info("AppCoordinator created", category: .app)
@@ -607,7 +884,8 @@ public actor AppCoordinator {
 
     /// Convenience initializer with default configuration
     public init() {
-        self.services = ServiceContainer()
+        let services = ServiceContainer()
+        self.services = services
         self.timelineStillDiskWriter = TimelineStillDiskWriter(
             bufferLimit: Self.timelineStillWriterBufferLimit,
             destinationResolver: { frameID in
@@ -618,6 +896,9 @@ public actor AppCoordinator {
             },
             warningLogger: { message in
                 Log.warning(message, category: .app)
+            },
+            processingStatuses: { frameIDs in
+                try await services.database.getFrameProcessingStatuses(frameIDs: frameIDs)
             }
         )
         Log.info("AppCoordinator created with default services", category: .app)
@@ -777,7 +1058,7 @@ public actor AppCoordinator {
         // Apply power-aware OCR settings
         await applyPowerSettings()
 
-        // Start periodic orphaned video cleanup (runs every 60s)
+        // Start periodic orphaned video cleanup (runs every 10 minutes)
         startOrphanedVideoCleanup()
         await recordDBStorageSnapshot(reason: "initialize")
         startDBStorageSnapshotTask()
@@ -1033,7 +1314,7 @@ public actor AppCoordinator {
     private static let phraseLevelRedactionEnabledKey = "phraseLevelRedactionEnabled"
     private static let abandonedMissingMasterKeyRewritePurpose = "redaction_missing_master_key_abandoned"
     /// Use a fixed suite name so it works regardless of how the app is launched (swift build vs .app bundle)
-    private static let userDefaultsSuite = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+    private static let userDefaultsSuite = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
 
     /// Save recording state to UserDefaults for persistence across app restarts
     private nonisolated func saveRecordingState(_ isRecording: Bool) {
@@ -1201,6 +1482,10 @@ public actor AppCoordinator {
                 timestamp: timestamp
             )
         }
+        await services.capture.setOnConferenceFramePrivacyEvent { [weak self] event in
+            guard let self else { return }
+            await self.updateConferenceConsentMenuState(with: event)
+        }
 
         // Start screen capture
         try await services.capture.startCapture(config: await services.capture.getConfig())
@@ -1297,6 +1582,16 @@ public actor AppCoordinator {
 
         isRunning = false
         statusHolder.update(isRunning: false)
+        latestConferenceConsentMenuState = nil
+        conferenceConsentMenuStateByCallID.removeAll()
+        conferencePrivacyMetricState = ConferencePrivacyMetricState()
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(
+                name: ConferenceConsentStateNotification.didChange,
+                object: nil,
+                userInfo: [:]
+            )
+        }
 
         if persistState {
             saveRecordingState(false)
@@ -1549,12 +1844,12 @@ public actor AppCoordinator {
     // MARK: - Orphaned Video Cleanup
 
     /// Start periodic cleanup of orphaned videos (processingState stuck at 1)
-    /// Runs every 60 seconds to catch videos that weren't finalized properly
+    /// Runs every 10 minutes after startup recovery to catch videos that weren't finalized properly
     private func startOrphanedVideoCleanup() {
         orphanedVideoCleanupTask?.cancel()
 
         orphanedVideoCleanupTask = Task { [weak self] in
-            let cleanupInterval: UInt64 = 60_000_000_000 // 60 seconds
+            let cleanupInterval: UInt64 = 600_000_000_000 // 10 minutes
 
             while !Task.isCancelled {
                 try? await Task.sleep(for: .nanoseconds(Int64(cleanupInterval)), clock: .continuous)
@@ -1564,7 +1859,7 @@ public actor AppCoordinator {
             }
         }
 
-        Log.info("[AppCoordinator] Orphaned video cleanup task started (60s interval)", category: .app)
+        Log.info("[AppCoordinator] Orphaned video cleanup task started (10 minute interval)", category: .app)
     }
 
     /// Stop the orphaned video cleanup task
@@ -1590,7 +1885,7 @@ public actor AppCoordinator {
             }
         }
 
-        Log.info("[AppCoordinator] DB storage snapshot task started (60s interval)", category: .app)
+        Log.info("[AppCoordinator] DB storage snapshot task started (15 minute interval)", category: .app)
     }
 
     private func stopDBStorageSnapshotTask() {
@@ -1726,11 +2021,19 @@ public actor AppCoordinator {
     }
 
     /// Main pipeline: Capture → Storage → Processing → Database → Search
-    /// Uses Rewind-style multi-resolution video writing
-    private func runPipeline() async {
+    /// Uses Rewind-style multi-resolution video writing. Injected streams let regression
+    /// tests exercise the real writer/database path without capture permissions, shared
+    /// preview-cache writes, or persisted stop notifications.
+    func runPipeline(
+        frameStream suppliedFrameStream: AsyncStream<CapturedFrame>? = nil,
+        cacheCapturedStills: Bool = true,
+        reportUnexpectedStops: Bool = true
+    ) async {
         Log.info("Pipeline processing started", category: .app)
 
-        let frameStream = await services.capture.frameStream
+        let frameStream: AsyncStream<CapturedFrame>
+        if let suppliedFrameStream { frameStream = suppliedFrameStream }
+        else { frameStream = await services.capture.frameStream }
         var writersByResolution: [String: VideoWriterState] = [:]
         var pendingUnexpectedStop: PendingUnexpectedRecordingStop?
         var lastPipelineMemoryLogAt = Date.distantPast
@@ -1854,6 +2157,9 @@ public actor AppCoordinator {
                 }
 
                 writerState.frameCount += 1
+                // Encoding already succeeded. Preserve its count and pending work even
+                // when a later metadata/readability/enqueue operation throws.
+                defer { writersByResolution[resolutionKey] = writerState }
 
                 if writerState.width == 0 {
                     writerState.width = await writerState.writer.frameWidth
@@ -1878,17 +2184,16 @@ public actor AppCoordinator {
                     metadata: frame.metadata,
                     source: .native
                 )
-                let frameID = try await services.database.insertFrame(frameRef)
+                let frameID = try await services.database.insertFrame(frameRef, accessibilitySnapshot: frame.accessibilitySnapshot)
                 let acceptedAt = Date()
                 recordAcceptedFrameProgress(at: acceptedAt)
                 await persistGlobalMousePositionIfNeeded(
                     frameID: frameID,
                     capturedFrame: frame
                 )
-                await writeCapturedFrameStillToTimelineDiskCache(
-                    frameID: frameID,
-                    frame: frame
-                )
+                if cacheCapturedStills {
+                    await writeCapturedFrameStillToTimelineDiskCache(frameID: frameID, frame: frame)
+                }
                 scheduleInPageURLMetadataCaptureIfNeeded(
                     frameID: frameID,
                     frameMetadata: frame.metadata
@@ -1966,11 +2271,12 @@ public actor AppCoordinator {
                 // Mark frames as readable and enqueue for OCR if they've been flushed to disk
                 while let firstFrame = writerState.pendingFrames.first,
                       firstFrame.frameIndexInSegment < flushedCount {
-                    let frameToEnqueue = writerState.pendingFrames.removeFirst()
-                    // Mark frame as readable now that it's confirmed flushed to video file
+                    let frameToEnqueue = firstFrame
+                    // Keep pending work until both database operations succeed.
                     try await services.database.markFrameReadable(frameID: frameToEnqueue.frameID)
-                    recordReadableFrameProgress(at: Date())
                     try await processingQueue.enqueue(frameID: frameToEnqueue.frameID)
+                    recordReadableFrameProgress(at: Date())
+                    writerState.pendingFrames.removeFirst()
                 }
 
                 if flushedCount > writerState.persistedReadableFrameCount {
@@ -2128,7 +2434,7 @@ public actor AppCoordinator {
             currentSegmentID = nil
         }
 
-        if let pendingUnexpectedStop {
+        if let pendingUnexpectedStop, reportUnexpectedStops {
             let state = await recordUnexpectedRecordingStop(pendingUnexpectedStop)
             finalizePipelineStopped(persistState: true, clearCaptureTask: false)
             await MainActor.run {
@@ -2283,7 +2589,7 @@ public actor AppCoordinator {
         let cachesDirectory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
             ?? FileManager.default.temporaryDirectory
         return cachesDirectory
-            .appendingPathComponent("io.retrace.app", isDirectory: true)
+            .appendingPathComponent(AppPaths.settingsSuiteName, isDirectory: true)
             .appendingPathComponent("TimelineFrameBuffer", isDirectory: true)
     }
 
@@ -2384,6 +2690,7 @@ public actor AppCoordinator {
         frameID: Int64,
         frame: CapturedFrame
     ) async {
+        guard !PhraseRedactionMode.isEnabled(in: Self.userDefaultsSuite) else { return }
         await timelineStillDiskWriter.enqueue(frameID: frameID, frame: frame)
     }
 
@@ -2685,10 +2992,31 @@ public actor AppCoordinator {
         let encoderFrameCount = await writerState.writer.frameCount
         Log.info("[FINALIZE-DEBUG] About to finalize videoDBID=\(writerState.videoDBID), writerState.frameCount=\(writerState.frameCount), encoderFrameCount=\(encoderFrameCount)", category: .app)
 
+        // Read aggregate counters before finalization deletes the temporary WAL.
+        let walManager = await services.storage.getWALManager()
+        let walVideoID = await writerState.writer.segmentID
+        let walCompression = await walManager.compressionStatistics(videoID: walVideoID)
         _ = try await writerState.writer.finalize()
         let fileSize = await writerState.writer.currentFileSize
         try await services.database.markVideoFinalized(id: writerState.videoDBID, frameCount: writerState.frameCount, fileSize: fileSize)
         Log.info("[FINALIZE-DEBUG] Marked videoDBID=\(writerState.videoDBID) as finalized with frameCount=\(writerState.frameCount), fileSize=\(fileSize) bytes", category: .app)
+
+        if let statistics = walCompression {
+            try? await recordMetricEvent(
+                metricType: .walCompression,
+                metadata: Self.metricMetadata([
+                    "codec": "lzfse", "outcome": "finalized",
+                    "frameCount": statistics.frameCount,
+                    "compressedFrameCount": statistics.compressedFrameCount,
+                    "rawBytes": statistics.rawBytes, "storedBytes": statistics.storedBytes,
+                    "compressionMilliseconds": statistics.compressionMilliseconds
+                ])
+            )
+            Log.info(
+                "[WAL-Compression] frames=\(statistics.frameCount) rawBytes=\(statistics.rawBytes) storedBytes=\(statistics.storedBytes) compressionMs=\(String(format: "%.1f", statistics.compressionMilliseconds))",
+                category: .storage
+            )
+        }
 
         // After finalization, all frames are now readable from the video file
         // Mark them as readable and enqueue for OCR processing
@@ -2862,7 +3190,8 @@ public actor AppCoordinator {
         let defaults = Self.userDefaultsSuite
         let hasMasterKey = MasterKeyManager.hasMasterKey()
         let phraseLevelRedactionEnabled =
-            defaults.object(forKey: Self.phraseLevelRedactionEnabledKey) as? Bool ?? false
+            (defaults.object(forKey: Self.phraseLevelRedactionEnabledKey) as? Bool ?? false)
+                && PhraseRedactionMode.load(from: defaults) == .scramble
 
         var hasProtectedRedactionData = false
         var hasPendingRedactionRewrites = false
@@ -2877,10 +3206,7 @@ public actor AppCoordinator {
         }
 
         do {
-            let pendingVideoIDs = try await services.database.getVideoIDsWithPendingNodeRedactions(
-                includeRetryableFailures: true
-            )
-            hasPendingRedactionRewrites = !pendingVideoIDs.isEmpty
+            hasPendingRedactionRewrites = try await services.database.hasPendingScrambleRedactions()
         } catch {
             Log.error(
                 "[AppCoordinator] Failed to inspect pending phrase-redaction rewrites: \(error.localizedDescription)",
@@ -3933,6 +4259,28 @@ public actor AppCoordinator {
 
     // MARK: - Frame Deletion
 
+    /// Dashboard bulk actions operate on native visible recordings only. Query directly
+    /// so imported Rewind IDs can never collide with native segment IDs during mutation.
+    public func getDashboardUsageActionFrames(bundleID: String, from start: Date, to end: Date) async throws -> [FrameReference] {
+        let hidden = try await services.database.getHiddenSegmentIds()
+        var selected: [FrameReference] = []
+        var cursor = start
+        // Bound temporary allocations while resolving the entire range, rather than
+        // accidentally acting on only the first dashboard page or a frame query limit.
+        repeat {
+            try Task.checkCancellation()
+            let batchEnd = min(cursor.addingTimeInterval(24 * 60 * 60), end)
+            let frames = try await services.database.getFrames(from: cursor, to: batchEnd, limit: Int(Int32.max))
+            selected.append(contentsOf: frames.filter {
+                $0.source == .native && $0.metadata.appBundleID == bundleID &&
+                !hidden.contains(SegmentID(value: $0.segmentID.value)) &&
+                (batchEnd == end || $0.timestamp < batchEnd)
+            })
+            cursor = batchEnd
+        } while cursor < end
+        return selected
+    }
+
     /// Delete a single frame from the database
     /// Note: For Rewind data, this only removes the database entry. Video files remain on disk.
     public func deleteFrame(
@@ -4378,6 +4726,144 @@ public actor AppCoordinator {
         )
     }
 
+    private func updateConferenceConsentMenuState(
+        with event: ConferenceFramePrivacyEvent
+    ) async {
+        let metricCallKey = event.callID ?? "unverified-\(event.conferenceKind.rawValue)"
+        if conferencePrivacyMetricState.shouldRecord(
+            callID: metricCallKey, outcome: event.outcome.rawValue, at: event.timestamp
+        ) {
+            try? await recordMetricEvent(
+                metricType: .conferencePrivacy,
+                timestamp: event.timestamp,
+                metadata: Self.metricMetadata([
+                    "action": "protection_changed", "outcome": event.outcome.rawValue,
+                    "conferenceKind": event.conferenceKind.rawValue, "source": "capture"
+                ])
+            )
+        }
+        guard let callID = event.callID?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !callID.isEmpty else {
+            await publishPreferredConferenceConsentMenuState(now: event.timestamp)
+            return
+        }
+
+        let title = conferenceConsentMenuTitle(
+            conferenceKind: event.conferenceKind,
+            windowName: event.windowName
+        )
+        let nextState = ConferenceConsentMenuState(
+            callID: callID,
+            title: title,
+            lastObservedAt: event.timestamp,
+            isBlurBypassedForConsent: event.outcome == .consentBypassed,
+            consentSessionID: event.consentSessionID
+        )
+        pruneConferenceConsentMenuStates(now: event.timestamp)
+        conferenceConsentMenuStateByCallID[callID] = ConferenceConsentMenuSelectionCandidate(
+            state: nextState,
+            menuSelectionPriority: event.isPreferredMenuCandidate ? 0 : 1
+        )
+        await publishPreferredConferenceConsentMenuState(now: event.timestamp)
+    }
+
+    public func disableFaceBlurForConferenceCall(callID: String) async -> Bool {
+        let normalizedCallID = callID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let didApply: Bool
+        if normalizedCallID.isEmpty {
+            didApply = false
+        } else {
+            didApply = await services.capture.disableFaceBlurForConferenceCall(callID: normalizedCallID)
+        }
+        try? await recordMetricEvent(
+            metricType: .conferencePrivacy,
+            metadata: Self.metricMetadata([
+                "action": "consent_override", "outcome": didApply ? "succeeded" : "failed",
+                "source": "menu_bar"
+            ])
+        )
+        guard didApply else { return false }
+
+        if let statusID = conferenceConsentMenuStateByCallID.first(where: {
+            $0.value.state.consentSessionID == normalizedCallID
+        })?.key, let storedState = conferenceConsentMenuStateByCallID[statusID] {
+            conferenceConsentMenuStateByCallID[statusID] = ConferenceConsentMenuSelectionCandidate(
+                state: ConferenceConsentMenuState(
+                    callID: storedState.state.callID,
+                    title: storedState.state.title,
+                    lastObservedAt: Date(),
+                    isBlurBypassedForConsent: true,
+                    consentSessionID: normalizedCallID
+                ),
+                menuSelectionPriority: storedState.menuSelectionPriority
+            )
+            await publishPreferredConferenceConsentMenuState(now: Date())
+        }
+
+        return true
+    }
+
+    private func pruneConferenceConsentMenuStates(now: Date) {
+        conferenceConsentMenuStateByCallID = conferenceConsentMenuStateByCallID.filter { _, candidate in
+            now.timeIntervalSince(candidate.state.lastObservedAt) <= Self.conferenceConsentMenuStateRetentionInterval
+        }
+    }
+
+    private func publishPreferredConferenceConsentMenuState(now: Date) async {
+        pruneConferenceConsentMenuStates(now: now)
+        let selectedState = Self.selectConferenceConsentMenuState(
+            from: Array(conferenceConsentMenuStateByCallID.values),
+            now: now,
+            retentionInterval: Self.conferenceConsentMenuStateRetentionInterval
+        )
+        latestConferenceConsentMenuState = selectedState
+        await publishConferenceConsentMenuStateNotification(selectedState)
+    }
+
+    static func selectConferenceConsentMenuState(
+        from candidates: [ConferenceConsentMenuSelectionCandidate],
+        now: Date,
+        retentionInterval: TimeInterval
+    ) -> ConferenceConsentMenuState? {
+        candidates
+            .filter { now.timeIntervalSince($0.state.lastObservedAt) <= retentionInterval }
+            .sorted { lhs, rhs in
+                if lhs.menuSelectionPriority != rhs.menuSelectionPriority {
+                    return lhs.menuSelectionPriority < rhs.menuSelectionPriority
+                }
+                if lhs.state.lastObservedAt != rhs.state.lastObservedAt {
+                    return lhs.state.lastObservedAt > rhs.state.lastObservedAt
+                }
+                return lhs.state.title.localizedCaseInsensitiveCompare(rhs.state.title) == .orderedAscending
+            }
+            .first?
+            .state
+    }
+
+    private func conferenceConsentMenuTitle(
+        conferenceKind: ConferenceSessionKind,
+        windowName: String?
+    ) -> String {
+        let trimmedWindowName = windowName?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !trimmedWindowName.isEmpty {
+            return trimmedWindowName
+        }
+        return conferenceKind.displayName
+    }
+
+    private func publishConferenceConsentMenuStateNotification(
+        _ state: ConferenceConsentMenuState?
+    ) async {
+        await MainActor.run {
+            NotificationCenter.default.post(
+                name: ConferenceConsentStateNotification.didChange,
+                object: nil,
+                userInfo: state?.notificationUserInfo ?? [:]
+            )
+        }
+    }
+
     private func recordUnexpectedRecordingStopMetric(
         action: String,
         state: UnexpectedRecordingStopState
@@ -4419,12 +4905,14 @@ public actor AppCoordinator {
     public func getDailyMetrics(
         metricType: DailyMetricsQueries.MetricType,
         from startDate: Date,
-        to endDate: Date
+        to endDate: Date,
+        preserveTimeBounds: Bool = false
     ) async throws -> [(date: Date, value: Int64)] {
         try await services.database.getDailyMetrics(
             metricType: metricType,
             from: startDate,
-            to: endDate
+            to: endDate,
+            preserveTimeBounds: preserveTimeBounds
         )
     }
 
@@ -4887,7 +5375,7 @@ public actor AppCoordinator {
     }
 
     private static func isInPageURLCollectionEnabled() -> Bool {
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
         guard defaults.object(forKey: inPageURLCollectionExperimentalKey) != nil else {
             return false
         }
@@ -4895,7 +5383,7 @@ public actor AppCoordinator {
     }
 
     private static func isMousePositionCollectionEnabled() -> Bool {
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
         guard defaults.object(forKey: captureMousePositionKey) != nil else {
             return true
         }

@@ -46,16 +46,21 @@ extension SettingsView {
     var phraseLevelRedactionCard: some View {
         ModernSettingsCard(title: "Phrase Level Redaction", icon: "text.viewfinder") {
             VStack(alignment: .leading, spacing: 14) {
-                Text("Redact matching OCR text with reversible scrambling from manual keywords.")
+                Text("Protect matching words and phrases with scrambling or permanent redaction.")
                     .font(.retraceCaption)
                     .foregroundColor(.retraceSecondary)
 
                 redactionSettingsSubcard {
+                    PhraseRedactionMethodPicker(mode: Binding(
+                        get: { phraseLevelRedactionModeRaw },
+                        set: { setPhraseLevelRedactionMode($0) }
+                    ))
+
                     ModernToggleRow(
                         title: "Redact on Keyword",
-                        subtitle: hasMasterKeyInKeychain
-                            ? "Scramble matching OCR text using the master key stored in Keychain"
-                            : "Requires creating a master key in Keychain before this feature can turn on",
+                        subtitle: phraseLevelRedactionModeRaw == PhraseRedactionMode.permanent.rawValue
+                            ? "Remove matching text and pixels without retaining a recoverable copy"
+                            : (hasMasterKeyInKeychain ? "Scramble matches using your master key" : "Requires a master key in Keychain"),
                         isOn: phraseLevelRedactionBinding
                     )
 
@@ -140,6 +145,21 @@ extension SettingsView {
                     }
                 }
             }
+        }
+    }
+
+    func setPhraseLevelRedactionMode(_ rawValue: String) {
+        guard let mode = PhraseRedactionMode(rawValue: rawValue), rawValue != phraseLevelRedactionModeRaw else { return }
+        phraseLevelRedactionModeRaw = rawValue
+        if mode == .scramble && phraseLevelRedactionEnabled && !hasMasterKeyInKeychain {
+            setPhraseLevelRedactionEnabled(false)
+            promptForMasterKey(feature: .phraseLevelRedaction)
+        }
+        Task {
+            try? await coordinatorWrapper.coordinator.recordMetricEvent(
+                metricType: .phraseLevelRedactionModeUpdated,
+                metadata: Self.inPageURLMetricMetadata(["mode": mode.rawValue, "source": "privacy_settings"])
+            )
         }
     }
 

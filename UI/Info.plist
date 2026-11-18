@@ -14,6 +14,24 @@
     <string>$(MARKETING_VERSION)</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
+    <key>RetraceVersion</key>
+    <string>$(MARKETING_VERSION)</string>
+    <key>RetraceBuildNumber</key>
+    <string>$(CURRENT_PROJECT_VERSION)</string>
+    <key>RetraceGitCommit</key>
+    <string>$(INFOPLIST_KEY_RetraceGitCommit)</string>
+    <key>RetraceGitCommitFull</key>
+    <string>$(INFOPLIST_KEY_RetraceGitCommitFull)</string>
+    <key>RetraceGitBranch</key>
+    <string>$(INFOPLIST_KEY_RetraceGitBranch)</string>
+    <key>RetraceBuildDate</key>
+    <string>$(INFOPLIST_KEY_RetraceBuildDate)</string>
+    <key>RetraceBuildConfig</key>
+    <string>$(INFOPLIST_KEY_RetraceBuildConfig)</string>
+    <key>RetraceIsDevBuild</key>
+    <string>$(INFOPLIST_KEY_RetraceIsDevBuild)</string>
+    <key>RetraceForkName</key>
+    <string>$(INFOPLIST_KEY_RetraceForkName)</string>
     <key>CFBundleExecutable</key>
     <string>Retrace</string>
 

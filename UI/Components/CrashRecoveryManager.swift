@@ -783,6 +783,7 @@ final class CrashRecoveryManager: ObservableObject {
     }
 
     func armAtLaunch() {
+        guard !AppPaths.isDevelopment else { return }
         Task { @MainActor [weak self] in
             guard let self else { return }
             Log.info(
@@ -794,6 +795,7 @@ final class CrashRecoveryManager: ObservableObject {
     }
 
     func refreshUserFacingStatus() {
+        guard !AppPaths.isDevelopment else { return }
         Task { @MainActor [weak self] in
             guard let self else { return }
             self.userFacingStatus = await self.worker.refreshStatus()
@@ -801,16 +803,19 @@ final class CrashRecoveryManager: ObservableObject {
     }
 
     func prepareForExpectedExit() async {
+        guard !AppPaths.isDevelopment else { return }
         userFacingStatus = await worker.prepareForExpectedExit()
     }
 
     func requestIntentionalRelaunch(targetAppPath: String? = nil) async -> Bool {
+        guard !AppPaths.isDevelopment else { return false }
         let result = await worker.requestIntentionalRelaunch(targetAppPath: targetAppPath)
         userFacingStatus = result.status
         return result.acknowledged
     }
 
     func retryActivationAfterApprovalChange() async {
+        guard !AppPaths.isDevelopment else { return }
         userFacingStatus = await worker.retryActivationAfterApprovalChange()
     }
 
@@ -818,14 +823,16 @@ final class CrashRecoveryManager: ObservableObject {
         trigger: String,
         timeoutMs: UInt64 = watchdogHangSampleTimeoutMs
     ) async -> String? {
-        await worker.captureWatchdogHangSample(trigger: trigger, timeoutMs: timeoutMs)
+        guard !AppPaths.isDevelopment else { return nil }
+        return await worker.captureWatchdogHangSample(trigger: trigger, timeoutMs: timeoutMs)
     }
 
     nonisolated static func captureWatchdogHangSample(
         trigger: String,
         timeoutMs: UInt64 = watchdogHangSampleTimeoutMs
     ) async -> String? {
-        await sharedCrashRecoveryWorker.captureWatchdogHangSample(trigger: trigger, timeoutMs: timeoutMs)
+        guard !AppPaths.isDevelopment else { return nil }
+        return await sharedCrashRecoveryWorker.captureWatchdogHangSample(trigger: trigger, timeoutMs: timeoutMs)
     }
 
     nonisolated static func helperAcknowledged(

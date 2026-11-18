@@ -179,7 +179,7 @@ public class TimelineWindowController: NSObject {
     private static let velocitySampleWindow: CFAbsoluteTime = 0.08
     /// Live-mode scroll suppression window (seconds) applied on open.
     private static let liveScrollSuppressDuration: CFAbsoluteTime = 0.30
-    private static let timelineSettingsStore = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+    private static let timelineSettingsStore = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
 
     /// Accumulated wrong-axis and right-axis scroll magnitudes for orientation mismatch detection
     private var wrongAxisScrollAccum: CGFloat = 0
@@ -1315,6 +1315,9 @@ public class TimelineWindowController: NSObject {
 
 	    /// Show the timeline overlay on the current screen
     public func show() {
+        // A newer explicit timeline command supersedes a pending Dock reveal.
+        let revealScheduler = DashboardRevealScheduler.shared
+        revealScheduler.cancelPendingReveal()
         reconcileVisibilityState(reason: "show")
         cancelDeferredHostingViewDetach()
         cancelWindowFadeIn(reason: "show")
@@ -1323,6 +1326,7 @@ public class TimelineWindowController: NSObject {
 
         // If we're in the middle of hiding, cancel the animation and snap back to visible
         if isHiding, let window = window {
+            revealScheduler.finishDeeplinkPresentation()
             isHiding = false
             presentationState = .visible
             // Cancel any running animation by setting duration to 0
@@ -1337,9 +1341,13 @@ public class TimelineWindowController: NSObject {
         }
 
         guard !isVisible, let coordinator = coordinator else {
+            revealScheduler.finishDeeplinkPresentation()
             return
         }
+        revealScheduler.beginDeeplinkPresentation()
         Task { @MainActor [weak self] in
+            // Covers failed presentations too, including a disconnected screen.
+            defer { revealScheduler.finishDeeplinkPresentation() }
             guard let self, !self.isVisible, self.coordinator === coordinator else { return }
         let showStartTime = CFAbsoluteTimeGetCurrent()
         liveModeCaptureTask?.cancel()
@@ -2827,6 +2835,10 @@ extension TimelineWindowController {
                     return event
                 }
 
+                if Self.isFrameTextScanShortcut(keyCode: event.keyCode, modifiers: modifiers) {
+                    if self?.handleKeyEvent(event) == true { return nil }
+                }
+
                 // Cmd+F toggles in-frame search even when the in-frame text field is focused.
                 if event.keyCode == 3 && modifiers == [.command] { // Cmd+F
                     _ = self?.handleKeyEvent(event)
@@ -3050,6 +3062,10 @@ extension TimelineWindowController {
         }
     }
 
+    static func isFrameTextScanShortcut(keyCode: UInt16, modifiers: NSEvent.ModifierFlags) -> Bool {
+        keyCode == 31 && modifiers.intersection([.command, .shift, .option, .control]) == [.command, .shift]
+    }
+
     @discardableResult
     private func handleKeyEvent(_ event: NSEvent) -> Bool {
         guard shouldHandleTimelineKeyboardShortcuts() else {
@@ -3075,6 +3091,11 @@ extension TimelineWindowController {
             } else {
                 return false
             }
+        }
+
+        if Self.isFrameTextScanShortcut(keyCode: event.keyCode, modifiers: modifiers) {
+            timelineViewModel?.scanCurrentFrameText(source: "keyboard")
+            return true
         }
 
         // Escape key - cascading behavior based on current state

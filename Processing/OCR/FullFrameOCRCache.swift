@@ -27,6 +27,9 @@ public actor FullFrameOCRCache {
 
     /// Current app bundle ID (cache invalidated on change)
     private var currentAppBundleID: String?
+    private var currentOCRRegions: [CGRect]?
+    private var currentDisplayID: UInt32 = 0
+    private var processedFrame = false
 
     /// Statistics
     private var hitCount: Int = 0
@@ -39,9 +42,17 @@ public actor FullFrameOCRCache {
     public func validateForFrame(
         width: Int,
         height: Int,
-        appBundleID: String?
+        appBundleID: String?,
+        ocrRegions: [CGRect]? = nil,
+        displayID: UInt32 = 0
     ) -> Bool {
         var invalidated = false
+        if ocrRegions != currentOCRRegions || displayID != currentDisplayID {
+            invalidateAll()
+            currentOCRRegions = ocrRegions
+            currentDisplayID = displayID
+            invalidated = true
+        }
 
         // Invalidate on resolution change
         if width != currentWidth || height != currentHeight {
@@ -61,6 +72,8 @@ public actor FullFrameOCRCache {
         return invalidated
     }
 
+    func hasProcessedFrame() -> Bool { processedFrame }
+
     /// Check if we have cached regions
     public func hasCachedRegions() -> Bool {
         return !cachedRegions.isEmpty
@@ -79,6 +92,7 @@ public actor FullFrameOCRCache {
     /// Store full-frame OCR results
     public func setFullFrameResults(regions: [TextRegion], tileGrid: [TileInfo]) {
         cachedRegions = regions
+        processedFrame = true
         cachedTileGrid = tileGrid
         hitCount += 1
     }
@@ -127,6 +141,7 @@ public actor FullFrameOCRCache {
     /// Invalidate entire cache
     public func invalidateAll() {
         cachedRegions = []
+        processedFrame = false
         cachedTileGrid = []
     }
 

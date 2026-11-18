@@ -139,6 +139,42 @@ final class CaptureIntervalSettingsTests: XCTestCase {
         )
     }
 
+    func testCaptureStorageEstimateReflectsShortRetentionIncludingOneMonth() {
+        let cases: [(Int, String)] = [
+            (3, "Estimated: ~0.8 to 1.3 GB retained"),
+            (7, "Estimated: ~1.9 to 3.0 GB retained"),
+            (30, "Estimated: ~8.0 to 13.0 GB retained"),
+            (0, "Estimated: ~8.0 to 13.0 GB per month"),
+            (60, "Estimated: ~8.0 to 13.0 GB per month"),
+        ]
+        for (days, expected) in cases {
+            XCTAssertEqual(
+                SettingsView.captureStorageEstimateText(
+                    videoQuality: 0.5,
+                    captureIntervalSeconds: 2,
+                    captureOnWindowChange: false,
+                    captureOnMouseClick: false,
+                    deduplicationThreshold: 0.9985,
+                    retentionDays: days
+                ),
+                expected
+            )
+        }
+    }
+
+    func testCaptureStorageEstimateRangeTracksRetentionForDeltaIndicator() {
+        let range = SettingsView.captureStorageEstimateRange(
+            videoQuality: 0.5,
+            captureIntervalSeconds: 2,
+            captureOnWindowChange: false,
+            captureOnMouseClick: false,
+            deduplicationThreshold: 0.9985,
+            retentionDays: 3
+        )
+        XCTAssertEqual(range.lowGB, 0.8, accuracy: 0.001)
+        XCTAssertEqual(range.highGB, 1.3, accuracy: 0.001)
+    }
+
     func testCaptureStorageEstimateUsesFiftyPercentAsDefaultTimerOnlyBaseline() {
         XCTAssertEqual(
             SettingsView.captureStorageEstimateText(

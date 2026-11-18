@@ -185,3 +185,27 @@ public final class SQLCipherConnection: DatabaseConnection, @unchecked Sendable 
         }
     }
 }
+
+/// Checked SELECT iteration. Keep lock retries bounded and never restart a read
+/// after returning rows, which could duplicate results or mix snapshots.
+public enum SQLiteReadStep: Sendable {
+    public static func next(_ statement: OpaquePointer?) throws -> Int32 {
+        guard let statement, let db = sqlite3_db_handle(statement) else {
+            throw DatabaseConnectionError.notConnected
+        }
+        let canRetry = sqlite3_stmt_readonly(statement) != 0 && sqlite3_stmt_busy(statement) == 0
+        var result = sqlite3_step(statement)
+        let primaryCode = result & 0xff
+        if canRetry && (primaryCode == SQLITE_BUSY || primaryCode == SQLITE_LOCKED) {
+            // Existing connection busy_timeout handles waiting. One fresh attempt only;
+            // reset preserves bound parameters and discards the failed execution.
+            sqlite3_reset(statement)
+            result = sqlite3_step(statement)
+        }
+        guard result == SQLITE_ROW || result == SQLITE_DONE else {
+            let sql = sqlite3_sql(statement).map(String.init(cString:)) ?? "SELECT"
+            throw DatabaseConnectionError.executionFailed(sql: sql, error: String(cString: sqlite3_errmsg(db)))
+        }
+        return result
+    }
+}
