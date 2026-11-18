@@ -993,14 +993,14 @@ public actor DataAdapter {
             LIMIT 1;
             """
 
-        guard let statement = try? connection.prepare(sql: sql) else {
+        guard let statement = try connection.prepare(sql: sql) else {
             throw DataAdapterError.frameNotFound
         }
         defer { connection.finalize(statement) }
 
         sqlite3_bind_int64(statement, 1, videoID.value)
 
-        guard sqlite3_step(statement) == SQLITE_ROW else {
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else {
             throw DataAdapterError.frameNotFound
         }
 
@@ -1534,14 +1534,14 @@ public actor DataAdapter {
             ? ""
             : " AND (rewritePurpose IS NULL OR rewritePurpose != 'deletion')"
         let sql = "SELECT id FROM frame WHERE createdAt = ?\(visibilityClause) LIMIT 1;"
-        guard let statement = try? connection.prepare(sql: sql) else {
+        guard let statement = try connection.prepare(sql: sql) else {
             throw DataAdapterError.frameNotFound
         }
         defer { connection.finalize(statement) }
 
         config.bindDate(timestamp, to: statement, at: 1)
 
-        guard sqlite3_step(statement) == SQLITE_ROW else {
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else {
             throw DataAdapterError.frameNotFound
         }
 
@@ -1721,7 +1721,7 @@ public actor DataAdapter {
             LIMIT ?;
             """
 
-        guard let statement = try? connection.prepare(sql: sql) else { return [] }
+        guard let statement = try connection.prepare(sql: sql) else { return [] }
         defer { connection.finalize(statement) }
 
         config.bindDate(effectiveStartDate, to: statement, at: 1)
@@ -1730,7 +1730,7 @@ public actor DataAdapter {
         // Bind app bundle IDs
         if let apps = filters?.selectedApps, !apps.isEmpty {
             for (index, app) in apps.enumerated() {
-                sqlite3_bind_text(statement, Int32(bindIndex + index), (app as NSString).utf8String, -1, nil)
+                sqlite3_bind_text(statement, Int32(bindIndex + index), (app as NSString).utf8String, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
             }
             bindIndex += apps.count
         }
@@ -1746,7 +1746,7 @@ public actor DataAdapter {
         sqlite3_bind_int(statement, Int32(bindIndex), Int32(limit))
 
         var frames: [FrameWithVideoInfo] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             if let frameWithVideo = try? Self.parseFrameWithVideoInfo(statement: statement, config: config) {
                 frames.append(frameWithVideo)
             }
@@ -1800,7 +1800,7 @@ public actor DataAdapter {
             ORDER BY f.createdAt DESC
             """
 
-        guard let statement = try? connection.prepare(sql: sql) else { return [] }
+        guard let statement = try connection.prepare(sql: sql) else { return [] }
         defer { connection.finalize(statement) }
 
         var bindIndex = 1
@@ -1812,7 +1812,7 @@ public actor DataAdapter {
         sqlite3_bind_int(statement, Int32(bindIndex), Int32(limit))
 
         var frames: [FrameWithVideoInfo] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             if let frameWithVideo = try? Self.parseFrameWithVideoInfo(statement: statement, config: config) {
                 frames.append(frameWithVideo)
             }
@@ -1888,7 +1888,7 @@ public actor DataAdapter {
             if let db = connection.getConnection(), let errMsg = sqlite3_errmsg(db) {
                 Log.error("[Filter] SQLite error: \(String(cString: errMsg))", category: .database)
             }
-            return []
+            throw error
         }
         guard let stmt = statement else {
             Log.error("[Filter] Statement is nil after prepare!", category: .database)
@@ -1902,11 +1902,11 @@ public actor DataAdapter {
             bindIndex += 1
         }
         for app in filterComponents.appBundleIDs {
-            sqlite3_bind_text(stmt, bindIndex, (app as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(stmt, bindIndex, (app as NSString).utf8String, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
             bindIndex += 1
         }
         for stringValue in filterComponents.metadataBindValues {
-            sqlite3_bind_text(stmt, bindIndex, (stringValue as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(stmt, bindIndex, (stringValue as NSString).utf8String, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
             bindIndex += 1
         }
         for date in filterComponents.dateRangeBounds {
@@ -1931,14 +1931,14 @@ public actor DataAdapter {
 
         var frames: [FrameWithVideoInfo] = []
         var stepCount = 0
-        var stepResult = sqlite3_step(stmt)
+        var stepResult = try SQLiteReadStep.next(stmt)
 
         while stepResult == SQLITE_ROW {
             stepCount += 1
             if let frameWithVideo = try? Self.parseFrameWithVideoInfo(statement: stmt, config: config) {
                 frames.append(frameWithVideo)
             }
-            stepResult = sqlite3_step(stmt)
+            stepResult = try SQLiteReadStep.next(stmt)
         }
 
         if stepResult != SQLITE_DONE {
@@ -2051,20 +2051,20 @@ public actor DataAdapter {
             LIMIT ?
             """
 
-        guard let statement = try? connection.prepare(sql: sql) else { return [] }
+        guard let statement = try connection.prepare(sql: sql) else { return [] }
         defer { connection.finalize(statement) }
 
         var bindIndex = 1
 
         if let apps = filters.selectedApps, !apps.isEmpty {
             for (index, app) in apps.enumerated() {
-                sqlite3_bind_text(statement, Int32(bindIndex + index), (app as NSString).utf8String, -1, nil)
+                sqlite3_bind_text(statement, Int32(bindIndex + index), (app as NSString).utf8String, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
             }
             bindIndex += apps.count
         }
 
         for stringValue in segmentMetadataBindValues {
-            sqlite3_bind_text(statement, Int32(bindIndex), (stringValue as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(statement, Int32(bindIndex), (stringValue as NSString).utf8String, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
             bindIndex += 1
         }
 
@@ -2086,7 +2086,7 @@ public actor DataAdapter {
         sqlite3_bind_int(statement, Int32(bindIndex), Int32(limit))
 
         var frames: [FrameWithVideoInfo] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             if let frameWithVideo = try? Self.parseFrameWithVideoInfo(statement: statement, config: config) {
                 frames.append(frameWithVideo)
             }
@@ -2135,7 +2135,7 @@ public actor DataAdapter {
             LIMIT ?
             """
 
-        guard let statement = try? connection.prepare(sql: sql) else { return [] }
+        guard let statement = try connection.prepare(sql: sql) else { return [] }
         defer { connection.finalize(statement) }
 
         var currentBindIndex: Int32 = 1
@@ -2160,7 +2160,7 @@ public actor DataAdapter {
         sqlite3_bind_int(statement, Int32(currentBindIndex), Int32(limit))
 
         var frames: [FrameWithVideoInfo] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             if let frameWithVideo = try? Self.parseFrameWithVideoInfo(statement: statement, config: config) {
                 frames.append(frameWithVideo)
             }
@@ -2208,7 +2208,7 @@ public actor DataAdapter {
             LIMIT ?
             """
 
-        guard let statement = try? connection.prepare(sql: sql) else { return [] }
+        guard let statement = try connection.prepare(sql: sql) else { return [] }
         defer { connection.finalize(statement) }
 
         var currentBindIndex: Int32 = 1
@@ -2233,7 +2233,7 @@ public actor DataAdapter {
         sqlite3_bind_int(statement, Int32(currentBindIndex), Int32(limit))
 
         var frames: [FrameWithVideoInfo] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             if let frameWithVideo = try? Self.parseFrameWithVideoInfo(statement: statement, config: config) {
                 frames.append(frameWithVideo)
             }
@@ -2287,7 +2287,7 @@ public actor DataAdapter {
             LIMIT ?
             """
 
-        guard let statement = try? connection.prepare(sql: sql) else {
+        guard let statement = try connection.prepare(sql: sql) else {
             return []
         }
         defer { connection.finalize(statement) }
@@ -2316,7 +2316,7 @@ public actor DataAdapter {
         sqlite3_bind_int(statement, Int32(currentBindIndex), Int32(limit))
 
         var frames: [FrameWithVideoInfo] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             if let frameWithVideo = try? Self.parseFrameWithVideoInfo(statement: statement, config: config) {
                 frames.append(frameWithVideo)
             }
@@ -2390,7 +2390,7 @@ public actor DataAdapter {
             ORDER BY f.createdAt DESC
             """
 
-        guard let statement = try? connection.prepare(sql: sql) else { return [] }
+        guard let statement = try connection.prepare(sql: sql) else { return [] }
         defer { connection.finalize(statement) }
 
         // Bind timestamp
@@ -2399,7 +2399,7 @@ public actor DataAdapter {
         // Bind app bundle IDs
         if let apps = filters?.selectedApps, !apps.isEmpty {
             for (index, app) in apps.enumerated() {
-                sqlite3_bind_text(statement, Int32(bindIndex + index), (app as NSString).utf8String, -1, nil)
+                sqlite3_bind_text(statement, Int32(bindIndex + index), (app as NSString).utf8String, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
             }
             bindIndex += apps.count
         }
@@ -2421,7 +2421,7 @@ public actor DataAdapter {
         sqlite3_bind_int(statement, Int32(bindIndex), Int32(limit))
 
         var frames: [FrameWithVideoInfo] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             if let frameWithVideo = try? Self.parseFrameWithVideoInfo(statement: statement, config: config) {
                 frames.append(frameWithVideo)
             }
@@ -2494,7 +2494,7 @@ public actor DataAdapter {
             ORDER BY f.createdAt ASC
             """
 
-        guard let statement = try? connection.prepare(sql: sql) else { return [] }
+        guard let statement = try connection.prepare(sql: sql) else { return [] }
         defer { connection.finalize(statement) }
 
         // Bind timestamp
@@ -2503,7 +2503,7 @@ public actor DataAdapter {
         // Bind app bundle IDs
         if let apps = filters?.selectedApps, !apps.isEmpty {
             for (index, app) in apps.enumerated() {
-                sqlite3_bind_text(statement, Int32(bindIndex + index), (app as NSString).utf8String, -1, nil)
+                sqlite3_bind_text(statement, Int32(bindIndex + index), (app as NSString).utf8String, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
             }
             bindIndex += apps.count
         }
@@ -2525,7 +2525,7 @@ public actor DataAdapter {
         sqlite3_bind_int(statement, Int32(bindIndex), Int32(limit))
 
         var frames: [FrameWithVideoInfo] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             if let frameWithVideo = try? Self.parseFrameWithVideoInfo(statement: statement, config: config) {
                 frames.append(frameWithVideo)
             }
@@ -2560,7 +2560,7 @@ public actor DataAdapter {
             WHERE f.id = ?\(visibilityClause)\(boundaryClause)
             """
 
-        guard let statement = try? connection.prepare(sql: sql) else { return nil }
+        guard let statement = try connection.prepare(sql: sql) else { return nil }
         defer { connection.finalize(statement) }
 
         sqlite3_bind_int64(statement, 1, id.value)
@@ -2570,7 +2570,7 @@ public actor DataAdapter {
             bindIndex += 1
         }
 
-        guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else { return nil }
 
         return try Self.parseFrameWithVideoInfo(statement: statement, config: config)
     }
@@ -2658,7 +2658,7 @@ public actor DataAdapter {
             LIMIT 1
             """
 
-        guard let statement = try? connection.prepare(sql: sql) else { return nil }
+        guard let statement = try connection.prepare(sql: sql) else { return nil }
         defer { connection.finalize(statement) }
 
         var bindIndex: Int32 = 1
@@ -2685,7 +2685,7 @@ public actor DataAdapter {
         }
         sqlite3_bind_int64(statement, bindIndex, anchorFrameID.value)
 
-        guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else { return nil }
         return try Self.parseVisibleBlockBoundaryHit(statement: statement, config: config)
     }
 
@@ -2722,12 +2722,12 @@ public actor DataAdapter {
             LIMIT 1;
             """
 
-        guard let statement = try? connection.prepare(sql: sql) else { return nil }
+        guard let statement = try connection.prepare(sql: sql) else { return nil }
         defer { connection.finalize(statement) }
 
         config.bindDate(timestamp, to: statement, at: 1)
 
-        guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else { return nil }
 
         guard let relativePath = Self.getTextOrNil(statement, 1) else { return nil }
 
@@ -2760,14 +2760,14 @@ public actor DataAdapter {
             ORDER BY startDate ASC;
             """
 
-        guard let statement = try? connection.prepare(sql: sql) else { return [] }
+        guard let statement = try connection.prepare(sql: sql) else { return [] }
         defer { connection.finalize(statement) }
 
         config.bindDate(startDate, to: statement, at: 1)
         config.bindDate(endDate, to: statement, at: 2)
 
         var segments: [Segment] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             if let segment = try? Self.parseSegment(statement: statement, config: config) {
                 segments.append(segment)
             }
@@ -2785,12 +2785,12 @@ public actor DataAdapter {
             isRewindDatabase: config.source == .rewind
         ).map { " AND \($0)" } ?? ""
         let frameSql = "SELECT id FROM frame WHERE createdAt = ?\(visibilityClause) LIMIT 1;"
-        guard let frameStatement = try? connection.prepare(sql: frameSql) else { return [] }
+        guard let frameStatement = try connection.prepare(sql: frameSql) else { return [] }
         defer { connection.finalize(frameStatement) }
 
         config.bindDate(timestamp, to: frameStatement, at: 1)
 
-        guard sqlite3_step(frameStatement) == SQLITE_ROW else { return [] }
+        guard try SQLiteReadStep.next(frameStatement) == SQLITE_ROW else { return [] }
 
         let frameID = FrameID(value: sqlite3_column_int64(frameStatement, 0))
         return try getAllOCRNodes(frameID: frameID, connection: connection, config: config)
@@ -2841,13 +2841,13 @@ public actor DataAdapter {
             ORDER BY n.nodeOrder ASC;
             """
 
-        guard let statement = try? connection.prepare(sql: sql) else { return [] }
+        guard let statement = try connection.prepare(sql: sql) else { return [] }
         defer { connection.finalize(statement) }
 
         sqlite3_bind_int64(statement, 1, frameID.value)
 
         var nodes: [OCRNodeWithText] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             if let node = parseOCRNodeFromRow(statement: statement) {
                 nodes.append(node)
             }
@@ -2870,7 +2870,7 @@ public actor DataAdapter {
             LIMIT 100;
             """
 
-        guard let statement = try? connection.prepare(sql: sql) else { return [] }
+        guard let statement = try connection.prepare(sql: sql) else { return [] }
         defer { connection.finalize(statement) }
 
         var bindIndex = 1
@@ -2880,7 +2880,7 @@ public actor DataAdapter {
         }
 
         var bundleIDs: [String] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             guard let bundleIDPtr = sqlite3_column_text(statement, 0) else { continue }
             bundleIDs.append(String(cString: bundleIDPtr))
         }
@@ -2905,12 +2905,12 @@ public actor DataAdapter {
             LIMIT 1;
             """
 
-        guard let frameStmt = try? connection.prepare(sql: frameSQL) else { return nil }
+        guard let frameStmt = try connection.prepare(sql: frameSQL) else { return nil }
         defer { connection.finalize(frameStmt) }
 
         config.bindDate(timestamp, to: frameStmt, at: 1)
 
-        guard sqlite3_step(frameStmt) == SQLITE_ROW else { return nil }
+        guard try SQLiteReadStep.next(frameStmt) == SQLITE_ROW else { return nil }
 
         let frameId = sqlite3_column_int64(frameStmt, 0)
         guard let browserUrlPtr = sqlite3_column_text(frameStmt, 1) else { return nil }
@@ -2930,12 +2930,12 @@ public actor DataAdapter {
             ) ds ON ds.docid = src.id;
             """
 
-        guard let ftsStmt = try? connection.prepare(sql: ftsSQL) else { return nil }
+        guard let ftsStmt = try connection.prepare(sql: ftsSQL) else { return nil }
         defer { connection.finalize(ftsStmt) }
 
         sqlite3_bind_int64(ftsStmt, 1, frameId)
 
-        guard sqlite3_step(ftsStmt) == SQLITE_ROW else { return nil }
+        guard try SQLiteReadStep.next(ftsStmt) == SQLITE_ROW else { return nil }
 
         let c0Text = sqlite3_column_text(ftsStmt, 0).map { String(cString: $0) } ?? ""
         let c1Text = sqlite3_column_text(ftsStmt, 1).map { String(cString: $0) } ?? ""
@@ -2950,7 +2950,7 @@ public actor DataAdapter {
             ORDER BY nodeOrder ASC;
             """
 
-        guard let nodesStmt = try? connection.prepare(sql: nodesSQL) else { return nil }
+        guard let nodesStmt = try connection.prepare(sql: nodesSQL) else { return nil }
         defer { connection.finalize(nodesStmt) }
 
         sqlite3_bind_int64(nodesStmt, 1, frameId)
@@ -2958,7 +2958,7 @@ public actor DataAdapter {
         var bestMatch: (x: CGFloat, y: CGFloat, width: CGFloat, height: CGFloat, score: Int)?
         var bestPathFallback: (x: CGFloat, y: CGFloat, width: CGFloat, height: CGFloat, score: Int)?
 
-        while sqlite3_step(nodesStmt) == SQLITE_ROW {
+        while try SQLiteReadStep.next(nodesStmt) == SQLITE_ROW {
             let textOffset = Int(sqlite3_column_int(nodesStmt, 1))
             let textLength = Int(sqlite3_column_int(nodesStmt, 2))
             let leftX = CGFloat(sqlite3_column_double(nodesStmt, 3))
@@ -3419,7 +3419,7 @@ public actor DataAdapter {
             ORDER BY b.rank ASC, b.frame_id ASC
             """
 
-        guard let statement = try? connection.prepare(sql: sql) else {
+        guard let statement = try connection.prepare(sql: sql) else {
             return SearchResults(query: query, results: [], searchTimeMs: 0)
         }
         defer { connection.finalize(statement) }
@@ -3467,7 +3467,7 @@ public actor DataAdapter {
         }
 
         var batch: [RelevantSearchRow] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             let frameId = sqlite3_column_int64(statement, 0)
             let timestamp = config.parseDate(from: statement, column: 1) ?? Date()
             let segmentId = sqlite3_column_int64(statement, 2)
@@ -4062,7 +4062,7 @@ public actor DataAdapter {
             }
 
             var batchRows: [FrameSearchRow] = []
-            while sqlite3_step(statement) == SQLITE_ROW {
+            while try SQLiteReadStep.next(statement) == SQLITE_ROW {
                 let frameId = sqlite3_column_int64(statement, 0)
                 let timestamp = config.parseDate(from: statement, column: 1) ?? Date()
                 let segmentId = sqlite3_column_int64(statement, 2)
@@ -4805,12 +4805,12 @@ public actor DataAdapter {
         var currentBindIndex = bindIndex
 
         for app in components.appBundleIDs {
-            sqlite3_bind_text(statement, currentBindIndex, (app as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(statement, currentBindIndex, (app as NSString).utf8String, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
             currentBindIndex += 1
         }
 
         for stringValue in components.metadataBindValues {
-            sqlite3_bind_text(statement, currentBindIndex, (stringValue as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(statement, currentBindIndex, (stringValue as NSString).utf8String, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
             currentBindIndex += 1
         }
 
@@ -5152,7 +5152,7 @@ public actor DataAdapter {
                 """
         }
 
-        guard let statement = try? connection.prepare(sql: sql) else {
+        guard let statement = try connection.prepare(sql: sql) else {
             return []
         }
         defer { connection.finalize(statement) }
@@ -5164,7 +5164,7 @@ public actor DataAdapter {
         }
 
         var dates: [Date] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             guard let date = config.parseDate(from: statement, column: 0) else { continue }
             dates.append(date)
         }
@@ -5203,7 +5203,7 @@ public actor DataAdapter {
             ORDER BY dayTimestamp DESC
             """
 
-        guard let statement = try? connection.prepare(sql: sql) else {
+        guard let statement = try connection.prepare(sql: sql) else {
             return []
         }
         defer { connection.finalize(statement) }
@@ -5222,7 +5222,7 @@ public actor DataAdapter {
         )
 
         var dates: [Date] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             guard let date = config.parseDate(from: statement, column: 0) else { continue }
             dates.append(date)
         }
@@ -5363,7 +5363,7 @@ public actor DataAdapter {
             ORDER BY hourTimestamp ASC
             """
 
-        guard let statement = try? connection.prepare(sql: sql) else {
+        guard let statement = try connection.prepare(sql: sql) else {
             return []
         }
         defer { connection.finalize(statement) }
@@ -5372,7 +5372,7 @@ public actor DataAdapter {
         sqlite3_bind_int64(statement, 2, endMs)
 
         var hours: [Date] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             let timestampMs = sqlite3_column_int64(statement, 0)
             // Return actual timestamp (not normalized) so navigation can find frames
             let timestamp = Date(timeIntervalSince1970: Double(timestampMs) / 1000.0)
@@ -5417,16 +5417,16 @@ public actor DataAdapter {
             ORDER BY hourTimestamp ASC
             """
 
-        guard let statement = try? connection.prepare(sql: sql) else {
+        guard let statement = try connection.prepare(sql: sql) else {
             return []
         }
         defer { connection.finalize(statement) }
 
-        sqlite3_bind_text(statement, 1, (startISO as NSString).utf8String, -1, nil)
-        sqlite3_bind_text(statement, 2, (endISO as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(statement, 1, (startISO as NSString).utf8String, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        sqlite3_bind_text(statement, 2, (endISO as NSString).utf8String, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
 
         var hours: [Date] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             guard let cString = sqlite3_column_text(statement, 0) else { continue }
             let isoString = String(cString: cString)
             // Return actual timestamp (not normalized) so navigation can find frames
@@ -5476,7 +5476,7 @@ public actor DataAdapter {
             ORDER BY hourTimestamp ASC
             """
 
-        guard let statement = try? connection.prepare(sql: sql) else {
+        guard let statement = try connection.prepare(sql: sql) else {
             return []
         }
         defer { connection.finalize(statement) }
@@ -5498,7 +5498,7 @@ public actor DataAdapter {
         config.bindDate(endOfDay, to: statement, at: bindIndex)
 
         var timestamps: [Date] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             guard let timestamp = config.parseDate(from: statement, column: 0) else { continue }
             timestamps.append(timestamp)
         }

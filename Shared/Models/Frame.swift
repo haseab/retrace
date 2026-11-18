@@ -59,6 +59,11 @@ public struct FrameMetadata: Codable, Sendable, Equatable {
     /// Mouse position in frame pixel coordinates (top-left origin), when captured.
     public let mousePosition: CGPoint?
 
+    /// Full crop bounds of visible application windows, ordered front to back.
+    /// Normalized top-left screenshot coordinates; overlaps mask lower-window crops.
+    /// nil uses legacy OCR; an empty list means no eligible pixels. Contains geometry only.
+    public var ocrRegions: [CGRect]?
+
     public init(
         appBundleID: String? = nil,
         appName: String? = nil,
@@ -67,7 +72,8 @@ public struct FrameMetadata: Codable, Sendable, Equatable {
         redactionReason: String? = nil,
         captureTrigger: FrameCaptureTrigger? = nil,
         displayID: UInt32 = 0,
-        mousePosition: CGPoint? = nil
+        mousePosition: CGPoint? = nil,
+        ocrRegions: [CGRect]? = nil
     ) {
         self.appBundleID = appBundleID
         self.appName = appName
@@ -77,6 +83,7 @@ public struct FrameMetadata: Codable, Sendable, Equatable {
         self.captureTrigger = captureTrigger
         self.displayID = displayID
         self.mousePosition = mousePosition
+        self.ocrRegions = ocrRegions
     }
 
     public static let empty = FrameMetadata()
@@ -93,6 +100,7 @@ public struct CapturedFrame: Sendable {
     public let height: Int
     public let bytesPerRow: Int
     public let metadata: FrameMetadata
+    public let accessibilitySnapshot: AccessibilitySnapshot?
 
     public init(
         timestamp: Date = Date(),
@@ -100,7 +108,8 @@ public struct CapturedFrame: Sendable {
         width: Int,
         height: Int,
         bytesPerRow: Int,
-        metadata: FrameMetadata = .empty
+        metadata: FrameMetadata = .empty,
+        accessibilitySnapshot: AccessibilitySnapshot? = nil
     ) {
         self.timestamp = timestamp
         self.imageData = imageData
@@ -108,6 +117,7 @@ public struct CapturedFrame: Sendable {
         self.height = height
         self.bytesPerRow = bytesPerRow
         self.metadata = metadata
+        self.accessibilitySnapshot = accessibilitySnapshot
     }
 }
 

@@ -1,9 +1,58 @@
 import XCTest
 import AppKit
+import SwiftUI
 @testable import Retrace
 
 @MainActor
 final class FocusableTextInputSupportTests: XCTestCase {
+    func testAdvancedFilterInputsKeepFocusWhileTyping() async throws {
+        let window = KeyableWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 380, height: 500),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        let host = NSHostingView(rootView: AdvancedSearchFilterPopover(
+            windowNameIncludeTerms: .constant([]),
+            windowNameExcludeTerms: .constant([]),
+            windowNameFilterMode: .constant(.include),
+            browserUrlIncludeTerms: .constant([]),
+            browserUrlExcludeTerms: .constant([]),
+            browserUrlFilterMode: .constant(.include),
+            excludedSearchTerms: .constant([])
+        ))
+        window.contentView = host
+        window.makeKeyAndOrderFront(nil)
+        defer { window.close() }
+        try await Task.sleep(for: .milliseconds(50))
+        host.layoutSubtreeIfNeeded()
+
+        func textFields(in view: NSView) -> [FocusableTextField] {
+            if let field = view as? FocusableTextField { return [field] }
+            return view.subviews.flatMap { textFields(in: $0) }
+        }
+
+        let fields = textFields(in: host)
+        XCTAssertEqual(fields.count, 3)
+        for field in fields {
+            field.onClickCallback?()
+            field.selectText(nil)
+            try await Task.sleep(for: .milliseconds(50))
+            let editor = try XCTUnwrap(field.currentEditor() as? NSTextView)
+            var expected = ""
+            for character in "meeting" {
+                editor.insertText(String(character), replacementRange: editor.selectedRange())
+                expected.append(character)
+                try await Task.sleep(for: .milliseconds(50))
+                XCTAssertTrue(window.firstResponder === editor, "Lost focus in \(field.placeholderString ?? "") after \(expected)")
+                XCTAssertTrue(field.currentEditor() === editor)
+                XCTAssertEqual(field.stringValue, expected)
+                XCTAssertEqual(editor.selectedRange(), NSRange(location: expected.count, length: 0))
+            }
+        }
+    }
+
     private final class ClipboardSpyTextView: NSTextView {
         var didCopy = false
         var didPaste = false

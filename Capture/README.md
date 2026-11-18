@@ -63,8 +63,7 @@ Capture/
 │   ├── DisplayMonitor.swift          # ✅ Display tracking
 │   └── ScreenCaptureService.swift    # ✅ ScreenCaptureKit wrapper
 ├── Deduplication/
-│   ├── FrameDeduplicator.swift       # ✅ DeduplicationProtocol impl
-│   └── PerceptualHash.swift          # ✅ dHash algorithm
+│   └── FrameDeduplicator.swift       # ✅ Pixel-sampling DeduplicationProtocol impl
 ├── Metadata/
 │   ├── AppInfoProvider.swift         # ✅ App metadata
 │   └── BrowserURLExtractor.swift     # ✅ Browser URL extraction

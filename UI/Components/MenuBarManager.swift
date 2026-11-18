@@ -54,6 +54,8 @@ public class MenuBarManager: ObservableObject {
     private var scheduledResumeTask: Task<Void, Never>?
     /// Target wall clock time for timed resume (nil means paused indefinitely / no timed pause active).
     private var scheduledResumeDate: Date?
+    private var conferenceConsentMenuState: ConferenceConsentMenuState?
+    private var faceBlurConsentWindowController: NSWindowController?
 
     private enum RecordingStatusIconStyle {
         case off
@@ -133,6 +135,35 @@ public class MenuBarManager: ObservableObject {
             settingEnabled: settingEnabled,
             shouldHideRecordingIndicator: shouldHideRecordingIndicator
         ) ? .replayQueuedPulse : .restoreCurrentIcon
+    }
+
+    @MainActor
+    static func makeFaceBlurConsentPanel(contentRect: NSRect) -> KeyablePanel {
+        let panel = KeyablePanel(
+            contentRect: contentRect,
+            styleMask: [.borderless, .nonactivatingPanel, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        panel.isFloatingPanel = true
+        panel.level = .modalPanel
+        panel.animationBehavior = .utilityWindow
+        panel.titleVisibility = .hidden
+        panel.titlebarAppearsTransparent = true
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.ignoresMouseEvents = false
+        panel.acceptsMouseMovedEvents = true
+        panel.becomesKeyOnlyIfNeeded = false
+        panel.isMovableByWindowBackground = false
+        panel.hidesOnDeactivate = false
+        panel.isReleasedWhenClosed = false
+        panel.isExcludedFromWindowsMenu = true
+        panel.sharingType = .readOnly
+        panel.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary, .ignoresCycle]
+        panel.tabbingMode = .disallowed
+        return panel
     }
 
     // MARK: - Initialization
@@ -311,6 +342,16 @@ public class MenuBarManager: ObservableObject {
             queue: .main
         ) { [weak self] notification in
             self?.handleCaptureObservedNotification(notification)
+        }
+
+        NotificationCenter.default.addObserver(
+            forName: ConferenceConsentStateNotification.didChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            self?.conferenceConsentMenuState = ConferenceConsentMenuState.from(
+                notificationUserInfo: notification.userInfo
+            )
         }
     }
 
@@ -1086,6 +1127,49 @@ public class MenuBarManager: ObservableObject {
         }
     }
 
+    private func visibleConferenceConsentState() -> ConferenceConsentMenuState? {
+        guard let state = conferenceConsentMenuState,
+              state.isVisible() else { return nil }
+        return state
+    }
+
+    private func activeConferenceConsentState() -> ConferenceConsentMenuState? {
+        guard let state = visibleConferenceConsentState() else { return nil }
+        guard state.canDisableFaceBlur else { return nil }
+        return state
+    }
+
+    static func conferenceConsentMenuItemTitle(
+        for state: ConferenceConsentMenuState,
+        truncatedTitleLimit: Int = 30
+    ) -> String {
+        guard state.isBlurBypassedForConsent else {
+            return state.canDisableFaceBlur ? "Disable Face Blurring This Call" : "Face Blurring Enabled"
+        }
+
+        let trimmedTitle = state.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedTitle.isEmpty else {
+            return "Blurring is disabled for this call"
+        }
+
+        let truncatedTitle = truncatedConferenceConsentCallTitle(
+            trimmedTitle,
+            limit: truncatedTitleLimit
+        )
+        return "Blurring is disabled for '\(truncatedTitle)'"
+    }
+
+    static func truncatedConferenceConsentCallTitle(
+        _ title: String,
+        limit: Int
+    ) -> String {
+        guard limit > 1, title.count > limit else {
+            return title
+        }
+
+        return String(title.prefix(max(1, limit - 1))) + "…"
+    }
+
     /// Refresh only the recording-controls section while status menu is open.
     /// This keeps the menu visible and updates pause rows immediately after toggle changes.
     private func refreshOpenRecordingControlsIfNeeded() {
@@ -1173,6 +1257,17 @@ public class MenuBarManager: ObservableObject {
 
         // Recording controls
         addRecordingControls(to: menu)
+
+        if let conferenceConsentState = visibleConferenceConsentState() {
+            let consentItem = NSMenuItem(
+                title: Self.conferenceConsentMenuItemTitle(for: conferenceConsentState),
+                action: conferenceConsentState.canDisableFaceBlur ? #selector(disableFaceBlurThisCall) : nil,
+                keyEquivalent: ""
+            )
+            consentItem.image = NSImage(systemSymbolName: "person.crop.circle.badge.checkmark", accessibilityDescription: nil)
+            consentItem.isEnabled = conferenceConsentState.canDisableFaceBlur
+            menu.addItem(consentItem)
+        }
 
         menu.addItem(NSMenuItem.separator())
 
@@ -1431,6 +1526,180 @@ public class MenuBarManager: ObservableObject {
         toggleTimelineOverlay()
     }
 
+    @objc private func disableFaceBlurThisCall() {
+        guard let state = activeConferenceConsentState(), let consentSessionID = state.consentSessionID else {
+            Log.warning("[FaceBlurConsentUI] Menu action invoked without an active conference consent state", category: .ui)
+            return
+        }
+
+        Log.info(
+            "[FaceBlurConsentUI] Presenting consent dialog",
+            category: .ui
+        )
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            UIMetricsRecorder.recordDictionary(
+                coordinator: coordinator, type: .conferencePrivacy,
+                payload: ["action": "consent_dialog", "outcome": "opened", "source": "menu_bar"]
+            )
+            presentFaceBlurConsentDialog(callTitle: state.title) { [weak self] didConfirm in
+                Log.info(
+                    "[FaceBlurConsentUI] Consent dialog decision confirmed=\(didConfirm)",
+                    category: .ui
+                )
+                guard let self else { return }
+                UIMetricsRecorder.recordDictionary(
+                    coordinator: coordinator, type: .conferencePrivacy,
+                    payload: [
+                        "action": "consent_dialog", "outcome": didConfirm ? "confirmed" : "cancelled",
+                        "source": "menu_bar"
+                    ]
+                )
+                guard didConfirm else { return }
+
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    let didApply = await coordinator.disableFaceBlurForConferenceCall(callID: consentSessionID)
+                    if didApply {
+                        conferenceConsentMenuState = ConferenceConsentMenuState(
+                            callID: state.callID,
+                            title: state.title,
+                            lastObservedAt: Date(),
+                            isBlurBypassedForConsent: true,
+                            consentSessionID: consentSessionID
+                        )
+                        setupMenu()
+                        return
+                    }
+
+                    let failureAlert = NSAlert()
+                    failureAlert.alertStyle = .informational
+                    failureAlert.messageText = "Couldn’t Disable Face Blur"
+                    failureAlert.informativeText = "Retrace could not apply the per-call consent override. Try again while the call is active."
+                    failureAlert.addButton(withTitle: "OK")
+                    failureAlert.runModal()
+                }
+            }
+        }
+    }
+
+    @MainActor
+    private func preferredConsentDialogOrigin(panelSize: CGSize) -> NSPoint? {
+        let mouseLocation = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first { NSMouseInRect(mouseLocation, $0.frame, false) }
+            ?? NSScreen.main
+        guard let screen else { return nil }
+
+        let visible = screen.visibleFrame
+        return NSPoint(
+            x: visible.midX - panelSize.width / 2,
+            y: visible.midY - panelSize.height / 2
+        )
+    }
+
+    @MainActor
+    private func presentFaceBlurConsentDialog(
+        callTitle: String,
+        onDecision: @escaping (Bool) -> Void
+    ) {
+        faceBlurConsentWindowController?.close()
+        faceBlurConsentWindowController = nil
+
+        let panelSize = CGSize(width: 420, height: 284)
+        let panel = Self.makeFaceBlurConsentPanel(
+            contentRect: NSRect(origin: .zero, size: panelSize)
+        )
+
+        let controller = NSWindowController(window: panel)
+        faceBlurConsentWindowController = controller
+
+        let closePanel: (Bool) -> Void = { [weak self] didConfirm in
+            self?.faceBlurConsentWindowController?.close()
+            self?.faceBlurConsentWindowController = nil
+            onDecision(didConfirm)
+        }
+
+        let rootView = FaceBlurConsentDialogView(
+            callTitle: callTitle,
+            onConfirm: {
+                closePanel(true)
+            },
+            onCancel: {
+                closePanel(false)
+            }
+        )
+        panel.onEscape = {
+            closePanel(false)
+        }
+        let hostingController = NSHostingController(rootView: rootView)
+        hostingController.view.wantsLayer = true
+        hostingController.view.layer?.backgroundColor = NSColor.clear.cgColor
+        if #available(macOS 10.15, *) {
+            hostingController.view.layer?.cornerCurve = .continuous
+        }
+        hostingController.view.layer?.cornerRadius = 28
+        hostingController.view.layer?.masksToBounds = true
+        panel.contentViewController = hostingController
+        applyFaceBlurConsentWindowMask(to: panel)
+        panel.setContentSize(panelSize)
+        logFaceBlurConsentPanelState(panel, reason: "before_positioning")
+
+        if let origin = preferredConsentDialogOrigin(panelSize: panelSize) {
+            panel.setFrameOrigin(origin)
+            Log.info(
+                "[FaceBlurConsentUI] Showing consent dialog at origin=\(origin)",
+                category: .ui
+            )
+        } else {
+            panel.center()
+            Log.info(
+                "[FaceBlurConsentUI] Showing consent dialog centered on screen",
+                category: .ui
+            )
+        }
+
+        controller.window = panel
+        panel.makeKeyAndOrderFront(nil)
+        panel.orderFrontRegardless()
+        logFaceBlurConsentPanelState(panel, reason: "after_order_front")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self, weak panel] in
+            guard let self, let panel else { return }
+            self.logFaceBlurConsentPanelState(panel, reason: "after_50ms")
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self, weak panel] in
+            guard let self, let panel else { return }
+            self.logFaceBlurConsentPanelState(panel, reason: "after_250ms")
+        }
+    }
+
+    @MainActor
+    private func applyFaceBlurConsentWindowMask(to window: NSWindow) {
+        guard let contentView = window.contentView else { return }
+        contentView.wantsLayer = true
+        contentView.layer?.backgroundColor = NSColor.clear.cgColor
+        if #available(macOS 10.15, *) {
+            contentView.layer?.cornerCurve = .continuous
+        }
+        contentView.layer?.cornerRadius = 28
+        contentView.layer?.masksToBounds = true
+    }
+
+    @MainActor
+    private func logFaceBlurConsentPanelState(_ panel: NSPanel, reason: String) {
+        let screenDescription: String
+        if let screen = panel.screen {
+            screenDescription = "frame=\(screen.frame) visible=\(screen.visibleFrame)"
+        } else {
+            screenDescription = "nil"
+        }
+        let occlusionVisible = panel.occlusionState.contains(.visible)
+        Log.info(
+            "[FaceBlurConsentUI] PanelState reason=\(reason) windowNumber=\(panel.windowNumber) visible=\(panel.isVisible) key=\(panel.isKeyWindow) main=\(panel.isMainWindow) mini=\(panel.isMiniaturized) alpha=\(String(format: "%.2f", panel.alphaValue)) level=\(panel.level.rawValue) occlusionVisible=\(occlusionVisible) frame=\(panel.frame) screen=\(screenDescription) appActive=\(NSApp.isActive)",
+            category: .ui
+        )
+    }
+
     @objc private func openSearch() {
         // Open the timeline search overlay without resetting existing search state.
         Task { @MainActor in
@@ -1632,6 +1901,165 @@ public class MenuBarManager: ObservableObject {
         autoResumeCountdownTimer?.invalidate()
         scheduledResumeTask?.cancel()
         teardownStatusClickMonitors()
+    }
+}
+
+private struct FaceBlurConsentDialogView: View {
+    let callTitle: String
+    let onConfirm: () -> Void
+    let onCancel: () -> Void
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            RoundedRectangle(cornerRadius: 28, style: .continuous)
+                .fill(
+                    LinearGradient(
+                        colors: [
+                            Color(red: 0.10, green: 0.17, blue: 0.30).opacity(0.96),
+                            Color(red: 0.08, green: 0.12, blue: 0.22).opacity(0.94)
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 28, style: .continuous)
+                        .stroke(Color.white.opacity(0.18), lineWidth: 1)
+                )
+                .shadow(color: Color.black.opacity(0.35), radius: 24, x: 0, y: 16)
+
+            VStack(alignment: .leading, spacing: 18) {
+                ZStack(alignment: .topLeading) {
+                    FaceBlurConsentWindowDragHandle()
+
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack(spacing: 7) {
+                            Image(systemName: "checkmark.shield")
+                                .font(.system(size: 10, weight: .bold))
+                            Text("Consent Required")
+                                .font(.system(size: 11, weight: .semibold))
+                        }
+                        .foregroundStyle(Color.white.opacity(0.74))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(
+                            Capsule(style: .continuous)
+                                .fill(Color.white.opacity(0.08))
+                                .overlay(
+                                    Capsule(style: .continuous)
+                                        .stroke(Color.white.opacity(0.12), lineWidth: 1)
+                                )
+                        )
+
+                        HStack(alignment: .center, spacing: 12) {
+                            ZStack {
+                                Circle()
+                                    .fill(Color(red: 0.95, green: 0.29, blue: 0.33).opacity(0.20))
+                                    .frame(width: 38, height: 38)
+                                Image(systemName: "person.2.slash.fill")
+                                    .font(.system(size: 17, weight: .semibold))
+                                    .foregroundStyle(Color(red: 0.99, green: 0.42, blue: 0.45))
+                            }
+
+                            Text("Disable Face Blurring This Call?")
+                                .font(.system(size: 19, weight: .bold))
+                                .foregroundStyle(.white)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, minHeight: 76, alignment: .topLeading)
+
+                Text("Only continue if you obtained consent from everyone in this call to record without face blurring.")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(Color.white.opacity(0.92))
+                    .lineSpacing(1.2)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Text(callTitle)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(Color.white.opacity(0.85))
+                    .lineLimit(2)
+
+                HStack(spacing: 12) {
+                    Button("Cancel", action: onCancel)
+                        .buttonStyle(FaceBlurConsentSecondaryButtonStyle())
+                        .keyboardShortcut(.cancelAction)
+
+                    Button("I got consent", action: onConfirm)
+                        .buttonStyle(FaceBlurConsentPrimaryButtonStyle())
+                        .keyboardShortcut(.defaultAction)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .padding(.horizontal, 22)
+            .padding(.top, 18)
+            .padding(.bottom, 20)
+        }
+        .frame(width: 420, height: 284)
+    }
+}
+
+private struct FaceBlurConsentWindowDragHandle: NSViewRepresentable {
+    func makeNSView(context: Context) -> FaceBlurConsentWindowDragHandleView {
+        FaceBlurConsentWindowDragHandleView()
+    }
+
+    func updateNSView(_ nsView: FaceBlurConsentWindowDragHandleView, context: Context) {}
+}
+
+private final class FaceBlurConsentWindowDragHandleView: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        self
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        window?.performDrag(with: event)
+    }
+}
+
+private struct FaceBlurConsentPrimaryButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 14, weight: .semibold))
+            .foregroundStyle(.white)
+            .frame(maxWidth: .infinity)
+            .frame(height: 34)
+            .background(
+                RoundedRectangle(cornerRadius: 11, style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            colors: [
+                                Color(red: 0.95, green: 0.29, blue: 0.33),
+                                Color(red: 0.84, green: 0.18, blue: 0.23)
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+            )
+            .opacity(configuration.isPressed ? 0.86 : 1)
+            .scaleEffect(configuration.isPressed ? 0.99 : 1)
+    }
+}
+
+private struct FaceBlurConsentSecondaryButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 14, weight: .semibold))
+            .foregroundStyle(Color.white.opacity(0.95))
+            .frame(maxWidth: .infinity)
+            .frame(height: 34)
+            .background(
+                RoundedRectangle(cornerRadius: 11, style: .continuous)
+                    .fill(Color.white.opacity(0.10))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 11, style: .continuous)
+                            .stroke(Color.white.opacity(0.18), lineWidth: 1)
+                    )
+            )
+            .opacity(configuration.isPressed ? 0.85 : 1)
+            .scaleEffect(configuration.isPressed ? 0.99 : 1)
     }
 }
 

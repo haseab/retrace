@@ -8,7 +8,7 @@ import Shared
 /// Vision framework implementation of OCRProtocol
 public final class VisionOCR: OCRProtocol, @unchecked Sendable {
     /// Recognition languages for OCR
-    private let recognitionLanguages: [String]
+    let recognitionLanguages: [String]
 
     public init(recognitionLanguages: [String] = ["en-US"]) {
         self.recognitionLanguages = recognitionLanguages
@@ -203,6 +203,11 @@ public final class VisionOCR: OCRProtocol, @unchecked Sendable {
         config: ProcessingConfig,
         extractInstrumentation: ProcessingExtractRequestInstrumentation?
     ) async throws -> RegionOCRResult {
+        if let normalized = frame.metadata.ocrRegions,
+           let regions = WindowOCRPlanner.pixelRegions(normalized, width: frame.width, height: frame.height) {
+            return try await recognizeWindowRegions(frame: frame, previousFrame: previousFrame,
+                cache: cache, config: config, pixelRegions: regions)
+        }
         let totalStartTime = Date()
         let regionReason = "processing.ocr.vision_region"
         if let extractInstrumentation {
@@ -218,7 +223,8 @@ public final class VisionOCR: OCRProtocol, @unchecked Sendable {
         let cacheInvalidated = await cache.validateForFrame(
             width: frame.width,
             height: frame.height,
-            appBundleID: frame.metadata.appBundleID
+            appBundleID: frame.metadata.appBundleID,
+            displayID: frame.metadata.displayID
         )
 
         let tileConfig = TileGridConfig.default

@@ -18,6 +18,7 @@ public actor RetentionManager {
     private let storage: StorageManager
     private let search: SearchManager
 
+    private var cleanupInFlight: Task<RetentionCleanupResult, Never>?
     private var cleanupTask: Task<Void, Never>?
     private var isRunning = false
 
@@ -89,7 +90,7 @@ public actor RetentionManager {
     /// Get the current retention policy from user settings
     /// Returns nil if retention is set to "Forever" (0 days)
     public nonisolated func getRetentionDays() -> Int? {
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
         let days = defaults.integer(forKey: "retentionDays")
         return days == 0 ? nil : days
     }
@@ -111,7 +112,7 @@ public actor RetentionManager {
         // Exclusions disabled - always return empty set
         return []
         // Original code (commented out):
-        // let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        // let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
         // guard let appsString = defaults.string(forKey: "retentionExcludedApps"), !appsString.isEmpty else {
         //     return []
         // }
@@ -124,7 +125,7 @@ public actor RetentionManager {
         // Exclusions disabled - always return empty set
         return []
         // Original code (commented out):
-        // let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        // let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
         // guard let tagsString = defaults.string(forKey: "retentionExcludedTagIds"), !tagsString.isEmpty else {
         //     return []
         // }
@@ -137,7 +138,7 @@ public actor RetentionManager {
         // Exclusions disabled - never exclude hidden items
         return false
         // Original code (commented out):
-        // let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        // let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
         // return defaults.bool(forKey: "retentionExcludeHidden")
     }
 
@@ -158,6 +159,15 @@ public actor RetentionManager {
     /// Run the cleanup process
     @discardableResult
     public func runCleanup() async -> RetentionCleanupResult {
+        if let cleanupInFlight { return await cleanupInFlight.value }
+        let task = Task { await self.performCleanup() }
+        cleanupInFlight = task
+        let result = await task.value
+        cleanupInFlight = nil
+        return result
+    }
+
+    private func performCleanup() async -> RetentionCleanupResult {
         guard let cutoffDate = getCutoffDate() else {
             Log.debug("[RetentionManager] Retention set to Forever - no cleanup needed", category: .app)
             return RetentionCleanupResult(
@@ -202,33 +212,29 @@ public actor RetentionManager {
             Log.info("[RetentionManager] Deleted \(deletedSegmentCount) app segments", category: .app)
 
             // Step 4: Delete orphaned video segments and their files
-            var reclaimedBytes: Int64 = 0
-            var deletedVideoCount = 0
-
-            for videoSegment in videoSegmentsToDelete {
-                do {
-                    // Get file size before deletion
-                    let segmentPath = try await storage.getSegmentPath(id: videoSegment)
-                    if let attrs = try? FileManager.default.attributesOfItem(atPath: segmentPath.path),
-                       let size = attrs[.size] as? Int64 {
-                        reclaimedBytes += size
-                    }
-
-                    // Delete from storage (file)
-                    try await storage.deleteSegment(id: videoSegment)
-
-                    // Delete from database
-                    try await database.deleteVideoSegment(id: videoSegment)
-
-                    deletedVideoCount += 1
-                } catch {
-                    Log.warning("[RetentionManager] Failed to delete video segment \(videoSegment.value): \(error)", category: .app)
+            let root = await storage.getStorageDirectory()
+            let journal = RetentionDeletionJournal(url: root.appendingPathComponent("retention-pending-video-deletions.json"))
+            let outcome = try await journal.process(
+                candidates: videoSegmentsToDelete.map(\.value),
+                deleteDatabase: { [database] id in
+                    try await database.deleteUnreferencedVideoSegment(id: VideoSegmentID(value: id))
+                },
+                deleteFile: { [storage] id in
+                    let videoID = VideoSegmentID(value: id)
+                    let path: URL
+                    do { path = try await storage.getSegmentPath(id: videoID) }
+                    catch StorageError.fileNotFound { return 0 }
+                    let values = try path.resourceValues(forKeys: [.fileSizeKey])
+                    try await storage.deleteSegment(id: videoID)
+                    return Int64(values.fileSize ?? 0)
                 }
-            }
+            )
+            let reclaimedBytes = outcome.bytes
+            let deletedVideoCount = outcome.deleted
             Log.info("[RetentionManager] Deleted \(deletedVideoCount) video segments, reclaimed \(formatBytes(reclaimedBytes))", category: .app)
 
             // Step 5: Clean up orphaned nodes (OCR data) for deleted frames
-            let deletedNodesCount = try await cleanupOrphanedNodes()
+            let deletedNodesCount = deletedFrameCount > 0 ? try await cleanupOrphanedNodes() : 0
             if deletedNodesCount > 0 {
                 Log.info("[RetentionManager] Cleaned up \(deletedNodesCount) orphaned OCR nodes", category: .app)
             }

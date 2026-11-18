@@ -110,7 +110,7 @@ public enum CrashRecoverySupport {
     public static let crashRecoverySourceArgument = "--retrace-crash-recovery-source"
     public static let registeredBuildKey = "crashRecoveryRegisteredBuild"
     public static let registeredLaunchTargetPathKey = "crashRecoveryRegisteredLaunchTargetPath"
-    public static let preferencesSuiteName = "io.retrace.app"
+    public static let preferencesSuiteName = Bundle.main.bundleIdentifier == "io.retrace.app.dev" ? "io.retrace.app.dev" : "io.retrace.app"
     public static let restartDebuggingLabelName = "restartDebugging"
     public static let restartDebuggingPendingMaxAgeSeconds: TimeInterval = 15 * 60
     public static let disconnectSuppressionMaxAgeSeconds: TimeInterval = 20

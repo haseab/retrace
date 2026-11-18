@@ -23,7 +23,7 @@ public enum EmergencyDiagnostics {
 
     /// Directory where emergency crash reports are written
     public static var crashReportDirectory: String {
-        let support = NSString(string: "~/Library/Application Support/Retrace/crash_reports").expandingTildeInPath
+        let support = NSString(string: "~/Library/Application Support/\(AppPaths.applicationSupportName)/crash_reports").expandingTildeInPath
         return support
     }
 
