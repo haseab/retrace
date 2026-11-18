@@ -173,7 +173,8 @@ public struct SimpleTimelineView: View {
                         if showFrameCard {
                             DebugFrameIDBadge(viewModel: viewModel)
                         }
-                        // OCR status indicator (only visible when OCR is in progress)
+                        FrameTextScanButton(viewModel: viewModel)
+                        // Background processing status remains separate from an on-demand scan.
                         OCRStatusIndicator(viewModel: viewModel)
                         #if DEBUG
                         DeveloperActionsMenu(viewModel: viewModel, onClose: onClose)
@@ -185,8 +186,8 @@ public struct SimpleTimelineView: View {
                         .allowsHitTesting(false)
                 }
                 .padding(.spacingL)
-                .offset(y: viewModel.areControlsHidden ? TimelineScaleFactor.closeButtonHiddenYOffset : 0)
-                .opacity(viewModel.areControlsHidden || viewModel.isDraggingZoomRegion ? 0 : 1)
+                .offset(y: viewModel.areControlsHidden && viewModel.frameTextScanState == .idle ? TimelineScaleFactor.closeButtonHiddenYOffset : 0)
+                .opacity((viewModel.areControlsHidden && viewModel.frameTextScanState == .idle) || viewModel.isDraggingZoomRegion ? 0 : 1)
 
                 #if DEBUG
                 if viewModel.showBrowserURLDebugWindow {
@@ -294,6 +295,23 @@ public struct SimpleTimelineView: View {
 
                 // Search overlay (Cmd+K) - uses persistent searchViewModel to preserve results
                 searchOverlay
+
+                // A brief outline makes freshly recognized text discoverable without selecting it.
+                if viewModel.frameTextScanState == .ready, !viewModel.isZoomRegionActive {
+                    Path { path in
+                        for node in viewModel.ocrNodes {
+                            path.addRoundedRect(in: CGRect(
+                                x: actualFrameRect.minX + node.x * actualFrameRect.width,
+                                y: actualFrameRect.minY + node.y * actualFrameRect.height,
+                                width: node.width * actualFrameRect.width,
+                                height: node.height * actualFrameRect.height
+                            ), cornerSize: CGSize(width: 2, height: 2))
+                        }
+                    }
+                    .stroke(Color.accentColor.opacity(0.55), lineWidth: 1)
+                    .allowsHitTesting(false)
+                    .transition(.opacity)
+                }
 
                 // OCR debug overlay (dev setting)
                 ocrDebugOverlay(containerSize: geometry.size, actualFrameRect: actualFrameRect)
@@ -6428,6 +6446,60 @@ struct DebugBrowserURLWindow: View {
         }
 
         return lines.joined(separator: "\n")
+    }
+}
+
+/// The action stays in place while its spinner and label communicate progress.
+struct FrameTextScanButton: View {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+
+    private var title: String {
+        switch viewModel.frameTextScanState {
+        case .idle: return "Scan Text"
+        case .scanning: return "Scanning Text…"
+        case .ready: return "Text Ready"
+        case .empty: return "No Text Found"
+        case .failed: return "Scan Failed · Retry"
+        case .protected: return "Protected Frame"
+        }
+    }
+
+    private var symbol: String {
+        switch viewModel.frameTextScanState {
+        case .ready: return "checkmark.circle"
+        case .failed: return "arrow.clockwise"
+        case .protected: return "lock"
+        default: return "text.viewfinder"
+        }
+    }
+
+    var body: some View {
+        Button { viewModel.scanCurrentFrameText() } label: {
+            HStack(spacing: 6) {
+                if viewModel.frameTextScanState == .scanning {
+                    ProgressView().controlSize(.small)
+                        .frame(width: 16, height: 16)
+                } else {
+                    Image(systemName: symbol).frame(width: 16, height: 16)
+                }
+                Text(title)
+            }
+            .font(.system(size: 12, weight: .medium))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+            .background(
+                viewModel.frameTextScanState == .scanning ? Color.accentColor.opacity(0.25) : Color.black.opacity(0.65),
+                in: RoundedRectangle(cornerRadius: 8)
+            )
+            .foregroundStyle(.white)
+        }
+        .buttonStyle(.plain)
+        .disabled(!viewModel.canScanCurrentFrameText || viewModel.frameTextScanState == .scanning)
+        .help(viewModel.frameTextScanState == .protected
+              ? "Scanning is unavailable for frames containing redacted text."
+              : "Scan text in this frame (⌘⇧O). Text is available for this viewing session.")
+        .accessibilityLabel(title)
+        .accessibilityHint("Recognize text in the current frame. Command Shift O.")
     }
 }
 

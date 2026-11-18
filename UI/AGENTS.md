@@ -655,6 +655,7 @@ struct BoundingBoxOverlay: View {
 |----------|--------|
 | `Cmd+Shift+T` | Open Timeline |
 | `Cmd+F` | Open Search |
+| `Cmd+Shift+O` | Scan text in the current timeline frame |
 | `Cmd+,` | Open Settings |
 | `/` | Focus search bar |
 | `←/→` | Previous/Next frame |
@@ -786,3 +787,13 @@ Timeline index touches do not rescan sizes. JPEG NSCache entries have compressed
 Bundled development runs use `AppPaths` to isolate settings, library, Keychain service, logs, preview caches and instance locks for `io.retrace.app.dev`. Never launch a dev build against hardcoded production domains. The production crash-recovery launch agent stays disarmed in the dev app; debugging one app must not manage the other app’s helper.
 
 - `Tests/QuitRecoveryTests.swift` covers intentional quit cancellation of pending watchdog recovery.
+
+### On-demand timeline OCR
+
+The timeline's Scan Text button and Cmd+Shift+O run session-only Vision OCR for native,
+imported, and live images. The button displays scanning, success, no-text, failure/retry,
+and protected-frame states. Historical scans check saved redaction metadata first;
+protected frames retain their existing overlays. Saved OCR and search indexes are unchanged.
+Navigation, a new live screenshot, and closing the timeline invalidate pending results.
+`timeline_text_scan` records entry/outcome without recognized text; manual OCR latency uses
+`timeline.manual_ocr.total_ms`.

@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import Combine
 import App
 import Shared
 
@@ -370,7 +371,7 @@ struct DashboardContentView: View {
         self._dashboardViewModel = StateObject(wrappedValue: dashboardViewModel)
     }
 
-    var body: some View {
+    private var dashboardWithAppearanceNotifications: some View {
         ZStack {
             if let showOnboarding = showOnboarding {
                 if showOnboarding {
@@ -427,6 +428,10 @@ struct DashboardContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: .fontStyleDidChange)) { _ in
             appearanceRefreshTick &+= 1
         }
+    }
+
+    private var dashboardWithSettingsNotifications: some View {
+        dashboardWithAppearanceNotifications
         .onReceive(NotificationCenter.default.publisher(for: .toggleSettings)) { _ in
             // Toggle: if on settings go to dashboard, otherwise go to settings
             let targetView: DashboardSelectedView
@@ -478,6 +483,10 @@ struct DashboardContentView: View {
             DashboardWindowController.shared.show()
             updateDashboardWindowTitle()
         }
+    }
+
+    var body: some View {
+        dashboardWithSettingsNotifications
         .onReceive(NotificationCenter.default.publisher(for: .openSettingsPauseReminderInterval)) { _ in
             initialSettingsTab = .capture
             initialSettingsScrollTargetID = SettingsView.pauseReminderIntervalTargetID
