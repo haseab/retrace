@@ -407,7 +407,7 @@ public actor StorageManager: StorageProtocol {
     private static let memoryLedgerGeneratorCacheTag = "storage.videoDecoding.generatorCache"
     private static let memoryLedgerDecoderHeapTag = "storage.videoDecoding.decoderHeap"
     private static let memoryLedgerDecodeSurfaceTag = "storage.videoDecoding.decodeSurface"
-    private static let memoryLedgerAppKitBridgeTag = "storage.videoDecoding.appKitBridge"
+    private static let memoryLedgerJPEGEncodingTag = "storage.videoDecoding.jpegEncoding"
     private static let memoryLedgerFrameCacheTag = "storage.videoDecoding.frameCache"
     private static let memoryLedgerCIContextTag = "storage.videoDecoding.ciContext"
     private static let discardableQuarantinedWALRetentionInterval: TimeInterval = 7 * 24 * 60 * 60
@@ -488,12 +488,12 @@ public actor StorageManager: StorageProtocol {
 
     private enum VideoDecodingTransientBucket {
         case decodeSurface
-        case appKitBridge
+        case jpegEncoding
         case ciContext
     }
 
     private var activeDecodeSurfaceBytesByToken: [UUID: Int64] = [:]
-    private var activeAppKitBridgeBytesByToken: [UUID: Int64] = [:]
+    private var activeJPEGEncodingBytesByToken: [UUID: Int64] = [:]
     private var activeCIContextBytesByToken: [UUID: Int64] = [:]
     private var decodeRetainedGenerationByCacheKey: [String: UInt64] = [:]
 
@@ -1183,22 +1183,22 @@ public actor StorageManager: StorageProtocol {
     /// Convert CGImage to JPEG data
     private func convertCGImageToJPEG(_ cgImage: CGImage) throws -> Data {
         let bridgeToken = beginVideoDecodingTransientBytes(
-            bucket: .appKitBridge,
-            bytes: Self.estimatedAppKitBridgeBytes(width: cgImage.width, height: cgImage.height),
-            reason: "storage.video_decoding.jpeg_bridge"
+            bucket: .jpegEncoding,
+            bytes: Self.estimatedJPEGEncodingBytes(width: cgImage.width, height: cgImage.height),
+            reason: "storage.video_decoding.jpeg_encoding"
         )
         defer {
             endVideoDecodingTransientBytes(
-                bucket: .appKitBridge,
+                bucket: .jpegEncoding,
                 token: bridgeToken,
-                reason: "storage.video_decoding.jpeg_bridge"
+                reason: "storage.video_decoding.jpeg_encoding"
             )
         }
 
         // Encode straight from the CGImage via ImageIO, avoiding the
         // NSImage -> tiffRepresentation -> NSBitmapImageRep round-trip (a full
-        // uncompressed frame copy + re-decode). The transient-bytes ledger
-        // accounting above is kept so memory telemetry stays consistent.
+        // uncompressed frame copy + re-decode). The ledger tracks an estimated
+        // ImageIO scratch/output budget rather than the removed TIFF bridge.
         let data = NSMutableData()
         guard let destination = CGImageDestinationCreateWithData(
             data as CFMutableData,
@@ -2075,8 +2075,8 @@ public actor StorageManager: StorageProtocol {
         switch bucket {
         case .decodeSurface:
             activeDecodeSurfaceBytesByToken[token] = max(0, bytes)
-        case .appKitBridge:
-            activeAppKitBridgeBytesByToken[token] = max(0, bytes)
+        case .jpegEncoding:
+            activeJPEGEncodingBytesByToken[token] = max(0, bytes)
         case .ciContext:
             activeCIContextBytesByToken[token] = max(0, bytes)
         }
@@ -2100,8 +2100,8 @@ public actor StorageManager: StorageProtocol {
         switch bucket {
         case .decodeSurface:
             activeDecodeSurfaceBytesByToken.removeValue(forKey: token)
-        case .appKitBridge:
-            activeAppKitBridgeBytesByToken.removeValue(forKey: token)
+        case .jpegEncoding:
+            activeJPEGEncodingBytesByToken.removeValue(forKey: token)
         case .ciContext:
             activeCIContextBytesByToken.removeValue(forKey: token)
         }
@@ -2126,7 +2126,7 @@ public actor StorageManager: StorageProtocol {
         let decodeSurfaceBytes = activeDecodeSurfaceBytesByToken.values.reduce(into: Int64(0)) { partialResult, bytes in
             partialResult += bytes
         }
-        let appKitBridgeBytes = activeAppKitBridgeBytesByToken.values.reduce(into: Int64(0)) { partialResult, bytes in
+        let jpegEncodingBytes = activeJPEGEncodingBytesByToken.values.reduce(into: Int64(0)) { partialResult, bytes in
             partialResult += bytes
         }
         let ciContextBytes = activeCIContextBytesByToken.values.reduce(into: Int64(0)) { partialResult, bytes in
@@ -2171,12 +2171,12 @@ public actor StorageManager: StorageProtocol {
             note: "estimated-native"
         )
         MemoryLedger.set(
-            tag: Self.memoryLedgerAppKitBridgeTag,
-            bytes: appKitBridgeBytes,
-            count: activeAppKitBridgeBytesByToken.count,
-            unit: "bridges",
+            tag: Self.memoryLedgerJPEGEncodingTag,
+            bytes: jpegEncodingBytes,
+            count: activeJPEGEncodingBytesByToken.count,
+            unit: "encoders",
             function: "storage.video_decoding",
-            kind: "appkit-jpeg-bridge",
+            kind: "imageio-jpeg-encoding",
             note: "proxy-native"
         )
         MemoryLedger.set(
@@ -2212,10 +2212,11 @@ public actor StorageManager: StorageProtocol {
         return max(frameBytes / 2, 8 * 1_024 * 1_024)
     }
 
-    private static func estimatedAppKitBridgeBytes(width: Int, height: Int) -> Int64 {
+    private static func estimatedJPEGEncodingBytes(width: Int, height: Int) -> Int64 {
         let frameBytes = estimatedFrameBytes(width: width, height: height)
         guard frameBytes > 0 else { return 0 }
-        return max(frameBytes * 2, 16 * 1_024 * 1_024)
+        // Proxy for encoder scratch and output headroom, not an allocation cap.
+        return frameBytes + 1 * 1_024 * 1_024
     }
 
     private static func estimatedCIContextBytes() -> Int64 {

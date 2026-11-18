@@ -281,15 +281,19 @@ func readFrame(segmentID: SegmentID, frameIndex: Int) async throws -> Data {
 
     let cgImage = try generator.copyCGImage(at: time, actualTime: nil)
 
-    // Convert to Data (JPEG for efficiency)
-    let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
-    guard let tiffData = nsImage.tiffRepresentation,
-          let bitmap = NSBitmapImageRep(data: tiffData),
-          let jpegData = bitmap.representation(using: .jpeg, properties: [.compressionFactor: 0.8]) else {
-        throw StorageError.fileReadFailed(path: path.path, underlying: "Failed to convert frame")
+    // Encode directly to JPEG; no intermediate TIFF/AppKit bitmap conversion.
+    let data = NSMutableData()
+    guard let destination = CGImageDestinationCreateWithData(
+        data as CFMutableData, "public.jpeg" as CFString, 1, nil
+    ) else {
+        throw StorageError.fileReadFailed(path: path.path, underlying: "Failed to create JPEG encoder")
     }
-
-    return jpegData
+    CGImageDestinationAddImage(destination, cgImage,
+        [kCGImageDestinationLossyCompressionQuality: 0.8] as CFDictionary)
+    guard CGImageDestinationFinalize(destination) else {
+        throw StorageError.fileReadFailed(path: path.path, underlying: "Failed to finalize JPEG")
+    }
+    return data as Data
 }
 ```
 
@@ -367,3 +371,8 @@ Start with the HEVC encoder since that's the core complexity, then add encryptio
 ### Encoder output inspection
 
 Keep the pre-append existence check for recovery before writing the next frame. After append, `outputFileSizeIfPresent` performs one attributes lookup for both missing-file detection and fragment size/frontier tracking. Missing paths trigger immediate recreation; empty existing files are not missing. Other metadata I/O failures propagate without treating the file as deleted or recreating the writer. Fragment thresholds and durable-frontier accounting remain unchanged.
+
+
+### JPEG frame extraction
+
+`ImageExtractor` implementations and `StorageManager` encode CGImage frames directly with ImageIO at quality 0.8. Do not reintroduce an NSImage/TIFF/NSBitmapImageRep round trip. JPEG conversion telemetry uses the `storage.videoDecoding.jpegEncoding` tag and a one-frame-plus-output-headroom proxy; this is an estimate, not measured allocation or a memory limit. Existing frame reading and real video/redaction regressions exercise decoded JPEGs. The paired encoder comparison used the same native decoded frames as both inputs and verified identical JPEG bytes for the sampled recordings.
