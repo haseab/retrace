@@ -3,6 +3,38 @@ import XCTest
 import CoreGraphics
 
 final class ConferenceROIPlannerTests: XCTestCase {
+    func testWindowMaskProjectionAccountsForRetinaAndDisplayOrigin() {
+        let projected = ConferenceWindowMaskProjection.project(
+            [CGRect(x: 20, y: 10, width: 40, height: 20)], sourceWidth: 200, sourceHeight: 100,
+            windowBounds: CGRect(x: 110, y: 70, width: 100, height: 50),
+            displayBounds: CGRect(x: 100, y: 50, width: 200, height: 100),
+            imageWidth: 400, imageHeight: 200)
+        XCTAssertEqual(projected, [CGRect(x: 40, y: 70, width: 40, height: 20)])
+    }
+
+    func testWindowMaskProjectionKeepsPartiallyOffscreenEllipseShape() {
+        let projected = ConferenceWindowMaskProjection.project(
+            [CGRect(x: 0, y: 20, width: 40, height: 40)], sourceWidth: 100, sourceHeight: 100,
+            windowBounds: CGRect(x: -20, y: 0, width: 100, height: 100),
+            displayBounds: CGRect(x: 0, y: 0, width: 100, height: 100),
+            imageWidth: 100, imageHeight: 100)
+        // Clipping this rectangle first would shrink/recenter the ellipse and
+        // leave part of the visible face unprotected. CGContext clips the path.
+        XCTAssertEqual(projected, [CGRect(x: -20, y: 20, width: 40, height: 40)])
+    }
+
+    func testWindowMaskProjectionRejectsInvisibleAndInvalidSources() {
+        let rect = CGRect(x: 0, y: 0, width: 40, height: 40)
+        let display = CGRect(x: 0, y: 0, width: 100, height: 100)
+        XCTAssertTrue(ConferenceWindowMaskProjection.project(
+            [rect], sourceWidth: 100, sourceHeight: 100,
+            windowBounds: CGRect(x: 200, y: 0, width: 100, height: 100), displayBounds: display,
+            imageWidth: 100, imageHeight: 100).isEmpty)
+        XCTAssertTrue(ConferenceWindowMaskProjection.project(
+            [rect], sourceWidth: 0, sourceHeight: 100, windowBounds: display, displayBounds: display,
+            imageWidth: 100, imageHeight: 100).isEmpty)
+    }
+
     func testWindowMetadataDoesNotProveAnOrdinaryWindowIsOpaque() {
         XCTAssertFalse(CGWindowListCapture.ConferenceROIPlanner.shouldUseAsOcclusionBlocker(
             ownerName: "Transparent overlay", appBundleID: "com.example.overlay",

@@ -59,6 +59,14 @@ struct ConferenceFaceBlurResult: Sendable {
     }
 }
 
+struct ConferenceFaceDetectionResult: Sendable {
+    let faceCount: Int
+    let detectionDurationMs: Double
+    let detectionMode: ConferenceFaceBlurResult.DetectionMode
+    let normalizedFaceRects: [CGRect]
+    let maskRects: [CGRect]
+}
+
 actor ConferenceFaceBlurProcessor {
     private let ciContext = CIContext()
 
@@ -67,6 +75,24 @@ actor ConferenceFaceBlurProcessor {
         regionOfInterest: CGRect?,
         configuration: ConferenceFaceBlurConfiguration = .production
     ) async throws -> ConferenceFaceBlurResult {
+        let detection = try detectFaces(in: image, regionOfInterest: regionOfInterest, configuration: configuration)
+        let output = try applyBlurMasks(in: image, maskRects: detection.maskRects)
+        return ConferenceFaceBlurResult(
+            blurredImage: output,
+            faceCount: detection.faceCount,
+            detectionDurationMs: detection.detectionDurationMs,
+            detectionMode: detection.detectionMode,
+            normalizedFaceRects: detection.normalizedFaceRects,
+            maskRects: detection.maskRects
+        )
+    }
+
+    /// Detection can use an isolated source image while rendering targets the desktop.
+    func detectFaces(
+        in image: CGImage,
+        regionOfInterest: CGRect?,
+        configuration: ConferenceFaceBlurConfiguration = .production
+    ) throws -> ConferenceFaceDetectionResult {
         let startedAt = CFAbsoluteTimeGetCurrent()
         let baseRegionOfInterest = Self.sanitizeRegionOfInterest(regionOfInterest)
         let requestRegions = Self.detectionRequestRegions(
@@ -94,26 +120,7 @@ actor ConferenceFaceBlurProcessor {
         let maskRects = expandedFaceRects.map(circularMaskRect(for:))
         let detectionDurationMs = max(0, (CFAbsoluteTimeGetCurrent() - startedAt) * 1000)
 
-        guard !maskRects.isEmpty else {
-            return ConferenceFaceBlurResult(
-                blurredImage: nil,
-                faceCount: 0,
-                detectionDurationMs: detectionDurationMs,
-                detectionMode: detectionMode,
-                normalizedFaceRects: mergedDetections,
-                maskRects: []
-            )
-        }
-
-        guard let output = try applyBlurMasks(
-            in: image,
-            maskRects: maskRects
-        ) else {
-            throw ConferenceFaceBlurProcessorError.outputImageCreationFailed
-        }
-
-        return ConferenceFaceBlurResult(
-            blurredImage: output,
+        return ConferenceFaceDetectionResult(
             faceCount: mergedDetections.count,
             detectionDurationMs: detectionDurationMs,
             detectionMode: detectionMode,
@@ -159,7 +166,10 @@ actor ConferenceFaceBlurProcessor {
         context.draw(blurredImage, in: fullImageRect)
         context.restoreGState()
 
-        return context.makeImage()
+        guard let output = context.makeImage() else {
+            throw ConferenceFaceBlurProcessorError.outputImageCreationFailed
+        }
+        return output
     }
 
     static func detectionRequestRegions(
