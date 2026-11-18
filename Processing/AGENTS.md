@@ -40,7 +40,7 @@ Processing/
     ├── WindowOCRTests.swift # Real Vision recognition, overlap masks, crop coordinates, exclusion and cache invalidation
     ├── ExtractRequestInstrumentationTests.swift # Region tail aggregation and coordinator helper coverage
     ├── InPageURLMetadataResolutionTests.swift # In-page URL metadata retry and rewrite scheduling regression coverage
-    ├── MemoryLedgerPendingWriteBoundTests.swift # Ledger pending-write backlog cap and ordered-write coverage
+    ├── MemoryLedgerPendingWriteBoundTests.swift # Controlled queue saturation, bounded awaited removals and ordered writes
     ├── OCRMemoryBackpressurePolicyTests.swift # OCR memory backpressure threshold/default coverage
     ├── PhraseLevelRedactionTests.swift        # Manual + automatic OCR phrase-level redaction coverage
     ├── RewriteRetryPolicyTests.swift          # Bounded automatic rewrite retry coverage
@@ -436,3 +436,5 @@ Capture-time AX: `Accessibility/AccessibilityOCRCorrector.swift` corrects OCR to
 `OCR/WindowOCR.swift` uses saved front-to-back application-window bounds, with at most one crop/request per selected window. Earlier-window intersections are painted opaque white inside lower crops; no underlying-window image is captured. Results intersecting those masks are rejected. Dirty detection considers exposed pieces only, and cache ownership excludes preceding windows so overlapping crop bounds cannot duplicate cached text. Whole dirty windows are re-recognized; unaffected windows reuse the previous OCR cache. Results retain screenshot coordinates and window order. The global request limiter caps Vision crop requests across workers to two. Crop requests use the same language-correction setting as the legacy initial full-frame request, so segmentation comparisons do not silently change spelling correction. No live window/AX lookup is allowed during historical OCR.
 
 `ProcessingManager` serializes complete cached frame extractions through async continuations because actors reenter across OCR awaits. Cache invalidation includes geometry, display ID, dimensions and foreground app. Missing/invalid geometry goes through the original pipeline, while an empty geometry list recognizes nothing. Failed/cancelled recognition must not publish partial cache results. Queue `window_ocr` metrics aggregate completed/failed frames, fallback frames, supplied rectangle counts and processing time, without text or geometry.
+
+Crop telemetry cleanup awaits `MemoryLedger.remove` outside the autorelease pool on success and failure, including cancellation. Removal waits for the ledger's capacity instead of dropping cleanup or creating an unbounded task chain; keep it within the global two-request OCR limiter. Ledger admission regressions hold the real task queue with a DEBUG-only testing SPI barrier so saturation does not depend on scheduler speed.

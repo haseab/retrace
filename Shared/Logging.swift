@@ -889,6 +889,15 @@ public enum MemoryLedger {
         _ = await pendingWriteSnapshot()?.result
     }
 
+#if DEBUG
+    /// Runs a controlled queue barrier for tests of real pending-write admission.
+    @_spi(Testing) public static func enqueuePendingWriteBarrier(
+        _ operation: @escaping @Sendable () async -> Void
+    ) -> Task<Void, Never> {
+        enqueuePendingWrite(operation)
+    }
+#endif
+
     /// Backlog depth, writes dropped because the backlog was full, and the cap itself.
     public static var pendingWriteDiagnostics: (depth: Int, dropped: Int, limit: Int) {
         pendingWriteLock.lock()
@@ -1044,25 +1053,29 @@ public enum MemoryLedger {
         _ = await task.result
     }
 
-    /// Remove a component from the ledger.
-    ///
-    /// Deliberately not droppable. A dropped `set` self-corrects on the next write of
-    /// the same tag, but a dropped `remove` would strand a component in the ledger
-    /// permanently and overstate tracked memory from then on. Removes are driven by
-    /// teardown rather than per-frame work, so they cannot be the runaway producer.
-    public static func remove(tag: String) {
+    /// Remove a component without dropping cleanup or extending a saturated queue.
+    /// Callers await both admission and completion; no task is created while full.
+    public static func remove(tag: String) async {
         guard !tag.isEmpty else { return }
-        enqueuePendingWrite {
-            await store.remove(tag: tag)
+        while true {
+            let admission = admitRemoval(tag: tag)
+            await admission.task.value
+            if admission.accepted { return }
         }
     }
 
     public static func removeOrdered(tag: String) async {
-        guard !tag.isEmpty else { return }
-        let task = enqueuePendingWrite {
-            await store.remove(tag: tag)
+        await remove(tag: tag)
+    }
+
+    private static func admitRemoval(tag: String) -> (task: Task<Void, Never>, accepted: Bool) {
+        pendingWriteLock.lock()
+        defer { pendingWriteLock.unlock() }
+        if pendingWriteDepth >= pendingWriteDepthLimit, let tail = pendingWriteTail {
+            // Suspend on existing work instead of allocating another ledger task.
+            return (tail, false)
         }
-        _ = await task.result
+        return (appendPendingWriteLocked { await store.remove(tag: tag) }, true)
     }
 
     /// Update process-level memory snapshot for tracked-vs-unattributed calculations.

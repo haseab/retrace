@@ -137,54 +137,61 @@ extension VisionOCR {
             try Task.checkCancellation()
             let task = Task.detached(priority: .utility) {
                 try Task.checkCancellation()
-                return try autoreleasepool {
-                    guard let rawCrop = image.image.cropping(to: bounds) else { throw ProcessingError.imageConversionFailed }
-                    let masks = coveredBy.map { $0.intersection(bounds) }.filter { !$0.isNull && !$0.isEmpty }
-                    let crop: CGImage
-                    if masks.isEmpty {
-                        crop = rawCrop
-                    } else {
-                        guard let context = CGContext(data: nil, width: rawCrop.width, height: rawCrop.height,
-                            bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
-                            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
-                            throw ProcessingError.imageConversionFailed
+                let tag = "processing.ocr.windowCrop.\(UUID().uuidString)"
+                do {
+                    let result: [TextRegion] = try autoreleasepool {
+                        guard let rawCrop = image.image.cropping(to: bounds) else { throw ProcessingError.imageConversionFailed }
+                        let masks = coveredBy.map { $0.intersection(bounds) }.filter { !$0.isNull && !$0.isEmpty }
+                        let crop: CGImage
+                        if masks.isEmpty {
+                            crop = rawCrop
+                        } else {
+                            guard let context = CGContext(data: nil, width: rawCrop.width, height: rawCrop.height,
+                                bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+                                throw ProcessingError.imageConversionFailed
+                            }
+                            context.draw(rawCrop, in: CGRect(origin: .zero, size: bounds.size))
+                            context.setFillColor(CGColor(gray: 1, alpha: 1))
+                            for mask in masks {
+                                context.fill(CGRect(x: mask.minX - bounds.minX, y: bounds.maxY - mask.maxY,
+                                                    width: mask.width, height: mask.height))
+                            }
+                            guard let masked = context.makeImage() else { throw ProcessingError.imageConversionFailed }
+                            crop = masked
                         }
-                        context.draw(rawCrop, in: CGRect(origin: .zero, size: bounds.size))
-                        context.setFillColor(CGColor(gray: 1, alpha: 1))
-                        for mask in masks {
-                            context.fill(CGRect(x: mask.minX - bounds.minX, y: bounds.maxY - mask.maxY,
-                                                width: mask.width, height: mask.height))
+                        MemoryLedger.set(tag: tag, bytes: Int64(crop.width) * Int64(crop.height) * (masks.isEmpty ? 4 : 8),
+                            count: 1, unit: "crops", function: "processing.ocr.window", kind: "crop-pixels")
+                        let request = VNRecognizeTextRequest()
+                        request.recognitionLevel = Self.recognitionLevel(for: config)
+                        request.recognitionLanguages = self.recognitionLanguages
+                        request.usesLanguageCorrection = Self.fullFrameRecognitionRequestConfig().usesLanguageCorrection
+                        request.preferBackgroundProcessing = config.preferBackgroundProcessing
+                        do { try VNImageRequestHandler(cgImage: crop, options: [:]).perform([request]) }
+                        catch { throw ProcessingError.ocrFailed(underlying: error.localizedDescription) }
+                        try Task.checkCancellation()
+                        return (request.results ?? []).compactMap { observation -> TextRegion? in
+                            guard let candidate = observation.topCandidates(1).first,
+                                  candidate.confidence >= config.minimumConfidence,
+                                  !candidate.string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+                            let box = observation.boundingBox
+                            let mapped = CGRect(x: bounds.minX + box.minX * bounds.width,
+                                y: bounds.minY + (1 - box.maxY) * bounds.height,
+                                width: box.width * bounds.width, height: box.height * bounds.height).intersection(bounds)
+                            guard !masks.contains(where: { !$0.intersection(mapped).isEmpty }) else { return nil }
+                            return TextRegion(frameID: .init(value: 0), text: candidate.string,
+                                bounds: mapped, confidence: Double(candidate.confidence))
+                        }.sorted {
+                            if $0.bounds.minY == $1.bounds.minY { return $0.bounds.minX < $1.bounds.minX }
+                            return $0.bounds.minY < $1.bounds.minY
                         }
-                        guard let masked = context.makeImage() else { throw ProcessingError.imageConversionFailed }
-                        crop = masked
                     }
-                    let tag = "processing.ocr.windowCrop.\(UUID().uuidString)"
-                    MemoryLedger.set(tag: tag, bytes: Int64(crop.width) * Int64(crop.height) * (masks.isEmpty ? 4 : 8),
-                        count: 1, unit: "crops", function: "processing.ocr.window", kind: "crop-pixels")
-                    defer { MemoryLedger.remove(tag: tag) }
-                    let request = VNRecognizeTextRequest()
-                    request.recognitionLevel = Self.recognitionLevel(for: config)
-                    request.recognitionLanguages = self.recognitionLanguages
-                    request.usesLanguageCorrection = Self.fullFrameRecognitionRequestConfig().usesLanguageCorrection
-                    request.preferBackgroundProcessing = config.preferBackgroundProcessing
-                    do { try VNImageRequestHandler(cgImage: crop, options: [:]).perform([request]) }
-                    catch { throw ProcessingError.ocrFailed(underlying: error.localizedDescription) }
-                    try Task.checkCancellation()
-                    return (request.results ?? []).compactMap { observation -> TextRegion? in
-                        guard let candidate = observation.topCandidates(1).first,
-                              candidate.confidence >= config.minimumConfidence,
-                              !candidate.string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
-                        let box = observation.boundingBox
-                        let mapped = CGRect(x: bounds.minX + box.minX * bounds.width,
-                            y: bounds.minY + (1 - box.maxY) * bounds.height,
-                            width: box.width * bounds.width, height: box.height * bounds.height).intersection(bounds)
-                        guard !masks.contains(where: { !$0.intersection(mapped).isEmpty }) else { return nil }
-                        return TextRegion(frameID: .init(value: 0), text: candidate.string,
-                            bounds: mapped, confidence: Double(candidate.confidence))
-                    }.sorted {
-                        if $0.bounds.minY == $1.bounds.minY { return $0.bounds.minX < $1.bounds.minX }
-                        return $0.bounds.minY < $1.bounds.minY
-                    }
+                    await MemoryLedger.remove(tag: tag)
+                    return result
+                } catch {
+                    // Cleanup also completes on OCR failure and cancellation.
+                    await MemoryLedger.remove(tag: tag)
+                    throw error
                 }
             }
             let result = try await withTaskCancellationHandler(operation: { try await task.value }, onCancel: { task.cancel() })
