@@ -150,6 +150,7 @@ public struct SettingsView: View {
     @AppStorage("redactWindowTitlePatterns", store: settingsStore) var redactWindowTitlePatternsRaw = SettingsDefaults.redactWindowTitlePatterns
     @AppStorage("redactBrowserURLPatterns", store: settingsStore) var redactBrowserURLPatternsRaw = SettingsDefaults.redactBrowserURLPatterns
     @AppStorage("phraseLevelRedactionPhrases", store: settingsStore) var phraseLevelRedactionPhrasesRaw = SettingsDefaults.phraseLevelRedactionPhrases
+    @AppStorage(PhraseRedactionMode.defaultsKey, store: settingsStore) var phraseLevelRedactionModeRaw = PhraseRedactionMode.scramble.rawValue
     @State var phraseLevelRedactionInput = ""
     @State var phraseLevelRedactionEnabled = SettingsDefaults.phraseLevelRedactionEnabled
     @State var phraseLevelRedactionToggleInitialized = false

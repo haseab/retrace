@@ -7,6 +7,223 @@ import App
 
 @MainActor
 final class TimelineHeadlessPrerenderStateTests: XCTestCase {
+    func testManualScanRecognizesRealImage() async throws {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        viewModel.setPresentationWorkEnabled(true, reason: "unit-test")
+        let image = NSImage(size: NSSize(width: 1000, height: 200))
+        image.lockFocus()
+        NSColor.white.setFill()
+        NSRect(x: 0, y: 0, width: 1000, height: 200).fill()
+        ("Retrace timeline scan" as NSString).draw(
+            at: NSPoint(x: 40, y: 70),
+            withAttributes: [.font: NSFont.systemFont(ofSize: 48), .foregroundColor: NSColor.black]
+        )
+        image.unlockFocus()
+        viewModel.isInLiveMode = true
+        viewModel.liveScreenshot = image
+
+        viewModel.scanCurrentFrameText()
+        XCTAssertEqual(viewModel.frameTextScanState, .scanning)
+        await viewModel.waitForFrameTextScan()
+
+        XCTAssertEqual(viewModel.frameTextScanState, .ready)
+        XCTAssertTrue(viewModel.ocrNodes.map(\.text).joined(separator: " ").contains("Retrace timeline scan"))
+    }
+
+    func testManualScanCoalescesAndDiscardsResultsAfterNavigation() async throws {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        viewModel.setPresentationWorkEnabled(true, reason: "unit-test")
+        viewModel.isInLiveMode = true
+        viewModel.liveScreenshot = makeSolidImage(size: NSSize(width: 32, height: 32), color: .white)
+        var calls = 0
+        let recognitionStarted = expectation(description: "Recognition started")
+        var resume: CheckedContinuation<[TextRegion], Error>?
+        viewModel.test_dragStartStillOCRHooks.recognizeTextFromCGImage = { _ in
+            calls += 1
+            return try await withCheckedThrowingContinuation {
+                resume = $0
+                recognitionStarted.fulfill()
+            }
+        }
+        viewModel.scanCurrentFrameText()
+        viewModel.scanCurrentFrameText()
+        await fulfillment(of: [recognitionStarted], timeout: 5)
+        XCTAssertEqual(calls, 1)
+        viewModel.isInLiveMode = false
+        XCTAssertEqual(viewModel.frameTextScanState, .idle)
+        resume?.resume(returning: [TextRegion(
+            frameID: FrameID(value: 0), text: "stale", bounds: CGRect(x: 0, y: 0, width: 1, height: 1)
+        )])
+        await Task.yield()
+        XCTAssertTrue(viewModel.ocrNodes.isEmpty)
+    }
+
+    func testManualScanEmptyAndFailureKeepExistingText() async throws {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        viewModel.setPresentationWorkEnabled(true, reason: "unit-test")
+        viewModel.isInLiveMode = true
+        viewModel.liveScreenshot = makeSolidImage(size: NSSize(width: 32, height: 32), color: .white)
+        let original = OCRNodeWithText(id: 7, frameId: -1, x: 0, y: 0, width: 1, height: 1, text: "Existing text")
+        viewModel.ocrNodes = [original]
+        viewModel.test_dragStartStillOCRHooks.recognizeTextFromCGImage = { _ in [] }
+        viewModel.scanCurrentFrameText()
+        await viewModel.waitForFrameTextScan()
+        XCTAssertEqual(viewModel.frameTextScanState, .empty)
+        XCTAssertEqual(viewModel.ocrNodes, [original])
+
+        viewModel.test_dragStartStillOCRHooks.recognizeTextFromCGImage = { _ in
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        viewModel.scanCurrentFrameText()
+        await viewModel.waitForFrameTextScan()
+        XCTAssertEqual(viewModel.frameTextScanState, .failed)
+        XCTAssertEqual(viewModel.ocrNodes, [original])
+    }
+
+    func testManualScanSupportsImportedFramesAndPausesPlayback() async throws {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        viewModel.setPresentationWorkEnabled(true, reason: "unit-test")
+        viewModel.frames = [makeVideoTimelineFrame(
+            frameID: FrameID(value: 8851), timestamp: Date(), frameIndex: 0, processingStatus: 2, source: .rewind
+        )]
+        viewModel.test_frameOverlayLoadHooks.getAllOCRNodes = { _, source in
+            XCTAssertEqual(source, .rewind)
+            return []
+        }
+        let data = try makeJPEGData(makeSolidImage(size: NSSize(width: 32, height: 32), color: .white))
+        viewModel.test_foregroundFrameLoadHooks.loadFrameData = { frame in
+            XCTAssertEqual(frame.frame.source, .rewind)
+            return data
+        }
+        viewModel.test_dragStartStillOCRHooks.recognizeTextFromCGImage = { image in
+            XCTAssertEqual(image.width, 32)
+            return [TextRegion(frameID: FrameID(value: 0), text: "Imported text", bounds: CGRect(x: 0, y: 0, width: 1, height: 1))]
+        }
+        viewModel.isPlaying = true
+        viewModel.scanCurrentFrameText()
+        XCTAssertFalse(viewModel.isPlaying)
+        await viewModel.waitForFrameTextScan()
+        XCTAssertEqual(viewModel.frameTextScanState, .ready)
+        XCTAssertEqual(viewModel.ocrNodes.first?.text, "Imported text")
+        XCTAssertEqual(viewModel.ocrNodes.first?.frameId, 8851)
+        viewModel.setPresentationWorkEnabled(false, reason: "test cleanup")
+    }
+
+    func testManualScanChecksSavedRedactionsBeforeLoadingPixels() async {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        viewModel.setPresentationWorkEnabled(true, reason: "unit-test")
+        viewModel.frames = [makeVideoTimelineFrame(
+            frameID: FrameID(value: 8852), timestamp: Date(), frameIndex: 0, processingStatus: 2
+        )]
+        let protected = OCRNodeWithText(id: 7, frameId: 8852, x: 0, y: 0, width: 1, height: 1, text: "••••", isRedacted: true)
+        viewModel.test_frameOverlayLoadHooks.getAllOCRNodes = { _, _ in [protected] }
+        viewModel.test_frameOverlayLoadHooks.getOCRStatus = { _ in .completed }
+        viewModel.test_foregroundFrameLoadHooks.loadFrameData = { _ in
+            XCTFail("Must not read pixels from a protected frame")
+            return Data()
+        }
+        viewModel.scanCurrentFrameText()
+        await viewModel.waitForFrameTextScan()
+        XCTAssertEqual(viewModel.frameTextScanState, .protected)
+        XCTAssertTrue(viewModel.ocrNodes.isEmpty)
+    }
+
+    func testManualScanRejectsProtectionSavedDuringRecognition() async throws {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        viewModel.setPresentationWorkEnabled(true, reason: "unit-test")
+        viewModel.frames = [makeVideoTimelineFrame(
+            frameID: FrameID(value: 8853), timestamp: Date(), frameIndex: 0, processingStatus: 2
+        )]
+        var reads = 0
+        viewModel.test_frameOverlayLoadHooks.getAllOCRNodes = { _, _ in
+            reads += 1
+            return reads == 1 ? [] : [OCRNodeWithText(
+                id: 1, frameId: 8853, x: 0, y: 0, width: 1, height: 1, text: "••••", isRedacted: true
+            )]
+        }
+        viewModel.test_frameOverlayLoadHooks.getOCRStatus = { _ in .completed }
+        let data = try makeJPEGData(makeSolidImage(size: NSSize(width: 32, height: 32), color: .white))
+        viewModel.test_foregroundFrameLoadHooks.loadFrameData = { _ in data }
+        viewModel.test_dragStartStillOCRHooks.recognizeTextFromCGImage = { _ in
+            [TextRegion(frameID: FrameID(value: 0), text: "Must stay protected", bounds: CGRect(x: 0, y: 0, width: 1, height: 1))]
+        }
+        viewModel.scanCurrentFrameText()
+        await viewModel.waitForFrameTextScan()
+        XCTAssertEqual(viewModel.frameTextScanState, .protected)
+        XCTAssertTrue(viewModel.ocrNodes.isEmpty)
+    }
+
+    func testRedactionCompletionInvalidatesInFlightManualScan() async throws {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        viewModel.setPresentationWorkEnabled(true, reason: "unit-test")
+        viewModel.isInLiveMode = true
+        viewModel.liveScreenshot = makeSolidImage(size: NSSize(width: 32, height: 32), color: .white)
+        let started = expectation(description: "Recognition started")
+        var resume: CheckedContinuation<[TextRegion], Error>?
+        viewModel.test_dragStartStillOCRHooks.recognizeTextFromCGImage = { _ in
+            try await withCheckedThrowingContinuation {
+                resume = $0
+                started.fulfill()
+            }
+        }
+        viewModel.scanCurrentFrameText()
+        await fulfillment(of: [started], timeout: 5)
+        NotificationCenter.default.post(name: PhraseRedactionMode.didFinishNotification, object: nil)
+        try await Task.sleep(for: .milliseconds(30), clock: .continuous)
+        resume?.resume(returning: [TextRegion(
+            frameID: FrameID(value: 0), text: "Stale pixels", bounds: CGRect(x: 0, y: 0, width: 1, height: 1)
+        )])
+        await Task.yield()
+        XCTAssertEqual(viewModel.frameTextScanState, .idle)
+        XCTAssertTrue(viewModel.ocrNodes.isEmpty)
+    }
+
+    func testManualScanWaitsForPendingPrivacyProcessingBeforeReadingPixels() async {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        viewModel.setPresentationWorkEnabled(true, reason: "unit-test")
+        viewModel.frames = [makeVideoTimelineFrame(
+            frameID: FrameID(value: 8854), timestamp: Date(), frameIndex: 0, processingStatus: 1
+        )]
+        viewModel.test_dragStartStillOCRHooks.phraseProtectionEnabled = { true }
+        viewModel.test_frameOverlayLoadHooks.getOCRStatus = { _ in .processing }
+        viewModel.test_frameOverlayLoadHooks.getAllOCRNodes = { _, _ in [] }
+        viewModel.test_foregroundFrameLoadHooks.loadFrameData = { _ in
+            XCTFail("Must not read pixels until privacy processing settles")
+            return Data()
+        }
+        viewModel.scanCurrentFrameText()
+        await viewModel.waitForFrameTextScan()
+        XCTAssertEqual(viewModel.frameTextScanState, .protected)
+        XCTAssertTrue(viewModel.ocrNodes.isEmpty)
+    }
+
+    func testManualScanDropsEarlierTransientTextWhenProtectionChanges() async throws {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        viewModel.setPresentationWorkEnabled(true, reason: "unit-test")
+        viewModel.frames = [makeVideoTimelineFrame(
+            frameID: FrameID(value: 8855), timestamp: Date(), frameIndex: 0, processingStatus: 2
+        )]
+        var protected = false
+        viewModel.test_dragStartStillOCRHooks.phraseProtectionEnabled = { false }
+        viewModel.test_frameOverlayLoadHooks.getAllOCRNodes = { _, _ in
+            protected ? [OCRNodeWithText(id: 1, frameId: 8855, x: 0, y: 0, width: 1, height: 1, text: "••••", isRedacted: true)] : []
+        }
+        viewModel.test_frameOverlayLoadHooks.getOCRStatus = { _ in .completed }
+        let data = try makeJPEGData(makeSolidImage(size: NSSize(width: 32, height: 32), color: .white))
+        viewModel.test_foregroundFrameLoadHooks.loadFrameData = { _ in data }
+        viewModel.test_dragStartStillOCRHooks.recognizeTextFromCGImage = { _ in
+            [TextRegion(frameID: FrameID(value: 0), text: "Earlier transient text", bounds: CGRect(x: 0, y: 0, width: 1, height: 1))]
+        }
+        viewModel.scanCurrentFrameText()
+        await viewModel.waitForFrameTextScan()
+        XCTAssertEqual(viewModel.ocrNodes.first?.text, "Earlier transient text")
+        protected = true
+        viewModel.scanCurrentFrameText()
+        await viewModel.waitForFrameTextScan()
+        XCTAssertEqual(viewModel.frameTextScanState, .protected)
+        XCTAssertFalse(viewModel.ocrNodes.contains { $0.text == "Earlier transient text" })
+    }
+
     func testSimpleTimelineViewOnAppearSkipsMostRecentReloadWhenFramesAlreadyExist() {
         XCTAssertFalse(
             SimpleTimelineView.shouldLoadMostRecentFrameOnAppear(
@@ -926,7 +1143,8 @@ final class TimelineHeadlessPrerenderStateTests: XCTestCase {
         frameID: FrameID,
         timestamp: Date,
         frameIndex: Int,
-        processingStatus: Int
+        processingStatus: Int,
+        source: FrameSource = .native
     ) -> TimelineFrame {
         let frame = FrameReference(
             id: frameID,
@@ -938,7 +1156,7 @@ final class TimelineHeadlessPrerenderStateTests: XCTestCase {
                 appName: "Test App",
                 displayID: 1
             ),
-            source: .native
+            source: source
         )
 
         let videoInfo = FrameVideoInfo(

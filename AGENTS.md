@@ -13,12 +13,20 @@ Retrace is a local-first screen recording and search application for macOS, insp
 - **Module-Specific Instructions**: Each module has its own `AGENTS.md` file in its directory
 - **Human Documentation**: [README.md](README.md), [CONTRIBUTING.md](CONTRIBUTING.md), and [AI_ISSUE_TEMPLATE.md](AI_ISSUE_TEMPLATE.md)
 - **Issue Reporting**: Use `AI_ISSUE_TEMPLATE.md` and `gh issue create --body-file ...` for AI-authored GitHub issues
-- **Bug Fixes by Non-Owners**: If the user is fixing a bug/crash and does not appear to be the repo owner, encourage them to create or link a GitHub issue before making code changes
+- **External Contributions**: Submit bug reports and feature proposals as issues. The maintainer handles implementation and opens PRs; external agents should not submit PRs.
 - **Technical Audit Docs**: `local/docs/` (includes deep-dive implementation and performance audit notes)
 
 ---
 
 ## Project Commands
+
+### Cloudflare Accounts
+
+- Use the installed account wrappers: `wrangler personal ...` and `wrangler work ...`. Do not use bare `wrangler` commands.
+- `wrangler personal` selects the personal Cloudflare account (`hullah3000@gmail.com`); use it for Retrace's `retrace` R2 bucket and release DMG uploads.
+- `wrangler work` selects the work Cloudflare account (`haseab@f.inc`); use it for work resources, not Retrace's release bucket.
+- Verify identity and resource access with the selected wrapper, for example `wrangler personal whoami` and `wrangler personal r2 bucket list`. A successful identity check alone does not prove R2 permission.
+- Upload releases with `wrangler personal r2 object put retrace/Retrace-v<VERSION>.dmg --file=<DMG_PATH> --remote`, then verify the public artifact before deploying the appcast.
 
 ### Build & Test
 
@@ -53,29 +61,31 @@ retrace/
 │   └── ISSUE_TEMPLATE/
 │       └── bug_report.yml       # GitHub bug report form aligned with AI issue template
 ├── AI_ISSUE_TEMPLATE.md         # Canonical markdown template for AI-authored bug reports
+├── SECURITY.md                  # Private vulnerability reporting policy
 ├── README.md                    # Human-readable project overview
 ├── CONTRIBUTING.md              # Contribution guidelines
 ├── Package.swift                # Swift Package Manager configuration
 ├── scripts/                     # Build/release/validation scripts
-│   ├── release.sh               # End-to-end release automation
-│   ├── create-release.sh        # Release build + packaging helper
+│   ├── create-release.sh        # Signed Release archive/export helper
 │   ├── check_no_nanoseconds_sleep.sh # Guardrail for Task.sleep(nanoseconds:)
 │   ├── validate_sleep_wake_stability.sh # Sleep/wake soak validation workflow
 │   └── validate_darkwake_watchdog.sh # Automated darkwake watchdog regression validation
 │
 ├── Shared/                      # CRITICAL: Shared types and protocols
-│   ├── Logging.swift            # Central log utility (Log.debug/info/warning/error)
+│   ├── Logging.swift            # Privacy-safe bounded background logging, batching, routine summaries and async flush
 │   ├── AppPaths.swift           # Application path configuration
 │   ├── BGRAImageUtilities.swift # Shared BGRA conversion + patch extraction helpers
 │   ├── MasterKeyManager.swift   # Keychain-backed master key creation + recovery phrase export
 │   ├── ReversibleOCRScrambler.swift # Deterministic reversible OCR patch scrambling + text protection
 │   ├── Models/                  # Data types used across modules
-│   │   ├── Frame.swift          # FrameID, CapturedFrame, VideoSegment
+│   │   ├── Frame.swift          # FrameID, CapturedFrame, VideoSegment, optional normalized OCR geometry
+│   │   ├── AccessibilitySnapshot.swift # Bounded saved capture-time OCR correction references
 │   │   ├── Text.swift           # ExtractedText, OCRTextRegion
 │   │   ├── TextRegion.swift     # OCR text region types
 │   │   ├── Search.swift         # SearchQuery, SearchResult
 │   │   ├── Segment.swift        # Segment data model
-│   │   ├── Config.swift         # Configuration types
+│   │   ├── ConferencePrivacy.swift # Shared call kinds and capture privacy outcome events
+│   │   ├── Config.swift         # Configuration types and per-node PhraseRedactionMode
 │   │   ├── Errors.swift         # Error types
 │   │   ├── Audio.swift          # Audio model types (Release 2)
 │   │   ├── FilterCriteria.swift # Timeline/search filter criteria
@@ -99,8 +109,8 @@ retrace/
 │   ├── IDMappingService.swift   # ID mapping between sources
 │   ├── Schema.swift             # Current schema definition
 │   ├── Migrations/              # Schema migration scripts
-│   ├── Queries/                 # Query implementations
-│   └── Tests/
+│   ├── Queries/                 # Query implementations, including FrameOCRRegionQueries.swift
+│   └── Tests/                  # Includes RetentionVideoDeletionTests (real SQLite guard/failure cases)
 │
 ├── Storage/                     # File I/O, HEVC encoding
 │   ├── AGENTS.md
@@ -108,25 +118,29 @@ retrace/
 │   ├── ImageExtractor.swift     # Extract frames from video files
 │   ├── IncrementalSegmentWriter.swift
 │   ├── SegmentWriterImpl.swift
-│   ├── FileManager/             # File system utilities
+│   ├── FileManager/             # File system utilities, including scoped TemporaryVideoLink
 │   ├── VideoEncoder/            # HEVC video encoding
 │   ├── WAL/                     # Write-Ahead Log (WALManager, RecoveryManager)
-│   └── Tests/
+│   └── Tests/                  # Includes TemporaryVideoLinkTests (real symlink lifetime)
 │
 ├── Capture/                     # CGWindowListCapture integration
 │   ├── AGENTS.md
 │   ├── CaptureManager.swift
 │   ├── ScreenCapture/           # Screen capture implementation
-│   ├── Deduplication/           # Perceptual hash deduplication
-│   ├── Metadata/                # AppInfoProvider, BrowserURLExtractor
-│   └── Tests/
+│   │   ├── CaptureFrameCandidate.swift # Native-image exact-duplicate check before BGRA materialization
+│   │   └── ConferenceFaceBlurProcessor.swift # Vision face detection + irreversible conference-call face blur
+│   ├── Deduplication/           # Pixel-sampling deduplication
+│   ├── Metadata/                # AppInfoProvider, BrowserURLExtractor, WindowOCRGeometry.swift
+│   │   ├── ConferenceCallActivityProvider.swift # Window-specific active-call accessibility controls
+│   │   └── ConferenceSessionPrivacyPolicy.swift # Conferencing-app rules + call-session consent tracking
+│   └── Tests/                  # Includes CaptureFrameCandidateTests (real screenshot pixels)
 │
 ├── Processing/                  # OCR and text extraction
 │   ├── AGENTS.md
 │   ├── ProcessingManager.swift
 │   ├── FrameProcessingQueue.swift # Async frame processing queue
 │   ├── URLExtractor.swift       # URL extraction from OCR text
-│   ├── OCR/                     # Vision framework OCR
+│   ├── OCR/                     # Vision framework OCR, including WindowOCR.swift region isolation
 │   ├── Accessibility/           # Accessibility API integration
 │   ├── TextMerger/              # Text merging utilities
 │   └── Tests/
@@ -153,14 +167,19 @@ retrace/
 │   ├── AppLifecycle.swift       # App lifecycle management
 │   ├── ModelManager.swift       # Model management
 │   ├── OnboardingManager.swift  # First-run onboarding flow
+│   ├── RetentionDeletionJournal.swift # Durable retries for database-first video deletion
 │   ├── RetentionManager.swift   # Data retention policies
 │   └── Tests/
+│       ├── RetentionDeletionJournalTests.swift # Real-file deletion failure and retry coverage
 │       ├── FeedbackRecentMetricSupportTests.swift # Feedback-export metric sanitization coverage
 │       ├── InPageURLCaptureRoutingTests.swift
+│       ├── DiagnosticLoggingTests.swift # Background log writes, bounded buffering, flush, summaries and release suppression
+│       ├── PrivacyProtectionTests.swift # Logging privacy, permanent pixel removal, and redaction mode defaults
 │       ├── MasterKeyManagerTests.swift
 │       ├── ServiceContainerRewindCutoffTests.swift # Rewind cutoff defaults and latest-frame probe coverage
 │       ├── TestLogger.swift
 │       ├── TimelineStillDiskWriterTests.swift
+│       ├── RecordingDatabaseFailureTests.swift # Real recording pipeline with an injected metadata insert failure
 │       └── UnexpectedRecordingStopHeuristicTests.swift # Unexpected-stop watchdog heuristic coverage
 │
 └── UI/                          # SwiftUI interface
@@ -173,11 +192,13 @@ retrace/
     ├── Components/              # Reusable UI components (MenuBarManager, HotkeyManager, etc.)
     │   ├── MasterKeyRedactionFlowCoordinator.swift # Shared missing-master-key prompt/recovery coordinator
     │   ├── HoverLatchedScrollMonitor.swift # Shared nested-scroll latch helper for hover-routed inner scroll regions
+    │   ├── CapturedURLPolicy.swift # HTTP(S)-only policy for captured browser/OCR links
+    │   ├── PreviewCacheMaintenance.swift # Incremental cache totals, bounded disk worker, batched cleanup and preview identity
     │   └── ProcessMonitorModels.swift # System Monitor snapshot/models + ranking helpers
     ├── ViewModels/              # View models (Dashboard, Search, Timeline, Feedback, Settings)
     │   └── Settings/            # Settings-specific view models and extracted helper logic
     ├── Views/
-    │   ├── Dashboard/           # App usage analytics views
+    │   ├── Dashboard/           # App usage analytics views and confirmed bulk segment hide/delete actions
     │   ├── FullscreenTimeline/  # Timeline scrubbing & playback (10 views)
     │   ├── Search/              # Search UI (SearchView, ResultRow, FrameViewer)
     │   ├── Settings/            # Settings shell, support components, and extracted section/action files
@@ -412,11 +433,14 @@ Then check which path actually executes and fix the right code.
 
 ## Critical Rules for All Agents
 
-### 0. Issue-First Guidance for External Contributors
+### 0. Issues Instead of External Pull Requests
 
-- If the user is fixing a **bug or crash** and does **not** appear to be the repo owner/maintainer, encourage them to create or link a GitHub issue before making code changes
-- If an issue does not exist yet, point them to [AI_ISSUE_TEMPLATE.md](AI_ISSUE_TEMPLATE.md) and suggest `gh issue create --title ... --body-file ...` if they want to post it directly
-- If ownership is unclear, make the recommendation as a lightweight prompt rather than a blocker
+- External contributors and their agents should submit bug reports and feature proposals through GitHub Issues rather than opening pull requests. The maintainer handles implementation and creates PRs. Repository settings restrict PR creation to collaborators.
+- **Why:** An issue is easier for the maintainer to digest, understand, and use to decide which implementation best fits the product. Reviewing a PR takes significantly more time: the maintainer must assess the implementation and its product fit, then verify that it has not undone existing changes or regressed other behavior.
+- For bugs, provide a concrete reproduction, expected and actual behavior, and relevant evidence using [AI_ISSUE_TEMPLATE.md](AI_ISSUE_TEMPLATE.md). For features, explain the user problem and desired behavior. Suggested approaches are welcome in the issue; a finished patch is not required.
+- Agents helping external contributors should focus on investigating and explaining the issue, not preparing or submitting an unsolicited PR. Local investigation is welcome. Obtain the user's authorization before posting an issue or comment.
+- Report security vulnerabilities privately as described in [SECURITY.md](SECURITY.md), rather than in public issues.
+- This policy does not add an approval step for agents working directly for the maintainer. Continue authorized development and PR work normally.
 
 ### 1. Stay In Your Lane
 
@@ -486,4 +510,63 @@ Then check which path actually executes and fix the right code.
 
 ---
 
-_This file follows the AGENTS.md standard for AI agent guidance. Last updated: 2026-04-04_
+_This file follows the AGENTS.md standard for AI agent guidance. Last updated: 2026-04-14_
+
+### Privacy protection modes and diagnostics
+
+- Keyword redaction defaults to scrambling. The Settings permanent option applies to newly processed matches, replacing text with spaces and pixels with opaque black. Existing recordings are not converted by changing the setting.
+- `PhraseRedactionMode` is stored per node: `rtx-permanent-v1` is a non-recoverable marker in the existing protected-text column. It contains no original text. Never infer an older node's mode from the current setting.
+- Permanent nodes cannot be revealed and do not require a master key; scrambling still requires one. Missing keys must prevent indexing a matched region unprotected.
+- Excluded-window masking failures drop the frame. Full excluded bounds are protected, including overlapped/translucent areas and edges.
+- `PrivacyLogMessage` strips free-form interpolated values before every logging sink; only primitive numbers and booleans are retained. Preformatted `String` messages are removed as a whole. Do not bypass this by explicitly constructing string literals from captured content.
+- Legacy diagnostic logs are discarded on logger initialization and are excluded from feedback reads, including the error channel. Raw capture-time previews are bypassed while keyword protection is enabled and stale preview copies are invalidated after rewrite.
+
+### Diagnostic logging write policy
+
+- Release `Log.debug` and `Log.verbose` calls do not evaluate their messages. Keep lifecycle events, unusual outcomes, warnings and errors; record routine capture/OCR successes through the fixed `Log.RoutineEvent` counters.
+- All console, unified-log and diagnostic-file sinks run on a serial background queue. Admission only takes a short memory lock. Buffer limits reserve space for errors; overflow produces a count-only warning rather than unbounded memory growth.
+- Retained messages flush after two seconds or 64 KiB; errors request an immediate background drain. Active routine counters summarize once per minute and on explicit flush. Idle logging has no repeating timer wakeup.
+- Await `Log.flush()` before asynchronous feedback snapshots and normal quit. Feedback export must not synchronously wait on the writer from the main thread. A hard crash can lose the pending batch.
+
+### Preview cache maintenance
+
+- Timeline cache byte totals are maintained on insert/replace/remove; access-only touches must remain O(1). Compressed JPEG NSCache entries carry their byte cost with a 64 MiB cost limit plus the existing count limit.
+- Search thumbnails have a 32 MiB estimated decoded-byte budget plus a 60-image count limit. Maintain costs incrementally and estimate from representation dimensions without forcing image decoding on main.
+- `PreviewCacheDiskWorker` serializes UI cache writes, JPEG serialization, deletion batches and folder pruning. Thumbnail trims coalesce bursts and run at most once per minute during continuing writes. Pending write payloads are bounded to 64 MiB; skipped persistence must not block display.
+- Preview keys describe source/frame/video identity, render dimensions, highlight geometry, and content revision. Queries do not belong in keys. Redaction completion advances the persisted revision and invalidates queued writes. Preserve the existing keyword-protection bypass and canonical preview paths used by the redaction purger.
+
+### Stable development app identity
+
+- Use one persistent development app: bundle ID `io.retrace.app.dev`, app name `Retrace Dev`, installed at `/Applications/Retrace Dev.app`. Reuse this identity and location across branches and rebuilds; do not create PR-specific or timestamped app identities.
+- Agent UI testing through Computer Use requires a bundled macOS app. Use `/Applications/Retrace Dev.app` for these tests, with its stable identity and development data namespace; a bare `.build/debug/Retrace` executable is not the supported Computer Use test target.
+- `./dev.sh` builds a complete app bundle, signs and verifies it, installs it at the fixed location, and launches it. Use `./dev.sh --build-only` when the native desktop helper will launch it for UI tests. `RETRACE_BUILD_PATH` reuses a scratch build and `RETRACE_DEV_SIGNING_IDENTITY` selects the certificate. It refuses to replace a running dev app.
+- Sign successive builds with the same certificate-backed signing identity and team, keeping the designated requirement stable. Ad-hoc signing ties identity to the binary hash and is unsuitable for preserving permissions across rebuilds. If the certificate and private key are unavailable, report the signing prerequisite instead of silently falling back to ad-hoc signing.
+- Keep a persistent development namespace for settings, library, caches, logs, Keychain items, and instance locks, separate from production. Preserve development data and permissions across normal rebuilds.
+- Build and sign on `hac-mini`. When using the authorized MacBook visual-testing fallback, transfer the prebuilt app; the fallback does not authorize builds or source edits on the MacBook.
+- Expect initial Screen Recording and Accessibility grants on each Mac. Stable signing should normally preserve recognition across rebuilds, but macOS can still require reauthorization. Codex computer-use launch confirmations are separate from macOS privacy permissions.
+
+### Recording maintenance and deletion safety
+
+- WAL append handles use an eight-entry LRU cache within active sessions; close them on finalization, quarantine, reset, and append failure. Append/register extends the offset index in place. Recovery counts/indexes must rescan and validate headers instead of trusting a writer's cached offsets.
+- Retention persists pending video-deletion IDs under the library root before deleting any video rows. Delete only completed videos with no remaining frame references, then remove the file; preserve failed operations for retry after restart. Keep journal access on the retention actor and coalesce overlapping cleanup runs.
+- Native capture candidates have already passed window/conference privacy masking. Reuse prior BGRA pixels only when image bytes and rendering properties match exactly; preserve the existing perceptual threshold, mouse-trigger semantics, and metadata. Retain at most the last kept native image and account for it in the memory ledger. Near duplicates still require the normal BGRA conversion.
+- Temporary MP4 links owned by local AVAssetReader operations must be removed after reader completion and on error. Generator-cache links retain their existing longer lifetime until eviction. Do not sweep arbitrary historical UUID links from the shared temporary directory.
+- Captured browser/OCR links may launch only HTTP(S) URLs with a host. Validate before default-browser lookup, NSWorkspace fallback dispatch, or successful-open metrics.
+- Orphan-node scans require actual frame deletions. Routine DB storage sampling runs every 15 minutes; orphan-video polling runs every 10 minutes in addition to startup recovery. These are maintenance fixes, not new user actions requiring new daily metrics.
+
+- Ordinary timeline-cache misses do not advance the global cache epoch. Entry eviction invalidates only that frame; keep per-frame epochs alive while reads/writes overlap and release miss-only epochs when the final operation finishes. Clear/redaction still invalidates all work.
+
+### Capture-time accessibility correction
+
+- `Shared/Models/AccessibilitySnapshot.swift` is the bounded screenshot-pixel AX reference/JSON model. `CapturedFrame` carries it through native capture.
+- `Capture/Metadata/AccessibilitySnapshotCollector.swift` samples the matched visible primary window immediately after capture (750 nodes, 60 ms best-effort deadline, 128 KiB encoded cap). Unsupported/hidden/secure/occluded content is skipped; AX is never required for recording. This is not an atomic macOS screenshot/AX transaction or all-window AX coverage.
+- `Database/Queries/AccessibilitySnapshotQueries.swift` installs the additive auxiliary table and cleanup triggers independently of numbered migrations, preserving compatibility with the pending encryption V21. Frame and bounded JSON snapshot/status insert atomically. References follow the enclosing database encryption policy without separate keys or Keychain access. Unsupported legacy encrypted references fall back to ordinary OCR. Raw AX never enters logs or diagnostic metrics.
+- OCR uses the saved reference only, before keyword redaction/indexing. `Processing/Accessibility/AccessibilityOCRCorrector.swift` preserves OCR geometry/order and adds no AX-only text. Reliable alignment can correct letters, numbers, names, and identifier tokens. Ambiguous matches stay unchanged.
+- Saved AX payloads survive pending/retry/restart and clear atomically when OCR completes, fails permanently, or stages redaction. Frame deletion removes the reference even when foreign-key enforcement is disabled. Reprocessing completed frames therefore has no old AX reference.
+- Pending/active OCR across all videos takes priority over starting video rewrites; active rewrites finish normally. Correction metrics contain counts only, batched once per minute and worker stop.
+
+Bundled development runs use `AppPaths` to isolate settings, library, Keychain service, logs, preview caches and instance locks for `io.retrace.app.dev`. Never launch a dev build against hardcoded production domains. The production crash-recovery launch agent stays disarmed in the dev app; debugging one app must not manage the other app’s helper.
+
+### Window-aware OCR coordination
+
+Capture, Shared, Database and Processing jointly carry geometry-only, front-to-back application-window bounds in `FrameMetadata.ocrRegions` from image acquisition to historical OCR. No new shared type is introduced: the optional rectangles use existing CoreGraphics types. The database protocol exposes saved geometry without changing existing metadata JSON used by browser links. Each meaningfully visible normal application window creates one masked OCR crop; fully covered windows, tiny slivers, system layers and desktop fragments create no requests. Versioned saved geometry rejects the superseded fragment layout. Recognition operates solely on privacy-filtered screenshots; tests use CoreGraphics/CoreText pixels, real Vision and SQLite.

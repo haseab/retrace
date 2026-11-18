@@ -5,11 +5,13 @@ public struct SegmentRedactionTarget: Sendable, Equatable {
     public let frameID: Int64
     public let nodeID: Int
     public let normalizedRect: CGRect
+    public let mode: PhraseRedactionMode
 
-    public init(frameID: Int64, nodeID: Int, normalizedRect: CGRect) {
+    public init(frameID: Int64, nodeID: Int, normalizedRect: CGRect, mode: PhraseRedactionMode = .scramble) {
         self.frameID = frameID
         self.nodeID = nodeID
         self.normalizedRect = normalizedRect
+        self.mode = mode
     }
 }
 
@@ -51,6 +53,10 @@ public struct SegmentRewritePlan: Sendable, Equatable {
 
     public var hasRedactionTargets: Bool {
         !redactions.isEmpty
+    }
+
+    public var requiresRedactionSecret: Bool {
+        redactions.contains { $0.targets.contains { $0.mode == .scramble } }
     }
 
     public var redactionFrameIDs: [Int64] {
@@ -255,7 +261,7 @@ public struct VideoEncoderConfig: Sendable {
     }
 
     public static var `default`: VideoEncoderConfig {
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
         let quality = defaults.object(forKey: "videoQuality") as? Double ?? 0.5
         return VideoEncoderConfig(quality: Float(quality))
     }

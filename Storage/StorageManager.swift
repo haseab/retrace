@@ -177,7 +177,7 @@ fileprivate actor SegmentRewriteExecutor {
             )
         }
 
-        if request.plan.hasRedactionTargets, request.secret == nil {
+        if request.plan.requiresRedactionSecret, request.secret == nil {
             throw StorageError.fileWriteFailed(
                 path: request.segmentURL.path,
                 underlying: "Missing rewrite secret for redaction targets"
@@ -230,7 +230,9 @@ fileprivate actor SegmentRewriteExecutor {
                             imageWidth: width,
                             imageHeight: height
                         )
-                        guard pixelRect.width > 1, pixelRect.height > 1 else { continue }
+                        guard pixelRect.width > 0, pixelRect.height > 0 else {
+                            throw StorageModuleError.encodingFailed(underlying: "Invalid redaction rectangle")
+                        }
                         if loggedTargets < 20 {
                             Log.debug(
                                 "[PhraseRedaction][Storage] Scramble mapping node=\(target.nodeID) frame=\(target.frameID) normalized=(\(String(format: "%.4f", target.normalizedRect.origin.x)),\(String(format: "%.4f", target.normalizedRect.origin.y)),\(String(format: "%.4f", target.normalizedRect.width)),\(String(format: "%.4f", target.normalizedRect.height))) pixelRect=(x=\(Int(pixelRect.origin.x)),y=\(Int(pixelRect.origin.y)),w=\(Int(pixelRect.width)),h=\(Int(pixelRect.height))) image=\(width)x\(height)",
@@ -243,17 +245,23 @@ fileprivate actor SegmentRewriteExecutor {
                             frameBytesPerRow: width * 4,
                             rect: pixelRect
                         ) else {
-                            continue
+                            throw StorageModuleError.encodingFailed(underlying: "Unable to extract protected region")
                         }
-                        ReversibleOCRScrambler.scramblePatchBGRA(
-                            &patch.data,
-                            width: patch.width,
-                            height: patch.height,
-                            bytesPerRow: patch.bytesPerRow,
-                            frameID: target.frameID,
-                            nodeID: target.nodeID,
-                            secret: request.secret ?? ""
-                        )
+                        if target.mode == .permanent {
+                            guard ReversibleOCRScrambler.permanentlyRedactPatchBGRA(
+                                &patch.data, width: patch.width, height: patch.height, bytesPerRow: patch.bytesPerRow
+                            ) else { throw StorageModuleError.encodingFailed(underlying: "Unable to permanently redact region") }
+                        } else {
+                            ReversibleOCRScrambler.scramblePatchBGRA(
+                                &patch.data,
+                                width: patch.width,
+                                height: patch.height,
+                                bytesPerRow: patch.bytesPerRow,
+                                frameID: target.frameID,
+                                nodeID: target.nodeID,
+                                secret: request.secret ?? ""
+                            )
+                        }
                         BGRAImageUtilities.writePatch(
                             patch,
                             into: &bgra,
@@ -293,33 +301,9 @@ fileprivate actor SegmentRewriteExecutor {
     }
 
     private func decodeAllFrames(from url: URL, segmentID: Int64) async throws -> [DecodedFrame] {
-        let assetURL: URL
-        if url.pathExtension.lowercased() == "mp4" {
-            assetURL = url
-        } else {
-            let tempDir = FileManager.default.temporaryDirectory
-            let symlinkPath = tempDir.appendingPathComponent("\(UUID().uuidString).mp4")
-
-            do {
-                try FileManager.default.createSymbolicLink(
-                    atPath: symlinkPath.path,
-                    withDestinationPath: url.path
-                )
-            } catch {
-                Log.error(
-                    "[StorageManager] Failed to create symlink for segment \(segmentID): \(symlinkPath.path)",
-                    category: .storage,
-                    error: error
-                )
-                throw StorageError.fileWriteFailed(
-                    path: symlinkPath.path,
-                    underlying: error.localizedDescription
-                )
-            }
-            assetURL = symlinkPath
-        }
-
-        let asset = AVAsset(url: assetURL)
+        let videoLink = try TemporaryVideoLink(source: url)
+        defer { videoLink.cleanup() }
+        let asset = AVAsset(url: videoLink.url)
         _ = try await asset.load(.duration)
 
         guard let videoTrack = try await asset.loadTracks(withMediaType: .video).first else {
@@ -1087,27 +1071,10 @@ public actor StorageManager: StorageProtocol {
 
         // Handle extensionless files by creating symlink
         // Use UUID to avoid conflicts when multiple workers process same video
-        // Note: We don't delete symlinks immediately as AVAsset may still need them
-        let assetURL: URL
-        if url.pathExtension.lowercased() == "mp4" {
-            assetURL = url
-        } else {
-            let tempDir = FileManager.default.temporaryDirectory
-            let symlinkPath = tempDir.appendingPathComponent("\(UUID().uuidString).mp4")
-
-            do {
-                try FileManager.default.createSymbolicLink(
-                    atPath: symlinkPath.path,
-                    withDestinationPath: url.path
-                )
-            } catch {
-                Log.error("[StorageManager] Failed to create symlink for segment \(segmentID): \(symlinkPath.path)", category: .storage, error: error)
-                throw StorageError.fileWriteFailed(path: symlinkPath.path, underlying: error.localizedDescription)
-            }
-            assetURL = symlinkPath
-        }
-
-        let asset = AVAsset(url: assetURL)
+        // Keep the scoped link until the reader finishes, including failure paths.
+        let videoLink = try TemporaryVideoLink(source: url)
+        defer { videoLink.cleanup() }
+        let asset = AVAsset(url: videoLink.url)
 
         // Load asset duration (validates asset is readable)
         _ = try await asset.load(.duration)
@@ -1330,21 +1297,9 @@ public actor StorageManager: StorageProtocol {
 
         // Handle extensionless files by creating symlink
         // Use UUID to avoid conflicts when multiple workers process same video
-        let assetURL: URL
-        if segmentURL.pathExtension.lowercased() == "mp4" {
-            assetURL = segmentURL
-        } else {
-            let tempDir = FileManager.default.temporaryDirectory
-            let symlinkPath = tempDir.appendingPathComponent("\(UUID().uuidString).mp4")
-
-            try FileManager.default.createSymbolicLink(
-                atPath: symlinkPath.path,
-                withDestinationPath: segmentURL.path
-            )
-            assetURL = symlinkPath
-        }
-
-        let asset = AVAsset(url: assetURL)
+        let videoLink = try TemporaryVideoLink(source: segmentURL)
+        defer { videoLink.cleanup() }
+        let asset = AVAsset(url: videoLink.url)
 
         guard let videoTrack = try? await asset.loadTracks(withMediaType: .video).first else {
             return 0
@@ -1395,21 +1350,9 @@ public actor StorageManager: StorageProtocol {
 
         // Handle extensionless files by creating symlink
         // Use UUID to avoid conflicts when multiple workers process same video
-        let assetURL: URL
-        if segmentURL.pathExtension.lowercased() == "mp4" {
-            assetURL = segmentURL
-        } else {
-            let tempDir = FileManager.default.temporaryDirectory
-            let symlinkPath = tempDir.appendingPathComponent("\(UUID().uuidString).mp4")
-
-            try FileManager.default.createSymbolicLink(
-                atPath: symlinkPath.path,
-                withDestinationPath: segmentURL.path
-            )
-            assetURL = symlinkPath
-        }
-
-        let asset = AVAsset(url: assetURL)
+        let videoLink = try TemporaryVideoLink(source: segmentURL)
+        defer { videoLink.cleanup() }
+        let asset = AVAsset(url: videoLink.url)
 
         guard let videoTrack = try? await asset.loadTracks(withMediaType: .video).first else {
             return false

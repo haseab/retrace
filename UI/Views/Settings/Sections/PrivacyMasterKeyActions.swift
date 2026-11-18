@@ -265,7 +265,7 @@ extension SettingsView {
     func setPhraseLevelRedactionEnabled(_ enabled: Bool) {
         guard enabled != phraseLevelRedactionEnabled else { return }
 
-        if enabled && !hasMasterKeyInKeychain {
+        if enabled && PhraseRedactionMode(rawValue: phraseLevelRedactionModeRaw) != .permanent && !hasMasterKeyInKeychain {
             promptForMasterKey(feature: .phraseLevelRedaction)
             return
         }

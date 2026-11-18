@@ -462,6 +462,7 @@ extension SettingsView {
         redactBrowserURLPatternsRaw = SettingsDefaults.redactBrowserURLPatterns
         phraseLevelRedactionEnabled = SettingsDefaults.phraseLevelRedactionEnabled
         settingsStore.set(SettingsDefaults.phraseLevelRedactionEnabled, forKey: phraseLevelRedactionEnabledDefaultsKey)
+        setPhraseLevelRedactionMode(PhraseRedactionMode.scramble.rawValue)
         phraseLevelRedactionPhrasesRaw = SettingsDefaults.phraseLevelRedactionPhrases
         phraseLevelRedactionInput = ""
         excludeSafariPrivate = SettingsDefaults.excludeSafariPrivate
