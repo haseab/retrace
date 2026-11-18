@@ -618,6 +618,10 @@ public actor CGWindowListCapture {
         }
         logCaptureResumeIfNeeded()
 
+        let sourcesBeforeCapture = prepareConferenceWindowSources(
+            windows: exclusionResult.conferenceWindowContexts,
+            hasActiveMediaCapture: systemMediaCaptureState.hasActiveCapture)
+
         // Capture the frame using CGWindowList with filtering
         guard let captureResult = captureWithFiltering(
             displayID: displayID,
@@ -629,6 +633,9 @@ public actor CGWindowListCapture {
             return nil
         }
         let screenshotTime = Date()
+        // Bracket the desktop capture before AX discovery or face processing can
+        // delay the second source snapshot. Changed content/geometry is untrusted.
+        let validatedWindowSources = validateConferenceWindowSources(sourcesBeforeCapture)
         // Snapshot immediately after capture, before potentially slow face processing.
         // Skip protected frames; AX must never recover content deliberately masked out.
         let axContext = exclusionResult.visibleWindowContext
@@ -689,7 +696,8 @@ public actor CGWindowListCapture {
             visibleWindowContext: visibleWindowContext,
             displayBounds: CGDisplayBounds(displayID),
             hasActiveMediaCapture: systemMediaCaptureState.hasActiveCapture,
-            captureIntervalSeconds: config.captureIntervalSeconds
+            captureIntervalSeconds: config.captureIntervalSeconds,
+            validatedWindowSources: validatedWindowSources
         ) else { return nil }
         cgImage = privacyImage
 
@@ -1277,6 +1285,44 @@ public actor CGWindowListCapture {
         )
     }
 
+    /// Capture only sources that can be needed behind an already consented
+    /// foreground window. Keep at most two source surfaces per desktop frame.
+    func prepareConferenceWindowSources(
+        windows: ConferenceWindowSelection, hasActiveMediaCapture: Bool
+    ) -> [CGWindowID: ConferenceWindowImageSnapshot] {
+        let visibleIDs = Set(windows.visible.map(\.windowID))
+        let matches = matchedConferenceWindows(from: windows.tracked, hasActiveMediaCapture: hasActiveMediaCapture)
+        var consentedBounds: [CGRect] = []
+        var sources: [CGWindowID: ConferenceWindowImageSnapshot] = [:]
+        for match in matches where visibleIDs.contains(match.context.windowID) {
+            guard let bounds = match.context.windowBounds else { continue }
+            if conferenceCallConsent.shouldBypassFaceBlur(for: match.callIdentity.id) {
+                consentedBounds.append(bounds)
+            } else if sources.count < 2, consentedBounds.contains(where: { $0.intersects(bounds) }),
+                      let source = conferenceWindowImages.snapshot(for: match.context.windowID),
+                      source.bounds == bounds, source.ownerPID == match.context.ownerPID,
+                      ConferenceWindowImageProvider.isReadable(source.image) {
+                sources[match.context.windowID] = source
+            }
+        }
+        return sources
+    }
+
+    /// Only byte-identical source content with the same owner and geometry on
+    /// both sides of the desktop capture may supply masks or a no-face decision.
+    func validateConferenceWindowSources(
+        _ before: [CGWindowID: ConferenceWindowImageSnapshot]
+    ) -> [CGWindowID: ConferenceWindowImageSnapshot] {
+        var validated: [CGWindowID: ConferenceWindowImageSnapshot] = [:]
+        for (windowID, source) in before {
+            if let after = conferenceWindowImages.snapshot(for: windowID),
+               source.hasSameContent(as: after) {
+                validated[windowID] = source
+            }
+        }
+        return validated
+    }
+
     /// The real pixel-processing stage accepts a captured image and observed
     /// metadata, so integration tests can replay it without screen capture or a call.
     func applyConferencePrivacy(
@@ -1285,7 +1331,8 @@ public actor CGWindowListCapture {
         visibleWindowContext: VisibleWindowContext?,
         displayBounds: CGRect,
         hasActiveMediaCapture: Bool,
-        captureIntervalSeconds: TimeInterval
+        captureIntervalSeconds: TimeInterval,
+        validatedWindowSources: [CGWindowID: ConferenceWindowImageSnapshot] = [:]
     ) async -> CGImage? {
         let privacyStartedAt = CFAbsoluteTimeGetCurrent()
         var cgImage = image
@@ -1329,7 +1376,7 @@ public actor CGWindowListCapture {
         let windowSummary = "matched=\(conferenceWindowMatches.count) visible=\(visibleMatches.count) verified=\(verifiedCount) bypassed=\(bypassedCount) scanning=\(visibleMatches.count - bypassedCount)"
         if windowSummary != lastConferenceWindowSummary {
             lastConferenceWindowSummary = windowSummary
-            Log.info("[ConferencePrivacy] Window processing changed: \(windowSummary)", category: .capture)
+            Log.info("[ConferencePrivacy] Window processing changed: matched=\(conferenceWindowMatches.count) visible=\(visibleMatches.count) verified=\(verifiedCount) bypassed=\(bypassedCount) scanning=\(visibleMatches.count - bypassedCount)", category: .capture)
         }
         let preferredConferenceCallID = preferredConferenceCallID(
             from: activeConferenceMatches.filter { visibleConferenceWindowIDs.contains($0.context.windowID) },
@@ -1421,7 +1468,8 @@ public actor CGWindowListCapture {
                 } ?? false
                 let blurredResult = try await blurConferenceWindow(
                     in: cgImage, context: conferenceContext, regionOfInterest: visionROI,
-                    displayBounds: displayBounds, useWindowSource: overlapsConsent
+                    displayBounds: displayBounds, useWindowSource: overlapsConsent,
+                    validatedSource: validatedWindowSources[conferenceContext.windowID]
                 )
                 Log.recordLatency("capture.conference_face_blur_total",
                                   valueMs: (CFAbsoluteTimeGetCurrent() - blurStartedAt) * 1000,
@@ -1509,15 +1557,18 @@ public actor CGWindowListCapture {
 
     private func blurConferenceWindow(
         in image: CGImage, context: VisibleWindowContext, regionOfInterest: CGRect,
-        displayBounds: CGRect, useWindowSource: Bool
+        displayBounds: CGRect, useWindowSource: Bool,
+        validatedSource: ConferenceWindowImageSnapshot?
     ) async throws -> ConferenceFaceBlurResult {
         guard useWindowSource, let windowBounds = context.windowBounds,
-              let source = conferenceWindowImages.image(for: context.windowID),
-              ConferenceWindowImageProvider.isReadable(source) else {
+              let snapshot = validatedSource,
+              snapshot.bounds == windowBounds, snapshot.ownerPID == context.ownerPID,
+              ConferenceWindowImageProvider.isReadable(snapshot.image) else {
             // An unavailable window source must not silently disable protection.
             return try await conferenceFaceBlurProcessor.blurFaces(
                 in: image, regionOfInterest: regionOfInterest, configuration: .production)
         }
+        let source = snapshot.image
         let detection = try await conferenceFaceBlurProcessor.detectFaces(
             in: source, regionOfInterest: nil, configuration: .production)
         let masks = ConferenceWindowMaskProjection.project(

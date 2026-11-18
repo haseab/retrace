@@ -16,7 +16,11 @@ final class ConferencePrivacyPixelReplayTests: XCTestCase {
 
     private struct WindowImages: ConferenceWindowImageProviding {
         let images: [CGWindowID: CGImage]
-        func image(for windowID: CGWindowID) -> CGImage? { images[windowID] }
+        var bounds = CGRect(x: 0, y: 0, width: 384, height: 1080)
+        var ownerPID: pid_t = 42
+        func snapshot(for windowID: CGWindowID) -> ConferenceWindowImageSnapshot? {
+            images[windowID].map { .init(image: $0, bounds: bounds, ownerPID: ownerPID) }
+        }
     }
 
     private func homeWindow(width: Int = 384, height: Int = 1080) throws -> CGImage {
@@ -127,10 +131,13 @@ final class ConferencePrivacyPixelReplayTests: XCTestCase {
             // image is used every time, so old stored blur cannot explain the result.
             for (step, includeBackground) in [false, true, false, true, false].enumerated() {
                 let selected = selection(windows(includeBackground: includeBackground))
+                let before = await capture.prepareConferenceWindowSources(windows: selected, hasActiveMediaCapture: false)
+                let validated = await capture.validateConferenceWindowSources(before)
                 let output = await capture.applyConferencePrivacy(to: image, windows: selected,
                     visibleWindowContext: selected.visible.first,
                     displayBounds: CGRect(x: 0, y: 0, width: 1920, height: 1080),
-                    hasActiveMediaCapture: false, captureIntervalSeconds: 2)
+                    hasActiveMediaCapture: false, captureIntervalSeconds: 2,
+                    validatedWindowSources: validated)
                 let result = try XCTUnwrap(output)
                 try export(result, step: step)
                 let recorded = await events.drain()
@@ -179,10 +186,39 @@ final class ConferencePrivacyPixelReplayTests: XCTestCase {
         try await assertBackgroundRemainsProtected(source: transparent)
     }
 
-    private func assertBackgroundRemainsProtected(source: CGImage?, backgroundX: CGFloat = 0) async throws {
+    func testChangedSourceCannotRemoveFacesCapturedBeforeVideoTurnedOff() async throws {
+        let earlier = try XCTUnwrap(try gallery().cropping(to: CGRect(x: 0, y: 0, width: 384, height: 1080)))
+        let before = ConferenceWindowImageSnapshot(image: earlier,
+            bounds: CGRect(x: 0, y: 0, width: 384, height: 1080), ownerPID: 42)
+        try await assertBackgroundRemainsProtected(source: try homeWindow(), before: before)
+    }
+
+    func testWindowSourceGeometryChangeKeepsDesktopProtection() async throws {
+        let image = try homeWindow()
+        let before = ConferenceWindowImageSnapshot(image: image,
+            bounds: CGRect(x: 1, y: 0, width: 384, height: 1080), ownerPID: 42)
+        try await assertBackgroundRemainsProtected(source: image, before: before)
+    }
+
+    func testWindowSourceOwnerChangeKeepsDesktopProtection() async throws {
+        let image = try homeWindow()
+        let before = ConferenceWindowImageSnapshot(image: image,
+            bounds: CGRect(x: 0, y: 0, width: 384, height: 1080), ownerPID: 43)
+        try await assertBackgroundRemainsProtected(source: image, before: before)
+    }
+
+    func testMissingPreCaptureSourceCannotAuthorizeNoFaces() async throws {
+        try await assertBackgroundRemainsProtected(source: try homeWindow(), skipPreCapture: true)
+    }
+
+    private func assertBackgroundRemainsProtected(
+        source: CGImage?, backgroundX: CGFloat = 0,
+        before: ConferenceWindowImageSnapshot? = nil, skipPreCapture: Bool = false
+    ) async throws {
         let image = try gallery()
         let capture = CGWindowListCapture(conferenceCallObserver: CallObserver(),
-            conferenceWindowImages: WindowImages(images: source.map { [20: $0] } ?? [:]),
+            conferenceWindowImages: WindowImages(images: source.map { [20: $0] } ?? [:],
+                bounds: CGRect(x: backgroundX, y: 0, width: 384, height: 1080)),
             conferenceObservationClock: { Date(timeIntervalSince1970: 1000) })
         let events = Events()
         await capture.setOnConferenceFramePrivacyEvent { await events.append($0) }
@@ -205,10 +241,14 @@ final class ConferencePrivacyPixelReplayTests: XCTestCase {
                 windowLayer: background.windowLayer,
                 windowBounds: CGRect(x: backgroundX, y: 0, width: 384, height: 1080))
             let selected = selection(contexts)
+            let prepared = skipPreCapture ? [:] : await capture.prepareConferenceWindowSources(
+                windows: selected, hasActiveMediaCapture: false)
+            let validated = await capture.validateConferenceWindowSources(before.map { [20: $0] } ?? prepared)
             let output = await capture.applyConferencePrivacy(to: image, windows: selected,
                 visibleWindowContext: selected.visible.first,
                 displayBounds: CGRect(x: 0, y: 0, width: 1920, height: 1080),
-                hasActiveMediaCapture: false, captureIntervalSeconds: 2)
+                hasActiveMediaCapture: false, captureIntervalSeconds: 2,
+                validatedWindowSources: validated)
             let result = try XCTUnwrap(output)
             let recorded = await events.drain()
             XCTAssertEqual(recorded.first?.outcome, .consentBypassed)
@@ -242,7 +282,7 @@ final class ConferencePrivacyPixelReplayTests: XCTestCase {
         let source = try homeWindow(width: 3840, height: 2160)
         let images = Dictionary(uniqueKeysWithValues: (0..<10).map { (UInt32(20 + $0), source) })
         let capture = CGWindowListCapture(conferenceCallObserver: CallObserver(),
-            conferenceWindowImages: WindowImages(images: images),
+            conferenceWindowImages: WindowImages(images: images, bounds: CGRect(x: 0, y: 0, width: 1920, height: 1080)),
             conferenceObservationClock: { Date(timeIntervalSince1970: 1000) })
         let events = Events()
         await capture.setOnConferenceFramePrivacyEvent { await events.append($0) }
@@ -268,10 +308,14 @@ final class ConferencePrivacyPixelReplayTests: XCTestCase {
                 let selected = selection([primary] + backgrounds)
                 for iteration in 0..<3 {
                     let start = CFAbsoluteTimeGetCurrent()
+                    let before = await capture.prepareConferenceWindowSources(windows: selected, hasActiveMediaCapture: false)
+                    XCTAssertLessThanOrEqual(before.count, 2)
+                    let validated = await capture.validateConferenceWindowSources(before)
                     let output = await capture.applyConferencePrivacy(to: image, windows: selected,
                         visibleWindowContext: primary,
                         displayBounds: CGRect(x: 0, y: 0, width: 1920, height: 1080),
-                        hasActiveMediaCapture: false, captureIntervalSeconds: 2)
+                        hasActiveMediaCapture: false, captureIntervalSeconds: 2,
+                        validatedWindowSources: validated)
                     let total = (CFAbsoluteTimeGetCurrent() - start) * 1000
                     XCTAssertNotNil(output)
                     let recorded = await events.drain()

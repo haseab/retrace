@@ -56,7 +56,7 @@ Capture/
 - Unknown observations retain existing consent for a bounded interval from the last verified active observation, but apply blur and cannot accept new consent. Recovery of the same identity restores bypass; expiration, disappearance, confirmed end, and reset revoke it.
 - Capture uses `max(8 seconds, 3 capture intervals)` for observation freshness and uncertainty retention. Repeated unknown results never extend the interval.
 - `applyConferencePrivacy` accepts image/window/display inputs for pixel-stage replay; the pixel tests build a controlled gallery from the existing CreatorProfile photo asset. Optional measurements use `RETRACE_MEASURE_FACE_BLUR=1`.
-- When an unconsented window overlaps a consented foreground window, detect faces in its isolated window image and project masks back to the desktop. If the source is unavailable or transparently unreadable, retain desktop-ROI protection. Preserve unclipped ellipse bounds for partially off-screen windows.
+- When an unconsented window overlaps a consented foreground window, detect faces in its isolated window image and project masks back to the desktop. Bracket the desktop capture with source snapshots; only unchanged pixel content, owner PID, and geometry may supply masks or a no-face result. Capture at most two source surfaces per frame. Missing, changed, or transparently unreadable sources retain desktop-ROI protection. Preserve unclipped ellipse bounds for partially off-screen windows.
 - Window identity changes and independent windows remain isolated; this boundary does not infer that sibling windows belong to one call.
 - Run `swift test --filter 'ConferenceCallObservationTests|ConferenceSessionPrivacyPolicyTests|ConferenceROIPlannerTests'` for consent and ROI coverage.
 
