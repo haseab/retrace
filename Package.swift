@@ -143,7 +143,8 @@ let package = Package(
         .testTarget(
             name: "ProcessingTests",
             dependencies: ["Processing", "Shared", "Database", "Storage"],
-            path: "Processing/Tests"
+            path: "Processing/Tests",
+            resources: [.copy("Fixtures")]
             // ⚠️ RELEASE 2 ONLY - Whisper cSettings and linkerSettings removed for Release 1
             // ⚠️ RELEASE 2 ONLY - Audio/Tests excluded for Release 1
         ),

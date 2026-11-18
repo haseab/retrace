@@ -1,6 +1,7 @@
 import Foundation
 import ApplicationServices
 import Darwin
+import Carbon
 import Shared
 
 // MARK: - AppleScript Coordination
@@ -1605,6 +1606,18 @@ struct BrowserURLExtractor: Sendable {
                (trimmed.contains(".") && !trimmed.contains(" ") && trimmed.count > 4)
     }
 
+    /// Automatic capture must not launch a permission dialog or wait behind one.
+    /// Explicit grants remain in onboarding/settings; AX URL extraction still works.
+    static func hasAutomationAuthorization(bundleID: String) -> Bool {
+        var target = AEAddressDesc()
+        let created = bundleID.withCString { bytes in
+            AECreateDesc(typeApplicationBundleID, bytes, strlen(bytes), &target)
+        }
+        guard created == noErr else { return false }
+        defer { AEDisposeDesc(&target) }
+        return AEDeterminePermissionToAutomateTarget(&target, typeWildCard, typeWildCard, false) == noErr
+    }
+
     /// Run AppleScript in an isolated subprocess and return trimmed stdout.
     /// This path is fully async and avoids blocking with semaphore waits.
     private static func runAppleScriptViaProcess(
@@ -1615,6 +1628,9 @@ struct BrowserURLExtractor: Sendable {
         isBootstrapTimeout: Bool,
         scriptLabel: String
     ) async -> BrowserURLAppleScriptResult {
+        guard hasAutomationAuthorization(bundleID: browserBundleID) else {
+            return BrowserURLAppleScriptResult(permissionDenied: true, completedWithoutTimeout: true)
+        }
         let startTime = CFAbsoluteTimeGetCurrent()
         let elapsedMs: () -> Double = {
             (CFAbsoluteTimeGetCurrent() - startTime) * 1000

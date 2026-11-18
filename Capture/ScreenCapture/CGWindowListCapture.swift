@@ -611,6 +611,16 @@ public actor CGWindowListCapture {
             Log.warning("[CGWindowListCapture] Failed to capture CGImage for displayID=\(displayID), excludedCount=\(excludedIDs.count)", category: .capture)
             return nil
         }
+        let screenshotTime = Date()
+        // Snapshot immediately after capture, before potentially slow face processing.
+        // Skip protected frames; AX must never recover content deliberately masked out.
+        let axContext = exclusionResult.visibleWindowContext
+        let axSnapshot = axContext.map { !excludedIDs.contains($0.windowID) && !exclusionResult.redactedWindowIDs.contains($0.windowID) } == true
+            ? AccessibilitySnapshotCollector.collect(
+                pid: axContext?.ownerPID, windowID: axContext?.windowID, windowBounds: axContext?.windowBounds,
+                displayBounds: CGDisplayBounds(displayID), width: captureResult.image.width,
+                height: captureResult.image.height, capturedAt: screenshotTime, capturedImage: captureResult.image)
+            : nil
         var cgImage = captureResult.image
         let displaySurfaceBytes = Self.estimatedImageSurfaceBytes(width: cgImage.width, height: cgImage.height)
         lastDisplaySurfaceBytes = displaySurfaceBytes
@@ -845,7 +855,7 @@ public actor CGWindowListCapture {
         // Create captured frame
         let frame = CaptureFrameCandidate(
             image: cgImage,
-            timestamp: Date(),
+            timestamp: screenshotTime,
             metadata: FrameMetadata(
                 appBundleID: frameMetadataAppBundleID,
                 appName: frameMetadataAppName,
@@ -853,7 +863,8 @@ public actor CGWindowListCapture {
                 browserURL: frameMetadataBrowserURL,
                 redactionReason: redactionSummary?.reason,
                 displayID: UInt32(displayID)
-            )
+            ),
+            accessibilitySnapshot: axSnapshot
         )
 
         return frame

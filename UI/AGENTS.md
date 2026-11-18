@@ -783,4 +783,6 @@ Timeline index touches do not rescan sizes. JPEG NSCache entries have compressed
 
 - PreviewCacheEntryEpochs in PreviewCacheMaintenance.swift isolates frame eviction from unrelated reads/writes. Release read-miss epochs after all overlapping operations finish; keep whole-cache invalidation for clear/redaction.
 
+Bundled development runs use `AppPaths` to isolate settings, library, Keychain service, logs, preview caches and instance locks for `io.retrace.app.dev`. Never launch a dev build against hardcoded production domains. The production crash-recovery launch agent stays disarmed in the dev app; debugging one app must not manage the other app’s helper.
+
 - `Tests/QuitRecoveryTests.swift` covers intentional quit cancellation of pending watchdog recovery.

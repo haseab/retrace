@@ -628,7 +628,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     nonisolated private static let captureMousePositionKey = "captureMousePosition"
 
     private static func isInPageURLCollectionEnabled() -> Bool {
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
         guard defaults.object(forKey: inPageURLCollectionExperimentalKey) != nil else {
             return false
         }
@@ -636,7 +636,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     private static func isMousePositionCaptureEnabled() -> Bool {
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
         guard defaults.object(forKey: captureMousePositionKey) != nil else {
             return true
         }
@@ -1187,7 +1187,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Whether to show frame IDs in debug mode (read from UserDefaults)
     public var showFrameIDs: Bool {
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
         return defaults.bool(forKey: "showFrameIDs")
     }
 
@@ -1319,7 +1319,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Whether video controls are enabled (read from UserDefaults)
     public var showVideoControls: Bool {
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
         return defaults.bool(forKey: "showVideoControls")
     }
 
@@ -1401,7 +1401,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     public func toggleFrameIDBadgeVisibilityFromDevMenu() {
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
         let isEnabled = !defaults.bool(forKey: "showFrameIDs")
         defaults.set(isEnabled, forKey: "showFrameIDs")
         DashboardViewModel.recordDeveloperSettingToggle(
@@ -2593,7 +2593,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// File path for cached Rewind app bundle IDs used by the timeline filter.
     nonisolated static var cachedRewindAppBundleIDsPath: URL {
-        let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
+        let cacheDir = AppPaths.cacheDirectory
         return cacheDir.appendingPathComponent("timeline_rewind_app_bundle_ids.json")
     }
 
@@ -2982,7 +2982,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         let cachesDirectory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
             ?? FileManager.default.temporaryDirectory
         return cachesDirectory
-            .appendingPathComponent("io.retrace.app", isDirectory: true)
+            .appendingPathComponent(AppPaths.settingsSuiteName, isDirectory: true)
             .appendingPathComponent("TimelineFrameBuffer", isDirectory: true)
     }
 
@@ -7218,7 +7218,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     nonisolated private static func currentRewindAppBundleIDCacheContext() -> RewindAppBundleIDCacheContext {
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
         return RewindAppBundleIDCacheContext(
             cutoffDate: ServiceContainer.rewindCutoffDate(in: defaults),
             effectiveRewindDatabasePath: normalizedFilesystemPath(AppPaths.rewindDBPath),
@@ -13984,7 +13984,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         guard !frames.isEmpty else { return }
 
         // Read user sensitivity setting (0.1–1.0, default 0.50)
-        let store = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let store = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
         let userSensitivity = store.object(forKey: "scrollSensitivity") != nil ? store.double(forKey: "scrollSensitivity") : 0.50
         let sensitivityMultiplier = CGFloat(userSensitivity / 0.50) // Normalize so 0.50 = current behavior
 
@@ -14233,7 +14233,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Whether frame ID search is enabled (read from UserDefaults)
     public var enableFrameIDSearch: Bool {
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
         return defaults.bool(forKey: "enableFrameIDSearch")
     }
 

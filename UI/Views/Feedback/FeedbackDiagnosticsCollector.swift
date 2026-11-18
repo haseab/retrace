@@ -301,7 +301,7 @@ extension FeedbackService {
     /// For list-type settings (excluded apps, OCR filtered apps), only the *count* is reported.
     /// Path settings are reduced to a boolean "is custom path set?" flag.
     private func collectSanitizedSettingsSnapshot() -> [String: String] {
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
 
         var settings: [String: String] = [:]
 

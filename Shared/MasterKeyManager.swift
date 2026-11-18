@@ -51,8 +51,8 @@ public enum MasterKeyManagerError: LocalizedError, Sendable {
 }
 
 public enum MasterKeyManager {
-    public static let settingsSuiteName = "io.retrace.app"
-    public static let keychainService = "io.retrace.app.masterkey"
+    public static let settingsSuiteName = AppPaths.settingsSuiteName
+    public static let keychainService = "\(AppPaths.settingsSuiteName).masterkey"
     public static let keychainAccount = "master-key"
     public static let createdAtDefaultsKey = "masterKeyCreatedAtMs"
     public static let lastShownRecoveryDefaultsKey = "masterKeyRecoveryShownAtMs"

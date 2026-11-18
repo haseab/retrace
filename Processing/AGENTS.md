@@ -27,12 +27,15 @@ Processing/
 │   ├── TileGridConfig.swift       # Tile grid tuning
 │   └── TileOCRProcessor.swift     # Tile OCR processing helpers
 ├── Accessibility/
+│   ├── AccessibilityOCRCorrector.swift # Capture-time AX token correction, including Unicode combining marks
 │   ├── AccessibilityService.swift  # AccessibilityProtocol implementation
 │   └── TextElementFilter.swift     # Filter relevant text elements
 │
 ├── TextMerger/
 │   └── TextMerger.swift            # Combine OCR + AX results
 └── Tests/
+    ├── AccessibilityVisionIntegrationTests.swift # Real Vision fixture and Unicode normalization regressions
+    ├── Fixtures/AXSmallText.rtf                 # Sanitized document used by Vision integration checks
     ├── ExtractRequestInstrumentationTests.swift # Region tail aggregation and coordinator helper coverage
     ├── InPageURLMetadataResolutionTests.swift # In-page URL metadata retry and rewrite scheduling regression coverage
     ├── OCRMemoryBackpressurePolicyTests.swift # OCR memory backpressure threshold/default coverage
@@ -416,3 +419,7 @@ Recovery scanning must wait for all active rewrites and block new rewrite reserv
 `FrameProcessingQueue.enqueueBatch` passes the whole ID list to `DatabaseManager.enqueueFramesForProcessing` in one await. Increase `currentQueueDepth` only after the database commits the whole batch; empty batches are no-ops and failures add nothing. `RewriteRetryPolicyTests.testEnqueueBatchIsAtomicAndUsesDatabaseBatch` exercises this wiring against migrated SQLite. This is maintenance of an existing action; no new daily metric is needed.
 
 When checking whether a frame is unrecoverable, a failed video-row lookup must not authorize deletion. Only a successful missing-row result establishes that the video row is absent. `RewriteRetryPolicyTests.testDatabaseReadFailureDoesNotAuthorizeFrameDeletion` covers a denied read against real SQLite.
+
+Capture-time AX: `Accessibility/AccessibilityOCRCorrector.swift` corrects OCR tokens using saved screenshot references, preserving geometry and reading order without appending AX-only text. `Tests/AccessibilityCorrectionTests.swift` covers actual observed Vision errors, numeric corrections and ambiguity/location rejection. ProcessingManager must never sample live AX while processing historical frames. Correction runs before phrase protection, indexing and video rewriting.
+
+`Tests/AccessibilityVisionIntegrationTests.swift` rasterizes the sanitized TextEdit `Tests/Fixtures/AXSmallText.rtf` fixture with CoreText and runs real production Vision/ProcessingManager extraction, checking captured metadata, geometry preservation and no AX-only completion. Tests require the full XCTest toolchain and access to macOS Vision services.
