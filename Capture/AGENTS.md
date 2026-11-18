@@ -25,6 +25,7 @@ Capture/
 │   ├── FrameDeduplicator.swift    # DeduplicationProtocol implementation
 │   └── PerceptualHash.swift       # dHash (difference hash) for comparison
 ├── Metadata/
+│   ├── WindowOCRGeometry.swift # Front-to-back visible application-window crop bounds
 │   ├── AccessibilitySnapshotCollector.swift # Bounded capture-time AX reference collection
 │   ├── AccessibilityWindowMatcher.swift # Unique geometry/title window matching
 │   ├── AppInfoProvider.swift      # Get active app info via NSWorkspace
@@ -33,6 +34,7 @@ Capture/
 │   ├── ConferenceCallActivityProvider.swift # Bounded window-specific active-call accessibility lookup
 │   └── ConferenceSessionPrivacyPolicy.swift # Conferencing-session rules + session-scoped consent
 └── Tests/
+    ├── WindowOCRGeometryTests.swift # Fullscreen, overlap, exclusion, scaling and sliver selection checks
     ├── WindowLookupReuseTests.swift # Lookup reuse, failure handling and real graphics/file regression checks
     ├── AccessibilityWindowMatcherTests.swift # Recorded TextEdit window-selection regression
     ├── AccessibilityInspectorTest.swift
@@ -507,3 +509,9 @@ Exclusion classification collects normal on-screen, non-transparent window IDs f
 Capture-time AX: `Metadata/AccessibilitySnapshotCollector.swift` reads the matched primary window immediately after screenshot capture, before face processing. The AX window is selected by unique bounds/title match across the app’s bounded window list, rather than assuming its focused window is the captured window. Title matching removes the known owner application suffix (for example, " - Google Chrome") and normalizes whitespace/case while preserving document identity. Ambiguous matches are rejected. Snapshot bounds are screenshot pixels; window identity/geometry is rechecked. Secure, hidden, offscreen, and excluded primary-window content is skipped. Rectangle overlaps alone do not establish opacity: overlapping text regions must match opaque pixels in the actual captured frame and a window-only image. Missing/misaligned images or exhausted verification budgets reject those regions. Verification allows only a two-level per-channel rendering tolerance, checks every pixel, and is bounded to two million region pixels plus a best-effort 50 ms loop. AX runs on the capture actor, with a short messaging timeout and bounded best-effort work. `CaptureFrameCandidate` and metadata enrichment preserve the snapshot.
 
 Automatic browser URL AppleScripts preflight Apple Events authorization without prompting. Missing/denied grants fall back to AX instead of blocking screenshot capture behind a 45-second permission dialog. Explicit permission requests remain in onboarding/settings. `BrowserURLAppleScriptCoordinatorTests` includes the real missing-target preflight case.
+
+### Window-aware OCR geometry
+
+`Metadata/WindowOCRGeometry.swift` selects at most 16 meaningfully visible layer-zero application windows in front-to-back order. Each entry is the full clipped window bounds in normalized top-left screenshot coordinates; entries may overlap. Fully covered windows, exposed slivers below 1% of the window area, tiny windows and non-normal system/status-item layers do not create OCR jobs. No background fragments are appended. Screen-sized surfaces owned by background accessory/system processes are ignored as crops and occluders; the captured primary application and Retrace itself remain eligible, including with a hidden Dock icon. This ownership check caches each PID once per frame and never overrides privacy exclusions. Excluded windows consume visible area but are never selected; capture's privacy-masked screenshot remains the only pixel source. Processing masks preceding windows inside each lower crop, preserving one Vision request per selected window. Geometry over budget falls back to legacy OCR.
+
+The privacy array helper still avoids extra lookups. The OCR feature separately takes one best-effort on-screen geometry snapshot immediately after image acquisition, before slow AX/face work; it must never replace the fresh bounds used by privacy masking. The window list and screenshot are separate Window Server calls, so fast motion can race them. Only already privacy-filtered screenshot pixels are passed to OCR; no individual window image is captured.

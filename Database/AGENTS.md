@@ -35,12 +35,12 @@ Database/
 │   ├── V18_DailyMetricsRecencyIndex.swift
 │   ├── V19_FrameEncodedAt.swift
 │   └── V20_PartialProcessingStatusIndex.swift # Exclude OCR-completed frames from status index
-├── Queries/
+├── Queries/                  # Includes FrameOCRRegionQueries.swift for bounded capture-time geometry
 │   ├── FrameQueries.swift     # Frame CRUD operations
 │   ├── SegmentQueries.swift   # Segment CRUD operations
 │   ├── DailyMetricsQueries.swift # Metric events and local-day counts, with optional exact timestamp bounds
 │   └── DocumentQueries.swift  # Document/FTS operations
-└── Tests/
+└── Tests/                    # Includes FrameOCRRegionTests.swift lifecycle coverage
     ├── AsyncQueuePipelineTests.swift
     ├── RetentionVideoDeletionTests.swift # Real migrated SQLite retention guards and injected failure
     ├── DatabaseManagerTests.swift
@@ -680,3 +680,7 @@ V20 replaces `idx_frame_processing_status` with `ON frame(processingStatus) WHER
 - Retry a busy/locked read once, only before its first row, using the existing connection timeout. Never retry interruption, I/O/corruption errors, writes, or restart a result set after rows have been returned.
 
 Capture-time AX: `Queries/AccessibilitySnapshotQueries.swift` owns the idempotent auxiliary table/cleanup triggers (independent of numbered migrations to coexist with encryption V21). Atomic native-frame insertion stores bounded JSON snapshots under the enclosing database encryption policy, with no separate encryption or Keychain access. Missing/encoding-failure states contain no text; legacy encrypted or malformed payloads fall back to ordinary OCR. Completion/failure/redaction staging clears payload in the same status update; delete triggers clean references with foreign keys on or off. `Tests/AccessibilitySnapshotTests.swift` covers bounded JSON round trips, legacy unreadable payloads, and real database lifecycle/failure cases.
+
+### OCR window geometry
+
+`Queries/FrameOCRRegionQueries.swift` owns the idempotent `frame_ocr_regions` auxiliary table (16 KiB/16-window bound, version 2 envelope) and explicit delete trigger. Native frame, AX reference, and OCR geometry inserts commit atomically. Geometry survives OCR completion for deterministic replay, but is deleted with its frame even when foreign keys are disabled. Absent/malformed geometry and the old fragment-array format use legacy OCR; an empty versioned window list means no eligible application windows. Ordered overlapping bounds round-trip without losing ownership order. `Tests/FrameOCRRegionTests.swift` exercises real SQLite round trips and deletion. `window_ocr` daily metrics contain aggregate counts/timing only.
