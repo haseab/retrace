@@ -6,6 +6,44 @@ import Shared
 @testable import Processing
 
 final class PhraseLevelRedactionTests: XCTestCase {
+    func testPreviewPurgeRemovesAffectedFilesAndIsIdempotent() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let stills = root.appendingPathComponent("io.retrace.app/TimelineFrameBuffer")
+        let thumbnails = root.appendingPathComponent("search_thumbnails_v1")
+        try FileManager.default.createDirectory(at: stills, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: thumbnails, withIntermediateDirectories: true)
+        try Data([1, 2, 3]).write(to: stills.appendingPathComponent("42.jpg"))
+        try Data([4, 5, 6]).write(to: stills.appendingPathComponent("43.jpg"))
+        try Data([7, 8, 9]).write(to: thumbnails.appendingPathComponent("old.jpg"))
+        try await FrameProcessingQueue.purgeRedactionPreviews(frameIDs: [42], cachesDirectory: root)
+        try await FrameProcessingQueue.purgeRedactionPreviews(frameIDs: [42], cachesDirectory: root)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: stills.appendingPathComponent("42.jpg").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: thumbnails.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: stills.appendingPathComponent("43.jpg").path))
+    }
+
+    func testPreviewPurgePropagatesDeletionFailureForRetry() async throws {
+        let manager = FileManager.default
+        let root = manager.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let stills = root.appendingPathComponent("io.retrace.app/TimelineFrameBuffer")
+        try manager.createDirectory(at: stills, withIntermediateDirectories: true)
+        defer {
+            try? manager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: stills.path)
+            try? manager.removeItem(at: root)
+        }
+        try Data([1, 2, 3]).write(to: stills.appendingPathComponent("42.jpg"))
+        try manager.setAttributes([.posixPermissions: 0o555], ofItemAtPath: stills.path)
+        var failed = false
+        do {
+            try await FrameProcessingQueue.purgeRedactionPreviews(frameIDs: [42], cachesDirectory: root)
+        } catch {
+            failed = true
+        }
+        XCTAssertTrue(failed)
+        XCTAssertTrue(manager.fileExists(atPath: stills.appendingPathComponent("42.jpg").path))
+    }
+
     func testFuzzyPhraseRedactionMatchesOCRSubstitution() {
         let extracted = makeExtractedText(regions: ["insentions"])
 
@@ -68,6 +106,18 @@ final class PhraseLevelRedactionTests: XCTestCase {
 
         XCTAssertTrue(result.redactedCombinedNodeOrders.isEmpty)
         XCTAssertEqual(result.sanitizedText.regions.map(\.text), ["insentions"])
+    }
+
+    func testPermanentRedactionMasksOCRWithoutRetainingPlaintextOrRequiringKey() {
+        let extracted = makeExtractedText(regions: ["secret", "visible"])
+        let result = FrameProcessingQueue.applyPhraseLevelRedactionForTesting(
+            to: extracted, phrases: ["secret"], redactionSecret: nil, mode: .permanent
+        )
+        XCTAssertEqual(result.redactedCombinedNodeOrders, Set([0]))
+        XCTAssertEqual(result.sanitizedText.regions[0].text, String(repeating: " ", count: 6))
+        XCTAssertEqual(result.sanitizedText.regions[1].text, "visible")
+        XCTAssertEqual(result.encryptedRedactedTexts, [0: PhraseRedactionMode.permanentTextMarker])
+        XCTAssertFalse(result.sanitizedText.fullText.contains("secret"))
     }
 
     func testEncryptedOCRTextRoundTripsWithCorrectNodeContext() throws {

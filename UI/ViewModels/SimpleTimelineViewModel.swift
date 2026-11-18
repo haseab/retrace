@@ -628,7 +628,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     nonisolated private static let captureMousePositionKey = "captureMousePosition"
 
     private static func isInPageURLCollectionEnabled() -> Bool {
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
         guard defaults.object(forKey: inPageURLCollectionExperimentalKey) != nil else {
             return false
         }
@@ -636,7 +636,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     private static func isMousePositionCaptureEnabled() -> Bool {
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
         guard defaults.object(forKey: captureMousePositionKey) != nil else {
             return true
         }
@@ -648,6 +648,10 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// All loaded frames with their preloaded video info
     @Published public var frames: [TimelineFrame] = [] {
         didSet {
+            if oldValue.indices.contains(currentIndex),
+               oldValue[currentIndex].frame != currentTimelineFrame?.frame {
+                resetFrameTextScan()
+            }
             let didChangeIdentity = frames.count != oldValue.count
                 || frames.first?.frame.id != oldValue.first?.frame.id
                 || frames.last?.frame.id != oldValue.last?.frame.id
@@ -692,6 +696,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     @Published public var currentIndex: Int = 0 {
         didSet {
             if currentIndex != oldValue {
+                resetFrameTextScan()
                 endInPageURLHoverTracking()
                 cancelPresentationOverlayTasks()
                 clearCurrentFrameOverlayPresentation()
@@ -749,10 +754,14 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Whether the timeline is in "live mode" showing a live screenshot
     /// When true, the liveScreenshot is displayed instead of historical frames
     /// Exits to historical frames on first scroll/navigation
-    @Published public var isInLiveMode: Bool = false
+    @Published public var isInLiveMode: Bool = false {
+        didSet { if isInLiveMode != oldValue { resetFrameTextScan() } }
+    }
 
     /// The live screenshot captured at timeline launch (only used when isInLiveMode == true)
-    @Published public var liveScreenshot: NSImage?
+    @Published public var liveScreenshot: NSImage? {
+        didSet { if liveScreenshot !== oldValue { resetFrameTextScan() } }
+    }
 
     /// Whether live OCR is currently being processed on the live screenshot
     @Published public var isLiveOCRProcessing: Bool = false
@@ -877,11 +886,14 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     enum PhraseLevelRedactionTooltipState: Equatable {
         case queued
+        case permanent
         case reveal
         case hide
 
         var title: String {
             switch self {
+            case .permanent:
+                return "Permanently redacted"
             case .queued:
                 return "Queued..."
             case .reveal:
@@ -893,6 +905,8 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         var tooltipText: String {
             switch self {
+            case .permanent:
+                return "Permanently redacted"
             case .queued:
                 return "Queued..."
             case .reveal:
@@ -904,7 +918,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         var isInteractive: Bool {
             switch self {
-            case .queued:
+            case .queued, .permanent:
                 return false
             case .reveal, .hide:
                 return true
@@ -1182,7 +1196,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Whether to show frame IDs in debug mode (read from UserDefaults)
     public var showFrameIDs: Bool {
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
         return defaults.bool(forKey: "showFrameIDs")
     }
 
@@ -1314,7 +1328,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Whether video controls are enabled (read from UserDefaults)
     public var showVideoControls: Bool {
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
         return defaults.bool(forKey: "showVideoControls")
     }
 
@@ -1396,7 +1410,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     public func toggleFrameIDBadgeVisibilityFromDevMenu() {
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
         let isEnabled = !defaults.bool(forKey: "showFrameIDs")
         defaults.set(isEnabled, forKey: "showFrameIDs")
         DashboardViewModel.recordDeveloperSettingToggle(
@@ -1406,6 +1420,179 @@ public class SimpleTimelineViewModel: ObservableObject {
             isEnabled: isEnabled
         )
     }
+
+    enum FrameTextScanState: Equatable {
+        case idle, scanning, ready, empty, failed, protected
+    }
+
+    @Published private(set) var frameTextScanState: FrameTextScanState = .idle
+    private var frameTextScanTask: Task<Void, Never>?
+    private var frameTextScanRequestID = UUID()
+    private var manualScanHasOverlay = false
+
+    var canScanCurrentFrameText: Bool {
+        isInLiveMode ? liveScreenshot != nil : currentTimelineFrame != nil
+    }
+
+    private func resetFrameTextScan() {
+        frameTextScanTask?.cancel()
+        frameTextScanTask = nil
+        frameTextScanRequestID = UUID()
+        frameTextScanState = .idle
+        manualScanHasOverlay = false
+    }
+
+    private var frameTextScanProtectionEnabled: Bool {
+#if DEBUG
+        if let override = test_dragStartStillOCRHooks.phraseProtectionEnabled { return override() }
+#endif
+        return PhraseRedactionMode.isEnabled(
+            in: UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
+        )
+    }
+
+    private func canPublishUnprotectedFrameTextScan(_ frame: TimelineFrame) async throws -> Bool {
+        // A native frame's pixels are unsafe until its privacy rewrite has settled.
+        if frame.frame.source == .native, frameTextScanProtectionEnabled {
+            let status = try await fetchOCRStatusForPresentation(frameID: frame.frame.id)
+            guard status.state == .completed else { return false }
+        }
+        let nodes = try await fetchAllOCRNodesForPresentation(
+            frameID: frame.frame.id, source: frame.frame.source
+        )
+        return !nodes.contains(where: \.isRedacted)
+    }
+
+    private func blockFrameTextScanForProtection(source: String) {
+        if manualScanHasOverlay {
+            manualScanHasOverlay = false
+            clearTextSelection()
+            clearHyperlinkMatches()
+            setOCRNodes([])
+            loadOCRNodes()
+        }
+        frameTextScanState = .protected
+        recordFrameTextScan(source: source, outcome: "protected")
+    }
+
+    /// On-demand, session-only OCR. Saved nodes and the search index are never changed.
+    func scanCurrentFrameText(source: String = "button") {
+        guard canScanCurrentFrameText, frameTextScanState != .scanning else { return }
+        stopPlayback()
+        frameTextScanTask?.cancel()
+        cancelDragStartStillFrameOCR(reason: "manual scan")
+        liveOCRDebounceTask?.cancel()
+        let requestID = UUID()
+        frameTextScanRequestID = requestID
+        let frame = currentTimelineFrame
+        let live = isInLiveMode
+        let image = live ? liveScreenshot : displayableCurrentImage
+        frameTextScanState = .scanning
+        let startedAt = CFAbsoluteTimeGetCurrent()
+        recordFrameTextScan(source: source, outcome: "started")
+
+        frameTextScanTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                if !live, let frame {
+                    // Consult saved metadata even when the timeline overlay has not loaded yet.
+                    let allowed = try await self.canPublishUnprotectedFrameTextScan(frame)
+                    guard self.frameTextScanRequestID == requestID, !Task.isCancelled else { return }
+                    if !allowed {
+                        self.blockFrameTextScanForProtection(source: source)
+                        return
+                    }
+                }
+                let cgImage: CGImage
+                if let image {
+                    let snapshot = FrameTextScanImage(image: image)
+                    cgImage = try await Task.detached(priority: .userInitiated) {
+                        guard let result = snapshot.image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+                            throw CocoaError(.fileReadCorruptFile)
+                        }
+                        return result
+                    }.value
+                } else if let frame {
+                    let data = try await self.loadFrameData(frame)
+                    cgImage = try await Task.detached(priority: .userInitiated) {
+                        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+                              let result = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+                            throw CocoaError(.fileReadCorruptFile)
+                        }
+                        return result
+                    }.value
+                } else {
+                    throw CocoaError(.fileNoSuchFile)
+                }
+                guard self.frameTextScanRequestID == requestID, !Task.isCancelled else { return }
+                let regions = try await self.recognizeTextFromCGImageForDragStartStillOCR(cgImage)
+                guard self.frameTextScanRequestID == requestID, !Task.isCancelled else { return }
+                if !live, let frame {
+                    // Protection may have changed while decoding or recognizing earlier pixels.
+                    let allowed = try await self.canPublishUnprotectedFrameTextScan(frame)
+                    guard self.frameTextScanRequestID == requestID, !Task.isCancelled else { return }
+                    if !allowed {
+                        self.blockFrameTextScanForProtection(source: source)
+                        return
+                    }
+                }
+                let resultFrameID = live ? Int64(-1) : frame?.frame.id.value ?? -1
+                if !regions.isEmpty {
+                    self.ocrNodesLoadTask?.cancel()
+                    self.ocrStatusPollingTask?.cancel()
+                    self.clearTextSelection()
+                    self.clearHyperlinkMatches()
+                    self.manualScanHasOverlay = true
+                    self.setOCRNodes(regions.enumerated().map { index, region in
+                        OCRNodeWithText(
+                            id: index, frameId: resultFrameID,
+                            x: region.bounds.minX, y: region.bounds.minY,
+                            width: region.bounds.width, height: region.bounds.height, text: region.text
+                        )
+                    })
+                    self.ocrStatus = .completed
+                }
+                self.frameTextScanState = regions.isEmpty ? .empty : .ready
+                self.recordFrameTextScan(source: source, outcome: regions.isEmpty ? "no_text" : "succeeded")
+                Log.recordLatency(
+                    "timeline.manual_ocr.total_ms", valueMs: (CFAbsoluteTimeGetCurrent() - startedAt) * 1000,
+                    category: .ui, summaryEvery: 10, warningThresholdMs: 500, criticalThresholdMs: 1500
+                )
+                // Keep the result legible before returning the button to its normal action.
+                try await Task.sleep(for: .seconds(2), clock: .continuous)
+                guard self.frameTextScanRequestID == requestID else { return }
+                self.frameTextScanState = .idle
+            } catch is CancellationError {
+                return
+            } catch {
+                guard self.frameTextScanRequestID == requestID, !Task.isCancelled else { return }
+                self.frameTextScanState = .failed
+                self.recordFrameTextScan(source: source, outcome: "failed")
+                Log.error("[Timeline-OCR] Manual scan failed: \(error)", category: .ui)
+            }
+        }
+    }
+
+    // NSImage is captured once and only read by the background conversion task.
+    private struct FrameTextScanImage: @unchecked Sendable {
+        let image: NSImage
+    }
+
+    private func recordFrameTextScan(source: String, outcome: String) {
+        UIMetricsRecorder.recordDictionary(
+            coordinator: coordinator, type: .timelineTextScan,
+            payload: ["source": source, "outcome": outcome, "live": isInLiveMode]
+        )
+    }
+
+#if DEBUG
+    func waitForFrameTextScan() async {
+        // Await recognition, leaving the brief success feedback visible to assertions.
+        for _ in 0..<1000 where frameTextScanState == .scanning {
+            try? await Task.sleep(for: .milliseconds(10), clock: .continuous)
+        }
+    }
+#endif
 
     /// Reprocess OCR for the current frame (developer tool)
     /// Clears existing OCR data and re-enqueues the frame for processing
@@ -2303,6 +2490,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     deinit {
+        frameTextScanTask?.cancel()
         commentSearchTask?.cancel()
         blockCommentsLoadTask?.cancel()
         tapeIndicatorRefreshTask?.cancel()
@@ -2378,24 +2566,11 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     /// Disk-backed timeline frame buffer metadata (payload bytes are stored in Library/Caches).
-    private var diskFrameBufferIndex: [FrameID: DiskFrameBufferEntry] = [:] {
-        didSet {
-            let oldCount = oldValue.count
-            let newCount = diskFrameBufferIndex.count
-            diskFrameBufferBytes = diskFrameBufferIndex.values.reduce(into: Int64(0)) { total, entry in
-                total += entry.sizeBytes
-            }
-            if oldCount != newCount {
-                if Self.isVerboseTimelineLoggingEnabled {
-                    Log.debug(
-                        "[Memory] diskFrameBuffer changed: \(oldCount) → \(newCount) frames (\(Self.formatBytes(diskFrameBufferBytes)))",
-                        category: .ui
-                    )
-                }
-            }
-        }
-    }
-    private var diskFrameBufferBytes: Int64 = 0
+    private var diskFrameBufferIndex = ByteCountedCacheIndex<FrameID, DiskFrameBufferEntry>(cost: { $0.sizeBytes })
+    private var diskFrameBufferBytes: Int64 { diskFrameBufferIndex.totalBytes }
+    private var diskFrameBufferGeneration: UInt64 = 0
+    private let diskFrameBufferEpoch = PreviewCacheEpoch()
+    private var diskFrameBufferEntryEpochs = PreviewCacheEntryEpochs<FrameID>()
     private var diskFrameBufferAccessSequence: UInt64 = 0
     private let diskFrameBufferDirectoryURL: URL
 
@@ -2480,6 +2655,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     private static func makeInMemoryJPEGFrameCache() -> NSCache<NSNumber, NSData> {
         let cache = NSCache<NSNumber, NSData>()
         cache.countLimit = inMemoryJPEGFrameCacheCountLimit
+        cache.totalCostLimit = 64 * 1024 * 1024
         return cache
     }
 
@@ -2600,7 +2776,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// File path for cached Rewind app bundle IDs used by the timeline filter.
     nonisolated static var cachedRewindAppBundleIDsPath: URL {
-        let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
+        let cacheDir = AppPaths.cacheDirectory
         return cacheDir.appendingPathComponent("timeline_rewind_app_bundle_ids.json")
     }
 
@@ -2679,6 +2855,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
     struct DragStartStillOCRTestHooks {
         var recognizeTextFromCGImage: ((CGImage) async throws -> [TextRegion])?
+        var phraseProtectionEnabled: (() -> Bool)?
     }
     struct BlockCommentsTestHooks {
         var getCommentsForSegments: (([SegmentID]) async throws -> [AppCoordinator.LinkedSegmentComment])?
@@ -2733,6 +2910,29 @@ public class SimpleTimelineViewModel: ObservableObject {
             // On startup with overlay already visible, keep the search bar front-and-center
             // without opening the recent-entries popover by default.
             searchViewModel.suppressRecentEntriesForNextOverlayOpen()
+        }
+
+        NotificationCenter.default.addObserver(
+            forName: PhraseRedactionMode.didFinishNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                Log.debug("[Timeline-OCR] Invalidating transient scan after redaction", category: .ui)
+                self.resetFrameTextScan()
+                self.cancelForegroundFrameLoad(reason: "redaction completed")
+                self.cancelCacheExpansion(reason: "redaction completed")
+                self.unavailableFrameDiskLookupTask?.cancel()
+                self.unavailableFrameDiskLookupTask = nil
+                self.diskFrameBufferGeneration &+= 1
+                self.diskFrameBufferEpoch.invalidate()
+                self.diskFrameBufferEntryEpochs.invalidateAll()
+                self.diskFrameBufferIndex.removeAll()
+                self.inMemoryJPEGFrameCache.removeAllObjects()
+                self.hotWindowRange = nil
+                self.clearCurrentFrameOverlayPresentation()
+                self.clearCurrentImagePresentation()
+                self.loadImageIfNeeded()
+            }
         }
 
         // Listen for data source changes (e.g., Rewind data toggled)
@@ -2968,7 +3168,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         let cachesDirectory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
             ?? FileManager.default.temporaryDirectory
         return cachesDirectory
-            .appendingPathComponent("io.retrace.app", isDirectory: true)
+            .appendingPathComponent(AppPaths.settingsSuiteName, isDirectory: true)
             .appendingPathComponent("TimelineFrameBuffer", isDirectory: true)
     }
 
@@ -2986,6 +3186,8 @@ public class SimpleTimelineViewModel: ObservableObject {
         for frameID: FrameID,
         logPrefix: String
     ) async -> NSImage? {
+        let privacyDefaults = UserDefaults(suiteName: ReversibleOCRScrambler.settingsSuiteName) ?? .standard
+        guard !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { return nil }
         let fileURL = timelineDiskFrameBufferFileURL(for: frameID)
         guard FileManager.default.fileExists(atPath: fileURL.path) else {
             return nil
@@ -2996,6 +3198,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                 try Data(contentsOf: fileURL, options: [.mappedIfSafe])
             }.value
 
+            guard !Task.isCancelled, !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { return nil }
             guard let image = NSImage(data: data) else {
                 Log.warning(
                     "\(logPrefix) Failed to decode timeline disk-buffer preview for frame \(frameID.value)",
@@ -3029,7 +3232,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     private func initializeDiskFrameBuffer() {
         diskFrameBufferAccessSequence = 0
-        diskFrameBufferIndex = [:]
+        diskFrameBufferIndex.removeAll()
         diskFrameBufferInitializationTask?.cancel()
 
         let directoryURL = diskFrameBufferDirectoryURL
@@ -3123,27 +3326,29 @@ public class SimpleTimelineViewModel: ObservableObject {
         removeExternalFiles: Bool = false
     ) -> (removedFromIndex: Int, removedFromDisk: Int, preservedExternal: Int) {
         guard !frameIDs.isEmpty else { return (0, 0, 0) }
+        diskFrameBufferEntryEpochs.invalidate(frameIDs)
 
         var removedFromIndex = 0
         var removedFromDisk = 0
         var preservedExternal = 0
+        var removals: [URL] = []
         removeInMemoryJPEGFrameData(frameIDs)
         for frameID in frameIDs {
             if let entry = diskFrameBufferIndex.removeValue(forKey: frameID) {
                 removedFromIndex += 1
-                let shouldRemoveFile = removeExternalFiles || entry.origin == .timelineManaged
-                if shouldRemoveFile {
-                    try? FileManager.default.removeItem(at: entry.fileURL)
+                if removeExternalFiles || entry.origin == .timelineManaged {
+                    removals.append(entry.fileURL)
                     removedFromDisk += 1
                 } else {
                     preservedExternal += 1
                 }
             }
         }
+        PreviewCacheDiskWorker.shared.removeFiles(removals)
 
         if Self.isVerboseTimelineLoggingEnabled {
             Log.info(
-                "[Memory] Removed frame-buffer entries reason=\(reason) removedFromIndex=\(removedFromIndex) removedFromDisk=\(removedFromDisk) preservedExternal=\(preservedExternal)",
+                "[Memory] Removed frame-buffer entries reason=\(reason) removedFromIndex=\(removedFromIndex) queuedForDiskRemoval=\(removedFromDisk) preservedExternal=\(preservedExternal)",
                 category: .ui
             )
         }
@@ -3151,6 +3356,9 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     private func clearDiskFrameBuffer(reason: String) {
+        diskFrameBufferGeneration &+= 1
+        diskFrameBufferEpoch.invalidate()
+        diskFrameBufferEntryEpochs.invalidateAll()
         unavailableFrameDiskLookupTask?.cancel()
         unavailableFrameDiskLookupTask = nil
         cancelForegroundFrameLoad(reason: "clearDiskFrameBuffer.\(reason)")
@@ -3174,14 +3382,14 @@ public class SimpleTimelineViewModel: ObservableObject {
             preservedExternalIndexed = result.preservedExternal
         }
         let removeAllUnindexedFiles = shouldRemoveAllUnindexedDiskFrameBufferFiles(for: reason)
-        let removedUnindexedFiles = clearUnindexedDiskFrameBufferFiles(
+        clearUnindexedDiskFrameBufferFiles(
             reason: reason,
             removeAll: removeAllUnindexedFiles
         )
-        if removedIndexedFiles > 0 || removedUnindexedFiles > 0 || removeAllUnindexedFiles || preservedExternalIndexed > 0 {
+        if removedIndexedFiles > 0 || removeAllUnindexedFiles || preservedExternalIndexed > 0 {
             let mode = removeAllUnindexedFiles ? "all" : "prune-old"
             Log.info(
-                "[Timeline-DiskBuffer] clear reason=\(reason) indexedBefore=\(indexedBefore) removedIndexed=\(removedIndexedFiles) removedIndexedFromDisk=\(removedIndexedFromDisk) preservedExternalIndexed=\(preservedExternalIndexed) removedUnindexed=\(removedUnindexedFiles) mode=\(mode)",
+                "[Timeline-DiskBuffer] clear reason=\(reason) indexedBefore=\(indexedBefore) removedIndexed=\(removedIndexedFiles) queuedIndexedDiskRemoval=\(removedIndexedFromDisk) preservedExternalIndexed=\(preservedExternalIndexed) unindexedCleanupQueued=true mode=\(mode)",
                 category: .ui
             )
         }
@@ -3191,47 +3399,9 @@ public class SimpleTimelineViewModel: ObservableObject {
         reason == "data source reload"
     }
 
-    private func clearUnindexedDiskFrameBufferFiles(
-        reason: String,
-        removeAll: Bool
-    ) -> Int {
-        do {
-            let resourceKeys: Set<URLResourceKey> = [.isRegularFileKey, .contentModificationDateKey]
-            let files = try FileManager.default.contentsOfDirectory(
-                at: diskFrameBufferDirectoryURL,
-                includingPropertiesForKeys: Array(resourceKeys),
-                options: [.skipsHiddenFiles]
-            )
-            let cutoffDate = removeAll
-                ? nil
-                : Date().addingTimeInterval(-Self.diskFrameBufferUnindexedPruneAgeSeconds)
-            var removedCount = 0
-            for fileURL in files {
-                let values = try? fileURL.resourceValues(forKeys: resourceKeys)
-                guard values?.isRegularFile == true else { continue }
-                guard Self.frameID(fromDiskFrameFileURL: fileURL) != nil else { continue }
-                if let cutoffDate,
-                   let contentModifiedAt = values?.contentModificationDate,
-                   contentModifiedAt >= cutoffDate {
-                    continue
-                }
-                try? FileManager.default.removeItem(at: fileURL)
-                removedCount += 1
-            }
-            if removedCount > 0, Self.isVerboseTimelineLoggingEnabled {
-                Log.info(
-                    "[Timeline-DiskBuffer] Removed \(removedCount) unindexed disk-buffer files (\(reason))",
-                    category: .ui
-                )
-            }
-            return removedCount
-        } catch {
-            Log.warning(
-                "[Timeline-DiskBuffer] Failed to clear unindexed disk-buffer files (\(reason)): \(error)",
-                category: .ui
-            )
-            return 0
-        }
+    private func clearUnindexedDiskFrameBufferFiles(reason: String, removeAll: Bool) {
+        let cutoff = removeAll ? Date() : Date().addingTimeInterval(-Self.diskFrameBufferUnindexedPruneAgeSeconds)
+        PreviewCacheDiskWorker.shared.pruneTimelineFiles(in: diskFrameBufferDirectoryURL, olderThan: cutoff)
     }
 
     private func describeHotWindowRange() -> String {
@@ -3272,6 +3442,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             presentationWorkGeneration &+= 1
         }
         if !enabled {
+            resetFrameTextScan()
             cancelPresentationOverlayTasks()
         }
         if Self.isVerboseTimelineLoggingEnabled {
@@ -3357,6 +3528,8 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     private func readFrameDataFromDiskFrameBuffer(frameID: FrameID) async -> Data? {
+        let privacyDefaults = UserDefaults(suiteName: ReversibleOCRScrambler.settingsSuiteName) ?? .standard
+        guard !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { return nil }
         await awaitDiskFrameBufferInitializationIfNeeded()
         let existingEntry = diskFrameBufferIndex[frameID]
         let fileURL = existingEntry?.fileURL ?? diskFrameBufferURL(for: frameID)
@@ -3368,18 +3541,17 @@ public class SimpleTimelineViewModel: ObservableObject {
             return cachedData
         }
 
-        guard FileManager.default.fileExists(atPath: fileURL.path) else {
-            if existingEntry != nil {
-                removeDiskFrameBufferEntries([frameID], reason: "read missing file")
-            }
-            return nil
-        }
-
+        let generation = diskFrameBufferGeneration
+        let entryEpoch = diskFrameBufferEntryEpochs.epoch(for: frameID)
+        let entryToken = entryEpoch.current
+        defer { diskFrameBufferEntryEpochs.finish(frameID, epoch: entryEpoch, keep: diskFrameBufferIndex[frameID] != nil) }
         do {
             let data = try await Task.detached(priority: .userInitiated) {
                 try Data(contentsOf: fileURL, options: [.mappedIfSafe])
             }.value
 
+            guard !Task.isCancelled, generation == diskFrameBufferGeneration, entryEpoch.matches(entryToken),
+                  !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { return nil }
             if existingEntry != nil {
                 touchDiskFrameBufferEntry(frameID)
             } else {
@@ -3395,36 +3567,43 @@ public class SimpleTimelineViewModel: ObservableObject {
             storeInMemoryJPEGFrameData(data, frameID: frameID)
             return data
         } catch {
-            removeDiskFrameBufferEntries([frameID], reason: "read failure")
+            guard generation == diskFrameBufferGeneration, entryEpoch.matches(entryToken) else { return nil }
+            if existingEntry != nil {
+                removeDiskFrameBufferEntries([frameID], reason: "read failure")
+            }
             return nil
         }
     }
 
     private func storeFrameDataInDiskFrameBuffer(frameID: FrameID, data: Data) async {
+        let privacyDefaults = UserDefaults(suiteName: ReversibleOCRScrambler.settingsSuiteName) ?? .standard
+        guard !Task.isCancelled, !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { return }
         await awaitDiskFrameBufferInitializationIfNeeded()
+        guard !Task.isCancelled else { return }
         let fileURL = diskFrameBufferURL(for: frameID)
-        do {
-            try await Task.detached(priority: .utility) {
-                try FileManager.default.createDirectory(
-                    at: fileURL.deletingLastPathComponent(),
-                    withIntermediateDirectories: true
-                )
-                try data.write(to: fileURL, options: [.atomic])
-            }.value
-
-            diskFrameBufferAccessSequence &+= 1
-            let entry = DiskFrameBufferEntry(
-                fileURL: fileURL,
-                sizeBytes: Int64(data.count),
-                lastAccessSequence: diskFrameBufferAccessSequence,
-                origin: .timelineManaged
-            )
-            diskFrameBufferIndex[frameID] = entry
-            storeInMemoryJPEGFrameData(data, frameID: frameID)
-
-        } catch {
-            Log.warning("[Timeline-DiskBuffer] Failed to write frame \(frameID.value) to disk buffer: \(error)", category: .ui)
+        let generation = diskFrameBufferGeneration
+        let epoch = diskFrameBufferEpoch
+        let token = epoch.current
+        let entryEpoch = diskFrameBufferEntryEpochs.epoch(for: frameID)
+        let entryToken = entryEpoch.current
+        defer { diskFrameBufferEntryEpochs.finish(frameID, epoch: entryEpoch, keep: diskFrameBufferIndex[frameID] != nil) }
+        let wrote = await withCheckedContinuation { continuation in
+            PreviewCacheDiskWorker.shared.enqueueWrite(data, to: fileURL, allowed: {
+                epoch.matches(token) && entryEpoch.matches(entryToken) && !PhraseRedactionMode.isEnabled(in: privacyDefaults)
+            }, completion: { continuation.resume(returning: $0) })
         }
+        guard wrote, !Task.isCancelled, generation == diskFrameBufferGeneration, entryEpoch.matches(entryToken),
+              !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { return }
+
+        diskFrameBufferAccessSequence &+= 1
+        let entry = DiskFrameBufferEntry(
+            fileURL: fileURL,
+            sizeBytes: Int64(data.count),
+            lastAccessSequence: diskFrameBufferAccessSequence,
+            origin: .timelineManaged
+        )
+        diskFrameBufferIndex[frameID] = entry
+        storeInMemoryJPEGFrameData(data, frameID: frameID)
     }
 
     private func inMemoryJPEGFrameCacheKey(for frameID: FrameID) -> NSNumber {
@@ -3445,7 +3624,8 @@ public class SimpleTimelineViewModel: ObservableObject {
     private func storeInMemoryJPEGFrameData(_ data: Data, frameID: FrameID) {
         inMemoryJPEGFrameCache.setObject(
             data as NSData,
-            forKey: inMemoryJPEGFrameCacheKey(for: frameID)
+            forKey: inMemoryJPEGFrameCacheKey(for: frameID),
+            cost: data.count
         )
     }
 
@@ -4033,7 +4213,12 @@ public class SimpleTimelineViewModel: ObservableObject {
             targetIndex = findClosestFrameIndex(to: targetDate)
         }
 
-        guard requestStillCurrent?() ?? true else { return nil }
+        // No staleness re-check here on purpose. `requestStillCurrent` asks whether the playhead
+        // still sits on the originally requested frame, and applyNavigationFrameWindow above has
+        // just replaced the window -- so by this point our own mutation has invalidated it. There
+        // is no await between the last check and here, so no request can have superseded us
+        // either. Re-checking could only abort a navigation that had already happened, leaving a
+        // freshly applied window with a stale index and reporting failure to the caller.
         navigateToFrame(targetIndex)
         return targetIndex
     }
@@ -7225,7 +7410,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     nonisolated private static func currentRewindAppBundleIDCacheContext() -> RewindAppBundleIDCacheContext {
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
         return RewindAppBundleIDCacheContext(
             cutoffDate: ServiceContainer.rewindCutoffDate(in: defaults),
             effectiveRewindDatabasePath: normalizedFilesystemPath(AppPaths.rewindDBPath),
@@ -9988,7 +10173,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     private func triggerDragStartStillFrameOCRIfNeeded(gesture: String) {
-        guard !isInLiveMode else { return }
+        guard !isInLiveMode, frameTextScanState != .scanning, !manualScanHasOverlay else { return }
         guard let timelineFrame = currentTimelineFrame else { return }
         guard timelineFrame.processingStatus == 4 else { return }
         let frameID = timelineFrame.frame.id
@@ -10090,6 +10275,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Trigger live OCR with a 350ms debounce
     /// Each call resets the timer - OCR only fires after 350ms of no new calls
     public func performLiveOCR() {
+        guard frameTextScanState != .scanning, !manualScanHasOverlay else { return }
         // Clear stale OCR nodes from previous frame immediately
         // This prevents interaction with old bounding boxes while debounce waits
         setOCRNodes([])
@@ -10135,8 +10321,8 @@ public class SimpleTimelineViewModel: ObservableObject {
                 return try await ocr.recognizeTextFromCGImage(detachedImage.image)
             }.value
 
-            // Only update if still in live mode (user may have scrolled away)
-            guard isInLiveMode else {
+            // Manual OCR owns the overlay until navigation or a new screenshot.
+            guard isInLiveMode, frameTextScanState != .scanning, !manualScanHasOverlay else {
                 isLiveOCRProcessing = false
                 return
             }
@@ -10540,13 +10726,14 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     static func phraseLevelRedactionTooltipState(
         for processingStatus: Int,
-        isRevealed: Bool
+        isRevealed: Bool,
+        isPermanent: Bool = false
     ) -> PhraseLevelRedactionTooltipState? {
         switch processingStatus {
         case 5, 6:
             return .queued
         case 2, 7:
-            return isRevealed ? .hide : .reveal
+            return isPermanent ? .permanent : (isRevealed ? .hide : .reveal)
         default:
             return nil
         }
@@ -11197,7 +11384,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Open the URL in the default browser
     public func openURLInBrowser() {
         guard let box = urlBoundingBox,
-              let url = URL(string: box.url) else {
+              let url = CapturedURLPolicy.webURL(box.url) else {
             return
         }
 
@@ -11227,7 +11414,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             "[BrowserLinkOpen] resolved frameId=\(timelineFrame.frame.id.value) finalURL=\(finalURLString)",
             category: .ui
         )
-        guard let finalURL = URL(string: finalURLString) else {
+        guard let finalURL = CapturedURLPolicy.webURL(finalURLString) else {
             Log.warning(
                 "[BrowserLinkOpen] invalid final URL frameId=\(timelineFrame.frame.id.value) finalURL=\(finalURLString)",
                 category: .ui
@@ -11558,7 +11745,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     @discardableResult
     public func openHyperlinkMatch(_ match: OCRHyperlinkMatch) -> Bool {
         guard let resolvedURLString = resolvedHyperlinkURLString(for: match),
-              let url = URL(string: resolvedURLString) else {
+              let url = CapturedURLPolicy.webURL(resolvedURLString) else {
             return false
         }
         let coordinator = self.coordinator
@@ -11989,7 +12176,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     public func togglePhraseLevelRedactionReveal(for node: OCRNodeWithText) {
-        guard node.isRedacted else { return }
+        guard node.isRedacted, !node.isPermanentlyRedacted else { return }
         guard let frame = currentTimelineFrame?.frame else { return }
         guard Self.isSuccessfulProcessingStatus(currentTimelineFrame?.processingStatus ?? -1) else { return }
         guard let secret = ReversibleOCRScrambler.currentAppWideSecret() else { return }
@@ -12155,6 +12342,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Load all OCR nodes for the current frame
     private func loadOCRNodes(expectedGeneration: UInt64 = 0) {
+        guard !manualScanHasOverlay else { return }
         // Don't overwrite live OCR results with database results
         guard !isInLiveMode else { return }
         let generation = expectedGeneration == 0
@@ -12210,6 +12398,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Load OCR nodes and wait for completion (used when we need to await the result)
     private func loadOCRNodesAsync(expectedGeneration: UInt64 = 0) async {
+        guard !manualScanHasOverlay else { return }
         let generation = expectedGeneration == 0
             ? currentPresentationWorkGeneration()
             : expectedGeneration
@@ -12237,7 +12426,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
             let (status, nodes) = try await (statusTask, nodesTask)
 
-            if canPublishPresentationResult(
+            if !manualScanHasOverlay, canPublishPresentationResult(
                 frameID: frame.id,
                 expectedGeneration: generation
             ) {
@@ -12264,7 +12453,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             return
         } catch {
             Log.error("[SimpleTimelineViewModel] Failed to load OCR nodes: \(error)", category: .app)
-            if canPublishPresentationResult(
+            if !manualScanHasOverlay, canPublishPresentationResult(
                 frameID: frame.id,
                 expectedGeneration: generation
             ) {
@@ -12368,7 +12557,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             )
 
             // Only update if still on the same frame
-            guard canPublishPresentationResult(
+            guard !manualScanHasOverlay, canPublishPresentationResult(
                 frameID: frameID,
                 expectedGeneration: generation
             ) else { return }
@@ -12388,7 +12577,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             )
         } catch {
             Log.error("[OCR-POLL] Failed to reload OCR nodes: \(error)", category: .ui)
-            guard canPublishPresentationResult(
+            guard !manualScanHasOverlay, canPublishPresentationResult(
                 frameID: frameID,
                 expectedGeneration: generation
             ) else { return }
@@ -13990,7 +14179,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         guard !frames.isEmpty else { return }
 
         // Read user sensitivity setting (0.1–1.0, default 0.50)
-        let store = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let store = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
         let userSensitivity = store.object(forKey: "scrollSensitivity") != nil ? store.double(forKey: "scrollSensitivity") : 0.50
         let sensitivityMultiplier = CGFloat(userSensitivity / 0.50) // Normalize so 0.50 = current behavior
 
@@ -14239,7 +14428,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Whether frame ID search is enabled (read from UserDefaults)
     public var enableFrameIDSearch: Bool {
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
         return defaults.bool(forKey: "enableFrameIDSearch")
     }
 
@@ -14998,7 +15187,13 @@ public class SimpleTimelineViewModel: ObservableObject {
             ? [trimmed]
             : [normalizedWithCompactTimes, trimmed]
         for chronoInput in chronoInputs {
-            if let result = chrono.parse(text: chronoInput, refDate: now, opt: [:]).first?.start.date {
+            // SwiftyChrono understands "in N units"; otherwise "N units from now" can match only "now".
+            let normalizedChronoInput = chronoInput.replacingOccurrences(
+                of: #"^(\d+\s+(?:seconds?|min(?:ute)?s?|hours?|days?|weeks?|months?|years?))\s+from\s+now\b"#,
+                with: "in $1",
+                options: [.regularExpression, .caseInsensitive]
+            )
+            if let result = chrono.parse(text: normalizedChronoInput, refDate: now, opt: [:]).first?.start.date {
                 let normalized = finalizeParsedDate(result)
                 return normalized
             }
@@ -15586,7 +15781,8 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     private func shouldCoerceYearlessAbsoluteDateToPast(_ input: String) -> Bool {
-        let normalizedInput = normalizeRelativeDateShorthand(input)
+        // Classify years after compact times such as "1417" have become "14:17".
+        let normalizedInput = normalizeCompactTimeFormat(normalizeRelativeDateShorthand(input))
         // Keep relative expressions as-is (tomorrow/next/last/etc).
         if normalizedInput.range(
             of: #"\b(today|tomorrow|yesterday|next|last|ago|this|now|tonight)\b|from now"#,

@@ -535,15 +535,20 @@ public actor HEVCEncoder {
         // Check if a new fragment was written by monitoring file size changes
         // Fragments are written every ~4 seconds of video time
         if let url = outputURL {
-            // Also check if file was deleted after append - if so, recreate immediately
-            // This minimizes frame loss to at most 1 frame
-            if !FileManager.default.fileExists(atPath: url.path) {
-                Log.warning("⚠️ Video file deleted after append, recreating encoder: \(url.path)", category: .storage)
+            // One metadata lookup supplies both existence and fragment-size tracking.
+            // Keep the pre-append check as well so deletion recovery still precedes
+            // the next append; a post-append deletion still recreates immediately.
+            let observedSize: Int64?
+            do {
+                observedSize = try Self.outputFileSizeIfPresent(at: url)
+            } catch {
+                throw StorageModuleError.encodingFailed(underlying: "Cannot inspect encoder output: \(error.localizedDescription)")
+            }
+            guard let currentSize = observedSize else {
+                Log.warning("[HEVCEncoder] Video file deleted after append, recreating encoder", category: .storage)
                 try await recreateEncoder()
                 return
             }
-
-            let currentSize = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int64) ?? 0
             let sizeIncrease = currentSize - lastLoggedFileSize
 
             // A fragment write typically causes a significant size jump (>1KB)
@@ -565,6 +570,25 @@ public actor HEVCEncoder {
                 // First write - initialization
                 lastLoggedFileSize = currentSize
             }
+        }
+    }
+
+    /// A missing path is recoverable deletion; other I/O errors must not be
+    /// mistaken for deletion and trigger destructive writer recreation.
+    static func outputFileSizeIfPresent(at url: URL) throws -> Int64? {
+        do {
+            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+            guard let size = attributes[.size] as? NSNumber else { throw CocoaError(.fileReadUnknown) }
+            return size.int64Value
+        } catch let error as NSError {
+            if error.domain == NSCocoaErrorDomain &&
+                (error.code == NSFileReadNoSuchFileError || error.code == NSFileNoSuchFileError) {
+                return nil
+            }
+            if error.domain == NSPOSIXErrorDomain && (error.code == Int(ENOENT) || error.code == Int(ENOTDIR)) {
+                return nil
+            }
+            throw error
         }
     }
 

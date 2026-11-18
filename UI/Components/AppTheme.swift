@@ -328,7 +328,7 @@ public class AppIconColorCache {
 /// Persists per-tag colors selected by users in Settings.
 /// Colors are keyed by tag ID and fall back to a deterministic color when unset.
 public enum TagColorStore {
-    private static let defaults: UserDefaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+    private static let defaults: UserDefaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
     private static let storageKey = "tagColorsByID"
     private static let lock = NSLock()
     private static var cachedHexByTagID: [Int64: String] = [:]
@@ -593,7 +593,7 @@ public enum RetraceFont {
     private static let fontStyleKey = "retraceFontStyle"
 
     /// Shared UserDefaults store (same as Settings uses)
-    private static let settingsStore = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+    private static let settingsStore = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
 
     /// The current font style (persisted in UserDefaults)
     public static var currentStyle: RetraceFontStyle {
@@ -1453,7 +1453,7 @@ public struct RetraceMenuButton: View {
 }
 
 /// Shared UserDefaults store for accessing settings
-private let menuContainerSettingsStore = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+private let menuContainerSettingsStore = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
 
 /// Standardized menu container modifier
 /// Applies consistent background, border, and shadow to any menu/popover content

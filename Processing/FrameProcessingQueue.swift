@@ -491,6 +491,9 @@ public actor FrameProcessingQueue {
     private let processing: ProcessingProtocol
     private let search: SearchProtocol
 
+    /// Defaults to the real master key; tests supply their fixture key without Keychain access.
+    private let appWideSecretProvider: @Sendable () -> String?
+
     private let config: ProcessingQueueConfig
     private var workers: [Task<Void, Never>] = []
     private var isRunning = false
@@ -512,8 +515,6 @@ public actor FrameProcessingQueue {
     private static let memoryLedgerWorkersTag = "processing.ocr.workers"
     private static let rewriteResumeDebounceNs: UInt64 = 300_000_000
     private static let defaultRetryableRewriteRetryDelayNs: UInt64 = 5_000_000_000
-    private static let phraseRedactionPhrasesDefaultsKey = "phraseLevelRedactionPhrases"
-    private static let phraseRedactionEnabledDefaultsKey = "phraseLevelRedactionEnabled"
     private static let phraseRedactionExtraTokenSlack = 2
     private static let phraseRedactionMaxNodeSpan = 8
     private var isPausedForMemoryPressure = false
@@ -524,6 +525,7 @@ public actor FrameProcessingQueue {
     private var rewriteResumeTask: Task<Void, Never>?
     private var retryableRewriteRetryTask: Task<Void, Never>?
     private var startupRewriteRecoveryPending = false
+    private var isRewriteRecoveryScanning = false
     private var exhaustedAutomaticRewriteRetryVideoIDs: Set<Int64> = []
 
     // MARK: - Power-Aware Processing Control
@@ -570,13 +572,17 @@ public actor FrameProcessingQueue {
         storage: StorageProtocol,
         processing: ProcessingProtocol,
         search: SearchProtocol,
-        config: ProcessingQueueConfig = .default
+        config: ProcessingQueueConfig = .default,
+        appWideSecretProvider: @escaping @Sendable () -> String? = {
+            ReversibleOCRScrambler.currentAppWideSecret()
+        }
     ) {
         self.databaseManager = database
         self.storage = storage
         self.processing = processing
         self.search = search
         self.config = config
+        self.appWideSecretProvider = appWideSecretProvider
     }
 
     // MARK: - Power Configuration
@@ -756,7 +762,11 @@ public actor FrameProcessingQueue {
 
     @discardableResult
     private func performStartupRewriteRecoveryIfPending(trigger: String) async -> Bool {
+        if isRewriteRecoveryScanning { return true }
         guard startupRewriteRecoveryPending else { return false }
+        // A recovery scan treats working files as interrupted. Only scan once all live
+        // encoders have finished; their completion schedules the pending recovery.
+        guard activeRewriteVideoIDs.isEmpty else { return true }
         guard !isRewriteSchedulingSuspended else {
             Log.debug(
                 "[Queue-Rewrite] Startup rewrite recovery still deferred while timeline is active (\(trigger))",
@@ -768,7 +778,11 @@ public actor FrameProcessingQueue {
         startupRewriteRecoveryPending = false
 
         do {
-            await reconcileInterruptedSegmentRewritesOnStartup()
+            isRewriteRecoveryScanning = true
+            do {
+                defer { isRewriteRecoveryScanning = false }
+                try await reconcileInterruptedSegmentRewritesOnStartup()
+            }
 
             let pendingVideoIDs = try await databaseManager.getVideoIDsWithPendingRewrites(
                 includeRetryableFailures: true
@@ -795,6 +809,7 @@ public actor FrameProcessingQueue {
                 }
             }
         } catch {
+            startupRewriteRecoveryPending = true
             Log.error(
                 "[Queue-Rewrite] Failed to scan pending rewrites on startup: \(error.localizedDescription)",
                 category: .processing
@@ -990,9 +1005,9 @@ public actor FrameProcessingQueue {
 
     /// Enqueue multiple frames (batch operation)
     public func enqueueBatch(frameIDs: [Int64], priority: Int = 0) async throws {
-        for frameID in frameIDs {
-            try await enqueue(frameID: frameID, priority: priority)
-        }
+        guard !frameIDs.isEmpty else { return }
+        try await databaseManager.enqueueFramesForProcessing(frameIDs: frameIDs, priority: priority)
+        currentQueueDepth += frameIDs.count
     }
 
     /// Dequeue the next frame for processing
@@ -1054,6 +1069,7 @@ public actor FrameProcessingQueue {
         guard isRunning else { return }
 
         isRunning = false
+        await flushAccessibilityMetrics()
 
         Log.info("[Queue] Stopping workers...", category: .processing)
 
@@ -1151,9 +1167,13 @@ public actor FrameProcessingQueue {
                     }
 
                     totalProcessed += 1
+                    if try await !databaseManager.hasFramesAwaitingOCR() {
+                        await drainPendingRewritesIfPossible(includeInProgressJobs: false,
+                            includeRetryableFailures: false, trigger: "ocr-backlog-drained")
+                    }
 
                     let elapsed = Date().timeIntervalSince(startTime)
-                    Log.info("[Queue-DIAG] Worker \(id) COMPLETED frame \(queuedFrame.frameID) in \(String(format: "%.2f", elapsed))s", category: .processing)
+                    Log.recordRoutine(.ocrProcessed, durationMs: elapsed * 1000)
 
                     // Apply rate limiting delay after successful processing
                     if minDelayBetweenFramesNs > 0 {
@@ -1211,7 +1231,7 @@ public actor FrameProcessingQueue {
         if !shouldProcessOCR(forBundleID: bundleID) {
             // Mark as completed (no OCR needed for this app)
             try await updateFrameProcessingStatus(frameID, status: .completed)
-            Log.debug("[Queue] Frame \(frameID) skipped - app \(bundleID ?? "unknown") excluded from OCR", category: .processing)
+            Log.recordRoutine(.ocrExcluded)
             return .skippedByAppFilter
         }
 
@@ -1240,7 +1260,7 @@ public actor FrameProcessingQueue {
             ocrStage = stage
         }
 
-        let phraseRedactionResult = applyPhraseLevelRedaction(
+        let phraseRedactionResult = try applyPhraseLevelRedaction(
             to: ocrStage.extractedText,
             actualFrameID: frameID
         )
@@ -1320,6 +1340,11 @@ public actor FrameProcessingQueue {
                 status: .rewritePending,
                 rewritePurpose: "redaction"
             )
+        }
+
+        axProcessedSinceMetric += 1
+        if Date().timeIntervalSince(lastAXMetricAt) >= 60 {
+            await flushAccessibilityMetrics()
         }
 
         // Video rewrites run only on finalized segments. Defer the actual rewrite
@@ -1414,7 +1439,29 @@ public actor FrameProcessingQueue {
         )
         let extractedText: ExtractedText
         do {
-            extractedText = try await processing.extractText(from: capturedFrame)
+            let snapshot: AccessibilitySnapshot?
+            do { snapshot = try await databaseManager.getAccessibilitySnapshot(frameID: frameID) }
+            catch {
+                // Unreadable saved references must not stall normal OCR. Never sample live AX.
+                snapshot = nil
+                axUnavailableSinceMetric += 1
+            }
+            var historicalMetadata = frameRef.metadata
+            do { historicalMetadata.ocrRegions = try await databaseManager.getFrameOCRRegions(frameID: frameID) }
+            catch { historicalMetadata.ocrRegions = nil }
+            let historicalFrame = CapturedFrame(timestamp: capturedFrame.timestamp, imageData: capturedFrame.imageData,
+                width: capturedFrame.width, height: capturedFrame.height, bytesPerRow: capturedFrame.bytesPerRow,
+                metadata: historicalMetadata, accessibilitySnapshot: snapshot)
+            do {
+                extractedText = try await processing.extractText(from: historicalFrame)
+            } catch {
+                windowOCRFailures += 1
+                throw error
+            }
+            windowOCRFrames += 1
+            windowOCRLayoutRegions += historicalMetadata.ocrRegions?.count ?? 0
+            if historicalMetadata.ocrRegions == nil { windowOCRFallbackFrames += 1 }
+            windowOCRMilliseconds += (CFAbsoluteTimeGetCurrent() - ocrStartTime) * 1000
             let postExtractSnapshot = await MemoryLedger.snapshot(waitForPendingUpdates: true)
             let extractResidualBytes = max(
                 0,
@@ -2272,7 +2319,7 @@ public actor FrameProcessingQueue {
     private func applyPhraseLevelRedaction(
         to extracted: ExtractedText,
         actualFrameID: Int64? = nil
-    ) -> PhraseLevelRedactionResult {
+    ) throws -> PhraseLevelRedactionResult {
         let defaults = UserDefaults(suiteName: ReversibleOCRScrambler.settingsSuiteName) ?? .standard
         let preliminaryResult = Self.applyPhraseLevelRedaction(
             to: extracted,
@@ -2283,22 +2330,22 @@ public actor FrameProcessingQueue {
             return preliminaryResult
         }
 
-        let secret = ReversibleOCRScrambler.currentAppWideSecret()
+        let mode = PhraseRedactionMode.load(from: defaults)
+        let secret = mode == .scramble ? appWideSecretProvider() : nil
+        guard mode == .permanent || secret != nil else {
+            throw ProcessingError.ocrFailed(underlying: "Phrase redaction requires the unavailable master key; retrying without indexing")
+        }
         let effectiveFrameID = actualFrameID ?? extracted.frameID.value
         let finalResult = Self.finalizedPhraseLevelRedactionResult(
             extracted: extracted,
             preliminaryResult: preliminaryResult,
             secret: secret,
-            actualFrameID: effectiveFrameID
+            actualFrameID: effectiveFrameID,
+            mode: mode
         )
-        if secret != nil {
-            return finalResult
+        guard finalResult.encryptedRedactedTexts.count == finalResult.redactedCombinedNodeOrders.count else {
+            throw ProcessingError.ocrFailed(underlying: "Unable to protect every matched OCR region")
         }
-
-        Log.warning(
-            "[PhraseRedaction] Skipping phrase-level redaction for frame \(effectiveFrameID) because no master key exists",
-            category: .processing
-        )
         return finalResult
     }
 
@@ -2306,7 +2353,8 @@ public actor FrameProcessingQueue {
         to extracted: ExtractedText,
         phrases: [String],
         redactionSecret: String? = "test-secret",
-        actualFrameID: Int64? = nil
+        actualFrameID: Int64? = nil,
+        mode: PhraseRedactionMode = .scramble
     ) -> (
         sanitizedText: ExtractedText,
         redactedCombinedNodeOrders: Set<Int>,
@@ -2320,7 +2368,8 @@ public actor FrameProcessingQueue {
             extracted: extracted,
             preliminaryResult: preliminaryResult,
             secret: redactionSecret,
-            actualFrameID: actualFrameID ?? extracted.frameID.value
+            actualFrameID: actualFrameID ?? extracted.frameID.value,
+            mode: mode
         )
         return (
             finalResult.sanitizedText,
@@ -2445,10 +2494,20 @@ public actor FrameProcessingQueue {
         extracted: ExtractedText,
         preliminaryResult: PhraseLevelRedactionResult,
         secret: String?,
-        actualFrameID: Int64
+        actualFrameID: Int64,
+        mode: PhraseRedactionMode = .scramble
     ) -> PhraseLevelRedactionResult {
         guard !preliminaryResult.redactedCombinedNodeOrders.isEmpty else {
             return preliminaryResult
+        }
+        if mode == .permanent {
+            return PhraseLevelRedactionResult(
+                sanitizedText: preliminaryResult.sanitizedText,
+                redactedCombinedNodeOrders: preliminaryResult.redactedCombinedNodeOrders,
+                encryptedRedactedTexts: Dictionary(uniqueKeysWithValues: preliminaryResult.redactedCombinedNodeOrders.map {
+                    ($0, PhraseRedactionMode.permanentTextMarker)
+                })
+            )
         }
         guard let secret else {
             return PhraseLevelRedactionResult(
@@ -2471,34 +2530,8 @@ public actor FrameProcessingQueue {
     }
 
     private func loadPhraseLevelRedactionPhrases(defaults: UserDefaults) -> [NormalizedPhraseRedactionPhrase] {
-        guard let raw = defaults.string(forKey: Self.phraseRedactionPhrasesDefaultsKey),
-              !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return []
-        }
-
-        guard Self.isPhraseLevelRedactionEnabled(defaults: defaults, hasStoredPhrases: true) else { return [] }
-
-        if let data = raw.data(using: .utf8),
-           let decoded = try? JSONDecoder().decode([String].self, from: data) {
-            return Self.normalizedRedactionPhrases(decoded)
-        }
-
-        let fallback = raw
-            .split(whereSeparator: { $0 == "," || $0 == "\n" })
-            .map(String.init)
-        return Self.normalizedRedactionPhrases(fallback)
-    }
-
-    private static func isPhraseLevelRedactionEnabled(
-        defaults: UserDefaults,
-        hasStoredPhrases: Bool
-    ) -> Bool {
-        if let storedEnabled = defaults.object(forKey: Self.phraseRedactionEnabledDefaultsKey) as? Bool {
-            return storedEnabled
-        }
-
-        // Preserve legacy behavior for installs created before the explicit toggle existed.
-        return hasStoredPhrases
+        guard PhraseRedactionMode.isEnabled(in: defaults) else { return [] }
+        return Self.normalizedRedactionPhrases(PhraseRedactionMode.configuredPhrases(in: defaults))
     }
 
     private static func normalizedRedactionPhrases(_ phrases: [String]) -> [NormalizedPhraseRedactionPhrase] {
@@ -2716,6 +2749,10 @@ public actor FrameProcessingQueue {
         includeRetryableFailures: Bool = false,
         isAutomaticRetryOfFailedRewrite: Bool = false
     ) async throws -> PendingRewriteDispatchOutcome {
+        guard !isRewriteRecoveryScanning else { return .deferred(.rewriteAlreadyInProgress) }
+        // OCR includes capture-time AX correction. Prioritize the entire OCR backlog
+        // over starting another expensive video rewrite (including other segments).
+        if try await databaseManager.hasFramesAwaitingOCR() { return .deferred(.pendingOCR) }
         if isRewriteSchedulingSuspended {
             Log.debug(
                 "[Queue-Rewrite] Deferring segment rewrite for video \(videoDatabaseID) while timeline interaction is active",
@@ -2741,6 +2778,13 @@ public actor FrameProcessingQueue {
             return .deferred(.pendingOCR)
         }
 
+        // Work can arrive while the rewrite plan is loaded. Recheck before reserving
+        // the encoder; a rewrite already running is allowed to finish normally.
+        if try await databaseManager.hasFramesAwaitingOCR() { return .deferred(.pendingOCR) }
+
+        // Database awaits above can yield to a recovery scan. Reserve the live
+        // rewrite only after checking again, with no await between check and insert.
+        guard !isRewriteRecoveryScanning else { return .deferred(.rewriteAlreadyInProgress) }
         guard !activeRewriteVideoIDs.contains(videoDatabaseID) else {
             rewriteVideosNeedingRedrain.insert(videoDatabaseID)
             Log.debug(
@@ -2752,6 +2796,9 @@ public actor FrameProcessingQueue {
         activeRewriteVideoIDs.insert(videoDatabaseID)
         defer {
             activeRewriteVideoIDs.remove(videoDatabaseID)
+            if startupRewriteRecoveryPending && activeRewriteVideoIDs.isEmpty {
+                handleRewriteSchedulingStateChange(trigger: "active-rewrites-finished")
+            }
             schedulePendingRewriteRedrainIfNeeded(for: videoDatabaseID)
         }
 
@@ -2770,10 +2817,10 @@ public actor FrameProcessingQueue {
         }
 
         let actualSegmentID = try parseActualSegmentID(from: videoSegment.relativePath)
-        let secret = ReversibleOCRScrambler.currentAppWideSecret()
+        let secret = appWideSecretProvider()
         let executablePlan: VideoRewritePlan
 
-        if plan.hasRedactionTargets && secret == nil {
+        if plan.segmentRewritePlan.requiresRedactionSecret && secret == nil {
             if plan.hasDeletionTargets {
                 executablePlan = plan.droppingRedactions()
                 Log.warning(
@@ -2809,7 +2856,7 @@ public actor FrameProcessingQueue {
                 secret: secret
             )
             rewriteCommitted = true
-            try await databaseManager.finalizeVideoRewrite(executablePlan)
+            try await finalizeVideoRewriteAfterPurgingPreviews(executablePlan)
             totalRewritten += executablePlan.deletions.count + executablePlan.redactions.count
 
             do {
@@ -2830,6 +2877,7 @@ public actor FrameProcessingQueue {
             return .completed
         } catch {
             if rewriteCommitted {
+                startupRewriteRecoveryPending = true
                 await recordRewriteOutcomeBestEffort(plan: executablePlan, outcome: "db_finalize_failed")
                 Log.error(
                     "[Queue-Rewrite] Segment rewrite for video \(videoDatabaseID) committed to disk but DB completion failed; leaving rewrite artifacts for startup reconciliation: \(error.localizedDescription)",
@@ -2874,7 +2922,33 @@ public actor FrameProcessingQueue {
         )
     }
 
-    private func reconcileInterruptedSegmentRewritesOnStartup() async {
+    /// Use the same privacy boundary for the normal commit and startup recovery.
+    /// Purge errors must leave the rewrite pending and its recovery artifacts intact.
+    private func finalizeVideoRewriteAfterPurgingPreviews(_ plan: VideoRewritePlan) async throws {
+        if plan.hasRedactionTargets {
+            let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+                ?? FileManager.default.temporaryDirectory
+            try await Self.purgeRedactionPreviews(frameIDs: plan.redactions.map(\.frameID), cachesDirectory: caches)
+        }
+        try await databaseManager.finalizeVideoRewrite(plan)
+        if plan.hasRedactionTargets {
+            NotificationCenter.default.post(name: PhraseRedactionMode.didFinishNotification, object: nil)
+        }
+    }
+
+    nonisolated static func purgeRedactionPreviews(frameIDs: [Int64], cachesDirectory: URL) async throws {
+        try await Task.detached(priority: .utility) {
+            let manager = FileManager.default
+            for id in Set(frameIDs) {
+                let path = cachesDirectory.appendingPathComponent("\(AppPaths.settingsSuiteName)/TimelineFrameBuffer/\(id).jpg")
+                if manager.fileExists(atPath: path.path) { try manager.removeItem(at: path) }
+            }
+            let thumbnails = cachesDirectory.appendingPathComponent("search_thumbnails_v1")
+            if manager.fileExists(atPath: thumbnails.path) { try manager.removeItem(at: thumbnails) }
+        }.value
+    }
+
+    private func reconcileInterruptedSegmentRewritesOnStartup() async throws {
         do {
             let actions = try await storage.recoverInterruptedSegmentRewrites()
             guard !actions.isEmpty else { return }
@@ -2923,14 +2997,14 @@ public actor FrameProcessingQueue {
                     case .rollbackToPending:
                         try await databaseManager.resetVideoRewritePlanToPending(plan)
                     case .finalizeCommitted:
-                        try await databaseManager.finalizeVideoRewrite(plan)
+                        try await finalizeVideoRewriteAfterPurgingPreviews(plan)
                     }
                 } catch {
                     Log.error(
                         "[Queue-Rewrite] Failed to persist startup rewrite reconciliation for segment \(action.segmentID.value): \(error.localizedDescription)",
                         category: .processing
                     )
-                    continue
+                    throw error
                 }
 
                 do {
@@ -2947,6 +3021,7 @@ public actor FrameProcessingQueue {
                 "[Queue-Rewrite] Failed to reconcile interrupted rewrite artifacts on startup: \(error.localizedDescription)",
                 category: .processing
             )
+            throw error
         }
     }
 
@@ -3002,6 +3077,44 @@ public actor FrameProcessingQueue {
         }
     }
 
+    private var windowOCRFailures = 0
+    private var windowOCRFrames = 0
+    private var windowOCRLayoutRegions = 0
+    private var windowOCRFallbackFrames = 0
+    private var windowOCRMilliseconds: Double = 0
+
+    private func flushWindowOCRMetrics() async {
+        guard windowOCRFrames + windowOCRFailures > 0 else { return }
+        let frames = windowOCRFrames, regions = windowOCRLayoutRegions, fallback = windowOCRFallbackFrames
+        let milliseconds = windowOCRMilliseconds
+        let failures = windowOCRFailures
+        windowOCRFailures = 0
+        windowOCRFrames = 0; windowOCRLayoutRegions = 0; windowOCRFallbackFrames = 0; windowOCRMilliseconds = 0
+        do {
+            let metadata = "{\"frames\":\(frames),\"failures\":\(failures),\"layoutRegions\":\(regions),\"fallbackFrames\":\(fallback),\"processingMilliseconds\":\(milliseconds)}"
+            try await databaseManager.recordMetricEvent(metricType: .windowOCR, metadata: metadata)
+        } catch {
+            windowOCRFailures += failures
+            windowOCRFrames += frames; windowOCRLayoutRegions += regions
+            windowOCRFallbackFrames += fallback; windowOCRMilliseconds += milliseconds
+        }
+    }
+
+    private var axUnavailableSinceMetric = 0
+    private var axProcessedSinceMetric = 0
+    private var lastAXMetricAt = Date()
+    private func flushAccessibilityMetrics() async {
+        await flushWindowOCRMetrics()
+        guard axProcessedSinceMetric > 0 else { return }
+        let count = axProcessedSinceMetric
+        let unavailable = axUnavailableSinceMetric
+        axProcessedSinceMetric = 0; axUnavailableSinceMetric = 0; lastAXMetricAt = Date()
+        do {
+            try await databaseManager.recordMetricEvent(metricType: .accessibilityCorrection,
+                metadata: "{\"phase\":\"processed\",\"frames\":\(count),\"unavailable\":\(unavailable)}")
+        } catch { axProcessedSinceMetric += count; axUnavailableSinceMetric += unavailable }
+    }
+
     // MARK: - Status Management
 
     /// Update frame processing status
@@ -3053,7 +3166,7 @@ public actor FrameProcessingQueue {
 
     /// Verify a frame is truly unrecoverable before deletion
     /// Returns true only if we're certain the video data cannot be recovered
-    private func verifyFrameIsUnrecoverable(frameID: Int64, error: Error) async -> Bool {
+    func verifyFrameIsUnrecoverable(frameID: Int64, error: Error) async -> Bool {
         let errorDesc = error.localizedDescription
 
         // SAFETY CHECK 1: Only delete for specific known-unrecoverable error types
@@ -3071,8 +3184,15 @@ public actor FrameProcessingQueue {
         }
 
         // SAFETY CHECK 3: Verify the video segment exists in DB
-        guard let videoSegment = try? await databaseManager.getVideoSegment(id: frameRef.videoID) else {
-            return true  // Video record doesn't exist, frame is orphaned
+        let videoSegment: VideoSegment
+        do {
+            guard let existing = try await databaseManager.getVideoSegment(id: frameRef.videoID) else {
+                return true  // A successful lookup confirmed the video row is absent.
+            }
+            videoSegment = existing
+        } catch {
+            // A failed read is not evidence that a recording is unrecoverable.
+            return false
         }
 
         // SAFETY CHECK 4: Extract segment ID and verify file state

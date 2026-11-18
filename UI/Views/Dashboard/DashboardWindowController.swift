@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import Combine
 import App
 import Shared
 
@@ -23,6 +24,8 @@ public class DashboardWindowController: NSObject {
 
     private(set) var window: NSWindow?
     private var coordinator: AppCoordinator?
+    private var dashboardViewModel: DashboardViewModel?
+    private var deeplinkTask: Task<Void, Never>?
 
     /// Whether the dashboard window is currently visible
     public private(set) var isVisible = false
@@ -146,6 +149,50 @@ public class DashboardWindowController: NSObject {
         NotificationCenter.default.post(name: .openDashboard, object: nil)
     }
 
+    /// Apply the filter before creating/showing the window, including on a cold launch.
+    /// Keeping the model in the controller prevents a lost first-window notification
+    /// and avoids starting an unfiltered storage scan before the range is applied.
+    public func openDeeplink(dateRange: DateRangeCriterion?) {
+        guard let coordinator else {
+            Log.error("[DashboardWindowController] Cannot open dashboard deeplink before configuration", category: .ui)
+            return
+        }
+        deeplinkTask?.cancel()
+        let appWasHidden = NSApp.isHidden
+        let dashboardWasVisible = isVisible
+        let viewModel = getDashboardViewModel(coordinator: coordinator)
+        UIMetricsRecorder.recordDictionary(
+            coordinator: coordinator,
+            type: .launchSurfaceReveal,
+            payload: [
+                "source": "dashboard_deeplink",
+                "action": "open_dashboard",
+                "appWasHidden": appWasHidden,
+                "dashboardWasVisible": dashboardWasVisible,
+                "isInitialized": true,
+                "hasDateRange": dateRange != nil
+            ]
+        )
+        deeplinkTask = Task { [weak self] in
+            if let dateRange {
+                await viewModel.setAppUsageDateRange(
+                    from: dateRange, source: "dashboard_deeplink", reloadStatistics: false
+                )
+            }
+            guard !Task.isCancelled, let self else { return }
+            self.showDashboard()
+            await viewModel.loadStatistics(reason: "dashboard_deeplink")
+            Log.info("[DashboardWindowController] Dashboard deeplink presented range=\(viewModel.appUsageRangeLabel)", category: .ui)
+        }
+    }
+
+    private func getDashboardViewModel(coordinator: AppCoordinator) -> DashboardViewModel {
+        if let dashboardViewModel { return dashboardViewModel }
+        let viewModel = DashboardViewModel(coordinator: coordinator)
+        dashboardViewModel = viewModel
+        return viewModel
+    }
+
     /// Update the dashboard window title used for metadata/window-list consumers.
     func updateWindowTitle(_ title: String) {
         window?.title = title
@@ -155,7 +202,10 @@ public class DashboardWindowController: NSObject {
 
     private func createWindow(coordinator: AppCoordinator) -> NSWindow {
         // Create the SwiftUI view for the dashboard content
-        let dashboardContent = DashboardContentView(coordinator: coordinator)
+        let dashboardContent = DashboardContentView(
+            coordinator: coordinator,
+            dashboardViewModel: getDashboardViewModel(coordinator: coordinator)
+        )
 
         // Create hosting controller
         let hostingController = NSHostingController(rootView: dashboardContent)
@@ -313,15 +363,15 @@ struct DashboardContentView: View {
     /// Forces a SwiftUI refresh when global appearance preferences change.
     @State private var appearanceRefreshTick = 0
 
-    init(coordinator: AppCoordinator) {
+    init(coordinator: AppCoordinator, dashboardViewModel: DashboardViewModel) {
         self.coordinator = coordinator
         self._coordinatorWrapper = StateObject(wrappedValue: AppCoordinatorWrapper(coordinator: coordinator))
         self._launchOnLoginReminderManager = StateObject(wrappedValue: LaunchOnLoginReminderManager(coordinator: coordinator))
         self._milestoneCelebrationManager = StateObject(wrappedValue: MilestoneCelebrationManager(coordinator: coordinator))
-        self._dashboardViewModel = StateObject(wrappedValue: DashboardViewModel(coordinator: coordinator))
+        self._dashboardViewModel = StateObject(wrappedValue: dashboardViewModel)
     }
 
-    var body: some View {
+    private var dashboardWithAppearanceNotifications: some View {
         ZStack {
             if let showOnboarding = showOnboarding {
                 if showOnboarding {
@@ -378,10 +428,19 @@ struct DashboardContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: .fontStyleDidChange)) { _ in
             appearanceRefreshTick &+= 1
         }
+    }
+
+    private var dashboardWithSettingsNotifications: some View {
+        dashboardWithAppearanceNotifications
         .onReceive(NotificationCenter.default.publisher(for: .toggleSettings)) { _ in
             // Toggle: if on settings go to dashboard, otherwise go to settings
+            let targetView: DashboardSelectedView
+            switch selectedView {
+            case .settings: targetView = .dashboard
+            default: targetView = .settings
+            }
             withAnimation(.easeInOut(duration: 0.2)) {
-                selectedView = selectedView == .settings ? .dashboard : .settings
+                selectedView = targetView
             }
             updateDashboardWindowTitle()
         }
@@ -424,6 +483,10 @@ struct DashboardContentView: View {
             DashboardWindowController.shared.show()
             updateDashboardWindowTitle()
         }
+    }
+
+    var body: some View {
+        dashboardWithSettingsNotifications
         .onReceive(NotificationCenter.default.publisher(for: .openSettingsPauseReminderInterval)) { _ in
             initialSettingsTab = .capture
             initialSettingsScrollTargetID = SettingsView.pauseReminderIntervalTargetID
