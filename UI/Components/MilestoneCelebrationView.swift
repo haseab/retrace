@@ -829,7 +829,7 @@ private final class DiscordInviteStatsModel: ObservableObject {
     private var inviteCode: String?
     private var isRefreshing = false
 
-    private static let shortInviteURL = URL(string: "https://dub.sh/retrace-discord")!
+    private static let shortInviteURL = URL(string: "https://retrace.to/l/retrace-discord")!
     private static let fallbackInviteCode = "retrace-discord"
 
     func refresh() async {

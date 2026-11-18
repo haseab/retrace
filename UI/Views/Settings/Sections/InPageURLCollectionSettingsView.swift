@@ -18,7 +18,7 @@ extension SettingsView {
             VStack(alignment: .leading, spacing: 16) {
                 ModernToggleRow(
                     title: "Collect in-page URLs",
-                    subtitle: "Collect visible links from browser pages using AppleScript automation. Default is off.",
+                    subtitle: "Collect visible links from browser pages using AppleScript automation.",
                     isOn: $collectInPageURLsExperimental,
                     badge: "Experimental"
                 )
@@ -149,21 +149,27 @@ extension SettingsView {
                                     Text("2. If the Develop menu is missing, enable it in Safari Settings > Advanced.")
                                     Text("3. Open Develop > Developer Settings...")
 
-                                    if let safariMenuImage = resolveSafariInPageURLMenuImage() {
-                                        inPageURLInstructionImage(safariMenuImage)
-                                    }
+                                    InPageURLInstructionAssetView(
+                                        assetName: "SafariInPageURLMenu",
+                                        fileName: "safari_instructions_1.png",
+                                        logName: "safari in-page URL menu instructions"
+                                    )
 
                                     Text("4. In the Developer tab, turn on Allow JavaScript from Apple Events.")
 
-                                    if let safariToggleImage = resolveSafariInPageURLToggleImage() {
-                                        inPageURLInstructionImage(safariToggleImage)
-                                    }
+                                    InPageURLInstructionAssetView(
+                                        assetName: "SafariInPageURLToggle",
+                                        fileName: "safari_instructions_2.png",
+                                        logName: "safari in-page URL toggle instructions"
+                                    )
 
                                     Text("5. When Safari shows the warning dialog, click Allow.")
 
-                                    if let safariAllowImage = resolveSafariInPageURLAllowImage() {
-                                        inPageURLInstructionImage(safariAllowImage)
-                                    }
+                                    InPageURLInstructionAssetView(
+                                        assetName: "SafariInPageURLAllow",
+                                        fileName: "safari_instructions_3.png",
+                                        logName: "safari in-page URL allow instructions"
+                                    )
                                 }
                                 .font(.retraceCaption2)
                                 .foregroundColor(.retraceSecondary)
@@ -186,9 +192,11 @@ extension SettingsView {
                                         .font(.retraceCaption2)
                                         .foregroundColor(.retraceSecondary)
 
-                                    if let chromiumInstructionsImage = resolveChromiumInPageURLInstructionsImage() {
-                                        inPageURLInstructionImage(chromiumInstructionsImage)
-                                    }
+                                    InPageURLInstructionAssetView(
+                                        assetName: "InPageURLInstructions",
+                                        fileName: "safari_instructions.png",
+                                        logName: "chromium in-page URL instructions"
+                                    )
                                 }
 
                                 InPageURLSecurityWarning(showSafariSpecificLine: false)
@@ -477,7 +485,7 @@ extension SettingsView {
 
             Spacer()
 
-            Text("Not supported")
+            Text("Does Not Support")
                 .font(.retraceCaption2Bold)
                 .foregroundColor(.retraceSecondary)
                 .padding(.horizontal, 10)

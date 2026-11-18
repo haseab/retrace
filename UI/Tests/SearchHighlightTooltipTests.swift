@@ -134,37 +134,6 @@ final class SearchHighlightTooltipTests: XCTestCase {
     }
 
     @MainActor
-    func testPhraseLevelRedactionTooltipStateIsQueuedWhileRewriteIsPending() {
-        XCTAssertEqual(
-            SimpleTimelineViewModel.phraseLevelRedactionTooltipState(for: 5, isRevealed: false),
-            .queued
-        )
-        XCTAssertEqual(
-            SimpleTimelineViewModel.phraseLevelRedactionTooltipState(for: 6, isRevealed: true),
-            .queued
-        )
-    }
-
-    @MainActor
-    func testPhraseLevelRedactionTooltipStateSupportsRevealAndCopyTextAfterRewriteCompletes() {
-        XCTAssertEqual(
-            SimpleTimelineViewModel.phraseLevelRedactionTooltipState(for: 7, isRevealed: false),
-            .reveal
-        )
-        XCTAssertEqual(
-            SimpleTimelineViewModel.phraseLevelRedactionTooltipState(for: 7, isRevealed: true),
-            .copyText
-        )
-    }
-
-    @MainActor
-    func testPhraseLevelRedactionTooltipStateIsUnavailableForFailedFrames() {
-        XCTAssertNil(
-            SimpleTimelineViewModel.phraseLevelRedactionTooltipState(for: 8, isRevealed: false)
-        )
-    }
-
-    @MainActor
     func testPhraseLevelRedactionOutlineStateKeepsQueuedOutlineOnlyWhileRewriteIsPending() {
         XCTAssertEqual(
             SimpleTimelineViewModel.phraseLevelRedactionOutlineState(

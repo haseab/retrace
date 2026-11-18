@@ -4,8 +4,7 @@ import Shared
 public enum SettingsTab: String, CaseIterable, Identifiable {
     case general = "General"
     case capture = "Capture"
-    case storage = "Storage"
-    case exportData = "Export & Data"
+    case storage = "Data"
     case privacy = "Privacy"
     case power = "Power"
     case tags = "Tags"
@@ -18,7 +17,6 @@ public enum SettingsTab: String, CaseIterable, Identifiable {
         case .general: return "gearshape"
         case .capture: return "video"
         case .storage: return "externaldrive"
-        case .exportData: return "square.and.arrow.up"
         case .privacy: return "lock.shield"
         case .power: return "bolt.fill"
         case .tags: return "tag"
@@ -30,8 +28,7 @@ public enum SettingsTab: String, CaseIterable, Identifiable {
         switch self {
         case .general: return "Startup, appearance, and shortcuts"
         case .capture: return "Frame rate, resolution, and display options"
-        case .storage: return "Retention, limits, and compression"
-        case .exportData: return "Export and manage your data"
+        case .storage: return "Retention, rewind, and database locations"
         case .privacy: return "Encryption, exclusions, and permissions"
         case .power: return "OCR processing and battery optimization"
         case .tags: return "Manage and delete tags"
@@ -44,7 +41,6 @@ public enum SettingsTab: String, CaseIterable, Identifiable {
         case .general: return .retraceAccentGradient
         case .capture: return .retracePurpleGradient
         case .storage: return .retraceOrangeGradient
-        case .exportData: return .retraceAccentGradient
         case .privacy: return .retraceGreenGradient
         case .power: return .retraceOrangeGradient
         case .tags: return .retraceAccentGradient
@@ -66,7 +62,7 @@ public enum SettingsTab: String, CaseIterable, Identifiable {
             return { view.resetPowerSettings() }
         case .advanced:
             return { view.resetAdvancedSettings() }
-        case .exportData, .tags:
+        case .tags:
             return nil
         }
     }

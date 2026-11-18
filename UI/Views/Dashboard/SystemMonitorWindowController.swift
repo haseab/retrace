@@ -86,6 +86,7 @@ public class SystemMonitorWindowController: NSObject {
         ProcessCPUMonitor.shared.setConsumerVisible(.systemMonitor, isVisible: false)
         window.orderOut(nil)
         isVisible = false
+        Log.info("[GhostAppCheck] system monitor hidden appHidden=\(NSApp.isHidden) appActive=\(NSApp.isActive)", category: .ui)
     }
 
     /// Bring window to front if visible
@@ -132,5 +133,6 @@ extension SystemMonitorWindowController: NSWindowDelegate {
         // Fail-safe for close paths that may bypass SwiftUI onDisappear timing.
         ProcessCPUMonitor.shared.setConsumerVisible(.systemMonitor, isVisible: false)
         isVisible = false
+        Log.info("[GhostAppCheck] system monitor windowWillClose appHidden=\(NSApp.isHidden) appActive=\(NSApp.isActive)", category: .ui)
     }
 }

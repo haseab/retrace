@@ -19,6 +19,13 @@ final class TimelineKeyboardShortcutDecisionTests: XCTestCase {
         super.tearDown()
     }
 
+    func testFrameTextScanShortcutRequiresCommandShiftO() {
+        XCTAssertTrue(TimelineWindowController.isFrameTextScanShortcut(keyCode: 31, modifiers: [.command, .shift]))
+        XCTAssertFalse(TimelineWindowController.isFrameTextScanShortcut(keyCode: 31, modifiers: [.command]))
+        XCTAssertFalse(TimelineWindowController.isFrameTextScanShortcut(keyCode: 31, modifiers: [.command, .shift, .option]))
+        XCTAssertFalse(TimelineWindowController.isFrameTextScanShortcut(keyCode: 15, modifiers: [.command, .shift]))
+    }
+
     func testShouldHandleKeyboardShortcutsWhenTimelineVisibleAndFrontmost() {
         XCTAssertTrue(
             TimelineWindowController.shouldHandleTimelineKeyboardShortcuts(
@@ -68,6 +75,36 @@ final class TimelineKeyboardShortcutDecisionTests: XCTestCase {
     func testShouldNotToggleSearchOverlayShortcutWhenScrollIsActive() {
         XCTAssertFalse(
             TimelineWindowController.shouldToggleSearchOverlayFromShortcut(isActivelyScrolling: true)
+        )
+    }
+
+    func testSearchOverlayShortcutOpensOverlayWhenHidden() {
+        XCTAssertEqual(
+            TimelineWindowController.searchOverlayShortcutAction(
+                isSearchOverlayVisible: false,
+                shouldRefocusSearchFieldBeforeClose: false
+            ),
+            .open
+        )
+    }
+
+    func testSearchOverlayShortcutFocusesFieldBeforeClosingWhenVisibleResultsOwnFocus() {
+        XCTAssertEqual(
+            TimelineWindowController.searchOverlayShortcutAction(
+                isSearchOverlayVisible: true,
+                shouldRefocusSearchFieldBeforeClose: true
+            ),
+            .focusField
+        )
+    }
+
+    func testSearchOverlayShortcutClosesOverlayWhenVisibleAndFieldAlreadyFocused() {
+        XCTAssertEqual(
+            TimelineWindowController.searchOverlayShortcutAction(
+                isSearchOverlayVisible: true,
+                shouldRefocusSearchFieldBeforeClose: false
+            ),
+            .close
         )
     }
 

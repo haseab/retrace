@@ -11,8 +11,7 @@ Search/
 ├── SearchManager.swift            # Main SearchProtocol implementation
 ├── QueryParser/
 │   ├── QueryParser.swift          # QueryParserProtocol implementation
-│   ├── QueryTokenizer.swift       # Tokenize raw query strings
-│   └── FilterExtractor.swift      # Extract filters (app:, date:, etc.)
+│   └── QueryTokenizer.swift       # Shared query tokenization + shell-option classification
 ├── Ranking/
 │   ├── ResultRanker.swift         # Rank and sort results
 │   └── SnippetGenerator.swift     # Generate highlighted snippets

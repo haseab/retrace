@@ -20,6 +20,7 @@ extension SettingsView {
         case "general.startup": startupCard
         case "general.appearance": appearanceCard
         case "capture.rate": captureRateCard
+        case "capture.menuBarIcon": menuBarIconCard
         case "capture.compression": compressionCard
         case "capture.pauseReminder": pauseReminderCard
         case "capture.inPageURLs": inPageURLCollectionCard

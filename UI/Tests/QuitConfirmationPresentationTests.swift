@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import XCTest
 @testable import Retrace
 
@@ -55,53 +56,80 @@ final class QuitConfirmationPresentationTests: XCTestCase {
         XCTAssertNil(anchor)
     }
 
-    func testFreshLaunchContinuesWhenCurrentProcessOwnsLockEvenIfMatchingRunningAppStillExists() {
+    func testQuitConfirmationAlertDoesNotOfferDontAskAgain() {
+        let alert = AppDelegate.makeQuitConfirmationAlert(applicationIcon: nil)
+
+        XCTAssertFalse(alert.showsSuppressionButton)
+        XCTAssertEqual(alert.buttons.map(\.title), [
+            "Quit Retrace",
+            "Run Retrace in Background",
+            "Cancel"
+        ])
+    }
+
+    func testFreshLaunchActivatesExistingInstanceWhenMatchingRunningAppExistsEvenIfLockWasAcquired() {
         XCTAssertEqual(
-            AppDelegate.freshLaunchAction(
-                hasSingleInstanceLock: true,
+            AppDelegate.launchGateAction(
+                mode: .fresh,
+                lockResult: .acquired(descriptor: 42, attempts: 1),
                 matchingRunningAppDetected: true
             ),
-            .continueLaunchIgnoringStaleRunningApp
+            .activateExistingInstanceAndExitDuplicate
         )
     }
 
-    func testFreshLaunchActivatesExistingInstanceWhenLockCannotBeAcquired() {
+    func testFreshLaunchActivatesExistingInstanceWhenLockIsHeldByAnotherProcess() {
         XCTAssertEqual(
-            AppDelegate.freshLaunchAction(
-                hasSingleInstanceLock: false,
-                matchingRunningAppDetected: true
-            ),
-            .activateExistingInstance
-        )
-    }
-
-    func testLaunchAfterLockErrorContinuesForRelaunch() {
-        XCTAssertEqual(
-            AppDelegate.launchActionAfterLockError(
-                isRelaunch: true,
-                matchingRunningAppDetected: true
-            ),
-            .continueLaunch
-        )
-    }
-
-    func testLaunchAfterLockErrorActivatesExistingInstanceForFreshLaunchWhenMatchExists() {
-        XCTAssertEqual(
-            AppDelegate.launchActionAfterLockError(
-                isRelaunch: false,
-                matchingRunningAppDetected: true
-            ),
-            .activateExistingInstance
-        )
-    }
-
-    func testLaunchAfterLockErrorContinuesFreshLaunchWhenNoMatchExists() {
-        XCTAssertEqual(
-            AppDelegate.launchActionAfterLockError(
-                isRelaunch: false,
+            AppDelegate.launchGateAction(
+                mode: .fresh,
+                lockResult: .failedHeldByAnotherProcess(attempts: 1),
                 matchingRunningAppDetected: false
             ),
+            .activateExistingInstanceAndExitDuplicate
+        )
+    }
+
+    func testRelaunchContinuesAfterLockError() {
+        XCTAssertEqual(
+            AppDelegate.launchGateAction(
+                mode: .relaunch,
+                lockResult: .failedError(code: EIO, attempts: 30),
+                matchingRunningAppDetected: true
+            ),
             .continueLaunch
+        )
+    }
+
+    func testRelaunchActivatesExistingInstanceWhenLockIsHeldByAnotherProcess() {
+        XCTAssertEqual(
+            AppDelegate.launchGateAction(
+                mode: .relaunch,
+                lockResult: .failedHeldByAnotherProcess(attempts: 30),
+                matchingRunningAppDetected: false
+            ),
+            .activateExistingInstanceAndExitDuplicate
+        )
+    }
+
+    func testFreshLaunchActivatesExistingInstanceWhenLockErrorOccursAndMatchExists() {
+        XCTAssertEqual(
+            AppDelegate.launchGateAction(
+                mode: .fresh,
+                lockResult: .failedError(code: EIO, attempts: 1),
+                matchingRunningAppDetected: true
+            ),
+            .activateExistingInstanceAndExitDuplicate
+        )
+    }
+
+    func testFreshLaunchFailsClosedWhenLockErrorOccursWithoutMatch() {
+        XCTAssertEqual(
+            AppDelegate.launchGateAction(
+                mode: .fresh,
+                lockResult: .failedError(code: EIO, attempts: 1),
+                matchingRunningAppDetected: false
+            ),
+            .exitDueToLockFailure
         )
     }
 }

@@ -7,7 +7,7 @@ import Shared
 final class StandaloneCommentComposerWindowController: NSObject {
     static let shared = StandaloneCommentComposerWindowController()
 
-    private static let settingsStore = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+    private static let settingsStore = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
     nonisolated static let windowTitle = "Quick Comment"
     nonisolated private static let legacyCaptureExcludedWindowTitles: Set<String> = ["Add Quick Comment"]
     private static let expandedContentSize = NSSize(width: 482, height: 365)
@@ -137,6 +137,7 @@ final class StandaloneCommentComposerWindowController: NSObject {
                 self.window = nil
                 self.viewModel = nil
                 self.cleanupPresentationState()
+                Log.info("[GhostAppCheck] quick comment composer hidden appHidden=\(NSApp.isHidden) appActive=\(NSApp.isActive)", category: .ui)
             }
         })
     }

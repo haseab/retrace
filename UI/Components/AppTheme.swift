@@ -328,7 +328,7 @@ public class AppIconColorCache {
 /// Persists per-tag colors selected by users in Settings.
 /// Colors are keyed by tag ID and fall back to a deterministic color when unset.
 public enum TagColorStore {
-    private static let defaults: UserDefaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+    private static let defaults: UserDefaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
     private static let storageKey = "tagColorsByID"
     private static let lock = NSLock()
     private static var cachedHexByTagID: [Int64: String] = [:]
@@ -593,7 +593,7 @@ public enum RetraceFont {
     private static let fontStyleKey = "retraceFontStyle"
 
     /// Shared UserDefaults store (same as Settings uses)
-    private static let settingsStore = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+    private static let settingsStore = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
 
     /// The current font style (persisted in UserDefaults)
     public static var currentStyle: RetraceFontStyle {
@@ -1241,6 +1241,110 @@ public struct RetraceMenuStyle {
     public static let appearanceAnimation = Animation.easeOut(duration: 0.15)
 }
 
+// MARK: - Timeline Overlay Surface Families
+
+/// Fullscreen timeline overlays must use one of two families:
+/// glass black for transient HUD chrome, or matte dark gray for owned editors/dialogs.
+public enum RetraceTimelineGlassVariant {
+    case chip
+    case banner
+    case panel
+
+    var fillColor: Color {
+        switch self {
+        case .chip:
+            return Color.black.opacity(0.46)
+        case .banner:
+            return Color.black.opacity(0.56)
+        case .panel:
+            return Color.black.opacity(0.4)
+        }
+    }
+
+    var materialOpacity: Double {
+        switch self {
+        case .chip:
+            return 0.9
+        case .banner:
+            return 1.0
+        case .panel:
+            return 1.0
+        }
+    }
+
+    var borderColor: Color {
+        switch self {
+        case .chip:
+            return Color.white.opacity(0.18)
+        case .banner:
+            return Color.white.opacity(0.16)
+        case .panel:
+            return Color.white.opacity(0.15)
+        }
+    }
+
+    var shadowColor: Color {
+        Color.black.opacity(0.5)
+    }
+
+    var shadowRadius: CGFloat {
+        switch self {
+        case .chip:
+            return 12
+        case .banner:
+            return 20
+        case .panel:
+            return 20
+        }
+    }
+
+    var shadowY: CGFloat {
+        switch self {
+        case .chip:
+            return 5
+        case .banner, .panel:
+            return 10
+        }
+    }
+}
+
+public struct RetraceTimelineGlassSurface: ViewModifier {
+    let variant: RetraceTimelineGlassVariant
+    let cornerRadius: CGFloat
+    let borderColorOverride: Color?
+
+    public func body(content: Content) -> some View {
+        content
+            .background(
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .fill(.ultraThinMaterial.opacity(variant.materialOpacity))
+                    .environment(\.colorScheme, .dark)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                            .fill(variant.fillColor)
+                    )
+                    .shadow(
+                        color: variant.shadowColor,
+                        radius: variant.shadowRadius,
+                        y: variant.shadowY
+                    )
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .stroke(borderColorOverride ?? variant.borderColor, lineWidth: 1)
+            )
+    }
+}
+
+public struct RetraceMattePanelSurface: ViewModifier {
+    let cornerRadius: CGFloat
+    let addPadding: Bool
+
+    public func body(content: Content) -> some View {
+        content.retraceMenuContainer(addPadding: addPadding, cornerRadius: cornerRadius)
+    }
+}
+
 // MARK: - Reusable Menu Components
 
 /// Standardized menu button component
@@ -1349,7 +1453,7 @@ public struct RetraceMenuButton: View {
 }
 
 /// Shared UserDefaults store for accessing settings
-private let menuContainerSettingsStore = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+private let menuContainerSettingsStore = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
 
 /// Standardized menu container modifier
 /// Applies consistent background, border, and shadow to any menu/popover content
@@ -1401,6 +1505,27 @@ extension View {
         cornerRadius: CGFloat = RetraceMenuStyle.cornerRadius
     ) -> some View {
         self.modifier(RetraceMenuContainer(addPadding: addPadding, cornerRadius: cornerRadius))
+    }
+
+    public func timelineGlassSurface(
+        _ variant: RetraceTimelineGlassVariant,
+        cornerRadius: CGFloat,
+        borderColor: Color? = nil
+    ) -> some View {
+        self.modifier(
+            RetraceTimelineGlassSurface(
+                variant: variant,
+                cornerRadius: cornerRadius,
+                borderColorOverride: borderColor
+            )
+        )
+    }
+
+    public func retraceMattePanel(
+        addPadding: Bool = true,
+        cornerRadius: CGFloat = RetraceMenuStyle.cornerRadius
+    ) -> some View {
+        self.modifier(RetraceMattePanelSurface(cornerRadius: cornerRadius, addPadding: addPadding))
     }
 }
 

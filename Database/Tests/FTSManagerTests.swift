@@ -112,7 +112,6 @@ final class FTSManagerTests: XCTestCase {
             segmentID: AppSegmentID(value: safariSegmentID),
             videoID: storedVideoID,
             frameIndexInSegment: 0,
-            encodingStatus: .success,
             metadata: FrameMetadata(appName: "Safari", windowName: "GitHub")
         )
 
@@ -122,7 +121,6 @@ final class FTSManagerTests: XCTestCase {
             segmentID: AppSegmentID(value: xcodeSegmentID),
             videoID: storedVideoID,
             frameIndexInSegment: 1,
-            encodingStatus: .success,
             metadata: FrameMetadata(appName: "Xcode", windowName: "Retrace Project")
         )
 
@@ -132,7 +130,6 @@ final class FTSManagerTests: XCTestCase {
             segmentID: AppSegmentID(value: terminalSegmentID),
             videoID: storedVideoID,
             frameIndexInSegment: 2,
-            encodingStatus: .success,
             metadata: FrameMetadata(appName: "Terminal", windowName: "bash")
         )
 
@@ -216,7 +213,6 @@ final class FTSManagerTests: XCTestCase {
             segmentID: AppSegmentID(value: segmentGitHub),
             videoID: storedVideoID,
             frameIndexInSegment: 0,
-            encodingStatus: .success,
             metadata: FrameMetadata(appName: "Chrome", windowName: "GitHub - retrace issue")
         )
 
@@ -226,7 +222,6 @@ final class FTSManagerTests: XCTestCase {
             segmentID: AppSegmentID(value: segmentApple),
             videoID: storedVideoID,
             frameIndexInSegment: 1,
-            encodingStatus: .success,
             metadata: FrameMetadata(appName: "Safari", windowName: "Apple Docs - SwiftUI")
         )
 
@@ -435,7 +430,6 @@ final class FTSManagerTests: XCTestCase {
             segmentID: AppSegmentID(value: segmentID1),
             videoID: storedVideoID,
             frameIndexInSegment: 0,
-            encodingStatus: .success,
             metadata: FrameMetadata(
                 appBundleID: "com.google.Chrome",
                 appName: "Chrome",
@@ -449,7 +443,6 @@ final class FTSManagerTests: XCTestCase {
             segmentID: AppSegmentID(value: segmentID2),
             videoID: storedVideoID,
             frameIndexInSegment: 1,
-            encodingStatus: .success,
             metadata: FrameMetadata(
                 appBundleID: "com.apple.Safari",
                 appName: "Safari",
@@ -729,7 +722,6 @@ final class FTSManagerTests: XCTestCase {
             segmentID: AppSegmentID(value: segmentID),
             videoID: storedVideoID,
             frameIndexInSegment: 0,
-            encodingStatus: .success,
             metadata: .empty
         )
 
@@ -739,7 +731,6 @@ final class FTSManagerTests: XCTestCase {
             segmentID: AppSegmentID(value: segmentID),
             videoID: storedVideoID,
             frameIndexInSegment: 1,
-            encodingStatus: .success,
             metadata: .empty
         )
 

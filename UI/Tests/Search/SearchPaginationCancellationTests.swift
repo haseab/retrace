@@ -138,6 +138,103 @@ final class SearchPaginationCancellationTests: XCTestCase {
         XCTAssertEqual(viewModel.results?.results.map(\.id.value), [41, 42, 43, 44, 45])
     }
 
+    func testSelectingNearEndPrefetchesMoreResultsAndPreservesResultContext() async throws {
+        let queryText = "lishy"
+        let nextCursor = SearchPageCursor(
+            native: SearchSourceCursor(
+                timestamp: Date(timeIntervalSince1970: 1_700_000_000),
+                frameID: 44
+            )
+        )
+
+        let initialResults = makeResults(
+            queryText: queryText,
+            sortOrder: .newestFirst,
+            frameIDs: [41, 42, 43, 44],
+            nextCursor: nextCursor
+        )
+        let loadMoreResults = makeResults(
+            queryText: queryText,
+            sortOrder: .newestFirst,
+            frameIDs: [45],
+            nextCursor: nil
+        )
+
+        let executor = SearchExecutorStub(
+            initialResults: initialResults,
+            staleLoadMoreResults: loadMoreResults,
+            refreshedResults: loadMoreResults
+        )
+        let viewModel = SearchViewModel(
+            coordinator: AppCoordinator(),
+            executeSearch: { query in
+                try await executor.execute(query)
+            }
+        )
+
+        viewModel.searchMode = .all
+        viewModel.sortOrder = .newestFirst
+        viewModel.searchQuery = queryText
+
+        await viewModel.performSearch(query: queryText, trigger: "initial-search")
+        viewModel.selectResult(initialResults.results[2])
+
+        try await waitUntil {
+            viewModel.isLoadingMore
+        }
+        try await waitUntil {
+            viewModel.isLoadingMore == false
+        }
+
+        XCTAssertEqual(viewModel.selectedResult?.id.value, 43)
+        XCTAssertEqual(viewModel.savedScrollPosition, 2)
+        XCTAssertEqual(viewModel.results?.results.map(\.id.value), [41, 42, 43, 44, 45])
+
+        let recordedQueries = await executor.recordedQueries
+        XCTAssertEqual(recordedQueries.count, 2)
+        XCTAssertNil(recordedQueries[0].cursor)
+        XCTAssertEqual(recordedQueries[1].cursor, nextCursor)
+    }
+
+    func testAdjacentResultSelectionUpdatesNavigationState() async {
+        let queryText = "lishy"
+        let initialResults = makeResults(
+            queryText: queryText,
+            sortOrder: .oldestFirst,
+            frameIDs: [11, 12, 13],
+            nextCursor: nil
+        )
+
+        let executor = SearchExecutorStub(
+            initialResults: initialResults,
+            staleLoadMoreResults: initialResults,
+            refreshedResults: initialResults
+        )
+        let viewModel = SearchViewModel(
+            coordinator: AppCoordinator(),
+            executeSearch: { query in
+                try await executor.execute(query)
+            }
+        )
+
+        viewModel.searchMode = .all
+        viewModel.sortOrder = .oldestFirst
+        viewModel.searchQuery = queryText
+
+        await viewModel.performSearch(query: queryText, trigger: "initial-search")
+        viewModel.selectResult(initialResults.results[0])
+
+        let advancedResult = viewModel.selectAdjacentResult(offset: 1)
+
+        XCTAssertEqual(advancedResult?.id.value, 12)
+        XCTAssertEqual(viewModel.selectedResult?.id.value, 12)
+        XCTAssertEqual(viewModel.savedScrollPosition, 1)
+        XCTAssertEqual(viewModel.selectedResultNavigationState?.currentPosition, 2)
+        XCTAssertEqual(viewModel.selectedResultNavigationState?.loadedCount, 3)
+        XCTAssertTrue(viewModel.selectedResultNavigationState?.canNavigatePrevious == true)
+        XCTAssertTrue(viewModel.selectedResultNavigationState?.canNavigateNext == true)
+    }
+
     private func waitUntil(
         timeout: Duration = .seconds(1),
         condition: @escaping @MainActor () -> Bool

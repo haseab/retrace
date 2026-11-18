@@ -62,6 +62,28 @@ final class FeedbackSubmissionProgressTests: XCTestCase {
         )
     }
 
+    func testSubmittedCompletionUsesLiveChatSuccessPresentation() {
+        let presentation = FeedbackCompletionState.submitted.presentation
+
+        XCTAssertEqual(presentation.title, "Feedback Sent!")
+        XCTAssertEqual(presentation.detail, "Thanks for helping improve Retrace.")
+        XCTAssertEqual(presentation.callToActionTitle, "Need a faster response?")
+        XCTAssertEqual(presentation.linkTitle, "Chat with me on retrace.to")
+        XCTAssertEqual(presentation.linkURL, URL(string: "https://retrace.to/chat"))
+        XCTAssertEqual(presentation.linkSymbolName, "message.fill")
+    }
+
+    func testExportedCompletionUsesDirectChatSuccessPresentation() {
+        let presentation = FeedbackCompletionState.exported.presentation
+
+        XCTAssertEqual(presentation.title, "Download Complete")
+        XCTAssertTrue(presentation.detail.contains("email, Discord, or live chat"))
+        XCTAssertEqual(presentation.callToActionTitle, "Next Steps:")
+        XCTAssertEqual(presentation.linkTitle, "Choose a Channel to Send")
+        XCTAssertEqual(presentation.linkURL, URL(string: "https://retrace.to/chat"))
+        XCTAssertEqual(presentation.linkSymbolName, "message.fill")
+    }
+
     @MainActor
     func testNetworkSubmissionFailureUsesSpecificCopy() {
         let failure = FeedbackViewModel.makeSubmissionFailure(
@@ -71,7 +93,7 @@ final class FeedbackSubmissionProgressTests: XCTestCase {
         XCTAssertEqual(failure.title, "No network connection")
         XCTAssertEqual(failure.symbolName, "wifi.slash")
         XCTAssertTrue(failure.isNetworkRelated)
-        XCTAssertTrue(failure.detail.contains("Download .txt"))
+        XCTAssertTrue(failure.detail.contains("Download .json.gz"))
     }
 
     @MainActor

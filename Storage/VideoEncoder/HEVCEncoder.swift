@@ -1,5 +1,7 @@
 import AVFoundation
+import CoreGraphics
 import CoreMedia
+import CoreVideo
 import Foundation
 import VideoToolbox
 import Shared
@@ -252,9 +254,10 @@ public actor HEVCEncoder {
         height: Int,
         config: VideoEncoderConfig
     ) -> CompressionTuning {
-        let clampedQuality = min(max(Double(config.quality), 0.0), 1.0)
+        let requestedQuality = min(max(Double(config.quality), 0.0), 1.0)
+        let encoderQuality = effectiveEncoderQuality(for: requestedQuality)
         let pixelCount = max(Double(width) * Double(height), 1.0)
-        let baseBitsPerPixelPerFrame = baseScreenContentBitsPerPixelPerFrame(quality: clampedQuality)
+        let baseBitsPerPixelPerFrame = baseScreenContentBitsPerPixelPerFrame(quality: encoderQuality)
         let defaultDensityBoost = screenContentDensityBoost(
             width: width,
             height: height,
@@ -273,24 +276,25 @@ public actor HEVCEncoder {
                 width: width,
                 height: height,
                 pixelCount: pixelCount,
-                quality: clampedQuality
+                quality: encoderQuality
             )
             averageBitRate = max(derivedAverageBitRate, displayClassBitRateFloor ?? 0, 750_000)
         }
 
         let effectiveBitsPerPixelPerFrame = Double(averageBitRate) / (pixelCount * Double(expectedSourceFrameRate))
-        let effectiveDensityBoost = max(effectiveBitsPerPixelPerFrame / baseBitsPerPixelPerFrame, 1.0)
+        let effectiveDensityBoost = effectiveBitsPerPixelPerFrame / baseBitsPerPixelPerFrame
 
-        // Keep a modest burst cap so bitrate can flex without running away.
+        // Keep a bounded burst cap so reference frames can spend materially more
+        // than the segment average without changing the long-GOP structure.
         let burstDataRateLimit = max(
-            Int((Double(averageBitRate) * 1.18 / 8.0).rounded()),
+            Int((Double(averageBitRate) * 6.0 / 8.0).rounded()),
             128 * 1_024
         )
 
         return CompressionTuning(
             averageBitRate: averageBitRate,
             dataRateLimitBytesPerSecond: burstDataRateLimit,
-            quality: Float(clampedQuality),
+            quality: Float(encoderQuality),
             bitsPerPixelPerFrame: effectiveBitsPerPixelPerFrame,
             densityBoost: effectiveDensityBoost
         )
@@ -360,9 +364,11 @@ public actor HEVCEncoder {
         // We verify availability above but cannot force it through compressionProperties
 
         let compressionTuning = Self.compressionTuning(width: width, height: height, config: config)
+        let requestedQuality = min(max(Double(config.quality), 0.0), 1.0)
         Log.info(
             """
-            Video encoder configured for \(width)x\(height): quality=\(String(format: "%.2f", compressionTuning.quality)) \
+            Video encoder configured for \(width)x\(height): requestedQuality=\(String(format: "%.2f", requestedQuality)) \
+            encoderQuality=\(String(format: "%.2f", compressionTuning.quality)) \
             avgBitrate=\(compressionTuning.averageBitRate) \
             dataRateLimitBytesPerSecond=\(compressionTuning.dataRateLimitBytesPerSecond) \
             bpppf=\(String(format: "%.4f", compressionTuning.bitsPerPixelPerFrame)) \
@@ -379,11 +385,14 @@ public actor HEVCEncoder {
                 compressionTuning.dataRateLimitBytesPerSecond,
                 1,
             ],
+            // Storage guardrail: keep the configured long GOP. Shortening this increases reference
+            // frame frequency and noticeably increases disk usage for continuous capture.
             kVTCompressionPropertyKey_MaxKeyFrameInterval as String: config.keyframeInterval,
             kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration as String:
                 Double(config.keyframeInterval) / Double(Self.expectedSourceFrameRate),
             kVTCompressionPropertyKey_AllowTemporalCompression as String: true,
-            // Enable frame reordering (B-frames) for better compression efficiency.
+            // Storage guardrail: keep frame reordering enabled. B-frames are a major part of the
+            // current storage-efficiency strategy and should not be disabled casually.
             kVTCompressionPropertyKey_AllowFrameReordering as String: true,
             kVTCompressionPropertyKey_ExpectedFrameRate as String: Self.expectedSourceFrameRate
         ]
@@ -404,6 +413,7 @@ public actor HEVCEncoder {
             AVVideoCodecKey: codecType,
             AVVideoWidthKey: width,
             AVVideoHeightKey: height,
+            AVVideoColorPropertiesKey: Self.screenCaptureOutputColorProperties(),
             AVVideoCompressionPropertiesKey: compressionProperties
         ]
 
@@ -513,6 +523,8 @@ public actor HEVCEncoder {
             try await Task.sleep(for: .nanoseconds(Int64(1_000_000)), clock: .continuous) // 1ms
         }
 
+        Self.applyScreenCaptureColorMetadata(to: pixelBuffer)
+
         guard adaptor.append(pixelBuffer, withPresentationTime: timestamp) else {
             Log.error("[HEVCEncoder] adaptor.append() failed at frameCount=\(frameCount), timestamp=\(timestamp.seconds)s, writerStatus=\(assetWriter?.status.rawValue ?? -1), outputURL=\(outputURL?.lastPathComponent ?? "nil")", category: .storage)
             throw StorageModuleError.encodingFailed(underlying: "Failed to append pixel buffer")
@@ -523,15 +535,20 @@ public actor HEVCEncoder {
         // Check if a new fragment was written by monitoring file size changes
         // Fragments are written every ~4 seconds of video time
         if let url = outputURL {
-            // Also check if file was deleted after append - if so, recreate immediately
-            // This minimizes frame loss to at most 1 frame
-            if !FileManager.default.fileExists(atPath: url.path) {
-                Log.warning("⚠️ Video file deleted after append, recreating encoder: \(url.path)", category: .storage)
+            // One metadata lookup supplies both existence and fragment-size tracking.
+            // Keep the pre-append check as well so deletion recovery still precedes
+            // the next append; a post-append deletion still recreates immediately.
+            let observedSize: Int64?
+            do {
+                observedSize = try Self.outputFileSizeIfPresent(at: url)
+            } catch {
+                throw StorageModuleError.encodingFailed(underlying: "Cannot inspect encoder output: \(error.localizedDescription)")
+            }
+            guard let currentSize = observedSize else {
+                Log.warning("[HEVCEncoder] Video file deleted after append, recreating encoder", category: .storage)
                 try await recreateEncoder()
                 return
             }
-
-            let currentSize = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int64) ?? 0
             let sizeIncrease = currentSize - lastLoggedFileSize
 
             // A fragment write typically causes a significant size jump (>1KB)
@@ -553,6 +570,25 @@ public actor HEVCEncoder {
                 // First write - initialization
                 lastLoggedFileSize = currentSize
             }
+        }
+    }
+
+    /// A missing path is recoverable deletion; other I/O errors must not be
+    /// mistaken for deletion and trigger destructive writer recreation.
+    static func outputFileSizeIfPresent(at url: URL) throws -> Int64? {
+        do {
+            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+            guard let size = attributes[.size] as? NSNumber else { throw CocoaError(.fileReadUnknown) }
+            return size.int64Value
+        } catch let error as NSError {
+            if error.domain == NSCocoaErrorDomain &&
+                (error.code == NSFileReadNoSuchFileError || error.code == NSFileNoSuchFileError) {
+                return nil
+            }
+            if error.domain == NSPOSIXErrorDomain && (error.code == Int(ENOENT) || error.code == Int(ENOTDIR)) {
+                return nil
+            }
+            throw error
         }
     }
 
@@ -668,6 +704,62 @@ public actor HEVCEncoder {
 }
 
 private extension HEVCEncoder {
+    static func screenCaptureOutputColorProperties() -> [String: String] {
+        let transferFunction: String
+        if #available(macOS 15.0, *) {
+            transferFunction = AVVideoTransferFunction_IEC_sRGB
+        } else {
+            transferFunction = AVVideoTransferFunction_ITU_R_709_2
+        }
+
+        return [
+            AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+            AVVideoTransferFunctionKey: transferFunction,
+            AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2,
+        ]
+    }
+
+    static func applyScreenCaptureColorMetadata(to pixelBuffer: CVPixelBuffer) {
+        CVBufferSetAttachment(
+            pixelBuffer,
+            kCVImageBufferColorPrimariesKey,
+            kCVImageBufferColorPrimaries_ITU_R_709_2,
+            .shouldPropagate
+        )
+        CVBufferSetAttachment(
+            pixelBuffer,
+            kCVImageBufferTransferFunctionKey,
+            kCVImageBufferTransferFunction_sRGB,
+            .shouldPropagate
+        )
+        CVBufferSetAttachment(
+            pixelBuffer,
+            kCVImageBufferYCbCrMatrixKey,
+            kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+            .shouldPropagate
+        )
+        if let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) {
+            CVBufferSetAttachment(
+                pixelBuffer,
+                kCVImageBufferCGColorSpaceKey,
+                colorSpace,
+                .shouldPropagate
+            )
+        }
+    }
+
+    static func effectiveEncoderQuality(for requestedQuality: Double) -> Double {
+        interpolate(
+            clampedQuality: requestedQuality,
+            points: [
+                (quality: 0.00, bpppf: 0.00),
+                (quality: 0.40, bpppf: 0.3469026324777675),
+                (quality: 0.70, bpppf: 0.55),
+                (quality: 1.00, bpppf: 1.00),
+            ]
+        )
+    }
+
     static func baseScreenContentBitsPerPixelPerFrame(quality: Double) -> Double {
         interpolate(
             clampedQuality: quality,
@@ -688,6 +780,12 @@ private extension HEVCEncoder {
     ) -> Double {
         guard pixelCount > 0 else { return 1.0 }
         let densityRatio = sqrt(referencePixelCount / pixelCount)
+
+        if pixelCount >= referencePixelCount {
+            // Above the reference display, scale sublinearly instead of charging a full
+            // linear pixel-count penalty. This keeps 5K captures closer to ~13-14 Mbps.
+            return densityRatio
+        }
 
         // Smaller full-display captures need extra bitrate to preserve dense UI text,
         // but tiny surfaces should not inherit the native-display budget.

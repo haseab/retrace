@@ -1,15 +1,25 @@
+import Dispatch
 import ServiceManagement
+import Shared
 import XCTest
 @testable import CrashRecoverySupport
 @testable import Retrace
 
-private final class TestCrashRecoveryHelperProxy: NSObject, CrashRecoveryHelperXPCProtocol {
+private final class TestCrashRecoveryHelperProxy: NSObject, CrashRecoveryHelperXPCProtocol, @unchecked Sendable {
     var shouldReply = false
+    var armCallCount = 0
     var expectedExitCallCount = 0
     var relaunchCallCount = 0
+    var hangSampleCallCount = 0
     var capturedRelaunchTargetAppPath: String?
+    var capturedHangSampleTrigger: String?
+    var hangSampleReplyPath: String?
+    var blockHangSampleReply = false
+
+    private let hangSampleReplyGate = DispatchSemaphore(value: 0)
 
     func arm(reply: @escaping () -> Void) {
+        armCallCount += 1
         if shouldReply {
             reply()
         }
@@ -29,9 +39,38 @@ private final class TestCrashRecoveryHelperProxy: NSObject, CrashRecoveryHelperX
             reply()
         }
     }
+
+    func captureWatchdogHangSample(trigger: String, reply: @escaping (String?) -> Void) {
+        hangSampleCallCount += 1
+        capturedHangSampleTrigger = trigger
+        if shouldReply {
+            if blockHangSampleReply {
+                let replyPath = hangSampleReplyPath
+                DispatchQueue.global(qos: .userInitiated).async {
+                    self.hangSampleReplyGate.wait()
+                    reply(replyPath)
+                }
+            } else {
+                reply(hangSampleReplyPath)
+            }
+        }
+    }
+
+    func releaseBlockedHangSampleReply() {
+        hangSampleReplyGate.signal()
+    }
 }
 
 final class CrashRecoverySupportTests: XCTestCase {
+    @MainActor
+    private func blockMainActorForTesting(
+        started: XCTestExpectation,
+        releaseMainActor: DispatchSemaphore
+    ) {
+        started.fulfill()
+        releaseMainActor.wait()
+    }
+
     private func makeTestDefaults(suffix: String = UUID().uuidString) -> UserDefaults {
         let suiteName = "io.retrace.tests.crash-recovery.\(suffix)"
         let defaults = UserDefaults(suiteName: suiteName)!
@@ -610,4 +649,135 @@ final class CrashRecoverySupportTests: XCTestCase {
         XCTAssertEqual(proxy.relaunchCallCount, 1)
         XCTAssertEqual(disconnectCallCount, 0)
     }
+
+    @MainActor
+    func testBundledHelperWatchdogHangSampleReturnsPathAfterReply() async {
+        let proxy = TestCrashRecoveryHelperProxy()
+        proxy.shouldReply = true
+        proxy.hangSampleReplyPath = "/tmp/retrace-watchdog-sample.txt"
+        let manager = CrashRecoveryManager.makeForTesting()
+        await manager.configureBundledHelperForTesting(proxy: proxy)
+
+        let samplePath = await manager.captureWatchdogHangSample(
+            trigger: "watchdog_auto_quit",
+            timeoutMs: 10
+        )
+
+        XCTAssertEqual(samplePath, "/tmp/retrace-watchdog-sample.txt")
+        XCTAssertEqual(proxy.hangSampleCallCount, 1)
+        XCTAssertEqual(proxy.capturedHangSampleTrigger, "watchdog_auto_quit")
+    }
+
+    @MainActor
+    func testBundledHelperWatchdogHangSampleReturnsNilWhenHelperDoesNotReply() async {
+        let proxy = TestCrashRecoveryHelperProxy()
+        let manager = CrashRecoveryManager.makeForTesting()
+        await manager.configureBundledHelperForTesting(proxy: proxy)
+
+        let samplePath = await manager.captureWatchdogHangSample(
+            trigger: "watchdog_auto_quit",
+            timeoutMs: 10
+        )
+
+        XCTAssertNil(samplePath)
+        XCTAssertEqual(proxy.hangSampleCallCount, 1)
+        XCTAssertEqual(proxy.capturedHangSampleTrigger, "watchdog_auto_quit")
+    }
+
+    func testHelperWatchdogHangSampleCompletesWhileMainActorIsBlocked() async {
+        let proxy = TestCrashRecoveryHelperProxy()
+        proxy.shouldReply = true
+        proxy.hangSampleReplyPath = "/tmp/retrace-watchdog-sample.txt"
+        let releaseMainActor = DispatchSemaphore(value: 0)
+        let mainActorStarted = expectation(description: "main actor blocked")
+        let completed = expectation(description: "hang sample completed off main actor")
+
+        Task { @MainActor in
+            self.blockMainActorForTesting(
+                started: mainActorStarted,
+                releaseMainActor: releaseMainActor
+            )
+        }
+        await fulfillment(of: [mainActorStarted], timeout: 1)
+
+        Task.detached {
+            let samplePath = await CrashRecoveryManager.helperWatchdogHangSample(
+                "watchdog_auto_quit",
+                via: proxy,
+                timeoutMs: 50
+            )
+            if samplePath == "/tmp/retrace-watchdog-sample.txt" {
+                completed.fulfill()
+            }
+        }
+
+        await fulfillment(of: [completed], timeout: 0.2)
+        releaseMainActor.signal()
+
+        XCTAssertEqual(proxy.hangSampleCallCount, 1)
+        XCTAssertEqual(proxy.capturedHangSampleTrigger, "watchdog_auto_quit")
+    }
+
+    @MainActor
+    func testWatchdogHangSampleDefersReconnectUntilInFlightRequestCompletes() async {
+        let proxy = TestCrashRecoveryHelperProxy()
+        proxy.shouldReply = true
+        proxy.blockHangSampleReply = true
+        proxy.hangSampleReplyPath = "/tmp/retrace-watchdog-sample.txt"
+        let manager = CrashRecoveryManager.makeForTesting()
+        await manager.configureBundledHelperForTesting(proxy: proxy)
+
+        let captureTask = Task {
+            await manager.captureWatchdogHangSample(
+                trigger: "watchdog_auto_quit",
+                timeoutMs: 500
+            )
+        }
+
+        while proxy.hangSampleCallCount == 0 {
+            await Task.yield()
+        }
+
+        await manager.simulateHelperConnectionLossForTesting(reason: "interrupted")
+        XCTAssertEqual(proxy.armCallCount, 0)
+
+        proxy.releaseBlockedHangSampleReply()
+        let samplePath = await captureTask.value
+
+        XCTAssertEqual(samplePath, "/tmp/retrace-watchdog-sample.txt")
+        XCTAssertEqual(proxy.hangSampleCallCount, 1)
+        XCTAssertEqual(proxy.armCallCount, 1)
+        XCTAssertEqual(proxy.capturedHangSampleTrigger, "watchdog_auto_quit")
+    }
+
+    func testEmergencyDiagnosticsCaptureMergesHelperWatchdogSampleAndDeletesScratchFile() throws {
+        let fileManager = FileManager.default
+        let reportDirectory = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try fileManager.createDirectory(at: reportDirectory, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: reportDirectory) }
+
+        let helperSampleURL = reportDirectory.appendingPathComponent("retrace-watchdog-sample-watchdog_auto_quit-2026-04-13_123000.txt")
+        try """
+        === RETRACE WATCHDOG HANG SAMPLE ===
+        Trigger: watchdog_auto_quit
+        Root Cause: main thread blocked in database write
+        """.write(to: helperSampleURL, atomically: true, encoding: .utf8)
+
+        let reportPath = try XCTUnwrap(
+            EmergencyDiagnostics.capture(
+                trigger: "watchdog_auto_quit",
+                supplementalReportPaths: [helperSampleURL.path],
+                cleanupSupplementalReports: true,
+                directory: reportDirectory.path
+            )
+        )
+
+        let reportContents = try String(contentsOfFile: reportPath, encoding: .utf8)
+        XCTAssertTrue(reportContents.contains("=== RETRACE EMERGENCY DIAGNOSTIC ==="))
+        XCTAssertTrue(reportContents.contains("--- HELPER WATCHDOG SAMPLE ---"))
+        XCTAssertTrue(reportContents.contains("=== RETRACE WATCHDOG HANG SAMPLE ==="))
+        XCTAssertTrue(reportContents.contains("Root Cause: main thread blocked in database write"))
+        XCTAssertFalse(fileManager.fileExists(atPath: helperSampleURL.path))
+    }
+
 }

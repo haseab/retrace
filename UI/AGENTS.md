@@ -2,7 +2,7 @@
 
 You are the **UI** agent responsible for building the SwiftUI interface for Retrace.
 
-**Status**: ✅ Fully implemented with modern SwiftUI design. Timeline, dashboard, search, settings, onboarding, feedback, and bundled crash-recovery helper integration all working. Global hotkeys functional (Cmd+Shift+T for timeline, Cmd+Shift+D for dashboard). Menu bar integration complete. **Apple Silicon required**. Audio transcription UI not implemented (planned for future release).
+**Status**: ✅ Fully implemented with modern SwiftUI design. Timeline, dashboard, search, settings, onboarding, feedback, and bundled crash-recovery helper integration all working. Global hotkeys functional (Cmd+Shift+T for timeline, Cmd+Shift+D for dashboard). Menu bar integration complete. Automatic move-to-Applications prompting has been removed. **Apple Silicon required**. Audio transcription UI not implemented (planned for future release).
 
 ## Your Directory
 
@@ -30,13 +30,26 @@ UI/
 │   │   └── StandaloneQuickCommentView.swift # Dedicated standalone quick-comment UI
 │   ├── Dashboard/
 │   │   ├── DashboardView.swift          # Main dashboard
+│   │   ├── DashboardWindowController.swift # Dashboard window lifecycle
 │   │   ├── ChangelogView.swift          # Appcast-powered release notes view
-│   │   ├── AnalyticsCard.swift          # Stats widgets
-│   │   ├── MigrationPanel.swift         # Import UI
-│   │   └── SupportLink.swift            # Twitter/support
+│   │   ├── AppUsageListView.swift       # App, website, and window usage breakdown
+│   │   ├── DashboardUsageActions.swift # Native usage context menus, exact grouping targets, and bulk hide/delete confirmations
+│   │   ├── AppUsageHardDriveView.swift  # App usage treemap
+│   │   ├── AppSessionsDetailView.swift # App/window session details
+│   │   ├── MiniLineGraphView.swift      # Daily statistic graphs
+│   │   ├── SystemMonitorView.swift     # CPU and memory monitor
+│   │   └── SystemMonitorWindowController.swift # System Monitor window lifecycle
 │   ├── Feedback/
 │   │   ├── FeedbackFormView.swift       # Feedback sheet with form, sending, and success states
+│   │   ├── FeedbackDiagnosticsPresentation.swift # Feedback diagnostics section building + readable formatting helpers
 │   │   ├── FeedbackModels.swift         # Feedback launch context, diagnostics, and payload models
+│   │   ├── FeedbackSubmissionExport.swift # Feedback export text/JSON generation + filtered payload builder
+│   │   ├── FeedbackCrashCompaction.swift # Crash-report compaction helpers for feedback exports/submissions
+│   │   ├── FeedbackCompression.swift    # Shared gzip compression utility for feedback payloads/exports
+│   │   ├── FeedbackDiagnosticsCollector.swift # Diagnostic snapshot collection helpers (system/settings/perf/memory summaries)
+│   │   ├── FeedbackLogSnapshotter.swift # Log-tail filtering/grouping/snapshot helpers for feedback diagnostics
+│   │   ├── FeedbackSubmissionTransport.swift # Feedback submission request construction + network transport helpers
+│   │   ├── FeedbackExportIO.swift      # Screenshot capture and feedback diagnostics/report export file I/O
 │   │   └── FeedbackService.swift        # Feedback submission and export implementation
 │   └── Settings/
 │       ├── SettingsView.swift           # Thin settings shell hosting navigation, alerts, and top-level wiring
@@ -69,6 +82,7 @@ UI/
 │           ├── PrivacyMasterKeyActions.swift
 │           ├── PrivacySettingsActions.swift
 │           ├── PhraseLevelRedactionSettingsView.swift
+│           ├── PhraseRedactionMethodPicker.swift # Scramble/permanent selector with future-match scope and reveal explanation
 │           ├── PrivateModeAutomationSettingsView.swift
 │           ├── PowerSettingsView.swift
 │           ├── TagManagementSettingsView.swift
@@ -83,23 +97,38 @@ UI/
 ├── LaunchAgents/
 │   └── io.retrace.app.crash-recovery.plist # SMAppService launch-agent plist for crash recovery
 ├── Components/
+│   ├── CapturedURLPolicy.swift # HTTP(S)-only captured-link dispatch validation
 │   ├── MasterKeyRedactionFlowCoordinator.swift # Shared missing-master-key prompt/recovery coordinator
 │   ├── BoundingBoxOverlay.swift         # Text region highlighting
+│   ├── WatchdogRecoveryState.swift      # Synchronous expected-exit guard shared with watchdog recovery
 │   ├── CrashRecoveryManager.swift       # App-side SMAppService/XPC lifecycle manager
 │   ├── SessionTimeline.swift            # App session visualization
-│   ├── DeeplinkHandler.swift            # URL scheme routing
+│   ├── DeeplinkHandler.swift            # Search, timeline, and exact dashboard date/time URL routing
+│   ├── LaunchMenuRouting.swift          # Shared dashboard/timeline/settings/system-monitor routing and frontmost-window checks for app/status menus
+│   ├── DashboardRevealScheduler.swift  # Cancellable activation/reopen fallback giving URL delivery precedence
 │   ├── AppMetadataCache.swift           # App name/icon lookup caches and app icon view
 │   ├── FaviconProvider.swift            # Favicon memory+disk cache and favicon view
-│   ├── ProcessCPUMonitor.swift          # Shared process CPU+memory sampler + 24h aggregation service
+│   ├── FocusableTextInputSupport.swift  # Shared AppKit-backed text input wrapper and right-click deferral helpers for borderless UI surfaces
+│   ├── ProcessCPUMonitor.swift          # Shared process CPU+memory sampler + bounded 12h tally aggregation
+│   ├── ProcessMonitorHistoryStore.swift # Incremental bucket journal, legacy tally loading, bounded compaction and crash-safe reset
+│   ├── ProcessUsageLogCleanup.swift     # Removes the unused legacy raw CPU log without reading it
 │   ├── ProcessMemoryCardPresentation.swift # Local presentation controller + row builder for memory monitor card
 │   ├── ProcessMonitorModels.swift       # System Monitor snapshot/models + ranking/build helpers
+│   ├── HoverLatchedScrollMonitor.swift  # Shared nested-scroll latch helper for hover-routed inner scroll regions
+│   ├── FilterPopoverComponents.swift   # Shared filters; date input preserves exact times and expands date-only bounds to full days
 │   ├── ProcessCPUSummaryCard.swift      # System Monitor CPU table/card UI
 │   ├── ProcessMemorySummaryCard.swift   # System Monitor memory table/card UI
+│   ├── RetraceAboutPanel.swift          # Custom About panel content and window factory used by the app menu
+│   ├── PreviewCacheMaintenance.swift # O(1) byte totals, bounded FIFO disk worker, batched cleanup, preview keys/costs
 │   └── UIMemoryEstimators.swift         # Shared UI memory-estimation helpers for telemetry
 ├── ViewModels/
 │   ├── SimpleTimelineViewModel.swift    # Fullscreen timeline state, caching, playback, filters, OCR overlays
 │   ├── SearchViewModel.swift
 │   ├── DashboardViewModel.swift
+│   ├── DashboardViewModel+Metrics.swift # Extracted dashboard/timeline/system-monitor metric recording helpers
+│   ├── TimelineMetrics.swift         # Timeline-scoped daily_metrics helpers and shared UI metric recorder glue
+│   ├── TimelineYouTubeLinkSupport.swift # Shared YouTube timestamping + OCR markdown-link extraction helpers for timeline flows
+│   ├── UIMetricsRecorder.swift       # Shared UI metric recording + JSON payload helpers
 │   ├── CrashRecoveryBannerModel.swift   # Dashboard-facing banner state derived from crash recovery manager status
 │   ├── CommentComposerTargetDisplayInfo.swift # Shared display metadata/title logic for timeline and quick-comment composers
 │   ├── FeedbackViewModel.swift          # Feedback form state, diagnostics, export, submission
@@ -117,38 +146,52 @@ UI/
 │       ├── TagsSettingsViewModel.swift
 │       └── AdvancedSettingsViewModel.swift
 └── Tests/
+    ├── Support/PreviewCacheMaintenanceTests.swift # Real-image/disk cleanup, invalidation, accounting, crop identity and queue-budget regressions
     ├── BuildInfoAndUpdaterTests.swift    # Build metadata formatting + updater version fallback tests
     ├── CommentComposerTargetContextTests.swift # Comment-target utilities and quick-comment persisted-preview source coverage
     ├── CrashRecoverySupportTests.swift   # Crash-recovery bundle resolution and registration policy coverage
     ├── CrashReportSupportTests.swift     # Dashboard crash/WAL report discovery and launch-context coverage
+    ├── CumulativeScreenTimeTrackerTests.swift # Persisted screen-time reconciliation coverage for milestone/reminder thresholds
     ├── QuitConfirmationPresentationTests.swift # Quit alert anchor-window selection coverage
     ├── FeedbackExportTests.swift         # Feedback report export formatting coverage
     ├── FeedbackSubmissionProgressTests.swift # Feedback sending-state sequence coverage
     ├── HyperlinkMappingTests.swift       # Stored hyperlink row to OCR-node mapping coverage
     ├── FaviconProviderTests.swift        # Favicon memory-vs-disk cache behavior coverage
     ├── HyperlinkResolutionTests.swift    # Hyperlink parsing/resolution coverage
-    ├── InPageURLSettingsTests.swift      # In-page URL setup instructions and toggle coverage
-    ├── MilestoneCelebrationViewTests.swift # Milestone dialog action layout coverage
-    ├── OnboardingAutomationTargetTests.swift # Onboarding/settings unsupported browser coverage
     ├── AppNameResolverInstalledAppsTests.swift # Installed-app scan deduplication coverage
     ├── SearchViewModelAvailableAppsTests.swift # Search app-list merge/deduplication coverage
     ├── SpotlightSearchOverlayRecentEntryAppMapTests.swift # Recent entry app-name map deduplication coverage
     ├── Search/SearchPaginationCancellationTests.swift # Search stale-pagination cancellation coverage on mode/sort changes
-    ├── DashboardAppUsageDateRangeTests.swift # Dashboard app-usage date-range normalization coverage
-    ├── DateRangePresetShortcutTests.swift # Shared date-range preset shortcut mapping and inclusive-range coverage
+    ├── DashboardAppUsageDateRangeTests.swift # Dashboard date/time range normalization and cache coverage
+    ├── DashboardRevealSchedulerTests.swift # Activation/URL ordering, cancellation, and later Dock reopen coverage
+    ├── DateRangePresetShortcutTests.swift # Date/time parsing, round-trip formatting, full-day bounds, and preset shortcuts
     ├── CaptureIntervalSettingsTests.swift # Live capture-interval config update coverage
     ├── ProcessCPUDisplayMetricsTests.swift # CPU sampler display math and live ranking coverage
     ├── SearchHighlightTooltipTests.swift # Search highlight tooltip hover/dismiss coverage
-    ├── Dashboard/                        # Dashboard-specific XCTestCase files (title formatting, storage tooltip breakdown)
-    │   └── StorageTooltipBreakdownTests.swift # Storage chart tooltip breakdown coverage
+    ├── Dashboard/                        # Dashboard-specific XCTestCase files
+    │   └── DashboardUsageActionsTests.swift # Real SQLite bulk-action scope, hidden exclusion, and preparation coverage
     ├── MenuBar/                          # Menu bar interaction tests
     ├── Search/                           # Search/deeplink/overlay XCTestCase files
     ├── Settings/                         # Settings-focused XCTestCase files, including shell/view-model coverage
     ├── Support/                          # Shared XCTest helpers and support-only tests
+    │   └── FocusableTextInputSupportTests.swift # Borderless text-input keyboard shortcut, right-click deferral, and menu-filter coverage
     ├── SystemMonitor/                    # System monitor XCTestCase files
+    │   ├── ProcessMonitorHistoryStoreTests.swift # File-backed incremental writes, migration, retention, recovery and reset coverage
+    │   └── ProcessUsageLogCleanupTests.swift # Large legacy log cleanup and tally/recording preservation
+    ├── Timeline/TimelineCoordinatorVisibilityDecisionTests.swift # Timeline coordinator visibility generation/race policy coverage
     ├── Timeline/TimelineCopyFeedbackTests.swift # Timeline copy image/text toast feedback coverage
+    ├── Timeline/TimelinePositionRecoveryHintTests.swift # Timeline reopen Cmd+Z recovery hint behavior and policy coverage
     └── Timeline/                         # Timeline XCTestCase files
 ```
+
+## System Monitor History Persistence
+
+- The sampler actor retains the bounded 12-hour tally while idle; it drops only derived chart state.
+- `ProcessMonitorHistoryStore` reads the legacy tally JSON and migrates on the next changed save.
+- Saves append changed time buckets, removed bucket keys, and latest-sample metadata once per minute. Closing the monitor and normal app termination flush pending history.
+- The checkpoint is compacted after 30 minutes or before the update journal exceeds 4 MB. Sequence numbers prevent old journal records from replaying over a newer checkpoint or reset.
+- Incomplete trailing appends are removed before the next write. Other corrupt history is preserved until an explicit Restart Baseline.
+- File access stays on the sampler actor, including initial loading. Isolated tests supply a temporary storage root; never use the user's live history for mutation tests.
 
 ## Feature Requirements
 
@@ -291,6 +334,36 @@ func handleURL(_ url: URL) {
 **Share functionality**:
 - Right-click result → Copy Link
 - Generates deeplink to share with others (or paste into notes)
+
+**Dashboard breakdown links**:
+
+Timeline and search deeplinks open their overlay without revealing a hidden dashboard.
+AppKit activation/reopen fallbacks wait 150 ms for URL delivery and are cancelled
+when a valid deeplink arrives. Automatic reveals stay suppressed until the timeline
+opens or closes; explicit dashboard commands and dashboard links still work.
+The timeline controller shares that scheduler: any explicit timeline open cancels
+older automatic reveals, and every completed/failed show attempt releases suppression.
+Cold-start automatic reveals are tracked separately from explicit dashboard requests,
+so a queued timeline/search link cannot inherit an earlier automatic dashboard request.
+
+- `retrace://dashboard` opens the dashboard and preserves the current range.
+- `retrace://dashboard?start={start}&end={end}` opens the existing app/window breakdown for that range.
+- Both bounds are required when either is supplied. Accept Unix **milliseconds**, ISO 8601 datetimes with `Z` or an explicit offset, or date-only `YYYY-MM-DD` values.
+- Exact times are preserved. A date-only start is local midnight; a date-only end is local 23:59:59.999, respecting daylight saving time and including the final millisecond.
+- Invalid, reversed, incomplete, or greater-than-31-calendar-day ranges are rejected.
+- Apply the range to the controller-owned dashboard model before creating the window, so cold launches do not briefly load the default range or scan all storage.
+- Show the window before awaiting statistics. Controller/appearance/refresh triggers join one in-flight load for the same range, and a completed cold-link load is reused on first appearance.
+- Dashboard engagement counts use exact timestamp bounds; date-only inputs already provide full-day bounds. Reopened picker text preserves millisecond precision.
+- `launchSurfaceReveal` records dashboard deeplink entry; the existing dashboard range metrics record filter application/outcomes with source `dashboard_deeplink`.
+
+Example from another macOS app or shell:
+
+```sh
+open 'retrace://dashboard?start=2026-11-06T05:00:00-08:00&end=2026-11-06T06:10:00-08:00'
+```
+
+Use `DeeplinkHandler.generateDashboardLink(start:end:)` to generate canonical millisecond links.
+macOS URL dispatch requires an updated app bundle registered for the `retrace` scheme. For a standalone SwiftPM/dev run, use the existing `RETRACE_DEV_DEEPLINK_URL` startup hook to test routing without changing the registered release app.
 
 ### 3. Frame Viewer with Bounding Box Highlighting
 
@@ -582,6 +655,7 @@ struct BoundingBoxOverlay: View {
 |----------|--------|
 | `Cmd+Shift+T` | Open Timeline |
 | `Cmd+F` | Open Search |
+| `Cmd+Shift+O` | Scan text in the current timeline frame |
 | `Cmd+,` | Open Settings |
 | `/` | Focus search bar |
 | `←/→` | Previous/Next frame |
@@ -687,3 +761,41 @@ You depend on:
 8. Add UI tests for behaviorally significant flows when warranted
 
 Focus on getting the timeline + search working first before polishing dashboard/settings.
+
+## Privacy controls
+
+- Phrase Level Redaction offers Scramble (default) and Permanently redact. Permanent mode requires no master key; switching an enabled feature back to scrambling without a key disables it and starts the existing key-setup flow.
+- The method selection emits `phrase_level_redaction_mode_updated` with `{mode, source}`; never include keyword contents.
+- Permanent-node tooltips are noninteractive and say “Permanently redacted”; reveal and clipboard paths must never recover their removed text or pixels.
+- Feedback log readers accept only the privacy-safe logger format and strip its format marker before normal grouping. All legacy file lines, including error and grouped channels, are excluded.
+- While keyword protection is enabled, timeline/search disk previews are bypassed. Completed rewrites invalidate preview images without resetting timeline filters or search queries.
+
+- Visible search cards reload thumbnails with a generation-keyed task after rewrite invalidation; keep card identity stable.
+
+- Async feedback collection awaits the background logger flush before reading the diagnostic file; normal termination awaits the same flush without blocking main. Keep queue diagnostic errors in feedback even when routine queue-detail messages are dropped.
+
+## Preview cache I/O and budgets
+
+Timeline index touches do not rescan sizes. JPEG NSCache entries have compressed-byte costs (64 MiB cost limit). Search LRU costs use decoded representation estimates (32 MiB, 60 entries); no CGImage decode is forced for accounting. Cache disk operations go through the shared FIFO utility worker; a brief admission lock only bounds pending memory. Coalesce thumbnail trim scans (burst debounce, 60-second minimum interval), batch deletions, and prune by request-time cutoff so new files survive delayed cleanup. Invalidation epochs and main-actor generations prevent stale completions from restoring cleared previews. Search keys use render identity and a persisted revision, with highlighted geometry kept distinct. Changing the rendering algorithm must advance the key format version. Keyword privacy bypasses and redaction purge paths remain mandatory.
+
+### Captured link policy
+
+- `UI/Components/CapturedURLPolicy.swift` allows HTTP(S) URLs with a host for captured browser/OCR links. Apply it before NSWorkspace/browser lookup in every captured-link open path. Existing comment-authored links are outside this policy. `HyperlinkResolutionTests` covers allowed and rejected schemes.
+
+- PreviewCacheEntryEpochs in PreviewCacheMaintenance.swift isolates frame eviction from unrelated reads/writes. Release read-miss epochs after all overlapping operations finish; keep whole-cache invalidation for clear/redaction.
+
+Bundled development runs use `AppPaths` to isolate settings, library, Keychain service, logs, preview caches and instance locks for `io.retrace.app.dev`. Never launch a dev build against hardcoded production domains. The production crash-recovery launch agent stays disarmed in the dev app; debugging one app must not manage the other app’s helper.
+
+- `Tests/QuitRecoveryTests.swift` covers intentional quit cancellation of pending watchdog recovery.
+
+### On-demand timeline OCR
+
+The timeline's Scan Text button and Cmd+Shift+O run session-only Vision OCR for native,
+imported, and live images. The button displays scanning, success, no-text, failure/retry,
+and protected-frame states. Historical scans check saved redaction metadata first;
+protected frames retain their existing overlays. Saved OCR and search indexes are unchanged.
+Navigation, a new live screenshot, and closing the timeline invalidate pending results.
+`timeline_text_scan` records entry/outcome without recognized text; manual OCR latency uses
+`timeline.manual_ocr.total_ms`.
+
+Manual scans recheck saved protection before publishing, wait for native privacy processing when enabled, and are invalidated by redaction-completion notifications. Fresh OCR outlines use the same zoom and pan transform as the frame.

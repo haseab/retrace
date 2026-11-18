@@ -36,7 +36,7 @@ final class HEVCEncoderTests: XCTestCase {
         )
 
         XCTAssertEqual(tuning.averageBitRate, 4_200_000)
-        XCTAssertEqual(tuning.quality, 0.85, accuracy: 0.0001)
+        XCTAssertEqual(tuning.quality, 0.775, accuracy: 0.0001)
     }
 
     func testCompressionTuningClampsOutOfRangeQualityIntoEncoderRange() {
@@ -53,6 +53,43 @@ final class HEVCEncoderTests: XCTestCase {
 
         XCTAssertEqual(lowQualityTuning.quality, 0.0, accuracy: 0.0001)
         XCTAssertEqual(highQualityTuning.quality, 1.0, accuracy: 0.0001)
+    }
+
+    func testCompressionTuningMapsFortyPercentQualityToLegacySevenPointTwoNineMegabits() {
+        let tuning = HEVCEncoder.compressionTuning(
+            width: 3024,
+            height: 1964,
+            config: VideoEncoderConfig(quality: 0.4)
+        )
+
+        XCTAssertEqual(tuning.averageBitRate, 7_290_000)
+        XCTAssertEqual(tuning.dataRateLimitBytesPerSecond, 5_467_500)
+        XCTAssertEqual(tuning.quality, 0.3469, accuracy: 0.0001)
+    }
+
+    func testCompressionTuningUsesSixXBurstCapForDefaultSeventyPercentQuality() {
+        let tuning = HEVCEncoder.compressionTuning(
+            width: 3024,
+            height: 1964,
+            config: VideoEncoderConfig(quality: 0.7)
+        )
+
+        XCTAssertEqual(tuning.averageBitRate, 10_334_097)
+        XCTAssertEqual(tuning.dataRateLimitBytesPerSecond, 7_750_573)
+        XCTAssertEqual(tuning.quality, 0.55, accuracy: 0.0001)
+    }
+
+    func testCompressionTuningCapsFiveKNearThirteenMegabitsAtDefaultQuality() {
+        let tuning = HEVCEncoder.compressionTuning(
+            width: 5120,
+            height: 2880,
+            config: .default
+        )
+
+        XCTAssertEqual(tuning.averageBitRate, 13_235_327)
+        XCTAssertEqual(tuning.dataRateLimitBytesPerSecond, 9_926_495)
+        XCTAssertEqual(tuning.quality, 0.4146, accuracy: 0.0001)
+        XCTAssertEqual(tuning.densityBoost, 0.6346, accuracy: 0.0001)
     }
 
     func testEncodeProducesValidMP4File() async throws {

@@ -21,6 +21,7 @@ public struct SearchFilterBar: View {
     @State private var showCommentDropdown = false
     @State private var showAdvancedDropdown = false
     @State private var showSearchOrderDropdown = false
+    @State private var datePopoverFocusRequestID: UUID?
     @State private var isClearFiltersHovered = false
     @State private var tabKeyMonitor: Any?
 
@@ -49,7 +50,11 @@ public struct SearchFilterBar: View {
                     }
                 }
             )
-            .dropdownOverlay(isPresented: $showSearchOrderDropdown, yOffset: SpotlightFilterChipMetrics.dropdownYOffset) {
+            .dropdownOverlay(
+                isPresented: $showSearchOrderDropdown,
+                yOffset: SpotlightFilterChipMetrics.dropdownYOffset,
+                dismissOnOutsideClick: false
+            ) {
                 SearchOrderPopover(
                     selection: SearchOrderOption.from(
                         mode: viewModel.searchMode,
@@ -94,7 +99,11 @@ public struct SearchFilterBar: View {
                     }
                 }
             )
-            .dropdownOverlay(isPresented: $showAppsDropdown, yOffset: SpotlightFilterChipMetrics.dropdownYOffset) {
+            .dropdownOverlay(
+                isPresented: $showAppsDropdown,
+                yOffset: SpotlightFilterChipMetrics.dropdownYOffset,
+                dismissOnOutsideClick: false
+            ) {
                 AppsFilterPopover(
                     apps: viewModel.installedApps.map { ($0.bundleID, $0.name) },
                     otherApps: viewModel.otherApps.map { ($0.bundleID, $0.name) },
@@ -124,7 +133,11 @@ public struct SearchFilterBar: View {
                 showChevron: true
             ) {
                 withAnimation(.easeOut(duration: 0.15)) {
-                    showDatePopover.toggle()
+                    let willOpen = !showDatePopover
+                    if willOpen {
+                        datePopoverFocusRequestID = UUID()
+                    }
+                    showDatePopover = willOpen
                     showAppsDropdown = false
                     showTagsDropdown = false
                     showVisibilityDropdown = false
@@ -132,7 +145,11 @@ public struct SearchFilterBar: View {
                     showAdvancedDropdown = false
                 }
             }
-            .dropdownOverlay(isPresented: $showDatePopover, yOffset: SpotlightFilterChipMetrics.dropdownYOffset) {
+            .dropdownOverlay(
+                isPresented: $showDatePopover,
+                yOffset: SpotlightFilterChipMetrics.dropdownYOffset,
+                dismissOnOutsideClick: false
+            ) {
                 DateRangeFilterPopover(
                     dateRanges: viewModel.effectiveDateRanges,
                     onApply: { ranges in
@@ -154,6 +171,10 @@ public struct SearchFilterBar: View {
                     onQuickPresetShortcut: { preset in
                         viewModel.recordKeyboardShortcut("search.date_range.\(preset.rawValue)")
                     },
+                    onClearShortcut: {
+                        viewModel.recordKeyboardShortcut("search.date_range.clear")
+                    },
+                    focusPrimaryInputRequestID: datePopoverFocusRequestID,
                     onDismiss: {
                         withAnimation(.easeOut(duration: 0.15)) {
                             showDatePopover = false
@@ -181,7 +202,11 @@ public struct SearchFilterBar: View {
                     }
                 }
             )
-            .dropdownOverlay(isPresented: $showTagsDropdown, yOffset: SpotlightFilterChipMetrics.dropdownYOffset) {
+            .dropdownOverlay(
+                isPresented: $showTagsDropdown,
+                yOffset: SpotlightFilterChipMetrics.dropdownYOffset,
+                dismissOnOutsideClick: false
+            ) {
                 TagsFilterPopover(
                     tags: viewModel.availableTags,
                     selectedTags: viewModel.selectedTags,
@@ -217,7 +242,11 @@ public struct SearchFilterBar: View {
                     }
                 }
             )
-            .dropdownOverlay(isPresented: $showVisibilityDropdown, yOffset: SpotlightFilterChipMetrics.dropdownYOffset) {
+            .dropdownOverlay(
+                isPresented: $showVisibilityDropdown,
+                yOffset: SpotlightFilterChipMetrics.dropdownYOffset,
+                dismissOnOutsideClick: false
+            ) {
                 VisibilityFilterPopover(
                     currentFilter: viewModel.hiddenFilter,
                     onSelect: { filter in
@@ -252,7 +281,11 @@ public struct SearchFilterBar: View {
                     }
                 }
             )
-            .dropdownOverlay(isPresented: $showCommentDropdown, yOffset: SpotlightFilterChipMetrics.dropdownYOffset) {
+            .dropdownOverlay(
+                isPresented: $showCommentDropdown,
+                yOffset: SpotlightFilterChipMetrics.dropdownYOffset,
+                dismissOnOutsideClick: false
+            ) {
                 CommentFilterPopover(
                     currentFilter: viewModel.commentFilter,
                     onSelect: { filter in
@@ -288,7 +321,11 @@ public struct SearchFilterBar: View {
                     showCommentDropdown = false
                 }
             }
-            .dropdownOverlay(isPresented: $showAdvancedDropdown, yOffset: SpotlightFilterChipMetrics.dropdownYOffset) {
+            .dropdownOverlay(
+                isPresented: $showAdvancedDropdown,
+                yOffset: SpotlightFilterChipMetrics.dropdownYOffset,
+                dismissOnOutsideClick: false
+            ) {
                 AdvancedSearchFilterPopover(
                     windowNameIncludeTerms: $viewModel.windowNameTerms,
                     windowNameExcludeTerms: $viewModel.windowNameExcludedTerms,
@@ -355,7 +392,7 @@ public struct SearchFilterBar: View {
             viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showCommentDropdown || showAdvancedDropdown || showSearchOrderDropdown
             // Lazy load apps only when dropdown is opened
             if isOpen {
-                viewModel.openFilterSignal = (2, UUID())
+                syncOpenFilterIndex(2)
                 Task {
                     await viewModel.loadAvailableApps()
                 }
@@ -365,37 +402,41 @@ public struct SearchFilterBar: View {
             viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showCommentDropdown || showAdvancedDropdown || showSearchOrderDropdown
             if !isOpen {
                 viewModel.isDatePopoverHandlingKeys = false
+                datePopoverFocusRequestID = nil
             }
             if isOpen {
-                viewModel.openFilterSignal = (3, UUID())
+                syncOpenFilterIndex(3)
             }
         }
         .onChange(of: showTagsDropdown) { isOpen in
             viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showCommentDropdown || showAdvancedDropdown || showSearchOrderDropdown
             if isOpen {
-                viewModel.openFilterSignal = (4, UUID())
+                syncOpenFilterIndex(4)
             }
         }
         .onChange(of: showVisibilityDropdown) { isOpen in
             viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showCommentDropdown || showAdvancedDropdown || showSearchOrderDropdown
             if isOpen {
-                viewModel.openFilterSignal = (5, UUID())
+                syncOpenFilterIndex(5)
             }
         }
         .onChange(of: showCommentDropdown) { isOpen in
             viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showCommentDropdown || showAdvancedDropdown || showSearchOrderDropdown
             if isOpen {
-                viewModel.openFilterSignal = (6, UUID())
+                syncOpenFilterIndex(6)
             }
         }
         .onChange(of: showAdvancedDropdown) { isOpen in
             viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showCommentDropdown || showAdvancedDropdown || showSearchOrderDropdown
             if isOpen {
-                viewModel.openFilterSignal = (7, UUID())
+                syncOpenFilterIndex(7)
             }
         }
         .onChange(of: showSearchOrderDropdown) { isOpen in
             viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showCommentDropdown || showAdvancedDropdown || showSearchOrderDropdown
+            if isOpen {
+                syncOpenFilterIndex(1)
+            }
         }
         .onChange(of: viewModel.closeDropdownsSignal) { newValue in
             // Close all dropdowns when signal is received (from Escape key in parent)
@@ -446,6 +487,7 @@ public struct SearchFilterBar: View {
                     await viewModel.loadAvailableApps()
                 }
             case 3:
+                datePopoverFocusRequestID = UUID()
                 showDatePopover = true
             case 4:
                 showTagsDropdown = true
@@ -459,6 +501,13 @@ public struct SearchFilterBar: View {
                 // Index 0 means focus search field - parent will handle via onChange
                 break
             }
+        }
+    }
+
+    private func syncOpenFilterIndex(_ index: Int) {
+        let currentID = viewModel.openFilterSignal.id
+        if viewModel.openFilterSignal.index != index {
+            viewModel.openFilterSignal = (index, currentID)
         }
     }
 

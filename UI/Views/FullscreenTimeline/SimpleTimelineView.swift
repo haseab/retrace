@@ -1,10 +1,11 @@
+import Foundation
 import SwiftUI
 import AVKit
 import Shared
 import App
 import UniformTypeIdentifiers
 
-private let timelineSettingsStore: UserDefaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+private let timelineSettingsStore: UserDefaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
 
 /// Redesigned fullscreen timeline view with scrolling tape and fixed playhead
 /// The timeline tape moves left/right while the playhead stays fixed in center
@@ -23,8 +24,8 @@ public struct SimpleTimelineView: View {
     @State private var commentSubmenuVisibility: Double = 0
     @State private var isSearchHighlightControlsHintDismissed = false
     @State private var browserURLDebugWindowPosition = CGSize(width: 320, height: 16)
-    @FocusState private var isInFrameSearchFieldFocused: Bool
-    @AppStorage("showFrameIDs", store: timelineSettingsStore) private var showFrameIDs = SettingsDefaults.showFrameIDs
+    @State private var isInFrameSearchFieldFocused = false
+    @AppStorage("showFrameIDs", store: timelineSettingsStore) private var showFrameCard = SettingsDefaults.showFrameIDs
 
     let coordinator: AppCoordinator
     let onClose: () -> Void
@@ -65,7 +66,6 @@ public struct SimpleTimelineView: View {
             )
             let shouldRenderSearchHighlightControlsHint =
                 shouldShowSearchHighlightControlsHint && !isSearchHighlightControlsHintDismissed
-            let controlsHiddenHintBannerStackOffset: CGFloat = viewModel.showControlsHiddenRestoreHintBanner ? 58 : 0
 
             ZStack {
                 // Full screen frame display
@@ -123,11 +123,7 @@ public struct SimpleTimelineView: View {
                         .ignoresSafeArea()
                         .onTapGesture {
                             withAnimation(.spring(response: 0.25, dampingFraction: 0.9)) {
-                                viewModel.isCalendarPickerVisible = false
-                                viewModel.hoursWithFrames = []
-                                viewModel.selectedCalendarDate = nil
-                                viewModel.calendarKeyboardFocus = .dateGrid
-                                viewModel.selectedCalendarHour = nil
+                                viewModel.closeCalendarPicker()
                             }
                         }
                 }
@@ -171,13 +167,14 @@ public struct SimpleTimelineView: View {
                     .transition(.opacity.animation(.easeInOut(duration: 0.2).delay(0.1)))
                 }
 
-                // Debug frame ID badge, OCR status indicator, and developer actions menu (top-left)
+                // Debug frame card, OCR status indicator, and developer actions menu (top-left)
                 VStack {
                     HStack(spacing: 8) {
-                        if showFrameIDs {
+                        if showFrameCard {
                             DebugFrameIDBadge(viewModel: viewModel)
                         }
-                        // OCR status indicator (only visible when OCR is in progress)
+                        FrameTextScanButton(viewModel: viewModel)
+                        // Background processing status remains separate from an on-demand scan.
                         OCRStatusIndicator(viewModel: viewModel)
                         #if DEBUG
                         DeveloperActionsMenu(viewModel: viewModel, onClose: onClose)
@@ -189,8 +186,8 @@ public struct SimpleTimelineView: View {
                         .allowsHitTesting(false)
                 }
                 .padding(.spacingL)
-                .offset(y: viewModel.areControlsHidden ? TimelineScaleFactor.closeButtonHiddenYOffset : 0)
-                .opacity(viewModel.areControlsHidden || viewModel.isDraggingZoomRegion ? 0 : 1)
+                .offset(y: viewModel.areControlsHidden && viewModel.frameTextScanState == .idle ? TimelineScaleFactor.closeButtonHiddenYOffset : 0)
+                .opacity((viewModel.areControlsHidden && viewModel.frameTextScanState == .idle) || viewModel.isDraggingZoomRegion ? 0 : 1)
 
                 #if DEBUG
                 if viewModel.showBrowserURLDebugWindow {
@@ -299,93 +296,29 @@ public struct SimpleTimelineView: View {
                 // Search overlay (Cmd+K) - uses persistent searchViewModel to preserve results
                 searchOverlay
 
+                // A brief outline makes freshly recognized text discoverable without selecting it.
+                if viewModel.frameTextScanState == .ready, !viewModel.isZoomRegionActive {
+                    Path { path in
+                        for node in viewModel.ocrNodes {
+                            path.addRoundedRect(in: CGRect(
+                                x: actualFrameRect.minX + node.x * actualFrameRect.width,
+                                y: actualFrameRect.minY + node.y * actualFrameRect.height,
+                                width: node.width * actualFrameRect.width,
+                                height: node.height * actualFrameRect.height
+                            ), cornerSize: CGSize(width: 2, height: 2))
+                        }
+                    }
+                    .stroke(Color.accentColor.opacity(0.55), lineWidth: 1)
+                    .scaleEffect(viewModel.frameZoomScale)
+                    .offset(viewModel.frameZoomOffset)
+                    .allowsHitTesting(false)
+                    .transition(.opacity)
+                }
+
                 // OCR debug overlay (dev setting)
                 ocrDebugOverlay(containerSize: geometry.size, actualFrameRect: actualFrameRect)
 
-                // Controls hidden restore affordance (top center)
-                if viewModel.showControlsHiddenRestoreHintBanner {
-                    VStack {
-                        ControlsHiddenRestoreHintBanner(
-                            onDismiss: { viewModel.dismissControlsHiddenRestoreHint() }
-                        )
-                            .fixedSize()
-                            .padding(.top, 60)
-                            .transition(.asymmetric(
-                                insertion: .move(edge: .top).combined(with: .opacity),
-                                removal: .opacity
-                            ))
-                        Spacer()
-                    }
-                    .animation(.spring(response: 0.3, dampingFraction: 0.8), value: viewModel.showControlsHiddenRestoreHintBanner)
-                }
-
-                // Text selection hint toast (top center)
-                if viewModel.showTextSelectionHint {
-                    VStack {
-                        TextSelectionHintBanner(
-                            onDismiss: {
-                                viewModel.dismissTextSelectionHint()
-                            }
-                        )
-                        .fixedSize()
-                        .padding(.top, 60 + controlsHiddenHintBannerStackOffset)
-                        .transition(.asymmetric(
-                            insertion: .move(edge: .top).combined(with: .opacity),
-                            removal: .opacity
-                        ))
-                        Spacer()
-                    }
-                    .animation(.spring(response: 0.3, dampingFraction: 0.8), value: viewModel.showTextSelectionHint)
-                }
-
-                // Search-highlight/timeline-controls hint toast (top center)
-                if shouldRenderSearchHighlightControlsHint {
-                    VStack {
-                        SearchHighlightControlsHintBanner(
-                            onDismiss: {
-                                isSearchHighlightControlsHintDismissed = true
-                            }
-                        )
-                            .fixedSize()
-                            .padding(
-                                .top,
-                                60 +
-                                    controlsHiddenHintBannerStackOffset +
-                                    (viewModel.showTextSelectionHint ? 58 : 0)
-                            )
-                            .transition(.asymmetric(
-                                insertion: .move(edge: .top).combined(with: .opacity),
-                                removal: .opacity
-                            ))
-                        Spacer()
-                    }
-                    .animation(.spring(response: 0.3, dampingFraction: 0.8), value: shouldRenderSearchHighlightControlsHint)
-                }
-
-                // Scroll orientation hint toast (top center)
-                if viewModel.showScrollOrientationHintBanner {
-                    VStack {
-                        ScrollOrientationHintBanner(
-                            currentOrientation: viewModel.scrollOrientationHintCurrentOrientation,
-                            onSwitch: { viewModel.openTimelineScrollOrientationSettings() },
-                            onDismiss: { viewModel.dismissScrollOrientationHint() }
-                        )
-                        .fixedSize()
-                        .padding(
-                            .top,
-                            60 +
-                                controlsHiddenHintBannerStackOffset +
-                                (viewModel.showTextSelectionHint ? 58 : 0) +
-                                (shouldRenderSearchHighlightControlsHint ? 58 : 0)
-                        )
-                        .transition(.asymmetric(
-                            insertion: .move(edge: .top).combined(with: .opacity),
-                            removal: .opacity
-                        ))
-                        Spacer()
-                    }
-                    .animation(.spring(response: 0.3, dampingFraction: 0.8), value: viewModel.showScrollOrientationHintBanner)
-                }
+                topHintOverlay(shouldRenderSearchHighlightControlsHint: shouldRenderSearchHighlightControlsHint)
 
                 // Filter panel (floating, anchored to filter button position)
                 if viewModel.isFilterPanelVisible {
@@ -473,18 +406,7 @@ public struct SimpleTimelineView: View {
                         }
                         .padding(.horizontal, 28)
                         .padding(.vertical, 18)
-                        .background(
-                            ZStack {
-                                RoundedRectangle(cornerRadius: 16)
-                                    .fill(.ultraThinMaterial)
-                                    .environment(\.colorScheme, .dark)
-                                RoundedRectangle(cornerRadius: 16)
-                                    .fill(Color.black.opacity(0.5))
-                                RoundedRectangle(cornerRadius: 16)
-                                    .stroke(toastAccentColor.opacity(0.35), lineWidth: 1)
-                            }
-                        )
-                        .shadow(color: .black.opacity(0.4), radius: 20, y: 8)
+                        .timelineGlassSurface(.banner, cornerRadius: 16, borderColor: toastAccentColor.opacity(0.35))
                         .scaleEffect(viewModel.toastVisible ? 1.0 : 0.85)
                         .opacity(viewModel.toastVisible ? 1.0 : 0.0)
                         Spacer()
@@ -534,15 +456,7 @@ public struct SimpleTimelineView: View {
                         }
                         .padding(.horizontal, 14)
                         .padding(.vertical, 10)
-                        .background(
-                            RoundedRectangle(cornerRadius: 12)
-                                .fill(Color.black.opacity(0.68))
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 12)
-                                        .stroke(Color.white.opacity(0.18), lineWidth: 1)
-                                )
-                        )
-                        .shadow(color: .black.opacity(0.4), radius: 14, y: 6)
+                        .timelineGlassSurface(.banner, cornerRadius: 12)
                         .padding(.top, max(geometry.safeAreaInsets.top + 18, 56))
                         Spacer()
                     }
@@ -734,6 +648,80 @@ public struct SimpleTimelineView: View {
         return viewModel.isFrameZoomed ? baseTopPadding + 48 : baseTopPadding
     }
 
+    private static let topHintTransition: AnyTransition = .asymmetric(
+        insertion: .move(edge: .top).combined(with: .opacity),
+        removal: .opacity
+    )
+
+    @ViewBuilder
+    private func topHintOverlay(shouldRenderSearchHighlightControlsHint: Bool) -> some View {
+        let hasVisibleHints =
+            viewModel.showControlsHiddenRestoreHintBanner ||
+            viewModel.showPositionRecoveryHintBanner ||
+            viewModel.showTextSelectionHint ||
+            shouldRenderSearchHighlightControlsHint ||
+            viewModel.showTimelineTapeRightClickHintBanner ||
+            viewModel.showScrollOrientationHintBanner
+
+        if hasVisibleHints {
+            TimelineHintOverlayStack {
+                if viewModel.showControlsHiddenRestoreHintBanner {
+                    ControlsHiddenRestoreHintBanner(
+                        onDismiss: { viewModel.dismissControlsHiddenRestoreHint() }
+                    )
+                    .fixedSize()
+                    .transition(Self.topHintTransition)
+                }
+
+                if viewModel.showPositionRecoveryHintBanner {
+                    PositionRecoveryHintBanner(
+                        onDismiss: { viewModel.dismissPositionRecoveryHint() }
+                    )
+                    .fixedSize()
+                    .transition(Self.topHintTransition)
+                }
+
+                if viewModel.showTextSelectionHint {
+                    TextSelectionHintBanner(
+                        onDismiss: { viewModel.dismissTextSelectionHint() }
+                    )
+                    .fixedSize()
+                    .transition(Self.topHintTransition)
+                }
+
+                if shouldRenderSearchHighlightControlsHint {
+                    SearchHighlightControlsHintBanner(
+                        onDismiss: {
+                            withAnimation(.easeOut(duration: 0.2)) {
+                                isSearchHighlightControlsHintDismissed = true
+                            }
+                        }
+                    )
+                    .fixedSize()
+                    .transition(Self.topHintTransition)
+                }
+
+                if viewModel.showTimelineTapeRightClickHintBanner {
+                    TimelineTapeRightClickHintBanner(
+                        onDismiss: { viewModel.dismissTimelineTapeRightClickHint() }
+                    )
+                    .fixedSize()
+                    .transition(Self.topHintTransition)
+                }
+
+                if viewModel.showScrollOrientationHintBanner {
+                    ScrollOrientationHintBanner(
+                        currentOrientation: viewModel.scrollOrientationHintCurrentOrientation,
+                        onSwitch: { viewModel.openTimelineScrollOrientationSettings() },
+                        onDismiss: { viewModel.dismissScrollOrientationHint() }
+                    )
+                    .fixedSize()
+                    .transition(Self.topHintTransition)
+                }
+            }
+        }
+    }
+
     private var frameCanvasBackgroundColor: Color {
         isAwaitingLiveScreenshot ? .clear : .black
     }
@@ -746,7 +734,7 @@ public struct SimpleTimelineView: View {
         guard !viewModel.areControlsHidden else { return false }
         guard !viewModel.isInFrameSearchVisible else { return false }
 
-        let highlightCutoffY = containerSize.height * 0.75
+        let highlightCutoffY = containerSize.height * 0.88
         var seenNodeIDs = Set<Int>()
         for match in viewModel.searchHighlightNodes {
             guard seenNodeIDs.insert(match.node.id).inserted else { continue }
@@ -1054,15 +1042,44 @@ public struct SimpleTimelineView: View {
 
     private var topRightControls: some View {
         let scale = TimelineScaleFactor.current
-        return HStack(spacing: 10 * scale) {
-            if viewModel.isInFrameSearchVisible {
-                inFrameSearchBar
-                    .transition(.move(edge: .trailing).combined(with: .opacity))
+        let searchResultNavigationState = viewModel.searchResultHighlightNavigationState
+
+        return VStack(alignment: .trailing, spacing: 10 * scale) {
+            HStack(spacing: 10 * scale) {
+                if viewModel.isInFrameSearchVisible {
+                    inFrameSearchBar
+                        .transition(.move(edge: .trailing).combined(with: .opacity))
+                }
+                // helpButton
+                closeButton
             }
-            // helpButton
-            closeButton
+
+            if let searchResultNavigationState {
+                SearchResultNavigationToast(
+                    state: searchResultNavigationState,
+                    onNavigatePrevious: {
+                        Task {
+                            await viewModel.navigateToAdjacentSearchResult(
+                                offset: -1,
+                                trigger: .button
+                            )
+                        }
+                    },
+                    onNavigateNext: {
+                        Task {
+                            await viewModel.navigateToAdjacentSearchResult(
+                                offset: 1,
+                                trigger: .button
+                            )
+                        }
+                    }
+                )
+                .fixedSize()
+                .transition(.move(edge: .trailing).combined(with: .opacity))
+            }
         }
         .animation(.easeOut(duration: 0.15), value: viewModel.isInFrameSearchVisible)
+        .animation(.spring(response: 0.24, dampingFraction: 0.84), value: searchResultNavigationState)
     }
 
     private var inFrameSearchBinding: Binding<String> {
@@ -1085,24 +1102,29 @@ public struct SimpleTimelineView: View {
                 .font(.system(size: 13 * scale, weight: .semibold))
                 .foregroundColor(.white.opacity(0.72))
 
-            TextField("Search this frame", text: inFrameSearchBinding)
-                .textFieldStyle(.plain)
-                .font(.system(size: 14 * scale, weight: .medium))
-                .foregroundColor(.white)
-                .focused($isInFrameSearchFieldFocused)
-                .submitLabel(.search)
-
-            if !viewModel.inFrameSearchQuery.isEmpty {
-                Button {
-                    viewModel.setInFrameSearchQuery("")
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 12 * scale, weight: .medium))
-                        .foregroundColor(.white.opacity(0.6))
+            FocusableTextInput(
+                text: inFrameSearchBinding,
+                placeholder: "Search this frame",
+                font: .systemFont(ofSize: 14 * scale, weight: .medium),
+                isFocused: { isInFrameSearchFieldFocused },
+                setFocused: { isFocused in
+                    isInFrameSearchFieldFocused = isFocused
                 }
-                .buttonStyle(.plain)
-                .help("Clear search")
+            )
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Button {
+                viewModel.setInFrameSearchQuery("")
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 12 * scale, weight: .medium))
+                    .foregroundColor(.white.opacity(0.6))
             }
+            .buttonStyle(.plain)
+            .disabled(viewModel.inFrameSearchQuery.isEmpty)
+            .opacity(viewModel.inFrameSearchQuery.isEmpty ? 0 : 1)
+            .allowsHitTesting(!viewModel.inFrameSearchQuery.isEmpty)
+            .help("Clear search")
 
             Button {
                 viewModel.closeInFrameSearch(clearQuery: true)
@@ -1117,7 +1139,7 @@ public struct SimpleTimelineView: View {
         .padding(.leading, 14 * scale)
         .padding(.trailing, 12 * scale)
         .frame(width: 340 * scale, height: height)
-        .retraceMenuContainer(addPadding: false)
+        .timelineGlassSurface(.panel, cornerRadius: 14 * scale)
         .overlay(
             RoundedRectangle(cornerRadius: 14 * scale)
                 .stroke(
@@ -1188,14 +1210,7 @@ public struct SimpleTimelineView: View {
                 .foregroundColor(isHelpButtonHovering ? .white : .white.opacity(0.8))
                 .frame(width: isHelpButtonHovering ? nil : buttonSize, height: buttonSize)
                 .padding(.horizontal, isHelpButtonHovering ? 20 * scale : 0)
-                .background(
-                    Capsule()
-                        .fill(Color.black.opacity(isHelpButtonHovering ? 0.7 : 0.5))
-                )
-                .overlay(
-                    Capsule()
-                        .stroke(Color.white.opacity(0.2), lineWidth: 0.5)
-                )
+                .timelineGlassSurface(.chip, cornerRadius: buttonSize / 2)
                 .animation(.easeOut(duration: 0.15), value: isHelpButtonHovering)
             }
         }
@@ -1234,14 +1249,7 @@ public struct SimpleTimelineView: View {
                 .foregroundColor(isCloseButtonHovering ? .white : .white.opacity(0.8))
                 .frame(width: isCloseButtonHovering ? nil : buttonSize, height: buttonSize)
                 .padding(.horizontal, isCloseButtonHovering ? 20 * scale : 0)
-                .background(
-                    Capsule()
-                        .fill(Color.black.opacity(isCloseButtonHovering ? 0.7 : 0.5))
-                )
-                .overlay(
-                    Capsule()
-                        .stroke(Color.white.opacity(0.2), lineWidth: 0.5)
-                )
+                .timelineGlassSurface(.chip, cornerRadius: buttonSize / 2)
                 .animation(.easeOut(duration: 0.15), value: isCloseButtonHovering)
             }
         }
@@ -1266,6 +1274,7 @@ public struct SimpleTimelineView: View {
                 .font(.retraceBody)
                 .foregroundColor(.white.opacity(0.7))
         }
+        .allowsHitTesting(false)
     }
 
     // MARK: - Helper Methods
@@ -1334,18 +1343,7 @@ public struct SimpleTimelineView: View {
         .padding(.horizontal, 28)
         .padding(.vertical, 18)
         .fixedSize(horizontal: true, vertical: false)
-        .background(
-            ZStack {
-                RoundedRectangle(cornerRadius: 16)
-                    .fill(.ultraThinMaterial)
-                    .environment(\.colorScheme, .dark)
-                RoundedRectangle(cornerRadius: 16)
-                    .fill(Color.black.opacity(0.5))
-                RoundedRectangle(cornerRadius: 16)
-                    .stroke(accentColor.opacity(0.35), lineWidth: 1)
-            }
-        )
-        .shadow(color: .black.opacity(0.4), radius: 20, y: 8)
+        .timelineGlassSurface(.banner, cornerRadius: 16, borderColor: accentColor.opacity(0.35))
         .padding(.horizontal, 24)
         .allowsHitTesting(false)
     }
@@ -1353,7 +1351,7 @@ public struct SimpleTimelineView: View {
 
 // MARK: - Reset Zoom Button
 
-/// Floating button that appears when the frame is zoomed, allowing quick reset to 100%
+/// Floating button that appears when the frame is zoomed, allowing quick reset to fit-to-screen.
 struct ResetZoomButton: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel
     @State private var isHovering = false
@@ -1373,14 +1371,7 @@ struct ResetZoomButton: View {
             .foregroundColor(isHovering ? .white : .white.opacity(0.8))
             .padding(.horizontal, 20 * scale)
             .padding(.vertical, 12 * scale)
-            .background(
-                Capsule()
-                    .fill(Color.black.opacity(isHovering ? 0.7 : 0.5))
-            )
-            .overlay(
-                Capsule()
-                    .stroke(Color.white.opacity(0.2), lineWidth: 0.5)
-            )
+            .timelineGlassSurface(.chip, cornerRadius: 22 * scale)
         }
         .buttonStyle(.plain)
         .onHover { hovering in
@@ -1391,7 +1382,7 @@ struct ResetZoomButton: View {
                 NSCursor.pop()
             }
         }
-        .help("Reset zoom to 100% (Cmd+0)")
+        .help("Reset zoom to \(TimelineZoomSettings.resetLabel) (Cmd+0)")
     }
 }
 
@@ -1463,19 +1454,7 @@ struct PeekModeBanner: View {
         }
         .padding(.horizontal, 16 * scale)
         .padding(.vertical, 10 * scale)
-        .background(
-            Capsule()
-                .fill(Color.black.opacity(0.6))
-                .background(
-                    Capsule()
-                        .fill(.ultraThinMaterial)
-                )
-                .clipShape(Capsule())
-        )
-        .overlay(
-            Capsule()
-                .stroke(Color.white.opacity(0.15), lineWidth: 0.5)
-        )
+        .timelineGlassSurface(.banner, cornerRadius: 18 * scale)
     }
 }
 
@@ -1685,7 +1664,7 @@ class DoubleBufferedVideoView: NSView {
         #if DEBUG
         return true
         #else
-        return (UserDefaults(suiteName: "io.retrace.app") ?? .standard)
+        return (UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard)
             .bool(forKey: "retrace.debug.filteredSeekDiagnostics")
         #endif
     }()
@@ -1982,8 +1961,6 @@ class DoubleBufferedVideoView: NSView {
         isPlayerAActive = true
         playerViewA?.isHidden = false
         playerViewB?.isHidden = true
-
-        Log.debug("[VideoView] Released decoder resources (\(reason))", category: .ui)
     }
 
     private func release(player: AVPlayer?, playerView: AVPlayerView?) {
@@ -2008,7 +1985,7 @@ class DoubleBufferedVideoView: NSView {
     }
 
     private func configuredSeekToleranceFrames() -> Int {
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
         if let value = defaults.object(forKey: "retrace.debug.timelineSeekToleranceFrames") as? NSNumber {
             return max(0, value.intValue)
         }
@@ -2167,7 +2144,8 @@ struct FrameWithURLOverlay<Content: View>: View {
                             rect: rect,
                             tooltipState: SimpleTimelineViewModel.phraseLevelRedactionTooltipState(
                                 for: viewModel.currentTimelineFrame?.processingStatus ?? -1,
-                                isRevealed: viewModel.revealedRedactedNodePatches[node.id] != nil
+                                isRevealed: viewModel.revealedRedactedNodePatches[node.id] != nil,
+                            isPermanent: node.isPermanentlyRedacted
                             )
                         )
                     }
@@ -2188,7 +2166,8 @@ struct FrameWithURLOverlay<Content: View>: View {
                         rect: rect,
                         tooltipState: SimpleTimelineViewModel.phraseLevelRedactionTooltipState(
                             for: viewModel.currentTimelineFrame?.processingStatus ?? -1,
-                            isRevealed: viewModel.revealedRedactedNodePatches[node.id] != nil
+                            isRevealed: viewModel.revealedRedactedNodePatches[node.id] != nil,
+                            isPermanent: node.isPermanentlyRedacted
                         )
                     )
                 }
@@ -2349,11 +2328,8 @@ struct FrameWithURLOverlay<Content: View>: View {
                         viewModel: viewModel,
                         entries: redactionContextMenuEntries,
                         containerSize: geometry.size,
-                        onReveal: { node in
+                        onToggleReveal: { node in
                             viewModel.togglePhraseLevelRedactionReveal(for: node)
-                        },
-                        onCopyText: { node in
-                            viewModel.copyPhraseLevelRedactionText(for: node)
                         }
                     )
                 }
@@ -2811,7 +2787,7 @@ struct FrameZoomIndicator: View {
         HStack(spacing: .spacingS) {
             Image(systemName: zoomScale > 1.0 ? "plus.magnifyingglass" : "minus.magnifyingglass")
                 .font(.retraceCaption)
-            Text("\(Int(zoomScale * 100))%")
+            Text(TimelineZoomSettings.percentLabel(forScale: zoomScale))
                 .font(.retraceCaption.monospacedDigit())
         }
         .foregroundColor(.white)
@@ -2828,8 +2804,11 @@ struct FrameZoomIndicator: View {
 private struct DemystifiedRevealPatchView: View {
     let patch: NSImage
     let size: CGSize
+    let isVisible: Bool
 
     @State private var revealProgress: CGFloat = 0
+
+    private static let revealAnimation = Animation.spring(response: 0.46, dampingFraction: 0.84)
 
     var body: some View {
         ZStack {
@@ -2860,9 +2839,14 @@ private struct DemystifiedRevealPatchView: View {
         .compositingGroup()
         .clipShape(RoundedRectangle(cornerRadius: 4))
         .onAppear {
-            revealProgress = 0
-            withAnimation(.spring(response: 0.46, dampingFraction: 0.84)) {
-                revealProgress = 1
+            revealProgress = isVisible ? 0 : 1
+            withAnimation(Self.revealAnimation) {
+                revealProgress = isVisible ? 1 : 0
+            }
+        }
+        .onChange(of: isVisible) { visible in
+            withAnimation(Self.revealAnimation) {
+                revealProgress = visible ? 1 : 0
             }
         }
     }
@@ -2887,11 +2871,14 @@ struct RedactedNodeRevealOverlay: View {
                         for: processingStatus,
                         isTooltipActive: isTooltipActive
                     )
+                    let patch = viewModel.revealedRedactedNodePatches[node.id]
+                        ?? viewModel.hidingRedactedNodePatches[node.id]
                     ZStack {
-                        if let patch = viewModel.revealedRedactedNodePatches[node.id] {
+                        if let patch {
                             DemystifiedRevealPatchView(
                                 patch: patch,
-                                size: CGSize(width: rect.width, height: rect.height)
+                                size: CGSize(width: rect.width, height: rect.height),
+                                isVisible: viewModel.revealedRedactedNodePatches[node.id] != nil
                             )
                                 .frame(width: rect.width, height: rect.height)
                         }
@@ -2955,12 +2942,15 @@ struct ZoomedRedactedNodeRevealOverlay: View {
                         for: processingStatus,
                         isTooltipActive: isTooltipActive
                     )
+                    let patch = viewModel.revealedRedactedNodePatches[node.id]
+                        ?? viewModel.hidingRedactedNodePatches[node.id]
 
                     ZStack {
-                        if let patch = viewModel.revealedRedactedNodePatches[node.id] {
+                        if let patch {
                             DemystifiedRevealPatchView(
                                 patch: patch,
-                                size: CGSize(width: rect.width, height: rect.height)
+                                size: CGSize(width: rect.width, height: rect.height),
+                                isVisible: viewModel.revealedRedactedNodePatches[node.id] != nil
                             )
                                 .frame(width: rect.width, height: rect.height)
                         }
@@ -3032,8 +3022,7 @@ struct RedactionTooltipOverlay: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel
     let entries: [RedactedNodeContextMenuEntry]
     let containerSize: CGSize
-    let onReveal: (OCRNodeWithText) -> Void
-    let onCopyText: (OCRNodeWithText) -> Void
+    let onToggleReveal: (OCRNodeWithText) -> Void
     @State private var escapeMonitor: Any?
     @State private var hoveredNodeID: Int?
 
@@ -3127,12 +3116,10 @@ struct RedactionTooltipOverlay: View {
         state: SimpleTimelineViewModel.PhraseLevelRedactionTooltipState
     ) {
         switch state {
-        case .queued:
+        case .queued, .permanent:
             break
-        case .reveal:
-            onReveal(node)
-        case .copyText:
-            onCopyText(node)
+        case .reveal, .hide:
+            onToggleReveal(node)
         }
     }
 
@@ -3569,8 +3556,6 @@ struct ZoomUnifiedOverlay<Content: View>: View {
         // For enter transition, we animate from 0 to 1
         // For final state, progress is 1.0
         let progress: CGFloat = (isTransitioning || isExitTransitioning) ? animationProgress : 1.0
-
-        let _ = Log.debug("[ZoomDismiss] ZoomUnifiedOverlay rendered - isTransitioning: \(isTransitioning), isExitTransitioning: \(isExitTransitioning), progress: \(progress)", category: .ui)
 
         // Convert zoomRegion from actualFrameRect-normalized coords to screen coords
         // The normalized Y from screenToNormalizedCoords is already in "top-down" space (0=top, 1=bottom)
@@ -4206,7 +4191,6 @@ struct ZoomedTextSelectionNSView: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: ZoomedSelectionView, context: Context) {
-        Log.debug("[ZoomedTextSelectionNSView] updateNSView called, selectionStart=\(viewModel.selectionStart != nil)", category: .ui)
         nsView.zoomRegion = zoomRegion
         nsView.enlargedSize = enlargedSize
 
@@ -5527,11 +5511,6 @@ struct DeleteConfirmationDialog: View {
                     Text("Choose to delete this frame or the entire segment.")
                         .font(.retraceCallout)
                         .foregroundColor(.white.opacity(0.6))
-
-                    Text("Note: Removes from database only. Video files remain on disk.")
-                        .font(.retraceCaption2)
-                        .foregroundColor(.white.opacity(0.4))
-                        .italic()
                 }
                 .multilineTextAlignment(.center)
 
@@ -5606,15 +5585,7 @@ struct DeleteConfirmationDialog: View {
                 .padding(.top, 8)
             }
             .padding(32)
-            .background(
-                RoundedRectangle(cornerRadius: 16)
-                    .fill(Color(white: 0.15))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 16)
-                            .stroke(Color.white.opacity(0.1), lineWidth: 1)
-                    )
-            )
-            .shadow(color: .black.opacity(0.5), radius: 30, y: 10)
+            .retraceMattePanel(addPadding: false, cornerRadius: 16)
         }
         .transition(.opacity.combined(with: .scale(scale: 0.95)))
         .animation(.spring(response: 0.3, dampingFraction: 0.8), value: true)
@@ -5690,7 +5661,12 @@ struct SearchHighlightOverlay: View {
     private var highlightLayer: some View {
         Group {
             if highlightedRects.isEmpty {
-                Color.clear
+                if viewModel.isSearchResultNavigationModeActive,
+                   viewModel.searchHighlightMode == .matchedNodes {
+                    Color.black.opacity(0.25)
+                } else {
+                    Color.clear
+                }
             } else {
                 ZStack {
                     // Dark overlay
@@ -5785,9 +5761,8 @@ struct SearchHighlightOverlay: View {
     static func shouldDismissTooltip(
         for location: CGPoint,
         highlightedRects: [CGRect],
-        tooltipFrame: CGRect?
+        tooltipFrame _: CGRect?
     ) -> Bool {
-        _ = tooltipFrame
         return !highlightedRects.contains(where: { $0.contains(location) })
     }
 
@@ -6168,7 +6143,7 @@ struct DebugFrameIDBadge: View {
 
     private var renderedMediaText: String {
         if viewModel.currentFrameStillDisplayMode == .waitingFallback {
-            return "decoded still (fallback)"
+            return viewModel.currentFrameStillUsesFreshCaptureSource ? "live still (fallback)" : "decoded still (fallback)"
         }
 
         if viewModel.isInLiveMode {
@@ -6177,7 +6152,7 @@ struct DebugFrameIDBadge: View {
 
         switch viewModel.currentFrameMediaDisplayMode {
         case .still:
-            return "decoded still"
+            return viewModel.currentFrameStillUsesFreshCaptureSource ? "live still" : "decoded still"
         case .decodedVideo:
             return "decoded video"
         case .noContent:
@@ -6187,7 +6162,7 @@ struct DebugFrameIDBadge: View {
 
     private var renderedMediaColor: Color {
         if viewModel.currentFrameStillDisplayMode == .waitingFallback {
-            return .orange.opacity(0.85)
+            return viewModel.currentFrameStillUsesFreshCaptureSource ? .blue.opacity(0.9) : .orange.opacity(0.85)
         }
 
         if viewModel.isInLiveMode {
@@ -6196,12 +6171,54 @@ struct DebugFrameIDBadge: View {
 
         switch viewModel.currentFrameMediaDisplayMode {
         case .still:
-            return .green.opacity(0.85)
+            return viewModel.currentFrameStillUsesFreshCaptureSource ? .blue.opacity(0.9) : .green.opacity(0.85)
         case .decodedVideo:
             return .cyan.opacity(0.9)
         case .noContent:
             return .white.opacity(0.5)
         }
+    }
+
+    private var videoReencodeText: String {
+        guard let videoInfo = viewModel.currentVideoInfo else {
+            return "n/a"
+        }
+
+        return videoInfo.isVideoReencoded ? "yes" : "no"
+    }
+
+    private var videoReencodeColor: Color {
+        guard let videoInfo = viewModel.currentVideoInfo else {
+            return .blue.opacity(0.8)
+        }
+
+        return videoInfo.isVideoReencoded ? .green.opacity(0.85) : .white.opacity(0.75)
+    }
+
+    private var bitrateText: String {
+        guard let videoInfo = viewModel.currentVideoInfo,
+              let bitsPerSecond = videoInfo.averageBitrateBitsPerSecond,
+              bitsPerSecond.isFinite,
+              bitsPerSecond > 0 else {
+            return "--"
+        }
+
+        if bitsPerSecond >= 1_000_000 {
+            return String(format: "%.2f Mbps", bitsPerSecond / 1_000_000)
+        }
+
+        return String(format: "%.0f kbps", bitsPerSecond / 1_000)
+    }
+
+    private var kibPerFrameText: String {
+        guard let videoInfo = viewModel.currentVideoInfo,
+              let kibPerFrame = videoInfo.kibibytesPerFrame,
+              kibPerFrame.isFinite,
+              kibPerFrame > 0 else {
+            return "--"
+        }
+
+        return String(format: "%.1f", kibPerFrame)
     }
 
     var body: some View {
@@ -6234,11 +6251,23 @@ struct DebugFrameIDBadge: View {
                             .foregroundColor(.white.opacity(0.5))
                     }
 
+                    Text("Memory JPEG: \(viewModel.currentFrameHasInMemoryJPEGCache ? "yes" : "no")")
+                        .font(.retraceMonoSmall)
+                        .foregroundColor(viewModel.currentFrameHasInMemoryJPEGCache ? .green.opacity(0.85) : .white.opacity(0.7))
+
                     // Debug: Show video frame index being requested
                     if let videoInfo = viewModel.currentVideoInfo {
                         Text("VidIdx: \(videoInfo.frameIndex)")
                             .font(.retraceMonoSmall)
                             .foregroundColor(.orange.opacity(0.8))
+
+                        Text("Bitrate: \(bitrateText)")
+                            .font(.retraceMonoSmall)
+                            .foregroundColor(.white.opacity(0.85))
+
+                        Text("KiB/f: \(kibPerFrameText)")
+                            .font(.retraceMonoSmall)
+                            .foregroundColor(.white.opacity(0.78))
                     }
 
                     // Debug: Show processing status
@@ -6267,6 +6296,10 @@ struct DebugFrameIDBadge: View {
                             )
                     }
 
+                    Text("Re-encoded: \(videoReencodeText)")
+                        .font(.retraceMonoSmall)
+                        .foregroundColor(videoReencodeColor)
+
                     Text("Shown: \(renderedMediaText)")
                         .font(.retraceMonoSmall)
                         .foregroundColor(renderedMediaColor)
@@ -6274,13 +6307,10 @@ struct DebugFrameIDBadge: View {
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 6)
-            .background(
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(Color(white: 0.15).opacity(0.9))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(isHovering ? Color.white.opacity(0.3) : Color.white.opacity(0.15), lineWidth: 0.5)
+            .timelineGlassSurface(
+                .chip,
+                cornerRadius: 8,
+                borderColor: isHovering ? Color.white.opacity(0.3) : Color.white.opacity(0.15)
             )
         }
         .buttonStyle(.plain)
@@ -6396,15 +6426,7 @@ struct DebugBrowserURLWindow: View {
             .frame(maxHeight: 170)
         }
         .frame(width: 720, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 10)
-                .fill(Color(white: 0.1).opacity(0.95))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 10)
-                .stroke(Color.white.opacity(0.2), lineWidth: 0.8)
-        )
-        .shadow(color: .black.opacity(0.4), radius: 20, y: 8)
+        .retraceMattePanel(addPadding: false, cornerRadius: 10)
         .offset(
             x: panelPosition.width + dragOffset.width,
             y: panelPosition.height + dragOffset.height
@@ -6426,6 +6448,60 @@ struct DebugBrowserURLWindow: View {
         }
 
         return lines.joined(separator: "\n")
+    }
+}
+
+/// The action stays in place while its spinner and label communicate progress.
+struct FrameTextScanButton: View {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+
+    private var title: String {
+        switch viewModel.frameTextScanState {
+        case .idle: return "Scan Text"
+        case .scanning: return "Scanning Text…"
+        case .ready: return "Text Ready"
+        case .empty: return "No Text Found"
+        case .failed: return "Scan Failed · Retry"
+        case .protected: return "Protected Frame"
+        }
+    }
+
+    private var symbol: String {
+        switch viewModel.frameTextScanState {
+        case .ready: return "checkmark.circle"
+        case .failed: return "arrow.clockwise"
+        case .protected: return "lock"
+        default: return "text.viewfinder"
+        }
+    }
+
+    var body: some View {
+        Button { viewModel.scanCurrentFrameText() } label: {
+            HStack(spacing: 6) {
+                if viewModel.frameTextScanState == .scanning {
+                    ProgressView().controlSize(.small)
+                        .frame(width: 16, height: 16)
+                } else {
+                    Image(systemName: symbol).frame(width: 16, height: 16)
+                }
+                Text(title)
+            }
+            .font(.system(size: 12, weight: .medium))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+            .background(
+                viewModel.frameTextScanState == .scanning ? Color.accentColor.opacity(0.25) : Color.black.opacity(0.65),
+                in: RoundedRectangle(cornerRadius: 8)
+            )
+            .foregroundStyle(.white)
+        }
+        .buttonStyle(.plain)
+        .disabled(!viewModel.canScanCurrentFrameText || viewModel.frameTextScanState == .scanning)
+        .help(viewModel.frameTextScanState == .protected
+              ? "Scanning is unavailable while privacy processing is pending or the frame contains redacted text."
+              : "Scan text in this frame (⌘⇧O). Text is available for this viewing session.")
+        .accessibilityLabel(title)
+        .accessibilityHint("Recognize text in the current frame. Command Shift O.")
     }
 }
 
@@ -6491,14 +6567,7 @@ struct OCRStatusIndicator: View {
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 6)
-            .background(
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(Color(white: 0.15).opacity(0.9))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(statusColor.opacity(0.4), lineWidth: 0.5)
-            )
+            .timelineGlassSurface(.chip, cornerRadius: 8, borderColor: statusColor.opacity(0.4))
             .transition(.opacity.combined(with: .scale(scale: 0.9)))
             .animation(.easeInOut(duration: 0.2), value: viewModel.ocrStatus)
         }
@@ -6515,7 +6584,7 @@ struct DeveloperActionsMenu: View {
     let onClose: () -> Void
     @State private var isHovering = false
     @State private var showReprocessFeedback = false
-    @AppStorage("showFrameIDs", store: timelineSettingsStore) private var showFrameIDs = SettingsDefaults.showFrameIDs
+    @AppStorage("showFrameIDs", store: timelineSettingsStore) private var showFrameCard = SettingsDefaults.showFrameIDs
 
     /// Whether the current frame can be reprocessed (only Retrace frames)
     private var canReprocess: Bool {
@@ -6530,8 +6599,8 @@ struct DeveloperActionsMenu: View {
                 }
             }) {
                 Label(
-                    showFrameIDs ? "Hide Frame ID" : "Show Frame ID",
-                    systemImage: "number.circle"
+                    showFrameCard ? "Hide Frame Card" : "Show Frame Card",
+                    systemImage: "info.square"
                 )
             }
 
@@ -6658,13 +6727,10 @@ struct DeveloperActionsMenu: View {
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 6)
-            .background(
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(Color(white: 0.15).opacity(0.9))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(isHovering ? Color.orange.opacity(0.5) : Color.white.opacity(0.15), lineWidth: 0.5)
+            .timelineGlassSurface(
+                .chip,
+                cornerRadius: 8,
+                borderColor: isHovering ? Color.orange.opacity(0.5) : Color.white.opacity(0.15)
             )
         }
         .menuStyle(.borderlessButton)
@@ -6708,11 +6774,10 @@ struct DeveloperActionsMenu: View {
 /// Guides the user to right-click anywhere on the frame to restore them.
 struct ControlsHiddenRestoreHintBanner: View {
     let onDismiss: () -> Void
-    @State private var isDismissHovering = false
     private var scale: CGFloat { TimelineScaleFactor.current }
 
     var body: some View {
-        HStack(spacing: 12 * scale) {
+        TimelineHintBanner(style: .capsule, scale: scale, onDismiss: onDismiss) {
             Image(systemName: "menubar.arrow.down.rectangle")
                 .font(.system(size: 16 * scale, weight: .medium))
                 .foregroundColor(.white.opacity(0.9))
@@ -6730,38 +6795,40 @@ struct ControlsHiddenRestoreHintBanner: View {
             Text("on screen to bring them back")
                 .font(.system(size: 14 * scale, weight: .medium))
                 .foregroundColor(.white.opacity(0.76))
-
-            Button(action: onDismiss) {
-                Image(systemName: "xmark")
-                    .font(.system(size: 11 * scale, weight: .bold))
-                    .foregroundColor(.white.opacity(isDismissHovering ? 0.88 : 0.66))
-                    .frame(width: 22 * scale, height: 22 * scale)
-                    .background(
-                        Circle()
-                            .fill(Color.white.opacity(isDismissHovering ? 0.16 : 0.1))
-                    )
-            }
-            .buttonStyle(.plain)
-            .onHover { hovering in
-                isDismissHovering = hovering
-                if hovering {
-                    NSCursor.pointingHand.push()
-                } else {
-                    NSCursor.pop()
-                }
-            }
         }
-        .padding(.horizontal, 18 * scale)
-        .padding(.vertical, 10 * scale)
-        .background(
-            Capsule()
-                .fill(Color.black.opacity(0.72))
-                .overlay(
-                    Capsule()
-                        .stroke(Color.white.opacity(0.14), lineWidth: 1)
-                )
-        )
-        .shadow(color: .black.opacity(0.28), radius: 16, y: 6)
+    }
+}
+
+/// Banner displayed after hidden-state cache expiry snaps the timeline to the newest frame.
+/// Reminds the user that Cmd+Z restores the previous playhead position.
+struct PositionRecoveryHintBanner: View {
+    let onDismiss: () -> Void
+    private var scale: CGFloat { TimelineScaleFactor.current }
+
+    var body: some View {
+        TimelineHintBanner(style: .capsule, scale: scale, onDismiss: onDismiss) {
+            Image(systemName: "arrow.uturn.backward.circle.fill")
+                .font(.system(size: 16 * scale, weight: .medium))
+                .foregroundColor(.white.opacity(0.9))
+
+            Text("Lost your place?")
+                .font(.system(size: 15 * scale, weight: .medium))
+                .foregroundColor(.white.opacity(0.92))
+
+            Rectangle()
+                .fill(Color.white.opacity(0.28))
+                .frame(width: 1, height: 16 * scale)
+
+            Text("Press")
+                .font(.system(size: 14 * scale, weight: .medium))
+                .foregroundColor(.white.opacity(0.76))
+
+            KeyboardBadge(symbol: "⌘ Z")
+
+            Text("to return to your previous position")
+                .font(.system(size: 14 * scale, weight: .medium))
+                .foregroundColor(.white.opacity(0.76))
+        }
     }
 }
 
@@ -6773,7 +6840,7 @@ struct TextSelectionHintBanner: View {
     let onDismiss: () -> Void
 
     var body: some View {
-        HStack(spacing: 12) {
+        TimelineHintBanner(style: .card, onDismiss: onDismiss) {
             // Info icon
             Image(systemName: "info.circle.fill")
                 .font(.retraceHeadline)
@@ -6807,29 +6874,107 @@ struct TextSelectionHintBanner: View {
                     .foregroundColor(.white.opacity(0.5))
                 KeyboardBadge(symbol: "⊹ Drag")
             }
-
-            // Dismiss button
-            Button(action: onDismiss) {
-                Image(systemName: "xmark")
-                    .font(.retraceCaption2Bold)
-                    .foregroundColor(.white.opacity(0.6))
-                    .frame(width: 24, height: 24)
-                    .background(Color.white.opacity(0.1))
-                    .clipShape(Circle())
-            }
-            .buttonStyle(.plain)
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
-        .background(
-            RoundedRectangle(cornerRadius: 10)
-                .fill(Color(white: 0.2).opacity(0.95))
-                .shadow(color: .black.opacity(0.3), radius: 10, y: 4)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 10)
-                .stroke(Color.white.opacity(0.15), lineWidth: 1)
-        )
+    }
+}
+
+private struct SearchResultNavigationToast: View {
+    let state: SearchViewModel.ResultNavigationState
+    let onNavigatePrevious: () -> Void
+    let onNavigateNext: () -> Void
+    private var scale: CGFloat { TimelineScaleFactor.current }
+
+    var body: some View {
+        VStack(alignment: .center, spacing: 10 * scale) {
+            HStack(spacing: 10 * scale) {
+                Image(systemName: "text.magnifyingglass")
+                    .font(.system(size: 16 * scale, weight: .medium))
+                    .foregroundColor(.white.opacity(0.9))
+
+                Text("\(state.currentPosition) of \(state.loadedCount)\(state.canLoadMore || state.isLoadingMore ? "+" : "")")
+                    .font(.system(size: 15 * scale, weight: .medium))
+                    .foregroundColor(.white.opacity(0.88))
+                    .monospacedDigit()
+            }
+
+            HStack(spacing: 10 * scale) {
+                SearchResultNavigationButton(
+                    systemImage: "chevron.left",
+                    isDisabled: !state.canNavigatePrevious,
+                    tooltipText: "⌘ ⇧ ←",
+                    scale: scale,
+                    action: onNavigatePrevious
+                )
+
+                SearchResultNavigationButton(
+                    systemImage: "chevron.right",
+                    isDisabled: !state.canNavigateNext && !state.canLoadMore,
+                    tooltipText: "⌘ ⇧ →",
+                    scale: scale,
+                    action: onNavigateNext
+                )
+            }
+
+            if state.isLoadingMore {
+                HStack(spacing: 6 * scale) {
+                    SpinnerView(size: 12 * scale, lineWidth: 1.8, color: .white.opacity(0.85))
+                    Text("Loading more")
+                        .font(.system(size: 14 * scale, weight: .medium))
+                        .foregroundColor(.white.opacity(0.76))
+                }
+            }
+        }
+        .padding(.horizontal, 16 * scale)
+        .padding(.vertical, 12 * scale)
+        .timelineGlassSurface(.banner, cornerRadius: 18 * scale)
+    }
+}
+
+private struct SearchResultNavigationButton: View {
+    let systemImage: String
+    let isDisabled: Bool
+    let tooltipText: String
+    var scale: CGFloat = 1
+    let action: () -> Void
+
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .font(.system(size: 12 * scale, weight: .semibold))
+                .foregroundColor(.white.opacity(isDisabled ? 0.38 : 0.88))
+                .frame(width: 34 * scale, height: 34 * scale)
+                .background(
+                    RoundedRectangle(cornerRadius: 10 * scale)
+                        .fill(buttonBackgroundColor)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10 * scale)
+                        .stroke(Color.white.opacity(isDisabled ? 0.08 : 0.16), lineWidth: 1)
+                )
+        }
+        .buttonStyle(.plain)
+        .disabled(isDisabled)
+        .instantTooltip(tooltipText, isVisible: $isHovering)
+        .onHover { hovering in
+            isHovering = !isDisabled && hovering
+        }
+        .onChange(of: isDisabled) { disabled in
+            if disabled {
+                isHovering = false
+            }
+        }
+        .onDisappear {
+            isHovering = false
+        }
+    }
+
+    private var buttonBackgroundColor: Color {
+        if isDisabled {
+            return Color.white.opacity(0.04)
+        }
+        return Color.white.opacity(isHovering ? 0.18 : 0.1)
     }
 }
 
@@ -6839,7 +6984,7 @@ struct SearchHighlightControlsHintBanner: View {
     let onDismiss: () -> Void
 
     var body: some View {
-        HStack(spacing: 12) {
+        TimelineHintBanner(style: .card, onDismiss: onDismiss) {
             Image(systemName: "lightbulb.fill")
                 .font(.retraceHeadline)
                 .foregroundColor(.white.opacity(0.9))
@@ -6857,28 +7002,27 @@ struct SearchHighlightControlsHintBanner: View {
             Text("to hide/show controls, or right-click.")
                 .font(.retraceCaption)
                 .foregroundColor(.white.opacity(0.7))
-
-            Button(action: onDismiss) {
-                Image(systemName: "xmark")
-                    .font(.retraceCaption2Bold)
-                    .foregroundColor(.white.opacity(0.6))
-                    .frame(width: 24, height: 24)
-                    .background(Color.white.opacity(0.1))
-                    .clipShape(Circle())
-            }
-            .buttonStyle(.plain)
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
-        .background(
-            RoundedRectangle(cornerRadius: 10)
-                .fill(Color(white: 0.2).opacity(0.95))
-                .shadow(color: .black.opacity(0.3), radius: 10, y: 4)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 10)
-                .stroke(Color.white.opacity(0.15), lineWidth: 1)
-        )
+    }
+}
+
+struct TimelineTapeRightClickHintBanner: View {
+    let onDismiss: () -> Void
+
+    var body: some View {
+        TimelineHintBanner(style: .card, onDismiss: onDismiss) {
+            Image(systemName: "lightbulb.fill")
+                .font(.retraceHeadline)
+                .foregroundColor(.white.opacity(0.9))
+
+            Text("Hint: You can also right-click the timeline tape to open the same tape menu!")
+                .font(.retraceCaptionMedium)
+                .foregroundColor(.white.opacity(0.9))
+
+            // Text("That works even if the hover bubble disappears while you scroll.")
+                .font(.retraceCaption)
+                .foregroundColor(.white.opacity(0.7))
+        }
     }
 }
 
@@ -6892,7 +7036,7 @@ struct ScrollOrientationHintBanner: View {
     @State private var isSwitchHovered = false
 
     var body: some View {
-        HStack(spacing: 12) {
+        TimelineHintBanner(style: .card, onDismiss: onDismiss) {
             // Direction icon
             Image(systemName: isHorizontal ? "arrow.up.arrow.down" : "arrow.left.arrow.right")
                 .font(.retraceHeadline)
@@ -6933,28 +7077,104 @@ struct ScrollOrientationHintBanner: View {
                 }
             }
 
-            // Dismiss button
-            Button(action: onDismiss) {
-                Image(systemName: "xmark")
-                    .font(.retraceCaption2Bold)
-                    .foregroundColor(.white.opacity(0.6))
-                    .frame(width: 24, height: 24)
-                    .background(Color.white.opacity(0.1))
-                    .clipShape(Circle())
-            }
-            .buttonStyle(.plain)
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
-        .background(
-            RoundedRectangle(cornerRadius: 10)
-                .fill(Color(white: 0.2).opacity(0.95))
-                .shadow(color: .black.opacity(0.3), radius: 10, y: 4)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 10)
-                .stroke(Color.white.opacity(0.15), lineWidth: 1)
-        )
+    }
+}
+
+private struct TimelineHintOverlayStack<Content: View>: View {
+    @ViewBuilder let content: () -> Content
+    private var scale: CGFloat { TimelineScaleFactor.current }
+
+    var body: some View {
+        VStack(spacing: 10 * scale) {
+            content()
+        }
+        .padding(.top, 60)
+        .padding(.horizontal, .spacingL)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    }
+}
+
+private enum TimelineHintBannerStyle {
+    case capsule
+    case card
+}
+
+private struct TimelineHintBanner<Content: View>: View {
+    let style: TimelineHintBannerStyle
+    var scale: CGFloat = 1
+    let onDismiss: (() -> Void)?
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        HStack(spacing: 12 * scale) {
+            content()
+
+            if let onDismiss {
+                TimelineHintDismissButton(scale: scale, onDismiss: onDismiss)
+            }
+        }
+        .padding(.horizontal, horizontalPadding)
+        .padding(.vertical, verticalPadding)
+        .timelineGlassSurface(.banner, cornerRadius: style.cornerRadius(scale: scale))
+    }
+
+    private var horizontalPadding: CGFloat {
+        switch style {
+        case .capsule:
+            18 * scale
+        case .card:
+            16
+        }
+    }
+
+    private var verticalPadding: CGFloat {
+        switch style {
+        case .capsule:
+            10 * scale
+        case .card:
+            10
+        }
+    }
+
+}
+
+private extension TimelineHintBannerStyle {
+    func cornerRadius(scale: CGFloat) -> CGFloat {
+        switch self {
+        case .capsule:
+            return 999
+        case .card:
+            return 10
+        }
+    }
+}
+
+private struct TimelineHintDismissButton: View {
+    var scale: CGFloat = 1
+    let onDismiss: () -> Void
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: onDismiss) {
+            Image(systemName: "xmark")
+                .font(.system(size: 11 * scale, weight: .bold))
+                .foregroundColor(.white.opacity(isHovering ? 0.88 : 0.66))
+                .frame(width: 24 * scale, height: 24 * scale)
+                .background(
+                    Circle()
+                        .fill(Color.white.opacity(isHovering ? 0.16 : 0.1))
+                )
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            isHovering = hovering
+            if hovering {
+                NSCursor.pointingHand.push()
+            } else {
+                NSCursor.pop()
+            }
+        }
     }
 }
 
@@ -6991,15 +7211,7 @@ private struct RedactionReasonBanner: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
         .frame(maxWidth: 680)
-        .background(
-            RoundedRectangle(cornerRadius: 10)
-                .fill(Color(white: 0.13).opacity(0.94))
-                .shadow(color: .black.opacity(0.3), radius: 10, y: 4)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 10)
-                .stroke(Color.orange.opacity(0.35), lineWidth: 1)
-        )
+        .timelineGlassSurface(.banner, cornerRadius: 10, borderColor: Color.orange.opacity(0.35))
         .allowsHitTesting(false)
         .help("Current frame is redacted")
     }
@@ -7171,6 +7383,10 @@ struct RightClickOverlay: ViewModifier {
     private func setupEventMonitor() {
         eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .rightMouseDown) { event in
             guard let window = event.window else { return event }
+
+            if FocusableTextInputSupport.shouldDeferRightClickToTextInput(window: window, event: event) {
+                return event
+            }
 
             // Get click location in window coordinates (origin at bottom-left of window)
             let windowLocation = event.locationInWindow
@@ -10332,7 +10548,7 @@ struct CommentMarkdownEditor: NSViewRepresentable {
     }
 }
 
-final class CommentMarkdownTextView: NSTextView {
+class CommentMarkdownTextView: NSTextView {
     var commandHandler: ((CommentEditorCommand) -> Void)?
     var submitHandler: (() -> Void)?
     var requestLinkHandler: (() -> Void)?
@@ -10358,6 +10574,18 @@ final class CommentMarkdownTextView: NSTextView {
         }
 
         switch key {
+        case "a":
+            selectAll(nil)
+            return true
+        case "c":
+            copy(nil)
+            return true
+        case "x":
+            cut(nil)
+            return true
+        case "v":
+            paste(nil)
+            return true
         case "b":
             commandHandler?(.bold)
             return true
@@ -10441,7 +10669,7 @@ struct TagSubmenuRow: View {
 
 /// Floating vertical card panel for timeline filtering
 /// Shared UserDefaults store for accessing settings
-private let filterPanelSettingsStore = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+private let filterPanelSettingsStore = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
 
 struct FilterPanel: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel
@@ -10578,6 +10806,21 @@ struct FilterPanel: View {
         return nil
     }
 
+    /// Submit button target for advanced-field keyboard traversal.
+    private var submitActionButtonFocus: ActionButtonFocus? {
+        if hasApplyButton { return .apply }
+        if hasClearButton { return .clear }
+        return nil
+    }
+
+    private var clearButtonTitle: String {
+        isClearHovered ? "Clear (⌘⌫)" : "Clear"
+    }
+
+    private var applyButtonTitle: String {
+        isApplyHovered ? "Apply Filters (⌘↩)" : "Apply Filters"
+    }
+
     private func commitAdvancedDraftInputs() {
         advancedFilterDraftState.commitDraftInputs()
         var pendingCriteria = viewModel.pendingFilterCriteria
@@ -10592,6 +10835,15 @@ struct FilterPanel: View {
         commitAdvancedDraftInputs()
         withAnimation(.easeOut(duration: 0.15)) {
             viewModel.applyFilters(dismissPanel: dismissPanel)
+        }
+    }
+
+    private func clearFiltersByResettingAdvancedDrafts() {
+        focusedActionButton = nil
+        advancedFilterDraftState.clearDraftInputs()
+        viewModel.clearPendingFilters()
+        withAnimation(.easeOut(duration: 0.15)) {
+            viewModel.applyFilters(dismissPanel: false)
         }
     }
 
@@ -10799,14 +11051,9 @@ struct FilterPanel: View {
                 // Clear button
                 if hasClearButton {
                     Button(action: {
-                        focusedActionButton = nil
-                        advancedFilterDraftState.clearDraftInputs()
-                        viewModel.clearPendingFilters()
-                        withAnimation(.easeOut(duration: 0.15)) {
-                            viewModel.applyFilters(dismissPanel: false)
-                        }
+                        clearFiltersByResettingAdvancedDrafts()
                     }) {
-                        Text("Clear")
+                        Text(clearButtonTitle)
                             .font(.system(size: 14, weight: .semibold))
                             .foregroundColor(.white.opacity(0.7))
                             .frame(maxWidth: .infinity)
@@ -10840,7 +11087,7 @@ struct FilterPanel: View {
                     Button(action: {
                         applyFiltersByCommittingAdvancedDrafts()
                     }) {
-                        Text("Apply Filters")
+                        Text(applyButtonTitle)
                             .font(.system(size: 14, weight: .semibold))
                             .foregroundColor(.white)
                             .frame(maxWidth: .infinity)
@@ -10880,15 +11127,11 @@ struct FilterPanel: View {
             .padding(.bottom, 14)
         }
         .frame(width: 360)
-        .background(
+        .retraceMattePanel(addPadding: false, cornerRadius: 16)
+        .overlay(
             RoundedRectangle(cornerRadius: 16)
-                .fill(Color(white: 0.12))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 16)
-                        .stroke(themeBorderColor, lineWidth: 1)
-                )
+                .stroke(themeBorderColor, lineWidth: 1)
         )
-        .shadow(color: .black.opacity(0.4), radius: 30, y: 15)
         .offset(
             x: panelPosition.width + dragOffset.width,
             y: panelPosition.height + dragOffset.height
@@ -10933,28 +11176,35 @@ struct FilterPanel: View {
 
                 // Cmd+Enter applies filters from anywhere in the filter panel.
                 if (event.keyCode == 36 || event.keyCode == 76) && modifiers == [.command] {
+                    viewModel.recordKeyboardShortcut("timeline.filter_panel.apply")
                     applyFiltersByCommittingAdvancedDrafts(dismissPanel: hasApplyButton)
                     return nil
                 }
 
-                // Handle Enter on Advanced highlight (expand and focus Window Name)
+                // Cmd+Backspace clears active filters without closing the panel.
+                if event.keyCode == 51 && modifiers == [.command] {
+                    guard hasClearButton else { return event }
+                    viewModel.recordKeyboardShortcut("timeline.filter_panel.clear")
+                    clearFiltersByResettingAdvancedDrafts()
+                    return nil
+                }
+
+                // Handle Enter on Advanced highlight (toggle while keeping header selected)
                 if (event.keyCode == 36 || event.keyCode == 76) &&
                     viewModel.activeFilterDropdown == .advanced &&
                     viewModel.advancedFocusedFieldIndex == 0 {
-                    // Enter on highlighted Advanced header → signal expand
-                    viewModel.advancedFocusedFieldIndex = -1  // Signal to expand
+                    // Enter on highlighted Advanced header toggles the section.
+                    // Tab then enters Window Name when the section is open,
+                    // preserving a predictable order:
+                    // header -> window -> browser -> submit.
+                    viewModel.advancedFocusedFieldIndex = -1
                     return nil
                 }
 
                 // Handle Enter while action buttons are keyboard-highlighted.
                 if (event.keyCode == 36 || event.keyCode == 76), let focusedButton = focusedActionButton {
                     if focusedButton == .clear {
-                        focusedActionButton = nil
-                        advancedFilterDraftState.clearDraftInputs()
-                        viewModel.clearPendingFilters()
-                        withAnimation(.easeOut(duration: 0.15)) {
-                            viewModel.applyFilters(dismissPanel: false)
-                        }
+                        clearFiltersByResettingAdvancedDrafts()
                     } else {
                         applyFiltersByCommittingAdvancedDrafts()
                     }
@@ -11061,17 +11311,19 @@ struct FilterPanel: View {
                 // Handle Tab while action buttons are focused
                 if let focusedButton = focusedActionButton {
                     if isShiftHeld {
+                        if viewModel.activeFilterDropdown == .advanced {
+                            // Reverse traversal inside Advanced is:
+                            // submit -> browser -> window -> header.
+                            focusedActionButton = nil
+                            viewModel.advancedFocusedFieldIndex = -2
+                            return nil
+                        }
                         if focusedButton == .apply && hasClearButton {
                             focusedActionButton = .clear
                             return nil
                         }
-                        // Shift+Tab from Clear (or Apply when Clear is hidden) -> Browser URL field
-                        // (Advanced section will focus Browser URL on this sentinel value).
+                        // Shift+Tab from Clear (or Apply when Clear is hidden) -> previous focus target.
                         focusedActionButton = nil
-                        if viewModel.activeFilterDropdown == .advanced {
-                            viewModel.advancedFocusedFieldIndex = -2
-                            return nil
-                        }
                     } else {
                         if focusedButton == .clear {
                             if hasApplyButton {
@@ -11102,30 +11354,29 @@ struct FilterPanel: View {
                 if viewModel.activeFilterDropdown == .advanced {
                     let fieldIndex = viewModel.advancedFocusedFieldIndex
                     if fieldIndex == 0 {
-                        // Advanced header is highlighted: Tab goes to action buttons first.
+                        // Advanced header is highlighted: Tab enters the first field.
                         if !isShiftHeld {
-                            viewModel.advancedFocusedFieldIndex = -4
-                            focusedActionButton = leadingActionButtonFocus
+                            focusedActionButton = nil
+                            viewModel.advancedFocusedFieldIndex = 1
                             return nil
                         }
                     } else if !isShiftHeld && fieldIndex == 1 {
-                        // Tab on Window Name → let SwiftUI move focus to Browser URL
-                        return event
+                        // Tab on Window Name -> explicitly focus Browser URL.
+                        viewModel.advancedFocusedFieldIndex = 2
+                        return nil
                     } else if !isShiftHeld && fieldIndex == 2 {
-                        // Tab on Browser URL -> action buttons first (Clear, then Apply).
+                        // Tab on Browser URL -> submit button.
                         viewModel.advancedFocusedFieldIndex = -4
-                        focusedActionButton = leadingActionButtonFocus
+                        focusedActionButton = submitActionButtonFocus
                         return nil
                     } else if isShiftHeld && fieldIndex == 2 {
                         // Shift+Tab on Browser URL -> explicitly focus Window Name.
                         viewModel.advancedFocusedFieldIndex = -3
                         return nil
                     } else if isShiftHeld && fieldIndex == 1 {
-                        // Shift+Tab on Window Name → cycle to Date Range
-                        let nextAnchorFrame = viewModel.filterAnchorFrames[.dateRange] ?? .zero
-                        withAnimation(.easeOut(duration: 0.15)) {
-                            viewModel.showFilterDropdown(.dateRange, anchorFrame: nextAnchorFrame)
-                        }
+                        // Shift+Tab on Window Name -> return to the Advanced header.
+                        focusedActionButton = nil
+                        viewModel.advancedFocusedFieldIndex = 0
                         return nil
                     }
                 }
@@ -11464,7 +11715,7 @@ struct AdvancedFiltersSection: View {
         case windowName
         case browserUrl
     }
-    @FocusState private var focusedField: AdvancedField?
+    @State private var focusedField: AdvancedField?
 
     /// Whether any advanced filter is active
     private var hasActiveAdvancedFilters: Bool {
@@ -11524,14 +11775,15 @@ struct AdvancedFiltersSection: View {
         VStack(alignment: .leading, spacing: 0) {
             // Toggle header
             Button(action: {
+                let willExpand = !isExpanded
                 withAnimation(.easeInOut(duration: 0.2)) {
-                    isExpanded.toggle()
+                    isExpanded = willExpand
                 }
-                if isExpanded {
-                    // Focus window name field when manually expanding
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                        focusedField = .windowName
-                    }
+                focusedField = nil
+                if willExpand {
+                    viewModel.advancedFocusedFieldIndex = 0
+                } else {
+                    viewModel.advancedFocusedFieldIndex = 0
                 }
             }) {
                 HStack {
@@ -11589,14 +11841,21 @@ struct AdvancedFiltersSection: View {
                             .foregroundColor(.white.opacity(0.6))
 
                         HStack(spacing: 10) {
-                            TextField("Search titles...", text: $draftState.windowInputText)
-                                .focused($focusedField, equals: .windowName)
-                                .textFieldStyle(.plain)
-                                .font(.system(size: 13))
-                                .foregroundColor(.white)
-                                .onSubmit {
+                            FocusableTextInput(
+                                text: $draftState.windowInputText,
+                                placeholder: "Search titles...",
+                                onSubmit: {
                                     draftState.commitWindowNameDraft()
+                                },
+                                isFocused: { focusedField == .windowName },
+                                setFocused: { isFocused in
+                                    if isFocused {
+                                        focusedField = .windowName
+                                    } else if focusedField == .windowName {
+                                        focusedField = nil
+                                    }
                                 }
+                            )
 
                             IncludeExcludeModeToggle(mode: $draftState.windowNameFilterMode)
                                 .frame(width: 138)
@@ -11647,14 +11906,21 @@ struct AdvancedFiltersSection: View {
                             .foregroundColor(.white.opacity(0.6))
 
                         HStack(spacing: 10) {
-                            TextField("Search URLs...", text: $draftState.browserInputText)
-                                .focused($focusedField, equals: .browserUrl)
-                                .textFieldStyle(.plain)
-                                .font(.system(size: 13))
-                                .foregroundColor(.white)
-                                .onSubmit {
+                            FocusableTextInput(
+                                text: $draftState.browserInputText,
+                                placeholder: "Search URLs...",
+                                onSubmit: {
                                     draftState.commitBrowserUrlDraft()
+                                },
+                                isFocused: { focusedField == .browserUrl },
+                                setFocused: { isFocused in
+                                    if isFocused {
+                                        focusedField = .browserUrl
+                                    } else if focusedField == .browserUrl {
+                                        focusedField = nil
+                                    }
                                 }
+                            )
 
                             IncludeExcludeModeToggle(mode: $draftState.browserUrlFilterMode)
                                 .frame(width: 138)
@@ -11744,12 +12010,15 @@ struct AdvancedFiltersSection: View {
             } else if newValue == 2 {
                 focusedField = .browserUrl
             } else if newValue == -1 && viewModel.activeFilterDropdown == .advanced {
-                // Enter was pressed on the Advanced header — expand and focus Window Name
+                // Enter on the Advanced header toggles the section while keeping
+                // keyboard focus on the header.
+                let willExpand = !isExpanded
                 withAnimation(.easeInOut(duration: 0.2)) {
-                    isExpanded = true
+                    isExpanded = willExpand
                 }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                    focusedField = .windowName
+                focusedField = nil
+                DispatchQueue.main.async {
+                    viewModel.advancedFocusedFieldIndex = 0
                 }
             } else if (newValue == 0 || newValue == -4) && viewModel.activeFilterDropdown == .advanced {
                 // Advanced header (0) or action-button sentinel (-4): clear text-field focus/caret.
@@ -12139,16 +12408,8 @@ struct FilterDropdownOverlay: View {
 
                         // Scroll events are handled at TimelineWindowController level
                         dropdownContent
-                            .background(
-                                RoundedRectangle(cornerRadius: 10)
-                                    .fill(Color(white: 0.12))
-                            )
+                            .retraceMattePanel(addPadding: false, cornerRadius: 10)
                             .clipShape(RoundedRectangle(cornerRadius: 10))
-                            .shadow(color: .black.opacity(0.5), radius: 15, y: 8)
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 10)
-                                    .stroke(Color.white.opacity(0.15), lineWidth: 1)
-                            )
                             .fixedSize()
                             .background(
                                 GeometryReader { geo in
@@ -12274,6 +12535,8 @@ struct FilterDropdownOverlay: View {
                 selectedApps: viewModel.pendingFilterCriteria.selectedApps,
                 filterMode: viewModel.pendingFilterCriteria.appFilterMode,
                 allowMultiSelect: true,
+                isLoading: viewModel.isLoadingAppsForFilter,
+                isLoadingOtherApps: viewModel.isRefreshingRewindAppsForFilter,
                 onSelectApp: { bundleID in
                     if let bundleID = bundleID {
                         viewModel.toggleAppFilter(bundleID)
@@ -12359,6 +12622,9 @@ struct FilterDropdownOverlay: View {
                 },
                 onQuickPresetShortcut: { preset in
                     viewModel.recordKeyboardShortcut("timeline.date_range.\(preset.rawValue)")
+                },
+                onClearShortcut: {
+                    viewModel.recordKeyboardShortcut("timeline.date_range.clear")
                 },
                 onDismiss: {
                     withAnimation(.easeOut(duration: 0.15)) {

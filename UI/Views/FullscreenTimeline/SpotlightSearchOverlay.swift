@@ -5,6 +5,20 @@ import AppKit
 
 private let searchLog = "[SpotlightSearch]"
 
+fileprivate enum SearchFieldSelectionBehavior: Equatable {
+    case caretAtEnd
+    case selectAll
+}
+
+fileprivate struct SearchFieldRefocusRequest: Equatable {
+    var id: UUID
+    var selectionBehavior: SearchFieldSelectionBehavior
+
+    static var initial: Self {
+        .init(id: UUID(), selectionBehavior: .caretAtEnd)
+    }
+}
+
 private enum SpotlightSearchLayoutMetrics {
     static let searchFieldHeight: CGFloat = 30
     static let searchControlButtonSize: CGFloat = 24
@@ -39,7 +53,7 @@ public struct SpotlightSearchOverlay: View {
     @State private var isVisible = false
     @State private var resultsHeight: CGFloat = 0  // Reserved results viewport height to avoid collapse during reloads
     @State private var isExpanded = false  // Whether to show filters and results (expanded view)
-    @State private var refocusSearchField: UUID = UUID()  // Trigger to refocus search field
+    @State private var refocusSearchField = SearchFieldRefocusRequest.initial
     @State private var keyboardSelectedResultIndex: Int?
     @State private var isResultKeyboardNavigationActive = false
     @State private var shouldFocusFirstResultAfterSubmit = false
@@ -124,9 +138,7 @@ public struct SpotlightSearchOverlay: View {
                 Color.black.opacity(isVisible ? 0.6 : 0)
                     .ignoresSafeArea()
                     .onTapGesture {
-                        if viewModel.isDropdownOpen {
-                            viewModel.closeDropdownsSignal += 1
-                        } else {
+                        if !viewModel.isDropdownOpen {
                             // Outside click should dismiss with animation but preserve search state.
                             dismissOverlayPreservingSearch()
                         }
@@ -161,27 +173,19 @@ public struct SpotlightSearchOverlay: View {
                                 resultsArea
                                     .contentShape(Rectangle())
                                     .onTapGesture {
-                                        // Dismiss dropdown when tapping on results area
-                                        if viewModel.isDropdownOpen {
-                                            viewModel.closeDropdownsSignal += 1
-                                        }
+                                        guard !viewModel.isDropdownOpen else { return }
                                     }
                             }
                         }
                     }
                 }
                 .frame(width: isExpanded ? panelWidth : collapsedWidth)
-                .background(
-                    RoundedRectangle(cornerRadius: 12)
-                        .fill(Color.black.opacity(0.4))
-                        .background(.ultraThinMaterial)
-                )
+                .timelineGlassSurface(.panel, cornerRadius: 12)
                 .clipShape(RoundedRectangle(cornerRadius: 12))
                 .overlay(
                     RoundedRectangle(cornerRadius: 12)
                         .stroke(Color.white.opacity(isExpanded ? 0 : 0.15), lineWidth: 1)
                 )
-                .shadow(color: Color.black.opacity(0.5), radius: 20, y: 10)
                 .overlay(alignment: .top) {
                     recentEntriesPopover
                         .offset(y: isRecentEntriesPopoverVisible ? 58 : 50)
@@ -292,11 +296,12 @@ public struct SpotlightSearchOverlay: View {
                 if let results = viewModel.results {
                     Log.info("\(searchLog) Results received: \(results.results.count) results, nextPage=\(results.nextCursor != nil), searchTime=\(results.searchTimeMs)ms", category: .ui)
                 }
-                if shouldFocusFirstResultAfterSubmit {
-                    focusFirstResultIfAvailable()
-                }
+                updateSubmittedSearchResultFocus()
             }
             refreshRecentEntriesPopoverVisibility()
+        }
+        .onChange(of: viewModel.results != nil) { _ in
+            updateSubmittedSearchResultFocus()
         }
         .onChange(of: viewModel.visibleResults.count) { _ in
             Log.info(
@@ -306,6 +311,7 @@ public struct SpotlightSearchOverlay: View {
             if !viewModel.visibleResults.isEmpty {
                 reserveExpandedResultsHeight()
             }
+            updateSubmittedSearchResultFocus()
             syncKeyboardSelectionWithCurrentResults()
             scheduleAppIconPrefetch(for: viewModel.visibleResults)
         }
@@ -321,13 +327,13 @@ public struct SpotlightSearchOverlay: View {
         .onChange(of: viewModel.openFilterSignal.id) { _ in
             // When Tab cycles back to search field (index 0), trigger refocus
             if viewModel.openFilterSignal.index == 0 {
-                refocusSearchField = UUID()
+                requestSearchFieldRefocus()
             }
         }
         .onChange(of: viewModel.isDropdownOpen) { isOpen in
             // When a dropdown closes (Escape or Enter selection), refocus the search field
             if !isOpen {
-                refocusSearchField = UUID()
+                requestSearchFieldRefocus()
             }
             if isOpen {
                 isRecentEntriesPopoverVisible = false
@@ -341,8 +347,8 @@ public struct SpotlightSearchOverlay: View {
         .onChange(of: viewModel.collapseOverlaySignal) { _ in
             collapseToCompactSearchBar(clearFilters: false)
         }
-        .onChange(of: viewModel.focusSearchFieldSignal) { _ in
-            focusSearchFieldFromEscape()
+        .onChange(of: viewModel.focusSearchFieldSignal.id) { _ in
+            focusSearchField(selectAll: viewModel.focusSearchFieldSignal.selectAll)
         }
         .onChange(of: viewModel.dismissRecentEntriesPopoverSignal) { _ in
             dismissRecentEntriesPopoverByUser()
@@ -384,19 +390,7 @@ public struct SpotlightSearchOverlay: View {
 
                 SpotlightSearchField(
                     text: $viewModel.searchQuery,
-                    onSubmit: {
-                        if isRecentEntriesPopoverVisible {
-                            selectHighlightedRecentEntry()
-                            return
-                        }
-                        if !viewModel.searchQuery.isEmpty {
-                            withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                                isExpanded = true
-                            }
-                            prepareResultKeyboardNavigationAfterSubmit()
-                            viewModel.submitSearch()
-                        }
-                    },
+                    onSubmit: handleSearchFieldSubmit,
                     onEscape: {
                         handleSearchEscape()
                     },
@@ -418,7 +412,6 @@ public struct SpotlightSearchOverlay: View {
                         viewModel.openFilterSignal = (7, UUID())
                     },
                     onFocus: {
-                        Log.info("\(searchLog)[\(overlaySessionID)] search field focused", category: .ui)
                         isSearchFieldFocused = true
                         viewModel.isSearchFieldFocused = true
                         clearResultKeyboardNavigation()
@@ -443,14 +436,14 @@ public struct SpotlightSearchOverlay: View {
                         highlightedRecentEntryIndex = max(highlightedRecentEntryIndex - 1, 0)
                         return true
                     },
-                    refocusTrigger: refocusSearchField
+                    refocusRequest: refocusSearchField
                 )
                 .frame(height: SpotlightSearchLayoutMetrics.searchFieldHeight)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(Rectangle())
             .onTapGesture {
-                refocusSearchField = UUID()
+                requestSearchFieldRefocus()
             }
 
             // Loading spinner (shown while searching)
@@ -541,6 +534,33 @@ public struct SpotlightSearchOverlay: View {
         .animation(.easeOut(duration: 0.18), value: isSpotlightSearchGlowActive)
     }
 
+    static func shouldSelectHighlightedRecentEntry(
+        isRecentEntriesPopoverVisible: Bool,
+        forceRawQuerySubmit: Bool
+    ) -> Bool {
+        isRecentEntriesPopoverVisible && !forceRawQuerySubmit
+    }
+
+    private func handleSearchFieldSubmit(forceRawQuerySubmit: Bool) {
+        if Self.shouldSelectHighlightedRecentEntry(
+            isRecentEntriesPopoverVisible: isRecentEntriesPopoverVisible,
+            forceRawQuerySubmit: forceRawQuerySubmit
+        ) {
+            selectHighlightedRecentEntry()
+            return
+        }
+
+        guard !viewModel.searchQuery.isEmpty else { return }
+        if forceRawQuerySubmit {
+            DashboardViewModel.recordKeyboardShortcut(coordinator: coordinator, shortcut: "cmd+enter")
+        }
+        withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+            isExpanded = true
+        }
+        prepareResultKeyboardNavigationAfterSubmit()
+        viewModel.submitSearch(trigger: forceRawQuerySubmit ? "command-submit" : "submit")
+    }
+
     // MARK: - Recent Entries
 
     private func refreshRankedRecentEntries() {
@@ -624,7 +644,6 @@ public struct SpotlightSearchOverlay: View {
             highlightedRecentEntryIndex = 0
             hoveredRecentEntryKey = nil
         }
-        logRecentEntriesState(context: "refreshRecentEntriesPopoverVisibility")
     }
 
     private func scheduleRecentEntriesMetadataWarmupIfNeeded() {
@@ -811,17 +830,8 @@ public struct SpotlightSearchOverlay: View {
             .padding(.bottom, 10)
         }
         .frame(width: collapsedWidth - 8, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 12)
-                .fill(Color.black.opacity(0.4))
-                .background(.ultraThinMaterial)
-        )
+        .timelineGlassSurface(.panel, cornerRadius: 12)
         .clipShape(RoundedRectangle(cornerRadius: 12))
-        .overlay(
-            RoundedRectangle(cornerRadius: 12)
-                .stroke(Color.white.opacity(0.15), lineWidth: 1)
-        )
-        .shadow(color: Color.black.opacity(0.5), radius: 20, y: 10)
     }
 
     private func recentEntryRelativeTimeText(for entry: SearchViewModel.RecentSearchEntry) -> String {
@@ -1155,9 +1165,10 @@ public struct SpotlightSearchOverlay: View {
                             },
                             viewModel: viewModel
                         )
-                        .onAppear {
+                        .task(id: viewModel.searchGeneration) {
                             loadThumbnail(for: result)
-
+                        }
+                        .onAppear {
                             // Infinite scroll: load more when near the end
                             if index >= visibleResults.count - 3 && viewModel.canLoadMore {
                                 viewModel.loadMore()
@@ -1305,15 +1316,16 @@ public struct SpotlightSearchOverlay: View {
     // MARK: - Thumbnail Loading
 
     private func thumbnailKey(for result: SearchResult) -> String {
-        // Use committedSearchQuery (set on Enter) instead of live searchQuery
-        // This prevents thumbnails from reloading while user is typing
-        "\(result.segmentID.stringValue)_\(result.timestamp.timeIntervalSince1970)_\(viewModel.committedSearchQuery)"
+        let highlight = result.highlightNode.map { CGRect(x: $0.x, y: $0.y, width: $0.width, height: $0.height) }
+        return PreviewThumbnailIdentity.key(
+            source: result.source.rawValue, frameID: result.id.value, videoID: result.videoID.value,
+            frameIndex: result.frameIndex, timestamp: result.timestamp.timeIntervalSince1970, size: thumbnailSize, highlight: highlight,
+            revision: viewModel.thumbnailContentRevision
+        )
     }
 
     private func loadThumbnail(for result: SearchResult) {
         let key = thumbnailKey(for: result)
-        // Use committedSearchQuery for highlighting (the query that was actually searched)
-        let searchQuery = viewModel.committedSearchQuery
         let currentGeneration = viewModel.searchGeneration
 
         if viewModel.thumbnailCache[key] != nil {
@@ -1333,6 +1345,7 @@ public struct SpotlightSearchOverlay: View {
                 return
             }
 
+            guard viewModel.searchGeneration == currentGeneration else { return }
             do {
                 // 1. Fetch frame image (prefer direct path to avoid per-thumbnail DB lookups and JPEG round-trips)
                 let fullImage: NSImage
@@ -1378,31 +1391,7 @@ public struct SpotlightSearchOverlay: View {
                         size: thumbnailSize
                     )
                 } else {
-                    // 2. Get OCR nodes for this frame (use frameID for exact match)
-                    let ocrNodes = try await coordinator.getAllOCRNodes(
-                        frameID: result.frameID,
-                        source: result.source
-                    )
-
-                    // Check if search generation changed again
-                    guard viewModel.searchGeneration == currentGeneration else {
-                        viewModel.failThumbnailLoad(with: nil, for: key, generation: currentGeneration)
-                        return
-                    }
-
-                    // 3. Find the matching OCR node for the search query
-                    let matchingNode = findMatchingOCRNode(query: searchQuery, nodes: ocrNodes)
-
-                    // 4. Create the highlighted thumbnail
-                    if let matchNode = matchingNode {
-                        thumbnail = createHighlightedThumbnail(
-                            from: fullImage,
-                            matchingNode: matchNode,
-                            size: thumbnailSize
-                        )
-                    } else {
-                        thumbnail = createThumbnail(from: fullImage, size: thumbnailSize)
-                    }
+                    thumbnail = createThumbnail(from: fullImage, size: thumbnailSize)
                 }
 
                 viewModel.finishThumbnailLoad(
@@ -1460,75 +1449,6 @@ public struct SpotlightSearchOverlay: View {
 
         thumbnail.unlockFocus()
         return thumbnail
-    }
-
-    /// Find the OCR node that best matches the search query
-    /// Handles both exact phrase matching (quoted queries) and individual term matching
-    private func findMatchingOCRNode(query: String, nodes: [OCRNodeWithText]) -> OCRNodeWithText? {
-        let trimmedQuery = query.trimmingCharacters(in: .whitespaces)
-
-        // Check if this is an exact phrase search (wrapped in quotes)
-        let isExactPhraseSearch = trimmedQuery.hasPrefix("\"") && trimmedQuery.hasSuffix("\"") && trimmedQuery.count > 2
-
-        if isExactPhraseSearch {
-            // Extract phrase without quotes and search for exact consecutive match
-            let phrase = String(trimmedQuery.dropFirst().dropLast()).lowercased()
-
-            // Only match if the exact phrase appears in the node
-            for node in nodes {
-                if node.text.lowercased().contains(phrase) {
-                    return node
-                }
-            }
-
-            // No fallback for exact phrase search - return nil if not found
-            return nil
-        }
-
-        // Non-quoted search: split into terms and search for any term
-        let queryTerms = trimmedQuery.lowercased()
-            .components(separatedBy: .whitespaces)
-            .filter { !$0.isEmpty }
-
-        // First pass: find node containing any query term as exact word
-        for node in nodes {
-            let nodeText = node.text.lowercased()
-            for term in queryTerms {
-                let pattern = "\\b\(NSRegularExpression.escapedPattern(for: term))\\b"
-                if let regex = try? NSRegularExpression(pattern: pattern, options: []),
-                   regex.firstMatch(in: nodeText, options: [], range: NSRange(nodeText.startIndex..., in: nodeText)) != nil {
-                    return node
-                }
-            }
-        }
-
-        // Second pass: find any substring match as fallback
-        for node in nodes {
-            let nodeText = node.text.lowercased()
-            for term in queryTerms {
-                if nodeText.contains(term) {
-                    return node
-                }
-            }
-        }
-
-        return nil
-    }
-
-    /// Create a thumbnail cropped around the matching OCR node with a yellow highlight
-    private func createHighlightedThumbnail(
-        from image: NSImage,
-        matchingNode: OCRNodeWithText,
-        size: CGSize
-    ) -> NSImage {
-        createHighlightedThumbnail(
-            from: image,
-            matchX: matchingNode.x,
-            matchY: matchingNode.y,
-            matchWidth: matchingNode.width,
-            matchHeight: matchingNode.height,
-            size: size
-        )
     }
 
     private func createHighlightedThumbnail(
@@ -1713,7 +1633,8 @@ public struct SpotlightSearchOverlay: View {
     // MARK: - Actions
 
     private func selectResult(_ result: SearchResult) {
-        let query = viewModel.searchQuery
+        viewModel.selectResult(result)
+        let query = viewModel.committedSearchQuery.isEmpty ? viewModel.searchQuery : viewModel.committedSearchQuery
         let df = DateFormatter()
         df.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
         df.timeZone = .current
@@ -1755,7 +1676,7 @@ public struct SpotlightSearchOverlay: View {
             isExpanded = false
         }
 
-        refocusSearchField = UUID()
+        requestSearchFieldRefocus()
         refreshRecentEntriesPopoverVisibility()
     }
 
@@ -1775,6 +1696,12 @@ public struct SpotlightSearchOverlay: View {
             return
         }
 
+        // When results own keyboard focus, Escape should return to the query first.
+        if viewModel.shouldRefocusSearchFieldOnEscape {
+            focusSearchField(selectAll: true)
+            return
+        }
+
         // Expanded overlay with no submitted search should collapse back to compact mode.
         if isExpanded && !viewModel.shouldDismissExpandedOverlayOnEscape {
             collapseToCompactSearchBar(clearFilters: true)
@@ -1784,11 +1711,33 @@ public struct SpotlightSearchOverlay: View {
         dismissOverlay()
     }
 
-    private func focusSearchFieldFromEscape() {
+    private func handleSearchCommandK() {
+        if viewModel.isDropdownOpen {
+            viewModel.closeDropdownsSignal += 1
+            return
+        }
+
+        if viewModel.shouldRefocusSearchFieldOnEscape {
+            focusSearchField(selectAll: true)
+            return
+        }
+
+        // Cmd+K closes the visible overlay but preserves the current search state.
+        dismissOverlayPreservingSearch()
+    }
+
+    private func requestSearchFieldRefocus(selectAll: Bool = false) {
+        refocusSearchField = SearchFieldRefocusRequest(
+            id: UUID(),
+            selectionBehavior: selectAll ? .selectAll : .caretAtEnd
+        )
+    }
+
+    private func focusSearchField(selectAll: Bool) {
         clearResultKeyboardNavigation()
         isSearchFieldFocused = true
         viewModel.isSearchFieldFocused = true
-        refocusSearchField = UUID()
+        requestSearchFieldRefocus(selectAll: selectAll)
     }
 
     private func dismissOverlay(clearSearchState: Bool) {
@@ -1847,6 +1796,34 @@ public struct SpotlightSearchOverlay: View {
         resignSearchFieldFocus()
     }
 
+    private func updateSubmittedSearchResultFocus() {
+        guard shouldFocusFirstResultAfterSubmit else { return }
+
+        let totalResultCount = viewModel.results?.results.count
+        let visibleResultCount = keyboardNavigableResults.count
+        let hasSearchError = viewModel.error != nil
+
+        if visibleResultCount > 0 {
+            focusFirstResultIfAvailable()
+            return
+        }
+
+        if viewModel.isSearching {
+            return
+        }
+
+        if let totalResultCount {
+            if totalResultCount == 0 {
+                clearResultKeyboardNavigation()
+            }
+            return
+        }
+
+        if hasSearchError {
+            clearResultKeyboardNavigation()
+        }
+    }
+
     private func syncKeyboardSelectionWithCurrentResults() {
         let results = keyboardNavigableResults
 
@@ -1886,6 +1863,20 @@ public struct SpotlightSearchOverlay: View {
     private func installKeyEventMonitor() {
         guard keyEventMonitor == nil else { return }
         keyEventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+
+            // Handle overlay-level dismissal/focus shortcuts here so AppKit text bindings
+            // in the search field do not swallow them before the timeline controller sees them.
+            if event.keyCode == 53 && modifiers.isEmpty { // Escape
+                handleSearchEscape()
+                return nil
+            }
+
+            if event.keyCode == 40 && modifiers == [.command] { // Cmd+K
+                handleSearchCommandK()
+                return nil
+            }
+
             guard isResultKeyboardNavigationActive,
                   !viewModel.isDropdownOpen,
                   !viewModel.isDatePopoverHandlingKeys else {
@@ -2092,7 +2083,7 @@ private struct ResultsAreaHeightPreferenceKey: PreferenceKey {
 /// Uses manual makeFirstResponder for reliable focus in borderless windows
 struct SpotlightSearchField: NSViewRepresentable {
     @Binding var text: String
-    let onSubmit: () -> Void
+    let onSubmit: (Bool) -> Void
     let onEscape: () -> Void
     var onTab: (() -> Void)? = nil
     var onBackTab: (() -> Void)? = nil
@@ -2101,7 +2092,7 @@ struct SpotlightSearchField: NSViewRepresentable {
     var onArrowDown: (() -> Bool)? = nil
     var onArrowUp: (() -> Bool)? = nil
     var placeholder: String = "Search anything you have seen..."
-    var refocusTrigger: UUID = UUID()  // Change this to trigger refocus
+    fileprivate var refocusRequest: SearchFieldRefocusRequest = .initial
 
     func makeNSView(context: Context) -> FocusableTextField {
         let textField = FocusableTextField()
@@ -2127,14 +2118,25 @@ struct SpotlightSearchField: NSViewRepresentable {
         textField.isEditable = true
         textField.isSelectable = true
 
+        context.coordinator.onSubmit = onSubmit
+        context.coordinator.onEscape = onEscape
+        context.coordinator.onTab = onTab
+        context.coordinator.onBackTab = onBackTab
+        context.coordinator.onFocus = onFocus
+        context.coordinator.onBlur = onBlur
+        context.coordinator.onArrowDown = onArrowDown
+        context.coordinator.onArrowUp = onArrowUp
         textField.onCancelCallback = onEscape
         textField.onClickCallback = {
             self.onFocus?()
         }
+        textField.onCommandReturnCallback = {
+            self.onSubmit(true)
+        }
 
         // Focus the text field with retry logic for external monitors
         Log.info("\(searchLog)[FieldFocus] makeNSView scheduling initial focus", category: .ui)
-        focusTextField(textField, attempt: 1)
+        focusTextField(textField, attempt: 1, selectionBehavior: .caretAtEnd)
 
         return textField
     }
@@ -2145,18 +2147,33 @@ struct SpotlightSearchField: NSViewRepresentable {
         if !isComposing, textField.stringValue != text {
             textField.stringValue = text
         }
-        // Update the click callback in case onFocus changed
+        context.coordinator.onSubmit = onSubmit
+        context.coordinator.onEscape = onEscape
+        context.coordinator.onTab = onTab
+        context.coordinator.onBackTab = onBackTab
+        context.coordinator.onFocus = onFocus
+        context.coordinator.onBlur = onBlur
+        context.coordinator.onArrowDown = onArrowDown
+        context.coordinator.onArrowUp = onArrowUp
+        textField.onCancelCallback = onEscape
         textField.onClickCallback = {
             self.onFocus?()
         }
+        textField.onCommandReturnCallback = {
+            self.onSubmit(true)
+        }
         // Check if refocus was triggered
-        if context.coordinator.lastRefocusTrigger != refocusTrigger {
-            context.coordinator.lastRefocusTrigger = refocusTrigger
-            focusTextField(textField, attempt: 1)
+        if context.coordinator.lastRefocusRequest != refocusRequest {
+            context.coordinator.lastRefocusRequest = refocusRequest
+            focusTextField(textField, attempt: 1, selectionBehavior: refocusRequest.selectionBehavior)
         }
     }
 
-    private func focusTextField(_ textField: FocusableTextField, attempt: Int) {
+    private func focusTextField(
+        _ textField: FocusableTextField,
+        attempt: Int,
+        selectionBehavior: SearchFieldSelectionBehavior
+    ) {
         let maxAttempts = 5
         let delay: TimeInterval = attempt == 1 ? 0.0 : Double(attempt) * 0.05
 
@@ -2164,12 +2181,21 @@ struct SpotlightSearchField: NSViewRepresentable {
             guard let window = textField.window else {
                 if attempt < maxAttempts {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                        self.focusTextField(textField, attempt: attempt + 1)
+                        self.focusTextField(
+                            textField,
+                            attempt: attempt + 1,
+                            selectionBehavior: selectionBehavior
+                        )
                     }
                 }
                 return
             }
-            self.performFocus(textField, in: window, attempt: attempt)
+            self.performFocus(
+                textField,
+                in: window,
+                attempt: attempt,
+                selectionBehavior: selectionBehavior
+            )
         }
 
         if delay > 0 {
@@ -2179,7 +2205,12 @@ struct SpotlightSearchField: NSViewRepresentable {
         }
     }
 
-    private func performFocus(_ textField: FocusableTextField, in window: NSWindow, attempt: Int) {
+    private func performFocus(
+        _ textField: FocusableTextField,
+        in window: NSWindow,
+        attempt: Int,
+        selectionBehavior: SearchFieldSelectionBehavior
+    ) {
         let maxAttempts = 5
 
         // Activate the app first — required for makeKey to work on external monitors
@@ -2188,33 +2219,46 @@ struct SpotlightSearchField: NSViewRepresentable {
             NSApp.activate(ignoringOtherApps: true)
         }
         window.makeKeyAndOrderFront(nil)
-        let isKeyAfterMakeKey = window.isKeyWindow
         let success = window.makeFirstResponder(textField)
-        Log.info(
-            "\(searchLog)[FieldFocus] performFocus attempt=\(attempt) isKeyAfterMakeKey=\(isKeyAfterMakeKey) makeFirstResponderSuccess=\(success)",
-            category: .ui
-        )
 
         // Ensure field editor exists for caret to appear
         if window.fieldEditor(false, for: textField) == nil {
             _ = window.fieldEditor(true, for: textField)
         }
 
-        // Move caret to end of text instead of selecting all
+        // Restore either a caret-at-end focus or a select-all replacement affordance.
         if let fieldEditor = window.fieldEditor(false, for: textField) as? NSTextView {
-            let endPosition = fieldEditor.string.count
-            fieldEditor.setSelectedRange(NSRange(location: endPosition, length: 0))
+            switch selectionBehavior {
+            case .caretAtEnd:
+                let endPosition = fieldEditor.string.count
+                fieldEditor.setSelectedRange(NSRange(location: endPosition, length: 0))
+            case .selectAll:
+                fieldEditor.setSelectedRange(NSRange(location: 0, length: fieldEditor.string.count))
+            }
+        }
+
+        // Keep SwiftUI focus state in sync with programmatic AppKit focus restoration.
+        if success {
+            onFocus?()
         }
 
         // If the window isn't key yet (activation is async on external monitors),
         // retry so keystrokes actually reach the text field
-        if !isKeyAfterMakeKey && attempt < maxAttempts {
+        if !window.isKeyWindow && attempt < maxAttempts {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                self.focusTextField(textField, attempt: attempt + 1)
+                self.focusTextField(
+                    textField,
+                    attempt: attempt + 1,
+                    selectionBehavior: selectionBehavior
+                )
             }
         } else if !success && attempt < maxAttempts {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                self.focusTextField(textField, attempt: attempt + 1)
+                self.focusTextField(
+                    textField,
+                    attempt: attempt + 1,
+                    selectionBehavior: selectionBehavior
+                )
             }
         }
     }
@@ -2235,19 +2279,19 @@ struct SpotlightSearchField: NSViewRepresentable {
 
     class Coordinator: NSObject, NSTextFieldDelegate {
         @Binding var text: String
-        let onSubmit: () -> Void
-        let onEscape: () -> Void
-        let onTab: (() -> Void)?
-        let onBackTab: (() -> Void)?
-        let onFocus: (() -> Void)?
-        let onBlur: (() -> Void)?
-        let onArrowDown: (() -> Bool)?
-        let onArrowUp: (() -> Bool)?
-        var lastRefocusTrigger: UUID = UUID()
+        var onSubmit: (Bool) -> Void
+        var onEscape: () -> Void
+        var onTab: (() -> Void)?
+        var onBackTab: (() -> Void)?
+        var onFocus: (() -> Void)?
+        var onBlur: (() -> Void)?
+        var onArrowDown: (() -> Bool)?
+        var onArrowUp: (() -> Bool)?
+        fileprivate var lastRefocusRequest: SearchFieldRefocusRequest = .initial
 
         init(
             text: Binding<String>,
-            onSubmit: @escaping () -> Void,
+            onSubmit: @escaping (Bool) -> Void,
             onEscape: @escaping () -> Void,
             onTab: (() -> Void)?,
             onBackTab: (() -> Void)?,
@@ -2282,8 +2326,9 @@ struct SpotlightSearchField: NSViewRepresentable {
         }
 
         func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
-            if commandSelector == #selector(NSResponder.insertNewline(_:)) {
-                onSubmit()
+            if commandSelector == #selector(NSResponder.insertNewline(_:)) ||
+                commandSelector == #selector(NSResponder.insertNewlineIgnoringFieldEditor(_:)) {
+                onSubmit(false)
                 return true
             } else if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
                 onEscape()

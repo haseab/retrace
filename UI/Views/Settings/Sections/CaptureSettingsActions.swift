@@ -463,6 +463,8 @@ extension SettingsView {
             return "SigmaOS does not support in-page URL extraction."
         case "com.openai.atlas":
             return "ChatGPT Atlas does not support in-page URL extraction."
+        case "app.zen-browser.zen":
+            return "Zen does not support in-page URL extraction."
         default:
             return "This browser does not support in-page URL extraction."
         }

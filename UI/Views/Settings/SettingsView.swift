@@ -20,6 +20,20 @@ public struct SettingsView: View {
         case comment
     }
 
+    struct StorageEstimateRange: Equatable {
+        let lowGB: Double
+        let highGB: Double
+
+        var midpointGB: Double {
+            (lowGB + highGB) / 2.0
+        }
+    }
+
+    enum StorageEstimateDeltaDirection: Equatable {
+        case increase
+        case decrease
+    }
+
     // MARK: - Properties
 
     /// Optional initial tab to open (passed from parent when navigating to specific section)
@@ -87,6 +101,8 @@ public struct SettingsView: View {
     @State var lastNonZeroCaptureIntervalSeconds = SettingsDefaults.captureIntervalSeconds
     @State var isProgrammaticCaptureIntervalChange = false
     @State var isProgrammaticWindowChangeCaptureToggleChange = false
+    @State var lastObservedStorageEstimateRange: StorageEstimateRange?
+    @State var storageEstimateDeltaDirection: StorageEstimateDeltaDirection?
 
     // MARK: Storage Settings
     @AppStorage("retentionDays", store: settingsStore) var retentionDays: Int = SettingsDefaults.retentionDays
@@ -98,7 +114,9 @@ public struct SettingsView: View {
     @State var previewRetentionDays: Int?  // Visual preview while selecting
     @AppStorage("maxStorageGB", store: settingsStore) var maxStorageGB: Double = SettingsDefaults.maxStorageGB
     @AppStorage("useRewindData", store: settingsStore) var useRewindData: Bool = SettingsDefaults.useRewindData
-    @State var rewindCutoffDateSelection: Date = ServiceContainer.rewindCutoffDate(in: settingsStore)
+    @State var rewindCutoffDateSelection: Date = Calendar.current.startOfDay(
+        for: ServiceContainer.rewindCutoffDate(in: settingsStore)
+    )
     @State var isRefreshingRewindCutoff = false
     @State var settingsToastMessage: String?
     @State var settingsToastVisible = false
@@ -132,6 +150,7 @@ public struct SettingsView: View {
     @AppStorage("redactWindowTitlePatterns", store: settingsStore) var redactWindowTitlePatternsRaw = SettingsDefaults.redactWindowTitlePatterns
     @AppStorage("redactBrowserURLPatterns", store: settingsStore) var redactBrowserURLPatternsRaw = SettingsDefaults.redactBrowserURLPatterns
     @AppStorage("phraseLevelRedactionPhrases", store: settingsStore) var phraseLevelRedactionPhrasesRaw = SettingsDefaults.phraseLevelRedactionPhrases
+    @AppStorage(PhraseRedactionMode.defaultsKey, store: settingsStore) var phraseLevelRedactionModeRaw = PhraseRedactionMode.scramble.rawValue
     @State var phraseLevelRedactionInput = ""
     @State var phraseLevelRedactionEnabled = SettingsDefaults.phraseLevelRedactionEnabled
     @State var phraseLevelRedactionToggleInitialized = false
@@ -182,6 +201,7 @@ public struct SettingsView: View {
     @AppStorage("enableFrameIDSearch", store: settingsStore) var enableFrameIDSearch = SettingsDefaults.enableFrameIDSearch
     @AppStorage("showOCRDebugOverlay", store: settingsStore) var showOCRDebugOverlay = SettingsDefaults.showOCRDebugOverlay
     @AppStorage("showVideoControls", store: settingsStore) var showVideoControls = SettingsDefaults.showVideoControls
+    @AppStorage(menuBarCaptureFeedbackDefaultsKey, store: settingsStore) var showMenuBarCaptureFeedback = SettingsDefaults.showMenuBarCaptureFeedback
 
     // MARK: OCR Power Settings
     @AppStorage("ocrEnabled", store: settingsStore) var ocrEnabled = SettingsDefaults.ocrEnabled
@@ -191,6 +211,7 @@ public struct SettingsView: View {
     @AppStorage("ocrProcessingLevel", store: settingsStore) var ocrProcessingLevel = SettingsDefaults.ocrProcessingLevel
     @AppStorage("ocrAppFilterMode", store: settingsStore) var ocrAppFilterMode: OCRAppFilterMode = SettingsDefaults.ocrAppFilterMode
     @AppStorage("ocrFilteredApps", store: settingsStore) var ocrFilteredAppsString = SettingsDefaults.ocrFilteredApps
+    @AppStorage("autoMaxOCR", store: settingsStore) var autoMaxOCR = SettingsDefaults.autoMaxOCR
     @State var excludedAppsPopoverShown = false
     @State var installedAppsForExcludedRedaction: [(bundleID: String, name: String)] = []
     @State var otherAppsForExcludedRedaction: [(bundleID: String, name: String)] = []
@@ -238,7 +259,8 @@ public struct SettingsView: View {
     }
 
     var hasCustomRewindCutoffDate: Bool {
-        rewindCutoffDateSelection != SettingsDefaults.rewindCutoffDate
+        Calendar.current.startOfDay(for: rewindCutoffDateSelection)
+            != Calendar.current.startOfDay(for: SettingsDefaults.rewindCutoffDate)
     }
 
     var defaultRewindCutoffDateDescription: String {
@@ -246,7 +268,7 @@ public struct SettingsView: View {
     }
 
     var customRewindCutoffWarningText: String {
-        let formattedCutoff = rewindCutoffDateSelection.formatted(date: .abbreviated, time: .shortened)
+        let formattedCutoff = rewindCutoffDateSelection.formatted(date: .abbreviated, time: .omitted)
         return "When Rewind data is enabled, any native Retrace data before \(formattedCutoff) will not be available."
     }
 
@@ -314,20 +336,7 @@ public struct SettingsView: View {
         qos: .utility,
         attributes: .concurrent
     )
-    nonisolated static let inPageURLKnownBrowserBundleIDs: [String] = [
-        "com.apple.Safari",
-        "com.google.Chrome",
-        "com.google.Chrome.canary",
-        "org.chromium.Chromium",
-        "com.microsoft.edgemac",
-        "com.brave.Browser",
-        "com.vivaldi.Vivaldi",
-        "com.operasoftware.Opera",
-        "company.thebrowser.Browser",
-        "ai.perplexity.comet",
-        "company.thebrowser.dia",
-        "com.nicklockwood.Thorium",
-    ]
+    nonisolated static let inPageURLKnownBrowserBundleIDs: [String] = AppInfo.supportedBrowserBundleIDOrder
     nonisolated static let inPageURLUnsupportedBundleIDs: [String] = [
         "org.mozilla.firefox",
         "org.mozilla.firefoxbeta",
@@ -336,20 +345,9 @@ public struct SettingsView: View {
         "com.duckduckgo.macos.browser",
         "com.sigmaos.sigmaos.macos",
         "com.openai.atlas",
+        "app.zen-browser.zen",
     ]
-    nonisolated static let inPageURLChromiumHostBundleIDPrefixes: [String] = [
-        "com.google.Chrome",
-        "com.google.Chrome.canary",
-        "org.chromium.Chromium",
-        "com.microsoft.edgemac",
-        "com.brave.Browser",
-        "com.vivaldi.Vivaldi",
-        "com.operasoftware.Opera",
-        "company.thebrowser.Browser",
-        "ai.perplexity.comet",
-        "company.thebrowser.dia",
-        "com.nicklockwood.Thorium",
-    ]
+    nonisolated static let inPageURLChromiumHostBundleIDPrefixes: [String] = AppInfo.chromiumHostBrowserBundleIDPrefixes
     static let inPageURLTestURLString = "https://en.wikipedia.org/wiki/Cat"
     static let inPageURLNoMatchingWindowToken = "__NO_MATCHING_WINDOW__"
     nonisolated static let privateModeAutomationFallbackBundleIDs: [String] = [

@@ -104,7 +104,10 @@ actor MigrationRunner {
             V14_DBStorageSnapshot(),
             V15_NodeRedactionFlag(),
             V16_ProcessingQueueFrameIDIndex(),
-            V17_FrameCaptureTrigger()
+            V17_FrameCaptureTrigger(),
+            V18_DailyMetricsRecencyIndex(),
+            V19_FrameEncodedAt(),
+            V20_PartialProcessingStatusIndex()
         ]
     }
 

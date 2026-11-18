@@ -52,4 +52,16 @@ final class SearchRecentEntriesRemovalTests: XCTestCase {
 
         XCTAssertEqual(viewModel.recentSearchEntries, beforeRemoval)
     }
+
+    func testRecentSearchHistoryCapsStoredEntriesAtEighty() {
+        let viewModel = SearchViewModel(coordinator: AppCoordinator())
+
+        for index in 0..<100 {
+            viewModel.recordRecentSearchEntry("query \(index)")
+        }
+
+        XCTAssertEqual(viewModel.recentSearchEntries.count, 80)
+        XCTAssertEqual(viewModel.recentSearchEntries.first?.query, "query 99")
+        XCTAssertEqual(viewModel.recentSearchEntries.last?.query, "query 20")
+    }
 }

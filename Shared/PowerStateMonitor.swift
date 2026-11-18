@@ -41,6 +41,7 @@ public final class PowerStateMonitor: @unchecked Sendable {
     public var isOnBattery: Bool {
         getCurrentPowerSource() == .battery
     }
+
 }
 
 // MARK: - OCR App Filter Mode

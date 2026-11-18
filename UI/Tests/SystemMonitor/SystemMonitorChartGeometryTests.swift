@@ -116,4 +116,26 @@ final class SystemMonitorChartGeometryTests: XCTestCase {
 
         XCTAssertEqual(center, 288, accuracy: 0.001)
     }
+
+    func testYAxisUpperBoundTracksObservedDataInsteadOfFixedBacklogCap() {
+        let upperBound = ActivityBarChart.yAxisUpperBound(
+            historicalMax: 7,
+            liveTotal: 3,
+            pendingCount: 0,
+            backlogBarCap: 100
+        )
+
+        XCTAssertEqual(upperBound, 10)
+    }
+
+    func testYAxisUpperBoundIncludesVisibleBacklogChunkWhenPresent() {
+        let upperBound = ActivityBarChart.yAxisUpperBound(
+            historicalMax: 12,
+            liveTotal: 6,
+            pendingCount: 250,
+            backlogBarCap: 100
+        )
+
+        XCTAssertEqual(upperBound, 100)
+    }
 }

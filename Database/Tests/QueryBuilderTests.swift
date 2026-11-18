@@ -1,5 +1,5 @@
 import XCTest
-import SQLite3
+import SQLCipher
 import Darwin
 import Shared
 @testable import Database
@@ -85,7 +85,6 @@ final class QueryBuilderTests: XCTestCase {
             segmentID: frame.segmentID,
             videoID: frame.videoID,
             frameIndexInSegment: frame.frameIndexInSegment,
-            encodingStatus: frame.encodingStatus,
             metadata: frame.metadata,
             source: frame.source
         )

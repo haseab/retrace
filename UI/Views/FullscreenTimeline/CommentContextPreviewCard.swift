@@ -30,6 +30,97 @@ enum CommentContextPreviewMetadataLayout {
     case stacked
 }
 
+private enum CommentContextPreviewShellStyle {
+    static let contentTransition = AnyTransition.asymmetric(
+        insertion: .opacity.combined(with: .scale(scale: 0.98, anchor: .topTrailing)),
+        removal: .opacity.combined(with: .scale(scale: 0.98, anchor: .topTrailing))
+    )
+    static let collapseAnimation = Animation.spring(response: 0.24, dampingFraction: 0.88)
+}
+
+private struct CommentContextPreviewCollapseButton: View {
+    let isCollapsed: Bool
+    let action: () -> Void
+
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: isCollapsed ? "chevron.down" : "chevron.up")
+                .font(.system(size: 10, weight: .bold))
+                .foregroundColor(
+                    isHovering
+                    ? Color.retracePrimary.opacity(0.98)
+                    : Color.retraceSecondary.opacity(0.92)
+                )
+                .frame(
+                    width: CommentContextPreviewStyle.collapseButtonSize,
+                    height: CommentContextPreviewStyle.collapseButtonSize
+                )
+                .frame(
+                    width: CommentContextPreviewStyle.collapseButtonHitArea,
+                    height: CommentContextPreviewStyle.collapseButtonHitArea
+                )
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            isHovering = hovering
+            if hovering { NSCursor.pointingHand.push() }
+            else { NSCursor.pop() }
+        }
+    }
+}
+
+private struct CommentContextPreviewShell<ExpandedContent: View, CollapsedContent: View, FooterContent: View>: View {
+    let isCollapsed: Bool
+    let onToggleCollapsed: (() -> Void)?
+    let expandedContent: ExpandedContent
+    let collapsedContent: CollapsedContent
+    let footerContent: FooterContent
+
+    init(
+        isCollapsed: Bool,
+        onToggleCollapsed: (() -> Void)? = nil,
+        @ViewBuilder expanded: () -> ExpandedContent,
+        @ViewBuilder collapsed: () -> CollapsedContent,
+        @ViewBuilder footer: () -> FooterContent
+    ) {
+        self.isCollapsed = isCollapsed
+        self.onToggleCollapsed = onToggleCollapsed
+        self.expandedContent = expanded()
+        self.collapsedContent = collapsed()
+        self.footerContent = footer()
+    }
+
+    var body: some View {
+        CommentChromeSectionCard(cornerRadius: CommentContextPreviewStyle.sectionCornerRadius) {
+            VStack(alignment: .leading, spacing: 10) {
+                Group {
+                    if isCollapsed {
+                        collapsedContent
+                    } else {
+                        expandedContent
+                    }
+                }
+                .transition(CommentContextPreviewShellStyle.contentTransition)
+
+                footerContent
+            }
+        }
+        .overlay(alignment: .topTrailing) {
+            if let onToggleCollapsed {
+                CommentContextPreviewCollapseButton(
+                    isCollapsed: isCollapsed,
+                    action: onToggleCollapsed
+                )
+                .padding(10)
+            }
+        }
+        .animation(CommentContextPreviewShellStyle.collapseAnimation, value: isCollapsed)
+    }
+}
+
 struct CommentContextPreviewCard<TagsContent: View, FooterContent: View>: View {
     let title: String
     let subtitle: String?
@@ -43,8 +134,6 @@ struct CommentContextPreviewCard<TagsContent: View, FooterContent: View>: View {
     let onToggleCollapsed: (() -> Void)?
     let tagsContent: TagsContent
     let footerContent: FooterContent
-
-    @State private var isHoveringCollapseButton = false
 
     init(
         title: String,
@@ -104,36 +193,16 @@ struct CommentContextPreviewCard<TagsContent: View, FooterContent: View>: View {
     }
 
     var body: some View {
-        CommentChromeSectionCard(cornerRadius: CommentContextPreviewStyle.sectionCornerRadius) {
-            VStack(alignment: .leading, spacing: 10) {
-                if isCollapsed {
-                    collapsedContent
-                        .transition(
-                            .asymmetric(
-                                insertion: .opacity.combined(with: .scale(scale: 0.98, anchor: .topTrailing)),
-                                removal: .opacity.combined(with: .scale(scale: 0.98, anchor: .topTrailing))
-                            )
-                        )
-                } else {
-                    expandedContent
-                        .transition(
-                            .asymmetric(
-                                insertion: .opacity.combined(with: .scale(scale: 0.98, anchor: .topTrailing)),
-                                removal: .opacity.combined(with: .scale(scale: 0.98, anchor: .topTrailing))
-                            )
-                        )
-                }
-
-                footerContent
-            }
+        CommentContextPreviewShell(
+            isCollapsed: isCollapsed,
+            onToggleCollapsed: onToggleCollapsed
+        ) {
+            expandedContent
+        } collapsed: {
+            collapsedContent
+        } footer: {
+            footerContent
         }
-        .overlay(alignment: .topTrailing) {
-            if let onToggleCollapsed {
-                collapseToggleButton(action: onToggleCollapsed)
-                    .padding(10)
-            }
-        }
-        .animation(.spring(response: 0.24, dampingFraction: 0.88), value: isCollapsed)
     }
 
     private var expandedContent: some View {
@@ -262,33 +331,6 @@ struct CommentContextPreviewCard<TagsContent: View, FooterContent: View>: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private func collapseToggleButton(action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Image(systemName: isCollapsed ? "chevron.down" : "chevron.up")
-                .font(.system(size: 10, weight: .bold))
-                .foregroundColor(
-                    isHoveringCollapseButton
-                    ? Color.retracePrimary.opacity(0.98)
-                    : Color.retraceSecondary.opacity(0.92)
-                )
-                .frame(
-                    width: CommentContextPreviewStyle.collapseButtonSize,
-                    height: CommentContextPreviewStyle.collapseButtonSize
-                )
-                .frame(
-                    width: CommentContextPreviewStyle.collapseButtonHitArea,
-                    height: CommentContextPreviewStyle.collapseButtonHitArea
-                )
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .onHover { hovering in
-            isHoveringCollapseButton = hovering
-            if hovering { NSCursor.pointingHand.push() }
-            else { NSCursor.pop() }
-        }
-    }
-
     @ViewBuilder
     private var previewAppIcon: some View {
         if let appBundleID {
@@ -364,56 +406,129 @@ struct CommentContextPreviewCard<TagsContent: View, FooterContent: View>: View {
 struct CommentContextPreviewLoadingCard: View {
     let title: String
     let detail: String
+    let isCollapsed: Bool
+    let onToggleCollapsed: (() -> Void)?
+
+    init(
+        title: String,
+        detail: String,
+        isCollapsed: Bool = false,
+        onToggleCollapsed: (() -> Void)? = nil
+    ) {
+        self.title = title
+        self.detail = detail
+        self.isCollapsed = isCollapsed
+        self.onToggleCollapsed = onToggleCollapsed
+    }
 
     var body: some View {
-        CommentChromeSectionCard(cornerRadius: CommentContextPreviewStyle.sectionCornerRadius) {
-            HStack(alignment: .top, spacing: CommentContextPreviewStyle.sectionSpacing) {
-                VStack(alignment: .leading, spacing: 10) {
-                    Text(title)
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundColor(.retracePrimary.opacity(0.96))
-                        .padding(.leading, 4)
-
-                    VStack(alignment: .leading, spacing: 8) {
-                        RoundedRectangle(cornerRadius: 5)
-                            .fill(Color.white.opacity(0.11))
-                            .frame(width: 184, height: 14)
-
-                        RoundedRectangle(cornerRadius: 5)
-                            .fill(Color.white.opacity(0.08))
-                            .frame(width: 108, height: 11)
-                    }
-                    .padding(.top, 2)
-
-                    RoundedRectangle(cornerRadius: 5)
-                        .fill(Color.white.opacity(0.07))
-                        .frame(height: CommentContextPreviewStyle.metadataRowMinHeight)
-
-                    Text(detail)
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundColor(.retraceSecondary.opacity(0.86))
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-                Spacer(minLength: 0)
-
-                RoundedRectangle(cornerRadius: 16)
-                    .fill(Color.white.opacity(0.07))
-                    .frame(
-                        width: CommentContextPreviewStyle.previewWidth,
-                        height: CommentContextPreviewStyle.previewHeight
-                    )
-                    .overlay(
-                        VStack(spacing: 8) {
-                            ProgressView()
-                                .controlSize(.small)
-                            Text("Loading preview")
-                                .font(.system(size: 11, weight: .medium))
-                                .foregroundColor(.retraceSecondary.opacity(0.88))
-                        }
-                    )
-            }
+        CommentContextPreviewShell(
+            isCollapsed: isCollapsed,
+            onToggleCollapsed: onToggleCollapsed
+        ) {
+            expandedContent
+        } collapsed: {
+            collapsedContent
+        } footer: {
+            EmptyView()
         }
     }
+
+    private var expandedContent: some View {
+        HStack(alignment: .top, spacing: CommentContextPreviewStyle.sectionSpacing) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text(title)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(.retracePrimary.opacity(0.96))
+                    .padding(.leading, 4)
+
+                VStack(alignment: .leading, spacing: 8) {
+                    RoundedRectangle(cornerRadius: 5)
+                        .fill(Color.white.opacity(0.11))
+                        .frame(width: 184, height: 14)
+
+                    RoundedRectangle(cornerRadius: 5)
+                        .fill(Color.white.opacity(0.08))
+                        .frame(width: 108, height: 11)
+                }
+                .padding(.top, 2)
+
+                RoundedRectangle(cornerRadius: 5)
+                    .fill(Color.white.opacity(0.07))
+                    .frame(height: CommentContextPreviewStyle.metadataRowMinHeight)
+
+                Text(detail)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(.retraceSecondary.opacity(0.86))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Spacer(minLength: 0)
+
+            RoundedRectangle(cornerRadius: 16)
+                .fill(Color.white.opacity(0.07))
+                .frame(
+                    width: CommentContextPreviewStyle.previewWidth,
+                    height: CommentContextPreviewStyle.previewHeight
+                )
+                .overlay(
+                    VStack(spacing: 8) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Loading preview")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundColor(.retraceSecondary.opacity(0.88))
+                    }
+                )
+                .padding(.trailing, onToggleCollapsed == nil ? 0 : CommentContextPreviewStyle.expandedPreviewTrailingInset)
+        }
+    }
+
+    private var collapsedContent: some View {
+        HStack(alignment: .center, spacing: 14) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Context Preview")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(.retracePrimary.opacity(0.96))
+                    .lineLimit(1)
+
+                HStack(alignment: .center, spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text(title)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(.retraceSecondary.opacity(0.88))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+            }
+            .frame(
+                width: CommentContextPreviewStyle.collapsedColumnWidth,
+                alignment: .leading
+            )
+
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color.white.opacity(0.07))
+                .frame(width: 34, height: 34)
+                .overlay(
+                    Image(systemName: "macwindow")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(.retracePrimary.opacity(0.78))
+                )
+
+            VStack(alignment: .leading, spacing: 7) {
+                RoundedRectangle(cornerRadius: 5)
+                    .fill(Color.white.opacity(0.11))
+                    .frame(width: 124, height: 14)
+
+                RoundedRectangle(cornerRadius: 5)
+                    .fill(Color.white.opacity(0.08))
+                    .frame(width: 86, height: 11)
+            }
+            .padding(.trailing, onToggleCollapsed == nil ? 0 : CommentContextPreviewStyle.collapseButtonInset)
+        }
+        .frame(maxWidth: .infinity, minHeight: 34, alignment: .leading)
+    }
+
 }

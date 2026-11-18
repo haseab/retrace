@@ -3,9 +3,10 @@ import Shared
 import App
 
 /// Shared UserDefaults store for consistent settings across debug/release builds.
-let settingsStore: UserDefaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+let settingsStore: UserDefaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
 let rewindCutoffDateDefaultsKey = "rewindCutoffDate"
 let phraseLevelRedactionEnabledDefaultsKey = "phraseLevelRedactionEnabled"
+let menuBarCaptureFeedbackDefaultsKey = "showMenuBarCaptureFeedback"
 
 enum MasterKeyProtectedFeature: String, Identifiable {
     case phraseLevelRedaction
@@ -93,6 +94,7 @@ enum SettingsDefaults {
     static let enableFrameIDSearch = false
     static let showOCRDebugOverlay = false
     static let showVideoControls = false
+    static let showMenuBarCaptureFeedback = false
 
     static let ocrEnabled = true
     static let ocrOnlyWhenPluggedIn = false
@@ -101,6 +103,7 @@ enum SettingsDefaults {
     static let ocrProcessingLevel: Int = 3
     static let ocrAppFilterMode: OCRAppFilterMode = .allApps
     static let ocrFilteredApps = ""
+    static let autoMaxOCR = false
 }
 
 enum DashboardAppUsageViewModeSetting: String, CaseIterable {

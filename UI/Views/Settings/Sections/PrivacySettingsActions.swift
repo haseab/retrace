@@ -20,13 +20,16 @@ extension SettingsView {
         Task {
             do {
                 // Use deleteRecentData to delete frames NEWER than the cutoff date
-                let result = try await coordinatorWrapper.coordinator.deleteRecentData(newerThan: option.cutoffDate)
+                let result = try await coordinatorWrapper.coordinator.deleteRecentData(
+                    newerThan: option.cutoffDate,
+                    metricSource: "quick_delete"
+                )
 
                 await MainActor.run {
                     isDeleting = false
                     deletingOption = nil
-                    if result.deletedFrames > 0 {
-                        showSettingsToast("Deleted \(result.deletedFrames) frames from the \(option.displayName)")
+                    if result.affectedFrames > 0 {
+                        showSettingsToast(quickDeleteToastMessage(for: result, option: option))
                         // Notify timeline to reload so deleted frames don't appear
                         NotificationCenter.default.post(name: .dataSourceDidChange, object: nil)
                     } else {
@@ -42,25 +45,42 @@ extension SettingsView {
             }
         }
     }
+
+    private func quickDeleteToastMessage(for result: FrameDeletionResult, option: QuickDeleteOption) -> String {
+        if result.queuedFrames == 0 {
+            return "Deleted \(result.completedFrames) frames from the \(option.displayName)"
+        }
+        if result.completedFrames == 0 {
+            return "Queued deletion for \(result.queuedFrames) frames from the \(option.displayName)."
+        }
+        return "Deleted \(result.completedFrames) frames and queued \(result.queuedFrames) more from the \(option.displayName)"
+    }
 }
 
 // MARK: - Excluded Apps Management
 
 extension SettingsView {
     func loadExcludedAppsForRedaction() {
-        let installed = AppNameResolver.shared.getInstalledApps()
-            .map { (bundleID: $0.bundleID, name: $0.name) }
-            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
-        installedAppsForExcludedRedaction = installed
-
-        let installedBundleIDs = Set(installed.map(\.bundleID))
         Task {
+            let installed = await Task.detached(priority: .utility) {
+                AppNameResolver.shared.getInstalledApps()
+                    .map { (bundleID: $0.bundleID, name: $0.name) }
+                    .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+            }.value
+
+            let installedBundleIDs = Set(installed.map(\.bundleID))
+            await MainActor.run {
+                installedAppsForExcludedRedaction = installed
+            }
+
             do {
                 let historyBundleIDs = try await coordinatorWrapper.coordinator.getDistinctAppBundleIDs()
                 let otherBundleIDs = historyBundleIDs.filter { !installedBundleIDs.contains($0) }
-                let resolvedApps = AppNameResolver.shared.resolveAll(bundleIDs: otherBundleIDs)
-                    .map { (bundleID: $0.bundleID, name: $0.name) }
-                    .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+                let resolvedApps = await Task.detached(priority: .utility) {
+                    AppNameResolver.shared.resolveAll(bundleIDs: otherBundleIDs)
+                        .map { (bundleID: $0.bundleID, name: $0.name) }
+                        .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+                }.value
 
                 await MainActor.run {
                     otherAppsForExcludedRedaction = resolvedApps
@@ -82,12 +102,11 @@ extension SettingsView {
                 installedAppsForExcludedRedaction.first(where: { $0.bundleID == bundleID })?.name ??
                 otherAppsForExcludedRedaction.first(where: { $0.bundleID == bundleID })?.name ??
                 bundleID
-            let iconPath = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID)?.path
             apps.append(
                 ExcludedAppInfo(
                     bundleID: bundleID,
                     name: name,
-                    iconPath: iconPath
+                    iconPath: nil
                 )
             )
         }

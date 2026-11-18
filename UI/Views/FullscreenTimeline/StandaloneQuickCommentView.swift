@@ -2,7 +2,7 @@ import SwiftUI
 import AppKit
 import Shared
 
-private let quickCommentSettingsStore: UserDefaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+private let quickCommentSettingsStore: UserDefaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
 
 struct StandaloneQuickCommentView: View {
     @ObservedObject var viewModel: QuickCommentComposerViewModel
@@ -139,7 +139,9 @@ struct StandaloneQuickCommentView: View {
     private var loadingTargetSection: some View {
         CommentContextPreviewLoadingCard(
             title: "Resolving current moment...",
-            detail: "Finding the latest captured frame and segment before this quick-comment window."
+            detail: "Finding the latest captured frame and segment before this quick-comment window.",
+            isCollapsed: isContextPreviewCollapsed,
+            onToggleCollapsed: toggleContextPreviewCollapsed
         )
     }
 

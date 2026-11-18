@@ -12,9 +12,57 @@ import Carbon
 import UniformTypeIdentifiers
 
 extension SettingsView {
+    @ViewBuilder
+    func floatingStorageEstimateCard(
+        valueText: String,
+        deltaDirection: StorageEstimateDeltaDirection?
+    ) -> some View {
+        HStack(alignment: .center, spacing: 14) {
+            Image(systemName: "externaldrive.fill")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(.white)
+                .frame(width: 34, height: 34)
+                .background(Color.retraceAccent)
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Estimated Storage")
+                    .font(.retraceCaptionMedium)
+                    .foregroundColor(.retraceSecondary.opacity(0.85))
+
+                HStack(spacing: 6) {
+                    Text(valueText)
+                        .font(.retraceCalloutBold)
+                        .foregroundColor(.white)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.85)
+
+                    if let deltaDirection {
+                        Image(systemName: deltaDirection == .increase ? "arrowtriangle.up.fill" : "arrowtriangle.down.fill")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundColor(deltaDirection == .increase ? .retraceSuccess : .retraceDanger)
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 13)
+        .background(
+            RoundedRectangle(cornerRadius: 14)
+                .fill(Color.retraceCard)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 14)
+                .stroke(Color.white.opacity(0.08), lineWidth: 1)
+        )
+        .fixedSize(horizontal: true, vertical: false)
+        .shadow(color: Color.black.opacity(0.18), radius: 18, y: 8)
+    }
+
     var captureSettings: some View {
         VStack(alignment: .leading, spacing: 20) {
             captureRateCard
+            menuBarIconCard
             compressionCard
             Color.clear
                 .frame(height: 0)
@@ -52,14 +100,10 @@ extension SettingsView {
                         updateCaptureIntervalSetting(to: newValue)
                     }
 
-                HStack {
-                    Text(captureIntervalEstimateText)
-                        .font(.retraceCaption2)
-                        .foregroundColor(.retraceSecondary.opacity(0.7))
+                if captureIntervalSeconds != SettingsDefaults.captureIntervalSeconds {
+                    HStack {
+                        Spacer()
 
-                    Spacer()
-
-                    if captureIntervalSeconds != SettingsDefaults.captureIntervalSeconds {
                         Button(action: {
                             captureIntervalSeconds = SettingsDefaults.captureIntervalSeconds
                         }) {
@@ -108,7 +152,7 @@ extension SettingsView {
 
                 ModernToggleRow(
                     title: "Capture mouse position",
-                    subtitle: "Store pointer coordinates for each frame and render them in timeline playback.",
+                    subtitle: "Store pointer coordinates for each frame and render them in timeline playback. Estimated storage increases while this is enabled.",
                     isOn: $captureMousePosition
                 )
                 .onChange(of: captureMousePosition) { enabled in
@@ -154,14 +198,10 @@ extension SettingsView {
                         showCompressionUpdateFeedback()
                     }
 
-                HStack {
-                    Text(videoQualityEstimateText)
-                        .font(.retraceCaption2)
-                        .foregroundColor(.retraceSecondary.opacity(0.7))
+                if videoQuality != SettingsDefaults.videoQuality {
+                    HStack {
+                        Spacer()
 
-                    Spacer()
-
-                    if videoQuality != SettingsDefaults.videoQuality {
                         Button(action: {
                             videoQuality = SettingsDefaults.videoQuality
                         }) {
@@ -181,7 +221,7 @@ extension SettingsView {
                     .background(Color.white.opacity(0.1))
 
                 HStack {
-                    Text("Deduplication")
+                    Text("Similar Frames Deduplication Threshold")
                         .font(.retraceCalloutMedium)
                         .foregroundColor(.retracePrimary)
                     Spacer()
@@ -194,13 +234,17 @@ extension SettingsView {
                         .cornerRadius(8)
                 }
 
-                ModernSlider(value: $deduplicationThreshold, range: 0.98...1.0, step: 0.0001)
+                ModernSlider(
+                    value: $deduplicationThreshold,
+                    range: 0.98...1.0,
+                    step: Self.deduplicationThresholdSliderStep
+                )
                     .onChange(of: deduplicationThreshold) { newValue in
                         updateDeduplicationThreshold()
                         deleteDuplicateFrames = newValue < 1.0
                     }
 
-                HStack {
+                HStack(alignment: .top) {
                     Text(deduplicationSensitivityText)
                         .font(.retraceCaption2)
                         .foregroundColor(.retraceSecondary.opacity(0.7))
@@ -231,7 +275,7 @@ extension SettingsView {
                 ModernToggleRow(
                     title: "Keep frames on mouse movement",
                     subtitle: captureMousePosition
-                        ? "Do not deduplicate when the pointer moved between captures."
+                        ? "Keep duplicate frames even if only the mouse moved between captures."
                         : "Enable \"Capture mouse position\" in Capture Rate to use this setting.",
                     isOn: $keepFramesOnMouseMovement
                 )
@@ -246,6 +290,17 @@ extension SettingsView {
                     )
                 }
             }
+        }
+    }
+
+    @ViewBuilder
+    var menuBarIconCard: some View {
+        ModernSettingsCard(title: "Menu Bar Icon", icon: "menubar.rectangle") {
+            ModernToggleRow(
+                title: "Show capture animation",
+                subtitle: "Animate the menu bar icon like a camera shutter every time Retrace takes a screenshot.",
+                isOn: menuBarCaptureFeedbackBinding
+            )
         }
     }
 
@@ -268,6 +323,12 @@ extension SettingsView {
                 }
 
                 PauseReminderDelayPicker(selectedMinutes: $pauseReminderDelayMinutes)
+                    .onChange(of: pauseReminderDelayMinutes) { newValue in
+                        NotificationCenter.default.post(
+                            name: PauseReminderSettingsNotification.didChange,
+                            object: PauseReminderSettingsSnapshot(delayMinutes: newValue)
+                        )
+                    }
 
                 HStack {
                     Text("How long to wait before reminding you again when recording is stopped")
@@ -305,5 +366,24 @@ extension SettingsView {
                 )
                 .animation(.easeInOut(duration: 0.2), value: shellViewModel.isPauseReminderCardHighlighted)
         }
+    }
+}
+
+private extension SettingsView {
+    var menuBarCaptureFeedbackBinding: Binding<Bool> {
+        Binding(
+            get: {
+                showMenuBarCaptureFeedback
+            },
+            set: { isEnabled in
+                showMenuBarCaptureFeedback = isEnabled
+                DashboardViewModel.recordDeveloperSettingToggle(
+                    coordinator: coordinatorWrapper.coordinator,
+                    source: "settings.capture.menuBarIcon",
+                    settingKey: menuBarCaptureFeedbackDefaultsKey,
+                    isEnabled: isEnabled
+                )
+            }
+        )
     }
 }

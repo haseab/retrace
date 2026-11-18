@@ -7,59 +7,6 @@ import App
 
 @MainActor
 final class DateJumpRelativeDayAnchoringTests: XCTestCase {
-    func testYearOnlyUsesFirstFrameInResolvedYear() async {
-        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
-        let calendar = Calendar.current
-        let year = makeDate(year: 2024, month: 1, day: 1, hour: 0, minute: 0)
-        guard let yearInterval = calendar.dateInterval(of: .year, for: year) else {
-            XCTFail("Failed to construct expected year interval")
-            return
-        }
-
-        var anchoredTimestamp: Date?
-        var sawYearAnchorFetch = false
-        var sawWindowFetch = false
-
-        viewModel.test_windowFetchHooks.getFramesWithVideoInfo = { start, end, limit, _, reason in
-            switch reason {
-            case "searchForDate.anchor.firstFrameInYear":
-                sawYearAnchorFetch = true
-                XCTAssertEqual(limit, 1)
-                XCTAssertEqual(start.timeIntervalSince(yearInterval.start), 0, accuracy: 0.01)
-                XCTAssertEqual(end.timeIntervalSince(yearInterval.end), -0.001, accuracy: 0.01)
-                let firstFrameInYear = start.addingTimeInterval(123)
-                anchoredTimestamp = firstFrameInYear
-                return [self.makeFrameWithVideoInfo(id: 6899, timestamp: firstFrameInYear, processingStatus: 4)]
-
-            case "searchForDate":
-                sawWindowFetch = true
-                guard let anchoredTimestamp else {
-                    XCTFail("Expected year anchor to resolve before window fetch")
-                    return []
-                }
-                XCTAssertEqual(limit, 1000)
-                XCTAssertEqual(start.timeIntervalSince(anchoredTimestamp), -600, accuracy: 0.01)
-                XCTAssertEqual(end.timeIntervalSince(anchoredTimestamp), 600, accuracy: 0.01)
-                return [self.makeFrameWithVideoInfo(id: 6899, timestamp: anchoredTimestamp, processingStatus: 4)]
-
-            case "loadNewerFrames.reason=searchForDate",
-                 "loadOlderFrames.reason=searchForDate":
-                return []
-
-            default:
-                XCTFail("Unexpected fetch reason: \(reason)")
-                return []
-            }
-        }
-
-        await viewModel.searchForDate("2024")
-
-        XCTAssertTrue(sawYearAnchorFetch)
-        XCTAssertTrue(sawWindowFetch)
-        XCTAssertEqual(viewModel.currentTimelineFrame?.frame.id.value, 6899)
-        XCTAssertEqual(viewModel.currentTimelineFrame?.frame.timestamp, anchoredTimestamp)
-    }
-
     func testMonthAndYearUseFirstFrameInResolvedMonth() async {
         let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
         let calendar = Calendar.current
@@ -711,6 +658,243 @@ final class DateJumpRelativeDayAnchoringTests: XCTestCase {
         XCTAssertFalse(sawLookbackFetch)
         XCTAssertTrue(sawWindowFetch)
         XCTAssertEqual(viewModel.currentTimelineFrame?.frame.id.value, 7341)
+        XCTAssertEqual(viewModel.currentTimelineFrame?.frame.timestamp, expectedTarget)
+    }
+
+    func testCompact24HourTimeWithDayAgoShorthandRemainsExact() async {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let calendar = Calendar.current
+        let now = Date()
+
+        var todayAtTargetComponents = calendar.dateComponents([.year, .month, .day], from: now)
+        todayAtTargetComponents.hour = 18
+        todayAtTargetComponents.minute = 43
+        todayAtTargetComponents.second = 0
+        guard
+            let todayAtTarget = calendar.date(from: todayAtTargetComponents),
+            let expectedTarget = calendar.date(byAdding: .day, value: -1, to: todayAtTarget)
+        else {
+            XCTFail("Failed to construct expected exact target")
+            return
+        }
+
+        var sawAnchorFetch = false
+        var sawWindowFetch = false
+
+        viewModel.test_windowFetchHooks.getFramesWithVideoInfo = { start, end, _, _, reason in
+            switch reason {
+            case "searchForDate.anchor.firstFrameInRelativeLookback",
+                 "searchForDate.anchor.firstFrameInDay",
+                 "searchForDate.anchor.firstFrameInHour",
+                 "searchForDate.anchor.firstFrameInMinute":
+                sawAnchorFetch = true
+                XCTFail("1843 1da should remain an exact timestamp search")
+                return []
+
+            case "searchForDate":
+                sawWindowFetch = true
+                XCTAssertEqual(start.timeIntervalSince(expectedTarget), -600, accuracy: 0.01)
+                XCTAssertEqual(end.timeIntervalSince(expectedTarget), 600, accuracy: 0.01)
+                return [self.makeFrameWithVideoInfo(id: 7345, timestamp: expectedTarget, processingStatus: 4)]
+
+            case "loadNewerFrames.reason=searchForDate",
+                 "loadOlderFrames.reason=searchForDate":
+                return []
+
+            default:
+                XCTFail("Unexpected fetch reason: \(reason)")
+                return []
+            }
+        }
+
+        await viewModel.searchForDate("1843 1da")
+
+        XCTAssertFalse(sawAnchorFetch)
+        XCTAssertTrue(sawWindowFetch)
+        XCTAssertEqual(viewModel.currentTimelineFrame?.frame.id.value, 7345)
+        XCTAssertEqual(viewModel.currentTimelineFrame?.frame.timestamp, expectedTarget)
+    }
+
+    func testThatDayTimeUsesPlayheadCalendarDate() async {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let base = makeDate(year: 2026, month: 3, day: 25, hour: 14, minute: 37)
+        let expectedTarget = makeDate(year: 2026, month: 3, day: 25, hour: 18, minute: 0)
+        viewModel.frames = [makeTimelineFrame(id: 7350, timestamp: base, processingStatus: 4)]
+        viewModel.currentIndex = 0
+
+        var sawWindowFetch = false
+
+        viewModel.test_windowFetchHooks.getFramesWithVideoInfo = { start, end, _, _, reason in
+            switch reason {
+            case "searchForDate":
+                sawWindowFetch = true
+                XCTAssertEqual(start.timeIntervalSince(expectedTarget), -600, accuracy: 0.01)
+                XCTAssertEqual(end.timeIntervalSince(expectedTarget), 600, accuracy: 0.01)
+                return [self.makeFrameWithVideoInfo(id: 7351, timestamp: expectedTarget, processingStatus: 4)]
+
+            case "loadNewerFrames.reason=searchForDate",
+                 "loadOlderFrames.reason=searchForDate":
+                return []
+
+            default:
+                XCTFail("Unexpected fetch reason: \(reason)")
+                return []
+            }
+        }
+
+        await viewModel.searchForDate("6pm that day")
+
+        XCTAssertTrue(sawWindowFetch)
+        XCTAssertEqual(viewModel.currentTimelineFrame?.frame.id.value, 7351)
+        XCTAssertEqual(viewModel.currentTimelineFrame?.frame.timestamp, expectedTarget)
+    }
+
+    func testSameDayUsesPlayheadDayBucket() async {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let calendar = Calendar.current
+        let base = makeDate(year: 2026, month: 3, day: 25, hour: 14, minute: 37)
+        guard let dayInterval = calendar.dateInterval(of: .day, for: base) else {
+            XCTFail("Failed to construct expected playhead day interval")
+            return
+        }
+        viewModel.frames = [makeTimelineFrame(id: 7360, timestamp: base, processingStatus: 4)]
+        viewModel.currentIndex = 0
+
+        var anchoredTimestamp: Date?
+        var sawDayAnchorFetch = false
+        var sawWindowFetch = false
+
+        viewModel.test_windowFetchHooks.getFramesWithVideoInfo = { start, end, limit, _, reason in
+            switch reason {
+            case "searchForDate.anchor.firstFrameInDay":
+                sawDayAnchorFetch = true
+                XCTAssertEqual(limit, 1)
+                XCTAssertEqual(start.timeIntervalSince(dayInterval.start), 0, accuracy: 0.01)
+                XCTAssertEqual(end.timeIntervalSince(dayInterval.end), -0.001, accuracy: 0.01)
+                let firstFrameInDay = dayInterval.start.addingTimeInterval(215)
+                anchoredTimestamp = firstFrameInDay
+                return [self.makeFrameWithVideoInfo(id: 7361, timestamp: firstFrameInDay, processingStatus: 4)]
+
+            case "searchForDate":
+                sawWindowFetch = true
+                guard let anchoredTimestamp else {
+                    XCTFail("Expected same-day anchor to resolve before window fetch")
+                    return []
+                }
+                XCTAssertEqual(start.timeIntervalSince(anchoredTimestamp), -600, accuracy: 0.01)
+                XCTAssertEqual(end.timeIntervalSince(anchoredTimestamp), 600, accuracy: 0.01)
+                return [self.makeFrameWithVideoInfo(id: 7361, timestamp: anchoredTimestamp, processingStatus: 4)]
+
+            case "loadNewerFrames.reason=searchForDate",
+                 "loadOlderFrames.reason=searchForDate":
+                return []
+
+            default:
+                XCTFail("Unexpected fetch reason: \(reason)")
+                return []
+            }
+        }
+
+        await viewModel.searchForDate("same day")
+
+        XCTAssertTrue(sawDayAnchorFetch)
+        XCTAssertTrue(sawWindowFetch)
+        XCTAssertEqual(viewModel.currentTimelineFrame?.frame.id.value, 7361)
+        XCTAssertEqual(viewModel.currentTimelineFrame?.frame.timestamp, anchoredTimestamp)
+    }
+
+    func testAbsoluteCalendarDateWithSoftHourUsesFirstFrameInResolvedHour() async {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let calendar = Calendar.current
+        let targetHour = makeDate(year: 2026, month: 4, day: 16, hour: 21, minute: 0)
+        guard let hourInterval = calendar.dateInterval(of: .hour, for: targetHour) else {
+            XCTFail("Failed to construct expected hour interval")
+            return
+        }
+
+        var anchoredTimestamp: Date?
+        var sawHourAnchorFetch = false
+        var sawWindowFetch = false
+
+        viewModel.test_windowFetchHooks.getFramesWithVideoInfo = { start, end, limit, _, reason in
+            switch reason {
+            case "searchForDate.anchor.firstFrameInHour":
+                sawHourAnchorFetch = true
+                XCTAssertEqual(limit, 1)
+                XCTAssertEqual(start.timeIntervalSince(hourInterval.start), 0, accuracy: 0.01)
+                XCTAssertEqual(end.timeIntervalSince(hourInterval.end), -0.001, accuracy: 0.01)
+                let firstFrameInHour = hourInterval.start.addingTimeInterval(137)
+                anchoredTimestamp = firstFrameInHour
+                return [self.makeFrameWithVideoInfo(id: 7365, timestamp: firstFrameInHour, processingStatus: 4)]
+
+            case "searchForDate":
+                sawWindowFetch = true
+                guard let anchoredTimestamp else {
+                    XCTFail("Expected hour anchor to resolve before window fetch")
+                    return []
+                }
+                XCTAssertEqual(start.timeIntervalSince(anchoredTimestamp), -600, accuracy: 0.01)
+                XCTAssertEqual(end.timeIntervalSince(anchoredTimestamp), 600, accuracy: 0.01)
+                return [self.makeFrameWithVideoInfo(id: 7365, timestamp: anchoredTimestamp, processingStatus: 4)]
+
+            case "loadNewerFrames.reason=searchForDate",
+                 "loadOlderFrames.reason=searchForDate":
+                return []
+
+            default:
+                XCTFail("Unexpected fetch reason: \(reason)")
+                return []
+            }
+        }
+
+        await viewModel.searchForDate("April 16 2026 9pm")
+
+        XCTAssertTrue(sawHourAnchorFetch)
+        XCTAssertTrue(sawWindowFetch)
+        XCTAssertEqual(viewModel.currentTimelineFrame?.frame.id.value, 7365)
+        XCTAssertEqual(viewModel.currentTimelineFrame?.frame.timestamp, anchoredTimestamp)
+    }
+
+    func testAbsoluteCalendarDateWithMinutePrecisionRemainsExact() async {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let expectedTarget = makeDate(year: 2026, month: 4, day: 16, hour: 21, minute: 0)
+
+        var sawAnchorFetch = false
+        var sawWindowFetch = false
+
+        viewModel.test_windowFetchHooks.getFramesWithVideoInfo = { start, end, _, _, reason in
+            switch reason {
+            case "searchForDate.anchor.firstFrameInRelativeLookback",
+                 "searchForDate.anchor.firstFrameInDay",
+                 "searchForDate.anchor.firstFrameInHour",
+                 "searchForDate.anchor.firstFrameInMinute",
+                 "searchForDate.anchor.firstFrameInMonth",
+                 "searchForDate.anchor.firstFrameInYear":
+                sawAnchorFetch = true
+                XCTFail("April 16 2026 9:00pm should remain an exact timestamp search")
+                return []
+
+            case "searchForDate":
+                sawWindowFetch = true
+                XCTAssertEqual(start.timeIntervalSince(expectedTarget), -600, accuracy: 0.01)
+                XCTAssertEqual(end.timeIntervalSince(expectedTarget), 600, accuracy: 0.01)
+                return [self.makeFrameWithVideoInfo(id: 7366, timestamp: expectedTarget, processingStatus: 4)]
+
+            case "loadNewerFrames.reason=searchForDate",
+                 "loadOlderFrames.reason=searchForDate":
+                return []
+
+            default:
+                XCTFail("Unexpected fetch reason: \(reason)")
+                return []
+            }
+        }
+
+        await viewModel.searchForDate("April 16 2026 9:00pm")
+
+        XCTAssertFalse(sawAnchorFetch)
+        XCTAssertTrue(sawWindowFetch)
+        XCTAssertEqual(viewModel.currentTimelineFrame?.frame.id.value, 7366)
         XCTAssertEqual(viewModel.currentTimelineFrame?.frame.timestamp, expectedTarget)
     }
 

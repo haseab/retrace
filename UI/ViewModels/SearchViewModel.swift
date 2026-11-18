@@ -226,6 +226,20 @@ public class SearchViewModel: ObservableObject {
         }
     }
 
+    struct ResultNavigationState: Equatable {
+        let currentIndex: Int
+        let loadedCount: Int
+        let canNavigatePrevious: Bool
+        let canNavigateNext: Bool
+        let canLoadMore: Bool
+        let isLoadingMore: Bool
+
+        var currentPosition: Int { currentIndex + 1 }
+        var requestsMoreResultsOnNextAdvance: Bool {
+            canLoadMore && currentIndex >= max(0, loadedCount - 2)
+        }
+    }
+
     // MARK: - Published State
 
     @Published public var searchQuery: String = "" {
@@ -304,11 +318,10 @@ public class SearchViewModel: ObservableObject {
     public var savedScrollPosition: CGFloat = 0
 
     // Thumbnail cache - persists across overlay open/close, cleared on new search
-    @Published public var thumbnailCache: [String: NSImage] = [:] {
-        didSet {
-            thumbnailCacheBytes = UIMemoryEstimator.imageDictionaryBytes(thumbnailCache)
-        }
-    }
+    @Published public private(set) var thumbnailCache: [String: NSImage] = [:]
+    @Published public private(set) var thumbnailContentRevision = UserDefaults.standard.string(forKey: "search.thumbnailContentRevision.v2") ?? "initial-v2"
+    private let thumbnailDiskEpoch = PreviewCacheEpoch()
+    private var thumbnailCosts: [String: Int64] = [:]
     @Published public var loadingThumbnails: Set<String> = []
     @Published public var appIconCache: [String: NSImage] = [:] {
         didSet {
@@ -366,7 +379,8 @@ public class SearchViewModel: ObservableObject {
     @Published public var collapseOverlaySignal: UUID = UUID()
 
     // Signal to refocus the spotlight search field from parent-level handlers.
-    @Published public var focusSearchFieldSignal: UUID = UUID()
+    // selectAll=true is used when returning from results so the existing query is easy to replace.
+    @Published public var focusSearchFieldSignal: (selectAll: Bool, id: UUID) = (false, UUID())
 
     // Signal to dismiss the recent-entries popover as if the user clicked the header "x".
     @Published public var dismissRecentEntriesPopoverSignal: UUID = UUID()
@@ -426,13 +440,14 @@ public class SearchViewModel: ObservableObject {
     private let otherAppsRefreshDelayNs: UInt64 = 2_000_000_000
     private let memoryReportIntervalNs: UInt64 = 5_000_000_000
     private let maxInMemoryThumbnailCount = 60
+    private let maxInMemoryThumbnailBytes: Int64 = 32 * 1024 * 1024
     nonisolated private static let memoryLedgerSummaryIntervalSeconds: TimeInterval = 30
     nonisolated private static let memoryLedgerThumbnailTag = "ui.search.thumbnailCache"
     nonisolated private static let memoryLedgerAppIconTag = "ui.search.appIconCache"
     nonisolated private static let memoryLedgerResultSetTag = "ui.search.resultSet"
     nonisolated private static let memoryLedgerRecentSearchesTag = "ui.search.recentEntries"
-    private static let thumbnailDiskCacheMaxBytes: Int64 = 512 * 1024 * 1024
-    private static let thumbnailDiskCacheMaxAge: TimeInterval = 7 * 24 * 60 * 60
+    private nonisolated static let thumbnailDiskCacheMaxBytes: Int64 = 512 * 1024 * 1024
+    private nonisolated static let thumbnailDiskCacheMaxAge: TimeInterval = 7 * 24 * 60 * 60
     private static let maxRecentSearchEntryCount = 80
     private static let recentSearchEntriesKey = "search.recentEntries.v1"
     private static let encodedMetadataFilterPrefix = "__retrace_meta_filter_v1__"
@@ -494,19 +509,19 @@ public class SearchViewModel: ObservableObject {
 
     /// File path for cached other apps data
     private static nonisolated var cachedOtherAppsPath: URL {
-        let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
+        let cacheDir = AppPaths.cacheDirectory
         return cacheDir.appendingPathComponent("other_apps_cache.json")
     }
 
     /// File path for cached search results data
     private static nonisolated var cachedSearchResultsPath: URL {
-        let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
+        let cacheDir = AppPaths.cacheDirectory
         return cacheDir.appendingPathComponent("search_results_cache.json")
     }
 
     /// File path for disk-backed search thumbnails.
     private static nonisolated var cachedSearchThumbnailsDirectory: URL {
-        let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
+        let cacheDir = AppPaths.cacheDirectory
         return cacheDir.appendingPathComponent("search_thumbnails_v1", isDirectory: true)
     }
 
@@ -535,6 +550,18 @@ public class SearchViewModel: ObservableObject {
     // MARK: - Setup
 
     private func setupBindings() {
+        NotificationCenter.default.publisher(for: PhraseRedactionMode.didFinishNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                self.thumbnailDiskEpoch.invalidate()
+                self.thumbnailContentRevision = UUID().uuidString
+                UserDefaults.standard.set(self.thumbnailContentRevision, forKey: "search.thumbnailContentRevision.v2")
+                self.searchGeneration += 1
+                self.clearInMemoryThumbnailCache()
+            }
+            .store(in: &cancellables)
+
         // NOTE: Auto-search on typing is disabled - search is triggered manually on Enter
         // Clear results and cache when query is cleared by user (not on init)
         $searchQuery
@@ -600,19 +627,18 @@ public class SearchViewModel: ObservableObject {
         .store(in: &cancellables)
     }
 
+    private nonisolated static var thumbnailTrimPolicy: PreviewCacheDiskWorker.TrimPolicy {
+        .init(directory: cachedSearchThumbnailsDirectory, maxBytes: thumbnailDiskCacheMaxBytes, maxAge: thumbnailDiskCacheMaxAge)
+    }
+
     private func prepareThumbnailDiskCache() {
-        Task.detached(priority: .utility) {
-            let directory = Self.cachedSearchThumbnailsDirectory
-            try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            Self.trimThumbnailDiskCache(
-                maxBytes: Self.thumbnailDiskCacheMaxBytes,
-                maxAge: Self.thumbnailDiskCacheMaxAge
-            )
-        }
+        PreviewCacheDiskWorker.shared.requestTrim(Self.thumbnailTrimPolicy)
     }
 
     private func clearInMemoryThumbnailCache() {
         thumbnailCache.removeAll()
+        thumbnailCosts.removeAll()
+        thumbnailCacheBytes = 0
         loadingThumbnails.removeAll()
         thumbnailLRUKeys.removeAll()
     }
@@ -638,10 +664,7 @@ public class SearchViewModel: ObservableObject {
         generation: Int,
         persistToDisk: Bool = true
     ) {
-        guard searchGeneration == generation else {
-            loadingThumbnails.remove(key)
-            return
-        }
+        guard searchGeneration == generation else { return }
         insertThumbnailIntoMemory(image, for: key)
         loadingThumbnails.remove(key)
         if persistToDisk {
@@ -654,10 +677,7 @@ public class SearchViewModel: ObservableObject {
         for key: String,
         generation: Int
     ) {
-        guard searchGeneration == generation else {
-            loadingThumbnails.remove(key)
-            return
-        }
+        guard searchGeneration == generation else { return }
         if let placeholder {
             insertThumbnailIntoMemory(placeholder, for: key)
         }
@@ -665,6 +685,10 @@ public class SearchViewModel: ObservableObject {
     }
 
     public func loadThumbnailFromDiskIfAvailable(for key: String, generation: Int) async -> Bool {
+        guard searchGeneration == generation else { return false }
+        let privacyDefaults = UserDefaults(suiteName: ReversibleOCRScrambler.settingsSuiteName) ?? .standard
+        guard !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { return false }
+
         if thumbnailCache[key] != nil {
             touchThumbnailKey(key)
             return true
@@ -675,7 +699,8 @@ public class SearchViewModel: ObservableObject {
             try? Data(contentsOf: url, options: [.mappedIfSafe])
         }.value
 
-        guard let data, searchGeneration == generation else { return false }
+        guard let data, searchGeneration == generation,
+              !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { return false }
         guard let image = NSImage(data: data) else { return false }
 
         insertThumbnailIntoMemory(image, for: key)
@@ -683,6 +708,11 @@ public class SearchViewModel: ObservableObject {
     }
 
     private func insertThumbnailIntoMemory(_ image: NSImage, for key: String) {
+        let cost = PreviewThumbnailIdentity.memoryCost(image)
+        guard cost <= maxInMemoryThumbnailBytes else { return }
+        thumbnailCacheBytes -= thumbnailCosts[key] ?? 0
+        thumbnailCosts[key] = cost
+        thumbnailCacheBytes += cost
         thumbnailCache[key] = image
         touchThumbnailKey(key)
         evictThumbnailsIfNeeded()
@@ -696,97 +726,28 @@ public class SearchViewModel: ObservableObject {
     }
 
     private func evictThumbnailsIfNeeded() {
-        guard thumbnailCache.count > maxInMemoryThumbnailCount else { return }
-
-        let evictCount = thumbnailCache.count - maxInMemoryThumbnailCount
-        for _ in 0..<evictCount {
+        while thumbnailCache.count > maxInMemoryThumbnailCount || thumbnailCacheBytes > maxInMemoryThumbnailBytes {
             guard let oldestKey = thumbnailLRUKeys.first else { break }
             thumbnailLRUKeys.removeFirst()
             thumbnailCache.removeValue(forKey: oldestKey)
+            thumbnailCacheBytes -= thumbnailCosts.removeValue(forKey: oldestKey) ?? 0
         }
     }
 
     private func persistThumbnailToDisk(_ image: NSImage, for key: String) {
-        guard let tiffData = image.tiffRepresentation else { return }
-        let targetURL = Self.diskThumbnailURL(for: key)
-
-        Task.detached(priority: .utility) {
-            guard let data = Self.jpegData(fromTIFFData: tiffData) else { return }
-            let directory = Self.cachedSearchThumbnailsDirectory
-            try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            do {
-                try data.write(to: targetURL, options: .atomic)
-                Self.trimThumbnailDiskCache(
-                    maxBytes: Self.thumbnailDiskCacheMaxBytes,
-                    maxAge: Self.thumbnailDiskCacheMaxAge
-                )
-            } catch {
-                // Ignore disk cache write failures; memory cache still serves this thumbnail.
-            }
-        }
+        let privacyDefaults = UserDefaults(suiteName: ReversibleOCRScrambler.settingsSuiteName) ?? .standard
+        guard !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { return }
+        let epoch = thumbnailDiskEpoch
+        let token = epoch.current
+        PreviewCacheDiskWorker.shared.enqueueThumbnail(image, to: Self.diskThumbnailURL(for: key), allowed: {
+            epoch.matches(token) && !PhraseRedactionMode.isEnabled(in: privacyDefaults)
+        }, trim: Self.thumbnailTrimPolicy)
     }
 
     private nonisolated static func diskThumbnailURL(for key: String) -> URL {
         let digest = SHA256.hash(data: Data(key.utf8))
         let fileName = digest.map { String(format: "%02x", $0) }.joined()
         return cachedSearchThumbnailsDirectory.appendingPathComponent("\(fileName).jpg")
-    }
-
-    private nonisolated static func jpegData(fromTIFFData tiffData: Data) -> Data? {
-        guard let bitmapRep = NSBitmapImageRep(data: tiffData) else { return nil }
-        return bitmapRep.representation(
-            using: .jpeg,
-            properties: [.compressionFactor: 0.72]
-        )
-    }
-
-    private nonisolated static func trimThumbnailDiskCache(maxBytes: Int64, maxAge: TimeInterval) {
-        let directory = cachedSearchThumbnailsDirectory
-        let fileManager = FileManager.default
-
-        guard let urls = try? fileManager.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey],
-            options: [.skipsHiddenFiles]
-        ) else {
-            return
-        }
-
-        let cutoff = Date().addingTimeInterval(-maxAge)
-        struct DiskEntry {
-            let url: URL
-            let modifiedAt: Date
-            let size: Int64
-        }
-
-        var entries: [DiskEntry] = []
-        var totalBytes: Int64 = 0
-
-        for url in urls {
-            guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey]),
-                  values.isRegularFile == true else {
-                continue
-            }
-
-            let modifiedAt = values.contentModificationDate ?? .distantPast
-            let size = Int64(values.fileSize ?? 0)
-
-            if modifiedAt < cutoff {
-                try? fileManager.removeItem(at: url)
-                continue
-            }
-
-            entries.append(DiskEntry(url: url, modifiedAt: modifiedAt, size: size))
-            totalBytes += size
-        }
-
-        guard totalBytes > maxBytes else { return }
-
-        let sortedByOldest = entries.sorted { $0.modifiedAt < $1.modifiedAt }
-        for entry in sortedByOldest where totalBytes > maxBytes {
-            try? fileManager.removeItem(at: entry.url)
-            totalBytes -= entry.size
-        }
     }
 
     private func startMemoryReporting() {
@@ -803,11 +764,6 @@ public class SearchViewModel: ObservableObject {
 
     private func logMemorySnapshot() {
         let resultCount = results?.results.count ?? 0
-        Log.info(
-            "[Search-Memory] results=\(resultCount) visibleResults=\(visibleResults.count) thumbnails=\(thumbnailCache.count)/\(Self.formatBytes(thumbnailCacheBytes)) appIcons=\(appIconCache.count)/\(Self.formatBytes(appIconCacheBytes))",
-            category: .ui
-        )
-
         updateMemoryLedger(resultCount: resultCount)
     }
 
@@ -1151,8 +1107,9 @@ public class SearchViewModel: ObservableObject {
     }
 
     /// Ask the overlay view to move focus back to the search field.
-    public func requestSearchFieldFocus() {
-        focusSearchFieldSignal = UUID()
+    /// - Parameter selectAll: Whether the current query should be fully selected after focus is restored.
+    public func requestSearchFieldFocus(selectAll: Bool = false) {
+        focusSearchFieldSignal = (selectAll, UUID())
     }
 
     /// Set a one-shot delay for the next "Recent Entries" popover reveal.
@@ -1316,6 +1273,8 @@ public class SearchViewModel: ObservableObject {
         guard !query.isEmpty else {
             results = nil
             committedSearchQuery = ""
+            selectedResult = nil
+            showingFrameViewer = false
             clearInMemoryThumbnailCache()
             didReachPaginationEnd = false
             nextPageCursor = nil
@@ -1330,6 +1289,8 @@ public class SearchViewModel: ObservableObject {
 
         results = nil  // Clear old results immediately to prevent stale thumbnail loads
         savedScrollPosition = 0  // Reset scroll position for new search
+        selectedResult = nil
+        showingFrameViewer = false
         clearInMemoryThumbnailCache()  // Clear in-memory thumbnail cache for new search
         searchGeneration += 1  // Increment generation to invalidate in-flight thumbnail loads
         committedSearchQuery = query  // Set committed query for thumbnail cache keys
@@ -1667,6 +1628,10 @@ public class SearchViewModel: ObservableObject {
     public func selectResult(_ result: SearchResult) {
         selectedResult = result
         showingFrameViewer = true
+        updateSavedScrollPosition(for: result)
+        if let selectedIndex = selectedResultIndex(in: results?.results, selectedResult: result) {
+            prefetchMoreResultsIfNeeded(selectedIndex: selectedIndex)
+        }
     }
 
     public func closeFrameViewer() {
@@ -1751,7 +1716,7 @@ public class SearchViewModel: ObservableObject {
             guard let self else { return }
 
             do {
-                try await Task.sleep(nanoseconds: otherAppsRefreshDelayNs)
+                try await Task.sleep(for: .nanoseconds(Int64(otherAppsRefreshDelayNs)), clock: .continuous)
             } catch {
                 return
             }
@@ -2056,26 +2021,88 @@ public class SearchViewModel: ObservableObject {
 
     // MARK: - Navigation
 
-    public func nextResult() {
-        guard let results = results,
-              let current = selectedResult,
-              let index = results.results.firstIndex(where: { $0.frameID == current.frameID }),
-              index + 1 < results.results.count else {
-            return
+    var selectedResultNavigationState: ResultNavigationState? {
+        guard let loadedResults = results?.results,
+              let currentIndex = selectedResultIndex(in: loadedResults) else {
+            return nil
         }
 
-        selectResult(results.results[index + 1])
+        return ResultNavigationState(
+            currentIndex: currentIndex,
+            loadedCount: loadedResults.count,
+            canNavigatePrevious: currentIndex > 0,
+            canNavigateNext: currentIndex + 1 < loadedResults.count,
+            canLoadMore: canLoadMore,
+            isLoadingMore: isLoadingMore
+        )
     }
 
-    public func previousResult() {
-        guard let results = results,
-              let current = selectedResult,
-              let index = results.results.firstIndex(where: { $0.frameID == current.frameID }),
-              index > 0 else {
-            return
+    @discardableResult
+    public func nextResult() -> SearchResult? {
+        selectAdjacentResult(offset: 1)
+    }
+
+    @discardableResult
+    public func previousResult() -> SearchResult? {
+        selectAdjacentResult(offset: -1)
+    }
+
+    @discardableResult
+    func selectAdjacentResult(offset: Int) -> SearchResult? {
+        guard offset != 0,
+              let loadedResults = results?.results,
+              let currentIndex = selectedResultIndex(in: loadedResults) else {
+            return nil
         }
 
-        selectResult(results.results[index - 1])
+        prefetchMoreResultsIfNeeded(selectedIndex: currentIndex)
+
+        let targetIndex = currentIndex + offset
+        guard loadedResults.indices.contains(targetIndex) else {
+            return nil
+        }
+
+        let targetResult = loadedResults[targetIndex]
+        selectResult(targetResult)
+        return targetResult
+    }
+
+    private func selectedResultIndex(in loadedResults: [SearchResult]?, selectedResult: SearchResult? = nil) -> Int? {
+        guard let loadedResults else { return nil }
+        let targetResult = selectedResult ?? self.selectedResult
+        guard let targetResult else { return nil }
+        return loadedResults.firstIndex(where: { $0.id == targetResult.id })
+    }
+
+    private func updateSavedScrollPosition(for result: SearchResult) {
+        guard let selectedIndex = selectedResultIndex(in: results?.results, selectedResult: result) else {
+            return
+        }
+        savedScrollPosition = CGFloat(selectedIndex)
+    }
+
+    private func prefetchMoreResultsIfNeeded(selectedIndex: Int, threshold: Int = 1) {
+        guard let loadedResults = results?.results,
+              shouldPrefetchMoreResults(
+                  selectedIndex: selectedIndex,
+                  loadedCount: loadedResults.count,
+                  canLoadMore: canLoadMore,
+                  threshold: threshold
+              ) else {
+            return
+        }
+        loadMore()
+    }
+
+    private func shouldPrefetchMoreResults(
+        selectedIndex: Int,
+        loadedCount: Int,
+        canLoadMore: Bool,
+        threshold: Int
+    ) -> Bool {
+        guard loadedCount > 0, canLoadMore else { return false }
+        let prefetchBoundaryIndex = max(0, loadedCount - 1 - threshold)
+        return selectedIndex >= prefetchBoundaryIndex
     }
 
     // MARK: - Sharing
