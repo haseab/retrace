@@ -29,6 +29,8 @@ Capture/
 │   ├── AppInfoProvider.swift      # Get active app info via NSWorkspace
 │   ├── ForegroundWindowSelection.swift # Reject sharing helpers and background processes for attribution
 │   ├── BrowserURLExtractor.swift  # Extract URL from browsers (AX API)
+│   ├── ConferenceCallObservation.swift # Injectable observations and deterministic consent replay
+│   ├── ConferenceWindowImageProvider.swift # Isolated window images and face-mask projection
 │   ├── ConferenceCallActivityProvider.swift # Bounded window-specific active-call accessibility lookup
 │   └── ConferenceSessionPrivacyPolicy.swift # Conferencing-session rules + session-scoped consent
 └── Tests/
@@ -38,12 +40,25 @@ Capture/
     ├── BrowserURLAppleScriptCoordinatorTests.swift
     ├── ExcludedWindowMaskerTests.swift # Pixel coverage and injected render-failure regression coverage
     ├── ForegroundWindowSelectionTests.swift
+    ├── ConferencePrivacyPixelReplayTests.swift # Real Vision and rendering regressions using a controlled gallery
+    ├── ConferenceCallObservationTests.swift # Consent recovery, expiry, and isolation
     ├── ConferenceROIPlannerTests.swift
     ├── ConferenceSessionPrivacyPolicyTests.swift
     ├── CaptureFrameCandidateTests.swift # Committed screenshot pixel/layout comparison
     ├── CaptureTriggerSchedulingTests.swift
     └── DeduplicationTests.swift
 ```
+
+## Conference consent replay boundary
+
+- `ConferenceCallObserving` supplies active, ended, or unknown observations. The AX adapter treats missing controls and failed lookups as unknown.
+- Capture injects the observer and observation clock; `ConferenceCallConsentState.observe` accepts explicit time for deterministic replay tests without live calls.
+- Unknown observations retain existing consent for a bounded interval from the last verified active observation, but apply blur and cannot accept new consent. Recovery of the same identity restores bypass; expiration, disappearance, confirmed end, and reset revoke it.
+- Capture uses `max(8 seconds, 3 capture intervals)` for observation freshness and uncertainty retention. Repeated unknown results never extend the interval.
+- `applyConferencePrivacy` accepts image/window/display inputs for pixel-stage replay; the pixel tests build a controlled gallery from the existing CreatorProfile photo asset. Optional measurements use `RETRACE_MEASURE_FACE_BLUR=1`.
+- When an unconsented window overlaps a consented foreground window, detect faces in its isolated window image and project masks back to the desktop. If the source is unavailable, retain desktop-ROI protection. Preserve unclipped ellipse bounds for partially off-screen windows.
+- Window identity changes and independent windows remain isolated; this boundary does not infer that sibling windows belong to one call.
+- Run `swift test --filter 'ConferenceCallObservationTests|ConferenceSessionPrivacyPolicyTests|ConferenceROIPlannerTests'` for consent and ROI coverage.
 
 ## System Requirements
 

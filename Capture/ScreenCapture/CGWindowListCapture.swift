@@ -478,7 +478,22 @@ public actor CGWindowListCapture {
     private var lastDisplaySurfaceBytes: Int64 = 0
     private var onConferenceFramePrivacyEvent: (@Sendable (ConferenceFramePrivacyEvent) async -> Void)?
     private var conferenceCallConsent = ConferenceCallConsentState()
+    private let conferenceWindowImages: any ConferenceWindowImageProviding
+    private let conferenceCallObserver: any ConferenceCallObserving
+    private let conferenceObservationClock: @Sendable () -> Date
+
+    init(
+        conferenceCallObserver: any ConferenceCallObserving = ConferenceCallActivityProvider(),
+        conferenceWindowImages: any ConferenceWindowImageProviding = ConferenceWindowImageProvider(),
+        conferenceObservationClock: @escaping @Sendable () -> Date = { Date() }
+    ) {
+        self.conferenceWindowImages = conferenceWindowImages
+        self.conferenceCallObserver = conferenceCallObserver
+        self.conferenceObservationClock = conferenceObservationClock
+    }
+
     private var lastConferenceObservationAt: Date?
+    private var lastConferenceWindowSummary: String?
     private var cachedSystemMediaCaptureState = SystemMediaCaptureState(
         cameraInUse: false,
         microphoneInUse: false
@@ -503,6 +518,7 @@ public actor CGWindowListCapture {
         self.lastCaptureBlockReason = nil
         self.conferenceCallConsent.reset()
         self.lastConferenceObservationAt = nil
+        self.lastConferenceWindowSummary = nil
         self.screenLockStateMonitor.start()
 
         // Use provided display ID or fall back to main display
@@ -517,6 +533,7 @@ public actor CGWindowListCapture {
         lastCaptureBlockReason = nil
         conferenceCallConsent.reset()
         lastConferenceObservationAt = nil
+        lastConferenceWindowSummary = nil
         screenLockStateMonitor.stop()
         lastDisplaySurfaceBytes = 0
         updatePersistentCaptureNativeLedger()
@@ -549,7 +566,7 @@ public actor CGWindowListCapture {
         let freshnessInterval = max(8, (currentConfig?.captureIntervalSeconds ?? 2) * 3)
         guard isActive, !normalizedCallID.isEmpty,
               let lastConferenceObservationAt,
-              Date().timeIntervalSince(lastConferenceObservationAt) <= freshnessInterval else {
+              conferenceObservationClock().timeIntervalSince(lastConferenceObservationAt) <= freshnessInterval else {
             return false
         }
         return conferenceCallConsent.disableFaceBlur(callID: normalizedCallID)
@@ -666,185 +683,15 @@ public actor CGWindowListCapture {
         let frameMetadataWindowName = redactionSummary == nil ? visibleWindowContext?.windowName : nil
         let frameMetadataBrowserURL = redactionSummary == nil ? visibleWindowContext?.browserURL : nil
 
-        let conferenceWindowMatches = matchedConferenceWindows(
-            from: exclusionResult.conferenceWindowContexts.tracked,
-            systemMediaCaptureState: systemMediaCaptureState
-        )
-        let observationTime = Date()
-        let freshnessInterval = max(8, config.captureIntervalSeconds * 3)
-        if let lastConferenceObservationAt,
-           observationTime.timeIntervalSince(lastConferenceObservationAt) > freshnessInterval {
-            conferenceCallConsent.reset()
-        }
-        let activeConferenceMatches = conferenceWindowMatches.filter { match in
-            guard let pid = match.context.ownerPID else { return false }
-            return ConferenceCallActivityProvider.hasActiveCallControl(
-                pid: pid, windowTitle: match.context.windowName
-            )
-        }
-        conferenceCallConsent.update(activeCallIDs: Set(activeConferenceMatches.map { $0.callIdentity.id }))
-        lastConferenceObservationAt = observationTime
-        let visibleConferenceWindowIDs = Set(exclusionResult.conferenceWindowContexts.visible.map(\.windowID))
-        let preferredConferenceCallID = preferredConferenceCallID(
-            from: activeConferenceMatches.filter { visibleConferenceWindowIDs.contains($0.context.windowID) },
-            visibleWindowContext: visibleWindowContext
-        )
-
-        for conferenceWindowMatch in conferenceWindowMatches
-            where visibleConferenceWindowIDs.contains(conferenceWindowMatch.context.windowID) {
-            let conferenceContext = conferenceWindowMatch.context
-            let conferenceMatch = conferenceWindowMatch.match
-            let callIdentity = conferenceWindowMatch.callIdentity
-            let callSessionID = conferenceCallConsent.sessionID(for: callIdentity.id)
-            let isPreferredMenuCandidate = callIdentity.id == preferredConferenceCallID
-
-            if let callSessionID, conferenceCallConsent.isBypassed(callID: callSessionID) {
-                await emitConferenceFramePrivacyOutcome(
-                    conferenceMatch: conferenceMatch,
-                    outcome: .consentBypassed,
-                    appBundleID: conferenceContext.appBundleID,
-                    faceCount: 0,
-                    windowLayer: conferenceContext.windowLayer,
-                    windowName: conferenceContext.windowName,
-                    browserURL: conferenceContext.browserURL,
-                    callID: callIdentity.id,
-                    consentSessionID: callSessionID,
-                    isPreferredMenuCandidate: isPreferredMenuCandidate
-                )
-                continue
-            }
-
-            guard let visionROI = normalizedVisionRegionOfInterest(
-                windowBounds: conferenceContext.windowBounds,
-                displayID: displayID
-            ) else {
-                if let fallbackBlurredImage = makeBlurredConferenceWindowImage(
-                    from: cgImage,
-                    windowBounds: conferenceContext.windowBounds,
-                    displayID: displayID
-                ) {
-                    cgImage = fallbackBlurredImage
-                    await emitConferenceFramePrivacyOutcome(
-                        conferenceMatch: conferenceMatch,
-                        outcome: .blurred,
-                        appBundleID: conferenceContext.appBundleID,
-                        faceCount: 0,
-                        windowLayer: conferenceContext.windowLayer,
-                        windowName: conferenceContext.windowName,
-                        browserURL: conferenceContext.browserURL,
-                        callID: callIdentity.id,
-                        consentSessionID: callSessionID,
-                        isPreferredMenuCandidate: isPreferredMenuCandidate
-                    )
-                    Log.warning(
-                        "[ConferencePrivacy] Missing ROI for conference-matched window; applied full-window blur fallback for \(conferenceMatch.kind.rawValue) layer=\(conferenceContext.windowLayer) bounds=\(conferenceContext.windowBounds.map { String(describing: $0) } ?? "nil")",
-                        category: .capture
-                    )
-                    continue
-                }
-
-                await emitConferenceFramePrivacyOutcome(
-                    conferenceMatch: conferenceMatch,
-                    outcome: .droppedDetectionFailure,
-                    appBundleID: conferenceContext.appBundleID,
-                    faceCount: 0,
-                    windowLayer: conferenceContext.windowLayer,
-                    windowName: conferenceContext.windowName,
-                    browserURL: conferenceContext.browserURL,
-                    callID: callIdentity.id,
-                    consentSessionID: callSessionID,
-                    isPreferredMenuCandidate: isPreferredMenuCandidate
-                )
-                Log.error(
-                    "[ConferencePrivacy] Dropping frame after missing ROI and failed full-window blur fallback for \(conferenceMatch.kind.rawValue) layer=\(conferenceContext.windowLayer)",
-                    category: .capture
-                )
-                return nil
-            }
-
-            do {
-                let blurredResult = try await conferenceFaceBlurProcessor.blurFaces(
-                    in: cgImage,
-                    regionOfInterest: visionROI,
-                    configuration: .production
-                )
-                Log.recordLatency(
-                    "capture.conference_face_blur",
-                    valueMs: blurredResult.detectionDurationMs,
-                    category: .capture
-                )
-                if let blurredImage = blurredResult.blurredImage {
-                    cgImage = blurredImage
-                    await emitConferenceFramePrivacyOutcome(
-                        conferenceMatch: conferenceMatch,
-                        outcome: .blurred,
-                        appBundleID: conferenceContext.appBundleID,
-                        faceCount: blurredResult.faceCount,
-                        windowLayer: conferenceContext.windowLayer,
-                        windowName: conferenceContext.windowName,
-                        browserURL: conferenceContext.browserURL,
-                        callID: callIdentity.id,
-                        consentSessionID: callSessionID,
-                        isPreferredMenuCandidate: isPreferredMenuCandidate
-                    )
-                } else {
-                    await emitConferenceFramePrivacyOutcome(
-                        conferenceMatch: conferenceMatch,
-                        outcome: .noFacesDetected,
-                        appBundleID: conferenceContext.appBundleID,
-                        faceCount: 0,
-                        windowLayer: conferenceContext.windowLayer,
-                        windowName: conferenceContext.windowName,
-                        browserURL: conferenceContext.browserURL,
-                        callID: callIdentity.id,
-                        consentSessionID: callSessionID,
-                        isPreferredMenuCandidate: isPreferredMenuCandidate
-                    )
-                }
-            } catch {
-                if let fallbackBlurredImage = makeBlurredConferenceWindowImage(
-                    from: cgImage,
-                    windowBounds: conferenceContext.windowBounds,
-                    displayID: displayID
-                ) {
-                    cgImage = fallbackBlurredImage
-                    await emitConferenceFramePrivacyOutcome(
-                        conferenceMatch: conferenceMatch,
-                        outcome: .blurred,
-                        appBundleID: conferenceContext.appBundleID,
-                        faceCount: 0,
-                        windowLayer: conferenceContext.windowLayer,
-                        windowName: conferenceContext.windowName,
-                        browserURL: conferenceContext.browserURL,
-                        callID: callIdentity.id,
-                        consentSessionID: callSessionID,
-                        isPreferredMenuCandidate: isPreferredMenuCandidate
-                    )
-                    Log.warning(
-                        "[ConferencePrivacy] Face detection failed; applied full-window blur fallback for \(conferenceMatch.kind.rawValue) layer=\(conferenceContext.windowLayer): \(error.localizedDescription)",
-                        category: .capture
-                    )
-                } else {
-                    await emitConferenceFramePrivacyOutcome(
-                        conferenceMatch: conferenceMatch,
-                        outcome: .droppedDetectionFailure,
-                        appBundleID: conferenceContext.appBundleID,
-                        faceCount: 0,
-                        windowLayer: conferenceContext.windowLayer,
-                        windowName: conferenceContext.windowName,
-                        browserURL: conferenceContext.browserURL,
-                        callID: callIdentity.id,
-                        consentSessionID: callSessionID,
-                        isPreferredMenuCandidate: isPreferredMenuCandidate
-                    )
-                    Log.error(
-                        "[ConferencePrivacy] Dropping frame after face detection failure and failed full-window blur fallback for \(conferenceMatch.kind.rawValue) layer=\(conferenceContext.windowLayer): \(error.localizedDescription)",
-                        category: .capture
-                    )
-                    return nil
-                }
-            }
-        }
+        guard let privacyImage = await applyConferencePrivacy(
+            to: cgImage,
+            windows: exclusionResult.conferenceWindowContexts,
+            visibleWindowContext: visibleWindowContext,
+            displayBounds: CGDisplayBounds(displayID),
+            hasActiveMediaCapture: systemMediaCaptureState.hasActiveCapture,
+            captureIntervalSeconds: config.captureIntervalSeconds
+        ) else { return nil }
+        cgImage = privacyImage
 
         // Get display info and captured image dimensions
         let width = cgImage.width
@@ -1409,16 +1256,6 @@ public actor CGWindowListCapture {
         return true
     }
 
-    private func normalizedVisionRegionOfInterest(
-        windowBounds: CGRect?,
-        displayID: CGWindowID
-    ) -> CGRect? {
-        ConferenceROIPlanner.normalizedVisionRegionOfInterest(
-            windowBounds: windowBounds,
-            displayBounds: CGDisplayBounds(displayID)
-        )
-    }
-
     private func currentSystemMediaCaptureState() -> SystemMediaCaptureState {
         let now = Date()
         if now.timeIntervalSince(cachedSystemMediaCaptureObservedAt) < systemMediaCaptureCacheInterval {
@@ -1440,16 +1277,280 @@ public actor CGWindowListCapture {
         )
     }
 
+    /// The real pixel-processing stage accepts a captured image and observed
+    /// metadata, so integration tests can replay it without screen capture or a call.
+    func applyConferencePrivacy(
+        to image: CGImage,
+        windows: ConferenceWindowSelection,
+        visibleWindowContext: VisibleWindowContext?,
+        displayBounds: CGRect,
+        hasActiveMediaCapture: Bool,
+        captureIntervalSeconds: TimeInterval
+    ) async -> CGImage? {
+        let privacyStartedAt = CFAbsoluteTimeGetCurrent()
+        var cgImage = image
+        let conferenceWindowMatches = matchedConferenceWindows(
+            from: windows.tracked,
+            hasActiveMediaCapture: hasActiveMediaCapture
+        )
+        defer {
+            if !conferenceWindowMatches.isEmpty {
+                Log.recordLatency("capture.conference_privacy_total",
+                                  valueMs: (CFAbsoluteTimeGetCurrent() - privacyStartedAt) * 1000,
+                                  category: .capture)
+            }
+        }
+        let observationTime = conferenceObservationClock()
+        let freshnessInterval = max(8, captureIntervalSeconds * 3)
+        if let lastConferenceObservationAt,
+           observationTime.timeIntervalSince(lastConferenceObservationAt) > freshnessInterval {
+            conferenceCallConsent.reset()
+        }
+        let observationStartedAt = CFAbsoluteTimeGetCurrent()
+        let activeCallIDs = conferenceCallConsent.observe(
+            conferenceWindowMatches.map {
+                ConferenceCallObservationTarget(identity: $0.callIdentity.id,
+                                                pid: $0.context.ownerPID,
+                                                windowTitle: $0.context.windowName)
+            },
+            using: conferenceCallObserver,
+            at: observationTime,
+            uncertaintyGraceInterval: freshnessInterval
+        )
+        Log.recordLatency("capture.conference_call_observation",
+                          valueMs: (CFAbsoluteTimeGetCurrent() - observationStartedAt) * 1000,
+                          category: .capture)
+        let activeConferenceMatches = conferenceWindowMatches.filter { activeCallIDs.contains($0.callIdentity.id) }
+        lastConferenceObservationAt = observationTime
+        let visibleConferenceWindowIDs = Set(windows.visible.map(\.windowID))
+        let visibleMatches = conferenceWindowMatches.filter { visibleConferenceWindowIDs.contains($0.context.windowID) }
+        let bypassedCount = visibleMatches.filter { conferenceCallConsent.shouldBypassFaceBlur(for: $0.callIdentity.id) }.count
+        let verifiedCount = visibleMatches.filter { activeCallIDs.contains($0.callIdentity.id) }.count
+        let windowSummary = "matched=\(conferenceWindowMatches.count) visible=\(visibleMatches.count) verified=\(verifiedCount) bypassed=\(bypassedCount) scanning=\(visibleMatches.count - bypassedCount)"
+        if windowSummary != lastConferenceWindowSummary {
+            lastConferenceWindowSummary = windowSummary
+            Log.info("[ConferencePrivacy] Window processing changed: \(windowSummary)", category: .capture)
+        }
+        let preferredConferenceCallID = preferredConferenceCallID(
+            from: activeConferenceMatches.filter { visibleConferenceWindowIDs.contains($0.context.windowID) },
+            visibleWindowContext: visibleWindowContext
+        )
+
+        // Tracked contexts preserve front-to-back CGWindow ordering. Never
+        // infer another window's face locations from consented foreground pixels.
+        var consentedForegroundBounds: [CGRect] = []
+        for conferenceWindowMatch in conferenceWindowMatches
+            where visibleConferenceWindowIDs.contains(conferenceWindowMatch.context.windowID) {
+            let conferenceContext = conferenceWindowMatch.context
+            let conferenceMatch = conferenceWindowMatch.match
+            let callIdentity = conferenceWindowMatch.callIdentity
+            let callSessionID = activeCallIDs.contains(callIdentity.id)
+                ? conferenceCallConsent.sessionID(for: callIdentity.id) : nil
+            let isPreferredMenuCandidate = callIdentity.id == preferredConferenceCallID
+
+            // Retained consent is dormant until the call is positively verified again.
+            if conferenceCallConsent.shouldBypassFaceBlur(for: callIdentity.id) {
+                if let bounds = conferenceContext.windowBounds { consentedForegroundBounds.append(bounds) }
+                await emitConferenceFramePrivacyOutcome(
+                    conferenceMatch: conferenceMatch,
+                    outcome: .consentBypassed,
+                    appBundleID: conferenceContext.appBundleID,
+                    faceCount: 0,
+                    windowLayer: conferenceContext.windowLayer,
+                    windowName: conferenceContext.windowName,
+                    browserURL: conferenceContext.browserURL,
+                    callID: callIdentity.id,
+                    consentSessionID: callSessionID,
+                    isPreferredMenuCandidate: isPreferredMenuCandidate
+                )
+                continue
+            }
+
+            guard let visionROI = ConferenceROIPlanner.normalizedVisionRegionOfInterest(
+                windowBounds: conferenceContext.windowBounds,
+                displayBounds: displayBounds
+            ) else {
+                if let fallbackBlurredImage = makeBlurredConferenceWindowImage(
+                    from: cgImage,
+                    windowBounds: conferenceContext.windowBounds,
+                    displayBounds: displayBounds
+                ) {
+                    cgImage = fallbackBlurredImage
+                    await emitConferenceFramePrivacyOutcome(
+                        conferenceMatch: conferenceMatch,
+                        outcome: .blurred,
+                        appBundleID: conferenceContext.appBundleID,
+                        faceCount: 0,
+                        windowLayer: conferenceContext.windowLayer,
+                        windowName: conferenceContext.windowName,
+                        browserURL: conferenceContext.browserURL,
+                        callID: callIdentity.id,
+                        consentSessionID: callSessionID,
+                        isPreferredMenuCandidate: isPreferredMenuCandidate
+                    )
+                    Log.warning(
+                        "[ConferencePrivacy] Missing ROI for conference-matched window; applied full-window blur fallback for \(conferenceMatch.kind.rawValue) layer=\(conferenceContext.windowLayer) bounds=\(conferenceContext.windowBounds.map { String(describing: $0) } ?? "nil")",
+                        category: .capture
+                    )
+                    continue
+                }
+
+                await emitConferenceFramePrivacyOutcome(
+                    conferenceMatch: conferenceMatch,
+                    outcome: .droppedDetectionFailure,
+                    appBundleID: conferenceContext.appBundleID,
+                    faceCount: 0,
+                    windowLayer: conferenceContext.windowLayer,
+                    windowName: conferenceContext.windowName,
+                    browserURL: conferenceContext.browserURL,
+                    callID: callIdentity.id,
+                    consentSessionID: callSessionID,
+                    isPreferredMenuCandidate: isPreferredMenuCandidate
+                )
+                Log.error(
+                    "[ConferencePrivacy] Dropping frame after missing ROI and failed full-window blur fallback for \(conferenceMatch.kind.rawValue) layer=\(conferenceContext.windowLayer)",
+                    category: .capture
+                )
+                return nil
+            }
+
+            do {
+                let blurStartedAt = CFAbsoluteTimeGetCurrent()
+                let overlapsConsent = conferenceContext.windowBounds.map { bounds in
+                    consentedForegroundBounds.contains { $0.intersects(bounds) }
+                } ?? false
+                let blurredResult = try await blurConferenceWindow(
+                    in: cgImage, context: conferenceContext, regionOfInterest: visionROI,
+                    displayBounds: displayBounds, useWindowSource: overlapsConsent
+                )
+                Log.recordLatency("capture.conference_face_blur_total",
+                                  valueMs: (CFAbsoluteTimeGetCurrent() - blurStartedAt) * 1000,
+                                  category: .capture)
+                Log.recordLatency(
+                    "capture.conference_face_blur",
+                    valueMs: blurredResult.detectionDurationMs,
+                    category: .capture
+                )
+                if let blurredImage = blurredResult.blurredImage {
+                    cgImage = blurredImage
+                    await emitConferenceFramePrivacyOutcome(
+                        conferenceMatch: conferenceMatch,
+                        outcome: .blurred,
+                        appBundleID: conferenceContext.appBundleID,
+                        faceCount: blurredResult.faceCount,
+                        windowLayer: conferenceContext.windowLayer,
+                        windowName: conferenceContext.windowName,
+                        browserURL: conferenceContext.browserURL,
+                        callID: callIdentity.id,
+                        consentSessionID: callSessionID,
+                        isPreferredMenuCandidate: isPreferredMenuCandidate
+                    )
+                } else {
+                    await emitConferenceFramePrivacyOutcome(
+                        conferenceMatch: conferenceMatch,
+                        outcome: .noFacesDetected,
+                        appBundleID: conferenceContext.appBundleID,
+                        faceCount: 0,
+                        windowLayer: conferenceContext.windowLayer,
+                        windowName: conferenceContext.windowName,
+                        browserURL: conferenceContext.browserURL,
+                        callID: callIdentity.id,
+                        consentSessionID: callSessionID,
+                        isPreferredMenuCandidate: isPreferredMenuCandidate
+                    )
+                }
+            } catch {
+                if let fallbackBlurredImage = makeBlurredConferenceWindowImage(
+                    from: cgImage,
+                    windowBounds: conferenceContext.windowBounds,
+                    displayBounds: displayBounds
+                ) {
+                    cgImage = fallbackBlurredImage
+                    await emitConferenceFramePrivacyOutcome(
+                        conferenceMatch: conferenceMatch,
+                        outcome: .blurred,
+                        appBundleID: conferenceContext.appBundleID,
+                        faceCount: 0,
+                        windowLayer: conferenceContext.windowLayer,
+                        windowName: conferenceContext.windowName,
+                        browserURL: conferenceContext.browserURL,
+                        callID: callIdentity.id,
+                        consentSessionID: callSessionID,
+                        isPreferredMenuCandidate: isPreferredMenuCandidate
+                    )
+                    Log.warning(
+                        "[ConferencePrivacy] Face detection failed; applied full-window blur fallback for \(conferenceMatch.kind.rawValue) layer=\(conferenceContext.windowLayer): \(error.localizedDescription)",
+                        category: .capture
+                    )
+                } else {
+                    await emitConferenceFramePrivacyOutcome(
+                        conferenceMatch: conferenceMatch,
+                        outcome: .droppedDetectionFailure,
+                        appBundleID: conferenceContext.appBundleID,
+                        faceCount: 0,
+                        windowLayer: conferenceContext.windowLayer,
+                        windowName: conferenceContext.windowName,
+                        browserURL: conferenceContext.browserURL,
+                        callID: callIdentity.id,
+                        consentSessionID: callSessionID,
+                        isPreferredMenuCandidate: isPreferredMenuCandidate
+                    )
+                    Log.error(
+                        "[ConferencePrivacy] Dropping frame after face detection failure and failed full-window blur fallback for \(conferenceMatch.kind.rawValue) layer=\(conferenceContext.windowLayer): \(error.localizedDescription)",
+                        category: .capture
+                    )
+                    return nil
+                }
+            }
+        }
+
+        return cgImage
+    }
+
+    private func blurConferenceWindow(
+        in image: CGImage, context: VisibleWindowContext, regionOfInterest: CGRect,
+        displayBounds: CGRect, useWindowSource: Bool
+    ) async throws -> ConferenceFaceBlurResult {
+        guard useWindowSource, let windowBounds = context.windowBounds,
+              let source = conferenceWindowImages.image(for: context.windowID) else {
+            // An unavailable window source must not silently disable protection.
+            return try await conferenceFaceBlurProcessor.blurFaces(
+                in: image, regionOfInterest: regionOfInterest, configuration: .production)
+        }
+        let detection = try await conferenceFaceBlurProcessor.detectFaces(
+            in: source, regionOfInterest: nil, configuration: .production)
+        let masks = ConferenceWindowMaskProjection.project(
+            detection.maskRects, sourceWidth: source.width, sourceHeight: source.height,
+            windowBounds: windowBounds, displayBounds: displayBounds,
+            imageWidth: image.width, imageHeight: image.height)
+        let output = try await conferenceFaceBlurProcessor.applyBlurMasks(in: image, maskRects: masks)
+        let sourceFaces = detection.normalizedFaceRects.map {
+            CGRect(x: $0.minX * CGFloat(source.width), y: $0.minY * CGFloat(source.height),
+                   width: $0.width * CGFloat(source.width), height: $0.height * CGFloat(source.height))
+        }
+        let faces = ConferenceWindowMaskProjection.project(
+            sourceFaces, sourceWidth: source.width, sourceHeight: source.height,
+            windowBounds: windowBounds, displayBounds: displayBounds,
+            imageWidth: image.width, imageHeight: image.height).map {
+                CGRect(x: $0.minX / CGFloat(image.width), y: $0.minY / CGFloat(image.height),
+                       width: $0.width / CGFloat(image.width), height: $0.height / CGFloat(image.height))
+            }
+        return ConferenceFaceBlurResult(
+            blurredImage: output, faceCount: masks.count,
+            detectionDurationMs: detection.detectionDurationMs, detectionMode: detection.detectionMode,
+            normalizedFaceRects: faces, maskRects: masks)
+    }
+
     private func matchedConferenceWindows(
         from contexts: [VisibleWindowContext],
-        systemMediaCaptureState: SystemMediaCaptureState
+        hasActiveMediaCapture: Bool
     ) -> [ConferenceWindowMatch] {
         contexts.compactMap { context in
             guard let match = ConferenceSessionPrivacyPolicy.match(
                 appBundleID: context.appBundleID,
                 browserURL: context.browserURL,
                 windowName: context.windowName,
-                hasActiveMediaCapture: systemMediaCaptureState.hasActiveCapture
+                hasActiveMediaCapture: hasActiveMediaCapture
             ) else {
                 return nil
             }
@@ -1892,13 +1993,12 @@ public actor CGWindowListCapture {
     private func makeBlurredConferenceWindowImage(
         from image: CGImage,
         windowBounds: CGRect?,
-        displayID: CGWindowID
+        displayBounds: CGRect
     ) -> CGImage? {
         guard let windowBounds else {
             return nil
         }
 
-        let displayBounds = CGDisplayBounds(displayID)
         guard displayBounds.width > 1, displayBounds.height > 1 else {
             return nil
         }

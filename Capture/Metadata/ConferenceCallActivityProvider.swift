@@ -3,7 +3,12 @@ import Foundation
 
 /// A meeting URL identifies a service, not an active call. Only offer consent
 /// when that exact window exposes an actionable leave/end-call control.
-enum ConferenceCallActivityProvider {
+struct ConferenceCallActivityProvider: ConferenceCallObserving {
+    func observe(_ target: ConferenceCallObservationTarget) -> ConferenceCallObservation {
+        guard let pid = target.pid else { return .unknown(.windowUnavailable) }
+        return Self.observation(pid: pid, windowTitle: target.windowTitle)
+    }
+
     static func isActiveCallControl(role: String?, label: String?, isEnabled: Bool = true) -> Bool {
         guard isEnabled, role == kAXButtonRole as String, let label else { return false }
         let normalized = label.replacingOccurrences(of: "_", with: " ")
@@ -16,9 +21,22 @@ enum ConferenceCallActivityProvider {
     }
 
     static func hasActiveCallControl(pid: pid_t, windowTitle: String?) -> Bool {
-        guard AXIsProcessTrusted(),
-              let window = BrowserURLExtractor.matchingAXWindow(pid: pid, requestedTitle: windowTitle) else {
-            return false
+        observation(pid: pid, windowTitle: windowTitle) == .active
+    }
+
+    private static func observation(pid: pid_t, windowTitle: String?) -> ConferenceCallObservation {
+        guard AXIsProcessTrusted() else { return .unknown(.accessibilityUnavailable) }
+        guard let window = BrowserURLExtractor.matchingAXWindow(pid: pid, requestedTitle: windowTitle) else {
+            return .unknown(.windowUnavailable)
+        }
+        var incomplete = false
+        func attribute(_ element: AXUIElement, _ key: String) -> CFTypeRef? {
+            var value: CFTypeRef?
+            let error = AXUIElementCopyAttributeValue(element, key as CFString, &value)
+            if error != .success && error != .attributeUnsupported && error != .noValue {
+                incomplete = true
+            }
+            return error == .success ? value : nil
         }
         let deadline = CFAbsoluteTimeGetCurrent() + 0.15
         var pending: [(AXUIElement, Int)] = [(window, 0)]
@@ -34,20 +52,21 @@ enum ConferenceCallActivityProvider {
                         role: role, label: attribute(element, key) as? String,
                         isEnabled: attribute(element, kAXEnabledAttribute) as? Bool ?? false
                     ) {
-                        return true
+                        return .active
                     }
                 }
             }
-            if depth < 16, let children = attribute(element, kAXChildrenAttribute) as? [AXUIElement] {
-                pending.append(contentsOf: children.prefix(750 - min(pending.count, 750)).map { ($0, depth + 1) })
+            if let children = attribute(element, kAXChildrenAttribute) as? [AXUIElement], !children.isEmpty {
+                let capacity = 750 - min(pending.count, 750)
+                if depth >= 16 || children.count > capacity { incomplete = true }
+                if depth < 16 {
+                    pending.append(contentsOf: children.prefix(capacity).map { ($0, depth + 1) })
+                }
             }
         }
-        return false
-    }
-
-    private static func attribute(_ element: AXUIElement, _ key: String) -> CFTypeRef? {
-        var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, key as CFString, &value) == .success else { return nil }
-        return value
+        if index < pending.count || CFAbsoluteTimeGetCurrent() >= deadline { incomplete = true }
+        // Even a complete tree without Leave/End is inconclusive: call toolbars
+        // can hide. Only stronger evidence (or expiration) may revoke consent.
+        return .unknown(incomplete ? .traversalIncomplete : .controlNotFound)
     }
 }

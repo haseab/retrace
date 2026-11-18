@@ -11,28 +11,67 @@ struct ConferenceSessionMatch: Sendable, Equatable {
 struct ConferenceCallConsentState: Sendable {
     private var sessions: [String: String] = [:]
     private var consentedSessionIDs: Set<String> = []
+    private var lastVerifiedActiveAt: [String: Date] = [:]
+    private var activeIdentities: Set<String> = []
 
     mutating func update(activeCallIDs: Set<String>) {
-        sessions = sessions.filter { activeCallIDs.contains($0.key) }
-        for identity in activeCallIDs where sessions[identity] == nil {
-            sessions[identity] = UUID().uuidString
+        update(observations: Dictionary(uniqueKeysWithValues: activeCallIDs.map { ($0, .active) }),
+               at: Date())
+    }
+
+    /// Unknown observations retain consent briefly, but never authorize pixel bypass.
+    /// The grace period is measured from the last verified active observation, not
+    /// from the latest failure, so repeated failures cannot extend it indefinitely.
+    mutating func update(
+        observations: [String: ConferenceCallObservation],
+        at time: Date,
+        uncertaintyGraceInterval: TimeInterval = 8
+    ) {
+        sessions = sessions.filter { identity, _ in
+            guard observations[identity] != nil, let verifiedAt = lastVerifiedActiveAt[identity] else {
+                return false
+            }
+            let age = time.timeIntervalSince(verifiedAt)
+            return age >= 0 && age <= uncertaintyGraceInterval
         }
+        activeIdentities.removeAll(keepingCapacity: true)
+        for (identity, observation) in observations {
+            switch observation {
+            case .active:
+                if sessions[identity] == nil { sessions[identity] = UUID().uuidString }
+                lastVerifiedActiveAt[identity] = time
+                activeIdentities.insert(identity)
+            case .ended:
+                sessions.removeValue(forKey: identity)
+            case .unknown:
+                break
+            }
+        }
+        lastVerifiedActiveAt = lastVerifiedActiveAt.filter { sessions[$0.key] != nil }
         consentedSessionIDs.formIntersection(Set(sessions.values))
     }
 
     func sessionID(for identity: String) -> String? { sessions[identity] }
 
     mutating func disableFaceBlur(callID: String) -> Bool {
-        guard sessions.values.contains(callID) else { return false }
+        guard activeIdentities.contains(where: { sessions[$0] == callID }) else { return false }
         consentedSessionIDs.insert(callID)
         return true
     }
 
     func isBypassed(callID: String) -> Bool { consentedSessionIDs.contains(callID) }
 
+    /// Pixel policy, shared by production capture and replay tests.
+    func shouldBypassFaceBlur(for identity: String) -> Bool {
+        guard activeIdentities.contains(identity), let session = sessions[identity] else { return false }
+        return consentedSessionIDs.contains(session)
+    }
+
     mutating func reset() {
         sessions.removeAll()
         consentedSessionIDs.removeAll()
+        lastVerifiedActiveAt.removeAll()
+        activeIdentities.removeAll()
     }
 }
 
