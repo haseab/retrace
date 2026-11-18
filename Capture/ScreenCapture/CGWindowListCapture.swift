@@ -1512,7 +1512,8 @@ public actor CGWindowListCapture {
         displayBounds: CGRect, useWindowSource: Bool
     ) async throws -> ConferenceFaceBlurResult {
         guard useWindowSource, let windowBounds = context.windowBounds,
-              let source = conferenceWindowImages.image(for: context.windowID) else {
+              let source = conferenceWindowImages.image(for: context.windowID),
+              ConferenceWindowImageProvider.isReadable(source) else {
             // An unavailable window source must not silently disable protection.
             return try await conferenceFaceBlurProcessor.blurFaces(
                 in: image, regionOfInterest: regionOfInterest, configuration: .production)

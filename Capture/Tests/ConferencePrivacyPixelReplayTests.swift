@@ -171,6 +171,14 @@ final class ConferencePrivacyPixelReplayTests: XCTestCase {
         try await assertBackgroundRemainsProtected(source: nil)
     }
 
+    func testUnreadableTransparentWindowImageFallsBackToDesktopProtection() async throws {
+        let context = try XCTUnwrap(CGContext(data: nil, width: 384, height: 1080,
+            bitsPerComponent: 8, bytesPerRow: 384 * 4, space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        let transparent = try XCTUnwrap(context.makeImage())
+        try await assertBackgroundRemainsProtected(source: transparent)
+    }
+
     private func assertBackgroundRemainsProtected(source: CGImage?, backgroundX: CGFloat = 0) async throws {
         let image = try gallery()
         let capture = CGWindowListCapture(conferenceCallObserver: CallObserver(),

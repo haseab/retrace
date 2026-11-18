@@ -10,6 +10,19 @@ struct ConferenceWindowImageProvider: ConferenceWindowImageProviding {
         CGWindowListCreateImage(.null, .optionIncludingWindow, windowID,
                                [.boundsIgnoreFraming, .bestResolution])
     }
+
+    /// Quartz can return transparent black when a window cannot be read.
+    /// Reject transparent samples conservatively: a sparse transparent window
+    /// may use the desktop fallback, but an unreadable source cannot disable blur.
+    static func isReadable(_ image: CGImage) -> Bool {
+        guard image.width > 1, image.height > 1,
+              let sample = CGContext(data: nil, width: 1, height: 1,
+                  bitsPerComponent: 8, bytesPerRow: 4, space: CGColorSpaceCreateDeviceRGB(),
+                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue)
+        else { return false }
+        sample.draw(image, in: CGRect(x: 0, y: 0, width: 1, height: 1))
+        return (sample.data?.assumingMemoryBound(to: UInt8.self)[3] ?? 0) > 0
+    }
 }
 
 /// Window coordinates are in desktop points (top-left origin); mask coordinates
