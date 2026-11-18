@@ -100,6 +100,7 @@ UI/
 │   ├── CapturedURLPolicy.swift # HTTP(S)-only captured-link dispatch validation
 │   ├── MasterKeyRedactionFlowCoordinator.swift # Shared missing-master-key prompt/recovery coordinator
 │   ├── BoundingBoxOverlay.swift         # Text region highlighting
+│   ├── WatchdogRecoveryState.swift      # Synchronous expected-exit guard shared with watchdog recovery
 │   ├── CrashRecoveryManager.swift       # App-side SMAppService/XPC lifecycle manager
 │   ├── SessionTimeline.swift            # App session visualization
 │   ├── DeeplinkHandler.swift            # Search, timeline, and exact dashboard date/time URL routing
@@ -783,3 +784,5 @@ Timeline index touches do not rescan sizes. JPEG NSCache entries have compressed
 - PreviewCacheEntryEpochs in PreviewCacheMaintenance.swift isolates frame eviction from unrelated reads/writes. Release read-miss epochs after all overlapping operations finish; keep whole-cache invalidation for clear/redaction.
 
 Bundled development runs use `AppPaths` to isolate settings, library, Keychain service, logs, preview caches and instance locks for `io.retrace.app.dev`. Never launch a dev build against hardcoded production domains. The production crash-recovery launch agent stays disarmed in the dev app; debugging one app must not manage the other app’s helper.
+
+- `Tests/QuitRecoveryTests.swift` covers intentional quit cancellation of pending watchdog recovery.
