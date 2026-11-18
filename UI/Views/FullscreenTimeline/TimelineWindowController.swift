@@ -2835,6 +2835,10 @@ extension TimelineWindowController {
                     return event
                 }
 
+                if Self.isFrameTextScanShortcut(keyCode: event.keyCode, modifiers: modifiers) {
+                    if self?.handleKeyEvent(event) == true { return nil }
+                }
+
                 // Cmd+F toggles in-frame search even when the in-frame text field is focused.
                 if event.keyCode == 3 && modifiers == [.command] { // Cmd+F
                     _ = self?.handleKeyEvent(event)
@@ -3058,6 +3062,10 @@ extension TimelineWindowController {
         }
     }
 
+    static func isFrameTextScanShortcut(keyCode: UInt16, modifiers: NSEvent.ModifierFlags) -> Bool {
+        keyCode == 31 && modifiers.intersection([.command, .shift, .option, .control]) == [.command, .shift]
+    }
+
     @discardableResult
     private func handleKeyEvent(_ event: NSEvent) -> Bool {
         guard shouldHandleTimelineKeyboardShortcuts() else {
@@ -3083,6 +3091,11 @@ extension TimelineWindowController {
             } else {
                 return false
             }
+        }
+
+        if Self.isFrameTextScanShortcut(keyCode: event.keyCode, modifiers: modifiers) {
+            timelineViewModel?.scanCurrentFrameText(source: "keyboard")
+            return true
         }
 
         // Escape key - cascading behavior based on current state
