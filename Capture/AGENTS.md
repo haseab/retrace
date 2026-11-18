@@ -22,8 +22,7 @@ Capture/
 │   ├── PrivateWindowMonitor.swift # Detect private browsing
 │   └── PermissionChecker.swift    # Screen recording permission
 ├── Deduplication/
-│   ├── FrameDeduplicator.swift    # DeduplicationProtocol implementation
-│   └── PerceptualHash.swift       # dHash (difference hash) for comparison
+│   └── FrameDeduplicator.swift    # Pixel-sampling DeduplicationProtocol implementation
 ├── Metadata/
 │   ├── WindowOCRGeometry.swift # Front-to-back visible application-window crop bounds
 │   ├── AccessibilitySnapshotCollector.swift # Bounded capture-time AX reference collection
@@ -207,73 +206,15 @@ public struct PermissionChecker {
 }
 ```
 
-### 3. Frame Deduplication (Perceptual Hashing)
+### 3. Frame Deduplication (Pixel Sampling)
 
-**Implementation**: dHash (difference hash) for ~95% deduplication rate
+`FrameDeduplicator.swift` implements `DeduplicationProtocol` using direct pixel sampling:
 
-```swift
-public struct FrameDeduplicator {
-    public func shouldKeepFrame(
-        _ frame: CapturedFrame,
-        comparedTo reference: CapturedFrame?,
-        threshold: Double
-    ) -> Bool {
-        guard let reference = reference else { return true }
+- `shouldKeepFrame` keeps the first frame and frames whose dimensions change, then compares similarity against the configured threshold.
+- `computeSimilarity` samples a uniform two-dimensional grid of pixels and compares RGB channel differences with a tolerance.
+- `computeHash` provides a lightweight checksum of sampled RGB values for the protocol's hash API. It is not a dHash implementation.
 
-        // Quick size check
-        if frame.width != reference.width || frame.height != reference.height {
-            return true
-        }
-
-        // Compare perceptual hashes
-        let similarity = computeSimilarity(frame, reference)
-
-        // Keep frame if dissimilar enough (inverse of threshold)
-        return similarity < threshold
-    }
-
-    public func computeHash(for frame: CapturedFrame) -> UInt64 {
-        // dHash (difference hash):
-        // 1. Resize to 9x8 (72 pixels)
-        // 2. Convert to grayscale
-        // 3. Compare adjacent pixels horizontally
-        // 4. Create 64-bit hash (8 rows × 8 comparisons)
-
-        let resized = resizeImage(frame.imageData, width: frame.width, height: frame.height, toSize: (9, 8))
-        let grayscale = toGrayscale(resized)
-
-        var hash: UInt64 = 0
-        for row in 0..<8 {
-            for col in 0..<8 {
-                let idx = row * 9 + col
-                let left = grayscale[idx]
-                let right = grayscale[idx + 1]
-
-                if left > right {
-                    let bitPosition = row * 8 + col
-                    hash |= (1 << bitPosition)
-                }
-            }
-        }
-
-        return hash
-    }
-
-    public func computeSimilarity(_ frame1: CapturedFrame, _ frame2: CapturedFrame) -> Double {
-        let hash1 = computeHash(for: frame1)
-        let hash2 = computeHash(for: frame2)
-
-        // Hamming distance (number of differing bits)
-        let xor = hash1 ^ hash2
-        let differentBits = xor.nonzeroBitCount
-
-        // Similarity = 1.0 (identical) to 0.0 (completely different)
-        return 1.0 - (Double(differentBits) / 64.0)
-    }
-}
-```
-
-**Performance**: ~95% of frames are duplicates and filtered out, drastically reducing storage and processing load.
+Capture deduplication is implemented entirely in `FrameDeduplicator`.
 
 ### 4. App Info Provider
 
@@ -494,7 +435,7 @@ throw CaptureError.captureSessionFailed(underlying: error.localizedDescription)
 ## Getting Started
 
 1. Read `CGWindowListCapture.swift` - main capture implementation
-2. Read `FrameDeduplicator.swift` + `PerceptualHash.swift` - deduplication logic
+2. Read `FrameDeduplicator.swift` - pixel-sampling deduplication logic
 3. Read `AppInfoProvider.swift` - metadata extraction
 4. Read `CaptureManager.swift` - protocol conformance + pipeline
 

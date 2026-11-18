@@ -648,6 +648,10 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// All loaded frames with their preloaded video info
     @Published public var frames: [TimelineFrame] = [] {
         didSet {
+            if oldValue.indices.contains(currentIndex),
+               oldValue[currentIndex].frame != currentTimelineFrame?.frame {
+                resetFrameTextScan()
+            }
             let didChangeIdentity = frames.count != oldValue.count
                 || frames.first?.frame.id != oldValue.first?.frame.id
                 || frames.last?.frame.id != oldValue.last?.frame.id
@@ -692,6 +696,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     @Published public var currentIndex: Int = 0 {
         didSet {
             if currentIndex != oldValue {
+                resetFrameTextScan()
                 endInPageURLHoverTracking()
                 cancelPresentationOverlayTasks()
                 clearCurrentFrameOverlayPresentation()
@@ -749,10 +754,14 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Whether the timeline is in "live mode" showing a live screenshot
     /// When true, the liveScreenshot is displayed instead of historical frames
     /// Exits to historical frames on first scroll/navigation
-    @Published public var isInLiveMode: Bool = false
+    @Published public var isInLiveMode: Bool = false {
+        didSet { if isInLiveMode != oldValue { resetFrameTextScan() } }
+    }
 
     /// The live screenshot captured at timeline launch (only used when isInLiveMode == true)
-    @Published public var liveScreenshot: NSImage?
+    @Published public var liveScreenshot: NSImage? {
+        didSet { if liveScreenshot !== oldValue { resetFrameTextScan() } }
+    }
 
     /// Whether live OCR is currently being processed on the live screenshot
     @Published public var isLiveOCRProcessing: Bool = false
@@ -1411,6 +1420,179 @@ public class SimpleTimelineViewModel: ObservableObject {
             isEnabled: isEnabled
         )
     }
+
+    enum FrameTextScanState: Equatable {
+        case idle, scanning, ready, empty, failed, protected
+    }
+
+    @Published private(set) var frameTextScanState: FrameTextScanState = .idle
+    private var frameTextScanTask: Task<Void, Never>?
+    private var frameTextScanRequestID = UUID()
+    private var manualScanHasOverlay = false
+
+    var canScanCurrentFrameText: Bool {
+        isInLiveMode ? liveScreenshot != nil : currentTimelineFrame != nil
+    }
+
+    private func resetFrameTextScan() {
+        frameTextScanTask?.cancel()
+        frameTextScanTask = nil
+        frameTextScanRequestID = UUID()
+        frameTextScanState = .idle
+        manualScanHasOverlay = false
+    }
+
+    private var frameTextScanProtectionEnabled: Bool {
+#if DEBUG
+        if let override = test_dragStartStillOCRHooks.phraseProtectionEnabled { return override() }
+#endif
+        return PhraseRedactionMode.isEnabled(
+            in: UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
+        )
+    }
+
+    private func canPublishUnprotectedFrameTextScan(_ frame: TimelineFrame) async throws -> Bool {
+        // A native frame's pixels are unsafe until its privacy rewrite has settled.
+        if frame.frame.source == .native, frameTextScanProtectionEnabled {
+            let status = try await fetchOCRStatusForPresentation(frameID: frame.frame.id)
+            guard status.state == .completed else { return false }
+        }
+        let nodes = try await fetchAllOCRNodesForPresentation(
+            frameID: frame.frame.id, source: frame.frame.source
+        )
+        return !nodes.contains(where: \.isRedacted)
+    }
+
+    private func blockFrameTextScanForProtection(source: String) {
+        if manualScanHasOverlay {
+            manualScanHasOverlay = false
+            clearTextSelection()
+            clearHyperlinkMatches()
+            setOCRNodes([])
+            loadOCRNodes()
+        }
+        frameTextScanState = .protected
+        recordFrameTextScan(source: source, outcome: "protected")
+    }
+
+    /// On-demand, session-only OCR. Saved nodes and the search index are never changed.
+    func scanCurrentFrameText(source: String = "button") {
+        guard canScanCurrentFrameText, frameTextScanState != .scanning else { return }
+        stopPlayback()
+        frameTextScanTask?.cancel()
+        cancelDragStartStillFrameOCR(reason: "manual scan")
+        liveOCRDebounceTask?.cancel()
+        let requestID = UUID()
+        frameTextScanRequestID = requestID
+        let frame = currentTimelineFrame
+        let live = isInLiveMode
+        let image = live ? liveScreenshot : displayableCurrentImage
+        frameTextScanState = .scanning
+        let startedAt = CFAbsoluteTimeGetCurrent()
+        recordFrameTextScan(source: source, outcome: "started")
+
+        frameTextScanTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                if !live, let frame {
+                    // Consult saved metadata even when the timeline overlay has not loaded yet.
+                    let allowed = try await self.canPublishUnprotectedFrameTextScan(frame)
+                    guard self.frameTextScanRequestID == requestID, !Task.isCancelled else { return }
+                    if !allowed {
+                        self.blockFrameTextScanForProtection(source: source)
+                        return
+                    }
+                }
+                let cgImage: CGImage
+                if let image {
+                    let snapshot = FrameTextScanImage(image: image)
+                    cgImage = try await Task.detached(priority: .userInitiated) {
+                        guard let result = snapshot.image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+                            throw CocoaError(.fileReadCorruptFile)
+                        }
+                        return result
+                    }.value
+                } else if let frame {
+                    let data = try await self.loadFrameData(frame)
+                    cgImage = try await Task.detached(priority: .userInitiated) {
+                        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+                              let result = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+                            throw CocoaError(.fileReadCorruptFile)
+                        }
+                        return result
+                    }.value
+                } else {
+                    throw CocoaError(.fileNoSuchFile)
+                }
+                guard self.frameTextScanRequestID == requestID, !Task.isCancelled else { return }
+                let regions = try await self.recognizeTextFromCGImageForDragStartStillOCR(cgImage)
+                guard self.frameTextScanRequestID == requestID, !Task.isCancelled else { return }
+                if !live, let frame {
+                    // Protection may have changed while decoding or recognizing earlier pixels.
+                    let allowed = try await self.canPublishUnprotectedFrameTextScan(frame)
+                    guard self.frameTextScanRequestID == requestID, !Task.isCancelled else { return }
+                    if !allowed {
+                        self.blockFrameTextScanForProtection(source: source)
+                        return
+                    }
+                }
+                let resultFrameID = live ? Int64(-1) : frame?.frame.id.value ?? -1
+                if !regions.isEmpty {
+                    self.ocrNodesLoadTask?.cancel()
+                    self.ocrStatusPollingTask?.cancel()
+                    self.clearTextSelection()
+                    self.clearHyperlinkMatches()
+                    self.manualScanHasOverlay = true
+                    self.setOCRNodes(regions.enumerated().map { index, region in
+                        OCRNodeWithText(
+                            id: index, frameId: resultFrameID,
+                            x: region.bounds.minX, y: region.bounds.minY,
+                            width: region.bounds.width, height: region.bounds.height, text: region.text
+                        )
+                    })
+                    self.ocrStatus = .completed
+                }
+                self.frameTextScanState = regions.isEmpty ? .empty : .ready
+                self.recordFrameTextScan(source: source, outcome: regions.isEmpty ? "no_text" : "succeeded")
+                Log.recordLatency(
+                    "timeline.manual_ocr.total_ms", valueMs: (CFAbsoluteTimeGetCurrent() - startedAt) * 1000,
+                    category: .ui, summaryEvery: 10, warningThresholdMs: 500, criticalThresholdMs: 1500
+                )
+                // Keep the result legible before returning the button to its normal action.
+                try await Task.sleep(for: .seconds(2), clock: .continuous)
+                guard self.frameTextScanRequestID == requestID else { return }
+                self.frameTextScanState = .idle
+            } catch is CancellationError {
+                return
+            } catch {
+                guard self.frameTextScanRequestID == requestID, !Task.isCancelled else { return }
+                self.frameTextScanState = .failed
+                self.recordFrameTextScan(source: source, outcome: "failed")
+                Log.error("[Timeline-OCR] Manual scan failed: \(error)", category: .ui)
+            }
+        }
+    }
+
+    // NSImage is captured once and only read by the background conversion task.
+    private struct FrameTextScanImage: @unchecked Sendable {
+        let image: NSImage
+    }
+
+    private func recordFrameTextScan(source: String, outcome: String) {
+        UIMetricsRecorder.recordDictionary(
+            coordinator: coordinator, type: .timelineTextScan,
+            payload: ["source": source, "outcome": outcome, "live": isInLiveMode]
+        )
+    }
+
+#if DEBUG
+    func waitForFrameTextScan() async {
+        // Await recognition, leaving the brief success feedback visible to assertions.
+        for _ in 0..<1000 where frameTextScanState == .scanning {
+            try? await Task.sleep(for: .milliseconds(10), clock: .continuous)
+        }
+    }
+#endif
 
     /// Reprocess OCR for the current frame (developer tool)
     /// Clears existing OCR data and re-enqueues the frame for processing
@@ -2308,6 +2490,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     deinit {
+        frameTextScanTask?.cancel()
         commentSearchTask?.cancel()
         blockCommentsLoadTask?.cancel()
         tapeIndicatorRefreshTask?.cancel()
@@ -2672,6 +2855,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
     struct DragStartStillOCRTestHooks {
         var recognizeTextFromCGImage: ((CGImage) async throws -> [TextRegion])?
+        var phraseProtectionEnabled: (() -> Bool)?
     }
     struct BlockCommentsTestHooks {
         var getCommentsForSegments: (([SegmentID]) async throws -> [AppCoordinator.LinkedSegmentComment])?
@@ -2733,6 +2917,8 @@ public class SimpleTimelineViewModel: ObservableObject {
         ) { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
+                Log.debug("[Timeline-OCR] Invalidating transient scan after redaction", category: .ui)
+                self.resetFrameTextScan()
                 self.cancelForegroundFrameLoad(reason: "redaction completed")
                 self.cancelCacheExpansion(reason: "redaction completed")
                 self.unavailableFrameDiskLookupTask?.cancel()
@@ -3256,6 +3442,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             presentationWorkGeneration &+= 1
         }
         if !enabled {
+            resetFrameTextScan()
             cancelPresentationOverlayTasks()
         }
         if Self.isVerboseTimelineLoggingEnabled {
@@ -9981,7 +10168,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     private func triggerDragStartStillFrameOCRIfNeeded(gesture: String) {
-        guard !isInLiveMode else { return }
+        guard !isInLiveMode, frameTextScanState != .scanning, !manualScanHasOverlay else { return }
         guard let timelineFrame = currentTimelineFrame else { return }
         guard timelineFrame.processingStatus == 4 else { return }
         let frameID = timelineFrame.frame.id
@@ -10083,6 +10270,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Trigger live OCR with a 350ms debounce
     /// Each call resets the timer - OCR only fires after 350ms of no new calls
     public func performLiveOCR() {
+        guard frameTextScanState != .scanning, !manualScanHasOverlay else { return }
         // Clear stale OCR nodes from previous frame immediately
         // This prevents interaction with old bounding boxes while debounce waits
         setOCRNodes([])
@@ -10128,8 +10316,8 @@ public class SimpleTimelineViewModel: ObservableObject {
                 return try await ocr.recognizeTextFromCGImage(detachedImage.image)
             }.value
 
-            // Only update if still in live mode (user may have scrolled away)
-            guard isInLiveMode else {
+            // Manual OCR owns the overlay until navigation or a new screenshot.
+            guard isInLiveMode, frameTextScanState != .scanning, !manualScanHasOverlay else {
                 isLiveOCRProcessing = false
                 return
             }
@@ -12149,6 +12337,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Load all OCR nodes for the current frame
     private func loadOCRNodes(expectedGeneration: UInt64 = 0) {
+        guard !manualScanHasOverlay else { return }
         // Don't overwrite live OCR results with database results
         guard !isInLiveMode else { return }
         let generation = expectedGeneration == 0
@@ -12204,6 +12393,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Load OCR nodes and wait for completion (used when we need to await the result)
     private func loadOCRNodesAsync(expectedGeneration: UInt64 = 0) async {
+        guard !manualScanHasOverlay else { return }
         let generation = expectedGeneration == 0
             ? currentPresentationWorkGeneration()
             : expectedGeneration
@@ -12231,7 +12421,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
             let (status, nodes) = try await (statusTask, nodesTask)
 
-            if canPublishPresentationResult(
+            if !manualScanHasOverlay, canPublishPresentationResult(
                 frameID: frame.id,
                 expectedGeneration: generation
             ) {
@@ -12258,7 +12448,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             return
         } catch {
             Log.error("[SimpleTimelineViewModel] Failed to load OCR nodes: \(error)", category: .app)
-            if canPublishPresentationResult(
+            if !manualScanHasOverlay, canPublishPresentationResult(
                 frameID: frame.id,
                 expectedGeneration: generation
             ) {
@@ -12362,7 +12552,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             )
 
             // Only update if still on the same frame
-            guard canPublishPresentationResult(
+            guard !manualScanHasOverlay, canPublishPresentationResult(
                 frameID: frameID,
                 expectedGeneration: generation
             ) else { return }
@@ -12382,7 +12572,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             )
         } catch {
             Log.error("[OCR-POLL] Failed to reload OCR nodes: \(error)", category: .ui)
-            guard canPublishPresentationResult(
+            guard !manualScanHasOverlay, canPublishPresentationResult(
                 frameID: frameID,
                 expectedGeneration: generation
             ) else { return }
