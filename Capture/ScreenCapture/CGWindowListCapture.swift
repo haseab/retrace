@@ -494,6 +494,7 @@ public actor CGWindowListCapture {
 
     private var lastConferenceObservationAt: Date?
     private var lastConferenceWindowSummary: String?
+    private var capturePerformance = CapturePerformanceDiagnostics()
     private var cachedSystemMediaCaptureState = SystemMediaCaptureState(
         cameraInUse: false,
         microphoneInUse: false
@@ -519,6 +520,7 @@ public actor CGWindowListCapture {
         self.conferenceCallConsent.reset()
         self.lastConferenceObservationAt = nil
         self.lastConferenceWindowSummary = nil
+        self.capturePerformance = CapturePerformanceDiagnostics()
         self.screenLockStateMonitor.start()
 
         // Use provided display ID or fall back to main display
@@ -534,6 +536,8 @@ public actor CGWindowListCapture {
         conferenceCallConsent.reset()
         lastConferenceObservationAt = nil
         lastConferenceWindowSummary = nil
+        let reports = capturePerformance.flush(at: CapturePerformanceFrame.now())
+        capturePerformance.emit(reports)
         screenLockStateMonitor.stop()
         lastDisplaySurfaceBytes = 0
         updatePersistentCaptureNativeLedger()
@@ -587,6 +591,15 @@ public actor CGWindowListCapture {
 
     private func captureFrameInternal(displayID: CGWindowID) async -> CaptureFrameCandidate? {
         guard isActive, let config = currentConfig else { return nil }
+        let performance = CapturePerformanceFrame()
+        let performanceStart = CapturePerformanceFrame.now()
+        var completed = false
+        defer {
+            performance.record(.total, since: performanceStart)
+            performance.increment(completed ? .completed : .dropped)
+            let reports = capturePerformance.record(performance.snapshot(), at: CapturePerformanceFrame.now())
+            capturePerformance.emit(reports)
+        }
         let residualEpoch = await MemoryLedger.beginResidualEpoch(
             ownerFunction: "capture.screen_capture",
             candidateConcurrentFunctions: [
@@ -602,14 +615,17 @@ public actor CGWindowListCapture {
             }
         }
 
+        let metadataStart = CapturePerformanceFrame.now()
         let systemMediaCaptureState = currentSystemMediaCaptureState()
 
         // Compute excluded window IDs for THIS capture (real-time filtering)
         let exclusionResult = await computeExcludedWindowIDs(
             config: config,
             displayID: displayID,
-            systemMediaCaptureState: systemMediaCaptureState
+            systemMediaCaptureState: systemMediaCaptureState,
+            performance: performance
         )
+        performance.record(.metadata, since: metadataStart)
         let excludedIDs = exclusionResult.excludedWindowIDs
 
         if let captureBlockReason = screenLockStateMonitor.captureBlockReason() ?? exclusionResult.captureBlockReason {
@@ -618,26 +634,35 @@ public actor CGWindowListCapture {
         }
         logCaptureResumeIfNeeded()
 
+        let sourceStart = CapturePerformanceFrame.now()
         let sourcesBeforeCapture = prepareConferenceWindowSources(
             windows: exclusionResult.conferenceWindowContexts,
             hasActiveMediaCapture: systemMediaCaptureState.hasActiveCapture)
 
+        performance.record(.sourceSnapshots, since: sourceStart)
+
         // Capture the frame using CGWindowList with filtering
-        guard let captureResult = captureWithFiltering(
+        let screenshotStart = CapturePerformanceFrame.now()
+        let captureResult = captureWithFiltering(
             displayID: displayID,
             excludedWindowIDs: excludedIDs,
             includedWindowIDs: exclusionResult.includedCaptureWindowIDs,
             forceMasking: !exclusionResult.redactedWindowIDs.isEmpty
-        ) else {
+        )
+        performance.record(.screenshot, since: screenshotStart)
+        guard let captureResult else {
             Log.warning("[CGWindowListCapture] Failed to capture CGImage for displayID=\(displayID), excludedCount=\(excludedIDs.count)", category: .capture)
             return nil
         }
         let screenshotTime = Date()
         // Bracket the desktop capture before AX discovery or face processing can
         // delay the second source snapshot. Changed content/geometry is untrusted.
+        let validationStart = CapturePerformanceFrame.now()
         let validatedWindowSources = validateConferenceWindowSources(sourcesBeforeCapture)
+        performance.record(.sourceSnapshots, since: validationStart)
+        performance.dimensions(width: captureResult.image.width, height: captureResult.image.height)
         // Best-effort capture-time OCR geometry. No AX calls, text or per-window captures.
-        let geometryStart = CFAbsoluteTimeGetCurrent()
+        let geometryStart = CapturePerformanceFrame.now()
         let ocrRegions = (CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements],
             kCGNullWindowID) as? [[String: Any]]).flatMap {
                 let displayBounds = CGDisplayBounds(displayID)
@@ -668,9 +693,9 @@ public actor CGWindowListCapture {
                     imageSize: CGSize(width: captureResult.image.width, height: captureResult.image.height),
                     excludedWindowIDs: excludedIDs, ignoredWindowIDs: ignoredWindowIDs)
             }
-        Log.recordLatency("capture.ocr_geometry", valueMs: (CFAbsoluteTimeGetCurrent() - geometryStart) * 1000,
-            category: .capture, summaryEvery: 100)
+        performance.record(.ocrGeometry, since: geometryStart)
         // AX must never recover content deliberately masked out.
+        let accessibilityStart = CapturePerformanceFrame.now()
         let axContext = exclusionResult.visibleWindowContext
         let axSnapshot = axContext.map { !excludedIDs.contains($0.windowID) && !exclusionResult.redactedWindowIDs.contains($0.windowID) } == true
             ? AccessibilitySnapshotCollector.collect(
@@ -678,6 +703,7 @@ public actor CGWindowListCapture {
                 displayBounds: CGDisplayBounds(displayID), width: captureResult.image.width,
                 height: captureResult.image.height, capturedAt: screenshotTime, capturedImage: captureResult.image)
             : nil
+        performance.record(.accessibilitySnapshot, since: accessibilityStart)
         var cgImage = captureResult.image
         let displaySurfaceBytes = Self.estimatedImageSurfaceBytes(width: cgImage.width, height: cgImage.height)
         lastDisplaySurfaceBytes = displaySurfaceBytes
@@ -730,7 +756,8 @@ public actor CGWindowListCapture {
             displayBounds: CGDisplayBounds(displayID),
             hasActiveMediaCapture: systemMediaCaptureState.hasActiveCapture,
             captureIntervalSeconds: config.captureIntervalSeconds,
-            validatedWindowSources: validatedWindowSources
+            validatedWindowSources: validatedWindowSources,
+            performance: performance
         ) else { return nil }
         cgImage = privacyImage
 
@@ -756,6 +783,7 @@ public actor CGWindowListCapture {
             accessibilitySnapshot: axSnapshot
         )
 
+        completed = true
         return frame
     }
 
@@ -764,7 +792,8 @@ public actor CGWindowListCapture {
     private func computeExcludedWindowIDs(
         config: CaptureConfig,
         displayID: CGWindowID,
-        systemMediaCaptureState: SystemMediaCaptureState
+        systemMediaCaptureState: SystemMediaCaptureState,
+        performance: CapturePerformanceFrame
     ) async -> ExclusionComputationResult {
         var excludedIDs = Set<CGWindowID>()
         var captureEligibleWindowIDs: [CGWindowID] = []
@@ -831,6 +860,7 @@ public actor CGWindowListCapture {
             let browserURLCacheKey = "\(ownerPID)|\(windowCacheKey.lowercased())"
 
             if let cachedResult = browserURLCache[browserURLCacheKey] {
+                performance.increment(.urlCacheHits)
                 switch cachedResult {
                 case let .found(cachedURL):
                     return cachedURL
@@ -839,10 +869,14 @@ public actor CGWindowListCapture {
                 }
             }
 
+            performance.increment(.urlLookups)
+            let urlStart = CapturePerformanceFrame.now()
+            defer { performance.record(.browserURL, since: urlStart) }
             let fetchedURL = await BrowserURLExtractor.getURLForWindow(
                 bundleID: bundleID,
                 pid: ownerPID,
-                windowCacheKey: windowCacheKey
+                windowCacheKey: windowCacheKey,
+                performance: performance
             )?.trimmingCharacters(in: .whitespacesAndNewlines)
 
             if let fetchedURL, !fetchedURL.isEmpty {
@@ -851,6 +885,7 @@ public actor CGWindowListCapture {
             }
 
             browserURLCache[browserURLCacheKey] = .unavailable
+            performance.increment(.urlUnavailable)
             return nil
         }
 
@@ -1366,41 +1401,35 @@ public actor CGWindowListCapture {
         displayBounds: CGRect,
         hasActiveMediaCapture: Bool,
         captureIntervalSeconds: TimeInterval,
-        validatedWindowSources: [CGWindowID: ConferenceWindowImageSnapshot] = [:]
+        validatedWindowSources: [CGWindowID: ConferenceWindowImageSnapshot] = [:],
+        performance: CapturePerformanceFrame? = nil
     ) async -> CGImage? {
-        let privacyStartedAt = CFAbsoluteTimeGetCurrent()
+        let privacyStartedAt = CapturePerformanceFrame.now()
         var cgImage = image
         let conferenceWindowMatches = matchedConferenceWindows(
             from: windows.tracked,
             hasActiveMediaCapture: hasActiveMediaCapture
         )
-        defer {
-            if !conferenceWindowMatches.isEmpty {
-                Log.recordLatency("capture.conference_privacy_total",
-                                  valueMs: (CFAbsoluteTimeGetCurrent() - privacyStartedAt) * 1000,
-                                  category: .capture)
-            }
-        }
+        performance?.increment(.trackedWindows, by: windows.tracked.count)
+        performance?.increment(.visibleWindows, by: windows.visible.count)
+        performance?.increment(.conferenceWindows, by: conferenceWindowMatches.count)
+        defer { performance?.record(.privacy, since: privacyStartedAt) }
         let observationTime = conferenceObservationClock()
         let freshnessInterval = max(8, captureIntervalSeconds * 3)
         if let lastConferenceObservationAt,
            observationTime.timeIntervalSince(lastConferenceObservationAt) > freshnessInterval {
             conferenceCallConsent.reset()
         }
-        let observationStartedAt = CFAbsoluteTimeGetCurrent()
         let activeCallIDs = conferenceCallConsent.observe(
             conferenceWindowMatches.map {
                 ConferenceCallObservationTarget(identity: $0.callIdentity.id,
                                                 pid: $0.context.ownerPID,
                                                 windowTitle: $0.context.windowName)
             },
-            using: conferenceCallObserver,
+            using: PerformanceConferenceCallObserver(base: conferenceCallObserver, performance: performance),
             at: observationTime,
             uncertaintyGraceInterval: freshnessInterval
         )
-        Log.recordLatency("capture.conference_call_observation",
-                          valueMs: (CFAbsoluteTimeGetCurrent() - observationStartedAt) * 1000,
-                          category: .capture)
         let activeConferenceMatches = conferenceWindowMatches.filter { activeCallIDs.contains($0.callIdentity.id) }
         lastConferenceObservationAt = observationTime
         let visibleConferenceWindowIDs = Set(windows.visible.map(\.windowID))
@@ -1431,6 +1460,7 @@ public actor CGWindowListCapture {
 
             // Retained consent is dormant until the call is positively verified again.
             if conferenceCallConsent.shouldBypassFaceBlur(for: callIdentity.id) {
+                performance?.increment(.consentBypassed)
                 if let bounds = conferenceContext.windowBounds { consentedForegroundBounds.append(bounds) }
                 await emitConferenceFramePrivacyOutcome(
                     conferenceMatch: conferenceMatch,
@@ -1451,10 +1481,12 @@ public actor CGWindowListCapture {
                 windowBounds: conferenceContext.windowBounds,
                 displayBounds: displayBounds
             ) else {
+                performance?.increment(.fullWindowFallbacks)
                 if let fallbackBlurredImage = makeBlurredConferenceWindowImage(
                     from: cgImage,
                     windowBounds: conferenceContext.windowBounds,
-                    displayBounds: displayBounds
+                    displayBounds: displayBounds,
+                    performance: performance
                 ) {
                     cgImage = fallbackBlurredImage
                     await emitConferenceFramePrivacyOutcome(
@@ -1496,23 +1528,17 @@ public actor CGWindowListCapture {
             }
 
             do {
-                let blurStartedAt = CFAbsoluteTimeGetCurrent()
+                performance?.increment(.faceWindows)
                 let overlapsConsent = conferenceContext.windowBounds.map { bounds in
                     consentedForegroundBounds.contains { $0.intersects(bounds) }
                 } ?? false
                 let blurredResult = try await blurConferenceWindow(
                     in: cgImage, context: conferenceContext, regionOfInterest: visionROI,
                     displayBounds: displayBounds, useWindowSource: overlapsConsent,
-                    validatedSource: validatedWindowSources[conferenceContext.windowID]
+                    validatedSource: validatedWindowSources[conferenceContext.windowID],
+                    performance: performance
                 )
-                Log.recordLatency("capture.conference_face_blur_total",
-                                  valueMs: (CFAbsoluteTimeGetCurrent() - blurStartedAt) * 1000,
-                                  category: .capture)
-                Log.recordLatency(
-                    "capture.conference_face_blur",
-                    valueMs: blurredResult.detectionDurationMs,
-                    category: .capture
-                )
+                performance?.increment(.faces, by: blurredResult.faceCount)
                 if let blurredImage = blurredResult.blurredImage {
                     cgImage = blurredImage
                     await emitConferenceFramePrivacyOutcome(
@@ -1542,10 +1568,12 @@ public actor CGWindowListCapture {
                     )
                 }
             } catch {
+                performance?.increment(.fullWindowFallbacks)
                 if let fallbackBlurredImage = makeBlurredConferenceWindowImage(
                     from: cgImage,
                     windowBounds: conferenceContext.windowBounds,
-                    displayBounds: displayBounds
+                    displayBounds: displayBounds,
+                    performance: performance
                 ) {
                     cgImage = fallbackBlurredImage
                     await emitConferenceFramePrivacyOutcome(
@@ -1592,24 +1620,27 @@ public actor CGWindowListCapture {
     private func blurConferenceWindow(
         in image: CGImage, context: VisibleWindowContext, regionOfInterest: CGRect,
         displayBounds: CGRect, useWindowSource: Bool,
-        validatedSource: ConferenceWindowImageSnapshot?
+        validatedSource: ConferenceWindowImageSnapshot?,
+        performance: CapturePerformanceFrame?
     ) async throws -> ConferenceFaceBlurResult {
         guard useWindowSource, let windowBounds = context.windowBounds,
               let snapshot = validatedSource,
               snapshot.bounds == windowBounds, snapshot.ownerPID == context.ownerPID,
               ConferenceWindowImageProvider.isReadable(snapshot.image) else {
             // An unavailable window source must not silently disable protection.
+            performance?.increment(.desktopFallbacks)
             return try await conferenceFaceBlurProcessor.blurFaces(
-                in: image, regionOfInterest: regionOfInterest, configuration: .production)
+                in: image, regionOfInterest: regionOfInterest, configuration: .production, performance: performance)
         }
+        performance?.increment(.isolatedSources)
         let source = snapshot.image
         let detection = try await conferenceFaceBlurProcessor.detectFaces(
-            in: source, regionOfInterest: nil, configuration: .production)
+            in: source, regionOfInterest: nil, configuration: .production, performance: performance)
         let masks = ConferenceWindowMaskProjection.project(
             detection.maskRects, sourceWidth: source.width, sourceHeight: source.height,
             windowBounds: windowBounds, displayBounds: displayBounds,
             imageWidth: image.width, imageHeight: image.height)
-        let output = try await conferenceFaceBlurProcessor.applyBlurMasks(in: image, maskRects: masks)
+        let output = try await conferenceFaceBlurProcessor.applyBlurMasks(in: image, maskRects: masks, performance: performance)
         let sourceFaces = detection.normalizedFaceRects.map {
             CGRect(x: $0.minX * CGFloat(source.width), y: $0.minY * CGFloat(source.height),
                    width: $0.width * CGFloat(source.width), height: $0.height * CGFloat(source.height))
@@ -2079,8 +2110,11 @@ public actor CGWindowListCapture {
     private func makeBlurredConferenceWindowImage(
         from image: CGImage,
         windowBounds: CGRect?,
-        displayBounds: CGRect
+        displayBounds: CGRect,
+        performance: CapturePerformanceFrame? = nil
     ) -> CGImage? {
+        let start = CapturePerformanceFrame.now()
+        defer { performance?.record(.faceRender, since: start) }
         guard let windowBounds else {
             return nil
         }

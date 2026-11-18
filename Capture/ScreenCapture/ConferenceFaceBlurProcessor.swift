@@ -73,10 +73,11 @@ actor ConferenceFaceBlurProcessor {
     func blurFaces(
         in image: CGImage,
         regionOfInterest: CGRect?,
-        configuration: ConferenceFaceBlurConfiguration = .production
+        configuration: ConferenceFaceBlurConfiguration = .production,
+        performance: CapturePerformanceFrame? = nil
     ) async throws -> ConferenceFaceBlurResult {
-        let detection = try detectFaces(in: image, regionOfInterest: regionOfInterest, configuration: configuration)
-        let output = try applyBlurMasks(in: image, maskRects: detection.maskRects)
+        let detection = try detectFaces(in: image, regionOfInterest: regionOfInterest, configuration: configuration, performance: performance)
+        let output = try applyBlurMasks(in: image, maskRects: detection.maskRects, performance: performance)
         return ConferenceFaceBlurResult(
             blurredImage: output,
             faceCount: detection.faceCount,
@@ -91,8 +92,11 @@ actor ConferenceFaceBlurProcessor {
     func detectFaces(
         in image: CGImage,
         regionOfInterest: CGRect?,
-        configuration: ConferenceFaceBlurConfiguration = .production
+        configuration: ConferenceFaceBlurConfiguration = .production,
+        performance: CapturePerformanceFrame? = nil
     ) throws -> ConferenceFaceDetectionResult {
+        let diagnosticStart = CapturePerformanceFrame.now()
+        defer { performance?.record(.faceDetection, since: diagnosticStart) }
         let startedAt = CFAbsoluteTimeGetCurrent()
         let baseRegionOfInterest = Self.sanitizeRegionOfInterest(regionOfInterest)
         let requestRegions = Self.detectionRequestRegions(
@@ -131,8 +135,11 @@ actor ConferenceFaceBlurProcessor {
 
     func applyBlurMasks(
         in image: CGImage,
-        maskRects: [CGRect]
+        maskRects: [CGRect],
+        performance: CapturePerformanceFrame? = nil
     ) throws -> CGImage? {
+        let diagnosticStart = CapturePerformanceFrame.now()
+        defer { performance?.record(.faceRender, since: diagnosticStart) }
         guard !maskRects.isEmpty else {
             return nil
         }

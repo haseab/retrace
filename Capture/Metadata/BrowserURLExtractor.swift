@@ -559,15 +559,21 @@ struct BrowserURLExtractor: Sendable {
     /// 2. Generic AXWebArea → AXURL traversal
     /// 3. Address bar text field search
     /// Window-scoped capture must never borrow the focused window's URL.
-    static func getURLForWindow(bundleID: String, pid: pid_t, windowCacheKey: String?) async -> String? {
+    static func getURLForWindow(bundleID: String, pid: pid_t, windowCacheKey: String?,
+                                performance: CapturePerformanceFrame? = nil) async -> String? {
         guard isBrowser(bundleID), !firefoxBundleIDs.contains(bundleID),
               normalizedWindowTitleForWindowMatch(windowCacheKey) != nil else { return nil }
-        if let window = matchingAXWindow(pid: pid, requestedTitle: windowCacheKey) {
-            let candidate = getAXURLString(window, kAXDocumentAttribute)
-                ?? findURLInWebArea(window)
-                ?? findURLInElement(window, depth: 0, maxDepth: 8)
-            if let url = sanitizedBrowserURLCandidate(candidate, for: bundleID) { return url }
+        let accessibilityStart = CapturePerformanceFrame.now()
+        let window = matchingAXWindow(pid: pid, requestedTitle: windowCacheKey)
+        let candidate = window.flatMap {
+            getAXURLString($0, kAXDocumentAttribute)
+                ?? findURLInWebArea($0)
+                ?? findURLInElement($0, depth: 0, maxDepth: 8)
         }
+        performance?.record(.urlAccessibility, since: accessibilityStart)
+        if let url = sanitizedBrowserURLCandidate(candidate, for: bundleID) { return url }
+        let fallbackStart = CapturePerformanceFrame.now()
+        defer { performance?.record(.urlFallback, since: fallbackStart) }
         if isChromiumAppShim(bundleID) {
             return await getWebAppURLViaAppleScript(bundleID: bundleID, pid: pid, windowCacheKey: windowCacheKey)
         }

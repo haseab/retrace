@@ -12,6 +12,7 @@ Capture/
 ├── ScreenCapture/
 │   ├── CaptureFrameCandidate.swift # Defer BGRA materialization for exact native duplicates
 │   ├── CGWindowListCapture.swift  # Legacy CGWindowList API wrapper
+│   ├── CapturePerformanceDiagnostics.swift # Bounded production stage timings, slow events, and process snapshots
 │   ├── ExcludedWindowMasker.swift # Full-bounds masking; failure returns no screenshot
 │   ├── PrivateWindowDetector.swift # Private-window accessibility heuristics
 │   ├── ConferenceFaceBlurProcessor.swift # Vision face detection + irreversible conference-call face blur
@@ -47,6 +48,7 @@ Capture/
     ├── ConferenceROIPlannerTests.swift
     ├── ConferenceSessionPrivacyPolicyTests.swift
     ├── CaptureFrameCandidateTests.swift # Committed screenshot pixel/layout comparison
+    ├── CapturePerformanceDiagnosticsTests.swift # Summary bounds, rate limits, and production log field retention
     ├── CaptureTriggerSchedulingTests.swift
     └── DeduplicationTests.swift
 ```
@@ -61,6 +63,15 @@ Capture/
 - When an unconsented window overlaps a consented foreground window, detect faces in its isolated window image and project masks back to the desktop. Bracket the desktop capture with source snapshots; only unchanged pixel content, owner PID, and geometry may supply masks or a no-face result. Capture at most two source surfaces per frame. Missing, changed, or transparently unreadable sources retain desktop-ROI protection. Preserve unclipped ellipse bounds for partially off-screen windows.
 - Window identity changes and independent windows remain isolated; this boundary does not infer that sibling windows belong to one call.
 - Run `swift test --filter 'ConferenceCallObservationTests|ConferenceSessionPrivacyPolicyTests|ConferenceROIPlannerTests'` for consent and ROI coverage.
+
+## Production capture performance diagnostics
+
+- `[CapturePerf]` messages use only fixed labels and numeric/boolean values, with no titles, URLs, call/window IDs, or pixels. They use the normal production log and remain in feedback exports when full logs are included.
+- Native capture and the outer pipeline each aggregate one minute of counters. Latency distributions retain at most 256 samples per stage; p50/p95 describe that recent sample window, while maxima and counts span the whole reporting interval. Stage timings are summed per capture, including all URL lookups or call windows in that capture. A final partial summary is flushed on stop.
+- Native summaries cover metadata, URL AX versus AppleScript fallback, call observation outcomes, source snapshots, screenshot capture, OCR geometry, capture-time AX, Vision detection, rendering, and consent bypass/fallback counts. The outer pipeline adds scheduling lateness, pixel comparison/materialization, frame handling, trigger mix, and kept/not-kept counts.
+- Slow events are limited to one every 30 seconds per recorder; later reports show suppressed event counts. The thresholds are diagnostic only and never change privacy decisions or skip work.
+- CPU and current RSS are sampled only when native reports emit. CPU uses `getrusage` timeval seconds and is expressed as percent of one core over the stated process window, including all Retrace work. It does not measure Zoom/browser CPU, GPU/ANE time, or prove another application's slowdown. Thermal codes: 0 nominal, 1 fair, 2 serious, 3 critical.
+- Timings use a monotonic clock. Keep per-frame collection to clocks and bounded numeric counters; never scan other processes or add per-frame disk logging for these diagnostics.
 
 ## System Requirements
 

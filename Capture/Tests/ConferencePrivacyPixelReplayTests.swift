@@ -115,14 +115,22 @@ final class ConferencePrivacyPixelReplayTests: XCTestCase {
         try await capture.startCapture(config: .default, displayID: 1)
         do {
             let foregroundOnly = selection(windows(includeBackground: false))
+            let initialPerformance = CapturePerformanceFrame()
             let initial = await capture.applyConferencePrivacy(to: image, windows: foregroundOnly,
                 visibleWindowContext: foregroundOnly.visible.first,
                 displayBounds: CGRect(x: 0, y: 0, width: 1920, height: 1080),
-                hasActiveMediaCapture: false, captureIntervalSeconds: 2)
+                hasActiveMediaCapture: false, captureIntervalSeconds: 2,
+                performance: initialPerformance)
             XCTAssertNotNil(initial)
             let initialEvents = await events.drain()
             XCTAssertEqual(initialEvents.first?.outcome, .blurred)
             XCTAssertEqual(initialEvents.first?.faceCount, 10, "Calibration must detect all ten controlled faces")
+            let initialSample = initialPerformance.snapshot()
+            XCTAssertEqual(initialSample.counts[.faceWindows], 1)
+            XCTAssertEqual(initialSample.counts[.faces], 10)
+            XCTAssertEqual(initialSample.counts[.callActive], 1)
+            XCTAssertGreaterThan(initialSample.durations[.faceDetection] ?? 0, 0)
+            XCTAssertGreaterThan(initialSample.durations[.faceRender] ?? 0, 0)
             let token = try XCTUnwrap(initialEvents.first?.consentSessionID)
             let granted = await capture.disableFaceBlurForConferenceCall(callID: token)
             XCTAssertTrue(granted)
@@ -133,15 +141,20 @@ final class ConferencePrivacyPixelReplayTests: XCTestCase {
                 let selected = selection(windows(includeBackground: includeBackground))
                 let before = await capture.prepareConferenceWindowSources(windows: selected, hasActiveMediaCapture: false)
                 let validated = await capture.validateConferenceWindowSources(before)
+                let performance = CapturePerformanceFrame()
                 let output = await capture.applyConferencePrivacy(to: image, windows: selected,
                     visibleWindowContext: selected.visible.first,
                     displayBounds: CGRect(x: 0, y: 0, width: 1920, height: 1080),
                     hasActiveMediaCapture: false, captureIntervalSeconds: 2,
-                    validatedWindowSources: validated)
+                    validatedWindowSources: validated, performance: performance)
                 let result = try XCTUnwrap(output)
                 try export(result, step: step)
                 let recorded = await events.drain()
                 XCTAssertEqual(recorded.first?.outcome, .consentBypassed)
+                let sample = performance.snapshot()
+                XCTAssertEqual(sample.counts[.consentBypassed], 1)
+                XCTAssertEqual(sample.counts[.faceWindows] ?? 0, includeBackground ? 1 : 0)
+                XCTAssertEqual(sample.counts[.callUnknownControls] ?? 0, includeBackground ? 1 : 0)
                 let inputBytes = try XCTUnwrap(image.dataProvider?.data) as Data
                 let outputBytes = try XCTUnwrap(result.dataProvider?.data) as Data
                 if includeBackground {
@@ -332,6 +345,34 @@ final class ConferencePrivacyPixelReplayTests: XCTestCase {
     }
 
     /// Opt in to measurements; no timing thresholds because host load and hardware vary.
+    func testMeasureDiagnosticsOverhead() async throws {
+        guard ProcessInfo.processInfo.environment["RETRACE_MEASURE_FACE_BLUR"] == "1" else {
+            throw XCTSkip("Set RETRACE_MEASURE_FACE_BLUR=1 for diagnostic overhead measurements")
+        }
+        let image = try gallery(width: 3840, height: 2160)
+        let processor = ConferenceFaceBlurProcessor()
+        var diagnostics = CapturePerformanceDiagnostics()
+        for phase in 0..<3 {
+            let enabled = phase == 1
+            for iteration in 0..<9 {
+                let start = CapturePerformanceFrame.now()
+                let performance = enabled ? CapturePerformanceFrame() : nil
+                let result = try await processor.blurFaces(in: image, regionOfInterest: nil,
+                    configuration: .production, performance: performance)
+                if let performance {
+                    performance.record(.total, since: start)
+                    let reports = diagnostics.record(performance.snapshot(), at: CapturePerformanceFrame.now())
+                    diagnostics.emit(reports)
+                    XCTAssertNotNil(performance.snapshot().durations[.faceDetection])
+                    XCTAssertNotNil(performance.snapshot().durations[.faceRender])
+                }
+                let total = (CapturePerformanceFrame.now() - start) * 1000
+                XCTAssertEqual(result.faceCount, 10)
+                print("DIAGNOSTIC_BENCH phase=\(phase) enabled=\(enabled) iteration=\(iteration) faces=\(result.faceCount) total_ms=\(total)")
+            }
+        }
+    }
+
     func testMeasureDetectionAndRenderingCost() async throws {
         guard ProcessInfo.processInfo.environment["RETRACE_MEASURE_FACE_BLUR"] == "1" else {
             throw XCTSkip("Set RETRACE_MEASURE_FACE_BLUR=1 for controlled processing measurements")

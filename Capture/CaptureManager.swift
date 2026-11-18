@@ -218,6 +218,7 @@ public actor CaptureManager: CaptureProtocol {
     private var lastActualCaptureTime: Date?
     private var currentCaptureDisplayID: UInt32?
     private var isCaptureExecutionInFlight = false
+    private var pipelinePerformance = CapturePerformanceDiagnostics(pipeline: true)
     private static let dedupedFrameBufferLimit = 8
     private static let memoryLedgerCurrentFrameTag = "capture.stream.currentFrame"
     private static let memoryLedgerLastKeptFrameTag = "capture.dedup.lastKeptFrame"
@@ -332,6 +333,8 @@ public actor CaptureManager: CaptureProtocol {
         await mouseClickMonitor.stopMonitoring()
         await cgWindowListCapture.setOnConferenceFramePrivacyEvent(nil)
         try await cgWindowListCapture.stopCapture()
+        let reports = pipelinePerformance.flush(at: CapturePerformanceFrame.now())
+        pipelinePerformance.emit(reports)
 
         dedupedFrameContinuation?.finish()
         dedupedFrameContinuation = nil
@@ -422,6 +425,7 @@ public actor CaptureManager: CaptureProtocol {
     }
 
     private func resetCaptureState() {
+        pipelinePerformance = CapturePerformanceDiagnostics(pipeline: true)
         scheduledCaptureTask?.cancel()
         scheduledCaptureTask = nil
         pendingCapture = nil
@@ -693,6 +697,20 @@ public actor CaptureManager: CaptureProtocol {
         guard let capture = pendingCapture else { return }
         guard !isCaptureExecutionInFlight else { return }
 
+        let performance = CapturePerformanceFrame()
+        let performanceStart = CapturePerformanceFrame.now()
+        performance.record(.queueDelay, milliseconds: max(0, now().timeIntervalSince(capture.fireTime) * 1000))
+        switch capture.trigger {
+        case .interval: performance.increment(.intervalTrigger)
+        case .mouseClick: performance.increment(.clickTrigger)
+        case .windowChange: performance.increment(.windowTrigger)
+        }
+        defer {
+            performance.record(.total, since: performanceStart)
+            let reports = pipelinePerformance.record(performance.snapshot(), at: CapturePerformanceFrame.now())
+            pipelinePerformance.emit(reports)
+        }
+
         pendingCapture = nil
         scheduledCaptureTask = nil
         isCaptureExecutionInFlight = true
@@ -721,6 +739,7 @@ public actor CaptureManager: CaptureProtocol {
                     capturedMetadata: candidate.metadata
                 )
                 if shouldDropFrame {
+                    performance.increment(.dropped)
                     scheduleNextIntervalCapture(from: captureAttemptCompletedAt)
                     if capture.trigger == .windowChange {
                         await syncCaptureDisplayIfNeeded()
@@ -735,6 +754,7 @@ public actor CaptureManager: CaptureProtocol {
             // An exact native-pixel duplicate would have similarity 1. Reuse the
             // prior BGRA bytes and preserve the normal mouse/threshold decision.
             // Near duplicates still go through the existing renderer/comparator.
+            let pixelStart = CapturePerformanceFrame.now()
             let reusablePixels: Data?
             if currentConfig.adaptiveCaptureEnabled,
                currentConfig.deduplicationThreshold < 1,
@@ -744,13 +764,24 @@ public actor CaptureManager: CaptureProtocol {
             } else {
                 reusablePixels = nil
             }
-            if let frame = candidate.materialize(reusingPixels: reusablePixels),
-               await handleCapturedFrame(frame, trigger: capture.trigger) {
-                lastKeptCandidate = candidate
-                updateCaptureMemoryLedger(currentFrameBytes: 0)
+            if reusablePixels != nil { performance.increment(.pixelReused) }
+            let frame = candidate.materialize(reusingPixels: reusablePixels)
+            performance.record(.materialize, since: pixelStart)
+            if let frame {
+                let handlingStart = CapturePerformanceFrame.now()
+                let kept = await handleCapturedFrame(frame, trigger: capture.trigger)
+                performance.record(.deduplication, since: handlingStart)
+                performance.increment(kept ? .kept : .deduplicated)
+                if kept {
+                    lastKeptCandidate = candidate
+                    updateCaptureMemoryLedger(currentFrameBytes: 0)
+                }
+            } else {
+                performance.increment(.dropped)
             }
             scheduleNextIntervalCapture(from: captureAttemptCompletedAt)
         } else {
+            performance.increment(.dropped)
             scheduleNextIntervalCapture(from: max(captureAttemptStartedAt, captureAttemptCompletedAt))
         }
 
