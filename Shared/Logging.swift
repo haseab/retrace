@@ -786,6 +786,23 @@ public enum MemoryLedger {
     private static let store = MemoryLedgerStore()
     private static let pendingWriteLock = NSLock()
     private static var pendingWriteTail: Task<Void, Never>?
+    /// Enqueued writes that have not finished yet. Guarded by `pendingWriteLock`.
+    private static var pendingWriteDepth = 0
+    /// Writes refused because the backlog was already at `pendingWriteDepthLimit`.
+    private static var pendingWriteDropCount = 0
+    /// Backlog depth past which fire-and-forget writes are refused.
+    ///
+    /// Every write chains itself onto its predecessor, so each pending write keeps a
+    /// live `Task` alive that retains the one before it. A producer that outruns the
+    /// drain therefore grows an unbounded chain, and `flushPendingUpdates()` -- which
+    /// awaits the tail -- has to wait for all of it. An unthrottled writer loop grew
+    /// that chain until the test process died with signal 10.
+    ///
+    /// Ordered writes cannot run away, because their caller awaits each one before
+    /// issuing the next, so the cap applies only to the fire-and-forget entry points.
+    /// Production sits a handful of writes deep; this only engages on pathological
+    /// write rates, where dropping telemetry beats killing the process.
+    private static let pendingWriteDepthLimit = 256
     private static let summaryLoggingDefaultsKey = "retrace.debug.memoryLedgerSummaryLoggingEnabled"
 
     public struct ResidualEpoch: Sendable {
@@ -872,21 +889,89 @@ public enum MemoryLedger {
         _ = await pendingWriteSnapshot()?.result
     }
 
-    @discardableResult
-    private static func enqueuePendingWrite(
+#if DEBUG
+    /// Runs a controlled queue barrier for tests of real pending-write admission.
+    @_spi(Testing) public static func enqueuePendingWriteBarrier(
         _ operation: @escaping @Sendable () async -> Void
     ) -> Task<Void, Never> {
+        enqueuePendingWrite(operation)
+    }
+#endif
+
+    /// Backlog depth, writes dropped because the backlog was full, and the cap itself.
+    public static var pendingWriteDiagnostics: (depth: Int, dropped: Int, limit: Int) {
         pendingWriteLock.lock()
+        defer { pendingWriteLock.unlock() }
+        return (pendingWriteDepth, pendingWriteDropCount, pendingWriteDepthLimit)
+    }
+
+    /// Chain `operation` onto the current tail. The caller must hold `pendingWriteLock`.
+    @discardableResult
+    private static func appendPendingWriteLocked(
+        _ operation: @escaping @Sendable () async -> Void
+    ) -> Task<Void, Never> {
         let previousTail = pendingWriteTail
+        pendingWriteDepth += 1
         let task = Task(priority: .utility) {
             if let previousTail {
                 _ = await previousTail.result
             }
             await operation()
+            retirePendingWrite()
         }
         pendingWriteTail = task
-        pendingWriteLock.unlock()
         return task
+    }
+
+    /// Account for a finished write. Synchronous because `NSLock` may not be taken
+    /// from an async context.
+    private static func retirePendingWrite() {
+        pendingWriteLock.lock()
+        pendingWriteDepth -= 1
+        // Nobody can be waiting on this chain any more, so stop retaining its tail.
+        if pendingWriteDepth == 0 {
+            pendingWriteTail = nil
+        }
+        pendingWriteLock.unlock()
+    }
+
+    /// Enqueue a write whose completion the caller awaits.
+    ///
+    /// Uncapped on purpose: an awaiting caller cannot outrun the drain, so the depth
+    /// these contribute is bounded by the number of concurrent callers.
+    @discardableResult
+    private static func enqueuePendingWrite(
+        _ operation: @escaping @Sendable () async -> Void
+    ) -> Task<Void, Never> {
+        pendingWriteLock.lock()
+        defer { pendingWriteLock.unlock() }
+        return appendPendingWriteLocked(operation)
+    }
+
+    /// Enqueue a fire-and-forget write, refusing it once the backlog is saturated.
+    ///
+    /// These entry points are not `async`, so they have no way to apply backpressure;
+    /// refusing a telemetry write is the only bound available to them.
+    private static func enqueueDroppablePendingWrite(
+        _ operation: @escaping @Sendable () async -> Void
+    ) {
+        pendingWriteLock.lock()
+        guard pendingWriteDepth < pendingWriteDepthLimit else {
+            pendingWriteDropCount += 1
+            let dropped = pendingWriteDropCount
+            pendingWriteLock.unlock()
+            // Report on crossing each multiple of the limit, so a saturated ledger is
+            // visible without the report itself becoming the flood.
+            if dropped.isMultiple(of: pendingWriteDepthLimit) {
+                Log.warning(
+                    "[MemoryLedger] Dropped \(dropped) telemetry writes; pending-write backlog is at its \(pendingWriteDepthLimit) limit",
+                    category: .app
+                )
+            }
+            return
+        }
+        appendPendingWriteLocked(operation)
+        pendingWriteLock.unlock()
     }
 
     private static func pendingWriteSnapshot() -> Task<Void, Never>? {
@@ -925,7 +1010,7 @@ public enum MemoryLedger {
         countsTowardTrackedMemory: Bool = true
     ) {
         guard !tag.isEmpty else { return }
-        enqueuePendingWrite {
+        enqueueDroppablePendingWrite {
             await store.set(
                 tag: tag,
                 bytes: bytes,
@@ -968,20 +1053,29 @@ public enum MemoryLedger {
         _ = await task.result
     }
 
-    /// Remove a component from the ledger.
-    public static func remove(tag: String) {
+    /// Remove a component without dropping cleanup or extending a saturated queue.
+    /// Callers await both admission and completion; no task is created while full.
+    public static func remove(tag: String) async {
         guard !tag.isEmpty else { return }
-        enqueuePendingWrite {
-            await store.remove(tag: tag)
+        while true {
+            let admission = admitRemoval(tag: tag)
+            await admission.task.value
+            if admission.accepted { return }
         }
     }
 
     public static func removeOrdered(tag: String) async {
-        guard !tag.isEmpty else { return }
-        let task = enqueuePendingWrite {
-            await store.remove(tag: tag)
+        await remove(tag: tag)
+    }
+
+    private static func admitRemoval(tag: String) -> (task: Task<Void, Never>, accepted: Bool) {
+        pendingWriteLock.lock()
+        defer { pendingWriteLock.unlock() }
+        if pendingWriteDepth >= pendingWriteDepthLimit, let tail = pendingWriteTail {
+            // Suspend on existing work instead of allocating another ledger task.
+            return (tail, false)
         }
-        _ = await task.result
+        return (appendPendingWriteLocked { await store.remove(tag: tag) }, true)
     }
 
     /// Update process-level memory snapshot for tracked-vs-unattributed calculations.
@@ -991,7 +1085,7 @@ public enum MemoryLedger {
         internalBytes: UInt64?,
         compressedBytes: UInt64?
     ) {
-        enqueuePendingWrite {
+        enqueueDroppablePendingWrite {
             await store.setProcessSnapshot(
                 footprintBytes: footprintBytes,
                 residentBytes: residentBytes,
@@ -1025,7 +1119,7 @@ public enum MemoryLedger {
         minIntervalSeconds: TimeInterval = 30,
         force: Bool = false
     ) {
-        enqueuePendingWrite {
+        enqueueDroppablePendingWrite {
             await store.emitSummaryIfNeeded(
                 reason: reason,
                 category: category,
