@@ -1093,7 +1093,8 @@ public struct AdvancedSearchFilterPopover: View {
     @Binding var browserUrlFilterMode: AppFilterMode
     @Binding var excludedSearchTerms: [String]
 
-    @FocusState private var focusedField: Field?
+    // AppKit owns these fields; an unattached FocusState resets on view updates.
+    @State private var focusedField: Field?
     @State private var excludedInputText = ""
     @State private var windowInputText = ""
     @State private var browserInputText = ""
