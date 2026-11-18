@@ -1442,6 +1442,39 @@ public class SimpleTimelineViewModel: ObservableObject {
         manualScanHasOverlay = false
     }
 
+    private var frameTextScanProtectionEnabled: Bool {
+#if DEBUG
+        if let override = test_dragStartStillOCRHooks.phraseProtectionEnabled { return override() }
+#endif
+        return PhraseRedactionMode.isEnabled(
+            in: UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
+        )
+    }
+
+    private func canPublishUnprotectedFrameTextScan(_ frame: TimelineFrame) async throws -> Bool {
+        // A native frame's pixels are unsafe until its privacy rewrite has settled.
+        if frame.frame.source == .native, frameTextScanProtectionEnabled {
+            let status = try await fetchOCRStatusForPresentation(frameID: frame.frame.id)
+            guard status.state == .completed else { return false }
+        }
+        let nodes = try await fetchAllOCRNodesForPresentation(
+            frameID: frame.frame.id, source: frame.frame.source
+        )
+        return !nodes.contains(where: \.isRedacted)
+    }
+
+    private func blockFrameTextScanForProtection(source: String) {
+        if manualScanHasOverlay {
+            manualScanHasOverlay = false
+            clearTextSelection()
+            clearHyperlinkMatches()
+            setOCRNodes([])
+            loadOCRNodes()
+        }
+        frameTextScanState = .protected
+        recordFrameTextScan(source: source, outcome: "protected")
+    }
+
     /// On-demand, session-only OCR. Saved nodes and the search index are never changed.
     func scanCurrentFrameText(source: String = "button") {
         guard canScanCurrentFrameText, frameTextScanState != .scanning else { return }
@@ -1463,13 +1496,10 @@ public class SimpleTimelineViewModel: ObservableObject {
             do {
                 if !live, let frame {
                     // Consult saved metadata even when the timeline overlay has not loaded yet.
-                    let nodes = try await self.fetchAllOCRNodesForPresentation(
-                        frameID: frame.frame.id, source: frame.frame.source
-                    )
+                    let allowed = try await self.canPublishUnprotectedFrameTextScan(frame)
                     guard self.frameTextScanRequestID == requestID, !Task.isCancelled else { return }
-                    if nodes.contains(where: \.isRedacted) {
-                        self.frameTextScanState = .protected
-                        self.recordFrameTextScan(source: source, outcome: "protected")
+                    if !allowed {
+                        self.blockFrameTextScanForProtection(source: source)
                         return
                     }
                 }
@@ -1497,6 +1527,15 @@ public class SimpleTimelineViewModel: ObservableObject {
                 guard self.frameTextScanRequestID == requestID, !Task.isCancelled else { return }
                 let regions = try await self.recognizeTextFromCGImageForDragStartStillOCR(cgImage)
                 guard self.frameTextScanRequestID == requestID, !Task.isCancelled else { return }
+                if !live, let frame {
+                    // Protection may have changed while decoding or recognizing earlier pixels.
+                    let allowed = try await self.canPublishUnprotectedFrameTextScan(frame)
+                    guard self.frameTextScanRequestID == requestID, !Task.isCancelled else { return }
+                    if !allowed {
+                        self.blockFrameTextScanForProtection(source: source)
+                        return
+                    }
+                }
                 let resultFrameID = live ? Int64(-1) : frame?.frame.id.value ?? -1
                 if !regions.isEmpty {
                     self.ocrNodesLoadTask?.cancel()
@@ -2816,6 +2855,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
     struct DragStartStillOCRTestHooks {
         var recognizeTextFromCGImage: ((CGImage) async throws -> [TextRegion])?
+        var phraseProtectionEnabled: (() -> Bool)?
     }
     struct BlockCommentsTestHooks {
         var getCommentsForSegments: (([SegmentID]) async throws -> [AppCoordinator.LinkedSegmentComment])?
@@ -2877,6 +2917,8 @@ public class SimpleTimelineViewModel: ObservableObject {
         ) { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
+                Log.debug("[Timeline-OCR] Invalidating transient scan after redaction", category: .ui)
+                self.resetFrameTextScan()
                 self.cancelForegroundFrameLoad(reason: "redaction completed")
                 self.cancelCacheExpansion(reason: "redaction completed")
                 self.unavailableFrameDiskLookupTask?.cancel()

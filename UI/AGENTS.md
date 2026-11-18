@@ -797,3 +797,5 @@ protected frames retain their existing overlays. Saved OCR and search indexes ar
 Navigation, a new live screenshot, and closing the timeline invalidate pending results.
 `timeline_text_scan` records entry/outcome without recognized text; manual OCR latency uses
 `timeline.manual_ocr.total_ms`.
+
+Manual scans recheck saved protection before publishing, wait for native privacy processing when enabled, and are invalidated by redaction-completion notifications. Fresh OCR outlines use the same zoom and pan transform as the frame.

@@ -309,6 +309,8 @@ public struct SimpleTimelineView: View {
                         }
                     }
                     .stroke(Color.accentColor.opacity(0.55), lineWidth: 1)
+                    .scaleEffect(viewModel.frameZoomScale)
+                    .offset(viewModel.frameZoomOffset)
                     .allowsHitTesting(false)
                     .transition(.opacity)
                 }
@@ -6496,7 +6498,7 @@ struct FrameTextScanButton: View {
         .buttonStyle(.plain)
         .disabled(!viewModel.canScanCurrentFrameText || viewModel.frameTextScanState == .scanning)
         .help(viewModel.frameTextScanState == .protected
-              ? "Scanning is unavailable for frames containing redacted text."
+              ? "Scanning is unavailable while privacy processing is pending or the frame contains redacted text."
               : "Scan text in this frame (⌘⇧O). Text is available for this viewing session.")
         .accessibilityLabel(title)
         .accessibilityHint("Recognize text in the current frame. Command Shift O.")
