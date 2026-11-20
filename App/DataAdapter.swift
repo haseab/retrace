@@ -1442,6 +1442,7 @@ public actor DataAdapter {
             LEFT JOIN segment s ON f.segmentId = s.id
             LEFT JOIN video v ON f.videoId = v.id
             WHERE f.displayID = ? AND f.createdAt <= ?
+              AND (f.rewritePurpose IS NULL OR f.rewritePurpose != 'deletion')
             ORDER BY f.createdAt DESC
             LIMIT 1
             """
@@ -1478,6 +1479,7 @@ public actor DataAdapter {
                 SELECT f.id, f.createdAt, f.displayID
                 FROM frame f
                 WHERE f.id IN (\(frameIDList))
+                  AND (f.rewritePurpose IS NULL OR f.rewritePurpose != 'deletion')
             ),
             connected_secondary AS (
                 SELECT
@@ -1503,6 +1505,7 @@ public actor DataAdapter {
                 LEFT JOIN frame sf
                   ON sf.displayID = cs.secondary_display_id
                  AND sf.createdAt <= cs.primary_ts
+                 AND (sf.rewritePurpose IS NULL OR sf.rewritePurpose != 'deletion')
             )
             SELECT
                 rs.primary_id,

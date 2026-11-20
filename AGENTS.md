@@ -74,6 +74,7 @@ retrace/
 ├── Shared/                      # CRITICAL: Shared types and protocols
 │   ├── Logging.swift            # Privacy-safe bounded background logging, batching, routine summaries and async flush
 │   ├── AppPaths.swift           # Application path configuration
+│   ├── DisplayIdentity.swift    # Shared UUID identity registry with collision-safe persistence
 │   ├── BGRAImageUtilities.swift # Shared BGRA conversion + patch extraction helpers
 │   ├── MasterKeyManager.swift   # Keychain-backed master key creation + recovery phrase export
 │   ├── ReversibleOCRScrambler.swift # Deterministic reversible OCR patch scrambling + text protection

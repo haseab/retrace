@@ -180,7 +180,6 @@ public actor CaptureManager: CaptureProtocol {
     private var multiDisplayBackends: [UInt32: CGWindowListCapture] = [:]
     private var deduplicationByDisplay: [UInt32: (CaptureFrameCandidate?, CapturedFrame?, CGPoint?)] = [:]
     private var focusedDisplayID: UInt32 = 0
-    private var stableDisplayIDs: [UInt32: UInt32] = [:]
 
     private let cgWindowListCapture: any ScreenCaptureBackend
     private let displayMonitor: any CaptureDisplayMonitoring
@@ -341,7 +340,6 @@ public actor CaptureManager: CaptureProtocol {
         for backend in multiDisplayBackends.values { try await backend.stopCapture() }
         multiDisplayBackends.removeAll()
         deduplicationByDisplay.removeAll()
-        stableDisplayIDs.removeAll()
         let reports = pipelinePerformance.flush(at: CapturePerformanceFrame.now())
         pipelinePerformance.emit(reports)
 
@@ -751,7 +749,6 @@ public actor CaptureManager: CaptureProtocol {
         for id in disconnected {
             if let backend = multiDisplayBackends.removeValue(forKey: id) { try? await backend.stopCapture() }
             deduplicationByDisplay.removeValue(forKey: id)
-            stableDisplayIDs.removeValue(forKey: id)
         }
         for displayID in displays {
             guard _isCapturing else { break }
@@ -1390,37 +1387,7 @@ public extension Notification.Name {
 
 extension CaptureManager {
     private func stableDisplayID(forRuntimeDisplayID runtimeDisplayID: UInt32) -> UInt32 {
-        if let cached = stableDisplayIDs[runtimeDisplayID] { return cached }
-        let cgDisplayID = CGDirectDisplayID(runtimeDisplayID)
-        let vendor = CGDisplayVendorNumber(cgDisplayID)
-        let model = CGDisplayModelNumber(cgDisplayID)
-        let serial = CGDisplaySerialNumber(cgDisplayID)
-
-        let fingerprint: String
-        if vendor == 0 && model == 0 && serial == 0 {
-            // Conservative fallback: unknown hardware identity, keep runtime ID scoped to session.
-            fingerprint = "runtime:\(runtimeDisplayID)"
-        } else if serial != 0 {
-            fingerprint = "\(vendor):\(model):\(serial)"
-        } else {
-            // Some displays report serial=0; include pixel dimensions to reduce collisions.
-            let width = CGDisplayPixelsWide(cgDisplayID)
-            let height = CGDisplayPixelsHigh(cgDisplayID)
-            fingerprint = "\(vendor):\(model):\(width)x\(height)"
-        }
-
-        var hash: UInt32 = 2_166_136_261 // FNV-1a 32-bit offset basis
-        for byte in fingerprint.utf8 {
-            hash ^= UInt32(byte)
-            hash = hash &* 16_777_619
-        }
-
-        // Keep IDs Int32-compatible because persistence code still binds/reads displayID as Int32.
-        // This avoids runtime traps like "Not enough bits to represent the passed value".
-        let int32SafeHash = hash & 0x7FFF_FFFF
-        let result = int32SafeHash == 0 ? 1 : int32SafeHash
-        stableDisplayIDs[runtimeDisplayID] = result
-        return result
+        DisplayIdentityRegistry.shared.displayID(for: runtimeDisplayID)
     }
 
 }

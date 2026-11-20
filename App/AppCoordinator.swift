@@ -1891,31 +1891,7 @@ public actor AppCoordinator {
     /// Convert runtime CGDirectDisplayID into a stable hardware-derived ID for persistence.
     /// `displayID` columns keep their name, but this value is stable across runtime ID reuse.
     private func stableDisplayID(forRuntimeDisplayID runtimeDisplayID: UInt32) -> UInt32 {
-        let cgDisplayID = CGDirectDisplayID(runtimeDisplayID)
-        let vendor = CGDisplayVendorNumber(cgDisplayID)
-        let model = CGDisplayModelNumber(cgDisplayID)
-        let serial = CGDisplaySerialNumber(cgDisplayID)
-
-        let fingerprint: String
-        if vendor == 0 && model == 0 && serial == 0 {
-            fingerprint = "runtime:\(runtimeDisplayID)"
-        } else if serial != 0 {
-            fingerprint = "\(vendor):\(model):\(serial)"
-        } else {
-            let width = CGDisplayPixelsWide(cgDisplayID)
-            let height = CGDisplayPixelsHigh(cgDisplayID)
-            fingerprint = "\(vendor):\(model):\(width)x\(height)"
-        }
-
-        var hash: UInt32 = 2_166_136_261
-        for byte in fingerprint.utf8 {
-            hash ^= UInt32(byte)
-            hash = hash &* 16_777_619
-        }
-
-        // Keep IDs Int32-compatible because persistence code still binds/reads displayID as Int32.
-        let int32SafeHash = hash & 0x7FFF_FFFF
-        return int32SafeHash == 0 ? 1 : int32SafeHash
+        DisplayIdentityRegistry.shared.displayID(for: runtimeDisplayID)
     }
 
     private func reconcileDisplaySegments(reason: String) async {

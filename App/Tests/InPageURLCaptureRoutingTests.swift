@@ -361,6 +361,39 @@ final class DBStorageSnapshotEstimateTests: XCTestCase {
 }
 
 final class DataAdapterRewindBoundaryTests: XCTestCase {
+    func testSecondaryPreviewsExcludePendingDeletionFrames() async throws {
+        let fixture = try await makeFixture(cutoffDate: .distantPast)
+        let timestamp = Date(timeIntervalSince1970: 1_780_000_000)
+        let safe = try await seedFrameRecord(in: fixture.retraceDatabase, timestamp: timestamp,
+            bundleID: "com.example.editor", text: "visible", source: .native)
+        let deleted = try await seedFrameRecord(in: fixture.retraceDatabase, timestamp: timestamp.addingTimeInterval(1),
+            bundleID: "com.example.editor", text: "removed", source: .native)
+        let primary = try await seedFrameRecord(in: fixture.retraceDatabase, timestamp: timestamp.addingTimeInterval(2),
+            bundleID: "com.example.browser", text: "primary", source: .native)
+        let connection = await fixture.retraceDatabase.getConnection()
+        let db = try XCTUnwrap(connection)
+        let sql = """
+            UPDATE frame SET displayID=42 WHERE id IN (\(safe.frameID.value), \(deleted.frameID.value));
+            UPDATE frame SET rewritePurpose='deletion' WHERE id=\(deleted.frameID.value);
+            UPDATE frame SET displayID=41 WHERE id=\(primary.frameID.value);
+            INSERT INTO display(displayID,name,lastSeenAt) VALUES (42,'Example monitor',0);
+            INSERT INTO display_session(displayID,connectedAt) VALUES (42,0);
+            """
+        XCTAssertEqual(sqlite3_exec(db, sql, nil, nil, nil), SQLITE_OK)
+        let nearest = try await fixture.adapter.getNearestFrame(displayID: 42, before: timestamp.addingTimeInterval(3))
+        XCTAssertEqual(nearest?.frame.id, safe.frameID)
+        let payloads = try await fixture.adapter.getSecondaryDisplayFrames(forPrimaryFrameIDs: [primary.frameID])
+        XCTAssertEqual(payloads[primary.frameID.value]?.first?.videoInfo?.videoPath, nearest?.videoInfo?.videoPath)
+        XCTAssertNotNil(payloads[primary.frameID.value]?.first?.videoInfo)
+        let deleteAll = "UPDATE frame SET rewritePurpose='deletion' WHERE id=\(safe.frameID.value)"
+        XCTAssertEqual(sqlite3_exec(db, deleteAll, nil, nil, nil), SQLITE_OK)
+        let empty = try await fixture.adapter.getNearestFrame(displayID: 42, before: timestamp.addingTimeInterval(3))
+        XCTAssertNil(empty)
+        let emptyPayloads = try await fixture.adapter.getSecondaryDisplayFrames(forPrimaryFrameIDs: [primary.frameID])
+        XCTAssertNil(emptyPayloads[primary.frameID.value]?.first?.videoInfo)
+        try await close(fixture)
+    }
+
     func testDisplayFiltersAndNearestFramePreservePrivacyMetadata() async throws {
         let fixture = try await makeFixture(cutoffDate: .distantPast)
         let timestamp = Date(timeIntervalSince1970: 1_780_000_000)

@@ -956,7 +956,7 @@ final class StorageManagerTests: XCTestCase {
 
     /// Exercise the WAL with a committed screenshot, including padded rows, rather than
     /// relying on synthetic solid pixels to prove lossless image persistence.
-    private func makeWALScreenshotFrame(timestamp: Date = Date(timeIntervalSince1970: 1_720_000_000)) throws -> CapturedFrame {
+    private func makeWALScreenshotFrame(timestamp: Date = Date(timeIntervalSince1970: 1_720_000_000), isFocused: Bool = true) throws -> CapturedFrame {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         let source = try XCTUnwrap(
@@ -984,7 +984,7 @@ final class StorageManagerTests: XCTestCase {
             bytesPerRow: bytesPerRow,
             metadata: FrameMetadata(
                 appBundleID: "com.apple.Safari", appName: "Safari", windowName: "Instructions — 窗口",
-                browserURL: "https://example.com/instructions", displayID: 7
+                browserURL: "https://example.com/instructions", displayID: 7, isFocused: isFocused
             )
         )
     }
@@ -1179,7 +1179,7 @@ final class StorageManagerTests: XCTestCase {
         let manager = WALManager(walRoot: root)
         var session = try await manager.createSession(videoID: VideoSegmentID(value: 401))
         let first = try makeWALScreenshotFrame()
-        let second = try makeWALScreenshotFrame(timestamp: first.timestamp.addingTimeInterval(2))
+        let second = try makeWALScreenshotFrame(timestamp: first.timestamp.addingTimeInterval(2), isFocused: false)
         try await manager.appendFrame(first, to: &session)
         try await manager.registerFrameID(videoID: session.videoID, frameID: 9001, frameIndex: 0)
         try await manager.appendFrame(second, to: &session)
@@ -1205,15 +1205,26 @@ final class StorageManagerTests: XCTestCase {
         let legacy = try makeWALScreenshotFrame()
         let current = try makeWALScreenshotFrame(timestamp: legacy.timestamp.addingTimeInterval(2))
         try appendLegacyWALFrame(legacy, to: session.framesURL)
+        let legacyByteCount = try Data(contentsOf: session.framesURL).count
         try await manager.appendFrame(current, to: &session)
+        // Convert one genuine checksummed V3 screenshot record to the V2 layout.
+        let v3 = try Data(contentsOf: session.framesURL).subdata(in: legacyByteCount..<(try Data(contentsOf: session.framesURL).count))
+        var v2 = Data("RTRCWAL2".utf8)
+        v2.append(v3.subdata(in: 8..<84))
+        v2.append(v3.subdata(in: 88..<v3.count))
+        let handle = try FileHandle(forWritingTo: session.framesURL)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: v2)
+        try handle.close()
         try FileManager.default.removeItem(at: session.sessionDir.appendingPathComponent("metadata.json"))
 
         let restarted = WALManager(walRoot: root)
         let sessions = try await restarted.listActiveSessions()
-        XCTAssertEqual(sessions.first?.metadata.frameCount, 2)
+        XCTAssertEqual(sessions.first?.metadata.frameCount, 3)
         let frames = try await restarted.readFrames(from: session)
-        XCTAssertEqual(frames.map(\.imageData), [legacy.imageData, current.imageData])
-        XCTAssertEqual(frames.map(\.timestamp), [legacy.timestamp, current.timestamp])
+        XCTAssertEqual(frames.map(\.imageData), [legacy.imageData, current.imageData, current.imageData])
+        XCTAssertEqual(frames.map(\.timestamp), [legacy.timestamp, current.timestamp, current.timestamp])
+        XCTAssertTrue(frames.allSatisfy { $0.metadata.isFocused })
     }
 
     func testWALRejectsDamagedFrameChecksum() async throws {
@@ -1397,7 +1408,7 @@ final class StorageManagerTests: XCTestCase {
         XCTAssertEqual(stats?.rawBytes, Int64(pixels.count))
         let result = try await manager.readFrame(videoID: session.videoID, frameIndex: 0)
         XCTAssertEqual(result.imageData, pixels)
-        XCTAssertEqual(stats?.storedBytes, Int64(pixels.count + 84))
+        XCTAssertEqual(stats?.storedBytes, Int64(pixels.count + 88))
         try await manager.finalizeSession(session)
         let clearedStats = await manager.compressionStatistics(videoID: session.videoID)
         XCTAssertNil(clearedStats)
@@ -2233,13 +2244,7 @@ final class StorageManagerTests: XCTestCase {
 
         for index in 0..<3 {
             try await walManager.appendFrame(
-                makeCapturedFrame(
-                    width: 8,
-                    height: 8,
-                    bytesPerRow: 32,
-                    imageByteCount: 32 * 8,
-                    timestamp: start.addingTimeInterval(Double(index))
-                ),
+                try makeWALScreenshotFrame(timestamp: start.addingTimeInterval(Double(index)), isFocused: false),
                 to: &session
             )
         }
@@ -2270,12 +2275,15 @@ final class StorageManagerTests: XCTestCase {
         XCTAssertEqual(videos.first?.fileSizeBytes, 456)
 
         let recoveredVideoID = try XCTUnwrap(videos.first?.id.value)
+        let recoveredDisplayID = await database.displayIDForVideo(recoveredVideoID)
+        XCTAssertEqual(recoveredDisplayID, 7)
         let frames = try await database.getFrames(
             from: start.addingTimeInterval(-60),
             to: start.addingTimeInterval(60),
             limit: 10
         )
         XCTAssertEqual(frames.count, 3)
+        XCTAssertTrue(frames.allSatisfy { $0.metadata.displayID == 7 && !$0.metadata.isFocused })
         XCTAssertTrue(frames.allSatisfy { $0.videoID.value == recoveredVideoID })
         let activeSessions = try await walManager.listActiveSessions()
         XCTAssertTrue(activeSessions.isEmpty)
@@ -3421,13 +3429,7 @@ final class StorageManagerTests: XCTestCase {
 
         for index in 0..<3 {
             try await walManager.appendFrame(
-                makeCapturedFrame(
-                    width: 8,
-                    height: 8,
-                    bytesPerRow: 32,
-                    imageByteCount: 32 * 8,
-                    timestamp: start.addingTimeInterval(Double(index))
-                ),
+                try makeWALScreenshotFrame(timestamp: start.addingTimeInterval(Double(index)), isFocused: false),
                 to: &session
             )
         }
@@ -3451,6 +3453,8 @@ final class StorageManagerTests: XCTestCase {
 
         let videos = try await database.getVideoSegments(from: .distantPast, to: .distantFuture)
         XCTAssertEqual(videos.count, 1)
+        let recoveredDisplayID = await database.displayIDForVideo(try XCTUnwrap(videos.first?.id.value))
+        XCTAssertEqual(recoveredDisplayID, 7)
         XCTAssertEqual(videos[0].frameCount, 3)
         let deletedSegmentIDs = await storage.deletedSegmentIDsSnapshot()
         XCTAssertEqual(deletedSegmentIDs, [sessionVideoID.value])
@@ -4244,6 +4248,8 @@ private actor RecoveryTestDatabase: DatabaseProtocol {
     private var frameMetadataByID: [Int64: String] = [:]
     private var frameProcessingStatuses: [Int64: Int] = [:]
     private var videosByID: [Int64: StoredVideoRecord] = [:]
+    private var displayIDsByVideoID: [Int64: UInt32] = [:]
+    func displayIDForVideo(_ id: Int64) -> UInt32? { displayIDsByVideoID[id] }
     private var segmentsByID: [Int64: Segment] = [:]
     private var documentsByFrameID: [Int64: IndexedDocument] = [:]
     private var docIDsByFrameID: [Int64: Int64] = [:]
@@ -4415,6 +4421,7 @@ private actor RecoveryTestDatabase: DatabaseProtocol {
             source: segment.source
         )
         videosByID[databaseVideoID] = StoredVideoRecord(segment: storedSegment, processingState: 1)
+        displayIDsByVideoID[databaseVideoID] = displayID
         return databaseVideoID
     }
 

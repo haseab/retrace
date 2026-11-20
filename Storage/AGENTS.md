@@ -63,7 +63,7 @@ Location: `AppPaths.storageRoot` (default: `~/Library/Application Support/Retrac
 
 ### WAL format and memory rules
 
-- New records begin with `RTRCWAL2`, a UInt32 codec (0 = raw fallback, 1 = LZFSE), a UInt32 decoded size, and a 32-byte SHA-256 pixel digest. The existing 36-byte frame header, metadata strings, and stored payload follow. Integers use little-endian encoding.
+- New records begin with `RTRCWAL3`, a UInt32 codec (0 = raw fallback, 1 = LZFSE), a UInt32 decoded size, and a 32-byte SHA-256 pixel digest. The existing 36-byte frame header, a UInt32 focus flag (0 = secondary, 1 = focused), metadata strings, and stored payload follow. Readers also accept RTRCWAL2 (without flags, default focused) and legacy raw records. Integers use little-endian encoding.
 - Records are independent. Index scans skip payloads, while OCR/recovery decode one frame at a time. Loss of `metadata.json` must not prevent format detection or recovery.
 - Preserve legacy raw record support, exact row stride/padding, and frame-ID offset mappings. Never silently fall back to a different frame index when an ID mapping is missing.
 - Isolate metadata rebuild failures per session. Retain/quarantine unsupported or corrupt journals without deleting their bytes or blocking healthy recovery and recording startup.

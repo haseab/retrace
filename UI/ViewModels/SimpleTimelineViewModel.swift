@@ -696,10 +696,14 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     /// Current index in the frames array - THE SINGLE SOURCE OF TRUTH
-    /// Everything else (currentFrame, currentVideoInfo, currentTimestamp) derives from this
+    /// Selects the tape anchor; pinned presentation resolves one complete frame at that timestamp.
     @Published public var currentIndex: Int = 0 {
         didSet {
             if currentIndex != oldValue {
+                if isPrimaryDisplayPinned {
+                    invalidatePinnedPrimaryFrame()
+                    schedulePIPUpdate()
+                }
                 resetFrameTextScan()
                 endInPageURLHoverTracking()
                 cancelPresentationOverlayTasks()
@@ -2168,8 +2172,55 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Whether primary display selection is pinned by user swap (persistent until changed).
     @Published public var isPrimaryDisplayPinned: Bool = false
 
-    /// Override video info for the pinned primary display when it differs from timeline focus.
-    @Published public var primaryDisplayVideoInfoOverride: FrameVideoInfo?
+    /// Resolve pixels and every frame-scoped action together. The tape keeps its
+    /// union timestamp; a sparse pinned display may carry an older frame forward.
+    @Published private var pinnedPrimaryFrame: TimelineFrame?
+    private var pinnedPrimaryAnchorID: FrameID?
+    private var pinnedPrimaryResolutionGeneration: UInt64 = 0
+
+    private func invalidatePinnedPrimaryFrame() {
+        presentationWorkGeneration &+= 1
+        pinnedPrimaryResolutionGeneration &+= 1
+        pinnedPrimaryFrame = nil
+        pinnedPrimaryAnchorID = nil
+        resetFrameTextScan()
+        cancelPresentationOverlayTasks()
+        cancelForegroundFrameLoad(reason: "primary display changed")
+        clearCurrentFrameOverlayPresentation()
+        clearCurrentImagePresentation()
+        clearWaitingFallbackImage()
+    }
+
+    private func resolvePinnedPrimaryFrame() async {
+        guard isPrimaryDisplayPinned, let anchor = currentTapeFrame else { return }
+        let displayID = primaryDisplayID
+        guard anchor.frame.metadata.displayID != displayID else { return }
+        let generation = pinnedPrimaryResolutionGeneration
+        let resolved: FrameWithVideoInfo?
+        #if DEBUG
+        if let lookup = test_frameOverlayLoadHooks.getNearestDisplayFrame {
+            resolved = try? await lookup(displayID, anchor.frame.timestamp)
+        } else {
+            resolved = try? await coordinator.getNearestFrame(displayID: displayID, before: anchor.frame.timestamp)
+        }
+        #else
+        resolved = try? await coordinator.getNearestFrame(displayID: displayID, before: anchor.frame.timestamp)
+        #endif
+        guard !Task.isCancelled, generation == pinnedPrimaryResolutionGeneration,
+              isPrimaryDisplayPinned, primaryDisplayID == displayID,
+              currentTapeFrame?.frame.id == anchor.frame.id else { return }
+        let next = resolved.flatMap { deletedFrameIDs.contains($0.frame.id) ? nil : TimelineFrame(frameWithVideoInfo: $0) }
+        let changed = pinnedPrimaryAnchorID != anchor.frame.id || pinnedPrimaryFrame != next
+        pinnedPrimaryAnchorID = anchor.frame.id
+        pinnedPrimaryFrame = next
+        if changed {
+            resetFrameTextScan()
+            cancelPresentationOverlayTasks()
+            clearCurrentFrameOverlayPresentation()
+            prepareCurrentFramePresentationState(for: next, previousTimelineFrame: nil)
+            loadImageIfNeeded()
+        }
+    }
 
     /// Secondary display frames for PIP overlay (one per non-primary display)
     @Published public var secondaryDisplayFrames: [(displayID: UInt32, videoInfo: FrameVideoInfo?)] = []
@@ -2325,7 +2376,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Apply resolved primary display selection for current timeline position.
     private func syncPrimaryDisplaySelection() {
-        guard let resolved = resolvePrimaryDisplayID(for: currentFrame) else { return }
+        guard let resolved = resolvePrimaryDisplayID(for: currentTapeFrame?.frame) else { return }
         if primaryDisplayID != resolved {
             primaryDisplayID = resolved
         }
@@ -2364,15 +2415,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         isPrimaryDisplayPinned = true
         presentTimelineHUDToast(message: "Pinned \(displayLabel(for: displayID))")
 
-        if let timelineDisplayID = currentFrame?.metadata.displayID {
-            if timelineDisplayID != primaryDisplayID {
-                primaryDisplayVideoInfoOverride = preferredVideoInfo
-            } else {
-                primaryDisplayVideoInfoOverride = nil
-            }
-        } else {
-            primaryDisplayVideoInfoOverride = preferredVideoInfo
-        }
+        invalidatePinnedPrimaryFrame()
 
         Log.info(
             "[MultiDisplay] Pinned display globally: \(oldPrimary) -> \(displayID), wasPinned=\(wasPinned)",
@@ -2400,7 +2443,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         recordMultiDisplayAction("unpin")
         guard isPrimaryDisplayPinned else { return }
         isPrimaryDisplayPinned = false
-        primaryDisplayVideoInfoOverride = nil
+        invalidatePinnedPrimaryFrame()
         syncPrimaryDisplaySelection()
         presentTimelineHUDToast(message: "Showing Active Display")
         Log.info("[MultiDisplay] Unpinned primary display; returning to active display mode", category: .ui)
@@ -2434,65 +2477,20 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Update primary override + secondary display frames for the current timestamp (PIP carry-forward).
     func updateSecondaryDisplayFrames() async {
+        let anchorID = currentTapeFrame?.frame.id
+        let generation = pinnedPrimaryResolutionGeneration
+        await resolvePinnedPrimaryFrame()
+        guard !Task.isCancelled, currentTapeFrame?.frame.id == anchorID,
+              pinnedPrimaryResolutionGeneration == generation else { return }
         guard availableDisplayIDs.count > 1 else {
             secondaryDisplayFrames = []
-            primaryDisplayVideoInfoOverride = nil
             clearPIPDisplayFrameCache()
             return
         }
 
-        guard let timestamp = currentFrame?.timestamp else {
+        guard let timestamp = currentTapeFrame?.frame.timestamp else {
             secondaryDisplayFrames = []
-            primaryDisplayVideoInfoOverride = nil
             return
-        }
-
-        if let timelineFrame = currentTimelineFrame,
-           !timelineFrame.secondaryFrames.isEmpty {
-            syncPrimaryDisplaySelection()
-
-            let timelineDisplayID = timelineFrame.frame.metadata.displayID
-            let effectivePrimaryDisplayID = primaryDisplayID
-            var secondaryByDisplayID: [UInt32: FrameVideoInfo?] = [:]
-            for secondary in timelineFrame.secondaryFrames {
-                secondaryByDisplayID[secondary.displayID] = secondary.videoInfo
-            }
-
-            var displayIDs = Set(timelineFrame.secondaryFrames.map(\.displayID))
-            if timelineDisplayID != 0 {
-                displayIDs.insert(timelineDisplayID)
-            }
-            let orderedDisplayIDs = Array(displayIDs).sorted()
-
-            if orderedDisplayIDs.count <= 1 {
-                secondaryDisplayFrames = []
-                primaryDisplayVideoInfoOverride = nil
-                return
-            }
-
-            // If the pinned/selected primary is not in this payload, fall back to dynamic resolution.
-            if orderedDisplayIDs.contains(effectivePrimaryDisplayID) {
-                var newPrimaryOverride: FrameVideoInfo?
-                var newSecondaryFrames: [(displayID: UInt32, videoInfo: FrameVideoInfo?)] = []
-
-                if effectivePrimaryDisplayID != timelineDisplayID {
-                    newPrimaryOverride = secondaryByDisplayID[effectivePrimaryDisplayID] ?? nil
-                }
-
-                for displayID in orderedDisplayIDs where displayID != effectivePrimaryDisplayID {
-                    if displayID == timelineDisplayID {
-                        newSecondaryFrames.append((displayID: displayID, videoInfo: currentVideoInfo))
-                    } else {
-                        newSecondaryFrames.append(
-                            (displayID: displayID, videoInfo: secondaryByDisplayID[displayID] ?? nil)
-                        )
-                    }
-                }
-
-                primaryDisplayVideoInfoOverride = newPrimaryOverride
-                secondaryDisplayFrames = newSecondaryFrames
-                return
-            }
         }
 
         syncPrimaryDisplaySelection()
@@ -2517,14 +2515,10 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         if displayIDs.count <= 1 {
             secondaryDisplayFrames = []
-            if displayIDs.first != effectivePrimaryDisplayID {
-                primaryDisplayVideoInfoOverride = nil
-            }
             clearPIPDisplayFrameCache()
             return
         }
 
-        let timelineDisplayID = currentFrame?.metadata.displayID
         let cacheSignature = makePIPDisplayCacheSignature(displayIDs: displayIDs)
 
         if let signature = cacheSignature {
@@ -2563,24 +2557,20 @@ public class SimpleTimelineViewModel: ObservableObject {
             }
         }
 
-        var newPrimaryOverride: FrameVideoInfo?
         var newSecondaryFrames: [(displayID: UInt32, videoInfo: FrameVideoInfo?)] = []
 
         for displayID in displayIDs {
             let videoInfo = resolvedByDisplay[displayID]?.videoInfo
 
             if displayID == effectivePrimaryDisplayID {
-                if timelineDisplayID != effectivePrimaryDisplayID {
-                    newPrimaryOverride = videoInfo
-                } else {
-                    newPrimaryOverride = nil
-                }
+                continue
             } else {
                 newSecondaryFrames.append((displayID: displayID, videoInfo: videoInfo))
             }
         }
 
-        primaryDisplayVideoInfoOverride = newPrimaryOverride
+        guard !Task.isCancelled, currentTapeFrame?.frame.id == anchorID,
+              pinnedPrimaryResolutionGeneration == generation else { return }
         secondaryDisplayFrames = newSecondaryFrames
     }
 
@@ -2871,6 +2861,8 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Clear PIP cache state (called when multi-display mode/window state changes).
     private func clearPIPDisplayFrameCache() {
+        pinnedPrimaryResolutionGeneration &+= 1
+        secondaryDisplayFrames = []
         pipDisplayFrameCacheBuildTask?.cancel()
         pipDisplayFrameCacheBuildTask = nil
         pipDisplayFrameCacheBuildSignature = nil
@@ -2899,7 +2891,6 @@ public class SimpleTimelineViewModel: ObservableObject {
             )
 
             if displayIDs.count <= 1 {
-                primaryDisplayVideoInfoOverride = nil
                 secondaryDisplayFrames = []
                 clearPIPDisplayFrameCache()
                 // Keep explicit pin stable; only auto-select when unpinned.
@@ -3059,10 +3050,22 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     // MARK: - Derived Properties (computed from currentIndex)
 
-    /// Current timeline frame (frame + video info) - derived from currentIndex
-    public var currentTimelineFrame: TimelineFrame? {
+    /// Union-tape anchor for navigation and pagination, independent of a pinned display.
+    public var currentTapeFrame: TimelineFrame? {
         guard currentIndex >= 0 && currentIndex < frames.count else { return nil }
         return frames[currentIndex]
+    }
+
+    /// The frame actually displayed, including its metadata, OCR identity and video.
+    /// While a different pinned display is resolving, expose no actionable frame.
+    public var currentTimelineFrame: TimelineFrame? {
+        guard let anchor = currentTapeFrame else { return nil }
+        guard isPrimaryDisplayPinned, primaryDisplayID != 0,
+              anchor.frame.metadata.displayID != primaryDisplayID else { return anchor }
+        guard pinnedPrimaryAnchorID == anchor.frame.id,
+              pinnedPrimaryFrame?.frame.metadata.displayID == primaryDisplayID,
+              let frameID = pinnedPrimaryFrame?.frame.id, !deletedFrameIDs.contains(frameID) else { return nil }
+        return pinnedPrimaryFrame
     }
 
     /// Current frame reference - derived from currentIndex
@@ -3206,15 +3209,12 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Video info currently shown in the primary/fullscreen area.
     /// Uses pinned override when display is pinned; otherwise follows active timeline frame.
     public var displayedPrimaryVideoInfo: FrameVideoInfo? {
-        if isPrimaryDisplayPinned, let override = primaryDisplayVideoInfoOverride {
-            return override
-        }
-        return currentVideoInfo
+        currentVideoInfo
     }
 
-    /// Current timestamp - ALWAYS derived from the current frame
+    /// Scrub timestamp comes from the tape, even when a sparse display carries forward.
     public var currentTimestamp: Date? {
-        currentTimelineFrame?.frame.timestamp
+        currentTapeFrame?.frame.timestamp
     }
 
     // MARK: - Computed Properties for Timeline Tape
@@ -3776,6 +3776,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         var getFrameWithVideoInfoByID: ((FrameID) async throws -> FrameWithVideoInfo?)?
     }
     struct FrameOverlayLoadTestHooks {
+        var getNearestDisplayFrame: ((UInt32, Date) async throws -> FrameWithVideoInfo?)?
         var getURLBoundingBox: ((Date, FrameSource) async throws -> URLBoundingBox?)?
         var getOCRStatus: ((FrameID) async throws -> OCRProcessingStatus)?
         var getAllOCRNodes: ((FrameID, FrameSource) async throws -> [OCRNodeWithText])?
@@ -3846,6 +3847,9 @@ public class SimpleTimelineViewModel: ObservableObject {
             Task { @MainActor in
                 guard let self else { return }
                 Log.debug("[Timeline-OCR] Invalidating transient scan after redaction", category: .ui)
+                self.invalidatePinnedPrimaryFrame()
+                self.clearPIPDisplayFrameCache()
+                self.schedulePIPUpdate()
                 self.resetFrameTextScan()
                 self.cancelForegroundFrameLoad(reason: "redaction completed")
                 self.cancelCacheExpansion(reason: "redaction completed")
@@ -5222,6 +5226,8 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Called when data sources change (e.g., Rewind toggled on/off)
     @MainActor
     public func invalidateCachesAndReload() {
+        invalidatePinnedPrimaryFrame()
+        clearPIPDisplayFrameCache()
         Log.info("[DataSourceChange] invalidateCachesAndReload() called", category: .ui)
 
         // Clear disk frame buffer metadata/files
@@ -5440,7 +5446,18 @@ public class SimpleTimelineViewModel: ObservableObject {
             return
         }
 
-        let frameToDelete = frames[index]
+        let frameToDelete: TimelineFrame
+        if isPrimaryDisplayPinned, index == currentIndex {
+            guard let displayed = currentTimelineFrame else {
+                showDeleteConfirmation = false
+                return
+            }
+            frameToDelete = displayed
+        } else {
+            frameToDelete = frames[index]
+        }
+        let removalIndex = frames.firstIndex { $0.frame.id == frameToDelete.frame.id }
+        let removedFrames = removalIndex.map { [frames[$0]] } ?? []
         let frameID = frameToDelete.frame.id
         let frameRef = frameToDelete.frame
         let previousCurrentIndex = currentIndex
@@ -5448,15 +5465,18 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         // Optimistically mark/delete in UI immediately.
         deletedFrameIDs.insert(frameID)
-        frames.remove(at: index)
+        if let removalIndex { frames.remove(at: removalIndex) }
+        invalidatePinnedPrimaryFrame()
+        clearPIPDisplayFrameCache()
+        schedulePIPUpdate()
 
         // Keep block grouping/navigation consistent immediately for optimistic UI.
         refreshAppBlockSnapshotImmediately(reason: "confirmDeleteSelectedFrame")
 
-        // Adjust current index if needed
+        // Adjust only for a frame actually removed from the union tape.
         if currentIndex >= frames.count {
             currentIndex = max(0, frames.count - 1)
-        } else if currentIndex > index {
+        } else if let removalIndex, currentIndex > removalIndex {
             currentIndex -= 1
         }
 
@@ -5467,7 +5487,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         // Load image if needed for new current frame
         loadImageIfNeeded()
         scheduleWindowRefillAfterOptimisticDelete(
-            removedFrames: [frameToDelete],
+            removedFrames: removedFrames,
             reason: "confirmDeleteSelectedFrame"
         )
 
@@ -5477,9 +5497,9 @@ public class SimpleTimelineViewModel: ObservableObject {
             PendingDeleteOperation(
                 id: UUID(),
                 payload: .frame(frameRef),
-                removedFrames: [frameToDelete],
+                removedFrames: removedFrames,
                 removedFrameIDs: [frameID],
-                restoreStartIndex: index,
+                restoreStartIndex: removalIndex ?? index,
                 previousCurrentIndex: previousCurrentIndex,
                 previousSelectedFrameIndex: previousSelectedFrameIndex,
                 undoMessage: "Frame deleted"
@@ -5498,6 +5518,9 @@ public class SimpleTimelineViewModel: ObservableObject {
         guard let operation = pendingDeleteOperation else { return }
         clearPendingDeleteState()
         restoreDeletedOperation(operation, reason: "undo")
+        invalidatePinnedPrimaryFrame()
+        clearPIPDisplayFrameCache()
+        schedulePIPUpdate()
         showToast("Deletion undone", icon: "arrow.uturn.backward.circle.fill")
     }
 
@@ -5513,6 +5536,9 @@ public class SimpleTimelineViewModel: ObservableObject {
     private func stagePendingDelete(_ operation: PendingDeleteOperation) {
         commitPendingDeleteIfNeeded(reason: "superseded")
 
+        invalidatePinnedPrimaryFrame()
+        clearPIPDisplayFrameCache()
+        schedulePIPUpdate()
         pendingDeleteOperation = operation
         pendingDeleteUndoMessage = operation.undoMessage
 
@@ -5568,6 +5594,9 @@ public class SimpleTimelineViewModel: ObservableObject {
                 )
                 Log.debug("[Delete] Committed segment deletion frames=\(frameRefs.count) reason=\(reason)", category: .ui)
             }
+            invalidatePinnedPrimaryFrame()
+            clearPIPDisplayFrameCache()
+            schedulePIPUpdate()
             clearPendingDeletedFrameIDs(operation.removedFrameIDs, reason: "commit-success.\(reason)")
             if result.hasQueuedFrames {
                 showToast(queuedDeletionToastMessage(for: result), icon: "clock.badge.exclamationmark.fill")
@@ -5655,6 +5684,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Get the selected frame (if any)
     public var selectedFrame: TimelineFrame? {
         guard let index = selectedFrameIndex, index >= 0 && index < frames.count else { return nil }
+        if isPrimaryDisplayPinned, index == currentIndex { return currentTimelineFrame }
         return frames[index]
     }
 
@@ -5826,7 +5856,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             return false
         }
 
-        guard currentTimelineFrame?.frame.id == requestedFrameID else {
+        guard currentTapeFrame?.frame.id == requestedFrameID else {
             Log.info(
                 "[TimelineBlocks] Aborting stale lookup reason=\(reason) staleResult=playheadMoved requestedFrameID=\(requestedFrameID.value) currentFrameID=\(currentTimelineFrame?.frame.id.value ?? -1)",
                 category: .ui
@@ -6713,7 +6743,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         Task { @MainActor in
             try? await Task.sleep(for: .nanoseconds(Int64(160_000_000)), clock: .continuous)
 
-            let previousCurrentFrameID = currentTimelineFrame?.frame.id
+            let previousCurrentFrameID = currentTapeFrame?.frame.id
             let beforeCount = frames.count
             frames.removeAll { frame in
                 let segmentID = SegmentID(value: frame.frame.segmentID.value)
@@ -6823,7 +6853,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             Task { @MainActor in
                 try? await Task.sleep(for: .nanoseconds(Int64(160_000_000)), clock: .continuous)
 
-                let previousCurrentFrameID = currentTimelineFrame?.frame.id
+                let previousCurrentFrameID = currentTapeFrame?.frame.id
                 let beforeCount = frames.count
                 frames.removeAll { frame in
                     let segmentID = SegmentID(value: frame.frame.segmentID.value)
@@ -11402,6 +11432,9 @@ public class SimpleTimelineViewModel: ObservableObject {
         excluding frameID: FrameID,
         around index: Int
     ) -> [UnavailableFrameFallbackCandidate] {
+        // A union-tape neighbor can belong to a different monitor. A pinned
+        // display must wait for its own frame rather than borrow those pixels.
+        guard !isPrimaryDisplayPinned else { return [] }
         guard !frames.isEmpty else { return [] }
         guard index >= 0 && index < frames.count else { return [] }
 
@@ -18025,7 +18058,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     private func updateDeferredTrimAnchorForCurrentSelectionIfNeeded() {
         guard isActivelyScrolling, deferredTrimDirection == .newer else { return }
-        guard let currentFrame = currentTimelineFrame?.frame else { return }
+        guard let currentFrame = currentTapeFrame?.frame else { return }
 
         deferredTrimAnchorFrameID = currentFrame.id
         deferredTrimAnchorTimestamp = currentFrame.timestamp
@@ -18043,8 +18076,8 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         if allowDeferral, preserveDirection == .newer, isActivelyScrolling {
             deferredTrimDirection = preserveDirection
-            deferredTrimAnchorFrameID = anchorFrameID ?? currentTimelineFrame?.frame.id
-            deferredTrimAnchorTimestamp = anchorTimestamp ?? currentTimelineFrame?.frame.timestamp
+            deferredTrimAnchorFrameID = anchorFrameID ?? currentTapeFrame?.frame.id
+            deferredTrimAnchorTimestamp = anchorTimestamp ?? currentTapeFrame?.frame.timestamp
             let anchorIDValue = deferredTrimAnchorFrameID?.value ?? -1
             let anchorTS = deferredTrimAnchorTimestamp.map { Log.timestamp(from: $0) } ?? "nil"
             Log.info(
@@ -18071,8 +18104,8 @@ public class SimpleTimelineViewModel: ObservableObject {
             // User is scrolling toward newer, trim older frames from start
             Log.info("[Memory] TRIMMING \(excessCount) older frames from START (preserving newer) reason=\(reason)", category: .ui)
             let oldIndex = currentIndex
-            let resolvedAnchorFrameID = anchorFrameID ?? currentTimelineFrame?.frame.id
-            let resolvedAnchorTimestamp = anchorTimestamp ?? currentTimelineFrame?.frame.timestamp
+            let resolvedAnchorFrameID = anchorFrameID ?? currentTapeFrame?.frame.id
+            let resolvedAnchorTimestamp = anchorTimestamp ?? currentTapeFrame?.frame.timestamp
             let trimmedFrames = Array(frames.dropFirst(excessCount))
 
             let targetIndexAfterTrim: Int
