@@ -130,7 +130,7 @@ public final class VisionOCR: OCRProtocol, @unchecked Sendable {
             let textRequest = VNRecognizeTextRequest()
             textRequest.recognitionLevel = .accurate
             textRequest.recognitionLanguages = recognitionLanguages
-            textRequest.usesLanguageCorrection = true
+            textRequest.usesLanguageCorrection = false
 
             do {
                 try handler.perform([textRequest])
@@ -594,7 +594,7 @@ public final class VisionOCR: OCRProtocol, @unchecked Sendable {
         )
         let requestConfig = Self.regionRecognitionRequestConfig(
             regionOfInterest: normalizedRegion,
-            usesLanguageCorrection: config.ocrAccuracyLevel == .accurate
+            usesLanguageCorrection: false
         )
 
         return try await recognizeTextWithEnvelope(

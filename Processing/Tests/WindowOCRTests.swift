@@ -148,6 +148,67 @@ final class WindowOCRTests: XCTestCase {
         XCTAssertTrue(changed)
     }
 
+
+    func testRecordedInvoiceFragmentsReadLeftToRightOnTheSameLine() {
+        let regions = recordedInvoiceFragments()
+        let result = OCRReadingOrder.ordered(regions)
+        let expected = [regions[0], regions[1], regions[3], regions[2], regions[4], regions[5]]
+        XCTAssertEqual(result, expected)
+        XCTAssertEqual(result[1...3].map(\.text).joined(separator: " "),
+            "Invoice 10024 covers 36 items at a total of $1444.75.")
+    }
+
+    func testRecordedMixedFragmentsStayOnTheirOwnLines() {
+        // Actual RXCASE039 0.75-scale Vision text and screenshot rectangles.
+        let raw: [(String, CGRect)] = [
+            ("Please review the conference requirements before confirming your reservation.", CGRect(x: 22.8, y: 22.7246, width: 627, height: 20.2754)),
+            ("items", CGRect(x: 217.9162, y: 59.5336, width: 42.1676, height: 8.9327)),
+            ("at a total of $1459.75.", CGRect(x: 266, y: 60, width: 186, height: 12)),
+            ("Involce 10039 covers", CGRect(x: 24, y: 62, width: 164, height: 8)),
+            ("and the departure time is 14:35.", CGRect(x: 314, y: 92, width: 262, height: 16)),
+            ("is AB10039", CGRect(x: 226, y: 94, width: 84, height: 12)),
+            ("Ine reterence identıtıer", CGRect(x: 24, y: 96, width: 196, height: 8)),
+            ("Coordinator Morgan Ellis approved the conference schedule for November 12.", CGRect(x: 22.8, y: 122, width: 604.2, height: 20.029))
+        ]
+        let regions = raw.enumerated().map { i, item in
+            TextRegion(id: Int64(i + 1), frameID: .init(value: 39), text: item.0, bounds: item.1)
+        }
+        let result = OCRReadingOrder.ordered(regions)
+        XCTAssertEqual(result, [regions[0], regions[3], regions[1], regions[2], regions[6], regions[5], regions[4], regions[7]])
+        XCTAssertEqual(OCRReadingOrder.ordered(result), result, "Ordering must be stable when a cached result is reused")
+    }
+
+    func testRecordedFragmentsKeepWindowOrderWithoutLosingNodeIdentity() {
+        let left = recordedInvoiceFragments()
+        let right = left.map { region in
+            TextRegion(id: (region.databaseID ?? 0) + 100, frameID: region.frameID, text: region.text,
+                bounds: region.bounds.offsetBy(dx: 900, dy: -8), confidence: region.confidence, createdAt: region.createdAt)
+        }
+        var input: [TextRegion] = []
+        for i in left.indices { input += [right[i], left[i]] }
+        let windows = [CGRect(x: 0, y: 0, width: 740, height: 180), CGRect(x: 900, y: 0, width: 740, height: 180)]
+        let result = OCRReadingOrder.ordered(input, windows: windows)
+        let positions = [0, 1, 3, 2, 4, 5]
+        XCTAssertEqual(result, positions.map { left[$0] } + positions.map { right[$0] })
+        XCTAssertEqual(result.count, input.count)
+        XCTAssertEqual(Set(result.compactMap(\.databaseID)), Set(input.compactMap(\.databaseID)))
+    }
+
+    private func recordedInvoiceFragments() -> [TextRegion] {
+        // Actual RXCASE024 0.75-scale Vision output; 36 is two pixels lower.
+        let raw: [(String, CGRect)] = [
+            ("Please review the subscription requirements before confirming your reservation.", CGRect(x: 23.366659, y: 22.9999998, width: 642.583333, height: 18)),
+            ("Invoice 10024 covers", CGRect(x: 23.965812, y: 57.9999998, width: 169.757835, height: 14)),
+            ("items at a total of $1444.75.", CGRect(x: 215.692311, y: 58.0000001, width: 239.658104, height: 16)),
+            ("36", CGRect(x: 191.726496, y: 59.9999999, width: 23.965812, height: 10)),
+            ("The reference identifier is AB10024 and the departure time is 14:35.", CGRect(x: 23.366670, y: 90.686568, width: 554.958333, height: 20.477612)),
+            ("Coordinator Morgan Ellis approved the subscription schedule for November 25.", CGRect(x: 23.366685, y: 122.865672, width: 619.216642, height: 20.477612))
+        ]
+        return raw.enumerated().map { i, entry in
+            TextRegion(id: Int64(i + 1), frameID: .init(value: 24), text: entry.0, bounds: entry.1, confidence: 0.9)
+        }
+    }
+
     private func frame(rightText: String) throws -> CapturedFrame {
         let width = 1280, height = 600, stride = width * 4
         var pixels = Data(count: stride * height)

@@ -84,9 +84,19 @@ public actor ProcessingManager: ProcessingProtocol {
                 from: frame,
                 instrumentation: instrumentation
             )
-            let ocrRegions = ocrExtraction.regions.map { region in
-                guard config.accessibilityEnabled, let snapshot = frame.accessibilitySnapshot else { return region }
-                return AccessibilityOCRCorrector.correct(region, snapshot: snapshot)
+            let windowRegions = frame.metadata.ocrRegions.map {
+                WindowOCRPlanner.pixelRegions($0, width: frame.width, height: frame.height) ?? []
+            }
+            let orderedOCRRegions = OCRReadingOrder.ordered(ocrExtraction.regions, windows: windowRegions)
+            let ocrRegions: [TextRegion]
+            if config.accessibilityEnabled, let snapshot = frame.accessibilitySnapshot {
+                ocrRegions = await AccessibilityOCRCorrector.correct(
+                    orderedOCRRegions, snapshot: snapshot,
+                    recognitionLanguages: config.recognitionLanguages,
+                    windowRegions: windowRegions
+                )
+            } else {
+                ocrRegions = orderedOCRRegions
             }
             let ocrStage = await instrumentation.recordOCRStage(
                 ocrRegions: ocrRegions,
