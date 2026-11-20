@@ -5,6 +5,14 @@ import Database
 
 final class TimelineStillDiskWriterTests: XCTestCase {
     func testCaptureWriterPrunesExpiredStillsWithoutOpeningTimeline() async throws {
+        // Capture-time stills must remain available while phrase protection is enabled.
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName)!
+        let previousEnabled = defaults.object(forKey: "phraseLevelRedactionEnabled")
+        defaults.set(true, forKey: "phraseLevelRedactionEnabled")
+        defer {
+            if let previousEnabled { defaults.set(previousEnabled, forKey: "phraseLevelRedactionEnabled") }
+            else { defaults.removeObject(forKey: "phraseLevelRedactionEnabled") }
+        }
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("TimelineStillDiskWriterTests_\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

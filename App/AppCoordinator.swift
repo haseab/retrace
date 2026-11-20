@@ -459,17 +459,11 @@ actor TimelineStillDiskWriter {
                 let destinationURL = destinationResolver(request.frameID)
                 do {
                     let jpegData = try encoder(request.frame)
-                    let privacyDefaults = UserDefaults(suiteName: ReversibleOCRScrambler.settingsSuiteName) ?? .standard
-                    guard !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { continue }
                     try FileManager.default.createDirectory(
                         at: destinationURL.deletingLastPathComponent(),
                         withIntermediateDirectories: true
                     )
                     try jpegData.write(to: destinationURL, options: [.atomic])
-                    if PhraseRedactionMode.isEnabled(in: privacyDefaults) {
-                        try? FileManager.default.removeItem(at: destinationURL)
-                        continue
-                    }
                     await self.recordWriteSuccess(directory: destinationURL.deletingLastPathComponent())
                 } catch {
                     await self.recordWriteFailure(
@@ -2690,7 +2684,7 @@ public actor AppCoordinator {
         frameID: Int64,
         frame: CapturedFrame
     ) async {
-        guard !PhraseRedactionMode.isEnabled(in: Self.userDefaultsSuite) else { return }
+        // Preserve the capture-time preview until the encoded frame is readable.
         await timelineStillDiskWriter.enqueue(frameID: frameID, frame: frame)
     }
 

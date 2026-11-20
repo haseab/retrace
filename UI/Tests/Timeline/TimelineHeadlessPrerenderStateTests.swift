@@ -427,6 +427,14 @@ final class TimelineHeadlessPrerenderStateTests: XCTestCase {
     }
 
     func testRefreshStaticPresentationShowsCaptureTimeStillForProcessingStatus4Frame() async throws {
+        // Enabling phrase protection must not hide an available capture while video encodes.
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName)!
+        let previousEnabled = defaults.object(forKey: "phraseLevelRedactionEnabled")
+        defaults.set(true, forKey: "phraseLevelRedactionEnabled")
+        defer {
+            if let previousEnabled { defaults.set(previousEnabled, forKey: "phraseLevelRedactionEnabled") }
+            else { defaults.removeObject(forKey: "phraseLevelRedactionEnabled") }
+        }
         let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
         viewModel.setPresentationWorkEnabled(true, reason: "unit-test")
 

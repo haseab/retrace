@@ -519,7 +519,7 @@ _This file follows the AGENTS.md standard for AI agent guidance. Last updated: 2
 - Permanent nodes cannot be revealed and do not require a master key; scrambling still requires one. Missing keys must prevent indexing a matched region unprotected.
 - Excluded-window masking failures drop the frame. Full excluded bounds are protected, including overlapped/translucent areas and edges.
 - `PrivacyLogMessage` strips free-form interpolated values before every logging sink; only primitive numbers and booleans are retained. Preformatted `String` messages are removed as a whole. Do not bypass this by explicitly constructing string literals from captured content.
-- Legacy diagnostic logs are discarded on logger initialization and are excluded from feedback reads, including the error channel. Raw capture-time previews are bypassed while keyword protection is enabled and stale preview copies are invalidated after rewrite.
+- Legacy diagnostic logs are discarded on logger initialization and are excluded from feedback reads, including the error channel. Timeline capture-time stills remain available while video is encoding, including when keyword protection is enabled; these temporary previews can precede OCR redaction. Stale preview copies are invalidated after rewrite. Search disk previews remain bypassed while keyword protection is enabled.
 
 ### Diagnostic logging write policy
 
@@ -533,7 +533,7 @@ _This file follows the AGENTS.md standard for AI agent guidance. Last updated: 2
 - Timeline cache byte totals are maintained on insert/replace/remove; access-only touches must remain O(1). Compressed JPEG NSCache entries carry their byte cost with a 64 MiB cost limit plus the existing count limit.
 - Search thumbnails have a 32 MiB estimated decoded-byte budget plus a 60-image count limit. Maintain costs incrementally and estimate from representation dimensions without forcing image decoding on main.
 - `PreviewCacheDiskWorker` serializes UI cache writes, JPEG serialization, deletion batches and folder pruning. Thumbnail trims coalesce bursts and run at most once per minute during continuing writes. Pending write payloads are bounded to 64 MiB; skipped persistence must not block display.
-- Preview keys describe source/frame/video identity, render dimensions, highlight geometry, and content revision. Queries do not belong in keys. Redaction completion advances the persisted revision and invalidates queued writes. Preserve the existing keyword-protection bypass and canonical preview paths used by the redaction purger.
+- Preview keys describe source/frame/video identity, render dimensions, highlight geometry, and content revision. Queries do not belong in keys. Redaction completion advances the persisted revision and invalidates queued writes. Preserve the search keyword-protection bypass and canonical preview paths used by the redaction purger. Do not disable the timeline still fallback merely because keyword protection is enabled.
 
 ### Stable development app identity
 

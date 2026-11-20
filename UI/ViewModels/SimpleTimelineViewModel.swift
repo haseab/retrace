@@ -3186,8 +3186,6 @@ public class SimpleTimelineViewModel: ObservableObject {
         for frameID: FrameID,
         logPrefix: String
     ) async -> NSImage? {
-        let privacyDefaults = UserDefaults(suiteName: ReversibleOCRScrambler.settingsSuiteName) ?? .standard
-        guard !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { return nil }
         let fileURL = timelineDiskFrameBufferFileURL(for: frameID)
         guard FileManager.default.fileExists(atPath: fileURL.path) else {
             return nil
@@ -3198,7 +3196,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                 try Data(contentsOf: fileURL, options: [.mappedIfSafe])
             }.value
 
-            guard !Task.isCancelled, !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { return nil }
+            guard !Task.isCancelled else { return nil }
             guard let image = NSImage(data: data) else {
                 Log.warning(
                     "\(logPrefix) Failed to decode timeline disk-buffer preview for frame \(frameID.value)",
@@ -3528,8 +3526,6 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     private func readFrameDataFromDiskFrameBuffer(frameID: FrameID) async -> Data? {
-        let privacyDefaults = UserDefaults(suiteName: ReversibleOCRScrambler.settingsSuiteName) ?? .standard
-        guard !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { return nil }
         await awaitDiskFrameBufferInitializationIfNeeded()
         let existingEntry = diskFrameBufferIndex[frameID]
         let fileURL = existingEntry?.fileURL ?? diskFrameBufferURL(for: frameID)
@@ -3550,8 +3546,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                 try Data(contentsOf: fileURL, options: [.mappedIfSafe])
             }.value
 
-            guard !Task.isCancelled, generation == diskFrameBufferGeneration, entryEpoch.matches(entryToken),
-                  !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { return nil }
+            guard !Task.isCancelled, generation == diskFrameBufferGeneration, entryEpoch.matches(entryToken) else { return nil }
             if existingEntry != nil {
                 touchDiskFrameBufferEntry(frameID)
             } else {
@@ -3576,8 +3571,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     private func storeFrameDataInDiskFrameBuffer(frameID: FrameID, data: Data) async {
-        let privacyDefaults = UserDefaults(suiteName: ReversibleOCRScrambler.settingsSuiteName) ?? .standard
-        guard !Task.isCancelled, !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { return }
+        guard !Task.isCancelled else { return }
         await awaitDiskFrameBufferInitializationIfNeeded()
         guard !Task.isCancelled else { return }
         let fileURL = diskFrameBufferURL(for: frameID)
@@ -3589,11 +3583,10 @@ public class SimpleTimelineViewModel: ObservableObject {
         defer { diskFrameBufferEntryEpochs.finish(frameID, epoch: entryEpoch, keep: diskFrameBufferIndex[frameID] != nil) }
         let wrote = await withCheckedContinuation { continuation in
             PreviewCacheDiskWorker.shared.enqueueWrite(data, to: fileURL, allowed: {
-                epoch.matches(token) && entryEpoch.matches(entryToken) && !PhraseRedactionMode.isEnabled(in: privacyDefaults)
+                epoch.matches(token) && entryEpoch.matches(entryToken)
             }, completion: { continuation.resume(returning: $0) })
         }
-        guard wrote, !Task.isCancelled, generation == diskFrameBufferGeneration, entryEpoch.matches(entryToken),
-              !PhraseRedactionMode.isEnabled(in: privacyDefaults) else { return }
+        guard wrote, !Task.isCancelled, generation == diskFrameBufferGeneration, entryEpoch.matches(entryToken) else { return }
 
         diskFrameBufferAccessSequence &+= 1
         let entry = DiskFrameBufferEntry(
