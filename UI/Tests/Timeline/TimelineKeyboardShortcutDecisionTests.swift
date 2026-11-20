@@ -66,6 +66,39 @@ final class TimelineKeyboardShortcutDecisionTests: XCTestCase {
         )
     }
 
+    func testShouldHandleKeysAddressedToKeyTimelinePanelWhenAnotherAppIsFrontmost() {
+        XCTAssertTrue(
+            TimelineWindowController.shouldHandleTimelineKeyboardShortcuts(
+                isTimelineVisible: true,
+                frontmostProcessID: 222,
+                currentProcessID: 111,
+                eventTargetsKeyTimelineWindow: true
+            )
+        )
+    }
+
+    func testShouldHandleKeysAddressedToKeyTimelinePanelWhenFrontmostAppIsUnknown() {
+        XCTAssertTrue(
+            TimelineWindowController.shouldHandleTimelineKeyboardShortcuts(
+                isTimelineVisible: true,
+                frontmostProcessID: nil,
+                currentProcessID: 111,
+                eventTargetsKeyTimelineWindow: true
+            )
+        )
+    }
+
+    func testHiddenTimelineDoesNotHandleKeysEvenWithMatchingWindow() {
+        XCTAssertFalse(
+            TimelineWindowController.shouldHandleTimelineKeyboardShortcuts(
+                isTimelineVisible: false,
+                frontmostProcessID: 222,
+                currentProcessID: 111,
+                eventTargetsKeyTimelineWindow: true
+            )
+        )
+    }
+
     func testShouldToggleSearchOverlayShortcutWhenScrollIsNotActive() {
         XCTAssertTrue(
             TimelineWindowController.shouldToggleSearchOverlayFromShortcut(isActivelyScrolling: false)

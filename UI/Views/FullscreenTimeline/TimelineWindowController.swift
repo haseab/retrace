@@ -262,9 +262,15 @@ public class TimelineWindowController: NSObject {
     nonisolated static func shouldHandleTimelineKeyboardShortcuts(
         isTimelineVisible: Bool,
         frontmostProcessID: pid_t?,
-        currentProcessID: pid_t
+        currentProcessID: pid_t,
+        eventTargetsKeyTimelineWindow: Bool = false
     ) -> Bool {
-        guard isTimelineVisible, let frontmostProcessID else { return false }
+        guard isTimelineVisible else { return false }
+        // Nonactivating panels can own keyboard focus without owning the menu bar.
+        // Trust a local event addressed to the key timeline window; global events
+        // still require Retrace to be frontmost.
+        if eventTargetsKeyTimelineWindow { return true }
+        guard let frontmostProcessID else { return false }
         return frontmostProcessID == currentProcessID
     }
 
@@ -502,13 +508,20 @@ public class TimelineWindowController: NSObject {
         }
     }
 
-    private func shouldHandleTimelineKeyboardShortcuts() -> Bool {
+    private func shouldHandleTimelineKeyboardShortcuts(for event: NSEvent? = nil) -> Bool {
         let currentProcessID = ProcessInfo.processInfo.processIdentifier
         let frontmostProcessID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        let eventTargetsKeyTimelineWindow: Bool
+        if let eventWindow = event?.window, let window {
+            eventTargetsKeyTimelineWindow = eventWindow === window && window.isKeyWindow
+        } else {
+            eventTargetsKeyTimelineWindow = false
+        }
         return Self.shouldHandleTimelineKeyboardShortcuts(
             isTimelineVisible: isVisible,
             frontmostProcessID: frontmostProcessID,
-            currentProcessID: currentProcessID
+            currentProcessID: currentProcessID,
+            eventTargetsKeyTimelineWindow: eventTargetsKeyTimelineWindow
         )
     }
 
@@ -3068,7 +3081,7 @@ extension TimelineWindowController {
 
     @discardableResult
     private func handleKeyEvent(_ event: NSEvent) -> Bool {
-        guard shouldHandleTimelineKeyboardShortcuts() else {
+        guard shouldHandleTimelineKeyboardShortcuts(for: event) else {
             return false
         }
 
