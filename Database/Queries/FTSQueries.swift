@@ -7,13 +7,13 @@ import Shared
 ///
 /// Rewind-compatible FTS Pattern:
 /// 1. INSERT INTO searchRanking (text, otherText, title) → FTS auto-indexes, get rowid
-/// 2. INSERT INTO searchRanking_content (id, c0, c1, c2) with same id for OCR lookups
+/// 2. SQLite populates searchRanking_content shadow rows with the same rowid
 /// 3. INSERT INTO doc_segment (docid, segmentId, frameId)
 enum FTSQueries {
 
     // MARK: - Insert FTS Content
 
-    /// Insert OCR text into searchRanking (FTS) and searchRanking_content, return the docid
+    /// Insert OCR text into searchRanking (FTS) and return the docid.
     /// This matches Rewind's pattern where FTS table auto-indexes on insert
     ///
     /// - Parameters:
@@ -40,9 +40,14 @@ enum FTSQueries {
         }
 
         guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            let errorMessage = String(cString: sqlite3_errmsg(db))
+            Log.error(
+                "[FTSQueries] Failed to prepare searchRanking insert: \(errorMessage). Runtime: \(SQLiteRuntimeDiagnostics.summary(db: db))",
+                category: .database
+            )
             throw DatabaseError.queryFailed(
                 query: sql,
-                underlying: String(cString: sqlite3_errmsg(db))
+                underlying: errorMessage
             )
         }
 
@@ -51,9 +56,14 @@ enum FTSQueries {
         bindTextOrNull(statement, 3, windowTitle)
 
         guard sqlite3_step(statement) == SQLITE_DONE else {
+            let errorMessage = String(cString: sqlite3_errmsg(db))
+            Log.error(
+                "[FTSQueries] Failed to execute searchRanking insert: \(errorMessage). Runtime: \(SQLiteRuntimeDiagnostics.summary(db: db))",
+                category: .database
+            )
             throw DatabaseError.queryFailed(
                 query: sql,
-                underlying: String(cString: sqlite3_errmsg(db))
+                underlying: errorMessage
             )
         }
 
@@ -131,7 +141,11 @@ enum FTSQueries {
         segmentId: Int64,
         frameId: Int64
     ) throws -> Int64 {
-        // Step 1: Insert into searchRanking_content
+        if try getDocidForFrame(db: db, frameId: frameId) != nil {
+            try deleteForFrame(db: db, frameId: frameId)
+        }
+
+        // Step 1: Insert into searchRanking (and its shadow content row)
         let docid = try insertContent(
             db: db,
             mainText: mainText,
@@ -152,12 +166,12 @@ enum FTSQueries {
 
     // MARK: - Select
 
-    /// Get FTS content by docid
+    /// Get indexed content by docid
     static func getContent(db: OpaquePointer, docid: Int64) throws -> (mainText: String, chromeText: String?, windowTitle: String?)? {
         let sql = """
-            SELECT text, otherText, title
-            FROM searchRanking
-            WHERE rowid = ?;
+            SELECT c0, c1, c2
+            FROM searchRanking_content
+            WHERE id = ?;
             """
 
         var statement: OpaquePointer?
@@ -188,7 +202,7 @@ enum FTSQueries {
     /// Get docid for a frame
     static func getDocidForFrame(db: OpaquePointer, frameId: Int64) throws -> Int64? {
         let sql = """
-            SELECT docid
+            SELECT MAX(docid)
             FROM doc_segment
             WHERE frameId = ?;
             """
@@ -211,62 +225,106 @@ enum FTSQueries {
             return nil
         }
 
+        guard sqlite3_column_type(statement, 0) != SQLITE_NULL else {
+            return nil
+        }
+
         return sqlite3_column_int64(statement, 0)
+    }
+
+    /// Get all docids currently associated with a frame.
+    static func getDocidsForFrame(db: OpaquePointer, frameId: Int64) throws -> [Int64] {
+        let sql = """
+            SELECT DISTINCT docid
+            FROM doc_segment
+            WHERE frameId = ?
+            ORDER BY docid ASC;
+            """
+
+        var statement: OpaquePointer?
+        defer {
+            sqlite3_finalize(statement)
+        }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        sqlite3_bind_int64(statement, 1, frameId)
+
+        var docids: [Int64] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            docids.append(sqlite3_column_int64(statement, 0))
+        }
+        return docids
     }
 
     // MARK: - Delete
 
-    /// Delete FTS content and associated doc_segment records for a frame
+    /// Keep parameter lists bounded, including connections with a lowered SQLite limit.
+    static func deletionBatchSize(db: OpaquePointer) -> Int {
+        max(1, min(500, Int(sqlite3_limit(db, SQLITE_LIMIT_VARIABLE_NUMBER, -1))))
+    }
+
+    /// Delete search links for one frame, preserving documents referenced elsewhere.
     static func deleteForFrame(db: OpaquePointer, frameId: Int64) throws {
-        // First get the docid
-        guard let docid = try getDocidForFrame(db: db, frameId: frameId) else {
-            return // Nothing to delete
+        try deleteForFrames(db: db, frameIDs: [frameId])
+    }
+
+    /// Frame deletion supplies the enclosing transaction; single-frame indexing
+    /// also reuses this cleanup. Unrelated orphan documents are left untouched.
+    static func deleteForFrames(db: OpaquePointer, frameIDs: [Int64]) throws {
+        let batchSize = deletionBatchSize(db: db)
+        for start in stride(from: 0, to: frameIDs.count, by: batchSize) {
+            let ids = Array(frameIDs[start..<min(start + batchSize, frameIDs.count)])
+            let placeholders = ids.map { _ in "?" }.joined(separator: ",")
+            let sql = "SELECT DISTINCT docid FROM doc_segment WHERE frameId IN (\(placeholders));"
+            let docids: [Int64] = try {
+                var statement: OpaquePointer?
+                defer { sqlite3_finalize(statement) }
+                guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+                    throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+                }
+                for (index, id) in ids.enumerated() { sqlite3_bind_int64(statement, Int32(index + 1), id) }
+                var result: [Int64] = []
+                var status = sqlite3_step(statement)
+                while status == SQLITE_ROW {
+                    result.append(sqlite3_column_int64(statement, 0))
+                    status = sqlite3_step(statement)
+                }
+                guard status == SQLITE_DONE else {
+                    throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+                }
+                return result
+            }()
+            guard !docids.isEmpty else { continue }
+
+            try deleteMatchingIDs(db: db, sql: "DELETE FROM doc_segment WHERE frameId IN (\(placeholders));", ids: ids)
+            // A frame can have many documents. Chunk these independently of frame IDs
+            // and retain links to other frames, other batches, and audio-only segments.
+            for docStart in stride(from: 0, to: docids.count, by: batchSize) {
+                let docs = Array(docids[docStart..<min(docStart + batchSize, docids.count)])
+                let docPlaceholders = docs.map { _ in "?" }.joined(separator: ",")
+                try deleteMatchingIDs(db: db, sql: """
+                    DELETE FROM searchRanking WHERE rowid IN (\(docPlaceholders))
+                    AND NOT EXISTS (SELECT 1 FROM doc_segment WHERE docid = searchRanking.rowid);
+                    """, ids: docs)
+            }
         }
+    }
 
-        // Delete from doc_segment
-        let deleteJunctionSQL = "DELETE FROM doc_segment WHERE frameId = ?;"
-        var junctionStatement: OpaquePointer?
-        defer {
-            sqlite3_finalize(junctionStatement)
+    private static func deleteMatchingIDs(db: OpaquePointer, sql: String, ids: [Int64]) throws {
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
         }
-
-        guard sqlite3_prepare_v2(db, deleteJunctionSQL, -1, &junctionStatement, nil) == SQLITE_OK else {
-            throw DatabaseError.queryFailed(
-                query: deleteJunctionSQL,
-                underlying: String(cString: sqlite3_errmsg(db))
-            )
-        }
-
-        sqlite3_bind_int64(junctionStatement, 1, frameId)
-
-        guard sqlite3_step(junctionStatement) == SQLITE_DONE else {
-            throw DatabaseError.queryFailed(
-                query: deleteJunctionSQL,
-                underlying: String(cString: sqlite3_errmsg(db))
-            )
-        }
-
-        // Delete from searchRanking (FTS virtual table)
-        let deleteContentSQL = "DELETE FROM searchRanking WHERE rowid = ?;"
-        var contentStatement: OpaquePointer?
-        defer {
-            sqlite3_finalize(contentStatement)
-        }
-
-        guard sqlite3_prepare_v2(db, deleteContentSQL, -1, &contentStatement, nil) == SQLITE_OK else {
-            throw DatabaseError.queryFailed(
-                query: deleteContentSQL,
-                underlying: String(cString: sqlite3_errmsg(db))
-            )
-        }
-
-        sqlite3_bind_int64(contentStatement, 1, docid)
-
-        guard sqlite3_step(contentStatement) == SQLITE_DONE else {
-            throw DatabaseError.queryFailed(
-                query: deleteContentSQL,
-                underlying: String(cString: sqlite3_errmsg(db))
-            )
+        for (index, id) in ids.enumerated() { sqlite3_bind_int64(statement, Int32(index + 1), id) }
+        guard sqlite3_step(statement) == SQLITE_DONE else {
+            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
         }
     }
 

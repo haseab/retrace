@@ -138,7 +138,6 @@ public actor HybridSearchManager: SearchProtocol {
         return SearchResults(
             query: SearchQuery(text: query, filters: filters, limit: limit),
             results: finalResults,
-            totalCount: finalResults.count,
             searchTimeMs: searchTimeMs
         )
     }

@@ -86,6 +86,18 @@ public struct ShortcutConfig: Codable, Sendable, Equatable {
         key: "R",
         modifiers: [.command, .shift]
     )
+
+    /// Default system monitor shortcut: Cmd+Shift+M
+    public static let defaultSystemMonitor = ShortcutConfig(
+        key: "M",
+        modifiers: [.command, .shift]
+    )
+
+    /// Default quick-comment shortcut: Cmd+Shift+C
+    public static let defaultCommentCapture = ShortcutConfig(
+        key: "C",
+        modifiers: [.command, .shift]
+    )
 }
 
 // MARK: - Capture Configuration
@@ -107,13 +119,17 @@ public struct CaptureConfig: Codable, Sendable {
     /// - Default 0.9985 only discards nearly identical frames
     public let deduplicationThreshold: Double
 
+    /// Keep frames (do not deduplicate) when the mouse pointer moved between captures.
+    /// Useful when cursor movement should remain visible in timeline playback.
+    public let keepFramesOnMouseMovement: Bool
+
     /// Maximum resolution to capture (will downscale if screen is larger)
     public let maxResolution: Resolution
 
     /// App bundle IDs to exclude from capture
     public let excludedAppBundleIDs: Set<String>
 
-    /// Whether to exclude private/incognito browser windows
+    /// Whether to redact private/incognito browser windows detected via AX title markers.
     public let excludePrivateWindows: Bool
 
     /// Custom patterns to detect private windows (in addition to defaults)
@@ -121,6 +137,14 @@ public struct CaptureConfig: Codable, Sendable {
 
     /// Whether to show the mouse cursor in captures (default: true)
     public let showCursor: Bool
+
+    /// Case-insensitive substring patterns for window titles that should be redacted.
+    /// Matching frames are kept but replaced with black placeholder pixels.
+    public let redactWindowTitlePatterns: [String]
+
+    /// Case-insensitive substring patterns for browser URLs that should be redacted.
+    /// Matching frames are kept but replaced with black placeholder pixels.
+    public let redactBrowserURLPatterns: [String]
 
     /// Idle threshold in seconds - if no frames are captured for this duration,
     /// the current segment is closed and a new one is created on the next frame.
@@ -137,31 +161,78 @@ public struct CaptureConfig: Codable, Sendable {
     /// When false (default), only the active/focused display is recorded (current behavior).
     /// When true, one capture instance runs per connected display.
     public let recordAllDisplays: Bool
+    /// Whether to capture shortly after a left mouse click.
+    /// Default is false until the user enables it and grants Input Monitoring permission.
+    public let captureOnMouseClick: Bool
 
     public init(
         captureIntervalSeconds: Double = 2.0,
         adaptiveCaptureEnabled: Bool = true,
         deduplicationThreshold: Double = CaptureConfig.defaultDeduplicationThreshold,
+        keepFramesOnMouseMovement: Bool = true,
         maxResolution: Resolution = .uhd4K,
         excludedAppBundleIDs: Set<String> = [],
         excludePrivateWindows: Bool = true,
         customPrivateWindowPatterns: [String] = [],
         showCursor: Bool = true,
+        redactWindowTitlePatterns: [String] = [],
+        redactBrowserURLPatterns: [String] = [],
         idleThresholdSeconds: Double = 120.0,
         captureOnWindowChange: Bool = true,
-        recordAllDisplays: Bool = false
+        recordAllDisplays: Bool = false,
+        captureOnMouseClick: Bool = false
     ) {
         self.captureIntervalSeconds = captureIntervalSeconds
         self.adaptiveCaptureEnabled = adaptiveCaptureEnabled
         self.deduplicationThreshold = deduplicationThreshold
+        self.keepFramesOnMouseMovement = keepFramesOnMouseMovement
         self.maxResolution = maxResolution
         self.excludedAppBundleIDs = excludedAppBundleIDs
         self.excludePrivateWindows = excludePrivateWindows
         self.customPrivateWindowPatterns = customPrivateWindowPatterns
         self.showCursor = showCursor
+        self.redactWindowTitlePatterns = redactWindowTitlePatterns
+        self.redactBrowserURLPatterns = redactBrowserURLPatterns
         self.idleThresholdSeconds = idleThresholdSeconds
         self.captureOnWindowChange = captureOnWindowChange
         self.recordAllDisplays = recordAllDisplays
+        self.captureOnMouseClick = captureOnMouseClick
+    }
+
+    public func updating(
+        captureIntervalSeconds: Double? = nil,
+        adaptiveCaptureEnabled: Bool? = nil,
+        deduplicationThreshold: Double? = nil,
+        keepFramesOnMouseMovement: Bool? = nil,
+        maxResolution: Resolution? = nil,
+        excludedAppBundleIDs: Set<String>? = nil,
+        excludePrivateWindows: Bool? = nil,
+        customPrivateWindowPatterns: [String]? = nil,
+        showCursor: Bool? = nil,
+        redactWindowTitlePatterns: [String]? = nil,
+        redactBrowserURLPatterns: [String]? = nil,
+        idleThresholdSeconds: Double? = nil,
+        captureOnWindowChange: Bool? = nil,
+        recordAllDisplays: Bool? = nil,
+        captureOnMouseClick: Bool? = nil
+    ) -> Self {
+        Self(
+            captureIntervalSeconds: captureIntervalSeconds ?? self.captureIntervalSeconds,
+            adaptiveCaptureEnabled: adaptiveCaptureEnabled ?? self.adaptiveCaptureEnabled,
+            deduplicationThreshold: deduplicationThreshold ?? self.deduplicationThreshold,
+            keepFramesOnMouseMovement: keepFramesOnMouseMovement ?? self.keepFramesOnMouseMovement,
+            maxResolution: maxResolution ?? self.maxResolution,
+            excludedAppBundleIDs: excludedAppBundleIDs ?? self.excludedAppBundleIDs,
+            excludePrivateWindows: excludePrivateWindows ?? self.excludePrivateWindows,
+            customPrivateWindowPatterns: customPrivateWindowPatterns ?? self.customPrivateWindowPatterns,
+            showCursor: showCursor ?? self.showCursor,
+            redactWindowTitlePatterns: redactWindowTitlePatterns ?? self.redactWindowTitlePatterns,
+            redactBrowserURLPatterns: redactBrowserURLPatterns ?? self.redactBrowserURLPatterns,
+            idleThresholdSeconds: idleThresholdSeconds ?? self.idleThresholdSeconds,
+            captureOnWindowChange: captureOnWindowChange ?? self.captureOnWindowChange,
+            recordAllDisplays: recordAllDisplays ?? self.recordAllDisplays,
+            captureOnMouseClick: captureOnMouseClick ?? self.captureOnMouseClick
+        )
     }
 
     /// Default deduplication threshold (99.85% similarity)
@@ -247,16 +318,21 @@ public struct ProcessingConfig: Codable, Sendable {
     /// Minimum confidence threshold for OCR results (0-1)
     public let minimumConfidence: Float
 
+    /// Hint to Vision to prefer background processing (lower resource usage)
+    public let preferBackgroundProcessing: Bool
+
     public init(
         accessibilityEnabled: Bool = true,
         ocrAccuracyLevel: OCRAccuracyLevel = .accurate,
         recognitionLanguages: [String] = ["en-US"],
-        minimumConfidence: Float = 0.5
+        minimumConfidence: Float = 0.5,
+        preferBackgroundProcessing: Bool = false
     ) {
         self.accessibilityEnabled = accessibilityEnabled
         self.ocrAccuracyLevel = ocrAccuracyLevel
         self.recognitionLanguages = recognitionLanguages
         self.minimumConfidence = minimumConfidence
+        self.preferBackgroundProcessing = preferBackgroundProcessing
     }
 
     public static let `default` = ProcessingConfig()
@@ -385,4 +461,40 @@ public struct AppConfig: Codable, Sendable {
     }
 
     public static let `default` = AppConfig()
+}
+
+/// Each node records its mode, independently of later settings changes.
+public enum PhraseRedactionMode: String, CaseIterable, Codable, Sendable {
+    case scramble
+    case permanent
+
+    public static let didFinishNotification = Notification.Name("PhraseRedactionDidFinish")
+
+    public static func configuredPhrases(in defaults: UserDefaults) -> [String] {
+        guard let raw = defaults.string(forKey: "phraseLevelRedactionPhrases") else { return [] }
+        let phrases: [String]
+        if let data = raw.data(using: .utf8), let decoded = try? JSONDecoder().decode([String].self, from: data) {
+            phrases = decoded
+        } else {
+            phrases = raw.split(whereSeparator: { $0 == "," || $0 == "\n" }).map(String.init)
+        }
+        return phrases.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+    }
+
+    public static func isEnabled(in defaults: UserDefaults) -> Bool {
+        if let enabled = defaults.object(forKey: "phraseLevelRedactionEnabled") as? Bool { return enabled }
+        return !configuredPhrases(in: defaults).isEmpty
+    }
+
+    public static let defaultsKey = "phraseLevelRedactionMode"
+    /// A non-recoverable marker in the existing protected-text column, containing no original text.
+    public static let permanentTextMarker = "rtx-permanent-v1"
+
+    public static func load(from defaults: UserDefaults) -> Self {
+        Self(rawValue: defaults.string(forKey: defaultsKey) ?? "") ?? .scramble
+    }
+
+    public init(storedText: String?) {
+        self = storedText == Self.permanentTextMarker ? .permanent : .scramble
+    }
 }

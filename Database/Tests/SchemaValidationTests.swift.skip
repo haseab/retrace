@@ -283,7 +283,7 @@ final class SchemaValidationTests: XCTestCase {
         assertValidSQL(Schema.createFramesAppIndex, description: "Create idx_frames_app")
         assertValidSQL(Schema.createFramesSourceIndex, description: "Create idx_frames_source")
         assertValidSQL(Schema.createFramesSessionIndex, description: "Create idx_frames_session")
-        assertValidSQL(Schema.createFramesEncodingStatusIndex, description: "Create idx_frames_encoding_status")
+        assertValidSQL(Schema.createFramesEncodedAtIndex, description: "Create idx_frames_encoded_at")
     }
 
     func testCreateAppSessionIndexes_AreValidSQL() {
@@ -468,7 +468,7 @@ final class SchemaValidationTests: XCTestCase {
             ("idx_frames_app", Schema.createFramesAppIndex),
             ("idx_frames_source", Schema.createFramesSourceIndex),
             ("idx_frames_session", Schema.createFramesSessionIndex),
-            ("idx_frames_encoding_status", Schema.createFramesEncodingStatusIndex),
+            ("idx_frames_encoded_at", Schema.createFramesEncodedAtIndex),
             ("idx_app_sessions_time", Schema.createAppSessionsTimeIndex),
             ("idx_app_sessions_app", Schema.createAppSessionsAppIndex),
             ("idx_text_regions_frame", Schema.createTextRegionsFrameIndex),

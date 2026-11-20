@@ -2,27 +2,59 @@
 
 You are responsible for the **Database** module of Retrace. Your job is to implement SQLite database operations including schema, migrations, CRUD operations, and full-text search indexing.
 
-**v0.5 Status**: ✅ Core tables fully implemented (segments, frames, searchRanking FTS5). Uses SQLCipher for optional encryption and Rewind database import compatibility. **Advanced tables not yet implemented** (app_sessions, encoding_queue, junction tables - planned for future release). Audio tables exist in schema but are not used in v0.5.
+**Status**: ✅ Core tables fully implemented (segments, frames, searchRanking FTS5). Uses SQLCipher for optional encryption and Rewind database import compatibility. **Advanced tables not yet implemented** (app_sessions, encoding_queue, junction tables - planned for future release). Audio tables exist in schema but are not yet used.
 
 ## Your Directory
 
 ```
 Database/
 ├── DatabaseManager.swift      # Main DatabaseProtocol implementation
+├── DatabaseConnection.swift   # SQLite/SQLCipher connection wrappers + shared errors
+├── ReadConnectionSupport.swift # Read-only connection factory, pool, and in-memory shared-connection bridge
 ├── FTSManager.swift           # FTSProtocol implementation
 ├── Schema.swift               # Table definitions
 ├── Migrations/
 │   ├── MigrationRunner.swift  # Run migrations in order
 │   ├── V1_InitialSchema.swift # Initial schema migration
-│   └── V7_MultiDisplaySupport.swift # displayID/isFocused + display metadata table/indexes
-├── Queries/
+│   ├── V2_UnfinalisedVideoTracking.swift
+│   ├── V3_TagSystem.swift
+│   ├── V4_DailyMetrics.swift
+│   ├── V5_FTSUnicode61.swift
+│   ├── V6_FrameProcessedAt.swift
+│   ├── V7_FrameRedactionReason.swift
+│   ├── V8_SegmentComments.swift
+│   ├── V9_SegmentCommentFrameAnchor.swift
+│   ├── V10_SegmentCommentSearchIndex.swift
+│   ├── V11_SegmentCommentLinkCompositeIndex.swift
+│   ├── V12_FrameMetadata.swift
+│   ├── V13_RemoveInPageURLRects.swift
+│   ├── V14_DBStorageSnapshot.swift
+│   ├── V15_NodeRedactionFlag.swift
+│   ├── V16_ProcessingQueueFrameIDIndex.swift
+│   ├── V17_FrameCaptureTrigger.swift
+│   ├── V18_DailyMetricsRecencyIndex.swift
+│   ├── V19_FrameEncodedAt.swift
+│   ├── V20_PartialProcessingStatusIndex.swift # Exclude OCR-completed frames from status index
+│   └── V21_MultiDisplaySupport.swift # Display metadata and frame focus
+├── Queries/                  # Includes DisplayQueries.swift and FrameOCRRegionQueries.swift
 │   ├── FrameQueries.swift     # Frame CRUD operations
 │   ├── SegmentQueries.swift   # Segment CRUD operations
-│   ├── DocumentQueries.swift  # Document/FTS operations
-│   └── DisplayQueries.swift   # Display metadata upsert/fetch
-└── Tests/
+│   ├── DailyMetricsQueries.swift # Metric events and local-day counts, with optional exact timestamp bounds
+│   └── DocumentQueries.swift  # Document/FTS operations
+└── Tests/                    # Includes FrameOCRRegionTests.swift lifecycle, display round-trip, and V20-to-V21 upgrade coverage
+    ├── AsyncQueuePipelineTests.swift
+    ├── RetentionVideoDeletionTests.swift # Real migrated SQLite retention guards and injected failure
     ├── DatabaseManagerTests.swift
-    └── FTSManagerTests.swift
+    ├── SQLiteReadSafetyTests.swift # Text-buffer lifetime, missing/error distinction and bounded lock retries
+    ├── EdgeCaseTests.swift
+    ├── ProcessingStatusIndexTests.swift # V19 upgrade, index population and production query plans
+    ├── ProcessingQueueBatchTests.swift # Atomic backlog enqueue, statement reuse and eligibility checks
+    ├── FrameBatchDeletionTests.swift # Batched retention deletion, real SQLite/FTS, rollback and shared documents
+    ├── FTSManagerTests.swift
+    ├── IntegrationTests.swift
+    ├── OCRPipelineTests.swift
+    ├── QueryBuilderTests.swift
+    └── TestLogger.swift
 ```
 
 ## Protocols You Must Implement
@@ -398,10 +430,10 @@ CREATE TABLE encoding_queue (
 **Why?**: Encoding can be slow on Intel Macs. Async processing prevents blocking capture thread.
 
 **Workflow**:
-1. Frame captured → insert into `frames` with `encoding_status='pending'`
-2. Add job to `encoding_queue` with priority
-3. Background worker picks up job, encodes, updates status to 'success'
-4. On failure, increment `retry_count` and requeue
+1. Frame captured → insert into `frame` with `processingStatus = 4` ("not yet readable")
+2. Video writer flushes enough media for the frame to become readable from disk
+3. `markFrameReadable` transitions `processingStatus` to `0` and records `encodedAt`
+4. OCR/rewrite work continues via the processing queue
 
 #### 3. `deletion_queue` - Async Cleanup
 
@@ -439,27 +471,25 @@ ALTER TABLE segments ADD COLUMN source TEXT DEFAULT 'native';
 
 **Why?**: Multi-monitor setups have different resolutions. Need to know dimensions for proper video playback and timeline scrubbing.
 
-#### `frames` - Added Encoding Status and Session Link
+#### `frame` - Added Readable-Timing Metadata
 
 ```sql
-ALTER TABLE frames ADD COLUMN encoding_status TEXT DEFAULT 'pending';
-ALTER TABLE frames ADD COLUMN session_id TEXT REFERENCES app_sessions(id) ON DELETE SET NULL;
-ALTER TABLE frames ADD COLUMN source TEXT DEFAULT 'native';
+ALTER TABLE frame ADD COLUMN encodedAt INTEGER;
 ```
 
-- `encoding_status`: Track async encoding pipeline state
-- `session_id`: Link frame to app session for efficient grouping
-- `source`: Distinguish native captures from imported data (`'native'`, `'rewind'`, `'screen_memory'`, etc.)
+- `encodedAt`: Record when a frame became readable from the encoded video file
 
 **Note**: Removed `duration_ms` - it was always 2000ms (fixed capture rate). Can derive from timestamp gaps if needed.
 
 ### Migration Strategy
 
-Existing databases (V1/V2) will automatically upgrade via migrations:
-- V2: Add `source` column (for third-party import support)
-- V3: Add dimensions, encoding_status, session_id, new tables
+Existing databases upgrade forward in migration order. Recent frame-pipeline migrations include:
+- V15: rewrite/protected-text metadata
+- V17: `capture_trigger`
+- V18: `daily_metrics` recency index
+- V19: `encodedAt`
 
-New installations get V3 schema immediately (no migrations needed).
+New installations get the current schema plus all migrations applied during initialization.
 
 ### Indexes
 
@@ -477,9 +507,11 @@ CREATE INDEX idx_encoding_queue_status ON encoding_queue(status, priority DESC);
 CREATE INDEX idx_deletion_queue_type ON deletion_queue(entity_type);
 
 -- Frames (updated)
-CREATE INDEX idx_frames_session ON frames(session_id);
-CREATE INDEX idx_frames_encoding_status ON frames(encoding_status);
-CREATE INDEX idx_frames_source ON frames(source);
+CREATE INDEX index_frame_on_createdat ON frame(createdAt);
+CREATE INDEX index_frame_on_isstarred_createdat ON frame(isStarred, createdAt);
+CREATE INDEX index_frame_on_segmentid_createdat ON frame(segmentId, createdAt);
+CREATE INDEX index_frame_on_videoid ON frame(videoId);
+CREATE INDEX idx_frame_encoded_at ON frame(encodedAt) WHERE encodedAt IS NOT NULL;
 ```
 
 ### Junction Tables - Critical at 40GB+ Scale
@@ -620,3 +652,36 @@ With junction tables and proper indexes:
 - **Database size**: ~500MB metadata/month + ~150GB text regions + ~50MB junctions
 
 Trade-off: Slightly more complex writes (populate junction tables + text regions), but **massive** read speedups and professional UI.
+
+## Stored keyword protection mode
+
+The existing `node.encryptedText` column stores either the reversible protected-text payload or the exact non-recoverable marker `rtx-permanent-v1`. Permanent markers keep nodes masked and discoverable for rewrite scheduling, but must be excluded from missing-master-key recovery checks. Propagate mode into `PendingNodeRedactionJob` and `SegmentRedactionTarget`; no schema migration is needed. Active query files use the declared SQLCipher module, avoiding mixed system SQLite/SQLCipher headers.
+
+- Retention video deletion uses an atomic DELETE guarded by processingState=0 and absence of frame references. Report an already absent row as success for journal retry, but propagate SQLite errors before any file deletion.
+
+### Batched frame deletion
+
+- Retention, recent-frame deletion, and explicit frame-ID deletion share `FrameQueries` batching: at most 500 IDs per statement, reduced to the connection's SQLite variable limit. Preserve the existing requested-ID count semantics for explicit IDs.
+- Delete affected `doc_segment` links in batches, then delete only affected FTS documents with no remaining links (including audio-only links). Never sweep unrelated orphan documents. Chunk document IDs separately because a frame may have many documents.
+- Keep the complete operation in one transaction; when a caller owns a transaction, leave commit/rollback to that caller. Existing foreign-key cascades remain responsible for nodes, processing queue rows and frame anchors. No schema migration or new user action/metric is introduced.
+
+### Batched OCR queue insertion
+
+- `enqueueFramesForProcessing` uses one actor call, one reusable prepared INSERT, and a savepoint that commits as one standalone transaction or nests inside an existing transaction. Missing/non-pending frames and write failures roll back the complete batch, leaving pre-existing queue entries intact.
+- Preserve the single-frame API's eligibility (`processingStatus = 0`), priority, zero retry count, timestamp behavior, and duplicate-ID behavior. The single-frame path does not acquire an additional explicit transaction.
+
+### Partial processing-status index
+
+V20 replaces `idx_frame_processing_status` with `ON frame(processingStatus) WHERE processingStatus != 2`. Add the explicit `!= 2` conjunct to status-driven unfinished-work queries: SQLite does not infer it from `= 0` or `IN (...)`. Do not add it to primary-key/timeline reads that need completed frames. V6's completed-frame backfill runs before this migration while the full index still exists. Status 7 (rewritten), retry/failed states, and future non-2 values remain indexed; NULL rows remain stored but are excluded by the predicate. MigrationRunner applies the replacement atomically and only once; dropping the full index frees reusable database pages without running VACUUM.
+
+### Safe read iteration and text binding
+
+- Bind temporary Swift/Foundation text using `SQLITE_TRANSIENT` (the destructor sentinel `unsafeBitCast(-1, to: sqlite3_destructor_type.self)`). SQLite must own a copy until the statement is finalized or rebound.
+- Core frame/video/app and DatabaseManager SELECTs use `SQLiteReadStep.next`. Only `SQLITE_DONE` means no more rows; other errors must propagate rather than returning missing/empty/partial data.
+- Retry a busy/locked read once, only before its first row, using the existing connection timeout. Never retry interruption, I/O/corruption errors, writes, or restart a result set after rows have been returned.
+
+Capture-time AX: `Queries/AccessibilitySnapshotQueries.swift` owns the idempotent auxiliary table/cleanup triggers (independent of numbered migrations to coexist with encryption V21). Atomic native-frame insertion stores bounded JSON snapshots under the enclosing database encryption policy, with no separate encryption or Keychain access. Missing/encoding-failure states contain no text; legacy encrypted or malformed payloads fall back to ordinary OCR. Completion/failure/redaction staging clears payload in the same status update; delete triggers clean references with foreign keys on or off. `Tests/AccessibilitySnapshotTests.swift` covers bounded JSON round trips, legacy unreadable payloads, and real database lifecycle/failure cases.
+
+### OCR window geometry
+
+`Queries/FrameOCRRegionQueries.swift` owns the idempotent `frame_ocr_regions` auxiliary table (16 KiB/16-window bound, version 2 envelope) and explicit delete trigger. Native frame, AX reference, and OCR geometry inserts commit atomically. Geometry survives OCR completion for deterministic replay, but is deleted with its frame even when foreign keys are disabled. Absent/malformed geometry and the old fragment-array format use legacy OCR; an empty versioned window list means no eligible application windows. Ordered overlapping bounds round-trip without losing ownership order. `Tests/FrameOCRRegionTests.swift` exercises real SQLite round trips and deletion. `window_ocr` daily metrics contain aggregate counts/timing only.

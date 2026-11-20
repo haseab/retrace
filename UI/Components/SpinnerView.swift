@@ -1,17 +1,32 @@
 import SwiftUI
 
-/// A modern spinning arc loading indicator
-/// Uses native ProgressView for power efficiency (no idle wakeups)
+/// A pulsing ring loading indicator
+/// Uses a single repeating SwiftUI animation — no timers, no geometry recalculations
 struct SpinnerView: View {
     var size: CGFloat = 24
     var lineWidth: CGFloat = 3
     var color: Color = .retraceAccent
 
+    @State private var isAnimating = false
+
     var body: some View {
-        ProgressView()
-            .progressViewStyle(.circular)
-            .scaleEffect(size / 24)
-            .tint(color)
+        Circle()
+            .stroke(color.opacity(0.3), lineWidth: lineWidth)
+            .overlay(
+                Circle()
+                    .stroke(color, lineWidth: lineWidth)
+                    .scaleEffect(isAnimating ? 1.0 : 0.5)
+                    .opacity(isAnimating ? 0.0 : 1.0)
+            )
+            .frame(width: size, height: size)
+            .onAppear {
+                withAnimation(
+                    .easeOut(duration: 1.2)
+                    .repeatForever(autoreverses: false)
+                ) {
+                    isAnimating = true
+                }
+            }
     }
 }
 

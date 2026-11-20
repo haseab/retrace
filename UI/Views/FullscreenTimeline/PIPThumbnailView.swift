@@ -23,6 +23,7 @@ struct PIPThumbnailView: View {
                     if let videoInfo = videoInfo {
                         SimpleVideoFrameView(
                             videoInfo: videoInfo,
+                            debugContext: nil,
                             forceReload: $forceReload,
                             onLoadFailed: nil,
                             onLoadSuccess: nil

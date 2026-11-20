@@ -5,10 +5,11 @@ import Shared
 /// Parses search queries with support for:
 /// - Basic keywords: "error message"
 /// - Exact phrases: "exact phrase"
-/// - Exclusions: -excluded
+/// - Exclusions: -excluded or -"exact phrase"
 /// - App filter: app:Chrome
 /// - Date filters: after:2024-01-01 before:2024-12-31
 public struct QueryParser: QueryParserProtocol {
+    private let tokenizer = QueryTokenizer()
 
     public init() {}
 
@@ -27,45 +28,54 @@ public struct QueryParser: QueryParserProtocol {
         var endDate: Date? = nil
 
         // Tokenize preserving quotes
-        let tokens = tokenize(rawQuery)
+        let tokens = tokenizer.tokenize(rawQuery)
 
         for token in tokens {
-            if token.hasPrefix("\"") && token.hasSuffix("\"") && token.count > 1 {
-                // Exact phrase
-                let phrase = String(token.dropFirst().dropLast())
+            switch token.kind {
+            case .ignoredShellOption:
+                continue
+            case .excludedTerm, .excludedPhrase:
+                if !token.text.isEmpty {
+                    excludedTerms.append(token.text)
+                }
+            case .phrase:
+                let phrase = token.text
                 if !phrase.isEmpty {
                     phrases.append(phrase)
                 }
-            } else if token.hasPrefix("-") && token.count > 1 {
-                // Excluded term
-                excludedTerms.append(String(token.dropFirst()))
-            } else if token.lowercased().hasPrefix("app:") {
-                // App filter
-                let appValue = String(token.dropFirst(4))
-                if !appValue.isEmpty {
-                    appFilter = appValue
+            case .term:
+                let tokenText = token.text
+                if tokenText.lowercased().hasPrefix("app:") {
+                    // App filter
+                    let appValue = String(tokenText.dropFirst(4))
+                    if !appValue.isEmpty {
+                        appFilter = appValue
+                    }
+                } else if tokenText.lowercased().hasPrefix("after:") {
+                    // Start date
+                    let dateStr = String(tokenText.dropFirst(6))
+                    if let date = parseDate(dateStr) {
+                        startDate = date
+                    }
+                } else if tokenText.lowercased().hasPrefix("before:") {
+                    // End date
+                    let dateStr = String(tokenText.dropFirst(7))
+                    if let date = parseDate(dateStr) {
+                        endDate = date
+                    }
+                } else if !tokenText.isEmpty {
+                    // Regular search term
+                    searchTerms.append(tokenText)
                 }
-            } else if token.lowercased().hasPrefix("after:") {
-                // Start date
-                let dateStr = String(token.dropFirst(6))
-                if let date = parseDate(dateStr) {
-                    startDate = date
-                }
-            } else if token.lowercased().hasPrefix("before:") {
-                // End date
-                let dateStr = String(token.dropFirst(7))
-                if let date = parseDate(dateStr) {
-                    endDate = date
-                }
-            } else if !token.isEmpty {
-                // Regular search term
-                searchTerms.append(token)
             }
         }
 
         // Validate that we have at least some search criteria
         if searchTerms.isEmpty && phrases.isEmpty && excludedTerms.isEmpty {
             throw SearchError.invalidQuery(reason: "No search terms provided")
+        }
+        if searchTerms.isEmpty && phrases.isEmpty && !excludedTerms.isEmpty {
+            throw SearchError.invalidQuery(reason: "Exclusions require at least one search term")
         }
 
         return ParsedQuery(
@@ -99,57 +109,15 @@ public struct QueryParser: QueryParserProtocol {
             errors.append(QueryValidationError(message: "Offset cannot be negative"))
         }
 
-        // Check date range makes sense
-        if let start = query.filters.startDate, let end = query.filters.endDate {
-            if start > end {
+        // Check date range(s) make sense
+        for range in query.filters.effectiveDateRanges {
+            if let start = range.start, let end = range.end, start > end {
                 errors.append(QueryValidationError(message: "Start date must be before end date"))
+                break
             }
         }
 
         return errors
-    }
-
-    // MARK: - Private Helpers
-
-    /// Tokenize query string while preserving quoted phrases
-    private func tokenize(_ query: String) -> [String] {
-        var tokens: [String] = []
-        var current = ""
-        var inQuotes = false
-
-        for char in query {
-            if char == "\"" {
-                if inQuotes {
-                    // Ending quote
-                    current.append(char)
-                    tokens.append(current)
-                    current = ""
-                    inQuotes = false
-                } else {
-                    // Starting quote
-                    if !current.isEmpty {
-                        tokens.append(current)
-                        current = ""
-                    }
-                    current.append(char)
-                    inQuotes = true
-                }
-            } else if char.isWhitespace && !inQuotes {
-                if !current.isEmpty {
-                    tokens.append(current)
-                    current = ""
-                }
-            } else {
-                current.append(char)
-            }
-        }
-
-        // Add any remaining content
-        if !current.isEmpty {
-            tokens.append(current)
-        }
-
-        return tokens
     }
 
     /// Parse date string in various formats
@@ -201,34 +169,26 @@ extension ParsedQuery {
 
         // Regular terms with prefix matching
         for term in searchTerms {
-            // Escape special FTS characters
-            let escaped = escapeFTSSpecialChars(term)
+            let escaped = QueryTokenizer.sanitizeFTSTerm(term)
             parts.append("\(escaped)*")
         }
 
         // Exact phrases
         for phrase in phrases {
-            let escaped = escapeFTSSpecialChars(phrase)
+            let escaped = QueryTokenizer.sanitizeFTSTerm(phrase)
             parts.append("\"\(escaped)\"")
         }
 
         // Excluded terms
         for term in excludedTerms {
-            let escaped = escapeFTSSpecialChars(term)
-            parts.append("NOT \(escaped)")
+            let escaped = QueryTokenizer.sanitizeFTSTerm(term)
+            if term.contains(where: \.isWhitespace) {
+                parts.append("NOT \"\(escaped)\"")
+            } else {
+                parts.append("NOT \(escaped)")
+            }
         }
 
         return parts.joined(separator: " ")
-    }
-
-    /// Escape FTS5 special characters
-    private func escapeFTSSpecialChars(_ text: String) -> String {
-        // FTS5 special chars: " * ( ) { } [ ] ^ : -
-        var escaped = text
-        let specialChars = ["\""]
-        for char in specialChars {
-            escaped = escaped.replacingOccurrences(of: char, with: "")
-        }
-        return escaped
     }
 }

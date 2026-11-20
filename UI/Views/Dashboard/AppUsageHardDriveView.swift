@@ -7,10 +7,31 @@ struct AppUsageHardDriveView: View {
     let apps: [AppUsageData]
     let totalTime: TimeInterval
     var onAppTapped: ((AppUsageData) -> Void)? = nil
+    var onUsageAction: ((DashboardUsageTarget, DashboardUsageAction) -> Void)? = nil
     @State private var hoveredApp: AppUsageData? = nil
     @State private var hoverDebounceTask: DispatchWorkItem? = nil
 
     private let gap: CGFloat = 3
+
+    private struct TreemapItem {
+        let app: AppUsageData
+        let rect: CGRect
+        let targetArea: CGFloat  // Store target area for validation
+    }
+
+    private final class TreemapLayoutCacheEntry {
+        let items: [TreemapItem]
+
+        init(items: [TreemapItem]) {
+            self.items = items
+        }
+    }
+
+    private static let treemapLayoutCache: NSCache<NSString, TreemapLayoutCacheEntry> = {
+        let cache = NSCache<NSString, TreemapLayoutCacheEntry>()
+        cache.countLimit = 64
+        return cache
+    }()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -18,10 +39,17 @@ struct AppUsageHardDriveView: View {
             treemapVisualization
                 .frame(maxHeight: .infinity)
 
-            // Hover tooltip (shown below treemap)
-            if let app = hoveredApp {
-                tooltipView(for: app)
-                    .transition(.opacity.combined(with: .scale(scale: 0.95)))
+            // Hover tooltip (shown below treemap) - always reserve space
+            ZStack {
+                // Invisible placeholder to reserve space
+                tooltipPlaceholder
+                    .opacity(0)
+
+                // Actual tooltip (visible only when hovering)
+                if let app = hoveredApp {
+                    tooltipView(for: app)
+                        .transition(.opacity.combined(with: .scale(scale: 0.95)))
+                }
             }
         }
         .padding(16)
@@ -30,8 +58,9 @@ struct AppUsageHardDriveView: View {
 
     private var treemapVisualization: some View {
         GeometryReader { geometry in
-            let layout = calculateTreemap(
-                apps: Array(apps.prefix(12)),
+            let visibleApps = Array(apps.prefix(12))
+            let layout = memoizedTreemapLayout(
+                apps: visibleApps,
                 in: CGRect(x: 0, y: 0, width: geometry.size.width, height: geometry.size.height)
             )
 
@@ -115,11 +144,40 @@ struct AppUsageHardDriveView: View {
         .onTapGesture {
             onAppTapped?(item.app)
         }
+        .contextMenu {
+            DashboardUsageMenu(target: .app(item.app), onAction: onUsageAction)
+        }
     }
 
     private func iconSize(for blockSize: CGSize) -> CGFloat {
         let minDimension = min(blockSize.width, blockSize.height)
         return max(16, min(48, minDimension * 0.4))
+    }
+
+    private var tooltipPlaceholder: some View {
+        HStack(spacing: 12) {
+            Color.clear
+                .frame(width: 36, height: 36)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Placeholder")
+                    .font(.retraceCalloutBold)
+
+                HStack(spacing: 8) {
+                    Text("00h 00m")
+                        .font(.retraceCaptionMedium)
+                    Text("•")
+                    Text("0.0%")
+                        .font(.retraceCaptionMedium)
+                    Text("•")
+                    Text("0 tabs")
+                        .font(.retraceCaption2)
+                }
+            }
+
+            Spacer()
+        }
+        .padding(12)
     }
 
     private func tooltipView(for app: AppUsageData) -> some View {
@@ -167,10 +225,29 @@ struct AppUsageHardDriveView: View {
 
     // MARK: - Squarified Treemap Algorithm with Proportion-Preserving Fitting
 
-    private struct TreemapItem {
-        let app: AppUsageData
-        let rect: CGRect
-        let targetArea: CGFloat  // Store target area for validation
+    private func memoizedTreemapLayout(apps: [AppUsageData], in rect: CGRect) -> [TreemapItem] {
+        guard rect.width > 0, rect.height > 0 else { return [] }
+
+        let cacheKey = treemapCacheKey(apps: apps, containerSize: rect.size)
+        if let cached = Self.treemapLayoutCache.object(forKey: cacheKey) {
+            return cached.items
+        }
+
+        let layout = calculateTreemap(apps: apps, in: rect)
+        Self.treemapLayoutCache.setObject(TreemapLayoutCacheEntry(items: layout), forKey: cacheKey)
+        return layout
+    }
+
+    private func treemapCacheKey(apps: [AppUsageData], containerSize: CGSize) -> NSString {
+        let quantizedWidth = Int((containerSize.width * 2).rounded())
+        let quantizedHeight = Int((containerSize.height * 2).rounded())
+        let appsSignature = apps.map { app in
+            let percentage = Int((app.percentage * 10_000).rounded())
+            let duration = Int(app.duration.rounded())
+            return "\(app.appBundleID)|\(percentage)|\(duration)|\(app.uniqueItemCount)"
+        }.joined(separator: ";")
+
+        return "\(quantizedWidth)x\(quantizedHeight)|\(apps.count)|\(appsSignature)" as NSString
     }
 
     private func calculateTreemap(apps: [AppUsageData], in rect: CGRect) -> [TreemapItem] {

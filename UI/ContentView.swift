@@ -1,5 +1,6 @@
 import SwiftUI
 import App
+import Shared
 
 /// Root content view with navigation between main views
 public struct ContentView: View {
@@ -13,6 +14,7 @@ public struct ContentView: View {
     @StateObject private var launchOnLoginReminderManager: LaunchOnLoginReminderManager
     @StateObject private var milestoneCelebrationManager: MilestoneCelebrationManager
     @StateObject private var coordinatorWrapper: AppCoordinatorWrapper
+    @StateObject private var dashboardViewModel: DashboardViewModel
 
     private let coordinator: AppCoordinator
 
@@ -23,6 +25,7 @@ public struct ContentView: View {
         self._launchOnLoginReminderManager = StateObject(wrappedValue: LaunchOnLoginReminderManager(coordinator: coordinator))
         self._milestoneCelebrationManager = StateObject(wrappedValue: MilestoneCelebrationManager(coordinator: coordinator))
         self._coordinatorWrapper = StateObject(wrappedValue: AppCoordinatorWrapper(coordinator: coordinator))
+        self._dashboardViewModel = StateObject(wrappedValue: DashboardViewModel(coordinator: coordinator))
     }
 
     // MARK: - Body
@@ -46,6 +49,7 @@ public struct ContentView: View {
                         switch selectedView {
                         case .dashboard:
                             DashboardView(
+                                viewModel: dashboardViewModel,
                                 coordinator: coordinator,
                                 launchOnLoginReminderManager: launchOnLoginReminderManager,
                                 milestoneCelebrationManager: milestoneCelebrationManager
@@ -62,7 +66,7 @@ public struct ContentView: View {
                     .ignoresSafeArea()
             }
         }
-        .frame(minWidth: 1000, minHeight: 700)
+        .frame(minWidth: 760, minHeight: 700)
         .task {
             // Check onboarding status FIRST before anything else
             // This prevents flicker by determining what to show before rendering
@@ -94,6 +98,7 @@ public struct ContentView: View {
             setupNotifications()
         }
         .onOpenURL { url in
+            Log.info("[ContentView] onOpenURL received: \(url)", category: .ui)
             deeplinkHandler.handle(url)
         }
         .onChange(of: deeplinkHandler.activeRoute) { route in
@@ -198,15 +203,20 @@ public struct ContentView: View {
 
     private func handleDeeplink(_ route: DeeplinkRoute?) {
         guard let route = route else { return }
+        Log.info("[ContentView] handleDeeplink route=\(String(describing: route))", category: .ui)
 
         switch route {
-        case .search(_, let timestamp, _):
-            // Open fullscreen timeline with search
-            if let timestamp = timestamp {
-                TimelineWindowController.shared.showAndNavigate(to: timestamp)
-            } else {
-                TimelineWindowController.shared.show()
-            }
+        case let .dashboard(dateRange):
+            DashboardWindowController.shared.openDeeplink(dateRange: dateRange)
+
+        case let .search(query, timestamp, appBundleID):
+            // Open fullscreen timeline and apply deeplink search state.
+            TimelineWindowController.shared.showSearch(
+                query: query,
+                timestamp: timestamp,
+                appBundleID: appBundleID,
+                source: "ContentView.onOpenURL"
+            )
 
         case .timeline(let timestamp):
             // Open fullscreen timeline at specific timestamp
@@ -216,6 +226,9 @@ public struct ContentView: View {
                 TimelineWindowController.shared.show()
             }
         }
+
+        // Reset route so repeated identical deeplinks still trigger handling.
+        deeplinkHandler.clearActiveRoute()
     }
 
     // MARK: - Onboarding

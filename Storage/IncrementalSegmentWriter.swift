@@ -5,10 +5,10 @@ import Shared
 /// Segment writer with write-ahead logging
 ///
 /// Features:
-/// - Writes raw frames to WAL before encoding (crash-safe)
+/// - Persists original pixels in a losslessly compressed WAL before encoding
 /// - Encoder writes frames incrementally to video file
 /// - WAL enables crash recovery - frames can be re-encoded from WAL on restart
-/// - Video file becomes readable only after finalize(), but WAL ensures no data loss
+/// - WAL supplies original pixels for OCR while video fragments are being flushed
 public actor IncrementalSegmentWriter: SegmentWriter {
     public let segmentID: VideoSegmentID
     public private(set) var frameCount: Int = 0
@@ -23,6 +23,7 @@ public actor IncrementalSegmentWriter: SegmentWriter {
 
     public private(set) var hasFragmentWritten: Bool = false
     public private(set) var framesFlushedToDisk: Int = 0
+    public private(set) var durableFileSizeBytes: Int64 = 0
 
     private let encoder: HEVCEncoder
     private let encoderConfig: VideoEncoderConfig
@@ -60,12 +61,12 @@ public actor IncrementalSegmentWriter: SegmentWriter {
             throw StorageError.fileWriteFailed(path: fileURL.path, underlying: "Writer cancelled")
         }
 
-        Log.debug("[IncrementalWriter] appendFrame called: segmentID=\(segmentID.value), frameCount=\(frameCount), size=\(frame.width)x\(frame.height)", category: .storage)
+        Log.verbose("[IncrementalWriter] appendFrame called: segmentID=\(segmentID.value), frameCount=\(frameCount), size=\(frame.width)x\(frame.height)", category: .storage)
 
         // Track I/O latency for storage health monitoring
         let writeStart = CFAbsoluteTimeGetCurrent()
 
-        // STEP 1: Write to WAL first (crash-safe persistence)
+        // STEP 1: Persist a lossless WAL record before video encoding
         // This is the critical durability guarantee - frames are safe even if app crashes
         if walSession == nil {
             let session = try await walManager.createSession(videoID: segmentID)
@@ -96,14 +97,24 @@ public actor IncrementalSegmentWriter: SegmentWriter {
         }
 
         // STEP 3: Encode frame to video
-        // AVAssetWriter writes data incrementally, but file won't be playable until finalize()
-        let pixelBuffer = try FrameConverter.createPixelBuffer(from: frame)
+        // AVAssetWriter makes the video readable incrementally as fragments flush.
+        let pixelBufferToken = await StorageVideoEncodingMemoryLedger.beginPixelBuffer(
+            width: frame.width,
+            height: frame.height
+        )
         // Use integer arithmetic to avoid floating point precision issues
         // At 30fps with timescale 600: each frame = 20 time units (600/30 = 20)
         // This ensures exact timestamps: frame 0 = 0, frame 1 = 20, frame 11 = 220, etc.
         let timestamp = CMTime(value: Int64(frameCount) * 20, timescale: 600)
 
-        try await encoder.encode(pixelBuffer: pixelBuffer, timestamp: timestamp)
+        do {
+            let pixelBuffer = try await encoder.makePixelBuffer(from: frame)
+            try await encoder.encode(pixelBuffer: pixelBuffer, timestamp: timestamp)
+            await StorageVideoEncodingMemoryLedger.endPixelBuffer(pixelBufferToken)
+        } catch {
+            await StorageVideoEncodingMemoryLedger.endPixelBuffer(pixelBufferToken)
+            throw error
+        }
 
         frameCount += 1
         lastFrameTime = frame.timestamp
@@ -115,6 +126,7 @@ public actor IncrementalSegmentWriter: SegmentWriter {
 
         // Update the count of frames confirmed flushed to disk
         framesFlushedToDisk = await encoder.framesFlushedToDisk()
+        durableFileSizeBytes = await encoder.durableFileSizeBytes()
     }
 
     public func finalize() async throws -> VideoSegment {
@@ -144,13 +156,32 @@ public actor IncrementalSegmentWriter: SegmentWriter {
     }
 
     public func cancel() async throws {
+        try await cancelInternal(preserveWALForRecovery: false)
+    }
+
+    public func cancelPreservingRecoveryData() async throws {
+        try await cancelInternal(preserveWALForRecovery: true)
+    }
+
+    private func cancelInternal(preserveWALForRecovery: Bool) async throws {
         cancelled = true
         await encoder.reset()
         try? FileManager.default.removeItem(at: fileURL)
 
-        // Clean up WAL
-        if let session = walSession {
-            try? await walManager.finalizeSession(session)
+        guard let session = walSession else {
+            return
         }
+        walSession = nil
+
+        if preserveWALForRecovery {
+            // Preserve the WAL so startup recovery can salvage frames after writer/encoder failures.
+            Log.warning(
+                "[IncrementalWriter] Cancelled writer for segment \(segmentID.value); preserved WAL session for recovery",
+                category: .storage
+            )
+            return
+        }
+
+        try await walManager.finalizeSession(session)
     }
 }

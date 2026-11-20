@@ -6,7 +6,7 @@ import Shared
 // ╔══════════════════════════════════════════════════════════════════════════════╗
 // ║                     DIRECTORY MANAGER TESTS                                  ║
 // ║                                                                              ║
-// ║  • Verify base directories are created (segments, temp)                      ║
+// ║  • Verify base directories are created (chunks, temp)                        ║
 // ║  • Verify segment URL layout for encrypted and plain files                   ║
 // ║  • Verify relative path calculation from storage root                        ║
 // ╚══════════════════════════════════════════════════════════════════════════════╝
@@ -42,9 +42,9 @@ final class DirectoryManagerTests: XCTestCase {
     // └──────────────────────────────────────────────────────────────────────────┘
 
     func testEnsureBaseDirectoriesCreatesExpectedFolders() async throws {
-        let segments = root.appendingPathComponent("segments").path
+        let chunks = root.appendingPathComponent("chunks").path
         let temp = root.appendingPathComponent("temp").path
-        XCTAssertTrue(FileManager.default.fileExists(atPath: segments))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: chunks))
         XCTAssertTrue(FileManager.default.fileExists(atPath: temp))
     }
 
@@ -53,14 +53,13 @@ final class DirectoryManagerTests: XCTestCase {
         let id = VideoSegmentID(value: 123456)
 
         let url = try await directoryManager.segmentURL(for: id, date: date)
-        XCTAssertTrue(url.path.contains("segments/2025/01/02"))
-        XCTAssertEqual(url.lastPathComponent, "segment_\(id.stringValue)")
+        XCTAssertTrue(url.path.contains("chunks/202501/02"))
+        XCTAssertEqual(url.lastPathComponent, id.stringValue)
     }
 
     func testRelativePathFromRoot() async throws {
-        let url = root.appendingPathComponent("segments/2025/01/02/foo.mp4")
+        let url = root.appendingPathComponent("chunks/202501/02/foo.mp4")
         let rel = await directoryManager.relativePath(from: url)
-        XCTAssertEqual(rel, "segments/2025/01/02/foo.mp4")
+        XCTAssertEqual(rel, "chunks/202501/02/foo.mp4")
     }
 }
-

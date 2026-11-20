@@ -9,7 +9,7 @@ A local-first screen recording and search application for macOS, inspired by Rew
 
 Retrace is an open source alternative to Rewind AI that gives you photographic memory of everything you've seen on your screen. It continuously captures screenshots (every 2 seconds by default), extracts text using OCR, and stores everything in a searchable database—entirely on your Mac with no cloud dependencies.
 
-## Current Status (v0.5)
+## Current Status
 
 ### ✅ What's Working
 
@@ -17,7 +17,7 @@ Retrace is an open source alternative to Rewind AI that gives you photographic m
 - **OCR text extraction** using Apple's Vision framework
 - **Full-text search** with advanced filters (app, date, exclusions)
 - **Timeline viewer** - Scrub through your screen history frame-by-frame
-- **Dashboard analytics** - Visualize app usage, screen time, and activity patterns
+- **Dashboard analytics** - Visualize app usage, screen time, and activity patterns (stored locally on-device, not sent to third-party/developer analytics services)
 - **Rewind AI import** - Seamless, resumable background import of existing Rewind data
 - **Settings panel** - Comprehensive controls for capture, storage, privacy, and shortcuts
 - **Global hotkeys** - Quick access (Cmd+Shift+T for timeline, Cmd+Shift+D for dashboard)
@@ -34,7 +34,7 @@ Retrace is an open source alternative to Rewind AI that gives you photographic m
 
 ## Architecture
 
-**v0.5 Data Flow (Current Implementation):**
+**Data Flow:**
 
 ```
 CGWindowListCapture (every 2s)
@@ -63,7 +63,7 @@ See [AGENTS.md](AGENTS.md) for detailed architecture documentation.
 
 ## Tech Stack
 
-### Active in v0.5
+### Active
 
 - **Language**: Swift 5.9+ with async/await, Actors, Sendable
 - **Platform**: macOS 13.0+ (Apple Silicon required)
@@ -72,12 +72,12 @@ See [AGENTS.md](AGENTS.md) for detailed architecture documentation.
 - **OCR**: Vision framework (macOS native)
 - **Video**: VideoToolbox (HEVC encoding)
 - **Database**: SQLite with FTS5 full-text search
-- **Encryption**: CryptoKit (AES-256-GCM) for database
 
 ### Planned for Future Releases
 
 - **Audio transcription**: whisper.cpp (bundled, ready but disabled)
 - **Embeddings**: llama.cpp for semantic search (prepared but not active)
+- **Stored-data encryption**: AES-256-GCM encryption is in progress
 
 ## Requirements
 
@@ -153,6 +153,16 @@ The app will create its database at the default location (`~/Library/Application
 ./scripts/hardreset_onboarding.sh
 ```
 
+**Draft or submit a bug issue**:
+
+```bash
+# Start from the canonical AI issue template
+cp AI_ISSUE_TEMPLATE.md /tmp/retrace-issue.md
+
+# After filling it in, create the issue with gh if needed
+gh issue create --title "Crash on launch" --body-file /tmp/retrace-issue.md
+```
+
 ## Development
 
 Retrace follows a Test-Driven Development (TDD) approach. See [CONTRIBUTING.md](CONTRIBUTING.md) for:
@@ -160,6 +170,7 @@ Retrace follows a Test-Driven Development (TDD) approach. See [CONTRIBUTING.md](
 - Development workflow and conventions
 - Testing requirements (TDD, mocking protocols)
 - AI-assisted development guidelines
+- AI bug issue template
 - Module boundaries and architecture decisions
 - Code style and Swift patterns
 
@@ -187,7 +198,7 @@ retrace/
 
 ## Roadmap
 
-### v0.5 (Current Release - February 2026) ✅
+### Current Release ✅
 
 - [x] Screen capture with deduplication
 - [x] OCR text extraction (Vision framework)
@@ -200,13 +211,13 @@ retrace/
 - [x] Menu bar and global hotkeys
 - [x] Search highlighting
 
-### v0.2+ (Future Releases) - TBD
+### Future Releases - TBD
 
 _Roadmap for future releases to be determined based on user feedback and priorities._
 
 ## Performance
 
-**Current v0.5 Metrics:**
+**Current Metrics:**
 
 - **Capture Rate**: Every 2 seconds (configurable: 1-60 seconds)
 - **OCR Speed**: ~200-500ms per frame on Apple Silicon
@@ -217,18 +228,18 @@ _Roadmap for future releases to be determined based on user feedback and priorit
 - **Current**: ~50-70GB/month (HEVC working but not optimized)
 - **Target**: ~15-20GB/month with optimized compression
 
-## Known Limitations (v0.5)
+## Known Limitations
 
 - **macOS 13.0+ and Apple Silicon only** - Intel Macs not supported
 - **Storage not yet efficient** - Currently 4-5x less efficient than Rewind AI (~50-70GB/month vs ~15GB/month). HEVC encoding is working but not optimized
-- **No audio capture** - Audio recording and transcription infrastructure exists but is disabled for v0.5
+- **No audio capture** - Audio recording and transcription infrastructure exists but is currently disabled
 
 See [GitHub Issues](https://github.com/haseab/retrace/issues) for known bugs and feature requests.
 
 ## Privacy & Security
 
 - **100% Local** - All processing happens on your device
-- **Encrypted at Rest** - AES-256-GCM encryption for stored data
+- **Stored-data encryption in progress** - AES-256-GCM support is being worked on
 - **No Telemetry** - No data sent to external servers
 - **Open Source** - Audit the code yourself
 

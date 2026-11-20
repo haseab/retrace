@@ -36,10 +36,12 @@ enum AppUsageLayoutSize {
     var rankWidth: CGFloat { 20 }
     var progressBarWidth: CGFloat { 120 }
     var progressBarHeight: CGFloat { 6 }
-    var durationWidth: CGFloat { 70 }
+    var durationWidth: CGFloat { 75 }
     var horizontalPadding: CGFloat { 12 }
     var verticalPadding: CGFloat { 10 }
     var windowRowIndent: CGFloat { 52 }
+    var websiteTabRowIndent: CGFloat { windowRowIndent + 30 }
+    var websiteTabSectionLeading: CGFloat { websiteTabRowIndent + 14 }
 }
 
 // MARK: - Scroll Affordance
@@ -67,15 +69,69 @@ private struct ScrollAffordance: View {
     }
 }
 
+// MARK: - Window Title Formatting
+
+/// Cleans noisy Chrome PWA prefixes from dashboard window titles.
+enum DashboardWindowTitleFormatter {
+    private static let chromePWABundlePrefixes = [
+        "com.google.Chrome.app.",
+        "com.google.Chrome.canary.app."
+    ]
+
+    private static let chromeBrowserBundleIDs: Set<String> = [
+        "com.google.Chrome",
+        "com.google.Chrome.canary"
+    ]
+
+    static func displayTitle(for rawTitle: String, appBundleID: String) -> String {
+        let title = rawTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty else { return rawTitle }
+
+        if isChromePWABundleID(appBundleID) {
+            return stripChromePWAPrefix(from: title)
+        }
+
+        if chromeBrowserBundleIDs.contains(appBundleID),
+           title.localizedCaseInsensitiveContains(" web - ") {
+            return stripChromePWAPrefix(from: title)
+        }
+
+        return title
+    }
+
+    private static func isChromePWABundleID(_ bundleID: String) -> Bool {
+        chromePWABundlePrefixes.contains { bundleID.hasPrefix($0) }
+    }
+
+    private static func stripChromePWAPrefix(from title: String) -> String {
+        guard let separatorRange = title.range(of: " - ") else {
+            return title
+        }
+
+        var stripped = String(title[separatorRange.upperBound...])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Drop leading unread-count badges (for example "(4) ").
+        stripped = stripped.replacingOccurrences(
+            of: #"^\(\d+\)\s*"#,
+            with: "",
+            options: .regularExpression
+        )
+
+        return stripped.isEmpty ? title : stripped
+    }
+}
 
 /// List-style view for app usage data with expandable window details
 struct AppUsageListView: View {
     let apps: [AppUsageData]
     let totalTime: TimeInterval
     var layoutSize: AppUsageLayoutSize = .normal
-    var loadWindowUsage: ((String) async -> [WindowUsageData])? = nil  // For websites (domain aggregation)
+    var scrollAffordanceColor: Color = .retraceBackground
+    var loadWindowUsage: ((String, Int) async -> WindowUsagePage)? = nil  // For websites (domain aggregation)
     var loadTabsForDomain: ((String, String) async -> [WindowUsageData])? = nil  // (bundleID, domain) -> tabs for that domain
     var onWindowTapped: ((AppUsageData, WindowUsageData) -> Void)? = nil
+    var onUsageAction: ((DashboardUsageTarget, DashboardUsageAction) -> Void)? = nil
 
     @State private var hoveredAppIndex: Int? = nil
     @State private var hoveredWindowKey: String? = nil
@@ -83,6 +139,7 @@ struct AppUsageListView: View {
     @State private var isHoveringLoadMore: Bool = false
     @State private var expandedAppBundleID: String? = nil
     @State private var windowUsageCache: [String: [WindowUsageData]] = [:]  // Website/domain data
+    @State private var windowUsageTotalCounts: [String: Int] = [:]
     @State private var domainTabsCache: [String: [WindowUsageData]] = [:]   // Domain-specific tabs (key: "bundleID_domain")
     @State private var loadingWindows: Set<String> = []
     @State private var loadingDomainTabs: Set<String> = []  // Loading state for domain tabs
@@ -123,7 +180,7 @@ struct AppUsageListView: View {
             }
 
             // Inner shadow scroll affordance
-            ScrollAffordance(height: 40, color: Color.retraceBackground)
+            ScrollAffordance(height: 40, color: scrollAffordanceColor)
         }
     }
 
@@ -148,10 +205,12 @@ struct AppUsageListView: View {
         let appColor = Color.segmentColor(for: app.appBundleID)
         let displayedWindowCount = displayedWindowCounts[app.appBundleID] ?? initialWindowCount
         let displayedWindows = Array(windows.prefix(displayedWindowCount))
-        let hasMoreWindows = windows.count > displayedWindowCount
+        let totalWindowCount = windowUsageTotalCounts[app.appBundleID] ?? windows.count
+        let hasMoreWindows = totalWindowCount > displayedWindowCount
+        let isLoadingMore = isLoading && !windows.isEmpty
 
         VStack(spacing: 4) {
-            if isLoading {
+            if isLoading && windows.isEmpty {
                 HStack {
                     Spacer()
                     SpinnerView(size: 14, lineWidth: 2, color: .retraceSecondary)
@@ -205,7 +264,15 @@ struct AppUsageListView: View {
 
                 // Load More Windows button
                 if hasMoreWindows {
-                    windowLoadMoreButton(for: app, remainingCount: windows.count - displayedWindowCount, layoutSize: layoutSize)
+                    if isLoadingMore {
+                        windowLoadingFooter(layoutSize: layoutSize)
+                    } else {
+                        windowLoadMoreButton(
+                            for: app,
+                            remainingCount: max(totalWindowCount - displayedWindowCount, 0),
+                            layoutSize: layoutSize
+                        )
+                    }
                 }
             }
         }
@@ -219,11 +286,21 @@ struct AppUsageListView: View {
 
     private func windowLoadMoreButton(for app: AppUsageData, remainingCount: Int, layoutSize: AppUsageLayoutSize) -> some View {
         let isHovering = isHoveringWindowLoadMore == app.appBundleID
+        let isLoading = loadingWindows.contains(app.appBundleID)
 
         return Button(action: {
-            withAnimation(.easeInOut(duration: 0.2)) {
-                let currentCount = displayedWindowCounts[app.appBundleID] ?? initialWindowCount
-                displayedWindowCounts[app.appBundleID] = currentCount + windowLoadIncrement
+            let currentCount = displayedWindowCounts[app.appBundleID] ?? initialWindowCount
+            let desiredCount = currentCount + windowLoadIncrement
+            let cachedCount = windowUsageCache[app.appBundleID]?.count ?? 0
+            let totalCount = windowUsageTotalCounts[app.appBundleID] ?? cachedCount
+
+            if cachedCount >= desiredCount || cachedCount >= totalCount {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    displayedWindowCounts[app.appBundleID] = min(desiredCount, totalCount)
+                }
+            } else {
+                displayedWindowCounts[app.appBundleID] = desiredCount
+                loadWindowData(for: app, desiredVisibleCount: desiredCount)
             }
         }) {
             HStack(spacing: 4) {
@@ -231,9 +308,15 @@ struct AppUsageListView: View {
                     .font(.system(size: 10, weight: .medium))
                 Text("Load More")
                     .font(layoutSize.windowNameFont)
-                Text("(\(min(windowLoadIncrement, remainingCount)) more)")
-                    .font(.system(size: 10))
-                    .foregroundColor(.retraceSecondary.opacity(0.7))
+                if !isLoading {
+                    Text("(\(min(windowLoadIncrement, remainingCount)) more)")
+                        .font(.system(size: 10))
+                        .foregroundColor(.retraceSecondary.opacity(0.7))
+                } else {
+                    Text("(loading)")
+                        .font(.system(size: 10))
+                        .foregroundColor(.retraceSecondary.opacity(0.7))
+                }
             }
             .foregroundColor(.retraceSecondary)
             .padding(.vertical, 6)
@@ -248,6 +331,7 @@ struct AppUsageListView: View {
             )
         }
         .buttonStyle(.plain)
+        .disabled(isLoading)
         .padding(.leading, layoutSize.windowRowIndent)
         .padding(.top, 4)
         .onHover { hovering in
@@ -260,11 +344,27 @@ struct AppUsageListView: View {
         }
     }
 
+    private func windowLoadingFooter(layoutSize: AppUsageLayoutSize) -> some View {
+        HStack(spacing: 6) {
+            SpinnerView(size: 12, lineWidth: 2, color: .retraceSecondary)
+            Text("Loading more")
+                .font(layoutSize.windowNameFont)
+                .foregroundColor(.retraceSecondary.opacity(0.8))
+        }
+        .padding(.vertical, 6)
+        .padding(.leading, layoutSize.windowRowIndent)
+        .padding(.top, 4)
+    }
+
     // MARK: - Window Row
 
     private func windowRow(window: WindowUsageData, app: AppUsageData, appColor: Color, layoutSize: AppUsageLayoutSize, rowIndex: Int, isBrowser: Bool = false, showAsTab: Bool = false) -> some View {
         let windowKey = "\(app.appBundleID)_\(window.id)"
         let isHovered = hoveredWindowKey == windowKey
+        let displayTitle = DashboardWindowTitleFormatter.displayTitle(
+            for: window.displayName,
+            appBundleID: app.appBundleID
+        )
 
         // For tabs view, extract domain from browserUrl for favicon
         let faviconDomain: String = {
@@ -293,11 +393,11 @@ struct AppUsageListView: View {
 
             // Window/tab name with optional URL subtitle for tabs
             VStack(alignment: .leading, spacing: 2) {
-                Text(window.displayName)
+                Text(displayTitle)
                     .font(layoutSize.windowNameFont)
                     .foregroundColor(.retracePrimary.opacity(0.85))
                     .lineLimit(1)
-                    .truncationMode(.middle)
+                    .truncationMode(.tail)
 
                 // Show URL as subtitle in tabs view
                 if showAsTab, let url = window.browserUrl, !url.isEmpty {
@@ -329,12 +429,14 @@ struct AppUsageListView: View {
                 Text(formatDuration(window.duration))
                     .font(layoutSize.windowDurationFont)
                     .foregroundColor(.retracePrimary.opacity(0.85))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.9)
 
                 Text(String(format: "%.1f%%", window.percentage * 100))
                     .font(.system(size: 9, weight: .medium))
                     .foregroundColor(.retraceSecondary.opacity(0.7))
             }
-            .frame(width: layoutSize.durationWidth * 0.8, alignment: .trailing)
+            .frame(width: layoutSize.durationWidth, alignment: .trailing)
         }
         .padding(.horizontal, layoutSize.horizontalPadding)
         .padding(.vertical, layoutSize.verticalPadding * (showAsTab ? 0.7 : 0.6))
@@ -359,6 +461,9 @@ struct AppUsageListView: View {
         .onTapGesture {
             onWindowTapped?(app, window)
         }
+        .contextMenu {
+            DashboardUsageMenu(target: .window(app: app, window: window), onAction: onUsageAction)
+        }
     }
 
     // MARK: - Website Row (Expandable) or Window Fallback Row
@@ -369,6 +474,10 @@ struct AppUsageListView: View {
         let domainKey = "\(app.appBundleID)_\(window.displayName)"
         let isExpanded = window.isWebsite && expandedDomainKey == domainKey
         let isHovered = hoveredWindowKey == domainKey
+        let displayTitle = DashboardWindowTitleFormatter.displayTitle(
+            for: window.displayName,
+            appBundleID: app.appBundleID
+        )
 
         return HStack(spacing: layoutSize.rowSpacing) {
             // Expand/collapse chevron - only show for websites (not window fallbacks)
@@ -398,39 +507,53 @@ struct AppUsageListView: View {
                 }
             }
 
-            // Domain name or window name
-            Text(window.displayName)
-                .font(layoutSize.windowNameFont)
-                .foregroundColor(.retracePrimary.opacity(0.85))
-                .lineLimit(1)
-                .truncationMode(.middle)
+            // Domain name or window name with tab count metadata for websites
+            VStack(alignment: .leading, spacing: 2) {
+                Text(displayTitle)
+                    .font(layoutSize.windowNameFont)
+                    .foregroundColor(.retracePrimary.opacity(0.85))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+
+                if window.isWebsite {
+                    if let tabCount = window.tabCount {
+                        Text(tabCountLabel(tabCount))
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundColor(.retraceSecondary.opacity(0.65))
+                    }
+                }
+            }
 
             Spacer()
 
-            // Mini progress bar
-            GeometryReader { geometry in
-                ZStack(alignment: .trailing) {
-                    RoundedRectangle(cornerRadius: 3)
-                        .fill(Color.white.opacity(0.03))
+            // Use a fixed slot width here instead of GeometryReader to avoid
+            // geometry-driven relayout churn in the animated browser expansion.
+            let progressBarSlotWidth = layoutSize.progressBarWidth * 0.6
+            let progressBarSlotHeight = layoutSize.progressBarHeight - 1
+            let progressBarFillWidth = max(progressBarSlotWidth * window.percentage, 4)
+            ZStack(alignment: .trailing) {
+                RoundedRectangle(cornerRadius: 3)
+                    .fill(Color.white.opacity(0.03))
 
-                    RoundedRectangle(cornerRadius: 3)
-                        .fill(appColor.opacity(0.5))
-                        .frame(width: max(geometry.size.width * window.percentage, 4))
-                }
+                RoundedRectangle(cornerRadius: 3)
+                    .fill(appColor.opacity(0.5))
+                    .frame(width: progressBarFillWidth)
             }
-            .frame(width: layoutSize.progressBarWidth * 0.6, height: layoutSize.progressBarHeight - 1)
+            .frame(width: progressBarSlotWidth, height: progressBarSlotHeight)
 
             // Duration and percentage
             VStack(alignment: .trailing, spacing: 1) {
                 Text(formatDuration(window.duration))
                     .font(layoutSize.windowDurationFont)
                     .foregroundColor(.retracePrimary.opacity(0.85))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.9)
 
                 Text(String(format: "%.1f%%", window.percentage * 100))
                     .font(.system(size: 9, weight: .medium))
                     .foregroundColor(.retraceSecondary.opacity(0.7))
             }
-            .frame(width: layoutSize.durationWidth * 0.8, alignment: .trailing)
+            .frame(width: layoutSize.durationWidth, alignment: .trailing)
         }
         .padding(.horizontal, layoutSize.horizontalPadding)
         .padding(.vertical, layoutSize.verticalPadding * 0.6)
@@ -475,6 +598,12 @@ struct AppUsageListView: View {
                 onWindowTapped?(app, window)
             }
         }
+        .contextMenu {
+            DashboardUsageMenu(
+                target: window.isWebsite ? .website(app: app, domain: window.displayName) : .window(app: app, window: window),
+                onAction: onUsageAction
+            )
+        }
     }
 
     // MARK: - Domain Tabs Section
@@ -497,7 +626,7 @@ struct AppUsageListView: View {
                     Spacer()
                 }
                 .padding(.vertical, 6)
-                .padding(.leading, layoutSize.windowRowIndent + 20)
+                .padding(.leading, layoutSize.websiteTabSectionLeading)
             } else if tabs.isEmpty {
                 HStack {
                     Text("No tab data for this site")
@@ -506,7 +635,7 @@ struct AppUsageListView: View {
                         .italic()
                 }
                 .padding(.vertical, 6)
-                .padding(.leading, layoutSize.windowRowIndent + 20)
+                .padding(.leading, layoutSize.websiteTabSectionLeading)
             } else {
                 ForEach(Array(displayedTabs.enumerated()), id: \.element.id) { index, tab in
                     domainTabRow(tab: tab, app: app, appColor: appColor, layoutSize: layoutSize)
@@ -526,49 +655,66 @@ struct AppUsageListView: View {
     private func domainTabRow(tab: WindowUsageData, app: AppUsageData, appColor: Color, layoutSize: AppUsageLayoutSize) -> some View {
         let tabKey = "\(app.appBundleID)_domain_\(tab.id)"
         let isHovered = hoveredWindowKey == tabKey
-
-        return HStack(spacing: 6) {
-            // Extra indent + dot indicator
-            HStack(spacing: 4) {
-                Spacer()
-                    .frame(width: layoutSize.windowRowIndent + 6)
-
-                Circle()
-                    .fill(appColor.opacity(0.4))
-                    .frame(width: 4, height: 4)
-            }
-
-            // Tab title with URL subtitle
-            VStack(alignment: .leading, spacing: 2) {
-                Text(tab.displayName)
-                    .font(layoutSize.windowNameFont)
-                    .foregroundColor(.retracePrimary.opacity(0.85))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-
-                if let url = tab.browserUrl, !url.isEmpty {
-                    Text(url)
-                        .font(.system(size: 10))
-                        .foregroundColor(.retraceSecondary.opacity(0.5))
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
-            }
-
-            Spacer()
-
-            // Duration
-            Text(formatDuration(tab.duration))
-                .font(.system(size: 9, weight: .medium))
-                .foregroundColor(.retraceSecondary.opacity(0.7))
-                .frame(width: 50, alignment: .trailing)
-        }
-        .padding(.horizontal, layoutSize.horizontalPadding)
-        .padding(.vertical, 4)
-        .background(
-            RoundedRectangle(cornerRadius: 4)
-                .fill(isHovered ? Color.white.opacity(0.02) : Color.clear)
+        let displayTitle = DashboardWindowTitleFormatter.displayTitle(
+            for: tab.displayName,
+            appBundleID: app.appBundleID
         )
+
+        return Button {
+            onWindowTapped?(app, tab)
+        } label: {
+            HStack(spacing: 8) {
+                Spacer()
+                    .frame(width: layoutSize.websiteTabRowIndent)
+
+                // Sub-row marker to keep nested/tabbed hierarchy visible without a heavy card
+                Capsule()
+                    .fill(appColor.opacity(isHovered ? 0.75 : 0.35))
+                    .frame(width: 2, height: 18)
+
+                // Tab title with URL subtitle
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(displayTitle)
+                        .font(layoutSize.windowNameFont)
+                        .foregroundColor(.retracePrimary.opacity(0.85))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+
+                    if let url = tab.browserUrl, !url.isEmpty {
+                        Text(url)
+                            .font(.system(size: 10))
+                            .foregroundColor(.retraceSecondary.opacity(0.5))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                }
+
+                Spacer()
+
+                HStack(spacing: 5) {
+                    Text(formatDuration(tab.duration))
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundColor(.retraceSecondary.opacity(0.7))
+
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 8, weight: .semibold))
+                        .foregroundColor(.retraceSecondary.opacity(isHovered ? 0.7 : 0.32))
+                }
+                .frame(width: 60, alignment: .trailing)
+            }
+            .padding(.trailing, layoutSize.horizontalPadding)
+            .padding(.vertical, 4)
+            .background(
+                RoundedRectangle(cornerRadius: 5)
+                    .fill(isHovered ? Color.white.opacity(0.025) : Color.clear)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("Open details")
+        .contextMenu {
+            DashboardUsageMenu(target: .tab(app: app, window: tab), onAction: onUsageAction)
+        }
         .contentShape(Rectangle())
         .onHover { hovering in
             withAnimation(.easeInOut(duration: 0.1)) {
@@ -579,9 +725,6 @@ struct AppUsageListView: View {
             } else {
                 NSCursor.pop()
             }
-        }
-        .onTapGesture {
-            onWindowTapped?(app, tab)
         }
     }
 
@@ -607,7 +750,7 @@ struct AppUsageListView: View {
             .padding(.horizontal, 10)
         }
         .buttonStyle(.plain)
-        .padding(.leading, layoutSize.windowRowIndent + 20)
+        .padding(.leading, layoutSize.websiteTabSectionLeading)
         .padding(.top, 4)
     }
 
@@ -625,6 +768,10 @@ struct AppUsageListView: View {
                 loadingDomainTabs.remove(domainKey)
             }
         }
+    }
+
+    private func tabCountLabel(_ count: Int) -> String {
+        "\(count) tab\(count == 1 ? "" : "s")"
     }
 
     private var loadMoreButton: some View {
@@ -743,8 +890,9 @@ struct AppUsageListView: View {
             if hovering {
                 NSCursor.pointingHand.set()
                 // Preload window/website data on hover so it's ready when user clicks
-                if windowUsageCache[app.appBundleID] == nil && !loadingWindows.contains(app.appBundleID) {
-                    loadWindowData(for: app)
+                if windowUsageCache[app.appBundleID] == nil,
+                   !loadingWindows.contains(app.appBundleID) {
+                    loadWindowData(for: app, desiredVisibleCount: initialWindowCount)
                 }
             } else {
                 NSCursor.arrow.set()
@@ -756,13 +904,21 @@ struct AppUsageListView: View {
         .onTapGesture {
             toggleExpansion(for: app)
         }
+        .contextMenu {
+            DashboardUsageMenu(target: .app(app), onAction: onUsageAction)
+        }
     }
 
     // MARK: - Expansion Logic
 
     private func toggleExpansion(for app: AppUsageData) {
-        withAnimation(.easeInOut(duration: 0.2)) {
-            if expandedAppBundleID == app.appBundleID {
+        let isExpanded = expandedAppBundleID == app.appBundleID
+        let cachedRows = windowUsageCache[app.appBundleID]
+        let isLoading = loadingWindows.contains(app.appBundleID)
+        let shouldStartLoad = !isExpanded && cachedRows == nil && !isLoading
+
+        let applyExpansionChange = {
+            if isExpanded {
                 // Collapse
                 expandedAppBundleID = nil
                 // Reset displayed window count for next expansion
@@ -774,27 +930,41 @@ struct AppUsageListView: View {
                 displayedWindowCounts[app.appBundleID] = initialWindowCount
 
                 // Load window data if not cached
-                if windowUsageCache[app.appBundleID] == nil && !loadingWindows.contains(app.appBundleID) {
-                    loadWindowData(for: app)
+                if shouldStartLoad {
+                    loadWindowData(for: app, desiredVisibleCount: initialWindowCount)
                 }
             }
         }
+
+        withAnimation(.easeInOut(duration: 0.2)) {
+            applyExpansionChange()
+        }
     }
 
-    private func loadWindowData(for app: AppUsageData) {
+    private func loadWindowData(for app: AppUsageData, desiredVisibleCount: Int) {
         guard let loader = loadWindowUsage else { return }
 
         loadingWindows.insert(app.appBundleID)
+        let requestedCount = max(desiredVisibleCount, initialWindowCount)
+        Log.info(
+            "[Dashboard] Loading paged window usage bundleID=\(app.appBundleID) desiredVisibleCount=\(desiredVisibleCount) requestedCount=\(requestedCount)",
+            category: .ui
+        )
 
         Task {
-            let windows = await loader(app.appBundleID)
+            let page = await loader(app.appBundleID, requestedCount)
             await MainActor.run {
-                windowUsageCache[app.appBundleID] = windows
+                windowUsageCache[app.appBundleID] = page.rows
+                windowUsageTotalCounts[app.appBundleID] = page.totalCount
                 loadingWindows.remove(app.appBundleID)
+                Log.info(
+                    "[Dashboard] Loaded paged window usage bundleID=\(app.appBundleID) cachedRows=\(page.rows.count) totalCount=\(page.totalCount) requestedCount=\(requestedCount)",
+                    category: .ui
+                )
 
                 // Preload favicons for browser URLs
                 if app.isBrowser {
-                    for window in windows {
+                    for window in page.rows {
                         FaviconProvider.shared.fetchFaviconIfNeeded(for: window.displayName) { _ in }
                     }
                 }
@@ -827,7 +997,7 @@ struct AppUsageListView: View {
                     .foregroundColor(.retracePrimary)
                     .lineLimit(1)
 
-                Text("This week")
+                Text("Selected range")
                     .font(.retraceCaption2)
                     .foregroundColor(.retraceSecondary)
             }

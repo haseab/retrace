@@ -2,7 +2,7 @@
 
 You are responsible for the **Search** module of Retrace. Your job is to implement search functionality including query parsing, full-text search via SQLite FTS5, and result ranking.
 
-**v0.5 Status**: ✅ Full-text search with FTS5 fully implemented. Query parser supports filters (app:, date:, -exclude). **No vector/semantic search in v0.5** (planned for future release with llama.cpp embeddings).
+**Status**: ✅ Full-text search with FTS5 fully implemented. Query parser supports filters (app:, date:, -exclude). **No vector/semantic search yet** (planned for future release with llama.cpp embeddings).
 
 ## Your Directory
 
@@ -11,12 +11,11 @@ Search/
 ├── SearchManager.swift            # Main SearchProtocol implementation
 ├── QueryParser/
 │   ├── QueryParser.swift          # QueryParserProtocol implementation
-│   ├── QueryTokenizer.swift       # Tokenize raw query strings
-│   └── FilterExtractor.swift      # Extract filters (app:, date:, etc.)
+│   └── QueryTokenizer.swift       # Shared query tokenization + shell-option classification
 ├── Ranking/
 │   ├── ResultRanker.swift         # Rank and sort results
 │   └── SnippetGenerator.swift     # Generate highlighted snippets
-├── VectorSearchTODO/              # NOT IMPLEMENTED IN v0.5 (future)
+├── VectorSearchTODO/              # NOT YET IMPLEMENTED (future)
 │   ├── Embedding/
 │   └── VectorStore/
 └── Tests/
@@ -36,7 +35,7 @@ Search/
 - Parse query syntax
 - Extract filters (app:, date:, -exclude)
 
-**Note**: EmbeddingProtocol and VectorStoreProtocol exist but are NOT implemented in v0.5. Semantic/vector search is planned for a future release.
+**Note**: EmbeddingProtocol and VectorStoreProtocol exist but are NOT yet implemented. Semantic/vector search is planned for a future release.
 
 ## Key Implementation Details
 

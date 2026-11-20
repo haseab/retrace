@@ -1,27 +1,17 @@
 import Foundation
 import Vision
 import CoreGraphics
-import Accelerate
 import Shared
 
 // MARK: - VisionOCR
 
 /// Vision framework implementation of OCRProtocol
 public final class VisionOCR: OCRProtocol, @unchecked Sendable {
-
-    /// Reusable text recognition request - configured once, reused per frame
-    /// This avoids recreating the request object for every frame
-    private let textRequest: VNRecognizeTextRequest
-
-    /// Scale factor for downscaling images before OCR (0.9 = 90% of original size)
-    /// Lower values = less energy, slightly lower precision on bounding boxes
-    private static let ocrScaleFactor: CGFloat = 0.9
+    /// Recognition languages for OCR
+    let recognitionLanguages: [String]
 
     public init(recognitionLanguages: [String] = ["en-US"]) {
-        self.textRequest = VNRecognizeTextRequest()
-        textRequest.recognitionLevel = .accurate
-        textRequest.recognitionLanguages = recognitionLanguages
-        textRequest.usesLanguageCorrection = true
+        self.recognitionLanguages = recognitionLanguages
     }
 
     public func recognizeText(
@@ -31,75 +21,89 @@ public final class VisionOCR: OCRProtocol, @unchecked Sendable {
         bytesPerRow: Int,
         config: ProcessingConfig
     ) async throws -> [TextRegion] {
-        // Create CGImage from raw pixel data
-        guard let cgImage = createCGImage(from: imageData, width: width, height: height, bytesPerRow: bytesPerRow) else {
-            throw ProcessingError.imageConversionFailed
-        }
+        try await recognizeText(
+            imageData: imageData,
+            width: width,
+            height: height,
+            bytesPerRow: bytesPerRow,
+            config: config,
+            extractInstrumentation: nil
+        )
+    }
 
-        // Downscale image before OCR to reduce energy consumption
-        // OCR cost scales ~linearly with pixel count, so 50% scale = ~50% less ANE work
-        // Screen text remains perfectly readable at lower resolutions
-        let ocrImage: CGImage
-        if Self.ocrScaleFactor < 1.0 {
-            ocrImage = downscaleImage(cgImage, scale: Self.ocrScaleFactor) ?? cgImage
+    func recognizeText(
+        imageData: Data,
+        width: Int,
+        height: Int,
+        bytesPerRow: Int,
+        config: ProcessingConfig,
+        extractInstrumentation: ProcessingExtractRequestInstrumentation?
+    ) async throws -> [TextRegion] {
+        let requestConfig = Self.fullFrameRecognitionRequestConfig()
+        if let extractInstrumentation {
+            await extractInstrumentation.prepareForOCR(reason: requestConfig.memoryReason)
         } else {
-            ocrImage = cgImage
+            await ProcessingExtractMemoryLedger.reconcileHandoffObservedResidualToCurrentFootprint(
+                reason: requestConfig.memoryReason
+            )
         }
-
-        // Perform recognition on downscaled image using reusable request
-        let handler = VNImageRequestHandler(cgImage: ocrImage, options: [:])
-
-        return try await withCheckedThrowingContinuation { continuation in
-            do {
-                try handler.perform([self.textRequest])
-
-                guard let observations = self.textRequest.results else {
-                    continuation.resume(returning: [])
-                    return
-                }
-
-                // Convert observations to TextRegions
-                let regions = observations.compactMap { observation -> TextRegion? in
-                    // Filter by confidence threshold
-                    guard observation.confidence >= config.minimumConfidence else { return nil }
-
-                    // Extract text (top candidate)
-                    guard let topCandidate = observation.topCandidates(1).first else { return nil }
-                    let text = topCandidate.string
-
-                    // Skip empty text
-                    guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
-
-                    // Get bounding box (normalized coordinates, origin bottom-left)
-                    let box = observation.boundingBox
-
-                    // CRITICAL: Flip Y coordinate from Vision's bottom-left origin to top-left origin
-                    // Vision: y=0 at bottom, y=1 at top
-                    // Rewind/Screen: y=0 at top, y=1 at bottom
-                    // Formula: flippedY = 1.0 - visionY - visionHeight
-                    let flippedY = 1.0 - box.origin.y - box.height
-
-                    // Convert normalized coordinates to pixel coordinates (with flipped Y)
-                    let pixelBox = CGRect(
-                        x: box.origin.x * CGFloat(width),
-                        y: flippedY * CGFloat(height),
-                        width: box.width * CGFloat(width),
-                        height: box.height * CGFloat(height)
-                    )
-
-                    return TextRegion(
-                        frameID: FrameID(value: 0), // Placeholder - will be updated by caller
-                        text: text,
-                        bounds: pixelBox,
-                        confidence: Double(observation.confidence)
-                    )
-                }
-
-                continuation.resume(returning: regions)
-            } catch {
-                continuation.resume(throwing: ProcessingError.ocrFailed(underlying: error.localizedDescription))
-            }
+        Self.resetRequestScopedTags(Self.fullFrameResetSpecs)
+        let fullFrameBaselineSnapshot = await Self.synchronizedLedgerSnapshot()
+        let fullFrameRecognition = try await recognizeTextWithEnvelope(
+            imageData: imageData,
+            width: width,
+            height: height,
+            bytesPerRow: bytesPerRow,
+            config: config,
+            requestConfig: requestConfig
+        )
+        let postFullFrameSnapshot = await Self.synchronizedLedgerSnapshot()
+        let fullFramePayloadBytes = Self.estimatedTextRegionBufferBytes(fullFrameRecognition.regions)
+        let blindResidualClaimBytes = max(0, fullFrameRecognition.blindResidualClaim?.bytes ?? 0)
+        VisionOCRMemoryLedger.setObservedResidual(
+            tag: "processing.ocr.fullFrameOCRResultRetention",
+            function: "processing.ocr.full_frame",
+            reason: "processing.ocr.vision_full_frame",
+            bytes: fullFramePayloadBytes,
+            kind: "full-frame-ocr-results",
+            note: "estimated-results-payload",
+            delay: 4,
+            forceSummary: true
+        )
+        let fullFrameOCRCallResidualBytes = max(
+            0,
+            Self.measuredLedgerResidualBytes(
+                before: fullFrameBaselineSnapshot,
+                after: postFullFrameSnapshot,
+                subtractingBytes: fullFramePayloadBytes
+            ) - blindResidualClaimBytes
+        )
+        VisionOCRMemoryLedger.setObservedResidual(
+            tag: "processing.ocr.fullFrameOCRCallResidual",
+            function: "processing.ocr.full_frame",
+            reason: "processing.ocr.vision_full_frame",
+            bytes: fullFrameOCRCallResidualBytes,
+            kind: "full-frame-ocr-call-residual",
+            note: "observed-minus-results-payload-net-blind-residual",
+            delay: 4,
+            forceSummary: true
+        )
+        if let extractInstrumentation {
+            await extractInstrumentation.finalizeFullFrameResiduals(
+                reason: requestConfig.memoryReason,
+                blindResidualClaimBytes: blindResidualClaimBytes,
+                callResidualBytes: fullFrameOCRCallResidualBytes
+            )
+        } else {
+            await ProcessingExtractRequestInstrumentation.reconcileFullFrameResiduals(
+                reason: requestConfig.memoryReason,
+                blindResidualClaimBytes: blindResidualClaimBytes,
+                callResidualBytes: fullFrameOCRCallResidualBytes
+            )
+            Self.handoffCurrentFullFrameBlindResidualToExtract(reason: requestConfig.memoryReason)
+            ProcessingExtractRequestInstrumentation.scheduleFullFrameBlindResidualClear(reason: requestConfig.memoryReason)
         }
+        return fullFrameRecognition.regions
     }
 
     // MARK: - Live Screenshot OCR
@@ -108,92 +112,62 @@ public final class VisionOCR: OCRProtocol, @unchecked Sendable {
     /// Uses the same .accurate pipeline as frame processing
     /// Returns TextRegions with **normalized coordinates** (0.0-1.0) for direct use with OCRNodeWithText
     public func recognizeTextFromCGImage(_ cgImage: CGImage) async throws -> [TextRegion] {
-        // No downscaling for live screenshot - it's a one-shot operation
-        // and downscaling can introduce subtle bounding box drift from integer rounding
-        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+        return try autoreleasepool {
+            let memoryLease = VisionOCRMemoryLedger.begin(
+                tag: "processing.ocr.liveScreenshotVisionRequest",
+                function: "ui.live_screenshot_ocr",
+                reason: "ui.live_screenshot_ocr",
+                width: cgImage.width,
+                height: cgImage.height,
+                privateHeapTag: "processing.ocr.liveScreenshotPrivateHeap",
+                privateHeapFunction: "ui.live_screenshot_ocr"
+            )
+            defer {
+                VisionOCRMemoryLedger.end(lease: memoryLease, reason: "ui.live_screenshot_ocr")
+            }
 
-        return try await withCheckedThrowingContinuation { continuation in
+            let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+            let textRequest = VNRecognizeTextRequest()
+            textRequest.recognitionLevel = .accurate
+            textRequest.recognitionLanguages = recognitionLanguages
+            textRequest.usesLanguageCorrection = false
+
             do {
-                try handler.perform([self.textRequest])
-
-                guard let observations = self.textRequest.results else {
-                    continuation.resume(returning: [])
-                    return
-                }
-
-                let regions = observations.compactMap { observation -> TextRegion? in
-                    guard observation.confidence >= 0.5 else { return nil }
-                    guard let topCandidate = observation.topCandidates(1).first else { return nil }
-                    let text = topCandidate.string
-                    guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
-
-                    let box = observation.boundingBox
-
-                    // Flip Y from Vision's bottom-left origin to top-left origin
-                    let flippedY = 1.0 - box.origin.y - box.height
-
-                    // Return NORMALIZED coordinates (0.0-1.0) for OCRNodeWithText
-                    let normalizedBox = CGRect(
-                        x: box.origin.x,
-                        y: flippedY,
-                        width: box.width,
-                        height: box.height
-                    )
-
-                    return TextRegion(
-                        frameID: FrameID(value: 0),
-                        text: text,
-                        bounds: normalizedBox,
-                        confidence: Double(observation.confidence)
-                    )
-                }
-
-                continuation.resume(returning: regions)
+                try handler.perform([textRequest])
             } catch {
-                continuation.resume(throwing: ProcessingError.ocrFailed(underlying: error.localizedDescription))
+                throw ProcessingError.ocrFailed(underlying: error.localizedDescription)
+            }
+
+            guard let observations = textRequest.results else {
+                return []
+            }
+
+            return observations.compactMap { observation -> TextRegion? in
+                guard observation.confidence >= 0.5 else { return nil }
+                guard let topCandidate = observation.topCandidates(1).first else { return nil }
+                let text = topCandidate.string
+                guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+
+                let box = observation.boundingBox
+                let flippedY = 1.0 - box.origin.y - box.height
+                let normalizedBox = CGRect(
+                    x: box.origin.x,
+                    y: flippedY,
+                    width: box.width,
+                    height: box.height
+                )
+
+                return TextRegion(
+                    frameID: FrameID(value: 0),
+                    text: text,
+                    bounds: normalizedBox,
+                    confidence: Double(observation.confidence)
+                )
             }
         }
     }
 
     // MARK: - Image Processing
-
-    /// Downscale a CGImage using vImage (hardware-accelerated, high quality)
-    /// Returns nil if downscaling fails, caller should fall back to original image
-    private func downscaleImage(_ image: CGImage, scale: CGFloat) -> CGImage? {
-        let newWidth = Int(CGFloat(image.width) * scale)
-        let newHeight = Int(CGFloat(image.height) * scale)
-
-        guard newWidth > 0, newHeight > 0 else { return nil }
-
-        // Create source vImage buffer from CGImage
-        var format = vImage_CGImageFormat(
-            bitsPerComponent: 8,
-            bitsPerPixel: 32,
-            colorSpace: nil,  // Uses image's color space
-            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue),
-            version: 0,
-            decode: nil,
-            renderingIntent: .defaultIntent
-        )
-
-        var sourceBuffer = vImage_Buffer()
-        var error = vImageBuffer_InitWithCGImage(&sourceBuffer, &format, nil, image, vImage_Flags(kvImageNoFlags))
-        guard error == kvImageNoError else { return nil }
-        defer { free(sourceBuffer.data) }
-
-        // Create destination buffer
-        var destBuffer = vImage_Buffer()
-        error = vImageBuffer_Init(&destBuffer, vImagePixelCount(newHeight), vImagePixelCount(newWidth), 32, vImage_Flags(kvImageNoFlags))
-        guard error == kvImageNoError else { return nil }
-        defer { free(destBuffer.data) }
-
-        // Scale using high-quality Lanczos resampling
-        error = vImageScale_ARGB8888(&sourceBuffer, &destBuffer, nil, vImage_Flags(kvImageHighQualityResampling))
-        guard error == kvImageNoError else { return nil }
-
-        // Create CGImage from scaled buffer
-        return vImageCreateCGImageFromBuffer(&destBuffer, &format, nil, nil, vImage_Flags(kvImageNoFlags), &error)?.takeRetainedValue()
-    }
 
     // MARK: - Region-Based OCR
 
@@ -213,13 +187,44 @@ public final class VisionOCR: OCRProtocol, @unchecked Sendable {
         cache: FullFrameOCRCache,
         config: ProcessingConfig
     ) async throws -> RegionOCRResult {
+        try await recognizeTextRegionBased(
+            frame: frame,
+            previousFrame: previousFrame,
+            cache: cache,
+            config: config,
+            extractInstrumentation: nil
+        )
+    }
+
+    func recognizeTextRegionBased(
+        frame: CapturedFrame,
+        previousFrame: CapturedFrame?,
+        cache: FullFrameOCRCache,
+        config: ProcessingConfig,
+        extractInstrumentation: ProcessingExtractRequestInstrumentation?
+    ) async throws -> RegionOCRResult {
+        if let normalized = frame.metadata.ocrRegions,
+           let regions = WindowOCRPlanner.pixelRegions(normalized, width: frame.width, height: frame.height) {
+            return try await recognizeWindowRegions(frame: frame, previousFrame: previousFrame,
+                cache: cache, config: config, pixelRegions: regions)
+        }
         let totalStartTime = Date()
+        let regionReason = "processing.ocr.vision_region"
+        if let extractInstrumentation {
+            await extractInstrumentation.prepareForOCR(reason: regionReason)
+        } else {
+            await ProcessingExtractMemoryLedger.reconcileHandoffObservedResidualToCurrentFootprint(
+                reason: regionReason
+            )
+        }
+        Self.resetRequestScopedTags(Self.regionResetSpecs)
 
         // Check if cache is valid for this frame (resolution/app change invalidates)
         let cacheInvalidated = await cache.validateForFrame(
             width: frame.width,
             height: frame.height,
-            appBundleID: frame.metadata.appBundleID
+            appBundleID: frame.metadata.appBundleID,
+            displayID: frame.metadata.displayID
         )
 
         let tileConfig = TileGridConfig.default
@@ -238,7 +243,8 @@ public final class VisionOCR: OCRProtocol, @unchecked Sendable {
                 width: frame.width,
                 height: frame.height,
                 bytesPerRow: frame.bytesPerRow,
-                config: config
+                config: config,
+                extractInstrumentation: extractInstrumentation
             )
             let ocrTime = Date().timeIntervalSince(ocrStartTime) * 1000
 
@@ -259,6 +265,17 @@ public final class VisionOCR: OCRProtocol, @unchecked Sendable {
             )
         }
 
+        let regionResidualEpoch = await MemoryLedger.beginResidualEpoch(
+            ownerFunction: "processing.ocr.region_reocr",
+            candidateConcurrentFunctions: ["capture.screen_capture"]
+        )
+        defer {
+            Task(priority: .utility) {
+                await MemoryLedger.endResidualEpoch(regionResidualEpoch)
+            }
+        }
+        let changeDetectionBaselineSnapshot = await Self.synchronizedLedgerSnapshot()
+
         // Detect changed tiles using original frame dimensions
         guard let changeResult = changeDetector.detectChanges(
             current: frame,
@@ -270,7 +287,8 @@ public final class VisionOCR: OCRProtocol, @unchecked Sendable {
                 width: frame.width,
                 height: frame.height,
                 bytesPerRow: frame.bytesPerRow,
-                config: config
+                config: config,
+                extractInstrumentation: extractInstrumentation
             )
             let allTiles = changeDetector.createTileGrid(frameWidth: frame.width, frameHeight: frame.height)
             await cache.setFullFrameResults(regions: regions, tileGrid: allTiles)
@@ -286,7 +304,6 @@ public final class VisionOCR: OCRProtocol, @unchecked Sendable {
         // If nothing changed, return all cached results
         if changeResult.changedTiles.isEmpty {
             let cachedRegions = await cache.getCachedRegions()
-
             return RegionOCRResult(
                 regions: cachedRegions,
                 stats: RegionOCRStats(
@@ -300,25 +317,103 @@ public final class VisionOCR: OCRProtocol, @unchecked Sendable {
             )
         }
 
-        // Find which cached regions are affected by the changed tiles
-        // Any region that intersects a changed tile needs to be re-OCR'd
-        // We don't need to expand to adjacent tiles - if text moved there, those tiles would also be changed
-        let (_, unaffectedRegions) = await cache.findAffectedRegions(changedTiles: changeResult.changedTiles)
+        let postChangeDetectionSnapshot = await Self.synchronizedLedgerSnapshot()
+        Self.publishPhaseResidual(
+            tag: "processing.ocr.regionChangeDetection",
+            function: "processing.ocr.region_reocr",
+            reason: regionReason,
+            kind: "region-change-detection",
+            note: "observed-plus-buffer",
+            before: changeDetectionBaselineSnapshot,
+            after: postChangeDetectionSnapshot,
+            structuralBytes: Self.estimatedTileBufferBytes(changeResult.changedTiles) +
+                Self.estimatedTileBufferBytes(changeResult.unchangedTiles)
+        )
+        let partitionBaselineSnapshot = await Self.synchronizedLedgerSnapshot()
 
-        // Calculate the bounding box covering changed tiles only
-        let reOCRBounds = calculateBoundingBox(for: changeResult.changedTiles)
+        // Find which cached regions are affected by the changed tiles.
+        let (affectedRegions, unaffectedRegions) = await cache.findAffectedRegions(changedTiles: changeResult.changedTiles)
+        let postPartitionSnapshot = await Self.synchronizedLedgerSnapshot()
+        Self.publishPhaseResidual(
+            tag: "processing.ocr.regionCachePartition",
+            function: "processing.ocr.region_reocr",
+            reason: regionReason,
+            kind: "region-cache-partition",
+            note: "observed-plus-buffer",
+            before: partitionBaselineSnapshot,
+            after: postPartitionSnapshot,
+            structuralBytes: Self.estimatedTextRegionBufferBytes(affectedRegions) +
+                Self.estimatedTextRegionBufferBytes(unaffectedRegions)
+        )
+        let expansionBaselineSnapshot = await Self.synchronizedLedgerSnapshot()
+
+        // Expand OCR coverage to whole tiles touched by affected regions.
+        // This avoids a boundary case where a region intersects changed tiles by only a few pixels.
+        let reOCRTtiles = expandReOCRTiles(
+            changedTiles: changeResult.changedTiles,
+            affectedRegions: affectedRegions,
+            frameWidth: frame.width,
+            frameHeight: frame.height,
+            changeDetector: changeDetector
+        )
+        let reOCRBounds = calculateBoundingBox(for: reOCRTtiles)
+        let postExpansionSnapshot = await Self.synchronizedLedgerSnapshot()
+        Self.publishPhaseResidual(
+            tag: "processing.ocr.regionTileExpansion",
+            function: "processing.ocr.region_reocr",
+            reason: regionReason,
+            kind: "region-tile-expansion",
+            note: "observed-plus-buffer",
+            before: expansionBaselineSnapshot,
+            after: postExpansionSnapshot,
+            structuralBytes: Self.estimatedTileBufferBytes(reOCRTtiles)
+        )
+        let regionOCRBaselineSnapshot = await Self.synchronizedLedgerSnapshot()
 
         // Perform OCR only on the affected region using regionOfInterest
         let ocrStartTime = Date()
-        let newRegions = try await recognizeTextInRegion(
+        let regionRecognition = try await recognizeTextInRegion(
             imageData: frame.imageData,
             width: frame.width,
             height: frame.height,
             bytesPerRow: frame.bytesPerRow,
             region: reOCRBounds,
-            config: config
+            config: config,
+            extractInstrumentation: extractInstrumentation
         )
+        let newRegions = regionRecognition.regions
         let ocrTime = Date().timeIntervalSince(ocrStartTime) * 1000
+        let postRegionOCRSnapshot = await Self.synchronizedLedgerSnapshot()
+        let newRegionsPayloadBytes = Self.estimatedTextRegionBufferBytes(newRegions)
+        let blindResidualClaimBytes = max(0, regionRecognition.blindResidualClaim?.bytes ?? 0)
+        VisionOCRMemoryLedger.setObservedResidual(
+            tag: "processing.ocr.regionOCRResultRetention",
+            function: "processing.ocr.region_reocr",
+            reason: regionReason,
+            bytes: newRegionsPayloadBytes,
+            kind: "region-ocr-results",
+            note: "estimated-results-payload",
+            delay: 4,
+            forceSummary: true
+        )
+        VisionOCRMemoryLedger.setObservedResidual(
+            tag: "processing.ocr.regionOCRCallResidual",
+            function: "processing.ocr.region_reocr",
+            reason: regionReason,
+            bytes: max(
+                0,
+                Self.measuredLedgerResidualBytes(
+                    before: regionOCRBaselineSnapshot,
+                    after: postRegionOCRSnapshot,
+                    subtractingBytes: newRegionsPayloadBytes
+                ) - blindResidualClaimBytes
+            ),
+            kind: "region-ocr-call-residual",
+            note: "observed-minus-results-payload-net-blind-residual",
+            delay: 4,
+            forceSummary: true
+        )
+        let mergeBaselineSnapshot = await Self.synchronizedLedgerSnapshot()
 
         // Merge unaffected cached regions with new OCR results
         // Key insight: if a new region overlaps with an unaffected cached region,
@@ -346,58 +441,114 @@ public final class VisionOCR: OCRProtocol, @unchecked Sendable {
             return a.bounds.origin.y < b.bounds.origin.y
         }
         let mergeTime = Date().timeIntervalSince(mergeStartTime) * 1000
+        let postMergeSnapshot = await Self.synchronizedLedgerSnapshot()
+        Self.publishPhaseResidual(
+            tag: "processing.ocr.regionMergeScratch",
+            function: "processing.ocr.region_reocr",
+            reason: regionReason,
+            kind: "region-merge-scratch",
+            note: "observed-plus-buffer",
+            before: mergeBaselineSnapshot,
+            after: postMergeSnapshot,
+            structuralBytes: Self.estimatedTextRegionBufferBytes(filteredNewRegions) +
+                Self.estimatedTextRegionBufferBytes(mergedRegions)
+        )
+        let cacheRefreshBaselineSnapshot = await Self.synchronizedLedgerSnapshot()
 
         // Update cache with merged results
         let allTiles = changeDetector.createTileGrid(frameWidth: frame.width, frameHeight: frame.height)
         await cache.setFullFrameResults(regions: mergedRegions, tileGrid: allTiles)
+        let postCacheRefreshSnapshot = await Self.synchronizedLedgerSnapshot()
+        Self.publishPhaseResidual(
+            tag: "processing.ocr.regionCacheRefresh",
+            function: "processing.ocr.region_reocr",
+            reason: regionReason,
+            kind: "region-cache-refresh",
+            note: "observed-plus-buffer",
+            before: cacheRefreshBaselineSnapshot,
+            after: postCacheRefreshSnapshot,
+            structuralBytes: Self.estimatedTileBufferBytes(allTiles)
+        )
+        let postRegionReturnSnapshot = await Self.synchronizedLedgerSnapshot()
+        let regionReturnResidualRequestBytes = Self.netNewUnattributedBytes(
+            baselineSnapshot: changeDetectionBaselineSnapshot,
+            currentSnapshot: postRegionReturnSnapshot
+        )
+        await MemoryLedger.flushPendingUpdates()
+        let regionReturnResidualClaim = await MemoryLedger.claimCurrentUnattributed(
+            epoch: regionResidualEpoch,
+            requestedBytes: regionReturnResidualRequestBytes
+        )
+        let regionCallResidualBytes = VisionOCRMemoryLedger.currentTrackedBytes(tag: "processing.ocr.regionOCRCallResidual")
+        if let extractInstrumentation {
+            await extractInstrumentation.finalizeRegionResiduals(
+                reason: regionReason,
+                blindResidualBytes: blindResidualClaimBytes,
+                regionReturnResidualClaim: regionReturnResidualClaim,
+                callResidualBytes: regionCallResidualBytes,
+                requestBaselineSnapshot: regionOCRBaselineSnapshot,
+                requestPayloadBytes: newRegionsPayloadBytes,
+                cacheBaselineSnapshot: cacheRefreshBaselineSnapshot
+            )
+        } else {
+            Self.handoffRegionBlindResidualToExtract(
+                reason: regionReason,
+                blindResidualBytes: blindResidualClaimBytes,
+                subtractingReturnResidualBytes: max(0, regionReturnResidualClaim.bytes)
+            )
+            switch regionReturnResidualClaim.target {
+            case .owner:
+                ProcessingExtractMemoryLedger.absorbRegionReturnResidualBytesIntoHandoff(
+                    reason: regionReason,
+                    regionReturnResidualBytes: max(0, regionReturnResidualClaim.bytes)
+                )
+                Self.clearRegionReturnResidualForHandoff(reason: regionReason)
+            case .concurrent:
+                Self.publishArbitedResidualClaim(
+                    claim: regionReturnResidualClaim,
+                    ownerTag: "processing.ocr.regionReturnResidual",
+                    ownerFunction: "processing.ocr.region_reocr",
+                    ownerKind: "region-return-residual",
+                    ownerNote: "epoch-arbited-current-unattributed-after-cache-refresh",
+                    delay: Self.blindResidualHoldSeconds,
+                    reason: regionReason
+                )
+            case .none:
+                break
+            }
+            await ProcessingExtractRequestInstrumentation.reconcileRegionResiduals(
+                reason: regionReason,
+                blindResidualClaimBytes: blindResidualClaimBytes,
+                returnResidualClaimBytes: max(0, regionReturnResidualClaim.bytes),
+                callResidualBytes: regionCallResidualBytes
+            )
+            ProcessingExtractRequestInstrumentation.scheduleRegionSettledReconciliation(
+                reason: regionReason,
+                blindResidualClaimBytes: blindResidualClaimBytes,
+                returnResidualClaimBytes: max(0, regionReturnResidualClaim.bytes),
+                callResidualBytes: regionCallResidualBytes
+            )
+            ProcessingExtractRequestInstrumentation.scheduleRegionTailResidual(
+                reason: regionReason,
+                requestBaselineSnapshot: regionOCRBaselineSnapshot,
+                requestPayloadBytes: newRegionsPayloadBytes,
+                cacheBaselineSnapshot: cacheRefreshBaselineSnapshot
+            )
+        }
+        let tilesOCRed = min(changeResult.totalTiles, reOCRTtiles.count)
+        let tilesCached = max(0, changeResult.totalTiles - tilesOCRed)
 
         return RegionOCRResult(
             regions: mergedRegions,
             stats: RegionOCRStats(
-                tilesOCRed: changeResult.changedTiles.count,
-                tilesCached: changeResult.unchangedTiles.count,
+                tilesOCRed: tilesOCRed,
+                tilesCached: tilesCached,
                 totalTiles: changeResult.totalTiles,
                 changeDetectionTimeMs: changeResult.detectionTimeMs,
                 ocrTimeMs: ocrTime,
                 mergeTimeMs: mergeTime
             )
         )
-    }
-
-    /// Check if two rectangles overlap by more than 30%
-    /// Used to detect when a new partial region overlaps with a cached full region
-    private func boundsOverlapSignificantly(_ a: CGRect, _ b: CGRect) -> Bool {
-        let intersection = a.intersection(b)
-        if intersection.isNull || intersection.isEmpty {
-            return false
-        }
-
-        let intersectionArea = intersection.width * intersection.height
-        let smallerArea = min(a.width * a.height, b.width * b.height)
-
-        guard smallerArea > 0 else { return false }
-
-        // 30% overlap threshold - if significant portion overlaps, they're likely the same text
-        return intersectionArea / smallerArea > 0.3
-    }
-
-    /// Calculate the bounding box that covers all given tiles
-    private func calculateBoundingBox(for tiles: [TileInfo]) -> CGRect {
-        guard !tiles.isEmpty else { return .zero }
-
-        var minX = CGFloat.infinity
-        var minY = CGFloat.infinity
-        var maxX = CGFloat.zero
-        var maxY = CGFloat.zero
-
-        for tile in tiles {
-            minX = min(minX, tile.pixelBounds.minX)
-            minY = min(minY, tile.pixelBounds.minY)
-            maxX = max(maxX, tile.pixelBounds.maxX)
-            maxY = max(maxY, tile.pixelBounds.maxY)
-        }
-
-        return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
     }
 
     /// Perform OCR on a specific region of the frame using regionOfInterest
@@ -408,31 +559,23 @@ public final class VisionOCR: OCRProtocol, @unchecked Sendable {
         height: Int,
         bytesPerRow: Int,
         region: CGRect,
-        config: ProcessingConfig
-    ) async throws -> [TextRegion] {
+        config: ProcessingConfig,
+        extractInstrumentation: ProcessingExtractRequestInstrumentation?
+    ) async throws -> EnvelopeRecognitionOutput {
         // If region covers the full frame, use standard OCR
         if region.minX <= 0 && region.minY <= 0 &&
            region.maxX >= CGFloat(width) && region.maxY >= CGFloat(height) {
-            return try await recognizeText(
-                imageData: imageData,
-                width: width,
-                height: height,
-                bytesPerRow: bytesPerRow,
-                config: config
+            return EnvelopeRecognitionOutput(
+                regions: try await recognizeText(
+                    imageData: imageData,
+                    width: width,
+                    height: height,
+                    bytesPerRow: bytesPerRow,
+                    config: config,
+                    extractInstrumentation: extractInstrumentation
+                ),
+                blindResidualClaim: nil
             )
-        }
-
-        // Create CGImage from raw pixel data
-        guard let cgImage = createCGImage(from: imageData, width: width, height: height, bytesPerRow: bytesPerRow) else {
-            throw ProcessingError.imageConversionFailed
-        }
-
-        // Downscale image for OCR
-        let ocrImage: CGImage
-        if Self.ocrScaleFactor < 1.0 {
-            ocrImage = downscaleImage(cgImage, scale: Self.ocrScaleFactor) ?? cgImage
-        } else {
-            ocrImage = cgImage
         }
 
         // Convert pixel region to normalized coordinates for Vision
@@ -449,135 +592,289 @@ public final class VisionOCR: OCRProtocol, @unchecked Sendable {
             width: normalizedWidth,
             height: normalizedHeight
         )
-
-        // Create a fresh request with regionOfInterest
-        let request = VNRecognizeTextRequest()
-        request.recognitionLevel = .accurate
-        request.recognitionLanguages = textRequest.recognitionLanguages
-        request.usesLanguageCorrection = true
-        request.regionOfInterest = normalizedRegion
-
-        let handler = VNImageRequestHandler(cgImage: ocrImage, options: [:])
-
-        return try await withCheckedThrowingContinuation { continuation in
-            do {
-                try handler.perform([request])
-
-                guard let observations = request.results else {
-                    continuation.resume(returning: [])
-                    return
-                }
-
-                let regions = observations.compactMap { observation -> TextRegion? in
-                    guard observation.confidence >= config.minimumConfidence else { return nil }
-                    guard let topCandidate = observation.topCandidates(1).first else { return nil }
-                    let text = topCandidate.string
-                    guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
-
-                    // Vision returns bounding box relative to the regionOfInterest
-                    // We need to remap to full frame coordinates
-                    let roiBox = observation.boundingBox
-
-                    // Convert ROI-relative coords to full-image normalized coords
-                    let fullImageX = normalizedRegion.origin.x + (roiBox.origin.x * normalizedRegion.width)
-                    let fullImageY = normalizedRegion.origin.y + (roiBox.origin.y * normalizedRegion.height)
-                    let fullImageWidth = roiBox.width * normalizedRegion.width
-                    let fullImageHeight = roiBox.height * normalizedRegion.height
-
-                    // Flip Y from Vision's bottom-left to our top-left origin
-                    let flippedY = 1.0 - fullImageY - fullImageHeight
-
-                    // Convert normalized to pixel coordinates
-                    let pixelBounds = CGRect(
-                        x: fullImageX * CGFloat(width),
-                        y: flippedY * CGFloat(height),
-                        width: fullImageWidth * CGFloat(width),
-                        height: fullImageHeight * CGFloat(height)
-                    )
-
-                    return TextRegion(
-                        frameID: FrameID(value: 0),
-                        text: text,
-                        bounds: pixelBounds,
-                        confidence: Double(observation.confidence)
-                    )
-                }
-
-                continuation.resume(returning: regions)
-            } catch {
-                continuation.resume(throwing: ProcessingError.ocrFailed(underlying: error.localizedDescription))
-            }
-        }
-    }
-
-    /// Create a CapturedFrame-like structure from a CGImage for change detection
-    private func createScaledFrame(from cgImage: CGImage, originalFrame: CapturedFrame) -> CapturedFrame {
-        // Extract pixel data from CGImage
-        let width = cgImage.width
-        let height = cgImage.height
-        let bytesPerRow = width * 4
-        let dataSize = bytesPerRow * height
-
-        let colorSpace = CGColorSpaceCreateDeviceRGB()
-        let bitmapInfo = CGBitmapInfo(rawValue:
-            CGImageAlphaInfo.premultipliedFirst.rawValue |
-            CGBitmapInfo.byteOrder32Little.rawValue
+        let requestConfig = Self.regionRecognitionRequestConfig(
+            regionOfInterest: normalizedRegion,
+            usesLanguageCorrection: false
         )
 
-        var pixelData = Data(count: dataSize)
-        pixelData.withUnsafeMutableBytes { ptr in
-            guard let context = CGContext(
-                data: ptr.baseAddress,
-                width: width,
-                height: height,
-                bitsPerComponent: 8,
-                bytesPerRow: bytesPerRow,
-                space: colorSpace,
-                bitmapInfo: bitmapInfo.rawValue
-            ) else { return }
-
-            context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
-        }
-
-        return CapturedFrame(
-            timestamp: originalFrame.timestamp,
-            imageData: pixelData,
+        return try await recognizeTextWithEnvelope(
+            imageData: imageData,
             width: width,
             height: height,
             bytesPerRow: bytesPerRow,
-            metadata: originalFrame.metadata
+            config: config,
+            requestConfig: requestConfig
         )
     }
 
-    // MARK: - Image Conversion
-
-    /// Convert raw pixel data to CGImage for Vision framework
-    /// Assumes BGRA format (typical from ScreenCaptureKit)
-    func createCGImage(from data: Data, width: Int, height: Int, bytesPerRow: Int) -> CGImage? {
-        let colorSpace = CGColorSpaceCreateDeviceRGB()
-
-        // BGRA format: premultiplied alpha, little endian
-        let bitmapInfo = CGBitmapInfo(rawValue:
-            CGImageAlphaInfo.premultipliedFirst.rawValue |
-            CGBitmapInfo.byteOrder32Little.rawValue
+    private func recognizeTextWithEnvelope(
+        imageData: Data,
+        width: Int,
+        height: Int,
+        bytesPerRow: Int,
+        config: ProcessingConfig,
+        requestConfig: RecognitionRequestConfig
+    ) async throws -> EnvelopeRecognitionOutput {
+        let residualEpoch = await MemoryLedger.beginResidualEpoch(
+            ownerFunction: requestConfig.memoryFunction,
+            candidateConcurrentFunctions: ["capture.screen_capture"]
         )
 
-        guard let provider = CGDataProvider(data: data as CFData) else {
-            return nil
+        do {
+            let envelopeBaselineSnapshot = await Self.synchronizedLedgerSnapshot()
+            guard let cgImage = createCGImage(from: imageData, width: width, height: height, bytesPerRow: bytesPerRow) else {
+                throw ProcessingError.imageConversionFailed
+            }
+
+            let postImageBridgeSnapshot = await Self.synchronizedLedgerSnapshot()
+            let imageBridgeBytes = Self.measuredLedgerResidualBytes(
+                before: envelopeBaselineSnapshot,
+                after: postImageBridgeSnapshot
+            )
+            VisionOCRMemoryLedger.setObservedResidual(
+                tag: requestConfig.envelopeImageBridgeTag,
+                function: requestConfig.envelopeImageBridgeFunction,
+                reason: requestConfig.memoryReason,
+                bytes: imageBridgeBytes,
+                kind: "cgimage-bridge",
+                note: "observed-footprint-delta",
+                delay: requestConfig.phaseResidualDuration
+            )
+
+            let recognitionOutput = try performRecognition(
+                on: cgImage,
+                outputWidth: width,
+                outputHeight: height,
+                config: config,
+                requestConfig: requestConfig
+            )
+
+            let postEnvelopeSnapshot = await Self.synchronizedLedgerSnapshot()
+            let blindResidualRequestBytes = Self.netNewUnattributedBytes(
+                baselineSnapshot: envelopeBaselineSnapshot,
+                currentSnapshot: postEnvelopeSnapshot
+            )
+            await MemoryLedger.flushPendingUpdates()
+            let blindResidualClaim = await MemoryLedger.claimCurrentUnattributed(
+                epoch: residualEpoch,
+                requestedBytes: blindResidualRequestBytes
+            )
+            Self.publishBlindResidualClaim(
+                claim: blindResidualClaim,
+                ownerTag: requestConfig.envelopeResidualTag,
+                ownerFunction: requestConfig.envelopeResidualFunction,
+                reason: requestConfig.memoryReason
+            )
+
+            await MemoryLedger.endResidualEpoch(residualEpoch)
+            return EnvelopeRecognitionOutput(
+                regions: recognitionOutput.regions,
+                blindResidualClaim: blindResidualClaim.bytes > 0 ? blindResidualClaim : nil
+            )
+        } catch {
+            await MemoryLedger.endResidualEpoch(residualEpoch)
+            throw error
         }
+    }
 
-        return CGImage(
-            width: width,
-            height: height,
-            bitsPerComponent: 8,
-            bitsPerPixel: 32,
-            bytesPerRow: bytesPerRow,  // Use actual bytesPerRow (may include padding for alignment)
-            space: colorSpace,
-            bitmapInfo: bitmapInfo,
-            provider: provider,
-            decode: nil,
-            shouldInterpolate: false,
-            intent: .defaultIntent
-        )
+    private func performRecognition(
+        on image: CGImage,
+        outputWidth: Int,
+        outputHeight: Int,
+        config: ProcessingConfig,
+        requestConfig: RecognitionRequestConfig
+    ) throws -> VisionRecognitionOutput {
+        try autoreleasepool {
+            var retainedAdjustmentBytes: Int64 = 0
+            var retainedMeasurementOverride: (bytes: Int64, note: String)?
+            let memoryLease = VisionOCRMemoryLedger.begin(
+                tag: requestConfig.memoryTag,
+                function: requestConfig.memoryFunction,
+                reason: requestConfig.memoryReason,
+                width: outputWidth,
+                height: outputHeight,
+                privateHeapTag: requestConfig.privateHeapTag,
+                privateHeapFunction: requestConfig.privateHeapFunction,
+                retainedHeapTag: requestConfig.retainedHeapTag,
+                retainedHeapFunction: requestConfig.retainedHeapFunction,
+                retainedHeapDuration: requestConfig.retainedHeapDuration
+            )
+            defer {
+                VisionOCRMemoryLedger.end(
+                    lease: memoryLease,
+                    reason: requestConfig.memoryReason,
+                    retainedAdjustmentBytes: retainedAdjustmentBytes,
+                    retainedMeasurementOverride: retainedMeasurementOverride
+                )
+            }
+
+            let setupBaselineFootprintBytes = VisionOCRMemoryLedger.currentFootprintBytes()
+            let request = VNRecognizeTextRequest()
+            request.recognitionLevel = Self.recognitionLevel(for: config)
+            request.recognitionLanguages = recognitionLanguages
+            request.usesLanguageCorrection = requestConfig.usesLanguageCorrection
+            request.preferBackgroundProcessing = config.preferBackgroundProcessing
+            request.regionOfInterest = requestConfig.regionOfInterest ?? CGRect(x: 0, y: 0, width: 1, height: 1)
+
+            let handler = VNImageRequestHandler(cgImage: image, options: [:])
+            let postSetupFootprintBytes = VisionOCRMemoryLedger.currentFootprintBytes()
+            let setupResidualBytes = VisionOCRMemoryLedger.measuredPhaseResidualBytes(
+                baselineFootprintBytes: setupBaselineFootprintBytes ?? memoryLease?.baselineFootprintBytes,
+                currentFootprintBytes: postSetupFootprintBytes
+            )
+            VisionOCRMemoryLedger.setObservedResidual(
+                tag: requestConfig.setupResidualTag,
+                function: requestConfig.setupResidualFunction,
+                reason: requestConfig.memoryReason,
+                bytes: setupResidualBytes,
+                kind: "vision-request-setup",
+                note: "observed-footprint-delta",
+                delay: requestConfig.phaseResidualDuration
+            )
+
+            let performBaselineFootprintBytes = postSetupFootprintBytes
+
+            do {
+                try handler.perform([request])
+            } catch {
+                throw ProcessingError.ocrFailed(underlying: error.localizedDescription)
+            }
+
+            let postPerformFootprintBytes = VisionOCRMemoryLedger.currentFootprintBytes()
+            let observations = request.results ?? []
+            let postObservationBridgeFootprintBytes = VisionOCRMemoryLedger.currentFootprintBytes()
+            let observationBridgeBytes = VisionOCRMemoryLedger.measuredPhaseResidualBytes(
+                baselineFootprintBytes: postPerformFootprintBytes,
+                currentFootprintBytes: postObservationBridgeFootprintBytes
+            )
+            VisionOCRMemoryLedger.setObservedResidual(
+                tag: requestConfig.observationBridgeTag,
+                function: requestConfig.observationBridgeFunction,
+                reason: requestConfig.memoryReason,
+                bytes: observationBridgeBytes,
+                kind: "vision-observation-bridge",
+                note: "observed-footprint-delta",
+                delay: requestConfig.phaseResidualDuration
+            )
+            let runtimeResidualBytes = VisionOCRMemoryLedger.measuredPhaseResidualBytes(
+                baselineFootprintBytes: performBaselineFootprintBytes ?? memoryLease?.baselineFootprintBytes,
+                currentFootprintBytes: postPerformFootprintBytes,
+                subtractingBytes: (memoryLease?.requestBytes ?? 0) + (memoryLease?.privateHeapBytes ?? 0)
+            )
+            VisionOCRMemoryLedger.setObservedResidual(
+                tag: requestConfig.runtimeResidualTag,
+                function: requestConfig.runtimeResidualFunction,
+                reason: requestConfig.memoryReason,
+                bytes: runtimeResidualBytes,
+                kind: "vision-runtime-residual",
+                note: "observed-footprint-delta",
+                delay: requestConfig.phaseResidualDuration
+            )
+
+            var regions: [TextRegion] = []
+            regions.reserveCapacity(observations.count)
+            var retainedUTF16Units = 0
+            var retainedObservationCount = 0
+
+            for observation in observations {
+                guard observation.confidence >= config.minimumConfidence else { continue }
+                guard let topCandidate = observation.topCandidates(1).first else { continue }
+                let text = topCandidate.string
+                guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+                retainedObservationCount += 1
+                retainedUTF16Units += text.utf16.count
+
+                let roiBox = observation.boundingBox
+
+                let fullImageX: CGFloat
+                let fullImageY: CGFloat
+                let fullImageWidth: CGFloat
+                let fullImageHeight: CGFloat
+
+                if let regionOfInterest = requestConfig.regionOfInterest {
+                    fullImageX = regionOfInterest.origin.x + (roiBox.origin.x * regionOfInterest.width)
+                    fullImageY = regionOfInterest.origin.y + (roiBox.origin.y * regionOfInterest.height)
+                    fullImageWidth = roiBox.width * regionOfInterest.width
+                    fullImageHeight = roiBox.height * regionOfInterest.height
+                } else {
+                    fullImageX = roiBox.origin.x
+                    fullImageY = roiBox.origin.y
+                    fullImageWidth = roiBox.width
+                    fullImageHeight = roiBox.height
+                }
+
+                let flippedY = 1.0 - fullImageY - fullImageHeight
+                let pixelBounds = CGRect(
+                    x: fullImageX * CGFloat(outputWidth),
+                    y: flippedY * CGFloat(outputHeight),
+                    width: fullImageWidth * CGFloat(outputWidth),
+                    height: fullImageHeight * CGFloat(outputHeight)
+                )
+
+                regions.append(TextRegion(
+                    frameID: FrameID(value: 0),
+                    text: text,
+                    bounds: pixelBounds,
+                    confidence: Double(observation.confidence)
+                ))
+            }
+
+            let resultsGraphBytes = VisionOCRMemoryLedger.estimatedResultsGraphBytes(
+                observationCount: retainedObservationCount,
+                retainedUTF16Units: retainedUTF16Units,
+                regionCount: regions.count
+            )
+            VisionOCRMemoryLedger.setObservedResidual(
+                tag: requestConfig.resultsGraphTag,
+                function: requestConfig.resultsGraphFunction,
+                reason: requestConfig.memoryReason,
+                bytes: resultsGraphBytes,
+                kind: "ocr-results-graph",
+                note: "estimated-results",
+                delay: requestConfig.phaseResidualDuration
+            )
+
+            let postMaterializationFootprintBytes = VisionOCRMemoryLedger.currentFootprintBytes()
+            let materializationResidualBytes = VisionOCRMemoryLedger.measuredPhaseResidualBytes(
+                baselineFootprintBytes: postObservationBridgeFootprintBytes ?? postPerformFootprintBytes,
+                currentFootprintBytes: postMaterializationFootprintBytes,
+                subtractingBytes: resultsGraphBytes
+            )
+            VisionOCRMemoryLedger.setObservedResidual(
+                tag: requestConfig.materializationResidualTag,
+                function: requestConfig.materializationResidualFunction,
+                reason: requestConfig.memoryReason,
+                bytes: materializationResidualBytes,
+                kind: "ocr-materialization-residual",
+                note: "observed-footprint-delta",
+                delay: requestConfig.phaseResidualDuration
+            )
+            retainedAdjustmentBytes =
+                setupResidualBytes +
+                runtimeResidualBytes +
+                observationBridgeBytes +
+                resultsGraphBytes +
+                materializationResidualBytes
+
+            retainedMeasurementOverride = VisionOCRMemoryLedger.retainedMeasurement(
+                lease: memoryLease,
+                subtractingBytes: retainedAdjustmentBytes
+            )
+
+            let totalAttributedBytes =
+                (memoryLease?.requestBytes ?? 0) +
+                (memoryLease?.privateHeapBytes ?? 0) +
+                setupResidualBytes +
+                runtimeResidualBytes +
+                observationBridgeBytes +
+                resultsGraphBytes +
+                materializationResidualBytes +
+                (retainedMeasurementOverride?.bytes ?? 0)
+
+            return VisionRecognitionOutput(
+                regions: regions,
+                attributedBytes: totalAttributedBytes
+            )
+        }
     }
 }

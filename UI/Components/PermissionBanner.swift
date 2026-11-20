@@ -9,7 +9,7 @@ struct PermissionBanner: View {
     let onDismiss: () -> Void
 
     var body: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 10) {
             // Warning icon
             Image(systemName: "exclamationmark.triangle.fill")
                 .foregroundColor(.orange)
@@ -43,7 +43,8 @@ struct PermissionBanner: View {
             }
             .buttonStyle(.plain)
         }
-        .padding(12)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 9)
         .background(Color.orange.opacity(0.1))
         .cornerRadius(8)
         .overlay(
@@ -55,6 +56,12 @@ struct PermissionBanner: View {
 
 /// Helper to open System Settings to specific panes
 struct SystemSettingsOpener {
+    /// Open the main System Settings app.
+    static func openSystemSettingsApp() {
+        let url = URL(fileURLWithPath: "/System/Applications/System Settings.app")
+        NSWorkspace.shared.open(url)
+    }
+
     /// Open Accessibility privacy settings
     static func openAccessibilitySettings() {
         let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!
@@ -70,31 +77,25 @@ struct SystemSettingsOpener {
 
 // MARK: - Preview
 
-#Preview {
-    VStack(spacing: 16) {
-        PermissionBanner(
-            message: "Retrace needs Accessibility permission to detect which display you're working on.",
-            actionTitle: "Open Settings",
-            action: {
-                print("Opening settings...")
-            },
-            onDismiss: {
-                print("Dismissed")
-            }
-        )
-        .padding()
+struct PermissionBanner_Previews: PreviewProvider {
+    static var previews: some View {
+        VStack(spacing: 16) {
+            PermissionBanner(
+                message: "Retrace needs Accessibility permission to detect which display you're working on.",
+                actionTitle: "Open Settings",
+                action: {},
+                onDismiss: {}
+            )
+            .padding()
 
-        PermissionBanner(
-            message: "Screen recording permission is required to capture your screen.",
-            actionTitle: "Grant Permission",
-            action: {
-                print("Opening settings...")
-            },
-            onDismiss: {
-                print("Dismissed")
-            }
-        )
-        .padding()
+            PermissionBanner(
+                message: "Screen recording permission is required to capture your screen.",
+                actionTitle: "Grant Permission",
+                action: {},
+                onDismiss: {}
+            )
+            .padding()
+        }
+        .frame(width: 500)
     }
-    .frame(width: 500)
 }

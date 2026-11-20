@@ -1,0 +1,128 @@
+name: Bug report
+description: Report a crash, regression, or incorrect behavior in Retrace.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Keep observed facts separate from inferred causes. Use exact versions, timestamps, and file paths when possible. If something is not verified, write `Unknown`.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: Briefly describe the bug and the current impact.
+      placeholder: Retrace crashes on every open when launched from /Applications on macOS 15.4.
+    validations:
+      required: true
+
+  - type: textarea
+    id: user_impact
+    attributes:
+      label: User impact
+      description: Capture severity, scope, and frequency.
+      placeholder: |
+        Severity: Crash
+        Scope: Any user launching the installed app
+        Frequency: Always
+    validations:
+      required: true
+
+  - type: textarea
+    id: observed_behavior
+    attributes:
+      label: Observed behavior
+      description: Facts only. Include exact errors or visible behavior.
+      placeholder: |
+        - The app window appears briefly, then the process exits.
+        - Console shows a fatal error in startup path X.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected_behavior
+    attributes:
+      label: Expected behavior
+      placeholder: The app should launch to the previous screen without crashing.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Minimal, deterministic steps.
+      placeholder: |
+        1. Install Retrace.app into /Applications.
+        2. Launch the app.
+        3. Observe the crash before the main view loads.
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: Include logs, crash excerpts, screenshots, and relevant file paths.
+      placeholder: |
+        App version:
+        Build/source:
+        macOS version:
+        Hardware:
+
+        Logs / crash excerpts:
+        ```text
+        Paste exact output here
+        ```
+
+        Screenshots / attachments:
+        Related files / code paths:
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Add exact dates, branch / commit, permissions, and storage state when known.
+      placeholder: |
+        Date observed:
+        Branch / commit:
+        Permissions state:
+        Storage / database state:
+    validations:
+      required: true
+
+  - type: textarea
+    id: suspected_area
+    attributes:
+      label: Suspected area (inference)
+      description: Optional. Keep this separate from observed facts.
+      placeholder: |
+        Confidence:
+        Area:
+        Why this is suspected:
+    validations:
+      required: false
+
+  - type: textarea
+    id: acceptance_criteria
+    attributes:
+      label: Acceptance criteria
+      description: What needs to be true to close this issue?
+      placeholder: |
+        - [ ] Launch succeeds without crashing.
+        - [ ] Existing onboarding / startup flows still work.
+    validations:
+      required: true
+
+  - type: textarea
+    id: unknowns
+    attributes:
+      label: Unknowns
+      description: Track gaps explicitly instead of guessing.
+      placeholder: |
+        - Whether this reproduces on a fresh database
+        - Whether the crash is limited to release builds
+    validations:
+      required: false

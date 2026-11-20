@@ -1,4 +1,5 @@
 import Foundation
+import App
 
 // MARK: - Feedback Type
 
@@ -36,9 +37,49 @@ public enum FeedbackType: String, CaseIterable, Identifiable {
     }
 }
 
+public struct FeedbackLaunchContext {
+    public enum Source: String {
+        case manual
+        case crashBanner
+        case walFailureCrashBanner
+    }
+
+    public enum PreferredFocusField {
+        case email
+    }
+
+    public let source: Source
+    public let feedbackType: FeedbackType
+    public let prefilledDescription: String?
+    public let preferredFocusField: PreferredFocusField?
+
+    public init(
+        source: Source = .manual,
+        feedbackType: FeedbackType = .bug,
+        prefilledDescription: String? = nil,
+        preferredFocusField: PreferredFocusField? = nil
+    ) {
+        self.source = source
+        self.feedbackType = feedbackType
+        self.prefilledDescription = prefilledDescription
+        self.preferredFocusField = preferredFocusField
+    }
+}
+
 // MARK: - Diagnostic Info
 
-/// System and app diagnostic information included with feedback
+/// System and app diagnostic information included with feedback.
+///
+/// **Why this data is collected:**
+/// Retrace has no pre-existing telemetry, analytics, or crash reporting SDK. When a user submits
+/// a bug report, this diagnostic snapshot is the *only* context available to understand and
+/// reproduce the issue. Each field was chosen because it has directly helped diagnose a real
+/// class of user-reported problem (e.g. display scaling bugs, MDM interference, memory pressure).
+///
+/// **Privacy preserved:** Process info reports category counts only, never app names. Memory
+/// diagnostics add only a small allowlist of Retrace/media-system helper process names relevant
+/// to decoder debugging. No file paths, no user data. Settings snapshot uses a strict whitelist —
+/// no raw queries, app lists, or browsing data are ever included.
 public struct DiagnosticInfo: Codable {
     public let appVersion: String
     public let buildNumber: String
@@ -47,15 +88,239 @@ public struct DiagnosticInfo: Codable {
     public let totalDiskSpace: String
     public let freeDiskSpace: String
     public let databaseStats: DatabaseStats
+    /// Sanitized settings snapshot (strict whitelist of keys only) for debugging misconfiguration
+    /// reports. No raw paths, queries, app lists, or user data — only behavioral toggles and
+    /// numeric thresholds. See `collectSanitizedSettingsSnapshot()` for the exact whitelist.
+    public let settingsSnapshot: [String: String]
     public let recentErrors: [String]
     public let recentLogs: [String]
+    public let groupedRecentLogs: GroupedRecentLogs?
+    public let recentMetricEvents: [FeedbackRecentMetricEvent]
     public let timestamp: Date
 
-    public struct DatabaseStats: Codable {
+    // Enhanced diagnostics for debugging edge cases
+    public let displayInfo: DisplayInfo
+    public let processInfo: ProcessInfo
+    public let accessibilityInfo: AccessibilityInfo
+    public let performanceInfo: PerformanceInfo
+    public let emergencyCrashReports: [String]?
+
+    public struct GroupedRecentLogs: Codable, Sendable {
+        public struct SchemaEntry: Codable, Sendable {
+            public let event: String
+            public let fields: [String: String]
+
+            public init(event: String, fields: [String: String]) {
+                self.event = event
+                self.fields = fields
+            }
+        }
+
+        public struct Group: Codable, Sendable {
+            public let eventCode: String
+            public let baseTimestampMs: Int64
+            public let scalarFields: [String: Int64]
+            public let seriesFields: [String: [Int64]]
+
+            public init(
+                eventCode: String,
+                baseTimestampMs: Int64,
+                scalarFields: [String: Int64] = [:],
+                seriesFields: [String: [Int64]]
+            ) {
+                self.eventCode = eventCode
+                self.baseTimestampMs = baseTimestampMs
+                self.scalarFields = scalarFields
+                self.seriesFields = seriesFields
+            }
+
+            public var entryCount: Int {
+                seriesFields["dt"]?.count ?? 0
+            }
+
+            public func encode(to encoder: Encoder) throws {
+                var container = encoder.container(keyedBy: DynamicCodingKey.self)
+                try container.encode(eventCode, forKey: DynamicCodingKey("e"))
+                try container.encode(baseTimestampMs, forKey: DynamicCodingKey("t0"))
+
+                for key in scalarFields.keys.sorted() {
+                    if let value = scalarFields[key] {
+                        try container.encode(value, forKey: DynamicCodingKey(key))
+                    }
+                }
+
+                for key in seriesFields.keys.sorted() {
+                    if let values = seriesFields[key] {
+                        try container.encode(values, forKey: DynamicCodingKey(key))
+                    }
+                }
+            }
+
+            public init(from decoder: Decoder) throws {
+                let container = try decoder.container(keyedBy: DynamicCodingKey.self)
+                eventCode = try container.decode(String.self, forKey: DynamicCodingKey("e"))
+                baseTimestampMs = try container.decode(Int64.self, forKey: DynamicCodingKey("t0"))
+
+                var scalarFields: [String: Int64] = [:]
+                var seriesFields: [String: [Int64]] = [:]
+
+                for key in container.allKeys where key.stringValue != "e" && key.stringValue != "t0" {
+                    if let values = try? container.decode([Int64].self, forKey: key) {
+                        seriesFields[key.stringValue] = values
+                    } else if let value = try? container.decode(Int64.self, forKey: key) {
+                        scalarFields[key.stringValue] = value
+                    }
+                }
+
+                self.scalarFields = scalarFields
+                self.seriesFields = seriesFields
+            }
+
+            private struct DynamicCodingKey: CodingKey, Hashable {
+                let stringValue: String
+                let intValue: Int?
+
+                init(_ stringValue: String) {
+                    self.stringValue = stringValue
+                    self.intValue = nil
+                }
+
+                init?(stringValue: String) {
+                    self.init(stringValue)
+                }
+
+                init?(intValue: Int) {
+                    self.stringValue = "\(intValue)"
+                    self.intValue = intValue
+                }
+            }
+        }
+
+        public let schema: [String: SchemaEntry]
+        public let groups: [Group]
+
+        public init(schema: [String: SchemaEntry], groups: [Group]) {
+            self.schema = schema
+            self.groups = groups
+        }
+
+        public var representedEntryCount: Int {
+            groups.reduce(0) { $0 + $1.entryCount }
+        }
+    }
+
+    public struct DatabaseStats: Codable, Sendable {
         public let sessionCount: Int
         public let frameCount: Int
         public let segmentCount: Int
         public let databaseSizeMB: Double
+    }
+
+    /// Display configuration — needed to diagnose scaling, color space, and multi-monitor
+    /// rendering issues that are otherwise impossible to reproduce without the exact setup.
+    /// No file paths, no user data — only hardware display properties.
+    public struct DisplayInfo: Codable {
+        public let count: Int
+        public let displays: [Display]
+        public let mainDisplayIndex: Int
+
+        public init(count: Int, displays: [Display], mainDisplayIndex: Int) {
+            self.count = count
+            self.displays = displays
+            self.mainDisplayIndex = mainDisplayIndex
+        }
+
+        public struct Display: Codable {
+            public let index: Int
+            public let resolution: String  // "2560x1440"
+            public let backingScaleFactor: String  // "2.0" or "1.0"
+            public let colorSpace: String  // "RGB", "P3"
+            public let refreshRate: String  // "60Hz", "120Hz"
+            public let isRetina: Bool
+            public let frame: String  // "(0,0,2560,1440)" - position info
+        }
+    }
+
+    /// Running process diagnostics — needed because event-monitoring, window-management,
+    /// and MDM/security tools are the most common source of capture and accessibility
+    /// interference that users report. Without this, these issues are nearly impossible
+    /// to diagnose remotely.
+    ///
+    /// **Privacy preserved:** Only category counts are reported, never individual app names.
+    /// The whitelist of bundle-ID prefixes is checked locally; no app list leaves the device.
+    public struct ProcessInfo: Codable {
+        public let totalRunning: Int
+        public let eventMonitoringApps: Int   // count only — e.g. BTT, Alfred, Raycast
+        public let windowManagementApps: Int  // count only — e.g. Rectangle, Magnet
+        public let securityApps: Int          // count only — e.g. antivirus, MDM agents
+        // MDM presence flags — Jamf/Kandji frequently block screen capture permissions
+        public let hasJamf: Bool
+        public let hasKandji: Bool
+        // System process CPU — high values indicate accessibility or compositing contention
+        public let axuiServerCPU: Double      // % CPU
+        public let windowServerCPU: Double
+
+        public init(totalRunning: Int, eventMonitoringApps: Int, windowManagementApps: Int, securityApps: Int, hasJamf: Bool, hasKandji: Bool, axuiServerCPU: Double, windowServerCPU: Double) {
+            self.totalRunning = totalRunning
+            self.eventMonitoringApps = eventMonitoringApps
+            self.windowManagementApps = windowManagementApps
+            self.securityApps = securityApps
+            self.hasJamf = hasJamf
+            self.hasKandji = hasKandji
+            self.axuiServerCPU = axuiServerCPU
+            self.windowServerCPU = windowServerCPU
+        }
+    }
+
+    /// Accessibility feature flags — these macOS settings directly affect rendering behavior
+    /// (e.g. reduce-transparency changes compositing, reduce-motion disables animations).
+    /// Only boolean flags from public NSWorkspace APIs; no user-specific data.
+    public struct AccessibilityInfo: Codable {
+        public let voiceOverEnabled: Bool
+        public let switchControlEnabled: Bool
+        public let reduceMotionEnabled: Bool
+        public let increaseContrastEnabled: Bool
+        public let reduceTransparencyEnabled: Bool
+        public let differentiateWithoutColorEnabled: Bool
+        public let displayHasInvertedColors: Bool
+
+        public init(voiceOverEnabled: Bool, switchControlEnabled: Bool, reduceMotionEnabled: Bool, increaseContrastEnabled: Bool, reduceTransparencyEnabled: Bool, differentiateWithoutColorEnabled: Bool, displayHasInvertedColors: Bool) {
+            self.voiceOverEnabled = voiceOverEnabled
+            self.switchControlEnabled = switchControlEnabled
+            self.reduceMotionEnabled = reduceMotionEnabled
+            self.increaseContrastEnabled = increaseContrastEnabled
+            self.reduceTransparencyEnabled = reduceTransparencyEnabled
+            self.differentiateWithoutColorEnabled = differentiateWithoutColorEnabled
+            self.displayHasInvertedColors = displayHasInvertedColors
+        }
+    }
+
+    /// System performance snapshot — needed to distinguish "app bug" from "machine under
+    /// resource pressure" when users report slowness, dropped frames, or high CPU usage.
+    public struct PerformanceInfo: Codable {
+        public let cpuUsagePercent: Double
+        public let memoryUsedGB: Double
+        public let memoryTotalGB: Double
+        public let memoryPressure: String  // "normal", "warning", "critical"
+        public let swapUsedGB: Double
+        public let thermalState: String  // "nominal", "fair", "serious", "critical"
+        public let processorCount: Int
+        public let isLowPowerModeEnabled: Bool
+        public let powerSource: String  // "battery", "AC", "unknown"
+        public let batteryLevel: Int?  // 0-100 or nil
+
+        public init(cpuUsagePercent: Double, memoryUsedGB: Double, memoryTotalGB: Double, memoryPressure: String, swapUsedGB: Double, thermalState: String, processorCount: Int, isLowPowerModeEnabled: Bool, powerSource: String, batteryLevel: Int?) {
+            self.cpuUsagePercent = cpuUsagePercent
+            self.memoryUsedGB = memoryUsedGB
+            self.memoryTotalGB = memoryTotalGB
+            self.memoryPressure = memoryPressure
+            self.swapUsedGB = swapUsedGB
+            self.thermalState = thermalState
+            self.processorCount = processorCount
+            self.isLowPowerModeEnabled = isLowPowerModeEnabled
+            self.powerSource = powerSource
+            self.batteryLevel = batteryLevel
+        }
     }
 
     public init(
@@ -66,8 +331,17 @@ public struct DiagnosticInfo: Codable {
         totalDiskSpace: String,
         freeDiskSpace: String,
         databaseStats: DatabaseStats,
+        settingsSnapshot: [String: String] = [:],
         recentErrors: [String],
-        recentLogs: [String] = []
+        recentLogs: [String] = [],
+        groupedRecentLogs: GroupedRecentLogs? = nil,
+        recentMetricEvents: [FeedbackRecentMetricEvent] = [],
+        displayInfo: DisplayInfo = DisplayInfo(count: 0, displays: [], mainDisplayIndex: 0),
+        processInfo: ProcessInfo = ProcessInfo(totalRunning: 0, eventMonitoringApps: 0, windowManagementApps: 0, securityApps: 0, hasJamf: false, hasKandji: false, axuiServerCPU: 0, windowServerCPU: 0),
+        accessibilityInfo: AccessibilityInfo = AccessibilityInfo(voiceOverEnabled: false, switchControlEnabled: false, reduceMotionEnabled: false, increaseContrastEnabled: false, reduceTransparencyEnabled: false, differentiateWithoutColorEnabled: false, displayHasInvertedColors: false),
+        performanceInfo: PerformanceInfo = PerformanceInfo(cpuUsagePercent: 0, memoryUsedGB: 0, memoryTotalGB: 0, memoryPressure: "unknown", swapUsedGB: 0, thermalState: "unknown", processorCount: 0, isLowPowerModeEnabled: false, powerSource: "unknown", batteryLevel: nil),
+        emergencyCrashReports: [String]? = nil,
+        timestamp: Date = Date()
     ) {
         self.appVersion = appVersion
         self.buildNumber = buildNumber
@@ -76,56 +350,52 @@ public struct DiagnosticInfo: Codable {
         self.totalDiskSpace = totalDiskSpace
         self.freeDiskSpace = freeDiskSpace
         self.databaseStats = databaseStats
+        self.settingsSnapshot = settingsSnapshot
         self.recentErrors = recentErrors
         self.recentLogs = recentLogs
-        self.timestamp = Date()
+        self.groupedRecentLogs = groupedRecentLogs
+        self.recentMetricEvents = recentMetricEvents
+        self.displayInfo = displayInfo
+        self.processInfo = processInfo
+        self.accessibilityInfo = accessibilityInfo
+        self.performanceInfo = performanceInfo
+        self.emergencyCrashReports = emergencyCrashReports
+        self.timestamp = timestamp
     }
 
-    /// Format as readable text for display (summary without full logs)
-    public func formattedText() -> String {
-        """
-        App Version: \(appVersion) (\(buildNumber))
-        macOS: \(macOSVersion)
-        Device: \(deviceModel)
-        Disk: \(freeDiskSpace) free of \(totalDiskSpace)
-
-        Database Stats:
-        - Sessions: \(databaseStats.sessionCount)
-        - Frames: \(databaseStats.frameCount)
-        - Segments: \(databaseStats.segmentCount)
-        - Size: \(String(format: "%.1f", databaseStats.databaseSizeMB)) MB
-
-        Recent Errors: \(recentErrors.isEmpty ? "None" : "\(recentErrors.count) error(s)")
-        Recent Logs: \(recentLogs.count) entries from last hour
-        """
-    }
-
-    /// Full formatted text including all logs
-    public func fullFormattedText() -> String {
-        var text = formattedText()
-
-        if !recentErrors.isEmpty {
-            text += "\n\n--- ERRORS ---\n"
-            text += recentErrors.joined(separator: "\n")
-        }
-
-        if !recentLogs.isEmpty {
-            text += "\n\n--- FULL LOGS (last hour) ---\n"
-            text += recentLogs.joined(separator: "\n")
-        }
-
-        return text
+    public func withRecentMetricEvents(_ events: [FeedbackRecentMetricEvent]) -> DiagnosticInfo {
+        DiagnosticInfo(
+            appVersion: appVersion,
+            buildNumber: buildNumber,
+            macOSVersion: macOSVersion,
+            deviceModel: deviceModel,
+            totalDiskSpace: totalDiskSpace,
+            freeDiskSpace: freeDiskSpace,
+            databaseStats: databaseStats,
+            settingsSnapshot: settingsSnapshot,
+            recentErrors: recentErrors,
+            recentLogs: recentLogs,
+            groupedRecentLogs: groupedRecentLogs,
+            recentMetricEvents: events,
+            displayInfo: displayInfo,
+            processInfo: processInfo,
+            accessibilityInfo: accessibilityInfo,
+            performanceInfo: performanceInfo,
+            emergencyCrashReports: emergencyCrashReports,
+            timestamp: timestamp
+        )
     }
 }
 
 // MARK: - Feedback Submission
 
 /// Complete feedback submission payload
-public struct FeedbackSubmission: Codable {
+public struct FeedbackSubmission {
     public let type: String
     public let email: String?
     public let description: String
     public let diagnostics: DiagnosticInfo
+    public let includedDiagnosticSections: Set<DiagnosticInfo.SectionID>
     public let includeScreenshot: Bool
     public let screenshotData: Data?
 
@@ -134,6 +404,7 @@ public struct FeedbackSubmission: Codable {
         email: String = "",
         description: String,
         diagnostics: DiagnosticInfo,
+        includedDiagnosticSections: Set<DiagnosticInfo.SectionID> = Set(DiagnosticInfo.SectionID.allCases),
         includeScreenshot: Bool = false,
         screenshotData: Data? = nil
     ) {
@@ -141,6 +412,7 @@ public struct FeedbackSubmission: Codable {
         self.email = email.isEmpty ? nil : email
         self.description = description
         self.diagnostics = diagnostics
+        self.includedDiagnosticSections = includedDiagnosticSections
         self.includeScreenshot = includeScreenshot
         self.screenshotData = screenshotData
     }

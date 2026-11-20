@@ -18,8 +18,12 @@ import Shared
 // ╚══════════════════════════════════════════════════════════════════════════════╝
 
 final class AsyncQueuePipelineTests: XCTestCase {
+    private static let screenshotFixtureSkipMessage =
+        "Integration-only test. Set TEST_SCREENSHOT_PATH to a directory of .jpeg screenshots to run it."
 
     // MARK: - Properties
+
+    private let integrationPipelineEnabled = ProcessInfo.processInfo.environment["RUN_ASYNC_QUEUE_PIPELINE"] == "1"
 
     var database: DatabaseManager!
     var ftsManager: FTSManager!
@@ -27,38 +31,54 @@ final class AsyncQueuePipelineTests: XCTestCase {
     var processing: ProcessingManager!
     var search: SearchManager!
     var processingQueue: FrameProcessingQueue!
+    var testRoot: URL!
 
     /// Path to test screenshots (set via TEST_SCREENSHOT_PATH env var)
-    var screenshotPath: String {
-        ProcessInfo.processInfo.environment["TEST_SCREENSHOT_PATH"] ?? NSString(string: "~/ScreenMemoryData/screenshots").expandingTildeInPath
+    var screenshotPath: String? {
+        let path = ProcessInfo.processInfo.environment["TEST_SCREENSHOT_PATH"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let path, !path.isEmpty else {
+            return nil
+        }
+        return path
     }
 
-    /// Database path for this test (uses AppPaths which respects custom location)
+    /// Database path for this test (isolated temp location)
     var testDatabasePath: String {
-        NSString(string: AppPaths.databasePath).expandingTildeInPath
+        testRoot.appendingPathComponent("retrace-test.db").path
     }
 
-    /// Storage root for video segments (uses AppPaths which respects custom location)
+    /// Storage root for video segments (isolated temp location)
     var storageRoot: URL {
-        URL(fileURLWithPath: AppPaths.expandedStorageRoot)
+        testRoot.appendingPathComponent("storage", isDirectory: true)
     }
 
     // MARK: - Setup/Teardown
 
     override func setUp() async throws {
+        guard integrationPipelineEnabled else {
+            throw XCTSkip("Integration-only test. Set RUN_ASYNC_QUEUE_PIPELINE=1 to run manually.")
+        }
+        guard screenshotPath != nil else {
+            throw XCTSkip(Self.screenshotFixtureSkipMessage)
+        }
+
         print("\n" + String(repeating: "═", count: 70))
         print("  ASYNC QUEUE PIPELINE TEST - Testing Background Processing")
         print(String(repeating: "═", count: 70))
 
-        // Clean up database to ensure we have the latest schema with processing_queue table
-        try? FileManager.default.removeItem(atPath: testDatabasePath)
+        testRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RetraceAsyncQueueTests_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: testRoot, withIntermediateDirectories: true)
 
-        // Create directories if needed
-        try FileManager.default.createDirectory(atPath: AppPaths.expandedStorageRoot, withIntermediateDirectories: true)
+        // Create isolated storage directory for this test run
         try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
 
         // Initialize managers
-        database = DatabaseManager(databasePath: testDatabasePath)
+        database = DatabaseManager(
+            databasePath: testDatabasePath,
+            storageRootPath: storageRoot.path
+        )
         ftsManager = FTSManager(databasePath: testDatabasePath)
         storage = StorageManager(storageRoot: storageRoot)
         processing = ProcessingManager(config: .default)
@@ -102,11 +122,16 @@ final class AsyncQueuePipelineTests: XCTestCase {
     }
 
     override func tearDown() async throws {
-        // Stop workers first
-        await processingQueue.stopWorkers()
-
-        try await ftsManager.close()
-        try await database.close()
+        if processingQueue != nil {
+            // Stop workers first
+            await processingQueue.stopWorkers()
+        }
+        if ftsManager != nil {
+            try await ftsManager.close()
+        }
+        if database != nil {
+            try await database.close()
+        }
 
         database = nil
         ftsManager = nil
@@ -114,6 +139,10 @@ final class AsyncQueuePipelineTests: XCTestCase {
         processing = nil
         search = nil
         processingQueue = nil
+        if testRoot != nil {
+            try? FileManager.default.removeItem(at: testRoot)
+        }
+        testRoot = nil
 
         print("\n✓ Test cleanup complete")
         print(String(repeating: "═", count: 70) + "\n")
@@ -123,6 +152,10 @@ final class AsyncQueuePipelineTests: XCTestCase {
 
     /// Process screenshots through async queue pipeline
     func testProcessScreenshotsThroughAsyncQueue() async throws {
+        guard let screenshotPath else {
+            throw XCTSkip(Self.screenshotFixtureSkipMessage)
+        }
+
         // STEP 1: Discover screenshot files
         print("\n📁 Scanning for screenshots...")
         let files = try FileManager.default.contentsOfDirectory(atPath: screenshotPath)
@@ -266,7 +299,7 @@ final class AsyncQueuePipelineTests: XCTestCase {
             // Wait for queue to drain AND all frames to be processed
             if queueDepth == 0 && stats.totalProcessed >= allEnqueuedFrameIDs.count {
                 // Give a small grace period for workers to mark frames as completed
-                try await Task.sleep(nanoseconds: 100_000_000)  // 0.1 seconds
+                try await Task.sleep(for: .nanoseconds(Int64(100_000_000)), clock: .continuous)  // 0.1 seconds
                 break
             }
 
@@ -275,7 +308,7 @@ final class AsyncQueuePipelineTests: XCTestCase {
                 break
             }
 
-            try await Task.sleep(nanoseconds: 500_000_000)  // Wait 0.5 seconds
+            try await Task.sleep(for: .nanoseconds(Int64(500_000_000)), clock: .continuous)  // Wait 0.5 seconds
         }
 
         let elapsedWait = Date().timeIntervalSince(startWait)
@@ -303,6 +336,14 @@ final class AsyncQueuePipelineTests: XCTestCase {
                 XCTFail("Frame \(frameID) still marked as processing after queue drain")
             case .completed:
                 completedCount += 1
+            case .rewritePending:
+                XCTFail("Frame \(frameID) is still waiting on rewrite after queue drain")
+            case .rewriteProcessing:
+                XCTFail("Frame \(frameID) is still being rewritten after queue drain")
+            case .rewriteCompleted:
+                completedCount += 1
+            case .rewriteFailed:
+                failedCount += 1
             case .failed:
                 failedCount += 1
             }
@@ -352,7 +393,7 @@ final class AsyncQueuePipelineTests: XCTestCase {
     // MARK: - Helper Methods
 
     /// Get frame processing status
-    private func getFrameProcessingStatus(frameID: Int64) async throws -> FrameProcessingStatus {
+    private func getFrameProcessingStatus(frameID: Int64) async throws -> Processing.FrameProcessingStatus {
         guard let db = await database.getConnection() else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
@@ -372,7 +413,7 @@ final class AsyncQueuePipelineTests: XCTestCase {
         }
 
         let statusInt = Int(sqlite3_column_int(stmt, 0))
-        return FrameProcessingStatus(rawValue: statusInt) ?? .pending
+        return Processing.FrameProcessingStatus(rawValue: statusInt) ?? .pending
     }
 
     /// Convert NSImage to CapturedFrame with raw BGRA pixel data

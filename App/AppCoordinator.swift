@@ -8,6 +8,247 @@ import Search
 import Migration
 import CoreGraphics
 import AppKit
+import ImageIO
+import CryptoKit
+
+// MARK: - OCR Power Settings Notifications
+
+public enum OCRPowerSettingsNotification {
+    public static let didChange = Notification.Name("PowerSettingsDidChange")
+}
+
+public enum RecordingUnexpectedStopNotification {
+    public static let didStop = Notification.Name("RecordingUnexpectedStop")
+}
+
+public enum CaptureObservedNotification {
+    public static let didObserve = Notification.Name("CaptureObserved")
+}
+
+public enum ConferenceConsentStateNotification {
+    public static let didChange = Notification.Name("ConferenceConsentStateDidChange")
+}
+
+public struct ConferenceConsentMenuState: Sendable, Equatable {
+    public static let visibilityInterval: TimeInterval = 8
+
+    public let callID: String
+    public let title: String
+    public let lastObservedAt: Date
+    public let isBlurBypassedForConsent: Bool
+    public let consentSessionID: String?
+
+    public var canDisableFaceBlur: Bool { consentSessionID != nil && !isBlurBypassedForConsent }
+
+    public init(
+        callID: String,
+        title: String,
+        lastObservedAt: Date,
+        isBlurBypassedForConsent: Bool,
+        consentSessionID: String? = nil
+    ) {
+        self.callID = callID
+        self.title = title
+        self.lastObservedAt = lastObservedAt
+        self.isBlurBypassedForConsent = isBlurBypassedForConsent
+        self.consentSessionID = consentSessionID
+    }
+
+    public func isVisible(at now: Date = Date()) -> Bool {
+        now.timeIntervalSince(lastObservedAt) <= Self.visibilityInterval
+    }
+
+    public var notificationUserInfo: [AnyHashable: Any] {
+        var payload: [String: Any] = [
+            "callID": callID,
+            "title": title,
+            "lastObservedAt": lastObservedAt.timeIntervalSince1970,
+            "isBlurBypassedForConsent": isBlurBypassedForConsent
+        ]
+        payload["consentSessionID"] = consentSessionID
+        return payload
+    }
+
+    public static func from(notificationUserInfo: [AnyHashable: Any]?) -> ConferenceConsentMenuState? {
+        guard let callID = notificationUserInfo?["callID"] as? String,
+              let title = notificationUserInfo?["title"] as? String,
+              let lastObservedAtSeconds = notificationUserInfo?["lastObservedAt"] as? TimeInterval,
+              let isBlurBypassedForConsent = notificationUserInfo?["isBlurBypassedForConsent"] as? Bool else {
+            return nil
+        }
+
+        return ConferenceConsentMenuState(
+            callID: callID,
+            title: title,
+            lastObservedAt: Date(timeIntervalSince1970: lastObservedAtSeconds),
+            isBlurBypassedForConsent: isBlurBypassedForConsent,
+            consentSessionID: notificationUserInfo?["consentSessionID"] as? String
+        )
+    }
+}
+
+struct ConferenceConsentMenuSelectionCandidate: Sendable, Equatable {
+    let state: ConferenceConsentMenuState
+    let menuSelectionPriority: Int
+}
+
+struct ConferencePrivacyMetricState: Sendable {
+    private struct Observation: Sendable {
+        let outcome: String
+        let timestamp: Date
+    }
+    private var observations: [String: Observation] = [:]
+
+    mutating func shouldRecord(callID: String, outcome: String, at timestamp: Date) -> Bool {
+        if let previous = observations[callID], timestamp < previous.timestamp { return false }
+        observations = observations.filter {
+            timestamp.timeIntervalSince($0.value.timestamp) <= ConferenceConsentMenuState.visibilityInterval
+        }
+        let previous = observations[callID]
+        observations[callID] = Observation(outcome: outcome, timestamp: timestamp)
+        return previous?.outcome != outcome
+    }
+}
+
+public enum VisibleBlockBoundaryDirection: String, Sendable {
+    case start
+    case end
+}
+
+public struct VisibleBlockBoundaryHit: Equatable, Sendable {
+    public let frameID: FrameID
+    public let timestamp: Date
+
+    public init(frameID: FrameID, timestamp: Date) {
+        self.frameID = frameID
+        self.timestamp = timestamp
+    }
+}
+
+public enum UnexpectedRecordingStopReason: String, Codable, Sendable {
+    case captureStopped = "capture_stopped"
+    case encoderMismatch = "encoder_mismatch"
+    case fileWriteFailed = "file_write_failed"
+    case unreadableWriterStalled = "unreadable_writer_stalled"
+
+    public var description: String {
+        switch self {
+        case .captureStopped:
+            return "Screen capture stopped unexpectedly."
+        case .encoderMismatch:
+            return "The video encoder stopped accepting frames."
+        case .fileWriteFailed:
+            return "Retrace failed to write a recording chunk to disk."
+        case .unreadableWriterStalled:
+            return "A new recording writer never became readable."
+        }
+    }
+}
+
+public struct UnexpectedRecordingStopState: Codable, Equatable, Sendable {
+    public let stoppedAt: Date
+    public let reason: UnexpectedRecordingStopReason
+    public let summary: String
+    public let captureFramesObserved: Int
+    public let deduplicatedFrames: Int
+    public let acceptedFrameCount: Int
+    public let readableFrameCount: Int
+    public let pendingUnreadableFrameCount: Int
+    public let activeWriterCount: Int
+    public let stalledWriterResolution: String?
+    public let stalledWriterVideoID: Int64?
+    public let stalledWriterPendingAgeSeconds: Int?
+
+    public init(
+        stoppedAt: Date,
+        reason: UnexpectedRecordingStopReason,
+        summary: String,
+        captureFramesObserved: Int,
+        deduplicatedFrames: Int,
+        acceptedFrameCount: Int,
+        readableFrameCount: Int,
+        pendingUnreadableFrameCount: Int,
+        activeWriterCount: Int,
+        stalledWriterResolution: String?,
+        stalledWriterVideoID: Int64?,
+        stalledWriterPendingAgeSeconds: Int?
+    ) {
+        self.stoppedAt = stoppedAt
+        self.reason = reason
+        self.summary = summary
+        self.captureFramesObserved = captureFramesObserved
+        self.deduplicatedFrames = deduplicatedFrames
+        self.acceptedFrameCount = acceptedFrameCount
+        self.readableFrameCount = readableFrameCount
+        self.pendingUnreadableFrameCount = pendingUnreadableFrameCount
+        self.activeWriterCount = activeWriterCount
+        self.stalledWriterResolution = stalledWriterResolution
+        self.stalledWriterVideoID = stalledWriterVideoID
+        self.stalledWriterPendingAgeSeconds = stalledWriterPendingAgeSeconds
+    }
+
+    public var signature: String {
+        "\(reason.rawValue)|\(Int64(stoppedAt.timeIntervalSince1970))|\(stalledWriterVideoID ?? -1)"
+    }
+}
+
+/// Snapshot of OCR power settings, used to apply settings immediately without
+/// relying on asynchronous UserDefaults propagation.
+public struct OCRPowerSettingsSnapshot: Sendable {
+    public let ocrEnabled: Bool
+    public let pauseOnBattery: Bool
+    public let pauseOnLowPowerMode: Bool
+    public let processingLevel: Int
+    public let appFilterModeRaw: String
+    public let filteredAppsJSON: String
+    public let autoMaxOCR: Bool
+
+    public init(
+        ocrEnabled: Bool,
+        pauseOnBattery: Bool,
+        pauseOnLowPowerMode: Bool,
+        processingLevel: Int,
+        appFilterModeRaw: String,
+        filteredAppsJSON: String,
+        autoMaxOCR: Bool = false
+    ) {
+        self.ocrEnabled = ocrEnabled
+        self.pauseOnBattery = pauseOnBattery
+        self.pauseOnLowPowerMode = pauseOnLowPowerMode
+        self.processingLevel = processingLevel
+        self.appFilterModeRaw = appFilterModeRaw
+        self.filteredAppsJSON = filteredAppsJSON
+        self.autoMaxOCR = autoMaxOCR
+    }
+
+    public static func fromDefaults(
+        _ defaults: UserDefaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
+    ) -> OCRPowerSettingsSnapshot {
+        OCRPowerSettingsSnapshot(
+            ocrEnabled: defaults.object(forKey: "ocrEnabled") as? Bool ?? true,
+            pauseOnBattery: defaults.bool(forKey: "ocrOnlyWhenPluggedIn"),
+            pauseOnLowPowerMode: defaults.bool(forKey: "ocrPauseInLowPowerMode"),
+            processingLevel: (defaults.object(forKey: "ocrProcessingLevel") as? NSNumber)?.intValue ?? 3,
+            appFilterModeRaw: defaults.string(forKey: "ocrAppFilterMode") ?? "all",
+            filteredAppsJSON: defaults.string(forKey: "ocrFilteredApps") ?? "",
+            autoMaxOCR: defaults.bool(forKey: "autoMaxOCR")
+        )
+    }
+}
+
+private enum SegmentLogSanitizer {
+    static func obfuscatedWindowToken(_ windowName: String?) -> String {
+        guard let normalizedWindowName = windowName?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !normalizedWindowName.isEmpty else {
+            return "none"
+        }
+
+        let digest = SHA256.hash(data: Data(normalizedWindowName.utf8))
+        let token = digest.prefix(6).map { String(format: "%02x", $0) }.joined()
+        return "w_\(token)"
+    }
+}
 
 // MARK: - Thread-Safe Status Holder
 
@@ -130,18 +371,447 @@ public struct TimelineFramePayload: Sendable, Equatable {
     }
 }
 
+/// Best-effort writer for prewarming capture-time timeline stills on disk.
+/// This path is lossy by design: when disk/JPEG work falls behind, we prefer
+/// dropping older pending stills over retaining unbounded raw frame memory.
+actor TimelineStillDiskWriter {
+    struct CleanupPolicy: Sendable {
+        var interval: TimeInterval = 60
+        var maxAge: TimeInterval = 20 * 60
+        var maxBytes: Int64 = 2 * 1024 * 1024 * 1024
+    }
+
+    struct Diagnostics: Sendable {
+        var enqueuedCount = 0
+        var writtenCount = 0
+        var droppedCount = 0
+        var failureCount = 0
+        var terminatedEnqueueCount = 0
+        var cleanupCount = 0
+    }
+
+    private struct WriteRequest: Sendable {
+        let frameID: Int64
+        let frame: CapturedFrame
+    }
+
+    typealias DestinationResolver = @Sendable (Int64) -> URL
+    typealias Encoder = @Sendable (CapturedFrame) throws -> Data
+    typealias WarningLogger = @Sendable (String) -> Void
+    typealias ProcessingStatuses = @Sendable ([Int64]) async throws -> [Int64: Int]
+
+    private let destinationResolver: DestinationResolver
+    private let encoder: Encoder
+    private let warningLogger: WarningLogger
+    private let cleanupPolicy: CleanupPolicy
+    private let processingStatuses: ProcessingStatuses
+    private let stream: AsyncStream<WriteRequest>
+    private let continuation: AsyncStream<WriteRequest>.Continuation
+
+    private var workerTask: Task<Void, Never>?
+    private var cleanupTask: Task<Void, Never>?
+    private var lastCleanupUptime: TimeInterval?
+    private var diagnostics = Diagnostics()
+    private var isClosed = false
+
+    init(
+        bufferLimit: Int,
+        destinationResolver: @escaping DestinationResolver,
+        encoder: @escaping Encoder,
+        warningLogger: @escaping WarningLogger,
+        cleanupPolicy: CleanupPolicy = CleanupPolicy(),
+        processingStatuses: @escaping ProcessingStatuses = { _ in [:] }
+    ) {
+        let (stream, continuation) = AsyncStream<WriteRequest>.makeStream(
+            bufferingPolicy: .bufferingNewest(bufferLimit)
+        )
+        self.destinationResolver = destinationResolver
+        self.encoder = encoder
+        self.warningLogger = warningLogger
+        self.cleanupPolicy = cleanupPolicy
+        self.processingStatuses = processingStatuses
+        self.stream = stream
+        self.continuation = continuation
+    }
+
+    func enqueue(frameID: Int64, frame: CapturedFrame) {
+        guard !isClosed else { return }
+
+        startWorkerIfNeeded()
+        diagnostics.enqueuedCount += 1
+
+        switch continuation.yield(WriteRequest(frameID: frameID, frame: frame)) {
+        case .enqueued:
+            break
+        case .dropped(let droppedRequest):
+            diagnostics.droppedCount += 1
+            if diagnostics.droppedCount == 1 || diagnostics.droppedCount.isMultiple(of: 25) {
+                warningLogger(
+                    "[Timeline-DiskBuffer] Dropped backlogged capture-time still for frame \(droppedRequest.frameID) (dropped=\(diagnostics.droppedCount))"
+                )
+            }
+        case .terminated:
+            diagnostics.terminatedEnqueueCount += 1
+        @unknown default:
+            diagnostics.terminatedEnqueueCount += 1
+        }
+    }
+
+    func shutdown() async {
+        guard !isClosed else {
+            if let workerTask {
+                await workerTask.value
+            }
+            return
+        }
+
+        isClosed = true
+        // A large old cache must not hold shutdown hostage. The sweep checks cancellation
+        // between entries and after every database await; no further sweep can be scheduled.
+        cleanupTask?.cancel()
+        continuation.finish()
+        if let workerTask {
+            await workerTask.value
+            self.workerTask = nil
+        }
+    }
+
+    func diagnosticsSnapshot() -> Diagnostics {
+        diagnostics
+    }
+
+    private func startWorkerIfNeeded() {
+        guard workerTask == nil else { return }
+
+        let stream = self.stream
+        let destinationResolver = self.destinationResolver
+        let encoder = self.encoder
+        let warningLogger = self.warningLogger
+        workerTask = Task.detached(priority: .utility) {
+            for await request in stream {
+                let destinationURL = destinationResolver(request.frameID)
+                do {
+                    let jpegData = try encoder(request.frame)
+                    try FileManager.default.createDirectory(
+                        at: destinationURL.deletingLastPathComponent(),
+                        withIntermediateDirectories: true
+                    )
+                    try jpegData.write(to: destinationURL, options: [.atomic])
+                    await self.recordWriteSuccess(directory: destinationURL.deletingLastPathComponent())
+                } catch {
+                    await self.recordWriteFailure(
+                        frameID: request.frameID,
+                        error: error,
+                        warningLogger: warningLogger
+                    )
+                    // In particular, a full disk must not prevent the cleanup that frees space.
+                    await self.scheduleCleanupIfNeeded(directory: destinationURL.deletingLastPathComponent())
+                }
+            }
+        }
+    }
+
+    private func scheduleCleanupIfNeeded(directory: URL) {
+        guard !isClosed, cleanupTask == nil else { return }
+        let uptime = ProcessInfo.processInfo.systemUptime
+        guard lastCleanupUptime.map({ uptime - $0 >= cleanupPolicy.interval }) ?? true else { return }
+        let policy = cleanupPolicy
+        let statuses = processingStatuses
+        let logger = warningLogger
+        cleanupTask = Task.detached(priority: .background) { [weak self] in
+            await Self.pruneCache(directory: directory, policy: policy, processingStatuses: statuses, warningLogger: logger)
+            await self?.didFinishCleanup()
+        }
+    }
+
+    private func didFinishCleanup() {
+        lastCleanupUptime = ProcessInfo.processInfo.systemUptime
+        cleanupTask = nil
+        diagnostics.cleanupCount += 1
+    }
+
+    private struct CacheEntry {
+        let url: URL
+        let frameID: Int64
+        let modified: Date
+        let bytes: Int64
+    }
+
+    /// The byte budget is best effort: unreadable/unknown frames are protected, even over budget.
+    /// Run independently of the still writer, query bounded batches, and never await this on shutdown.
+    nonisolated private static func pruneCache(
+        directory: URL,
+        policy: CleanupPolicy,
+        processingStatuses: ProcessingStatuses,
+        warningLogger: WarningLogger
+    ) async {
+        let manager = FileManager.default
+        let keys: Set<URLResourceKey> = [.isRegularFileKey, .isSymbolicLinkKey, .contentModificationDateKey, .fileSizeKey]
+        var failureCount = 0
+        guard let files = manager.enumerator(
+            at: directory,
+            includingPropertiesForKeys: Array(keys),
+            options: [.skipsHiddenFiles, .skipsSubdirectoryDescendants],
+            errorHandler: { _, _ in
+                failureCount += 1
+                return !Task.isCancelled
+            }
+        ) else {
+            warningLogger("[Timeline-DiskBuffer] Capture cache cleanup could not enumerate directory")
+            return
+        }
+
+        let cutoff = Date().addingTimeInterval(-policy.maxAge)
+        var retained: [CacheEntry] = []
+        var batch: [CacheEntry] = []
+        var totalBytes: Int64 = 0
+        var protectedBytes: Int64 = 0
+        var removedCount = 0
+        var removedBytes: Int64 = 0
+
+        func remove(_ entry: CacheEntry) -> Bool {
+            guard !Task.isCancelled else { return false }
+            do {
+                // The timeline may atomically replace an old cached image while we await the DB.
+                // Preserve replacements until a later sweep rather than unlinking a fresh preview.
+                var currentURL = entry.url
+                currentURL.removeAllCachedResourceValues()
+                let current = try currentURL.resourceValues(forKeys: keys)
+                guard current.isRegularFile == true, current.isSymbolicLink != true,
+                      current.contentModificationDate == entry.modified,
+                      current.fileSize == Int(entry.bytes) else { return false }
+                try manager.removeItem(at: entry.url)
+                removedCount += 1
+                removedBytes += entry.bytes
+                return true
+            } catch let error as NSError where error.domain == NSCocoaErrorDomain &&
+                (error.code == NSFileNoSuchFileError || error.code == NSFileReadNoSuchFileError) {
+                return true // Timeline cleanup removed it concurrently.
+            } catch {
+                failureCount += 1
+                return false
+            }
+        }
+
+        func processBatch() async throws {
+            try Task.checkCancellation()
+            let statuses = try await processingStatuses(batch.map(\.frameID))
+            try Task.checkCancellation()
+            for entry in batch {
+                try Task.checkCancellation()
+                totalBytes += entry.bytes
+                // Status 4 has no readable video yet. Unknown rows/statuses and in-progress
+                // rewrites are also retained. Lookup failure aborts the sweep without guessing.
+                guard let status = statuses[entry.frameID], [0, 1, 2, 3, 7, 8].contains(status) else {
+                    protectedBytes += entry.bytes
+                    continue
+                }
+                if entry.modified < cutoff, remove(entry) {
+                    totalBytes -= entry.bytes
+                } else {
+                    retained.append(entry)
+                }
+            }
+            batch.removeAll(keepingCapacity: true)
+            await Task.yield()
+        }
+
+        do {
+            for case let url as URL in files {
+                try Task.checkCancellation()
+                guard url.pathExtension == "jpg",
+                      let frameID = Int64(url.deletingPathExtension().lastPathComponent) else { continue }
+                do {
+                    let values = try url.resourceValues(forKeys: keys)
+                    guard values.isRegularFile == true, values.isSymbolicLink != true,
+                          let modified = values.contentModificationDate,
+                          let size = values.fileSize else { continue }
+                    batch.append(CacheEntry(url: url, frameID: frameID, modified: modified, bytes: Int64(size)))
+                } catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError {
+                    continue
+                } catch {
+                    failureCount += 1
+                }
+                if batch.count >= 128 { try await processBatch() }
+            }
+            if !batch.isEmpty { try await processBatch() }
+            try Task.checkCancellation()
+
+            if totalBytes > policy.maxBytes {
+                // Recheck eligibility in bounded batches before size eviction: a rewrite may
+                // have begun since enumeration. Most recent entries are evicted last.
+                let oldestFirst = retained.sorted { $0.modified < $1.modified }
+                for offset in stride(from: 0, to: oldestFirst.count, by: 128) {
+                    guard totalBytes > policy.maxBytes else { break }
+                    try Task.checkCancellation()
+                    let candidates = oldestFirst[offset..<min(offset + 128, oldestFirst.count)]
+                    let statuses = try await processingStatuses(candidates.map(\.frameID))
+                    try Task.checkCancellation()
+                    for entry in candidates {
+                        guard totalBytes > policy.maxBytes else { break }
+                        guard let status = statuses[entry.frameID], [0, 1, 2, 3, 7, 8].contains(status) else { continue }
+                        if remove(entry) { totalBytes -= entry.bytes }
+                    }
+                    await Task.yield()
+                }
+            }
+        } catch is CancellationError {
+            return
+        } catch {
+            warningLogger("[Timeline-DiskBuffer] Capture cache cleanup stopped: \(error); preserving unchecked stills")
+            return
+        }
+        if removedCount > 0 || totalBytes > policy.maxBytes {
+            Log.info("[Timeline-DiskBuffer] Capture cache cleanup removed=\(removedCount) reclaimedBytes=\(removedBytes) remainingBytes=\(totalBytes) protectedBytes=\(protectedBytes)", category: .app)
+        }
+        if failureCount > 0 {
+            warningLogger("[Timeline-DiskBuffer] Capture cache cleanup failures=\(failureCount); will retry on next sweep")
+        }
+    }
+
+    private func recordWriteSuccess(directory: URL) {
+        diagnostics.writtenCount += 1
+        scheduleCleanupIfNeeded(directory: directory)
+    }
+
+    private func recordWriteFailure(
+        frameID: Int64,
+        error: Error,
+        warningLogger: WarningLogger
+    ) {
+        diagnostics.failureCount += 1
+        warningLogger(
+            "[Timeline-DiskBuffer] Failed to persist capture-time still for frame \(frameID): \(error.localizedDescription)"
+        )
+    }
+}
+
 /// Main coordinator that wires all modules together
 /// Implements the core data pipeline: Capture → Storage → Processing → Database → Search
 /// Owner: APP integration
 public actor AppCoordinator {
+    public struct MissingMasterKeyRedactionState: Sendable {
+        public let hasMasterKey: Bool
+        public let phraseLevelRedactionEnabled: Bool
+        public let hasProtectedRedactionData: Bool
+        public let hasPendingRedactionRewrites: Bool
+
+        public init(
+            hasMasterKey: Bool,
+            phraseLevelRedactionEnabled: Bool,
+            hasProtectedRedactionData: Bool,
+            hasPendingRedactionRewrites: Bool
+        ) {
+            self.hasMasterKey = hasMasterKey
+            self.phraseLevelRedactionEnabled = phraseLevelRedactionEnabled
+            self.hasProtectedRedactionData = hasProtectedRedactionData
+            self.hasPendingRedactionRewrites = hasPendingRedactionRewrites
+        }
+
+        public var requiresRecoveryPrompt: Bool {
+            !hasMasterKey && (
+                phraseLevelRedactionEnabled
+                    || hasProtectedRedactionData
+                    || hasPendingRedactionRewrites
+            )
+        }
+    }
+
+    public struct SegmentCommentCreateResult: Sendable {
+        public let comment: SegmentComment
+        public let linkedSegmentIDs: [SegmentID]
+        public let skippedSegmentIDs: [SegmentID]
+        public let failedSegmentIDs: [SegmentID]
+
+        public init(
+            comment: SegmentComment,
+            linkedSegmentIDs: [SegmentID],
+            skippedSegmentIDs: [SegmentID],
+            failedSegmentIDs: [SegmentID]
+        ) {
+            self.comment = comment
+            self.linkedSegmentIDs = linkedSegmentIDs
+            self.skippedSegmentIDs = skippedSegmentIDs
+            self.failedSegmentIDs = failedSegmentIDs
+        }
+    }
+
+    public typealias LinkedSegmentComment = Database.LinkedSegmentComment
+
+    public struct FrameInPageURLRow: Sendable, Equatable {
+        public let order: Int
+        public let url: String
+        public let nodeID: Int
+
+        public init(order: Int, url: String, nodeID: Int) {
+            self.order = order
+            self.url = url
+            self.nodeID = nodeID
+        }
+    }
+
+    public struct FrameInPageURLState: Sendable, Equatable {
+        public let mouseX: Double?
+        public let mouseY: Double?
+        public let scrollX: Double?
+        public let scrollY: Double?
+        public let videoCurrentTime: Double?
+
+        public init(
+            mouseX: Double?,
+            mouseY: Double?,
+            scrollX: Double?,
+            scrollY: Double?,
+            videoCurrentTime: Double?
+        ) {
+            self.mouseX = mouseX
+            self.mouseY = mouseY
+            self.scrollX = scrollX
+            self.scrollY = scrollY
+            self.videoCurrentTime = videoCurrentTime
+        }
+    }
+
+    struct DBStorageSnapshotLogState: Equatable {
+        let localDay: Date
+        let dbBytes: Int64
+        let walBytes: Int64
+        let sampledAt: Date
+    }
+
+    struct DBStorageSnapshotDeltaSummary: Equatable {
+        let dbDeltaBytes: Int64?
+        let walDeltaBytes: Int64?
+    }
+
+    struct UnexpectedRecordingStopWriterSnapshot: Equatable, Sendable {
+        let resolutionKey: String
+        let videoDBID: Int64
+        let frameCount: Int
+        let persistedReadableFrameCount: Int
+        let pendingUnreadableFrameCount: Int
+        let oldestPendingUnreadableAt: Date?
+    }
+
+    struct UnexpectedRecordingStopCounters: Equatable, Sendable {
+        var acceptedFrameCount: Int = 0
+        var readableFrameCount: Int = 0
+        var lastAcceptedFrameAt: Date?
+        var lastReadableFrameAt: Date?
+    }
+
+    struct PendingUnexpectedRecordingStop: Sendable {
+        let reason: UnexpectedRecordingStopReason
+        let summary: String
+        let counters: UnexpectedRecordingStopCounters
+        let writerSnapshots: [UnexpectedRecordingStopWriterSnapshot]
+    }
 
     // MARK: - Properties
 
-    private let services: ServiceContainer
+    private nonisolated let services: ServiceContainer
     private var captureTask: Task<Void, Never>?
-    private var pipelineHealthTask: Task<Void, Never>?
     private var isPipelineLoopActive = false
-    private var lastPipelineRecoveryAttempt = Date.distantPast
     // ⚠️ RELEASE 2 ONLY
     // private var audioTask: Task<Void, Never>?
     private var isRunning = false
@@ -159,12 +829,25 @@ public actor AppCoordinator {
 
     // Idle detection per display
     private var lastFrameTimestampByDisplay: [UInt32: Date] = [:]
+    private struct RecentClosedNilBrowserURLSegment: Sendable {
+        let segmentID: Int64
+        let bundleID: String
+        let normalizedWindowName: String
+        let closedAt: Date
+    }
+
+    private var recentClosedNilBrowserURLSegments: [RecentClosedNilBrowserURLSegment] = []
+    private let recentClosedSegmentBackfillWindowSeconds: TimeInterval = 3.0
+
+    // Idle detection - track last frame timestamp to detect gaps
 
     // Timeline visibility tracking - pause capture when timeline is open
     private var isTimelineVisible = false
+    private var timelineVisibilityGeneration: UInt64 = 0
 
     // Signal to flush pending frames to the OCR queue
     private var shouldFlushPendingFrames = false
+    private var pendingVideoWriterRotationReason: String?
 
     // Permission monitoring - stops recording gracefully if permissions are revoked
     private var permissionMonitorSetup = false
@@ -176,21 +859,82 @@ public actor AppCoordinator {
     private var displayTopologyObserver: NSObjectProtocol?
     private var displaySessionFallbackTask: Task<Void, Never>?
     /// Coalesced cadence for lightweight background maintenance checks (2 minutes).
-    private static let backgroundMaintenanceIntervalNanoseconds: UInt64 = 120_000_000_000
+    private static let displaySessionMaintenanceInterval: Duration = .seconds(120)
+    // Critical crash recovery can start in the background during launch, but capture
+    // start must join the same task so WAL recovery and live writes never overlap.
+    // Best-effort orphaned-frame re-enqueue is deferred to a separate background task.
+    private var crashRecoveryTask: Task<Bool, Error>?
+    private var hasCompletedCrashRecoverySinceLaunch = false
+    private var orphanedFrameRecoveryTask: Task<Void, Never>?
 
     // Periodic task to finalize orphaned videos (processingState stuck at 1)
     private var orphanedVideoCleanupTask: Task<Void, Never>?
+    private var dbStorageSnapshotTask: Task<Void, Never>?
+    private var lastLoggedDBStorageSnapshot: DBStorageSnapshotLogState?
+    private static let pipelineMemoryLogInterval: TimeInterval = 5.0
+    private static let memoryLedgerSummaryIntervalSeconds: TimeInterval = 30
+    private static let memoryLedgerPendingRawFramesTag = "app.capture.pendingRawFrames"
+    private static let memoryLedgerActiveWritersTag = "app.capture.activeWriters"
+    private static let dbStorageSnapshotIntervalNanoseconds: Int64 = 900_000_000_000
+    private static let timelineDiskCacheJPEGCompressionQuality: CGFloat = 0.80
+    private static let timelineStillWriterBufferLimit = 4
+    static let conferenceConsentMenuStateRetentionInterval = ConferenceConsentMenuState.visibilityInterval
+
+    private let timelineStillDiskWriter: TimelineStillDiskWriter
+    private var latestConferenceConsentMenuState: ConferenceConsentMenuState?
+    private var conferenceConsentMenuStateByCallID: [String: ConferenceConsentMenuSelectionCandidate] = [:]
+    private var conferencePrivacyMetricState = ConferencePrivacyMetricState()
+    private var unexpectedRecordingStopState: UnexpectedRecordingStopState?
+    private var hasLoadedUnexpectedRecordingStopState = false
+    private var unexpectedRecordingStopCounters = UnexpectedRecordingStopCounters()
+    private var stalledUnreadableWriterWarningVideoIDs: Set<Int64> = []
+    #if DEBUG
+    private var debugInterruptEncodingOnNextAppend = false
+    #endif
+    private static let unexpectedRecordingStopUnreadableWriterThreshold: TimeInterval = 45
+    private static let unexpectedRecordingStopUnreadableWriterMinimumPendingFrames = 2
 
     // MARK: - Initialization
 
     public init(services: ServiceContainer) {
         self.services = services
+        self.timelineStillDiskWriter = TimelineStillDiskWriter(
+            bufferLimit: Self.timelineStillWriterBufferLimit,
+            destinationResolver: { frameID in
+                Self.timelineDiskFrameBufferURL(for: frameID)
+            },
+            encoder: { frame in
+                try Self.encodeCapturedFrameAsJPEG(frame)
+            },
+            warningLogger: { message in
+                Log.warning(message, category: .app)
+            },
+            processingStatuses: { frameIDs in
+                try await services.database.getFrameProcessingStatuses(frameIDs: frameIDs)
+            }
+        )
         Log.info("AppCoordinator created", category: .app)
     }
 
     /// Convenience initializer with default configuration
     public init() {
-        self.services = ServiceContainer()
+        let services = ServiceContainer()
+        self.services = services
+        self.timelineStillDiskWriter = TimelineStillDiskWriter(
+            bufferLimit: Self.timelineStillWriterBufferLimit,
+            destinationResolver: { frameID in
+                Self.timelineDiskFrameBufferURL(for: frameID)
+            },
+            encoder: { frame in
+                try Self.encodeCapturedFrameAsJPEG(frame)
+            },
+            warningLogger: { message in
+                Log.warning(message, category: .app)
+            },
+            processingStatuses: { frameIDs in
+                try await services.database.getFrameProcessingStatuses(frameIDs: frameIDs)
+            }
+        )
         Log.info("AppCoordinator created with default services", category: .app)
     }
 
@@ -211,28 +955,117 @@ public actor AppCoordinator {
 
     /// Update capture configuration
     public func updateCaptureConfig(_ config: CaptureConfig) async throws {
-        let previousConfig = await services.capture.getConfig()
-        let recordAllDisplaysChanged = previousConfig.recordAllDisplays != config.recordAllDisplays
-
         try await services.capture.updateConfig(config)
+    }
 
-        // CaptureManager recreates its frame stream when recordAllDisplays flips.
-        // Rebind the pipeline consumer so ingestion continues on the new stream.
-        if isRunning && recordAllDisplaysChanged {
-            await restartPipelineConsumer(reason: "recordAllDisplays changed to \(config.recordAllDisplays)")
+    public func updateCaptureConfig(
+        _ transform: @Sendable (CaptureConfig) -> CaptureConfig
+    ) async throws {
+        try await services.capture.updateConfig(transform)
+    }
+
+    public func updateVideoQuality(
+        _ quality: Double,
+        source: String = "settings_capture_card"
+    ) async {
+        let clampedQuality = min(max(quality, 0.0), 1.0)
+        let currentConfig = await services.storage.getVideoEncoderConfig()
+        let currentQuality = Double(currentConfig.quality)
+        guard abs(currentQuality - clampedQuality) > 0.0001 else { return }
+
+        let newConfig = VideoEncoderConfig(
+            codec: currentConfig.codec,
+            targetBitrate: currentConfig.targetBitrate,
+            keyframeInterval: currentConfig.keyframeInterval,
+            useHardwareEncoder: currentConfig.useHardwareEncoder,
+            quality: Float(clampedQuality)
+        )
+
+        await services.storage.updateVideoEncoderConfig(newConfig)
+        await recordVideoQualityMetricIfNeeded(
+            quality: clampedQuality,
+            source: source,
+            isRunning: isRunning
+        )
+
+        if isRunning {
+            pendingVideoWriterRotationReason = "video_quality_update"
+            Log.info(
+                "[AppCoordinator] Video quality updated to \(clampedQuality); active video writers will rotate on the next frame",
+                category: .app
+            )
+        } else {
+            Log.info("[AppCoordinator] Video quality updated to \(clampedQuality)", category: .app)
         }
+    }
+
+    private static func privateRedactionTracePreview(_ value: String?, limit: Int = 180) -> String {
+        guard let value else { return "nil" }
+
+        let collapsed = value
+            .split(whereSeparator: { $0.isWhitespace })
+            .map(String.init)
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !collapsed.isEmpty else { return "(empty)" }
+        if collapsed.count <= limit {
+            return collapsed
+        }
+        return String(collapsed.prefix(limit)) + "..."
     }
 
     // MARK: - Timeline Visibility
 
     /// Set whether the timeline is currently visible (pauses frame processing when true)
-    public func setTimelineVisible(_ visible: Bool) {
+    public func setTimelineVisible(_ visible: Bool, generation: UInt64? = nil) async {
+        guard Self.shouldApplyTimelineVisibilityUpdate(
+            incomingGeneration: generation,
+            currentGeneration: timelineVisibilityGeneration
+        ) else {
+            Log.debug(
+                "[AppCoordinator] Ignoring stale timeline visibility update visible=\(visible) generation=\(generation.map(String.init) ?? "nil") currentGeneration=\(timelineVisibilityGeneration)",
+                category: .app
+            )
+            return
+        }
+
+        if let generation {
+            timelineVisibilityGeneration = generation
+        } else {
+            timelineVisibilityGeneration &+= 1
+        }
+
         isTimelineVisible = visible
         // When timeline becomes visible, signal to flush any buffered frames to OCR queue
         if visible {
             shouldFlushPendingFrames = true
         }
-        Log.info("Timeline visibility changed: \(visible) - frame processing \(visible ? "paused" : "resumed")", category: .app)
+        if let queue = await services.processingQueue {
+            await queue.setTimelineVisibleForRewriteScheduling(visible)
+        }
+    }
+
+    nonisolated static func shouldApplyTimelineVisibilityUpdate(
+        incomingGeneration: UInt64?,
+        currentGeneration: UInt64
+    ) -> Bool {
+        guard let incomingGeneration else { return true }
+        return incomingGeneration > currentGeneration
+    }
+
+    public func setTimelineScrubbing(_ scrubbing: Bool) async {
+        if let queue = await services.processingQueue {
+            await queue.setTimelineScrubbingForRewriteScheduling(scrubbing)
+        }
+    }
+
+    /// Release cached AVFoundation decode state after timeline/search teardown.
+    public func purgeVideoDecodingCaches(reason: String) async {
+        await services.storage.purgeFrameExtractionCaches(reason: reason)
+        if let adapter = await services.dataAdapter {
+            await adapter.purgeFrameExtractionCaches(reason: reason)
+        }
     }
 
     // MARK: - Lifecycle
@@ -242,13 +1075,16 @@ public actor AppCoordinator {
         Log.info("Initializing AppCoordinator...", category: .app)
         try await services.initialize()
 
-        // Run crash recovery from WAL in background (non-blocking)
-        Task {
-            do {
-                try await recoverFromCrash()
-            } catch {
-                Log.error("[AppCoordinator] Background crash recovery failed", category: .app, error: error)
-            }
+        if await services.storage.isWALReady() {
+            _ = scheduleCrashRecoveryIfNeeded(
+                skipOnboardingCheck: false,
+                logFailures: true
+            )
+        } else {
+            Log.warning(
+                "[AppCoordinator] Skipping crash recovery because WAL storage is currently unavailable",
+                category: .app
+            )
         }
 
         Log.info("AppCoordinator initialized successfully", category: .app)
@@ -256,21 +1092,102 @@ public actor AppCoordinator {
         // Apply power-aware OCR settings
         await applyPowerSettings()
 
-        // Start periodic orphaned video cleanup (coalesced on 2-minute maintenance cadence)
+        // Start periodic orphaned video cleanup (runs every 10 minutes)
         startOrphanedVideoCleanup()
+        await recordDBStorageSnapshot(reason: "initialize")
+        startDBStorageSnapshotTask()
 
         // Log auto-start state for debugging
         let shouldAutoStart = Self.shouldAutoStartRecording()
         Log.info("Auto-start recording check: shouldAutoStartRecording=\(shouldAutoStart)", category: .app)
     }
 
-    /// Recover frames from write-ahead log (WAL) after a crash
-    private func recoverFromCrash() async throws {
+    func runCrashRecoveryForTesting() async throws {
+        _ = scheduleCrashRecoveryIfNeeded(
+            skipOnboardingCheck: true,
+            logFailures: false
+        )
+        _ = try await awaitCrashRecoveryIfNeeded()
+    }
+
+    @discardableResult
+    func scheduleCrashRecoveryIfNeeded(
+        skipOnboardingCheck: Bool,
+        logFailures: Bool
+    ) -> Bool {
+        guard crashRecoveryTask == nil else {
+            return false
+        }
+
+        let task = Task { [self] in
+            try await performCrashRecovery(skipOnboardingCheck: skipOnboardingCheck)
+        }
+        crashRecoveryTask = task
+
+        if logFailures {
+            Task {
+                do {
+                    _ = try await task.value
+                } catch {
+                    Log.error("[AppCoordinator] Background crash recovery failed", category: .app, error: error)
+                }
+            }
+        }
+
+        return true
+    }
+
+    @discardableResult
+    func awaitCrashRecoveryIfNeeded() async throws -> Bool {
+        guard let task = crashRecoveryTask else {
+            return hasCompletedCrashRecoverySinceLaunch
+        }
+
+        defer {
+            crashRecoveryTask = nil
+        }
+
+        let didRun = try await task.value
+        if didRun {
+            hasCompletedCrashRecoverySinceLaunch = true
+        }
+        return didRun
+    }
+
+    func prepareForPipelineStart() async throws {
+        try await services.storage.validateCaptureReadiness()
+        try await runCrashRecoveryBeforePipelineStartIfNeeded()
+    }
+
+    private func runCrashRecoveryBeforePipelineStartIfNeeded() async throws {
+        guard !hasCompletedCrashRecoverySinceLaunch, await services.storage.isWALReady() else {
+            return
+        }
+
+        _ = scheduleCrashRecoveryIfNeeded(
+            skipOnboardingCheck: false,
+            logFailures: true
+        )
+        let didRunRecovery = try await awaitCrashRecoveryIfNeeded()
+
+        if !didRunRecovery, !hasCompletedCrashRecoverySinceLaunch, await services.storage.isWALReady() {
+            _ = scheduleCrashRecoveryIfNeeded(
+                skipOnboardingCheck: false,
+                logFailures: true
+            )
+            _ = try await awaitCrashRecoveryIfNeeded()
+        }
+    }
+
+    private func performCrashRecovery(skipOnboardingCheck: Bool) async throws -> Bool {
         // Skip crash recovery during first launch (onboarding) - there's nothing to recover
         // and the database may not be fully ready yet
-        guard await services.onboardingManager.hasCompletedOnboarding else {
-            Log.info("Skipping crash recovery during onboarding (first launch)", category: .app)
-            return
+        if !skipOnboardingCheck {
+            let hasCompletedOnboarding = await services.onboardingManager.hasCompletedOnboarding
+            guard hasCompletedOnboarding else {
+                Log.info("Skipping crash recovery during onboarding (first launch)", category: .app)
+                return false
+            }
         }
 
         Log.info("Checking for crash recovery...", category: .app)
@@ -278,16 +1195,14 @@ public actor AppCoordinator {
         // Cast to concrete StorageManager to access WAL
         guard let storageManager = services.storage as? StorageManager else {
             Log.warning("Storage not using WAL-enabled StorageManager, skipping recovery", category: .app)
-            return
+            return false
         }
 
         let walManager = await storageManager.getWALManager()
         let recoveryManager = RecoveryManager(
             walManager: walManager,
             storage: services.storage,
-            database: services.database,
-            processing: services.processing,
-            search: services.search
+            database: services.database
         )
 
         // Set callback for enqueueing recovered frames
@@ -302,10 +1217,17 @@ public actor AppCoordinator {
         // Finalize any orphaned videos (processingState=1 but no active WAL session)
         // This cleans up videos left unfinalised due to dev restarts or crashes
         let activeWALSessions = try await walManager.listActiveSessions()
-        let activeVideoIDs = Set(activeWALSessions.map { $0.videoID.value })
-        let orphanedVideosFinalized = try await services.database.finalizeOrphanedVideos(activeVideoIDs: activeVideoIDs)
-        if orphanedVideosFinalized > 0 {
-            Log.warning("[Recovery] Finalized \(orphanedVideosFinalized) orphaned videos (processingState was stuck at 1)", category: .app)
+        let activeVideoIDs = try await resolveActiveDatabaseVideoIDs(from: activeWALSessions)
+        if !activeWALSessions.isEmpty && activeVideoIDs.isEmpty {
+            Log.warning(
+                "[Recovery] Skipping orphan video finalization: \(activeWALSessions.count) active WAL sessions but no matching unfinalised DB video IDs",
+                category: .app
+            )
+        } else {
+            let orphanedVideosFinalized = try await services.database.finalizeOrphanedVideos(activeVideoIDs: activeVideoIDs)
+            if orphanedVideosFinalized > 0 {
+                Log.warning("[Recovery] Finalized \(orphanedVideosFinalized) orphaned videos (processingState was stuck at 1)", category: .app)
+            }
         }
 
         // Re-enqueue frames that were processing during crash
@@ -319,9 +1241,30 @@ public actor AppCoordinator {
             Log.info("No crash recovery needed", category: .app)
         }
 
-        // Re-enqueue orphaned frames (processingStatus=0 but not in queue)
-        // These are frames that were captured but never enqueued due to app restart
-        await reEnqueueOrphanedFrames()
+        // Re-enqueueing pending frames that were never queued is best-effort work and
+        // should not hold startup-critical readers behind a long anti-join.
+        scheduleOrphanedFrameRecoveryIfNeeded()
+        return true
+    }
+
+    private func scheduleOrphanedFrameRecoveryIfNeeded() {
+        guard orphanedFrameRecoveryTask == nil else { return }
+
+        orphanedFrameRecoveryTask = Task.detached(priority: .background) { [weak self] in
+            await self?.reEnqueueOrphanedFrames()
+            await self?.clearOrphanedFrameRecoveryTask()
+        }
+
+        Log.info("[ORPHAN-RECOVERY] Scheduled background orphaned-frame re-enqueue", category: .app)
+    }
+
+    private func clearOrphanedFrameRecoveryTask() {
+        orphanedFrameRecoveryTask = nil
+    }
+
+    private func stopOrphanedFrameRecovery() {
+        orphanedFrameRecoveryTask?.cancel()
+        orphanedFrameRecoveryTask = nil
     }
 
     /// Re-enqueue frames that have processingStatus=0 but are not in the processing queue
@@ -333,34 +1276,37 @@ public actor AppCoordinator {
         }
 
         do {
-            let orphanedCount = try await services.database.countPendingFramesNotInQueue()
-            if orphanedCount == 0 {
-                Log.info("[ORPHAN-RECOVERY] No orphaned frames found", category: .app)
-                return
-            }
-
-            Log.info("[ORPHAN-RECOVERY] Found \(orphanedCount) orphaned frames (pending but not in queue)", category: .app)
-
-            // Process in batches to avoid memory issues
             let batchSize = 500
             var totalEnqueued = 0
+            var hasLoggedDiscovery = false
 
             while true {
+                guard !Task.isCancelled else {
+                    Log.info("[ORPHAN-RECOVERY] Background orphaned-frame re-enqueue cancelled", category: .app)
+                    return
+                }
+
                 let frameIDs = try await services.database.getPendingFrameIDsNotInQueue(limit: batchSize)
                 if frameIDs.isEmpty {
                     break
                 }
 
-                for frameID in frameIDs {
-                    // Enqueue without frame data (will extract from video)
-                    try await queue.enqueue(frameID: frameID, priority: -1) // Low priority so new frames process first
+                if !hasLoggedDiscovery {
+                    Log.info("[ORPHAN-RECOVERY] Found orphaned frames; starting background re-enqueue", category: .app)
+                    hasLoggedDiscovery = true
                 }
 
+                try await queue.enqueueBatch(frameIDs: frameIDs, priority: -1)
                 totalEnqueued += frameIDs.count
-                Log.info("[ORPHAN-RECOVERY] Enqueued batch of \(frameIDs.count) frames (total: \(totalEnqueued)/\(orphanedCount))", category: .app)
+                Log.info("[ORPHAN-RECOVERY] Enqueued batch of \(frameIDs.count) frames (total: \(totalEnqueued))", category: .app)
 
-                // Small delay between batches to avoid overwhelming the queue
-                try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+                // Small delay between batches to avoid overwhelming the queue.
+                try? await Task.sleep(for: .nanoseconds(Int64(100_000_000)), clock: .continuous) // 100ms
+            }
+
+            if totalEnqueued == 0 {
+                Log.info("[ORPHAN-RECOVERY] No orphaned frames found", category: .app)
+                return
             }
 
             Log.info("[ORPHAN-RECOVERY] Completed - enqueued \(totalEnqueued) orphaned frames for OCR processing", category: .app)
@@ -381,6 +1327,15 @@ public actor AppCoordinator {
         await services.setRewindSourceEnabled(enabled)
     }
 
+    @discardableResult
+    public func refreshRewindCutoffDate() async -> Bool {
+        await services.refreshRewindCutoffDate()
+    }
+
+    public func latestRewindFrameDate() async -> Date? {
+        await services.latestRewindFrameDate()
+    }
+
     /// Setup callback for accessibility permission warnings
     public func setupAccessibilityWarningCallback(_ callback: @escaping @Sendable () -> Void) async {
         services.capture.onAccessibilityPermissionWarning = callback
@@ -389,8 +1344,11 @@ public actor AppCoordinator {
     // MARK: - Recording State Persistence
 
     private static let recordingStateKey = "shouldAutoStartRecording"
+    private static let unexpectedRecordingStopStateStorageKey = "unexpectedRecordingStopState"
+    private static let phraseLevelRedactionEnabledKey = "phraseLevelRedactionEnabled"
+    private static let abandonedMissingMasterKeyRewritePurpose = "redaction_missing_master_key_abandoned"
     /// Use a fixed suite name so it works regardless of how the app is launched (swift build vs .app bundle)
-    private static let userDefaultsSuite = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+    private static let userDefaultsSuite = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
 
     /// Save recording state to UserDefaults for persistence across app restarts
     private nonisolated func saveRecordingState(_ isRecording: Bool) {
@@ -398,6 +1356,113 @@ public actor AppCoordinator {
         Self.userDefaultsSuite.synchronize()  // Force immediate write to disk
         Log.debug("[AppCoordinator] saveRecordingState(\(isRecording)) - saved to UserDefaults", category: .app)
     }
+
+    private func loadUnexpectedRecordingStopStateIfNeeded() {
+        guard !hasLoadedUnexpectedRecordingStopState else { return }
+        hasLoadedUnexpectedRecordingStopState = true
+
+        guard let data = Self.userDefaultsSuite.data(
+            forKey: Self.unexpectedRecordingStopStateStorageKey
+        ) else {
+            unexpectedRecordingStopState = nil
+            return
+        }
+
+        do {
+            unexpectedRecordingStopState = try JSONDecoder().decode(
+                UnexpectedRecordingStopState.self,
+                from: data
+            )
+        } catch {
+            unexpectedRecordingStopState = nil
+            Self.userDefaultsSuite.removeObject(
+                forKey: Self.unexpectedRecordingStopStateStorageKey
+            )
+            Self.userDefaultsSuite.synchronize()
+            Log.warning(
+                "[RECORDING-STOP] Failed to decode persisted unexpected-stop state: \(error.localizedDescription)",
+                category: .app
+            )
+        }
+    }
+
+    private func persistUnexpectedRecordingStopState(_ state: UnexpectedRecordingStopState?) {
+        hasLoadedUnexpectedRecordingStopState = true
+        unexpectedRecordingStopState = state
+
+        if let state {
+            do {
+                let data = try JSONEncoder().encode(state)
+                Self.userDefaultsSuite.set(
+                    data,
+                    forKey: Self.unexpectedRecordingStopStateStorageKey
+                )
+            } catch {
+                Log.warning(
+                    "[RECORDING-STOP] Failed to persist unexpected-stop state: \(error.localizedDescription)",
+                    category: .app
+                )
+            }
+        } else {
+            Self.userDefaultsSuite.removeObject(
+                forKey: Self.unexpectedRecordingStopStateStorageKey
+            )
+        }
+
+        Self.userDefaultsSuite.synchronize()
+    }
+
+    public func getUnexpectedRecordingStopState() -> UnexpectedRecordingStopState? {
+        loadUnexpectedRecordingStopStateIfNeeded()
+        return unexpectedRecordingStopState
+    }
+
+    public func clearUnexpectedRecordingStopState() {
+        persistUnexpectedRecordingStopState(nil)
+    }
+
+    #if DEBUG
+    public func debugInterruptCapturePipeline() async {
+        guard isRunning else {
+            Log.warning(
+                "[RECORDING-STOP][DEBUG] Ignored capture interruption request because recording is already off",
+                category: .app
+            )
+            return
+        }
+
+        Log.warning(
+            "[RECORDING-STOP][DEBUG] Interrupting capture underneath the coordinator to exercise unexpected-stop detection",
+            category: .app
+        )
+
+        do {
+            try await services.capture.stopCapture()
+        } catch {
+            Log.error(
+                "[RECORDING-STOP][DEBUG] Failed to interrupt capture for testing",
+                category: .app,
+                error: error
+            )
+        }
+    }
+
+    public func debugInterruptEncodingPipeline() {
+        guard isRunning else {
+            Log.warning(
+                "[RECORDING-STOP][DEBUG] Ignored encoder interruption request because recording is already off",
+                category: .app
+            )
+            return
+        }
+
+        debugInterruptEncodingOnNextAppend = true
+        Log.warning(
+            "[RECORDING-STOP][DEBUG] Armed encoder interruption for the next frame append to exercise writer failure handling",
+            category: .app
+        )
+    }
+    #endif
 
     /// Check if recording should auto-start based on previous state
     public nonisolated static func shouldAutoStartRecording() -> Bool {
@@ -408,6 +1473,12 @@ public actor AppCoordinator {
 
     /// Start the capture pipeline
     public func startPipeline() async throws {
+        if !isRunning, let existingCaptureTask = captureTask {
+            Log.info("[RECORDING-STOP] Waiting for previous pipeline cleanup before starting capture again", category: .app)
+            await existingCaptureTask.value
+            captureTask = nil
+        }
+
         guard !isRunning else {
             Log.warning("Pipeline already running", category: .app)
             return
@@ -415,16 +1486,39 @@ public actor AppCoordinator {
 
         Log.info("Starting capture pipeline...", category: .app)
 
-        // Check permissions first
+        // Join any in-flight crash recovery and ensure WAL writes are available
+        // before we start capture.
+        try await prepareForPipelineStart()
+
+        // Check permissions before starting capture
         guard await services.capture.hasPermission() else {
             Log.error("Screen recording permission not granted", category: .app)
             throw AppError.permissionDenied(permission: "screen recording")
         }
 
-        // Set up callback for when capture stops unexpectedly (e.g., user clicks "Stop sharing")
-        services.capture.onCaptureStopped = { [weak self] in
-            guard let self = self else { return }
-            await self.handleCaptureStopped()
+        services.capture.onCaptureStopped = nil
+        services.capture.onCaptureObserved = { timestamp, trigger in
+            await MainActor.run {
+                NotificationCenter.default.post(
+                    name: CaptureObservedNotification.didObserve,
+                    object: nil,
+                    userInfo: [
+                        "timestamp": timestamp,
+                        "trigger": trigger
+                    ]
+                )
+            }
+        }
+        services.capture.onMouseClickCaptureOutcome = { [weak self] outcome, timestamp in
+            guard let self else { return }
+            await self.recordMouseClickCaptureMetricIfNeeded(
+                outcome: outcome,
+                timestamp: timestamp
+            )
+        }
+        await services.capture.setOnConferenceFramePrivacyEvent { [weak self] event in
+            guard let self else { return }
+            await self.updateConferenceConsentMenuState(with: event)
         }
 
         // Start screen capture
@@ -443,10 +1537,13 @@ public actor AppCoordinator {
         isRunning = true
         pipelineStartTime = Date()
         statusHolder.update(isRunning: true, startTime: pipelineStartTime)
+        resetUnexpectedRecordingProgressTracking()
+        #if DEBUG
+        debugInterruptEncodingOnNextAppend = false
+        #endif
         captureTask = Task {
             await runPipeline()
         }
-        startPipelineHealthMonitoring()
         // ⚠️ RELEASE 2 ONLY
         // audioTask = Task {
         //     await runAudioPipeline()
@@ -460,8 +1557,9 @@ public actor AppCoordinator {
 
         // Start unified storage health monitoring (disk space, I/O latency, volume events, keep-alive)
         startStorageHealthNotifications()
+        let storageRoot = await services.storage.getStorageDirectory().path
         StorageHealthMonitor.shared.startMonitoring(
-            storagePath: AppPaths.expandedStorageRoot,
+            storagePath: storageRoot,
             onCriticalError: { [weak self] in
                 await self?.handleStorageCriticalError()
             }
@@ -481,16 +1579,7 @@ public actor AppCoordinator {
 
         Log.info("Stopping capture pipeline...", category: .app)
 
-        // Stop display topology monitoring first to avoid recording transient events during shutdown.
-        await stopDisplaySegmentMonitoring()
-
-        // Stop permission monitoring
-        await stopPermissionMonitoring()
-        stopPipelineHealthMonitoring()
-
-        // Stop storage health monitoring
-        StorageHealthMonitor.shared.stopMonitoring()
-        stopStorageHealthNotifications()
+        await suspendPipelineInfrastructure()
 
         // Stop screen capture
         try await services.capture.stopCapture()
@@ -499,37 +1588,55 @@ public actor AppCoordinator {
         // // Stop audio capture
         // try await services.audioCapture.stopCapture()
 
-        // Cancel pipeline tasks
+        finalizePipelineStopped(persistState: persistState, clearCaptureTask: true)
+
+        Log.info("Capture pipeline stopped successfully", category: .app)
+    }
+
+    private func suspendPipelineInfrastructure() async {
+        await stopDisplaySegmentMonitoring()
+        _ = try? await services.database.closeAllOpenDisplaySegments(disconnectedAt: Date())
+        await stopPermissionMonitoring()
+        let storageRoot = await services.storage.getStorageDirectory().path
+        StorageHealthMonitor.shared.startMonitoring(
+            storagePath: storageRoot,
+            onCriticalError: nil
+        )
+    }
+
+    private func finalizePipelineStopped(
+        persistState: Bool,
+        clearCaptureTask: Bool
+    ) {
         captureTask?.cancel()
-        captureTask = nil
+        if clearCaptureTask {
+            captureTask = nil
+        }
         // ⚠️ RELEASE 2 ONLY
         // audioTask?.cancel()
         // audioTask = nil
-
-        // Wait for processing queue to drain
-        await services.processing.waitForQueueDrain()
-        // Audio processing drains automatically when stream ends
+        #if DEBUG
+        debugInterruptEncodingOnNextAppend = false
+        #endif
 
         isRunning = false
         statusHolder.update(isRunning: false)
+        latestConferenceConsentMenuState = nil
+        conferenceConsentMenuStateByCallID.removeAll()
+        conferencePrivacyMetricState = ConferencePrivacyMetricState()
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(
+                name: ConferenceConsentStateNotification.didChange,
+                object: nil,
+                userInfo: [:]
+            )
+        }
 
-        // Only save recording state as stopped if explicitly requested (user clicked stop)
-        // During shutdown, we want to preserve the "recording" state so it auto-starts next launch
         if persistState {
             saveRecordingState(false)
         }
 
-        // Close any open display segments when recording stops.
-        do {
-            let closedCount = try await services.database.closeAllOpenDisplaySegments(disconnectedAt: Date())
-            if closedCount > 0 {
-                Log.info("[DisplaySession] Closed \(closedCount) open display segment(s) on pipeline stop", category: .app)
-            }
-        } catch {
-            Log.error("[DisplaySession] Failed to close open display segments on stop: \(error)", category: .app)
-        }
-
-        Log.info("Capture pipeline stopped successfully", category: .app)
+        resetUnexpectedRecordingProgressTracking()
     }
 
     // MARK: - Storage Health Notifications
@@ -563,59 +1670,6 @@ public actor AppCoordinator {
         try? await stopPipeline()
     }
 
-    // MARK: - Pipeline Health Monitoring
-
-    private func startPipelineHealthMonitoring() {
-        pipelineHealthTask?.cancel()
-        pipelineHealthTask = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 5_000_000_000)
-                guard let self = self else { return }
-                await self.checkPipelineHealth()
-            }
-        }
-        Log.info("[AppCoordinator] Pipeline health monitor started", category: .app)
-    }
-
-    private func stopPipelineHealthMonitoring() {
-        pipelineHealthTask?.cancel()
-        pipelineHealthTask = nil
-        Log.info("[AppCoordinator] Pipeline health monitor stopped", category: .app)
-    }
-
-    private func checkPipelineHealth() async {
-        guard isRunning else { return }
-
-        let captureIsActive = await services.capture.isCapturing
-        guard captureIsActive else { return }
-
-        // A running loop may be idle waiting on the stream; that's healthy.
-        guard !isPipelineLoopActive else { return }
-
-        let now = Date()
-        guard now.timeIntervalSince(lastPipelineRecoveryAttempt) >= 5 else { return }
-        lastPipelineRecoveryAttempt = now
-
-        Log.error(
-            "[AppCoordinator] Capture is ON but pipeline loop is inactive. Restarting pipeline consumer.",
-            category: .app
-        )
-        await restartPipelineConsumer(reason: "health watchdog recovery")
-    }
-
-    private func restartPipelineConsumer(reason: String) async {
-        if let existingTask = captureTask {
-            await existingTask.value
-        }
-
-        guard isRunning else { return }
-
-        captureTask = Task {
-            await runPipeline()
-        }
-        Log.info("[AppCoordinator] Restarted pipeline consumer (\(reason))", category: .app)
-    }
-
     /// Shutdown all services
     public func shutdown() async throws {
         if isRunning {
@@ -624,7 +1678,13 @@ public actor AppCoordinator {
         }
 
         // Stop periodic cleanup tasks
+        stopOrphanedFrameRecovery()
         stopOrphanedVideoCleanup()
+        stopDBStorageSnapshotTask()
+        await recordDBStorageSnapshot(reason: "shutdown")
+        await timelineStillDiskWriter.shutdown()
+        stopStorageHealthNotifications()
+        StorageHealthMonitor.shared.stopMonitoring()
 
         Log.info("Shutting down AppCoordinator...", category: .app)
         try await services.shutdown()
@@ -636,15 +1696,28 @@ public actor AppCoordinator {
     /// Apply power-aware OCR settings to the processing queue
     /// Called on startup, when settings change, and when power source changes
     public func applyPowerSettings() async {
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let snapshot = OCRPowerSettingsSnapshot.fromDefaults()
+        await applyPowerSettings(snapshot: snapshot)
+    }
 
-        // Get OCR enabled state (defaults to true if not set)
-        let ocrEnabled = defaults.object(forKey: "ocrEnabled") as? Bool ?? true
-        let pauseOnBattery = defaults.bool(forKey: "ocrOnlyWhenPluggedIn")
-        let maxFPS = defaults.double(forKey: "ocrMaxFramesPerSecond")
+    /// Apply power-aware OCR settings from an explicit snapshot.
+    /// This path avoids races where UserDefaults writes are not immediately visible.
+    public func applyPowerSettings(snapshot: OCRPowerSettingsSnapshot) async {
+        let ocrEnabled = snapshot.ocrEnabled
+        let pauseOnBattery = snapshot.pauseOnBattery
+        let pauseOnLowPowerMode = snapshot.pauseOnLowPowerMode
+        let processingLevel = min(max(snapshot.processingLevel, 1), 5)
+        let powerSource = PowerStateMonitor.shared.getCurrentPowerSource()
+
+        // Optionally override the selected OCR level to Max whenever the Mac is on AC power.
+        var effectiveProcessingLevel = processingLevel
+        if snapshot.autoMaxOCR && powerSource == .ac {
+            effectiveProcessingLevel = 5
+            Log.info("[AppCoordinator] Plugged-in Max OCR active — boosting to level 5", category: .app)
+        }
 
         // Parse app filter mode and filtered apps
-        let filterModeRaw = defaults.string(forKey: "ocrAppFilterMode") ?? "all"
+        let filterModeRaw = snapshot.appFilterModeRaw
         let filterMode = OCRAppFilterMode(rawValue: filterModeRaw) ?? .allApps
 
         var excludedBundleIDs: Set<String> = []
@@ -654,9 +1727,9 @@ public actor AppCoordinator {
         struct FilteredAppInfo: Codable {
             let bundleID: String
         }
-        let appsString = defaults.string(forKey: "ocrFilteredApps") ?? ""
-        Log.info("[AppCoordinator] Raw ocrFilteredApps from UserDefaults: '\(appsString)'", category: .app)
-        Log.info("[AppCoordinator] Raw ocrAppFilterMode from UserDefaults: '\(filterModeRaw)'", category: .app)
+        let appsString = snapshot.filteredAppsJSON
+        Log.info("[AppCoordinator] Raw ocrFilteredApps from snapshot: '\(appsString)'", category: .app)
+        Log.info("[AppCoordinator] Raw ocrAppFilterMode from snapshot: '\(filterModeRaw)'", category: .app)
 
         if !appsString.isEmpty,
            let data = appsString.data(using: .utf8),
@@ -678,16 +1751,55 @@ public actor AppCoordinator {
             Log.info("[AppCoordinator] No filtered apps configured or failed to parse", category: .app)
         }
 
-        // Get current power source
-        let powerSource = PowerStateMonitor.shared.getCurrentPowerSource()
+        let isLowPowerModeEnabled = ProcessInfo.processInfo.isLowPowerModeEnabled
+
+        // Derive priority, FPS limit, and worker count from processing level
+        // Level 1: Efficiency  - background, 0.5 FPS, 1 worker
+        // Level 2: Light       - background, no limit, 2 workers
+        // Level 3: Balanced    - utility, no limit, 1 worker
+        // Level 4: Performance - medium, no limit, 1 worker
+        // Level 5: Max         - high, no limit, 2 workers
+        let taskPriority: TaskPriority
+        let maxFPS: Double
+        let workerCount: Int
+        switch effectiveProcessingLevel {
+        case 1:
+            taskPriority = .background; maxFPS = 0.5; workerCount = 1
+        case 2:
+            taskPriority = .background; maxFPS = 0; workerCount = 2
+        case 4:
+            taskPriority = .medium; maxFPS = 0; workerCount = 1
+        case 5:
+            taskPriority = .high; maxFPS = 0; workerCount = 2
+        default: // 3 = Balanced (default)
+            taskPriority = .utility; maxFPS = 0; workerCount = 1
+        }
+
+        // Update processing config - always prefer background processing for VNRecognizeTextRequest
+        let currentConfig = await services.processing.getConfig()
+        let preferBackground = true
+        if currentConfig.preferBackgroundProcessing != preferBackground {
+            let updatedConfig = ProcessingConfig(
+                accessibilityEnabled: currentConfig.accessibilityEnabled,
+                ocrAccuracyLevel: currentConfig.ocrAccuracyLevel,
+                recognitionLanguages: currentConfig.recognitionLanguages,
+                minimumConfidence: currentConfig.minimumConfidence,
+                preferBackgroundProcessing: preferBackground
+            )
+            await services.processing.updateConfig(updatedConfig)
+        }
 
         // Apply to processing queue
         if let queue = await services.processingQueue {
             await queue.updatePowerConfig(
                 ocrEnabled: ocrEnabled,
                 pauseOnBattery: pauseOnBattery,
+                pauseOnLowPowerMode: pauseOnLowPowerMode,
+                isLowPowerModeEnabled: isLowPowerModeEnabled,
                 currentPowerSource: powerSource,
                 maxFPS: maxFPS,
+                workerCount: workerCount,
+                taskPriority: taskPriority,
                 excludedBundleIDs: excludedBundleIDs,
                 includedBundleIDs: includedBundleIDs
             )
@@ -695,36 +1807,10 @@ public actor AppCoordinator {
             Log.warning("[AppCoordinator] processingQueue is nil, cannot apply power config", category: .app)
         }
 
-        Log.info("[AppCoordinator] Applied power settings: ocrEnabled=\(ocrEnabled), pauseOnBattery=\(pauseOnBattery), maxFPS=\(maxFPS), power=\(powerSource), filterMode=\(filterMode), excluded=\(excludedBundleIDs), included=\(includedBundleIDs)", category: .app)
-    }
-
-    /// Handle capture stopped unexpectedly (e.g., user clicked "Stop sharing" in macOS)
-    private func handleCaptureStopped() async {
-        guard isRunning else { return }
-
-        Log.info("Capture stopped unexpectedly, cleaning up pipeline...", category: .app)
-
-        // Cancel pipeline tasks
-        captureTask?.cancel()
-        captureTask = nil
-
-        // Wait for processing queue to drain
-        await services.processing.waitForQueueDrain()
-
-        isRunning = false
-        statusHolder.update(isRunning: false)
-
-        await stopDisplaySegmentMonitoring()
-        do {
-            let closedCount = try await services.database.closeAllOpenDisplaySegments(disconnectedAt: Date())
-            if closedCount > 0 {
-                Log.info("[DisplaySession] Closed \(closedCount) open display segment(s) after unexpected capture stop", category: .app)
-            }
-        } catch {
-            Log.error("[DisplaySession] Failed to close display segments after unexpected capture stop: \(error)", category: .app)
-        }
-
-        Log.info("Pipeline cleanup complete after unexpected stop", category: .app)
+        Log.info(
+            "[AppCoordinator] Applied power settings: ocrEnabled=\(ocrEnabled), level=\(processingLevel), workers=\(workerCount), priority=\(taskPriority), maxFPS=\(maxFPS), preferBgProcessing=\(preferBackground), pauseOnBattery=\(pauseOnBattery), pauseOnLowPowerMode=\(pauseOnLowPowerMode), isLowPowerModeEnabled=\(isLowPowerModeEnabled), power=\(powerSource)",
+            category: .app
+        )
     }
 
     // MARK: - Display Session Monitoring
@@ -764,7 +1850,7 @@ public actor AppCoordinator {
         displaySessionFallbackTask = Task { [weak self] in
             guard let self = self else { return }
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: Self.backgroundMaintenanceIntervalNanoseconds)
+                try? await Task.sleep(for: Self.displaySessionMaintenanceInterval, clock: .continuous)
                 guard !Task.isCancelled else { break }
                 await self.reconcileDisplaySegments(reason: "fallback-2m")
             }
@@ -777,6 +1863,61 @@ public actor AppCoordinator {
         displaySessionFallbackTask = nil
     }
 
+    @MainActor
+    private func runtimeDisplayName(for displayID: UInt32) -> String? {
+        for screen in NSScreen.screens {
+            guard
+                let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber,
+                screenNumber.uint32Value == displayID
+            else {
+                continue
+            }
+
+            let localized = screen.localizedName.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !localized.isEmpty else { return nil }
+
+            if CGDisplayIsBuiltin(CGDirectDisplayID(displayID)) != 0 {
+                if let hostName = Host.current().localizedName?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !hostName.isEmpty {
+                    return hostName
+                }
+            }
+
+            return localized
+        }
+        return nil
+    }
+
+    /// Convert runtime CGDirectDisplayID into a stable hardware-derived ID for persistence.
+    /// `displayID` columns keep their name, but this value is stable across runtime ID reuse.
+    private func stableDisplayID(forRuntimeDisplayID runtimeDisplayID: UInt32) -> UInt32 {
+        let cgDisplayID = CGDirectDisplayID(runtimeDisplayID)
+        let vendor = CGDisplayVendorNumber(cgDisplayID)
+        let model = CGDisplayModelNumber(cgDisplayID)
+        let serial = CGDisplaySerialNumber(cgDisplayID)
+
+        let fingerprint: String
+        if vendor == 0 && model == 0 && serial == 0 {
+            fingerprint = "runtime:\(runtimeDisplayID)"
+        } else if serial != 0 {
+            fingerprint = "\(vendor):\(model):\(serial)"
+        } else {
+            let width = CGDisplayPixelsWide(cgDisplayID)
+            let height = CGDisplayPixelsHigh(cgDisplayID)
+            fingerprint = "\(vendor):\(model):\(width)x\(height)"
+        }
+
+        var hash: UInt32 = 2_166_136_261
+        for byte in fingerprint.utf8 {
+            hash ^= UInt32(byte)
+            hash = hash &* 16_777_619
+        }
+
+        // Keep IDs Int32-compatible because persistence code still binds/reads displayID as Int32.
+        let int32SafeHash = hash & 0x7FFF_FFFF
+        return int32SafeHash == 0 ? 1 : int32SafeHash
+    }
+
     private func reconcileDisplaySegments(reason: String) async {
         guard isRunning else { return }
 
@@ -787,8 +1928,9 @@ public actor AppCoordinator {
             let openDisplayIDs = Set(try await services.database.getOpenDisplaySegmentIDs())
 
             for display in displays {
-                let stableDisplayID = stableDisplayID(forRuntimeDisplayID: display.id)
-                let name = runtimeDisplayName(for: display.id) ??
+                let stableDisplayID = self.stableDisplayID(forRuntimeDisplayID: display.id)
+                let runtimeName = await runtimeDisplayName(for: display.id)
+                let name = runtimeName ??
                     display.name.flatMap { $0.isEmpty ? nil : $0 } ??
                     "Display \(display.id)"
                 try await services.database.upsertDisplayName(
@@ -868,6 +2010,18 @@ public actor AppCoordinator {
             }
         }
 
+        PermissionMonitor.shared.onListenEventAccessGranted = { [weak self] in
+            guard let self else { return }
+            Log.info("[AppCoordinator] Listen-event access granted - retrying mouse click capture monitoring", category: .app)
+            await self.services.capture.retryMouseClickMonitoringIfNeeded()
+        }
+
+        PermissionMonitor.shared.onListenEventAccessRevoked = { [weak self] in
+            guard let self else { return }
+            Log.warning("[AppCoordinator] Listen-event access revoked - suspending mouse click capture monitoring", category: .app)
+            await self.services.capture.suspendMouseClickMonitoringForPermissionLoss()
+        }
+
         // Start the periodic permission check
         await PermissionMonitor.shared.startMonitoring()
         Log.info("[AppCoordinator] Permission monitoring started", category: .app)
@@ -883,28 +2037,93 @@ public actor AppCoordinator {
     // MARK: - Orphaned Video Cleanup
 
     /// Start periodic cleanup of orphaned videos (processingState stuck at 1)
-    /// Runs on the coalesced 2-minute maintenance cadence
+    /// Runs every 10 minutes after startup recovery to catch videos that weren't finalized properly
     private func startOrphanedVideoCleanup() {
         orphanedVideoCleanupTask?.cancel()
 
         orphanedVideoCleanupTask = Task { [weak self] in
-            let cleanupInterval = Self.backgroundMaintenanceIntervalNanoseconds
+            let cleanupInterval: UInt64 = 600_000_000_000 // 10 minutes
 
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: cleanupInterval)
+                try? await Task.sleep(for: .nanoseconds(Int64(cleanupInterval)), clock: .continuous)
                 guard !Task.isCancelled else { break }
 
                 await self?.cleanupOrphanedVideos()
             }
         }
 
-        Log.info("[AppCoordinator] Orphaned video cleanup task started (120s interval)", category: .app)
+        Log.info("[AppCoordinator] Orphaned video cleanup task started (10 minute interval)", category: .app)
     }
 
     /// Stop the orphaned video cleanup task
     private func stopOrphanedVideoCleanup() {
         orphanedVideoCleanupTask?.cancel()
         orphanedVideoCleanupTask = nil
+    }
+
+    // MARK: - DB Storage Snapshot Sampling
+
+    private func startDBStorageSnapshotTask() {
+        dbStorageSnapshotTask?.cancel()
+
+        dbStorageSnapshotTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(
+                    for: .nanoseconds(Self.dbStorageSnapshotIntervalNanoseconds),
+                    clock: .continuous
+                )
+                guard !Task.isCancelled else { break }
+
+                await self?.recordDBStorageSnapshot(reason: "periodic")
+            }
+        }
+
+        Log.info("[AppCoordinator] DB storage snapshot task started (15 minute interval)", category: .app)
+    }
+
+    private func stopDBStorageSnapshotTask() {
+        dbStorageSnapshotTask?.cancel()
+        dbStorageSnapshotTask = nil
+    }
+
+    private func recordDBStorageSnapshot(reason: String) async {
+        do {
+            try await services.database.recordDBStorageSnapshot()
+            if let snapshot = try await currentDBStorageSnapshotLogState() {
+                let deltaSummary = Self.dbStorageSnapshotDeltaSummary(
+                    current: snapshot,
+                    previous: lastLoggedDBStorageSnapshot
+                )
+                lastLoggedDBStorageSnapshot = snapshot
+                Log.info(
+                    Self.dbStorageSnapshotLogMessage(
+                        snapshot: snapshot,
+                        deltaSummary: deltaSummary,
+                        reason: reason
+                    ),
+                    category: .app
+                )
+            } else {
+                Log.debug("[AppCoordinator] Recorded DB storage snapshot (\(reason))", category: .app)
+            }
+        } catch {
+            Log.warning("[AppCoordinator] Failed to record DB storage snapshot (\(reason)): \(error)", category: .app)
+        }
+    }
+
+    private func currentDBStorageSnapshotLogState() async throws -> DBStorageSnapshotLogState? {
+        let calendar = Calendar.current
+        let today = calendar.startOfDay(for: Date())
+        let snapshots = try await services.database.getDBStorageSnapshots(from: today, to: today)
+        guard let snapshot = snapshots.last else {
+            return nil
+        }
+        return DBStorageSnapshotLogState(
+            localDay: calendar.startOfDay(for: snapshot.date),
+            dbBytes: snapshot.dbBytes,
+            walBytes: snapshot.walBytes,
+            sampledAt: snapshot.sampledAt
+        )
     }
 
     /// Finalize any orphaned videos that have processingState=1 but no active WAL session
@@ -917,7 +2136,15 @@ public actor AppCoordinator {
 
             let walManager = await storageManager.getWALManager()
             let activeWALSessions = try await walManager.listActiveSessions()
-            let activeVideoIDs = Set(activeWALSessions.map { $0.videoID.value })
+            let activeVideoIDs = try await resolveActiveDatabaseVideoIDs(from: activeWALSessions)
+
+            if !activeWALSessions.isEmpty && activeVideoIDs.isEmpty {
+                Log.warning(
+                    "[OrphanCleanup] Skipping orphan finalization: \(activeWALSessions.count) active WAL sessions but no matching unfinalised DB video IDs",
+                    category: .app
+                )
+                return
+            }
 
             let orphanedCount = try await services.database.finalizeOrphanedVideos(activeVideoIDs: activeVideoIDs)
             if orphanedCount > 0 {
@@ -928,14 +2155,49 @@ public actor AppCoordinator {
         }
     }
 
+    /// Map active WAL session path IDs to active DB video IDs.
+    /// WAL sessions are keyed by timestamp-based path IDs, while `video.id` is DB autoincrement.
+    func resolveActiveDatabaseVideoIDs(from activeWALSessions: [WALSession]) async throws -> Set<Int64> {
+        guard !activeWALSessions.isEmpty else { return [] }
+
+        let activeWALPathIDs = Set(activeWALSessions.map { $0.videoID.value })
+        let unfinalisedVideos = try await services.database.getAllUnfinalisedVideos()
+
+        var activeDBVideoIDs: Set<Int64> = []
+        var matchedWALPathIDs: Set<Int64> = []
+
+        for video in unfinalisedVideos {
+            guard let pathID = pathVideoID(for: video.relativePath)?.value else { continue }
+            if activeWALPathIDs.contains(pathID) {
+                activeDBVideoIDs.insert(video.id)
+                matchedWALPathIDs.insert(pathID)
+            }
+        }
+
+        let unmatchedWALPathIDs = activeWALPathIDs.subtracting(matchedWALPathIDs)
+        if !unmatchedWALPathIDs.isEmpty {
+            let sample = unmatchedWALPathIDs
+                .sorted()
+                .prefix(3)
+                .map(String.init)
+                .joined(separator: ", ")
+            Log.warning(
+                "[OrphanCleanup] \(unmatchedWALPathIDs.count) active WAL sessions had no matching unfinalised DB video path IDs (sample: \(sample))",
+                category: .app
+            )
+        }
+
+        return activeDBVideoIDs
+    }
+
     // MARK: - Pipeline Implementation
 
-    /// Buffered frame entry - stores both the frame ID and captured frame data
+    /// Buffered frame entry - tracks frames pending readability confirmation
     private struct BufferedFrame {
         let frameID: Int64
-        let capturedFrame: CapturedFrame
         /// The frame's index in the video segment (0-based)
         let frameIndexInSegment: Int
+        let acceptedAt: Date
     }
 
     /// State for tracking a video writer by display + resolution
@@ -944,6 +2206,7 @@ public actor AppCoordinator {
         var videoDBID: Int64
         var frameCount: Int
         var isReadable: Bool
+        var persistedReadableFrameCount: Int
         /// Buffer for frames waiting to be confirmed flushed to disk before marking readable
         var pendingFrames: [BufferedFrame]
         var width: Int
@@ -953,29 +2216,60 @@ public actor AppCoordinator {
     }
 
     /// Main pipeline: Capture → Storage → Processing → Database → Search
-    /// Uses Rewind-style multi-resolution video writing
-    private func runPipeline() async {
-        guard !isPipelineLoopActive else {
-            Log.warning("[AppCoordinator] runPipeline() requested while loop already active; ignoring duplicate request", category: .app)
-            return
-        }
-
+    /// Uses Rewind-style multi-resolution video writing. Injected streams let regression
+    /// tests exercise the real writer/database path without capture permissions, shared
+    /// preview-cache writes, or persisted stop notifications.
+    func runPipeline(
+        frameStream suppliedFrameStream: AsyncStream<CapturedFrame>? = nil,
+        cacheCapturedStills: Bool = true,
+        reportUnexpectedStops: Bool = true
+    ) async {
+        guard !isPipelineLoopActive else { return }
         isPipelineLoopActive = true
         defer { isPipelineLoopActive = false }
-
         Log.info("Pipeline processing started", category: .app)
 
-        let frameStream = await services.capture.frameStream
+        let frameStream: AsyncStream<CapturedFrame>
+        if let suppliedFrameStream { frameStream = suppliedFrameStream }
+        else { frameStream = await services.capture.frameStream }
         var writersByResolution: [String: VideoWriterState] = [:]
+        var pendingUnexpectedStop: PendingUnexpectedRecordingStop?
+        var lastPipelineMemoryLogAt = Date.distantPast
+        stalledUnreadableWriterWarningVideoIDs.removeAll()
         let maxFramesPerSegment = 150
         let videoUpdateInterval = 5
+
+        func maybeLogPipelineMemory(reason: String) {
+            let now = Date()
+            guard now.timeIntervalSince(lastPipelineMemoryLogAt) >= Self.pipelineMemoryLogInterval else { return }
+            lastPipelineMemoryLogAt = now
+            logPipelineMemorySnapshot(writersByResolution: writersByResolution, reason: reason)
+        }
+
+        func requestUnexpectedStop(
+            reason: UnexpectedRecordingStopReason,
+            summary: String
+        ) {
+            guard pendingUnexpectedStop == nil else { return }
+            pendingUnexpectedStop = PendingUnexpectedRecordingStop(
+                reason: reason,
+                summary: summary,
+                counters: unexpectedRecordingStopCounters,
+                writerSnapshots: Self.unexpectedRecordingStopWriterSnapshots(
+                    from: writersByResolution
+                )
+            )
+        }
+
         for await frame in frameStream {
-            Log.debug("[Pipeline] Received frame from stream: \(frame.width)x\(frame.height), app=\(frame.metadata.appName)", category: .app)
+            Log.verbose("[Pipeline] Received frame from stream: \(frame.width)x\(frame.height), app=\(frame.metadata.appName)", category: .app)
 
             if Task.isCancelled {
                 Log.info("Pipeline task cancelled", category: .app)
                 break
             }
+
+            await rotateActiveVideoWritersIfNeeded(&writersByResolution)
 
             // Skip frames entirely when loginwindow is frontmost (lock screen, login, etc.)
             if frame.metadata.appBundleID == "com.apple.loginwindow" {
@@ -988,18 +2282,15 @@ public actor AppCoordinator {
                 if shouldFlushPendingFrames {
                     shouldFlushPendingFrames = false
                     if let processingQueue = await services.processingQueue {
-                        for (resKey, state) in writersByResolution {
+                        for (_, state) in writersByResolution {
                             let pendingCount = state.pendingFrames.count
                             if pendingCount > 0 {
-                                Log.info("[FLUSH] Timeline opened - enqueueing \(pendingCount) pending frames for OCR (keeping in buffer for later readable marking)", category: .app)
-                                // Enqueue frames for OCR (uses cached pixel data, not video file)
-                                // DON'T clear pendingFrames - they still need to be marked readable later
-                                // when the fragment actually flushes to disk
+                                Log.info("[FLUSH] Timeline opened - enqueueing \(pendingCount) pending frames for OCR", category: .app)
+                                // DON'T clear pendingFrames here - they still need to be marked readable
+                                // when the fragment actually flushes to disk.
                                 for bufferedFrame in state.pendingFrames {
-                                    try? await processingQueue.enqueue(frameID: bufferedFrame.frameID, capturedFrame: bufferedFrame.capturedFrame)
+                                    try? await processingQueue.enqueue(frameID: bufferedFrame.frameID)
                                 }
-                                // Note: NOT clearing pendingFrames here - frames will be marked readable
-                                // when flushedCount catches up in the normal pipeline flow
                             }
                         }
                     }
@@ -1010,15 +2301,15 @@ public actor AppCoordinator {
             do {
                 // Key by displayID + resolution to prevent two same-resolution displays from sharing a video file
                 let displayID = frame.metadata.displayID
-                let writerKey = "\(displayID)_\(frame.width)x\(frame.height)"
+                let resolutionKey = "\(displayID)_\(frame.width)x\(frame.height)"
                 var writerState: VideoWriterState
 
-                if var existingState = writersByResolution[writerKey] {
+                if var existingState = writersByResolution[resolutionKey] {
                     if existingState.frameCount >= maxFramesPerSegment {
                         try await finalizeWriter(&existingState, processingQueue: await services.processingQueue)
-                        writersByResolution.removeValue(forKey: writerKey)
+                        writersByResolution.removeValue(forKey: resolutionKey)
                         writerState = try await createNewWriterState(width: frame.width, height: frame.height, displayID: displayID)
-                        writersByResolution[writerKey] = writerState
+                        writersByResolution[resolutionKey] = writerState
                     } else {
                         writerState = existingState
                     }
@@ -1028,21 +2319,25 @@ public actor AppCoordinator {
                         displayID: displayID,
                         width: frame.width,
                         height: frame.height
-                    ) {
-                        Log.info("Resuming unfinalised video \(unfinalised.id) for display \(displayID) resolution \(frame.width)x\(frame.height)", category: .app)
-                        writerState = try await resumeWriterState(from: unfinalised)
-                    } else if displayID == 0, let unfinalised = try await services.database.getUnfinalisedVideoByResolution(
-                        width: frame.width,
-                        height: frame.height
-                    ) {
-                        // Legacy fallback for displayID=0
-                        Log.info("Resuming unfinalised video \(unfinalised.id) for resolution \(frame.width)x\(frame.height) (legacy)", category: .app)
+                    ), try await shouldResumeUnfinalisedVideo(unfinalised) {
+                        Log.info("Resuming unfinalised video \(unfinalised.id) for display \(displayID)", category: .app)
                         writerState = try await resumeWriterState(from: unfinalised)
                     } else {
                         writerState = try await createNewWriterState(width: frame.width, height: frame.height, displayID: displayID)
                     }
-                    writersByResolution[writerKey] = writerState
+                    writersByResolution[resolutionKey] = writerState
                 }
+
+                #if DEBUG
+                if debugInterruptEncodingOnNextAppend {
+                    debugInterruptEncodingOnNextAppend = false
+                    Log.warning(
+                        "[RECORDING-STOP][DEBUG] Interrupting active writer before append videoDBID=\(writerState.videoDBID) resolution=\(resolutionKey)",
+                        category: .app
+                    )
+                    await cancelBrokenWriterPreservingRecoveryData(writerState.writer)
+                }
+                #endif
 
                 try await writerState.writer.appendFrame(frame)
 
@@ -1050,13 +2345,23 @@ public actor AppCoordinator {
                 // This detects if the encoder silently failed or auto-finalized
                 let actualEncoderFrameCount = await writerState.writer.frameCount
                 if actualEncoderFrameCount != writerState.frameCount + 1 {
-                    Log.error("[ENCODER-MISMATCH] Encoder frame count (\(actualEncoderFrameCount)) != expected (\(writerState.frameCount + 1)) - encoder may have failed/finalized. Removing broken writer for videoDBID=\(writerState.videoDBID), key=\(writerKey)", category: .app)
-                    try? await writerState.writer.cancel()
-                    writersByResolution.removeValue(forKey: writerKey)
-                    continue
+                    let summary =
+                        "Encoder frame count \(actualEncoderFrameCount) did not match expected \(writerState.frameCount + 1) " +
+                        "for videoDBID=\(writerState.videoDBID) at \(resolutionKey)."
+                    Log.error("[ENCODER-MISMATCH] \(summary)", category: .app)
+                    requestUnexpectedStop(
+                        reason: .encoderMismatch,
+                        summary: summary
+                    )
+                    await cancelBrokenWriterPreservingRecoveryData(writerState.writer)
+                    writersByResolution.removeValue(forKey: resolutionKey)
+                    break
                 }
 
                 writerState.frameCount += 1
+                // Encoding already succeeded. Preserve its count and pending work even
+                // when a later metadata/readability/enqueue operation throws.
+                defer { writersByResolution[resolutionKey] = writerState }
 
                 if writerState.width == 0 {
                     writerState.width = await writerState.writer.frameWidth
@@ -1065,7 +2370,7 @@ public actor AppCoordinator {
 
                 guard let appSegmentID = try await trackSessionChange(frame: frame) else {
                     Log.warning("No segment available for frame insertion (display=\(frame.metadata.displayID))", category: .app)
-                    writersByResolution[writerKey] = writerState
+                    writersByResolution[resolutionKey] = writerState
                     continue
                 }
 
@@ -1079,10 +2384,46 @@ public actor AppCoordinator {
                     metadata: frame.metadata,
                     source: .native
                 )
-                let frameID = try await services.database.insertFrame(frameRef)
+                let frameID = try await services.database.insertFrame(frameRef, accessibilitySnapshot: frame.accessibilitySnapshot)
+                let acceptedAt = Date()
+                recordAcceptedFrameProgress(at: acceptedAt)
+                await persistGlobalMousePositionIfNeeded(
+                    frameID: frameID,
+                    capturedFrame: frame
+                )
+                if cacheCapturedStills {
+                    await writeCapturedFrameStillToTimelineDiskCache(frameID: frameID, frame: frame)
+                }
+                scheduleInPageURLMetadataCaptureIfNeeded(
+                    frameID: frameID,
+                    frameMetadata: frame.metadata
+                )
 
-                Log.info(
-                    "[CAPTURE-INGEST] Successful capture + frame insert: frameID=\(frameID), videoDBID=\(writerState.videoDBID), frameIndexInSegment=\(frameIndexInSegment), size=\(frame.width)x\(frame.height), displayID=\(frame.metadata.displayID), app=\(frame.metadata.appName ?? "unknown")",
+                // Persist WAL mapping for exact frameID -> raw frame lookup while segment is unfinalized.
+                if let storageManager = services.storage as? StorageManager {
+                    let walVideoID = await writerState.writer.segmentID
+                    let walManager = await storageManager.getWALManager()
+                    do {
+                        try await walManager.registerFrameID(
+                            videoID: walVideoID,
+                            frameID: frameID,
+                            frameIndex: frameIndexInSegment
+                        )
+                    } catch {
+                        Log.warning(
+                            "[WAL] Failed to register frameID mapping for frame \(frameID) (video \(walVideoID.value), index \(frameIndexInSegment)): \(error)",
+                            category: .app
+                        )
+                    }
+                }
+
+                let appNameForLog = frame.metadata.appName ?? "nil"
+                let appBundleIDForLog = frame.metadata.appBundleID ?? "nil"
+                let windowNameForLog = Self.privateRedactionTracePreview(frame.metadata.windowName)
+                let redactionReasonForLog = frame.metadata.redactionReason ?? "none"
+
+                Log.verbose(
+                    "[CAPTURE-DEBUG] Captured frameID=\(frameID), videoDBID=\(writerState.videoDBID), frameIndexInSegment=\(frameIndexInSegment), bundleID=\(appBundleIDForLog), app=\(appNameForLog), window=\(windowNameForLog), redactionReason=\(redactionReasonForLog)",
                     category: .app
                 )
 
@@ -1101,12 +2442,16 @@ public actor AppCoordinator {
 
                 guard let processingQueue = await services.processingQueue else {
                     Log.error("Processing queue not initialized", category: .app)
-                    writersByResolution[writerKey] = writerState
+                    writersByResolution[resolutionKey] = writerState
                     continue
                 }
 
-                // Create buffered frame entry with both ID, raw pixel data, and frame index
-                let bufferedFrame = BufferedFrame(frameID: frameID, capturedFrame: frame, frameIndexInSegment: frameIndexInSegment)
+                // Track frame in pending buffer until it's confirmed flushed/readable.
+                let bufferedFrame = BufferedFrame(
+                    frameID: frameID,
+                    frameIndexInSegment: frameIndexInSegment,
+                    acceptedAt: acceptedAt
+                )
 
                 // Add frame to the pending buffer
                 writerState.pendingFrames.append(bufferedFrame)
@@ -1115,7 +2460,7 @@ public actor AppCoordinator {
                 if !writerState.isReadable {
                     writerState.isReadable = await writerState.writer.hasFragmentWritten
                     if writerState.isReadable {
-                        Log.info("First video fragment written for \(writerKey) - frames now readable from disk", category: .app)
+                        Log.info("First video fragment written for \(resolutionKey) - frames now readable from disk", category: .app)
                     }
                 }
 
@@ -1126,25 +2471,61 @@ public actor AppCoordinator {
                 // Mark frames as readable and enqueue for OCR if they've been flushed to disk
                 while let firstFrame = writerState.pendingFrames.first,
                       firstFrame.frameIndexInSegment < flushedCount {
-                    let frameToEnqueue = writerState.pendingFrames.removeFirst()
-                    // DEBUG: Log to file when marking readable
-                    let debugMsg = "[READABLE] frameID=\(frameToEnqueue.frameID) frameIndex=\(frameToEnqueue.frameIndexInSegment) flushedCount=\(flushedCount) videoDBID=\(writerState.videoDBID) writerFrameCount=\(writerState.frameCount)\n"
-                    if let data = debugMsg.data(using: .utf8) {
-                        let fileHandle = FileHandle(forWritingAtPath: "/tmp/retrace_debug.log") ?? {
-                            FileManager.default.createFile(atPath: "/tmp/retrace_debug.log", contents: nil)
-                            return FileHandle(forWritingAtPath: "/tmp/retrace_debug.log")!
-                        }()
-                        fileHandle.seekToEndOfFile()
-                        fileHandle.write(data)
-                        fileHandle.closeFile()
-                    }
-                    // Mark frame as readable now that it's confirmed flushed to video file
+                    let frameToEnqueue = firstFrame
+                    // Keep pending work until both database operations succeed.
                     try await services.database.markFrameReadable(frameID: frameToEnqueue.frameID)
-                    // Pass the original captured frame pixels directly to OCR
-                    try await processingQueue.enqueue(frameID: frameToEnqueue.frameID, capturedFrame: frameToEnqueue.capturedFrame)
+                    try await processingQueue.enqueue(frameID: frameToEnqueue.frameID)
+                    recordReadableFrameProgress(at: Date())
+                    writerState.pendingFrames.removeFirst()
                 }
 
-                writersByResolution[writerKey] = writerState
+                if flushedCount > writerState.persistedReadableFrameCount {
+                    let storageManager = services.storage
+                    let walVideoID = await writerState.writer.segmentID
+                    let walManager = await storageManager.getWALManager()
+                    let durableFileSizeBytes: Int64
+                    if let incrementalWriter = writerState.writer as? IncrementalSegmentWriter {
+                        durableFileSizeBytes = await incrementalWriter.durableFileSizeBytes
+                    } else {
+                        durableFileSizeBytes = await writerState.writer.currentFileSize
+                    }
+
+                    do {
+                        try await walManager.updateDurableVideoState(
+                            videoID: walVideoID,
+                            readableFrameCount: flushedCount,
+                            durableVideoFileSizeBytes: durableFileSizeBytes
+                        )
+                        writerState.persistedReadableFrameCount = flushedCount
+                    } catch {
+                        Log.warning(
+                            "[WAL] Failed to persist durable video frontier for video \(walVideoID.value) at flushedCount=\(flushedCount): \(error)",
+                            category: .app
+                        )
+                    }
+                }
+
+                writersByResolution[resolutionKey] = writerState
+                if let stalledWriter = Self.stalledUnreadableWriter(
+                    in: Self.unexpectedRecordingStopWriterSnapshots(from: writersByResolution),
+                    now: Date()
+                ) {
+                    let activeVideoIDs = Set(writersByResolution.values.map(\.videoDBID))
+                    stalledUnreadableWriterWarningVideoIDs.formIntersection(activeVideoIDs)
+                    if !stalledUnreadableWriterWarningVideoIDs.contains(stalledWriter.videoDBID) {
+                        let pendingAgeSeconds = stalledWriter.oldestPendingUnreadableAt.map {
+                            max(0, Int(Date().timeIntervalSince($0)))
+                        } ?? 0
+                        Log.warning(
+                            "[Pipeline] Writer remains unreadable videoDBID=\(stalledWriter.videoDBID) resolution=\(stalledWriter.resolutionKey) " +
+                                "pendingAgeSeconds=\(pendingAgeSeconds) pendingUnreadableFrames=\(stalledWriter.pendingUnreadableFrameCount); " +
+                                "keeping writer active because at least one other writer is readable.",
+                            category: .app
+                        )
+                        stalledUnreadableWriterWarningVideoIDs.insert(stalledWriter.videoDBID)
+                    }
+                }
+                maybeLogPipelineMemory(reason: "steady-state")
                 totalFramesProcessed += 1
                 statusHolder.incrementFrames()
 
@@ -1157,13 +2538,35 @@ public actor AppCoordinator {
                 statusHolder.incrementErrors()
                 Log.error("[Pipeline] Error processing frame", category: .app, error: error)
 
-                // If it's a file write failure, the writer is broken - remove it so a fresh one is created
+                if case .insufficientDiskSpace = error {
+                    Task { @MainActor in
+                        NotificationCenter.default.post(
+                            name: .storageCriticalLow,
+                            object: ["availableGB": 0.0, "shouldStop": true]
+                        )
+                    }
+                    Task { [weak self] in
+                        await self?.handleStorageCriticalError()
+                    }
+                    continue
+                }
+
+                // File write failures mean the active writer is no longer trustworthy.
+                // Stop recording instead of pretending capture is still healthy.
                 if case .fileWriteFailed = error {
-                    let errorWriterKey = "\(frame.metadata.displayID)_\(frame.width)x\(frame.height)"
-                    if let brokenWriter = writersByResolution[errorWriterKey] {
-                        Log.warning("Removing broken writer for \(errorWriterKey) due to write failure - will create fresh writer", category: .app)
-                        try? await brokenWriter.writer.cancel()
-                        writersByResolution.removeValue(forKey: errorWriterKey)
+                    let resolutionKey = "\(frame.metadata.displayID)_\(frame.width)x\(frame.height)"
+                    if let brokenWriter = writersByResolution[resolutionKey] {
+                        let summary =
+                            "File write failed for videoDBID=\(brokenWriter.videoDBID) at \(resolutionKey). " +
+                            "Recording was turned off to avoid claiming capture is healthy."
+                        Log.error("[RECORDING-STOP] \(summary)", category: .app)
+                        requestUnexpectedStop(
+                            reason: .fileWriteFailed,
+                            summary: summary
+                        )
+                        await cancelBrokenWriterPreservingRecoveryData(brokenWriter.writer)
+                        writersByResolution.removeValue(forKey: resolutionKey)
+                        break
                     }
                 }
                 continue
@@ -1174,6 +2577,41 @@ public actor AppCoordinator {
                 continue
             }
         }
+
+        if pendingUnexpectedStop == nil {
+            let captureIsActiveAfterPipeline = await services.capture.isCapturing
+            if Self.shouldTreatCaptureTerminationAsUnexpected(
+                isRunning: isRunning,
+                taskWasCancelled: Task.isCancelled,
+                isCaptureActive: captureIsActiveAfterPipeline
+            ) {
+                requestUnexpectedStop(
+                    reason: .captureStopped,
+                    summary: captureInactiveUnexpectedStopSummary(
+                        source: "frame_stream_ended",
+                        writerSnapshots: Self.unexpectedRecordingStopWriterSnapshots(
+                            from: writersByResolution
+                        )
+                    )
+                )
+            }
+        }
+
+        if pendingUnexpectedStop != nil {
+            await suspendPipelineInfrastructure()
+            if await services.capture.isCapturing {
+                do {
+                    try await services.capture.stopCapture()
+                } catch {
+                    Log.warning(
+                        "[RECORDING-STOP] Capture stop during unexpected-stop cleanup failed: \(error.localizedDescription)",
+                        category: .app
+                    )
+                }
+            }
+        }
+
+        logPipelineMemorySnapshot(writersByResolution: writersByResolution, reason: "pipeline-ending")
 
         // Save and finalize all remaining writers
         for (resolutionKey, var writerState) in writersByResolution {
@@ -1194,7 +2632,328 @@ public actor AppCoordinator {
         currentSegmentIDsByDisplay.removeAll()
         lastFrameTimestampByDisplay.removeAll()
 
+        if let pendingUnexpectedStop, reportUnexpectedStops {
+            let state = await recordUnexpectedRecordingStop(pendingUnexpectedStop)
+            finalizePipelineStopped(persistState: true, clearCaptureTask: false)
+            await MainActor.run {
+                NotificationCenter.default.post(
+                    name: RecordingUnexpectedStopNotification.didStop,
+                    object: state
+                )
+            }
+        }
+
         Log.info("Pipeline processing completed. Total frames: \(totalFramesProcessed), Errors: \(totalErrors)", category: .app)
+        captureTask = nil
+    }
+
+    private func rotateActiveVideoWritersIfNeeded(
+        _ writersByResolution: inout [String: VideoWriterState]
+    ) async {
+        guard let reason = pendingVideoWriterRotationReason else { return }
+        pendingVideoWriterRotationReason = nil
+
+        guard !writersByResolution.isEmpty else {
+            Log.info("[Pipeline] No active video writers to rotate for \(reason)", category: .app)
+            return
+        }
+
+        let processingQueue = await services.processingQueue
+
+        for (resolutionKey, var writerState) in writersByResolution {
+            do {
+                try await finalizeWriter(&writerState, processingQueue: processingQueue)
+                Log.info("[Pipeline] Rotated video writer for \(resolutionKey) due to \(reason)", category: .app)
+            } catch {
+                Log.error(
+                    "[Pipeline] Failed to rotate video writer for \(resolutionKey) due to \(reason)",
+                    category: .app,
+                    error: error
+                )
+                await cancelBrokenWriterPreservingRecoveryData(writerState.writer)
+            }
+        }
+
+        writersByResolution.removeAll()
+    }
+
+    private func logPipelineMemorySnapshot(writersByResolution: [String: VideoWriterState], reason: String) {
+        var totalPendingFrames = 0
+        var totalPendingBytes: Int64 = 0
+        var perResolutionParts: [String] = []
+
+        for (resolutionKey, writerState) in writersByResolution {
+            let pendingFrames = writerState.pendingFrames.count
+            guard pendingFrames > 0 else { continue }
+
+            let pendingBytes: Int64 = 0
+            totalPendingFrames += pendingFrames
+            totalPendingBytes += pendingBytes
+            perResolutionParts.append("\(resolutionKey):\(pendingFrames)f/\(Self.formatBytes(pendingBytes))")
+        }
+
+        let perResolutionSummary = perResolutionParts.isEmpty ? "none" : perResolutionParts.sorted().joined(separator: ", ")
+
+        Log.info(
+            "[Pipeline-Memory] reason=\(reason) pendingRawFrames=\(totalPendingFrames) pendingRawBytes=\(Self.formatBytes(totalPendingBytes)) activeWriters=\(writersByResolution.count) byResolution=[\(perResolutionSummary)]",
+            category: .app
+        )
+
+        MemoryLedger.set(
+            tag: Self.memoryLedgerPendingRawFramesTag,
+            bytes: totalPendingBytes,
+            count: totalPendingFrames,
+            unit: "frames",
+            function: "capture.pipeline",
+            kind: "pending-raw-frames"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerActiveWritersTag,
+            bytes: 0,
+            count: writersByResolution.count,
+            unit: "writers",
+            function: "capture.pipeline",
+            kind: "writer-pool",
+            note: "count-only"
+        )
+        MemoryLedger.emitSummary(
+            reason: "capture.pipeline.memory",
+            category: .app,
+            minIntervalSeconds: Self.memoryLedgerSummaryIntervalSeconds
+        )
+    }
+
+    private static func formatBytes(_ bytes: Int64) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .binary
+        formatter.allowedUnits = [.useKB, .useMB, .useGB]
+        formatter.includesUnit = true
+        formatter.isAdaptive = true
+        return formatter.string(fromByteCount: max(0, bytes))
+    }
+
+    private static func formatLocalDay(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.timeZone = .current
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: date)
+    }
+
+    static func dbStorageSnapshotDeltaSummary(
+        current: DBStorageSnapshotLogState,
+        previous: DBStorageSnapshotLogState?
+    ) -> DBStorageSnapshotDeltaSummary {
+        guard let previous else {
+            return DBStorageSnapshotDeltaSummary(dbDeltaBytes: nil, walDeltaBytes: nil)
+        }
+
+        let calendar = Calendar.current
+        guard calendar.isDate(previous.localDay, inSameDayAs: current.localDay) else {
+            return DBStorageSnapshotDeltaSummary(dbDeltaBytes: nil, walDeltaBytes: nil)
+        }
+
+        return DBStorageSnapshotDeltaSummary(
+            dbDeltaBytes: current.dbBytes - previous.dbBytes,
+            walDeltaBytes: current.walBytes - previous.walBytes
+        )
+    }
+
+    private static func dbStorageSnapshotLogMessage(
+        snapshot: DBStorageSnapshotLogState,
+        deltaSummary: DBStorageSnapshotDeltaSummary,
+        reason: String
+    ) -> String {
+        let localDay = formatLocalDay(snapshot.localDay)
+        let sampledAt = Log.timestamp(from: snapshot.sampledAt)
+        var message = "[AppCoordinator] Recorded DB storage snapshot (\(reason)) day=\(localDay) sampledAt=\(sampledAt)"
+        message += " db=\(snapshot.dbBytes) (\(formatBytes(snapshot.dbBytes)))"
+        message += " wal=\(snapshot.walBytes) (\(formatBytes(snapshot.walBytes)))"
+
+        if let dbDeltaBytes = deltaSummary.dbDeltaBytes {
+            let dbDeltaPrefix = dbDeltaBytes >= 0 ? "+" : ""
+            message += " dbDelta=\(dbDeltaPrefix)\(dbDeltaBytes) (\(formatBytes(abs(dbDeltaBytes))))"
+        }
+
+        if let walDeltaBytes = deltaSummary.walDeltaBytes {
+            let walDeltaPrefix = walDeltaBytes >= 0 ? "+" : ""
+            message += " walDelta=\(walDeltaPrefix)\(walDeltaBytes) (\(formatBytes(abs(walDeltaBytes))))"
+        }
+
+        return message
+    }
+
+    private static func timelineDiskFrameBufferDirectoryURL() -> URL {
+        let cachesDirectory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        return cachesDirectory
+            .appendingPathComponent(AppPaths.settingsSuiteName, isDirectory: true)
+            .appendingPathComponent("TimelineFrameBuffer", isDirectory: true)
+    }
+
+    private static func timelineDiskFrameBufferURL(for frameID: Int64) -> URL {
+        timelineDiskFrameBufferDirectoryURL()
+            .appendingPathComponent("\(frameID)")
+            .appendingPathExtension("jpg")
+    }
+
+    private func removeTimelineDiskCacheStills(frameIDs: [Int64]) {
+        for frameID in Set(frameIDs) {
+            let url = Self.timelineDiskFrameBufferURL(for: frameID)
+            try? FileManager.default.removeItem(at: url)
+        }
+    }
+
+    private func finalizeNativeFrameDeletionIntent(_ result: NativeFrameDeletionResult) async -> FrameDeletionResult {
+        guard result.affectedFrameCount > 0 else { return .empty }
+
+        removeTimelineDiskCacheStills(frameIDs: result.affectedFrameIDs)
+
+        let scheduledFrameIDs = Set(result.scheduledJobs.map(\.frameID))
+        var queuedScheduledFrameIDs = Set<Int64>()
+        let touchedVideoIDs = Array(Set(result.scheduledJobs.map(\.videoID))).sorted()
+
+        if let processingQueue = await services.processingQueue {
+            for videoID in touchedVideoIDs {
+                do {
+                    let dispatchOutcome = try await processingQueue.processPendingRewrites(for: videoID)
+                    if case .deferred(let reason) = dispatchOutcome {
+                        Log.info(
+                            "[AppCoordinator] Queued native frame deletion rewrite for video \(videoID): \(reason.rawValue)",
+                            category: .app
+                        )
+                    }
+                } catch {
+                    Log.error(
+                        "[AppCoordinator] Native frame deletion rewrite failed for video \(videoID); leaving deletion queued: \(error.localizedDescription)",
+                        category: .app
+                    )
+                }
+
+                do {
+                    let pendingJobs = try await services.database.getPendingFrameDeletionJobs(
+                        videoID: videoID,
+                        includeInProgressJobs: true,
+                        includeRetryableFailures: true
+                    )
+                    queuedScheduledFrameIDs.formUnion(pendingJobs.map(\.frameID))
+                } catch {
+                    queuedScheduledFrameIDs.formUnion(
+                        result.scheduledJobs
+                            .filter { $0.videoID == videoID }
+                            .map(\.frameID)
+                    )
+                    Log.error(
+                        "[AppCoordinator] Failed to verify native frame deletion completion for video \(videoID); treating scheduled frames as queued: \(error.localizedDescription)",
+                        category: .app
+                    )
+                }
+            }
+        } else if !scheduledFrameIDs.isEmpty {
+            queuedScheduledFrameIDs = scheduledFrameIDs
+            Log.warning(
+                "[AppCoordinator] processingQueue unavailable while deleting native frames; marking \(queuedScheduledFrameIDs.count) frame(s) queued",
+                category: .app
+            )
+        }
+
+        let relevantQueuedFrameIDs = queuedScheduledFrameIDs.intersection(scheduledFrameIDs)
+        return FrameDeletionResult(
+            completedFrames: result.immediatelyDeletedFrameIDs.count + scheduledFrameIDs.count - relevantQueuedFrameIDs.count,
+            queuedFrames: relevantQueuedFrameIDs.count
+        )
+    }
+
+    private func persistNativeFrameDeletionIntent(frameIDs: [Int64]) async throws -> FrameDeletionResult {
+        let result = try await services.database.deleteOrScheduleNativeFramesForDeletion(frameIDs: frameIDs)
+        return await finalizeNativeFrameDeletionIntent(result)
+    }
+
+    private func persistNativeFrameDeletionIntent(newerThan date: Date) async throws -> FrameDeletionResult {
+        let result = try await services.database.deleteOrScheduleNativeFramesForDeletion(newerThan: date)
+        return await finalizeNativeFrameDeletionIntent(result)
+    }
+
+    private func recordDeleteMetric(
+        metricType: DailyMetricsQueries.MetricType,
+        payload: [String: Any]
+    ) async {
+        try? await recordMetricEvent(
+            metricType: metricType,
+            metadata: Self.metricMetadata(payload)
+        )
+    }
+
+    private func writeCapturedFrameStillToTimelineDiskCache(
+        frameID: Int64,
+        frame: CapturedFrame
+    ) async {
+        // Preserve the capture-time preview until the encoded frame is readable.
+        await timelineStillDiskWriter.enqueue(frameID: frameID, frame: frame)
+    }
+
+    private static func encodeCapturedFrameAsJPEG(_ frame: CapturedFrame) throws -> Data {
+        guard frame.width > 0, frame.height > 0, frame.bytesPerRow > 0 else {
+            throw NSError(
+                domain: "AppCoordinator",
+                code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "Invalid frame dimensions for JPEG encode"]
+            )
+        }
+
+        let bitmapInfo = CGBitmapInfo(
+            rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+        )
+        guard let provider = CGDataProvider(data: frame.imageData as CFData),
+              let cgImage = CGImage(
+                  width: frame.width,
+                  height: frame.height,
+                  bitsPerComponent: 8,
+                  bitsPerPixel: 32,
+                  bytesPerRow: frame.bytesPerRow,
+                  space: CGColorSpaceCreateDeviceRGB(),
+                  bitmapInfo: bitmapInfo,
+                  provider: provider,
+                  decode: nil,
+                  shouldInterpolate: false,
+                  intent: .defaultIntent
+              ) else {
+            throw NSError(
+                domain: "AppCoordinator",
+                code: -2,
+                userInfo: [NSLocalizedDescriptionKey: "Failed to build CGImage from captured frame data"]
+            )
+        }
+
+        let outputData = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(
+            outputData,
+            "public.jpeg" as CFString,
+            1,
+            nil
+        ) else {
+            throw NSError(
+                domain: "AppCoordinator",
+                code: -3,
+                userInfo: [NSLocalizedDescriptionKey: "Failed to create JPEG image destination"]
+            )
+        }
+
+        let properties = [
+            kCGImageDestinationLossyCompressionQuality: Self.timelineDiskCacheJPEGCompressionQuality,
+        ] as CFDictionary
+
+        CGImageDestinationAddImage(destination, cgImage, properties)
+
+        guard CGImageDestinationFinalize(destination) else {
+            throw NSError(
+                domain: "AppCoordinator",
+                code: -4,
+                userInfo: [NSLocalizedDescriptionKey: "Failed to finalize JPEG image destination"]
+            )
+        }
+
+        return outputData as Data
     }
 
     private func createNewWriterState(width: Int, height: Int, displayID: UInt32 = 0) async throws -> VideoWriterState {
@@ -1219,6 +2978,7 @@ public actor AppCoordinator {
             videoDBID: videoDBID,
             frameCount: 0,
             isReadable: false,
+            persistedReadableFrameCount: 0,
             pendingFrames: [],
             width: width,
             height: height,
@@ -1226,36 +2986,17 @@ public actor AppCoordinator {
         )
     }
 
+    private func cancelBrokenWriterPreservingRecoveryData(_ writer: SegmentWriter) async {
+        if let incrementalWriter = writer as? IncrementalSegmentWriter {
+            try? await incrementalWriter.cancelPreservingRecoveryData()
+        } else {
+            try? await writer.cancel()
+        }
+    }
+
     private func resumeWriterState(from unfinalised: UnfinalisedVideo) async throws -> VideoWriterState {
         let writer = try await services.storage.createSegmentWriter()
-
-        // Get file size from filesystem for the old video
-        let storageDir = await services.storage.getStorageDirectory()
-        let oldVideoPath = storageDir.appendingPathComponent(unfinalised.relativePath).appendingPathExtension("mp4")
-        let fileSize: Int64
-        if let attrs = try? FileManager.default.attributesOfItem(atPath: oldVideoPath.path),
-           let size = attrs[.size] as? Int64 {
-            fileSize = size
-        } else {
-            fileSize = 0
-        }
-
-        // Clean up WAL session for the old unfinalised video (frames are already in the video file)
-        // The WAL directory is named with the segment timestampID (from relativePath), not the database ID
-        // relativePath format: "chunks/YYYYMM/DD/{timestampID}" - extract the timestampID from the last component
-        let timestampID = URL(fileURLWithPath: unfinalised.relativePath).lastPathComponent
-        let walDir = storageDir.deletingLastPathComponent().appendingPathComponent("wal")
-            .appendingPathComponent("active_segment_\(timestampID)")
-        if FileManager.default.fileExists(atPath: walDir.path) {
-            try? FileManager.default.removeItem(at: walDir)
-            Log.info("Cleaned up WAL session for unfinalised video \(unfinalised.id) (timestampID: \(timestampID))", category: .app)
-        }
-
-        // Mark old video as finalized and start fresh
-        // WARNING: This uses the frameCount from the database, which may differ from actual video file frames
-        // if the app crashed before database was updated
-        try await services.database.markVideoFinalized(id: unfinalised.id, frameCount: unfinalised.frameCount, fileSize: fileSize)
-        Log.warning("[RESUME-DEBUG] Marked unfinalised video \(unfinalised.id) as finalized with DB frameCount=\(unfinalised.frameCount), fileSize=\(fileSize) bytes - NOTE: actual video frames may differ if app crashed!", category: .app)
+        try await finalizeUnfinalisedVideoBeforeResuming(unfinalised)
 
         let relativePath = await writer.relativePath
         let placeholderSegment = VideoSegment(
@@ -1275,11 +3016,171 @@ public actor AppCoordinator {
             videoDBID: videoDBID,
             frameCount: 0,
             isReadable: false,
+            persistedReadableFrameCount: 0,
             pendingFrames: [],
             width: unfinalised.width,
             height: unfinalised.height,
             displayID: unfinalised.displayID
         )
+    }
+
+    func shouldResumeUnfinalisedVideo(_ unfinalised: UnfinalisedVideo) async throws -> Bool {
+        if let pathVideoID = pathVideoID(for: unfinalised.relativePath) {
+            let walManager = await services.storage.getWALManager()
+            let activeSessions = try await walManager.listActiveSessions()
+            if activeSessions.contains(where: { $0.videoID == pathVideoID }) {
+                Log.warning(
+                    "[WAL] Skipping resume of unfinalised video \(unfinalised.id) for path video \(pathVideoID.value) because an active WAL session still exists",
+                    category: .app
+                )
+                return false
+            }
+
+            do {
+                if let recoverableFrameCount = try await walManager.recoverableFrameCountIfPresent(videoID: pathVideoID),
+                   recoverableFrameCount > 0 {
+                    Log.warning(
+                        "[WAL] Skipping resume of unfinalised video \(unfinalised.id) for path video \(pathVideoID.value) because stale WAL directory still contains \(recoverableFrameCount) recoverable frame(s); deferring cleanup until crash recovery processes WAL",
+                        category: .app
+                    )
+                    return false
+                }
+            } catch {
+                Log.warning(
+                    "[WAL] Skipping resume of unfinalised video \(unfinalised.id) for path video \(pathVideoID.value) because stale WAL validation failed: \(error.localizedDescription)",
+                    category: .app
+                )
+                return false
+            }
+
+            if !(try await services.storage.segmentExists(id: pathVideoID)) {
+                Log.warning(
+                    "[WAL] Skipping resume of unfinalised video \(unfinalised.id) because segment file \(pathVideoID.value) is missing",
+                    category: .app
+                )
+                return false
+            }
+
+            return true
+        }
+
+        let resolvedPath = try await resolvedPathForUnfinalisedVideo(
+            unfinalised,
+            pathVideoID: nil
+        )
+        let exists = FileManager.default.fileExists(atPath: resolvedPath.path)
+        if !exists {
+            Log.warning(
+                "[WAL] Skipping resume of unfinalised video \(unfinalised.id) because backing file is missing at \(resolvedPath.path)",
+                category: .app
+            )
+        }
+        return exists
+    }
+
+    func finalizeUnfinalisedVideoBeforeResuming(_ unfinalised: UnfinalisedVideo) async throws {
+        let pathVideoID = pathVideoID(for: unfinalised.relativePath)
+        let oldVideoPath = try await resolvedPathForUnfinalisedVideo(
+            unfinalised,
+            pathVideoID: pathVideoID
+        )
+        let fileSize = (try? FileManager.default.attributesOfItem(atPath: oldVideoPath.path)[.size] as? Int64) ?? 0
+
+        if let pathVideoID {
+            await finalizeStaleWALSessionIfPresent(pathVideoID: pathVideoID)
+        }
+
+        let finalizedFrameCount: Int
+        if let pathVideoID {
+            finalizedFrameCount = try await services.storage.countFramesInSegment(id: pathVideoID)
+        } else {
+            finalizedFrameCount = unfinalised.frameCount
+        }
+
+        if let pathVideoID, finalizedFrameCount != unfinalised.frameCount {
+            Log.warning(
+                "[RESUME-DEBUG] Finalizing unfinalised video \(unfinalised.id) using actual readable frameCount=\(finalizedFrameCount) from path video \(pathVideoID.value) instead of stale DB frameCount=\(unfinalised.frameCount)",
+                category: .app
+            )
+        }
+
+        try await services.database.markVideoFinalized(
+            id: unfinalised.id,
+            frameCount: finalizedFrameCount,
+            fileSize: fileSize
+        )
+    }
+
+    private func pathVideoID(for relativePath: String) -> VideoSegmentID? {
+        let stem = URL(fileURLWithPath: relativePath)
+            .deletingPathExtension()
+            .lastPathComponent
+        guard let value = Int64(stem) else {
+            return nil
+        }
+        return VideoSegmentID(value: value)
+    }
+
+    private func resolvedPathForUnfinalisedVideo(
+        _ unfinalised: UnfinalisedVideo,
+        pathVideoID: VideoSegmentID?
+    ) async throws -> URL {
+        if let pathVideoID {
+            return try await services.storage.getSegmentPath(id: pathVideoID)
+        }
+
+        let storageDir = await services.storage.getStorageDirectory()
+        let directPath = storageDir.appendingPathComponent(unfinalised.relativePath)
+        if FileManager.default.fileExists(atPath: directPath.path) {
+            return directPath
+        }
+
+        return directPath.appendingPathExtension("mp4")
+    }
+
+    private func finalizeStaleWALSessionIfPresent(pathVideoID: VideoSegmentID) async {
+        guard let storageManager = services.storage as? StorageManager else {
+            return
+        }
+
+        let walManager = await storageManager.getWALManager()
+        let recoverableFrameCount: Int?
+        do {
+            recoverableFrameCount = try await walManager.recoverableFrameCountIfPresent(videoID: pathVideoID)
+        } catch {
+            Log.warning(
+                "[WAL] Skipping stale WAL cleanup for unfinalised video \(pathVideoID.value) because recoverability validation failed: \(error.localizedDescription)",
+                category: .app
+            )
+            return
+        }
+
+        guard let recoverableFrameCount else {
+            return
+        }
+
+        guard recoverableFrameCount == 0 else {
+            Log.warning(
+                "[WAL] Preserving stale WAL directory for unfinalised video \(pathVideoID.value): contains \(recoverableFrameCount) recoverable frame(s). Cleanup deferred to crash recovery.",
+                category: .app
+            )
+            return
+        }
+
+        do {
+            let removed = try await walManager.finalizeSessionDirectoryIfPresent(videoID: pathVideoID)
+            if removed {
+                Log.info(
+                    "Cleaned up WAL session for unfinalised video \(pathVideoID.value)",
+                    category: .app
+                )
+            }
+        } catch {
+            Log.warning(
+                "[WAL] Failed to clean up stale WAL directory for unfinalised video \(pathVideoID.value): \(error.localizedDescription)",
+                category: .app
+            )
+        }
     }
 
     private func finalizeWriter(_ writerState: inout VideoWriterState, processingQueue: FrameProcessingQueue?) async throws {
@@ -1291,10 +3192,31 @@ public actor AppCoordinator {
         let encoderFrameCount = await writerState.writer.frameCount
         Log.info("[FINALIZE-DEBUG] About to finalize videoDBID=\(writerState.videoDBID), writerState.frameCount=\(writerState.frameCount), encoderFrameCount=\(encoderFrameCount)", category: .app)
 
+        // Read aggregate counters before finalization deletes the temporary WAL.
+        let walManager = await services.storage.getWALManager()
+        let walVideoID = await writerState.writer.segmentID
+        let walCompression = await walManager.compressionStatistics(videoID: walVideoID)
         _ = try await writerState.writer.finalize()
         let fileSize = await writerState.writer.currentFileSize
         try await services.database.markVideoFinalized(id: writerState.videoDBID, frameCount: writerState.frameCount, fileSize: fileSize)
         Log.info("[FINALIZE-DEBUG] Marked videoDBID=\(writerState.videoDBID) as finalized with frameCount=\(writerState.frameCount), fileSize=\(fileSize) bytes", category: .app)
+
+        if let statistics = walCompression {
+            try? await recordMetricEvent(
+                metricType: .walCompression,
+                metadata: Self.metricMetadata([
+                    "codec": "lzfse", "outcome": "finalized",
+                    "frameCount": statistics.frameCount,
+                    "compressedFrameCount": statistics.compressedFrameCount,
+                    "rawBytes": statistics.rawBytes, "storedBytes": statistics.storedBytes,
+                    "compressionMilliseconds": statistics.compressionMilliseconds
+                ])
+            )
+            Log.info(
+                "[WAL-Compression] frames=\(statistics.frameCount) rawBytes=\(statistics.rawBytes) storedBytes=\(statistics.storedBytes) compressionMs=\(String(format: "%.1f", statistics.compressionMilliseconds))",
+                category: .storage
+            )
+        }
 
         // After finalization, all frames are now readable from the video file
         // Mark them as readable and enqueue for OCR processing
@@ -1304,10 +3226,217 @@ public actor AppCoordinator {
                 Log.debug("Enqueueing \(writerState.pendingFrames.count) pending frames after finalization", category: .app)
                 for bufferedFrame in writerState.pendingFrames {
                     try await services.database.markFrameReadable(frameID: bufferedFrame.frameID)
-                    try await processingQueue.enqueue(frameID: bufferedFrame.frameID, capturedFrame: bufferedFrame.capturedFrame)
+                    recordReadableFrameProgress(at: Date())
+                    try await processingQueue.enqueue(frameID: bufferedFrame.frameID)
                 }
                 writerState.pendingFrames = []
             }
+
+            // Trigger segment-level video rewrites for any p=5 frames now that the file is finalized.
+            _ = try? await processingQueue.processPendingRewrites(for: writerState.videoDBID)
+        }
+    }
+
+    private func resetUnexpectedRecordingProgressTracking() {
+        unexpectedRecordingStopCounters = UnexpectedRecordingStopCounters()
+    }
+
+    private func recordAcceptedFrameProgress(at date: Date) {
+        unexpectedRecordingStopCounters.acceptedFrameCount += 1
+        unexpectedRecordingStopCounters.lastAcceptedFrameAt = date
+    }
+
+    private func recordReadableFrameProgress(at date: Date) {
+        unexpectedRecordingStopCounters.readableFrameCount += 1
+        unexpectedRecordingStopCounters.lastReadableFrameAt = date
+    }
+
+    private static func unexpectedRecordingStopWriterSnapshots(
+        from writersByResolution: [String: VideoWriterState]
+    ) -> [UnexpectedRecordingStopWriterSnapshot] {
+        writersByResolution.map { resolutionKey, writerState in
+            UnexpectedRecordingStopWriterSnapshot(
+                resolutionKey: resolutionKey,
+                videoDBID: writerState.videoDBID,
+                frameCount: writerState.frameCount,
+                persistedReadableFrameCount: writerState.persistedReadableFrameCount,
+                pendingUnreadableFrameCount: writerState.pendingFrames.count,
+                oldestPendingUnreadableAt: writerState.pendingFrames.first?.acceptedAt
+            )
+        }
+    }
+
+    private static func unexpectedRecordingStopPendingUnreadableFrameCount(
+        in writerSnapshots: [UnexpectedRecordingStopWriterSnapshot]
+    ) -> Int {
+        writerSnapshots.reduce(0) { partialResult, writer in
+            partialResult + writer.pendingUnreadableFrameCount
+        }
+    }
+
+    static func stalledUnreadableWriter<C: Collection>(
+        in writers: C,
+        now: Date,
+        threshold: TimeInterval = AppCoordinator.unexpectedRecordingStopUnreadableWriterThreshold,
+        minimumPendingFrames: Int = AppCoordinator.unexpectedRecordingStopUnreadableWriterMinimumPendingFrames
+    ) -> UnexpectedRecordingStopWriterSnapshot? where C.Element == UnexpectedRecordingStopWriterSnapshot {
+        writers.first { writer in
+            guard writer.frameCount > 0,
+                  writer.persistedReadableFrameCount == 0,
+                  writer.pendingUnreadableFrameCount >= minimumPendingFrames,
+                  let oldestPendingUnreadableAt = writer.oldestPendingUnreadableAt else {
+                return false
+            }
+
+            let hasAnotherReadableWriter = writers.contains { otherWriter in
+                otherWriter.videoDBID != writer.videoDBID &&
+                    otherWriter.persistedReadableFrameCount > 0
+            }
+            guard hasAnotherReadableWriter else {
+                return false
+            }
+
+            return now.timeIntervalSince(oldestPendingUnreadableAt) >= threshold
+        }
+    }
+
+    static func shouldTreatCaptureTerminationAsUnexpected(
+        isRunning: Bool,
+        taskWasCancelled: Bool,
+        isCaptureActive: Bool
+    ) -> Bool {
+        isRunning && !taskWasCancelled && !isCaptureActive
+    }
+
+    private func captureInactiveUnexpectedStopSummary(
+        source: String,
+        writerSnapshots: [UnexpectedRecordingStopWriterSnapshot]
+    ) -> String {
+        let now = Date()
+        let statusIsRunning = statusHolder.status.isRunning
+        let pendingUnreadableFrameCount = Self.unexpectedRecordingStopPendingUnreadableFrameCount(
+            in: writerSnapshots
+        )
+        let lastAcceptedAgeSeconds = unexpectedRecordingStopCounters.lastAcceptedFrameAt.map {
+            max(0, Int(now.timeIntervalSince($0)))
+        }
+        let lastReadableAgeSeconds = unexpectedRecordingStopCounters.lastReadableFrameAt.map {
+            max(0, Int(now.timeIntervalSince($0)))
+        }
+
+        return
+            "Capture became inactive (\(source)) while recording remained marked on. " +
+            "coordinatorIsRunning=\(isRunning) statusHolderIsRunning=\(statusIsRunning) " +
+            "acceptedFrames=\(unexpectedRecordingStopCounters.acceptedFrameCount) " +
+            "readableFrames=\(unexpectedRecordingStopCounters.readableFrameCount) " +
+            "pendingUnreadableFrames=\(pendingUnreadableFrameCount) " +
+            "activeWriters=\(writerSnapshots.count) " +
+            "lastAcceptedAgeSeconds=\(lastAcceptedAgeSeconds.map(String.init) ?? "none") " +
+            "lastReadableAgeSeconds=\(lastReadableAgeSeconds.map(String.init) ?? "none")"
+    }
+
+    private func recordUnexpectedRecordingStop(
+        _ pendingStop: PendingUnexpectedRecordingStop
+    ) async -> UnexpectedRecordingStopState {
+        let now = Date()
+        let captureStats = await services.capture.getStatistics()
+        let pendingUnreadableFrameCount = Self.unexpectedRecordingStopPendingUnreadableFrameCount(
+            in: pendingStop.writerSnapshots
+        )
+        let stalledWriter = Self.stalledUnreadableWriter(
+            in: pendingStop.writerSnapshots,
+            now: now,
+            threshold: 0,
+            minimumPendingFrames: 1
+        )
+        let state = UnexpectedRecordingStopState(
+            stoppedAt: now,
+            reason: pendingStop.reason,
+            summary: pendingStop.summary,
+            captureFramesObserved: captureStats.totalFramesCaptured,
+            deduplicatedFrames: captureStats.framesDeduped,
+            acceptedFrameCount: pendingStop.counters.acceptedFrameCount,
+            readableFrameCount: pendingStop.counters.readableFrameCount,
+            pendingUnreadableFrameCount: pendingUnreadableFrameCount,
+            activeWriterCount: pendingStop.writerSnapshots.count,
+            stalledWriterResolution: stalledWriter?.resolutionKey,
+            stalledWriterVideoID: stalledWriter?.videoDBID,
+            stalledWriterPendingAgeSeconds: stalledWriter?.oldestPendingUnreadableAt.map {
+                max(0, Int(now.timeIntervalSince($0)))
+            }
+        )
+        persistUnexpectedRecordingStopState(state)
+        recordUnexpectedRecordingStopMetric(action: "auto_stopped", state: state)
+
+        Log.error(
+            "[RECORDING-STOP] reason=\(pendingStop.reason.rawValue) summary=\"\(pendingStop.summary)\" captureFramesObserved=\(state.captureFramesObserved) " +
+            "deduplicatedFrames=\(state.deduplicatedFrames) acceptedFrames=\(state.acceptedFrameCount) " +
+            "readableFrames=\(state.readableFrameCount) pendingUnreadableFrames=\(state.pendingUnreadableFrameCount) " +
+            "activeWriters=\(state.activeWriterCount) stalledWriterResolution=\(state.stalledWriterResolution ?? "none") " +
+            "stalledWriterVideoID=\(state.stalledWriterVideoID.map(String.init) ?? "none") " +
+            "stalledWriterPendingAgeSeconds=\(state.stalledWriterPendingAgeSeconds.map(String.init) ?? "none")",
+            category: .app
+        )
+        return state
+    }
+
+    public func recoverPendingPhraseRedactionRewritesIfPossible() async {
+        if let processingQueue = await services.processingQueue {
+            await processingQueue.recoverPendingRewritesIfPossible()
+        }
+    }
+
+    public func missingMasterKeyRedactionState() async -> MissingMasterKeyRedactionState {
+        let defaults = Self.userDefaultsSuite
+        let hasMasterKey = MasterKeyManager.hasMasterKey()
+        let phraseLevelRedactionEnabled =
+            (defaults.object(forKey: Self.phraseLevelRedactionEnabledKey) as? Bool ?? false)
+                && PhraseRedactionMode.load(from: defaults) == .scramble
+
+        var hasProtectedRedactionData = false
+        var hasPendingRedactionRewrites = false
+
+        do {
+            hasProtectedRedactionData = try await services.database.hasProtectedPhraseRedactionData()
+        } catch {
+            Log.error(
+                "[AppCoordinator] Failed to inspect protected phrase-redaction data state: \(error.localizedDescription)",
+                category: .app
+            )
+        }
+
+        do {
+            hasPendingRedactionRewrites = try await services.database.hasPendingScrambleRedactions()
+        } catch {
+            Log.error(
+                "[AppCoordinator] Failed to inspect pending phrase-redaction rewrites: \(error.localizedDescription)",
+                category: .app
+            )
+        }
+
+        // TODO(master-key-recovery): Extend this startup decision tree once database encryption
+        // is formally wired into the master-key UX. That branch needs to distinguish a missing
+        // phrase-redaction key from a missing SQLCipher database key and may need to block DB open.
+        return MissingMasterKeyRedactionState(
+            hasMasterKey: hasMasterKey,
+            phraseLevelRedactionEnabled: phraseLevelRedactionEnabled,
+            hasProtectedRedactionData: hasProtectedRedactionData,
+            hasPendingRedactionRewrites: hasPendingRedactionRewrites
+        )
+    }
+
+    @discardableResult
+    public func abandonPendingPhraseRedactionRewritesForFreshKey() async -> Int {
+        do {
+            return try await services.database.abandonPendingNodeRedactions(
+                missingKeyRewritePurpose: Self.abandonedMissingMasterKeyRewritePurpose
+            )
+        } catch {
+            Log.error(
+                "[AppCoordinator] Failed to abandon pending phrase-redaction rewrites for fresh key: \(error.localizedDescription)",
+                category: .app
+            )
+            return 0
         }
     }
 
@@ -1320,6 +3449,14 @@ public actor AppCoordinator {
         let metadata = frame.metadata
         let captureConfig = await services.capture.getConfig()
         let displayID = metadata.displayID
+        let normalizedBrowserURL: String?
+        if let rawBrowserURL = metadata.browserURL?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !rawBrowserURL.isEmpty {
+            normalizedBrowserURL = rawBrowserURL
+        } else {
+            normalizedBrowserURL = nil
+        }
+        pruneRecentClosedNilBrowserURLSegments(referenceTime: frame.timestamp)
 
         let trimmedBundleID = metadata.appBundleID?.trimmingCharacters(in: .whitespacesAndNewlines)
         let hasValidBundleID = trimmedBundleID != nil && !(trimmedBundleID?.isEmpty ?? true)
@@ -1359,18 +3496,30 @@ public actor AppCoordinator {
         }
 
         if appChanged || windowChanged || currentSegment == nil || idleDetected {
-            // Close previous segment for this display.
+            // Close previous segment
             if let segID = currentSegmentIDsByDisplay[displayID] {
-                // For idle detection, set end date to last frame timestamp + a small buffer
-                // This prevents the segment from appearing to span the idle period
-                let segmentEndDate: Date
-                if idleDetected, let lastTimestamp = lastFrameTimestampByDisplay[displayID] {
-                    segmentEndDate = lastTimestamp
-                } else {
-                    segmentEndDate = frame.timestamp
-                }
+                // If we crossed an idle boundary, close at the last observed frame.
+                // Otherwise close at the current transition frame timestamp.
+                let segmentEndDate = Self.segmentEndDateForSessionTransition(
+                    lastFrameTimestamp: lastFrameTimestampByDisplay[displayID],
+                    transitionTimestamp: frame.timestamp,
+                    idleDetected: idleDetected
+                )
                 try await services.database.updateSegmentEndDate(id: segID, endDate: segmentEndDate)
-                Log.debug("Closed segment on display \(displayID): \(currentSegment?.bundleID ?? "unknown") - \(currentSegment?.windowName ?? "nil")", category: .app)
+
+                if let closedSegment = currentSegment,
+                   closedSegment.browserUrl?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false,
+                   let normalizedWindowName = normalizedWindowNameForStrictBackfill(closedSegment.windowName) {
+                    recentClosedNilBrowserURLSegments.append(
+                        RecentClosedNilBrowserURLSegment(
+                            segmentID: segID,
+                            bundleID: closedSegment.bundleID,
+                            normalizedWindowName: normalizedWindowName,
+                            closedAt: segmentEndDate
+                        )
+                    )
+                    pruneRecentClosedNilBrowserURLSegments(referenceTime: frame.timestamp)
+                }
             }
 
             // Create new segment for this display.
@@ -1379,18 +3528,139 @@ public actor AppCoordinator {
                 startDate: frame.timestamp,
                 endDate: frame.timestamp,  // Will be updated as frames are captured
                 windowName: metadata.windowName,
-                browserUrl: metadata.browserURL,
+                browserUrl: normalizedBrowserURL,
                 type: 0  // 0 = screen capture
             )
 
             currentSegmentIDsByDisplay[displayID] = newSegmentID
-            Log.debug("Started segment on display \(displayID): \(bundleID) - \(metadata.windowName ?? "nil")", category: .app)
+            Log.debug(
+                "Started segment: \(metadata.appBundleID ?? "unknown") [segmentID=\(newSegmentID), windowToken=\(SegmentLogSanitizer.obfuscatedWindowToken(metadata.windowName)), browserURL=\(normalizedBrowserURL == nil ? "nil" : "present")]",
+                category: .app
+            )
+            if let browserURL = normalizedBrowserURL {
+                try await backfillRecentClosedNilBrowserURLSegments(
+                    bundleID: metadata.appBundleID,
+                    windowName: metadata.windowName,
+                    browserURL: browserURL,
+                    referenceTime: frame.timestamp
+                )
+            }
+        } else if let segID = currentSegmentIDsByDisplay[displayID],
+                  let browserURL = normalizedBrowserURL {
+            let existingBrowserURL: String?
+            if let rawBrowserURL = currentSegment?.browserUrl?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !rawBrowserURL.isEmpty {
+                existingBrowserURL = rawBrowserURL
+            } else {
+                existingBrowserURL = nil
+            }
+
+            if existingBrowserURL == nil {
+                try await services.database.updateSegmentBrowserURL(
+                    id: segID,
+                    browserURL: browserURL,
+                    onlyIfNull: true
+                )
+                let host = URL(string: browserURL)?.host ?? browserURL
+                Log.info(
+                    "[SegmentURL] Backfilled browserUrl for segmentID=\(segID), bundle=\(metadata.appBundleID ?? "unknown"), host=\(host)",
+                    category: .app
+                )
+                try await backfillRecentClosedNilBrowserURLSegments(
+                    bundleID: metadata.appBundleID,
+                    windowName: metadata.windowName,
+                    browserURL: browserURL,
+                    referenceTime: frame.timestamp
+                )
+            } else if existingBrowserURL != browserURL {
+                try await services.database.updateSegmentBrowserURL(
+                    id: segID,
+                    browserURL: browserURL,
+                    onlyIfNull: false
+                )
+                let previousLength = existingBrowserURL?.count ?? 0
+                let newLength = browserURL.count
+                Log.debug(
+                    "[SegmentURL] Corrected browserUrl for segmentID=\(segID), bundle=\(metadata.appBundleID ?? "unknown"), oldLen=\(previousLength), newLen=\(newLength)",
+                    category: .app
+                )
+            }
         }
 
         // Update last frame timestamp for idle detection on this display.
         lastFrameTimestampByDisplay[displayID] = frame.timestamp
 
         return currentSegmentIDsByDisplay[displayID]
+    }
+
+    /// Computes segment end time when transitioning between sessions.
+    /// Idle transitions close at the last observed frame (no idle credit).
+    nonisolated static func segmentEndDateForSessionTransition(
+        lastFrameTimestamp: Date?,
+        transitionTimestamp: Date,
+        idleDetected: Bool
+    ) -> Date {
+        if idleDetected, let lastFrameTimestamp {
+            return lastFrameTimestamp
+        }
+        return transitionTimestamp
+    }
+
+    /// Computes segment end time when capture pipeline shuts down.
+    /// Prefer the last observed frame to avoid synthetic tail time.
+    nonisolated static func segmentEndDateForShutdown(
+        lastFrameTimestamp: Date?,
+        shutdownTimestamp: Date
+    ) -> Date {
+        lastFrameTimestamp ?? shutdownTimestamp
+    }
+
+    private func normalizedWindowNameForStrictBackfill(_ windowName: String?) -> String? {
+        guard let windowName else { return nil }
+        let normalized = windowName
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .split(whereSeparator: { $0.isWhitespace })
+            .map(String.init)
+            .joined(separator: " ")
+            .lowercased()
+        return normalized.isEmpty ? nil : normalized
+    }
+
+    private func pruneRecentClosedNilBrowserURLSegments(referenceTime: Date) {
+        recentClosedNilBrowserURLSegments.removeAll { entry in
+            referenceTime.timeIntervalSince(entry.closedAt) > recentClosedSegmentBackfillWindowSeconds
+        }
+    }
+
+    private func backfillRecentClosedNilBrowserURLSegments(
+        bundleID: String?,
+        windowName: String?,
+        browserURL: String,
+        referenceTime: Date
+    ) async throws {
+        guard let bundleID,
+              let normalizedWindowName = normalizedWindowNameForStrictBackfill(windowName) else {
+            return
+        }
+
+        pruneRecentClosedNilBrowserURLSegments(referenceTime: referenceTime)
+
+        let matchingEntries = recentClosedNilBrowserURLSegments.filter { entry in
+            entry.bundleID == bundleID && entry.normalizedWindowName == normalizedWindowName
+        }
+        guard !matchingEntries.isEmpty else { return }
+
+        let matchingSegmentIDs = Set(matchingEntries.map(\.segmentID))
+        for segmentID in matchingSegmentIDs {
+            try await services.database.updateSegmentBrowserURL(id: segmentID, browserURL: browserURL)
+        }
+
+        recentClosedNilBrowserURLSegments.removeAll { matchingSegmentIDs.contains($0.segmentID) }
+        let host = URL(string: browserURL)?.host ?? browserURL
+        Log.info(
+            "[SegmentURL] Backfilled browserUrl for \(matchingSegmentIDs.count) recently-closed segment(s), bundle=\(bundleID), windowName=\(windowName ?? "nil"), host=\(host)",
+            category: .app
+        )
     }
 
     /// Audio pipeline: AudioCapture → AudioProcessing (whisper.cpp) → Database
@@ -1419,46 +3689,89 @@ public actor AppCoordinator {
 
     /// Get current power state for monitoring display
     nonisolated public func getCurrentPowerState() -> (source: PowerStateMonitor.PowerSource, isPaused: Bool) {
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
-        let pauseOnBattery = defaults.bool(forKey: "ocrOnlyWhenPluggedIn")
+        let snapshot = OCRPowerSettingsSnapshot.fromDefaults()
         let source = PowerStateMonitor.shared.getCurrentPowerSource()
-        let isPaused = pauseOnBattery && source == .battery
+        let isLowPowerModeEnabled = ProcessInfo.processInfo.isLowPowerModeEnabled
+        let isPaused =
+            (snapshot.pauseOnBattery && source == .battery) ||
+            (snapshot.pauseOnLowPowerMode && isLowPowerModeEnabled)
         return (source, isPaused)
     }
 
     /// Get frames processed per minute for the last N minutes
     /// Returns dictionary of [minuteOffset: count] where minuteOffset 0 = current minute
     public func getFramesProcessedPerMinute(lastMinutes: Int) async throws -> [Int: Int] {
-        let db = await services.database
-        return try await db.getFramesProcessedPerMinute(lastMinutes: lastMinutes)
+        try await services.database.getFramesProcessedPerMinute(lastMinutes: lastMinutes)
+    }
+
+    /// Get frames encoded/readable per minute for the last N minutes.
+    /// Returns dictionary of [minuteOffset: count] where minuteOffset 0 = current minute.
+    public func getFramesEncodedPerMinute(lastMinutes: Int) async throws -> [Int: Int] {
+        try await services.database.getFramesEncodedPerMinute(lastMinutes: lastMinutes)
+    }
+
+    /// Get frames rewritten per minute for the last N minutes.
+    /// Returns dictionary of [minuteOffset: count] where minuteOffset 0 = current minute.
+    public func getFramesRewrittenPerMinute(lastMinutes: Int) async throws -> [Int: Int] {
+        try await services.database.getFramesRewrittenPerMinute(lastMinutes: lastMinutes)
+    }
+
+    /// Get current frame-encoding buffer backlog.
+    /// The backlog is derived from frames that were created recently but are still not readable
+    /// from the encoded video file, so the counts describe short-lived buffer lag rather than a
+    /// durable worker queue.
+    public func getEncodingStatistics() async -> (
+        queueDepth: Int,
+        pendingCount: Int
+    )? {
+        // Intentionally use a short recency window here. `processingStatus = 4` currently
+        // conflates "buffered but still flushing to disk" with "older frame that may be stuck
+        // or otherwise never became readable." For the System Monitor card we want a signal for
+        // recent encoder buffer pressure, not a durable count that can stay pinned forever because
+        // of one stale unreadable frame. Once buffering/stalled states are modeled separately,
+        // this heuristic window should be replaced with explicit state-based accounting.
+        let backlogWindowMinutes = 5
+
+        guard let queueDepth = try? await services.database.getUnreadableFrameCount(withinLastMinutes: backlogWindowMinutes) else {
+            return nil
+        }
+
+        return (
+            queueDepth: queueDepth,
+            pendingCount: queueDepth
+        )
     }
 
     // MARK: - Search Interface
 
-    /// Get all distinct app bundle IDs from the database for filter UI
-    /// Caller should use AppNameResolver.shared.resolveAll() to get display names
-    public func getDistinctAppBundleIDs() async throws -> [String] {
+    /// Get distinct app bundle IDs from the database for filter UI.
+    /// When `source` is `nil`, returns the union across all connected sources.
+    /// Caller should use AppNameResolver.shared.resolveAll() to get display names.
+    public nonisolated func getDistinctAppBundleIDs(source: FrameSource? = nil) async throws -> [String] {
         guard let adapter = await services.dataAdapter else {
             return []
         }
-        return try await adapter.getDistinctAppBundleIDs()
+        return try await adapter.getDistinctAppBundleIDs(source: source)
     }
 
     /// Search for text across all captured frames
-    public func search(query: String, limit: Int = 50) async throws -> SearchResults {
+    public nonisolated func search(query: String, limit: Int = 50) async throws -> SearchResults {
         let searchQuery = SearchQuery(text: query, filters: .none, limit: limit, offset: 0)
         return try await search(query: searchQuery)
     }
 
     /// Advanced search with filters
     /// Routes to DataAdapter which prioritizes Rewind data source
-    public func search(query: SearchQuery) async throws -> SearchResults {
+    public nonisolated func search(query: SearchQuery) async throws -> SearchResults {
         // Try DataAdapter first (routes to Rewind if available)
         if let adapter = await services.dataAdapter {
             do {
                 return try await adapter.search(query: query)
             } catch {
-                Log.warning("[AppCoordinator] DataAdapter search failed, falling back to FTS: \(error)", category: .app)
+                Log.warning(
+                    "[AppCoordinator] DataAdapter search failed, falling back to FTS: \(error)",
+                    category: .app
+                )
             }
         }
 
@@ -1503,6 +3816,20 @@ public actor AppCoordinator {
         return try await adapter.getFrameImageByIndex(videoID: videoID, frameIndex: frameIndex, source: source)
     }
 
+    /// Get frame image as CGImage without JPEG encode/decode round-trips.
+    public func getFrameCGImage(videoPath: String, frameIndex: Int, frameRate: Double?, source: FrameSource) async throws -> CGImage {
+        guard let adapter = await services.dataAdapter else {
+            throw NSError(domain: "AppCoordinator", code: 500, userInfo: [NSLocalizedDescriptionKey: "DataAdapter not initialized"])
+        }
+
+        return try await adapter.getFrameCGImage(
+            videoPath: videoPath,
+            frameIndex: frameIndex,
+            frameRate: frameRate,
+            source: source
+        )
+    }
+
     /// Get frame image directly using filename-based videoID (optimized, no database lookup)
     /// Use this when you already have the video filename from a JOIN query (e.g., FrameVideoInfo)
     /// - Parameters:
@@ -1515,9 +3842,20 @@ public actor AppCoordinator {
         return try await services.storage.readFrame(segmentID: videoSegmentID, frameIndex: frameIndex)
     }
 
-    /// Get frame image from a full video path (used for Rewind frames with string-based IDs)
-    public func getFrameImageFromPath(videoPath: String, frameIndex: Int) async throws -> Data {
-        return try await services.storage.readFrameFromPath(videoPath: videoPath, frameIndex: frameIndex)
+    /// Get frame image from a full video path (used for Rewind frames with string-based IDs).
+    /// When not explicitly provided, strict timestamp matching follows timeline visibility:
+    /// strict while visible, relaxed while hidden.
+    public func getFrameImageFromPath(
+        videoPath: String,
+        frameIndex: Int,
+        enforceTimestampMatch: Bool? = nil
+    ) async throws -> Data {
+        let shouldEnforceTimestampMatch = enforceTimestampMatch ?? isTimelineVisible
+        return try await services.storage.readFrameFromPath(
+            videoPath: videoPath,
+            frameIndex: frameIndex,
+            enforceTimestampMatch: shouldEnforceTimestampMatch
+        )
     }
 
     /// Get frames in a time range
@@ -1545,6 +3883,52 @@ public actor AppCoordinator {
 
     /// Get timeline payloads in a time range with embedded secondary display rows.
     /// Uses a single denormalized query for native multi-display timelines.
+    /// Get the nearest frame for a specific display at or before a given timestamp.
+    /// Used for PIP carry-forward when a secondary display has no exact frame at the current timestamp.
+    public func getNearestFrame(displayID: UInt32, before timestamp: Date) async throws -> FrameWithVideoInfo? {
+        guard let adapter = await services.dataAdapter else {
+            return nil
+        }
+        return try await adapter.getNearestFrame(displayID: displayID, before: timestamp)
+    }
+
+    /// Get distinct display IDs that have frames in the given time range.
+    /// Used to discover which displays were active for PIP display.
+    public func getDistinctDisplayIDs(from startDate: Date, to endDate: Date) async throws -> [UInt32] {
+        guard let adapter = await services.dataAdapter else {
+            return []
+        }
+        return try await adapter.getDistinctDisplayIDs(from: startDate, to: endDate)
+    }
+
+    /// Get distinct displays in a time range, including persisted display names when available.
+    public func getDistinctDisplaysWithNames(from startDate: Date, to endDate: Date) async throws -> [(displayID: UInt32, displayName: String?)] {
+        guard let adapter = await services.dataAdapter else {
+            return []
+        }
+        return try await adapter.getDistinctDisplaysWithNames(from: startDate, to: endDate)
+    }
+
+    /// Get secondary display payloads for a set of primary frame IDs in one database round-trip.
+    /// Rows are grouped by primary frame ID and ordered by secondary display ID.
+    public func getSecondaryDisplayFrames(forPrimaryFrameIDs primaryFrameIDs: [FrameID]) async throws -> [Int64: [SecondaryDisplayFrameInfo]] {
+        guard let adapter = await services.dataAdapter else {
+            return [:]
+        }
+        return try await adapter.getSecondaryDisplayFrames(forPrimaryFrameIDs: primaryFrameIDs)
+    }
+
+    /// Get persisted display names for known display IDs.
+    public func getDisplayNames(displayIDs: [UInt32]) async throws -> [UInt32: String] {
+        try await services.database.getDisplayNames(displayIDs: displayIDs)
+    }
+
+    /// Get display IDs connected at a specific timestamp based on display_session rows.
+    public func getConnectedDisplayIDs(at timestamp: Date) async throws -> [UInt32] {
+        try await services.database.getConnectedDisplayIDs(at: timestamp)
+    }
+
+
     public func getTimelineFramesWithSecondaries(from startDate: Date, to endDate: Date, limit: Int = 500, filters: FilterCriteria? = nil) async throws -> [TimelineFramePayload] {
         guard let adapter = await services.dataAdapter else {
             let frames = try await getFramesWithVideoInfo(from: startDate, to: endDate, limit: limit, filters: filters)
@@ -1672,49 +4056,20 @@ public actor AppCoordinator {
         return try await adapter.getFrameWithVideoInfoByID(id: id)
     }
 
-    /// Get the nearest frame for a specific display at or before a given timestamp.
-    /// Used for PIP carry-forward when a secondary display has no exact frame at the current timestamp.
-    public func getNearestFrame(displayID: UInt32, before timestamp: Date) async throws -> FrameWithVideoInfo? {
+    public func getVisibleBlockBoundary(
+        anchorFrame: FrameReference,
+        filters: FilterCriteria,
+        direction: VisibleBlockBoundaryDirection
+    ) async throws -> VisibleBlockBoundaryHit? {
         guard let adapter = await services.dataAdapter else {
             return nil
         }
-        return try await adapter.getNearestFrame(displayID: displayID, before: timestamp)
-    }
 
-    /// Get distinct display IDs that have frames in the given time range.
-    /// Used to discover which displays were active for PIP display.
-    public func getDistinctDisplayIDs(from startDate: Date, to endDate: Date) async throws -> [UInt32] {
-        guard let adapter = await services.dataAdapter else {
-            return []
-        }
-        return try await adapter.getDistinctDisplayIDs(from: startDate, to: endDate)
-    }
-
-    /// Get distinct displays in a time range, including persisted display names when available.
-    public func getDistinctDisplaysWithNames(from startDate: Date, to endDate: Date) async throws -> [(displayID: UInt32, displayName: String?)] {
-        guard let adapter = await services.dataAdapter else {
-            return []
-        }
-        return try await adapter.getDistinctDisplaysWithNames(from: startDate, to: endDate)
-    }
-
-    /// Get secondary display payloads for a set of primary frame IDs in one database round-trip.
-    /// Rows are grouped by primary frame ID and ordered by secondary display ID.
-    public func getSecondaryDisplayFrames(forPrimaryFrameIDs primaryFrameIDs: [FrameID]) async throws -> [Int64: [SecondaryDisplayFrameInfo]] {
-        guard let adapter = await services.dataAdapter else {
-            return [:]
-        }
-        return try await adapter.getSecondaryDisplayFrames(forPrimaryFrameIDs: primaryFrameIDs)
-    }
-
-    /// Get persisted display names for known display IDs.
-    public func getDisplayNames(displayIDs: [UInt32]) async throws -> [UInt32: String] {
-        try await services.database.getDisplayNames(displayIDs: displayIDs)
-    }
-
-    /// Get display IDs connected at a specific timestamp based on display_session rows.
-    public func getConnectedDisplayIDs(at timestamp: Date) async throws -> [UInt32] {
-        try await services.database.getConnectedDisplayIDs(at: timestamp)
+        return try await adapter.getVisibleBlockBoundary(
+            anchorFrame: anchorFrame,
+            filters: filters,
+            direction: direction
+        )
     }
 
     /// Get processing status for multiple frames in a single query
@@ -1793,15 +4148,16 @@ public actor AppCoordinator {
     }
 
     /// Get window usage aggregated by windowName or domain for a specific app
-    /// For browsers: returns websites (from browserUrl) first, then windowName fallbacks
+    /// For browsers: returns websites (from browserUrl) first, then windowName fallbacks, with tab counts per website
     /// For non-browsers: returns windows by windowName
     /// Returns items sorted by type (websites first) then duration descending
     public func getWindowUsageForApp(
         bundleID: String,
         from startDate: Date,
-        to endDate: Date
-    ) async throws -> [(windowName: String?, isWebsite: Bool, duration: TimeInterval)] {
-        try await services.database.getWindowUsageForApp(bundleID: bundleID, from: startDate, to: endDate)
+        to endDate: Date,
+        limit: Int? = nil
+    ) async throws -> [(windowName: String?, isWebsite: Bool, duration: TimeInterval, tabCount: Int?, totalCount: Int, totalDuration: TimeInterval)] {
+        try await services.database.getWindowUsageForApp(bundleID: bundleID, from: startDate, to: endDate, limit: limit)
     }
 
     /// Get browser tab usage aggregated by windowName (tab title) with full URL
@@ -1842,28 +4198,79 @@ public actor AppCoordinator {
 
     /// Add a tag to a segment
     public func addTagToSegment(segmentId: SegmentID, tagId: TagID) async throws {
+        // Prevent tagging Rewind data
+        if try await isRewindSegment(segmentId: segmentId) {
+            Log.warning("[AppCoordinator] Cannot add tag to Rewind segment \(segmentId.value)", category: .app)
+            return
+        }
         try await services.database.addTagToSegment(segmentId: segmentId, tagId: tagId)
     }
 
     /// Add a tag to multiple segments
     public func addTagToSegments(segmentIds: [SegmentID], tagId: TagID) async throws {
+        var addedCount = 0
         for segmentId in segmentIds {
+            // Skip Rewind segments
+            if try await isRewindSegment(segmentId: segmentId) {
+                Log.debug("[AppCoordinator] Skipping tag add for Rewind segment \(segmentId.value)", category: .app)
+                continue
+            }
             try await services.database.addTagToSegment(segmentId: segmentId, tagId: tagId)
+            addedCount += 1
         }
-        Log.info("[AppCoordinator] Added tag \(tagId.value) to \(segmentIds.count) segments", category: .app)
+        Log.info("[AppCoordinator] Added tag \(tagId.value) to \(addedCount) segments (skipped \(segmentIds.count - addedCount) Rewind segments)", category: .app)
     }
 
     /// Remove a tag from a segment
     public func removeTagFromSegment(segmentId: SegmentID, tagId: TagID) async throws {
+        // Prevent removing tags from Rewind data
+        if try await isRewindSegment(segmentId: segmentId) {
+            Log.warning("[AppCoordinator] Cannot remove tag from Rewind segment \(segmentId.value)", category: .app)
+            return
+        }
         try await services.database.removeTagFromSegment(segmentId: segmentId, tagId: tagId)
     }
 
     /// Remove a tag from multiple segments
     public func removeTagFromSegments(segmentIds: [SegmentID], tagId: TagID) async throws {
+        var removedCount = 0
         for segmentId in segmentIds {
+            // Skip Rewind segments
+            if try await isRewindSegment(segmentId: segmentId) {
+                Log.debug("[AppCoordinator] Skipping tag removal for Rewind segment \(segmentId.value)", category: .app)
+                continue
+            }
             try await services.database.removeTagFromSegment(segmentId: segmentId, tagId: tagId)
+            removedCount += 1
         }
-        Log.info("[AppCoordinator] Removed tag \(tagId.value) from \(segmentIds.count) segments", category: .app)
+        Log.info("[AppCoordinator] Removed tag \(tagId.value) from \(removedCount) segments (skipped \(segmentIds.count - removedCount) Rewind segments)", category: .app)
+    }
+
+    /// Check if a segment is from Rewind data (before the cutoff date)
+    private func isRewindSegment(segmentId: SegmentID) async throws -> Bool {
+        guard let adapter = await services.dataAdapter else {
+            return false // No Rewind source configured
+        }
+
+        guard let cutoffDate = await adapter.rewindCutoffDate else {
+            return false // No cutoff date means no Rewind data
+        }
+
+        // Get segment to check its start date
+        guard let segment = try await services.database.getSegment(id: segmentId.value) else {
+            return false // Segment doesn't exist
+        }
+
+        // If segment starts before cutoff, it's from Rewind
+        return segment.startDate < cutoffDate
+    }
+
+    /// Get the Rewind cutoff date (for UI to check if data is from Rewind)
+    public func getRewindCutoffDate() async -> Date? {
+        guard let adapter = await services.dataAdapter else {
+            return nil
+        }
+        return await adapter.rewindCutoffDate
     }
 
     /// Get all tags for a segment
@@ -1892,6 +4299,11 @@ public actor AppCoordinator {
         try await services.database.getSegmentTagsMap()
     }
 
+    /// Get a map of segment IDs to linked comment counts for timeline comment indicators.
+    public func getSegmentCommentCountsMap() async throws -> [Int64: Int] {
+        try await services.database.getSegmentCommentCountsMap()
+    }
+
     /// Hide a segment by adding the "hidden" tag
     public func hideSegment(segmentId: SegmentID) async throws {
         try await hideSegments(segmentIds: [segmentId])
@@ -1914,6 +4326,221 @@ public actor AppCoordinator {
             try await services.database.addTagToSegment(segmentId: segmentId, tagId: hiddenTag.id)
         }
         Log.info("[AppCoordinator] Hidden \(segmentIds.count) segments", category: .app)
+    }
+
+    // MARK: - Segment Comment Operations
+
+    /// Create a comment and apply it to all provided segments (bulk by default)
+    /// Rewind segments are skipped to preserve read-only semantics.
+    public func createCommentForSegments(
+        body: String,
+        segmentIds: [SegmentID],
+        attachments: [SegmentCommentAttachment] = [],
+        frameID: FrameID? = nil,
+        author: String? = nil
+    ) async throws -> SegmentCommentCreateResult {
+        let trimmedBody = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedBody.isEmpty else {
+            throw DatabaseError.constraintViolation(underlying: "Comment body cannot be empty")
+        }
+
+        let resolvedAuthor = resolvedCommentAuthor(author)
+        let comment = try await services.database.createSegmentComment(
+            body: trimmedBody,
+            author: resolvedAuthor,
+            attachments: attachments,
+            frameID: frameID
+        )
+
+        var linkedSegmentIDs: [SegmentID] = []
+        var skippedSegmentIDs: [SegmentID] = []
+        var failedSegmentIDs: [SegmentID] = []
+
+        for segmentId in segmentIds {
+            do {
+                if try await isRewindSegment(segmentId: segmentId) {
+                    skippedSegmentIDs.append(segmentId)
+                    continue
+                }
+                try await services.database.addCommentToSegment(segmentId: segmentId, commentId: comment.id)
+                linkedSegmentIDs.append(segmentId)
+            } catch {
+                failedSegmentIDs.append(segmentId)
+                Log.warning(
+                    "[AppCoordinator] Failed linking comment \(comment.id.value) to segment \(segmentId.value): \(error)",
+                    category: .app
+                )
+            }
+        }
+
+        if linkedSegmentIDs.isEmpty {
+            // No eligible segments were linked, clean up the newly-created comment (and attachments).
+            do {
+                try await services.database.deleteSegmentComment(commentId: comment.id)
+            } catch {
+                Log.warning(
+                    "[AppCoordinator] Failed cleanup for unlinked comment \(comment.id.value): \(error)",
+                    category: .app
+                )
+            }
+            throw DatabaseError.constraintViolation(underlying: "No eligible segments to attach comment")
+        }
+
+        Log.info(
+            "[AppCoordinator] Created comment \(comment.id.value): linked=\(linkedSegmentIDs.count), skipped=\(skippedSegmentIDs.count), failed=\(failedSegmentIDs.count)",
+            category: .app
+        )
+        return SegmentCommentCreateResult(
+            comment: comment,
+            linkedSegmentIDs: linkedSegmentIDs,
+            skippedSegmentIDs: skippedSegmentIDs,
+            failedSegmentIDs: failedSegmentIDs
+        )
+    }
+
+    /// Link an existing comment to multiple segments
+    public func addCommentToSegments(segmentIds: [SegmentID], commentId: SegmentCommentID) async throws {
+        var linkedCount = 0
+        for segmentId in segmentIds {
+            if try await isRewindSegment(segmentId: segmentId) {
+                continue
+            }
+            try await services.database.addCommentToSegment(segmentId: segmentId, commentId: commentId)
+            linkedCount += 1
+        }
+        Log.info("[AppCoordinator] Linked comment \(commentId.value) to \(linkedCount) segments", category: .app)
+    }
+
+    /// Remove a comment link from multiple segments
+    public func removeCommentFromSegments(segmentIds: [SegmentID], commentId: SegmentCommentID) async throws {
+        var removedCount = 0
+        for segmentId in segmentIds {
+            if try await isRewindSegment(segmentId: segmentId) {
+                continue
+            }
+            try await services.database.removeCommentFromSegment(segmentId: segmentId, commentId: commentId)
+            removedCount += 1
+        }
+        Log.info("[AppCoordinator] Removed comment \(commentId.value) from \(removedCount) segments", category: .app)
+    }
+
+    private func withDatabaseActorTrace<T>(
+        _ operation: String,
+        _ body: () async throws -> T
+    ) async throws -> T {
+        let enqueuedAt = CFAbsoluteTimeGetCurrent()
+        let traceID = String(UUID().uuidString.prefix(8))
+
+        return try await DatabaseActorTraceContext.$requestEnqueuedAt.withValue(enqueuedAt) {
+            try await DatabaseActorTraceContext.$operationName.withValue(operation) {
+                try await DatabaseActorTraceContext.$traceID.withValue(traceID) {
+                    try await body()
+                }
+            }
+        }
+    }
+
+    /// Get comments linked to a segment
+    public func getCommentsForSegment(segmentId: SegmentID) async throws -> [SegmentComment] {
+        try await withDatabaseActorTrace("get_comments_for_segment") {
+            try await services.database.getCommentsForSegment(segmentId: segmentId)
+        }
+    }
+
+    /// Get unique comments linked to any of the provided segments, keeping the earliest
+    /// requested segment as the preferred fallback target for each comment.
+    public func getCommentsForSegments(segmentIds: [SegmentID]) async throws -> [LinkedSegmentComment] {
+        let orderedSegmentIDs = segmentIds.uniquePreservingOrder()
+        guard !orderedSegmentIDs.isEmpty else { return [] }
+
+        return try await withDatabaseActorTrace("get_comments_for_segments") {
+            try await services.database.getCommentsForSegments(segmentIds: orderedSegmentIDs)
+        }
+    }
+
+    /// Get all linked comments with representative segment context (Retrace DB only).
+    public func getAllCommentTimelineEntries() async throws -> [(
+        comment: SegmentComment,
+        segmentID: SegmentID,
+        appBundleID: String?,
+        appName: String?,
+        browserURL: String?,
+        referenceTimestamp: Date
+    )] {
+        try await services.database.getAllCommentTimelineEntries()
+    }
+
+    /// Search comments by body text (server-side, capped result set).
+    public func searchSegmentComments(query: String, limit: Int = 10, offset: Int = 0) async throws -> [SegmentComment] {
+        try await services.database.searchSegmentComments(query: query, limit: limit, offset: offset)
+    }
+
+    /// Search comments with representative segment context (All Comments view).
+    public func searchCommentTimelineEntries(
+        query: String,
+        limit: Int = 10,
+        offset: Int = 0
+    ) async throws -> [(
+        comment: SegmentComment,
+        segmentID: SegmentID,
+        appBundleID: String?,
+        appName: String?,
+        browserURL: String?,
+        referenceTimestamp: Date
+    )] {
+        try await services.database.searchCommentTimelineEntries(query: query, limit: limit, offset: offset)
+    }
+
+    /// Update an existing comment
+    public func updateSegmentComment(
+        commentId: SegmentCommentID,
+        body: String,
+        attachments: [SegmentCommentAttachment],
+        author: String? = nil
+    ) async throws {
+        let trimmedBody = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedBody.isEmpty else {
+            throw DatabaseError.constraintViolation(underlying: "Comment body cannot be empty")
+        }
+
+        try await services.database.updateSegmentComment(
+            commentId: commentId,
+            body: trimmedBody,
+            author: resolvedCommentAuthor(author),
+            attachments: attachments
+        )
+    }
+
+    /// Delete a comment and all of its segment links
+    public func deleteSegmentComment(commentId: SegmentCommentID) async throws {
+        try await services.database.deleteSegmentComment(commentId: commentId)
+    }
+
+    /// Get the number of linked segments for a comment
+    public func getSegmentCountForComment(commentId: SegmentCommentID) async throws -> Int {
+        try await services.database.getSegmentCountForComment(commentId: commentId)
+    }
+
+    /// Resolve the oldest linked segment for a comment.
+    public func getFirstLinkedSegmentForComment(commentId: SegmentCommentID) async throws -> SegmentID? {
+        try await services.database.getFirstLinkedSegmentForComment(commentId: commentId)
+    }
+
+    /// Resolve the oldest frame in a segment.
+    public func getFirstFrameForSegment(segmentId: SegmentID) async throws -> FrameID? {
+        try await services.database.getFirstFrameForSegment(segmentId: segmentId)
+    }
+
+    private nonisolated func resolvedCommentAuthor(_ proposedAuthor: String?) -> String {
+        if let proposedAuthor {
+            let trimmed = proposedAuthor.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                return trimmed
+            }
+        }
+
+        let fallback = NSFullUserName().trimmingCharacters(in: .whitespacesAndNewlines)
+        return fallback.isEmpty ? "Unknown User" : fallback
     }
 
     // MARK: - Text Region Retrieval
@@ -1939,45 +4566,112 @@ public actor AppCoordinator {
 
     // MARK: - Frame Deletion
 
+    /// Dashboard bulk actions operate on native visible recordings only. Query directly
+    /// so imported Rewind IDs can never collide with native segment IDs during mutation.
+    public func getDashboardUsageActionFrames(bundleID: String, from start: Date, to end: Date) async throws -> [FrameReference] {
+        let hidden = try await services.database.getHiddenSegmentIds()
+        var selected: [FrameReference] = []
+        var cursor = start
+        // Bound temporary allocations while resolving the entire range, rather than
+        // accidentally acting on only the first dashboard page or a frame query limit.
+        repeat {
+            try Task.checkCancellation()
+            let batchEnd = min(cursor.addingTimeInterval(24 * 60 * 60), end)
+            let frames = try await services.database.getFrames(from: cursor, to: batchEnd, limit: Int(Int32.max))
+            selected.append(contentsOf: frames.filter {
+                $0.source == .native && $0.metadata.appBundleID == bundleID &&
+                !hidden.contains(SegmentID(value: $0.segmentID.value)) &&
+                (batchEnd == end || $0.timestamp < batchEnd)
+            })
+            cursor = batchEnd
+        } while cursor < end
+        return selected
+    }
+
     /// Delete a single frame from the database
     /// Note: For Rewind data, this only removes the database entry. Video files remain on disk.
-    public func deleteFrame(frameID: FrameID, timestamp: Date, source: FrameSource) async throws {
-        guard let adapter = await services.dataAdapter else {
-            // Fallback to direct database deletion for native frames
-            if source == .native {
-                try await services.database.deleteFrame(id: frameID)
-                Log.info("[AppCoordinator] Deleted native frame \(frameID.stringValue)", category: .app)
-                return
-            }
-            throw AppError.notInitialized
-        }
-
-        // For Rewind frames, use timestamp-based deletion (more reliable than synthetic UUIDs)
+    public func deleteFrame(
+        frameID: FrameID,
+        timestamp: Date,
+        source: FrameSource,
+        metricSource: String? = nil
+    ) async throws -> FrameDeletionResult {
+        let result: FrameDeletionResult
         if source == .rewind {
+            guard let adapter = await services.dataAdapter else {
+                throw AppError.notInitialized
+            }
             try await adapter.deleteFrameByTimestamp(timestamp, source: source)
+            result = FrameDeletionResult(completedFrames: 1, queuedFrames: 0)
         } else {
-            try await adapter.deleteFrame(frameID: frameID, source: source)
+            result = try await persistNativeFrameDeletionIntent(frameIDs: [frameID.value])
         }
 
-        Log.info("[AppCoordinator] Deleted frame from \(source.displayName)", category: .app)
+        Log.info(
+            "[AppCoordinator] Deleted frame from \(source.displayName); completed=\(result.completedFrames), queued=\(result.queuedFrames)",
+            category: .app
+        )
+
+        await recordDeleteMetric(
+            metricType: .frameDeleted,
+            payload: [
+                "source": metricSource ?? "frame_delete",
+                "dataSource": source.rawValue,
+                "frameID": frameID.value,
+                "completedFrames": result.completedFrames,
+                "queuedFrames": result.queuedFrames
+            ]
+        )
+        return result
     }
 
     /// Delete multiple frames from the database
     /// Groups by source and uses appropriate deletion method for each
-    public func deleteFrames(_ frames: [FrameReference]) async throws {
-        guard !frames.isEmpty else { return }
+    public func deleteFrames(
+        _ frames: [FrameReference],
+        metricSource: String? = nil
+    ) async throws -> FrameDeletionResult {
+        guard !frames.isEmpty else { return .empty }
 
-        // For Rewind frames, delete by timestamp (more reliable)
-        // For native frames, delete by ID
-        for frame in frames {
-            try await deleteFrame(
-                frameID: frame.id,
-                timestamp: frame.timestamp,
-                source: frame.source
+        var result = FrameDeletionResult.empty
+
+        let nativeFrameIDs = frames
+            .filter { $0.source == .native }
+            .map { $0.id.value }
+        if !nativeFrameIDs.isEmpty {
+            result = result.merging(try await persistNativeFrameDeletionIntent(frameIDs: nativeFrameIDs))
+        }
+
+        let rewindFrames = frames.filter { $0.source == .rewind }
+        if !rewindFrames.isEmpty {
+            guard let adapter = await services.dataAdapter else {
+                throw AppError.notInitialized
+            }
+            for frame in rewindFrames {
+                try await adapter.deleteFrameByTimestamp(frame.timestamp, source: .rewind)
+            }
+            result = result.merging(
+                FrameDeletionResult(completedFrames: rewindFrames.count, queuedFrames: 0)
             )
         }
 
-        Log.info("[AppCoordinator] Deleted \(frames.count) frames", category: .app)
+        Log.info(
+            "[AppCoordinator] Deleted \(frames.count) frames; completed=\(result.completedFrames), queued=\(result.queuedFrames)",
+            category: .app
+        )
+
+        await recordDeleteMetric(
+            metricType: .segmentDeleted,
+            payload: [
+                "source": metricSource ?? "frame_batch_delete",
+                "frameCount": frames.count,
+                "segmentCount": Set(frames.map { $0.segmentID.value }).count,
+                "completedFrames": result.completedFrames,
+                "queuedFrames": result.queuedFrames,
+                "dataSources": Array(Set(frames.map { $0.source.rawValue })).sorted()
+            ]
+        )
+        return result
     }
 
     // MARK: - URL Bounding Box Detection
@@ -1991,6 +4685,68 @@ public actor AppCoordinator {
         }
 
         return try await adapter.getURLBoundingBox(timestamp: timestamp, source: source)
+    }
+
+    /// Persist optional per-frame metadata JSON payload.
+    public func saveFrameMetadata(frameID: FrameID, metadataJSON: String?) async throws {
+        try await services.database.updateFrameMetadata(frameID: frameID, metadataJSON: metadataJSON)
+    }
+
+    /// Load per-frame metadata JSON payload.
+    public func getFrameMetadata(frameID: FrameID) async throws -> String? {
+        try await services.database.getFrameMetadata(frameID: frameID)
+    }
+
+    public func replaceFrameInPageURLData(
+        frameID: FrameID,
+        state: FrameInPageURLState?,
+        rows: [FrameInPageURLRow]
+    ) async throws {
+        let dbState = state.map {
+            Database.FrameInPageURLState(
+                mouseX: $0.mouseX,
+                mouseY: $0.mouseY,
+                scrollX: $0.scrollX,
+                scrollY: $0.scrollY,
+                videoCurrentTime: $0.videoCurrentTime
+            )
+        }
+        let dbRows = rows.map {
+            Database.FrameInPageURLRow(
+                order: $0.order,
+                url: $0.url,
+                nodeID: $0.nodeID
+            )
+        }
+        try await services.database.replaceFrameInPageURLData(
+            frameID: frameID,
+            state: dbState,
+            rows: dbRows
+        )
+    }
+
+    public func getFrameInPageURLRows(frameID: FrameID) async throws -> [FrameInPageURLRow] {
+        let rows = try await services.database.getFrameInPageURLRows(frameID: frameID)
+        return rows.map {
+            FrameInPageURLRow(
+                order: $0.order,
+                url: $0.url,
+                nodeID: $0.nodeID
+            )
+        }
+    }
+
+    public func getFrameInPageURLState(frameID: FrameID) async throws -> FrameInPageURLState? {
+        let state = try await services.database.getFrameInPageURLState(frameID: frameID)
+        return state.map {
+            FrameInPageURLState(
+                mouseX: $0.mouseX,
+                mouseY: $0.mouseY,
+                scrollX: $0.scrollX,
+                scrollY: $0.scrollY,
+                videoCurrentTime: $0.videoCurrentTime
+            )
+        }
     }
 
     // MARK: - OCR Node Detection (for text selection)
@@ -2038,10 +4794,12 @@ public actor AppCoordinator {
             return .pending
         case 1: // processing
             return .processing
-        case 2: // completed
+        case 2, 7: // completed
             return .completed
-        case 3: // failed
+        case 3, 8: // failed
             return .failed
+        case 5, 6: // rewrite pending/processing
+            return .rewriting
         default:
             return .unknown
         }
@@ -2056,6 +4814,15 @@ public actor AppCoordinator {
 
         // Record OCR reprocess metric
         try? await recordMetricEvent(metricType: .ocrReprocessRequests, metadata: "\(frameID.value)")
+
+        let existingNodes = try await services.database.getOCRNodesWithText(frameID: frameID)
+        if existingNodes.contains(where: \.isRedacted) {
+            Log.warning(
+                "[OCR-REPROCESS] Refusing to reprocess frame \(frameID.value) because it contains redacted OCR nodes",
+                category: .processing
+            )
+            throw AppError.ocrReprocessBlockedForRedactedFrame(frameID: frameID.value)
+        }
 
         // Clear existing OCR nodes for this frame
         try await services.database.deleteNodes(frameID: frameID)
@@ -2112,10 +4879,14 @@ public actor AppCoordinator {
 
     // MARK: - Calendar Support
 
-    /// Get all distinct dates that have frames (for calendar display)
-    /// Uses filesystem (chunks folder structure) instead of slow database queries
-    /// Checks both Retrace chunks and Rewind chunks (if Rewind is connected)
-    public func getDistinctDates() async throws -> [Date] {
+    /// Get all distinct dates that have frames for calendar display.
+    /// When active filters are provided, the returned dates reflect the filtered timeline.
+    /// Unfiltered calls keep using the fast filesystem path.
+    public func getDistinctDates(filters: FilterCriteria? = nil) async throws -> [Date] {
+        if let filters, filters.hasActiveFilters, let adapter = await services.dataAdapter {
+            return try await adapter.getDistinctDates(filters: filters)
+        }
+
         var allDates = Set<Date>()
 
         // Get dates from Retrace chunks folder
@@ -2203,11 +4974,11 @@ public actor AppCoordinator {
         try await services.database.getCapturedDurationAfter(date: date)
     }
 
-    /// Get distinct hours for a specific date that have frames
-    /// Uses DataAdapter to query the appropriate database (Retrace or Rewind) based on date
-    public func getDistinctHoursForDate(_ date: Date) async throws -> [Date] {
+    /// Get distinct hours for a specific date that have frames.
+    /// When active filters are provided, the returned hours reflect the filtered timeline.
+    public func getDistinctHoursForDate(_ date: Date, filters: FilterCriteria? = nil) async throws -> [Date] {
         if let adapter = await services.dataAdapter {
-            return try await adapter.getDistinctHoursForDate(date)
+            return try await adapter.getDistinctHoursForDate(date, filters: filters)
         }
         // Fallback to Retrace-only query
         return try await services.database.getDistinctHoursForDate(date)
@@ -2228,17 +4999,242 @@ public actor AppCoordinator {
         )
     }
 
+    private func recordMouseClickCaptureMetricIfNeeded(
+        outcome: MouseClickCaptureOutcome,
+        timestamp: Date
+    ) async {
+        let metadata = Self.metricMetadata([
+            "trigger": "mouse_click",
+            "outcome": outcome.rawValue,
+            "button": "left"
+        ])
+
+        try? await recordMetricEvent(
+            metricType: .mouseClickCapture,
+            timestamp: timestamp,
+            metadata: metadata
+        )
+    }
+
+    private func recordVideoQualityMetricIfNeeded(
+        quality: Double,
+        source: String,
+        isRunning: Bool
+    ) async {
+        let metadata = Self.metricMetadata([
+            "quality": quality,
+            "source": source,
+            "isRunning": isRunning
+        ])
+
+        try? await recordMetricEvent(
+            metricType: .videoQualityUpdated,
+            metadata: metadata
+        )
+    }
+
+    private func updateConferenceConsentMenuState(
+        with event: ConferenceFramePrivacyEvent
+    ) async {
+        let metricCallKey = event.callID ?? "unverified-\(event.conferenceKind.rawValue)"
+        if conferencePrivacyMetricState.shouldRecord(
+            callID: metricCallKey, outcome: event.outcome.rawValue, at: event.timestamp
+        ) {
+            try? await recordMetricEvent(
+                metricType: .conferencePrivacy,
+                timestamp: event.timestamp,
+                metadata: Self.metricMetadata([
+                    "action": "protection_changed", "outcome": event.outcome.rawValue,
+                    "conferenceKind": event.conferenceKind.rawValue, "source": "capture"
+                ])
+            )
+        }
+        guard let callID = event.callID?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !callID.isEmpty else {
+            await publishPreferredConferenceConsentMenuState(now: event.timestamp)
+            return
+        }
+
+        let title = conferenceConsentMenuTitle(
+            conferenceKind: event.conferenceKind,
+            windowName: event.windowName
+        )
+        let nextState = ConferenceConsentMenuState(
+            callID: callID,
+            title: title,
+            lastObservedAt: event.timestamp,
+            isBlurBypassedForConsent: event.outcome == .consentBypassed,
+            consentSessionID: event.consentSessionID
+        )
+        pruneConferenceConsentMenuStates(now: event.timestamp)
+        conferenceConsentMenuStateByCallID[callID] = ConferenceConsentMenuSelectionCandidate(
+            state: nextState,
+            menuSelectionPriority: event.isPreferredMenuCandidate ? 0 : 1
+        )
+        await publishPreferredConferenceConsentMenuState(now: event.timestamp)
+    }
+
+    public func disableFaceBlurForConferenceCall(callID: String) async -> Bool {
+        let normalizedCallID = callID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let didApply: Bool
+        if normalizedCallID.isEmpty {
+            didApply = false
+        } else {
+            didApply = await services.capture.disableFaceBlurForConferenceCall(callID: normalizedCallID)
+        }
+        try? await recordMetricEvent(
+            metricType: .conferencePrivacy,
+            metadata: Self.metricMetadata([
+                "action": "consent_override", "outcome": didApply ? "succeeded" : "failed",
+                "source": "menu_bar"
+            ])
+        )
+        guard didApply else { return false }
+
+        if let statusID = conferenceConsentMenuStateByCallID.first(where: {
+            $0.value.state.consentSessionID == normalizedCallID
+        })?.key, let storedState = conferenceConsentMenuStateByCallID[statusID] {
+            conferenceConsentMenuStateByCallID[statusID] = ConferenceConsentMenuSelectionCandidate(
+                state: ConferenceConsentMenuState(
+                    callID: storedState.state.callID,
+                    title: storedState.state.title,
+                    lastObservedAt: Date(),
+                    isBlurBypassedForConsent: true,
+                    consentSessionID: normalizedCallID
+                ),
+                menuSelectionPriority: storedState.menuSelectionPriority
+            )
+            await publishPreferredConferenceConsentMenuState(now: Date())
+        }
+
+        return true
+    }
+
+    private func pruneConferenceConsentMenuStates(now: Date) {
+        conferenceConsentMenuStateByCallID = conferenceConsentMenuStateByCallID.filter { _, candidate in
+            now.timeIntervalSince(candidate.state.lastObservedAt) <= Self.conferenceConsentMenuStateRetentionInterval
+        }
+    }
+
+    private func publishPreferredConferenceConsentMenuState(now: Date) async {
+        pruneConferenceConsentMenuStates(now: now)
+        let selectedState = Self.selectConferenceConsentMenuState(
+            from: Array(conferenceConsentMenuStateByCallID.values),
+            now: now,
+            retentionInterval: Self.conferenceConsentMenuStateRetentionInterval
+        )
+        latestConferenceConsentMenuState = selectedState
+        await publishConferenceConsentMenuStateNotification(selectedState)
+    }
+
+    static func selectConferenceConsentMenuState(
+        from candidates: [ConferenceConsentMenuSelectionCandidate],
+        now: Date,
+        retentionInterval: TimeInterval
+    ) -> ConferenceConsentMenuState? {
+        candidates
+            .filter { now.timeIntervalSince($0.state.lastObservedAt) <= retentionInterval }
+            .sorted { lhs, rhs in
+                if lhs.menuSelectionPriority != rhs.menuSelectionPriority {
+                    return lhs.menuSelectionPriority < rhs.menuSelectionPriority
+                }
+                if lhs.state.lastObservedAt != rhs.state.lastObservedAt {
+                    return lhs.state.lastObservedAt > rhs.state.lastObservedAt
+                }
+                return lhs.state.title.localizedCaseInsensitiveCompare(rhs.state.title) == .orderedAscending
+            }
+            .first?
+            .state
+    }
+
+    private func conferenceConsentMenuTitle(
+        conferenceKind: ConferenceSessionKind,
+        windowName: String?
+    ) -> String {
+        let trimmedWindowName = windowName?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !trimmedWindowName.isEmpty {
+            return trimmedWindowName
+        }
+        return conferenceKind.displayName
+    }
+
+    private func publishConferenceConsentMenuStateNotification(
+        _ state: ConferenceConsentMenuState?
+    ) async {
+        await MainActor.run {
+            NotificationCenter.default.post(
+                name: ConferenceConsentStateNotification.didChange,
+                object: nil,
+                userInfo: state?.notificationUserInfo ?? [:]
+            )
+        }
+    }
+
+    private func recordUnexpectedRecordingStopMetric(
+        action: String,
+        state: UnexpectedRecordingStopState
+    ) {
+        let metadata = Self.metricMetadata([
+            "action": action,
+            "reason": state.reason.rawValue,
+            "captureFramesObserved": state.captureFramesObserved,
+            "deduplicatedFrames": state.deduplicatedFrames,
+            "acceptedFrameCount": state.acceptedFrameCount,
+            "readableFrameCount": state.readableFrameCount,
+            "pendingUnreadableFrameCount": state.pendingUnreadableFrameCount,
+            "activeWriterCount": state.activeWriterCount,
+            "stalledWriterResolution": state.stalledWriterResolution as Any,
+            "stalledWriterVideoID": state.stalledWriterVideoID as Any,
+            "stalledWriterPendingAgeSeconds": state.stalledWriterPendingAgeSeconds as Any
+        ])
+
+        Task {
+            try? await recordMetricEvent(
+                metricType: .unexpectedRecordingStopAction,
+                timestamp: state.stoppedAt,
+                metadata: metadata
+            )
+        }
+    }
+
+    private static func metricMetadata(_ payload: [String: Any]) -> String? {
+        guard JSONSerialization.isValidJSONObject(payload),
+              let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
+              let json = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+        return json
+    }
+
     /// Get daily counts for a metric type (for 7-day graphs)
     /// Returns array of (date, count) tuples sorted by date ascending
     public func getDailyMetrics(
         metricType: DailyMetricsQueries.MetricType,
         from startDate: Date,
-        to endDate: Date
+        to endDate: Date,
+        preserveTimeBounds: Bool = false
     ) async throws -> [(date: Date, value: Int64)] {
         try await services.database.getDailyMetrics(
             metricType: metricType,
             from: startDate,
-            to: endDate
+            to: endDate,
+            preserveTimeBounds: preserveTimeBounds
+        )
+    }
+
+    public func getRecentMetricEvents(
+        limit: Int
+    ) async throws -> [FeedbackRecentMetricEvent] {
+        let rawEvents = try await services.database.getRecentMetricEvents(
+            limit: FeedbackRecentMetricSupport.rawEventFetchLimit(
+                forDisplayedLimit: limit
+            ),
+            excluding: FeedbackRecentMetricSupport.excludedMetricTypes
+        )
+        return FeedbackRecentMetricSupport.sanitize(
+            rawEvents,
+            limit: limit
         )
     }
 
@@ -2248,10 +5244,55 @@ public actor AppCoordinator {
         from startDate: Date,
         to endDate: Date
     ) async throws -> [(date: Date, value: Int64)] {
-        try await services.database.getDailyScreenTime(
-            from: startDate,
-            to: endDate
+        try await services.database.getDailyScreenTime(from: startDate, to: endDate)
+    }
+
+    /// Estimate per-day durable DB growth from daily snapshots.
+    /// Uses adjacent local-day rows directly because each day only stores one latest snapshot.
+    /// WAL growth is intentionally ignored here because it is transient journal churn rather than
+    /// retained storage growth.
+    public func getDailyDBStorageEstimatedBytes(
+        from startDate: Date,
+        to endDate: Date
+    ) async throws -> [(date: Date, value: Int64)] {
+        let calendar = Calendar.current
+        let startDay = calendar.startOfDay(for: startDate)
+        let endDay = calendar.startOfDay(for: endDate)
+        guard let snapshotStart = calendar.date(byAdding: .day, value: -1, to: startDay) else {
+            return []
+        }
+
+        let snapshots = try await services.database.getDBStorageSnapshots(
+            from: snapshotStart,
+            to: endDay
         )
+        guard snapshots.count >= 2 else {
+            return []
+        }
+
+        let snapshotsByDay = Dictionary(
+            uniqueKeysWithValues: snapshots.map { (calendar.startOfDay(for: $0.date), $0) }
+        )
+
+        var results: [(date: Date, value: Int64)] = []
+        var currentDay = startDay
+        while currentDay <= endDay {
+            guard let previousDay = calendar.date(byAdding: .day, value: -1, to: currentDay),
+                  let currentSnapshot = snapshotsByDay[currentDay],
+                  let previousSnapshot = snapshotsByDay[previousDay] else {
+                currentDay = calendar.date(byAdding: .day, value: 1, to: currentDay)!
+                continue
+            }
+
+            let currentTotal = currentSnapshot.dbBytes
+            let previousTotal = previousSnapshot.dbBytes
+            let estimatedGrowth = max(0, currentTotal - previousTotal)
+            results.append((date: currentDay, value: estimatedGrowth))
+
+            currentDay = calendar.date(byAdding: .day, value: 1, to: currentDay)!
+        }
+
+        return results
     }
 
     // MARK: - Statistics & Monitoring
@@ -2343,25 +5384,30 @@ public actor AppCoordinator {
 
     /// Delete recent data (newer than specified date) - used for quick delete feature
     /// This deletes all frames captured after the cutoff date
-    public func deleteRecentData(newerThan date: Date) async throws -> CleanupResult {
+    public func deleteRecentData(
+        newerThan date: Date,
+        metricSource: String? = "quick_delete"
+    ) async throws -> FrameDeletionResult {
         Log.info("Starting quick delete for data newer than \(date)", category: .app)
 
-        // Delete recent frames from database
-        let deletedFrameCount = try await services.database.deleteFrames(newerThan: date)
+        let result = try await persistNativeFrameDeletionIntent(newerThan: date)
 
-        // Note: Video segments are not deleted here because they may contain older frames too
-        // The storage cleanup based on retention policy will handle orphaned segments
-
-        // Vacuum database to reclaim space
-        try await services.database.vacuum()
-
-        Log.info("Quick delete complete. Deleted \(deletedFrameCount) frames", category: .app)
-
-        return CleanupResult(
-            deletedFrames: deletedFrameCount,
-            deletedSegments: 0, // Segments are not deleted in quick delete
-            reclaimedBytes: 0
+        Log.info(
+            "Quick delete complete. completed=\(result.completedFrames), queued=\(result.queuedFrames)",
+            category: .app
         )
+
+        await recordDeleteMetric(
+            metricType: .segmentDeleted,
+            payload: [
+                "source": metricSource ?? "quick_delete",
+                "frameCount": result.affectedFrames,
+                "completedFrames": result.completedFrames,
+                "queuedFrames": result.queuedFrames,
+                "cutoffTimestampMs": Int64(date.timeIntervalSince1970 * 1000)
+            ]
+        )
+        return result
     }
 
     /// Rebuild the search index
@@ -2386,58 +5432,817 @@ public actor AppCoordinator {
         try await services.database.getSchemaDescription()
     }
 
-    private func runtimeDisplayName(for displayID: UInt32) -> String? {
-        for screen in NSScreen.screens {
-            guard
-                let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber,
-                screenNumber.uint32Value == displayID
-            else {
-                continue
+    // MARK: - In-Page URL Metadata Capture
+
+    private static let inPageURLCollectionExperimentalKey = "collectInPageURLsExperimental"
+    private static let captureMousePositionKey = "captureMousePosition"
+    private static let inPageURLChromiumBundleIDs: Set<String> = [
+        "com.google.Chrome",
+        "com.google.Chrome.canary",
+        "org.chromium.Chromium",
+        "com.microsoft.edgemac",
+        "com.brave.Browser",
+        "com.vivaldi.Vivaldi",
+        "com.operasoftware.Opera",
+        "company.thebrowser.Browser",
+        "ai.perplexity.comet",
+        "company.thebrowser.dia",
+        "com.sigmaos.sigmaos.macos",
+        "com.nicklockwood.Thorium",
+    ]
+    private static let inPageURLChromiumHostBundleIDPrefixes: [String] = [
+        "com.google.Chrome",
+        "com.google.Chrome.canary",
+        "org.chromium.Chromium",
+        "com.microsoft.edgemac",
+        "com.brave.Browser",
+        "com.vivaldi.Vivaldi",
+        "com.operasoftware.Opera",
+        "company.thebrowser.Browser",
+        "ai.perplexity.comet",
+        "company.thebrowser.dia",
+        "com.sigmaos.sigmaos.macos",
+        "com.nicklockwood.Thorium",
+    ]
+    private static let inPageURLRawLinkLimit = 100
+    private static let inPageURLAppleScriptTimeoutSeconds: TimeInterval = 4
+    private static let inPageURLNoMatchingWindowToken = "__NO_MATCHING_WINDOW__"
+    private static let inPageURLCaptureCoordinator = InPageURLCaptureCoordinator()
+
+    private actor InPageURLCaptureCoordinator {
+        private struct CaptureKey: Hashable {
+            let bundleID: String
+            let preferredURLNeedle: String
+        }
+
+        private struct BundleTaskState {
+            let token: UUID
+            let task: Task<String?, Error>
+        }
+
+        private var inFlightByKey: [CaptureKey: Task<String?, Error>] = [:]
+        private var inFlightByBundle: [String: BundleTaskState] = [:]
+
+        func capture(
+            bundleID: String,
+            preferredURL: String?,
+            operation: @escaping @Sendable () async throws -> String?
+        ) async throws -> String? {
+            let key = CaptureKey(
+                bundleID: bundleID,
+                preferredURLNeedle: AppCoordinator.preferredURLNeedle(from: preferredURL) ?? ""
+            )
+
+            if let existingTask = inFlightByKey[key] {
+                return try await existingTask.value
             }
 
-            let localized = screen.localizedName.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !localized.isEmpty else { return nil }
-
-            if CGDisplayIsBuiltin(CGDirectDisplayID(displayID)) != 0 {
-                if let hostName = Host.current().localizedName?.trimmingCharacters(in: .whitespacesAndNewlines),
-                   !hostName.isEmpty {
-                    return hostName
+            // Arc/Safari automation can time out when multiple in-page scripts hit the same
+            // browser concurrently. Serialize execution per bundle while still coalescing by key.
+            while let activeBundleTask = inFlightByBundle[bundleID] {
+                _ = try? await activeBundleTask.task.value
+                if inFlightByBundle[bundleID]?.token == activeBundleTask.token {
+                    inFlightByBundle[bundleID] = nil
+                }
+                if let existingTask = inFlightByKey[key] {
+                    return try await existingTask.value
                 }
             }
 
-            return localized
+            let token = UUID()
+            let task = Task<String?, Error> {
+                try await operation()
+            }
+            inFlightByKey[key] = task
+            inFlightByBundle[bundleID] = BundleTaskState(token: token, task: task)
+            defer {
+                inFlightByKey[key] = nil
+                if inFlightByBundle[bundleID]?.token == token {
+                    inFlightByBundle[bundleID] = nil
+                }
+            }
+            return try await task.value
         }
+    }
+
+    private struct InPageCapturedDOMLink: Codable, Sendable {
+        let href: String
+        let text: String
+        let left: Double
+        let top: Double
+        let width: Double
+        let height: Double
+    }
+
+    private struct InPageCapturedDOMMousePosition: Codable, Sendable {
+        let x: Double
+        let y: Double
+    }
+
+    private struct InPageCapturedDOMScrollPosition: Codable, Sendable {
+        let x: Double
+        let y: Double
+    }
+
+    private struct InPageCapturedDOMVideoPosition: Codable, Sendable {
+        let currentTime: Double
+    }
+
+    private struct InPageCapturedDOMPayload: Decodable, Sendable {
+        let pageUrl: String
+        let links: [InPageCapturedDOMLink]
+        let mousePosition: InPageCapturedDOMMousePosition?
+        let scrollPosition: InPageCapturedDOMScrollPosition?
+        let videoPosition: InPageCapturedDOMVideoPosition?
+    }
+
+    private struct PendingInPageURLMetadataRect: Codable, Sendable {
+        let x: Double
+        let y: Double
+        let w: Double
+        let h: Double
+    }
+
+    private struct PendingInPageURLMetadataResolvedURL: Codable, Sendable {
+        let url: String
+        let nid: Int
+        let p: PendingInPageURLMetadataRect
+    }
+
+    private struct PendingInPageURLMetadataRawLink: Codable, Sendable {
+        let url: String
+        let text: String
+        let left: Double
+        let top: Double
+        let width: Double
+        let height: Double
+    }
+
+    private struct PendingInPageURLMetadataPoint: Codable, Sendable {
+        let x: Double
+        let y: Double
+    }
+
+    private struct PendingInPageURLMetadataVideoPosition: Codable, Sendable {
+        let currenttime: Double
+    }
+
+    private struct PendingInPageURLMetadataPayload: Codable, Sendable {
+        let pageurl: String
+        let rawlinks: [PendingInPageURLMetadataRawLink]
+        let urls: [PendingInPageURLMetadataResolvedURL]
+        let mouseposition: PendingInPageURLMetadataPoint?
+        let scrollposition: PendingInPageURLMetadataPoint?
+        let videoposition: PendingInPageURLMetadataVideoPosition?
+    }
+
+    private enum InPageURLCaptureError: Error {
+        case unsupportedBundleID
+        case noWindows
+        case noMatchingWindow
+        case scriptFailed(String)
+        case invalidOutput(String)
+    }
+
+    private func persistGlobalMousePositionIfNeeded(
+        frameID: Int64,
+        capturedFrame: CapturedFrame
+    ) async {
+        guard Self.isMousePositionCollectionEnabled(),
+              let mousePosition = Self.globalMousePosition(in: capturedFrame) else {
+            return
+        }
+
+        do {
+            try await services.database.replaceFrameInPageURLData(
+                frameID: FrameID(value: frameID),
+                state: Database.FrameInPageURLState(
+                    mouseX: mousePosition.x,
+                    mouseY: mousePosition.y,
+                    scrollX: nil,
+                    scrollY: nil,
+                    videoCurrentTime: nil
+                ),
+                rows: []
+            )
+        } catch {
+            Log.warning(
+                "[MousePosition] Failed to persist mouse position for frame \(frameID): \(error)",
+                category: .app
+            )
+        }
+    }
+
+    private func scheduleInPageURLMetadataCaptureIfNeeded(
+        frameID: Int64,
+        frameMetadata: FrameMetadata
+    ) {
+        guard Self.isInPageURLCollectionEnabled(),
+              let bundleID = frameMetadata.appBundleID,
+              Self.isInPageURLCaptureSupported(bundleID: bundleID) else {
+            return
+        }
+
+        let database = services.database
+        let services = self.services
+        let frameIDValue = frameID
+        let preferredURL = frameMetadata.browserURL
+        let preferredURLNeedle = Self.preferredURLNeedle(from: preferredURL) ?? "<none>"
+
+        Task.detached(priority: .utility) {
+            do {
+                guard let metadataJSON = try await Self.inPageURLCaptureCoordinator.capture(
+                    bundleID: bundleID,
+                    preferredURL: preferredURL,
+                    operation: {
+                        try await Self.capturePendingInPageURLMetadataJSON(
+                            bundleID: bundleID,
+                            preferredURL: preferredURL
+                        )
+                    }
+                ) else {
+                    return
+                }
+
+                try await database.updateFrameMetadata(
+                    frameID: FrameID(value: frameIDValue),
+                    metadataJSON: metadataJSON
+                )
+
+                if let processingQueue = await services.processingQueue {
+                    try await processingQueue.resolveInPageURLMetadataIfPossible(frameID: frameIDValue)
+                }
+            } catch {
+                Log.debug(
+                    "[InPageURL][Capture] Pending metadata capture failed for frameID=\(frameIDValue), bundleID=\(bundleID), needle=\(preferredURLNeedle): \(error)",
+                    category: .app
+                )
+            }
+        }
+    }
+
+    private static func isInPageURLCollectionEnabled() -> Bool {
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
+        guard defaults.object(forKey: inPageURLCollectionExperimentalKey) != nil else {
+            return false
+        }
+        return defaults.bool(forKey: inPageURLCollectionExperimentalKey)
+    }
+
+    private static func isMousePositionCollectionEnabled() -> Bool {
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
+        guard defaults.object(forKey: captureMousePositionKey) != nil else {
+            return true
+        }
+        return defaults.bool(forKey: captureMousePositionKey)
+    }
+
+    private static func globalMousePosition(in frame: CapturedFrame) -> PendingInPageURLMetadataPoint? {
+        guard frame.width > 0, frame.height > 0 else { return nil }
+        if let capturedPosition = frame.metadata.mousePosition {
+            return PendingInPageURLMetadataPoint(x: roundedMetadataCoordinate(capturedPosition.x),
+                                                 y: roundedMetadataCoordinate(capturedPosition.y))
+        }
+
+        guard let event = CGEvent(source: nil) else { return nil }
+        let location = event.location
+        let displayID = CGDirectDisplayID(frame.metadata.displayID)
+        let displayBounds = CGDisplayBounds(displayID)
+        guard displayBounds.width > 0,
+              displayBounds.height > 0,
+              displayBounds.contains(location) else {
+            return nil
+        }
+
+        let relativeX = location.x - displayBounds.origin.x
+        let relativeY = location.y - displayBounds.origin.y
+        let scaleX = Double(frame.width) / Double(displayBounds.width)
+        let scaleY = Double(frame.height) / Double(displayBounds.height)
+
+        // CGEvent.location is already top-down in display coordinates.
+        // Store top-down frame coordinates so timeline overlays can map directly.
+        let x = relativeX * scaleX
+        let y = relativeY * scaleY
+
+        let clampedX = min(max(x, 0), Double(frame.width - 1))
+        let clampedY = min(max(y, 0), Double(frame.height - 1))
+
+        return PendingInPageURLMetadataPoint(
+            x: roundedMetadataCoordinate(clampedX),
+            y: roundedMetadataCoordinate(clampedY)
+        )
+    }
+
+    private static func isInPageURLCaptureSupported(bundleID: String) -> Bool {
+        if bundleID == "com.apple.Safari" {
+            return true
+        }
+        if inPageURLChromiumBundleIDs.contains(bundleID) {
+            return true
+        }
+        return inPageURLChromiumHostBundleIDPrefixes.contains { prefix in
+            bundleID.hasPrefix(prefix + ".app.")
+        }
+    }
+
+    static func inPageURLHostBrowserBundleID(for bundleID: String) -> String? {
+        if inPageURLChromiumBundleIDs.contains(bundleID) {
+            return bundleID
+        }
+
+        for prefix in inPageURLChromiumHostBundleIDPrefixes where bundleID.hasPrefix(prefix + ".app.") {
+            return prefix
+        }
+
         return nil
     }
 
-    /// Convert runtime CGDirectDisplayID into a stable hardware-derived ID for persistence.
-    /// `displayID` columns keep their name, but this value is stable across runtime ID reuse.
-    private func stableDisplayID(forRuntimeDisplayID runtimeDisplayID: UInt32) -> UInt32 {
-        let cgDisplayID = CGDirectDisplayID(runtimeDisplayID)
-        let vendor = CGDisplayVendorNumber(cgDisplayID)
-        let model = CGDisplayModelNumber(cgDisplayID)
-        let serial = CGDisplaySerialNumber(cgDisplayID)
+    private static func isInPageURLChromiumAppShimBundleID(_ bundleID: String) -> Bool {
+        guard let hostBrowserBundleID = inPageURLHostBrowserBundleID(for: bundleID) else {
+            return false
+        }
+        return hostBrowserBundleID != bundleID
+    }
 
-        let fingerprint: String
-        if vendor == 0 && model == 0 && serial == 0 {
-            fingerprint = "runtime:\(runtimeDisplayID)"
-        } else if serial != 0 {
-            fingerprint = "\(vendor):\(model):\(serial)"
-        } else {
-            let width = CGDisplayPixelsWide(cgDisplayID)
-            let height = CGDisplayPixelsHigh(cgDisplayID)
-            fingerprint = "\(vendor):\(model):\(width)x\(height)"
+    private static func capturePendingInPageURLMetadataJSON(
+        bundleID: String,
+        preferredURL: String?
+    ) async throws -> String? {
+        let scriptLines = try inPageURLCaptureScriptLines(
+            bundleID: bundleID,
+            preferredURL: preferredURL
+        )
+        let rawOutput = try await runInPageURLAppleScript(lines: scriptLines)
+        let trimmed = rawOutput.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if trimmed == "__NO_WINDOWS__" {
+            throw InPageURLCaptureError.noWindows
+        }
+        if trimmed == inPageURLNoMatchingWindowToken {
+            throw InPageURLCaptureError.noMatchingWindow
         }
 
-        var hash: UInt32 = 2_166_136_261
-        for byte in fingerprint.utf8 {
-            hash ^= UInt32(byte)
-            hash = hash &* 16_777_619
+        let payload: InPageCapturedDOMPayload
+        do {
+            payload = try decodeInPageCapturedDOMPayload(from: trimmed)
+        } catch {
+            var preview = trimmed.replacingOccurrences(of: "\n", with: "\\n")
+            if preview.count > 160 {
+                preview = String(preview.prefix(160)) + "..."
+            }
+            throw InPageURLCaptureError.invalidOutput("json decode failed: \(error), outputPreview=\(preview)")
         }
 
-        // Keep IDs Int32-compatible because persistence code still binds/reads displayID as Int32.
-        let int32SafeHash = hash & 0x7FFF_FFFF
-        return int32SafeHash == 0 ? 1 : int32SafeHash
+        var dedupedRawLinks: [PendingInPageURLMetadataRawLink] = []
+        dedupedRawLinks.reserveCapacity(min(payload.links.count, inPageURLRawLinkLimit))
+        var seenKeys: Set<String> = []
+        seenKeys.reserveCapacity(min(payload.links.count, inPageURLRawLinkLimit))
+        for link in payload.links {
+            if dedupedRawLinks.count >= inPageURLRawLinkLimit {
+                break
+            }
+
+            let url = link.href.trimmingCharacters(in: .whitespacesAndNewlines)
+            let text = link.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !url.isEmpty, !text.isEmpty else { continue }
+
+            let roundedLeft = roundedMetadataCoordinate(link.left)
+            let roundedTop = roundedMetadataCoordinate(link.top)
+            let roundedWidth = roundedMetadataCoordinate(link.width)
+            let roundedHeight = roundedMetadataCoordinate(link.height)
+            guard roundedWidth > 0, roundedHeight > 0 else { continue }
+
+            let key = "\(url)|\(text)|\(roundedLeft)|\(roundedTop)|\(roundedWidth)|\(roundedHeight)"
+            guard seenKeys.insert(key).inserted else { continue }
+
+            dedupedRawLinks.append(
+                PendingInPageURLMetadataRawLink(
+                    url: url,
+                    text: text,
+                    left: roundedLeft,
+                    top: roundedTop,
+                    width: roundedWidth,
+                    height: roundedHeight
+                )
+            )
+        }
+
+        let metadataPayload = PendingInPageURLMetadataPayload(
+            pageurl: payload.pageUrl,
+            rawlinks: dedupedRawLinks,
+            urls: [],
+            mouseposition: nil,
+            scrollposition: payload.scrollPosition.map {
+                PendingInPageURLMetadataPoint(
+                    x: roundedMetadataCoordinate($0.x),
+                    y: roundedMetadataCoordinate($0.y)
+                )
+            },
+            videoposition: payload.videoPosition.map {
+                PendingInPageURLMetadataVideoPosition(
+                    currenttime: $0.currentTime
+                )
+            }
+        )
+
+        let encodedData = try JSONEncoder().encode(metadataPayload)
+        return String(data: encodedData, encoding: .utf8)
+    }
+
+    private static func decodeInPageCapturedDOMPayload(
+        from rawOutput: String
+    ) throws -> InPageCapturedDOMPayload {
+        guard let data = rawOutput.data(using: .utf8) else {
+            throw InPageURLCaptureError.invalidOutput("utf8 conversion failed")
+        }
+
+        let decoder = JSONDecoder()
+        do {
+            return try decoder.decode(InPageCapturedDOMPayload.self, from: data)
+        } catch let directError {
+            // Arc can return JSON-stringified payloads wrapped as a string literal.
+            if let wrappedJSONString = try? decoder.decode(String.self, from: data),
+               let wrappedData = wrappedJSONString.data(using: .utf8),
+               let payload = try? decoder.decode(InPageCapturedDOMPayload.self, from: wrappedData) {
+                return payload
+            }
+            throw directError
+        }
+    }
+
+    private static func inPageURLCaptureScriptLines(
+        bundleID: String,
+        preferredURL: String?
+    ) throws -> [String] {
+        let escapedJS = appleScriptEscaped(inPageURLCaptureJavaScript)
+        let preferredNeedle = appleScriptEscaped(preferredURLNeedle(from: preferredURL) ?? "")
+
+        if bundleID == "com.apple.Safari" {
+            return [
+                "set __retraceNeedle to \"\(preferredNeedle)\"",
+                "tell application id \"com.apple.Safari\"",
+                "if (count of windows) = 0 then return \"__NO_WINDOWS__\"",
+                "set t to missing value",
+                "if __retraceNeedle is not \"\" then",
+                "repeat with w in windows",
+                "repeat with candidateTab in tabs of w",
+                "try",
+                "set tabURL to URL of candidateTab",
+                "if tabURL contains __retraceNeedle then",
+                "set t to candidateTab",
+                "exit repeat",
+                "end if",
+                "end try",
+                "end repeat",
+                "if t is not missing value then exit repeat",
+                "end repeat",
+                "end if",
+                "if t is missing value then set t to current tab of front window",
+                "with timeout of \(Int(inPageURLAppleScriptTimeoutSeconds)) seconds",
+                "return do JavaScript \"\(escapedJS)\" in t",
+                "end timeout",
+                "end tell",
+            ]
+        }
+
+        guard isInPageURLCaptureSupported(bundleID: bundleID) else {
+            throw InPageURLCaptureError.unsupportedBundleID
+        }
+
+        if isInPageURLChromiumAppShimBundleID(bundleID),
+           let hostBrowserBundleID = inPageURLHostBrowserBundleID(for: bundleID) {
+            return chromiumAppShimInPageURLCaptureScriptLines(
+                appShimBundleID: bundleID,
+                hostBrowserBundleID: hostBrowserBundleID,
+                preferredNeedle: preferredNeedle,
+                escapedJS: escapedJS
+            )
+        }
+
+        if bundleID == "company.thebrowser.Browser" {
+            // Arc returns UUID-backed object references that can fail when coerced via
+            // intermediate tab variables; resolve through tab id within front window.
+            return [
+                "set __retraceNeedle to \"\(preferredNeedle)\"",
+                "tell application id \"\(bundleID)\"",
+                "if (count of windows) = 0 then return \"__NO_WINDOWS__\"",
+                "set targetTabID to id of active tab of front window",
+                "if __retraceNeedle is not \"\" then",
+                "repeat with candidateTab in tabs of front window",
+                "try",
+                "set tabURL to URL of candidateTab",
+                "if tabURL contains __retraceNeedle then",
+                "set targetTabID to id of candidateTab",
+                "exit repeat",
+                "end if",
+                "end try",
+                "end repeat",
+                "end if",
+                "with timeout of \(Int(inPageURLAppleScriptTimeoutSeconds)) seconds",
+                "return execute (tab id targetTabID of front window) javascript \"\(escapedJS)\"",
+                "end timeout",
+                "end tell",
+            ]
+        }
+
+        return chromiumInPageURLCaptureScriptLines(
+            bundleID: bundleID,
+            preferredNeedle: preferredNeedle,
+            escapedJS: escapedJS
+        )
+    }
+
+    private static func chromiumInPageURLCaptureScriptLines(
+        bundleID: String,
+        preferredNeedle: String,
+        escapedJS: String
+    ) -> [String] {
+        [
+            "set __retraceNeedle to \"\(preferredNeedle)\"",
+            "tell application id \"\(bundleID)\"",
+            "if (count of windows) = 0 then return \"__NO_WINDOWS__\"",
+            "set t to active tab of front window",
+            "if __retraceNeedle is not \"\" then",
+            "try",
+            "set activeTabURL to URL of t",
+            "if activeTabURL does not contain __retraceNeedle then set t to missing value",
+            "on error",
+            "set t to missing value",
+            "end try",
+            "if t is missing value then",
+            "repeat with w in windows",
+            "repeat with candidateTab in tabs of w",
+            "try",
+            "set tabURL to URL of candidateTab",
+            "if tabURL contains __retraceNeedle then",
+            "set t to candidateTab",
+            "exit repeat",
+            "end if",
+            "end try",
+            "end repeat",
+            "if t is not missing value then exit repeat",
+            "end repeat",
+            "end if",
+            "end if",
+            "if t is missing value then set t to active tab of front window",
+            "with timeout of \(Int(inPageURLAppleScriptTimeoutSeconds)) seconds",
+            "return execute t javascript \"\(escapedJS)\"",
+            "end timeout",
+            "end tell",
+        ]
+    }
+
+    private static func chromiumAppShimInPageURLCaptureScriptLines(
+        appShimBundleID: String,
+        hostBrowserBundleID: String,
+        preferredNeedle: String,
+        escapedJS: String
+    ) -> [String] {
+        [
+            "set __retraceNeedle to \"\(preferredNeedle)\"",
+            "set __retraceWindowTitle to \"\"",
+            "tell application id \"\(appShimBundleID)\"",
+            "if (count of windows) = 0 then return \"__NO_WINDOWS__\"",
+            "try",
+            "set __retraceWindowTitle to name of front window",
+            "end try",
+            "end tell",
+            "tell application id \"\(hostBrowserBundleID)\"",
+            "if (count of windows) = 0 then return \"__NO_WINDOWS__\"",
+            "set targetWindowIndex to -1",
+            "set targetTabIndex to -1",
+            "set wIndex to 1",
+            "repeat with w in windows",
+            "set tIndex to 1",
+            "repeat with candidateTab in tabs of w",
+            "set tabURL to \"\"",
+            "set tabTitle to \"\"",
+            "try",
+            "set tabURL to URL of candidateTab",
+            "set tabTitle to title of candidateTab",
+            "end try",
+            "if targetTabIndex is -1 and __retraceNeedle is not \"\" and tabURL is not \"\" then",
+            "if tabURL contains __retraceNeedle then",
+            "set targetWindowIndex to wIndex",
+            "set targetTabIndex to tIndex",
+            "exit repeat",
+            "end if",
+            "end if",
+            "if targetTabIndex is -1 and __retraceWindowTitle is not \"\" and tabTitle is not \"\" then",
+            "if __retraceWindowTitle is equal to tabTitle then",
+            "set targetWindowIndex to wIndex",
+            "set targetTabIndex to tIndex",
+            "exit repeat",
+            "end if",
+            "if __retraceWindowTitle ends with (\" - \" & tabTitle) then",
+            "set targetWindowIndex to wIndex",
+            "set targetTabIndex to tIndex",
+            "exit repeat",
+            "end if",
+            "end if",
+            "set tIndex to tIndex + 1",
+            "end repeat",
+            "if targetTabIndex is not -1 then exit repeat",
+            "set wIndex to wIndex + 1",
+            "end repeat",
+            "if targetTabIndex is -1 then return \"\(inPageURLNoMatchingWindowToken)\"",
+            "with timeout of \(Int(inPageURLAppleScriptTimeoutSeconds)) seconds",
+            "return execute (tab targetTabIndex of window targetWindowIndex) javascript \"\(escapedJS)\"",
+            "end timeout",
+            "end tell",
+        ]
+    }
+
+    static func preferredURLNeedle(from rawURL: String?) -> String? {
+        guard let rawURL,
+              let parsed = URL(string: rawURL),
+              let host = parsed.host?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() else {
+            return nil
+        }
+
+        let normalizedHost = host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
+        guard let components = URLComponents(url: parsed, resolvingAgainstBaseURL: false) else {
+            return normalizedHost
+        }
+
+        let path = components.percentEncodedPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let query = components.percentEncodedQuery?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        var needle = normalizedHost
+        if !path.isEmpty, path != "/" {
+            needle += path
+        } else if let query, !query.isEmpty {
+            needle += "/"
+        }
+
+        if let query, !query.isEmpty {
+            needle += "?\(query)"
+        }
+
+        return needle
+    }
+
+    private static func runInPageURLAppleScript(lines: [String]) async throws -> String {
+        try await Task.detached(priority: .utility) {
+            let startTime = CFAbsoluteTimeGetCurrent()
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+            process.arguments = lines.flatMap { ["-e", $0] }
+
+            let stdout = Pipe()
+            let stderr = Pipe()
+            process.standardOutput = stdout
+            process.standardError = stderr
+
+            try process.run()
+
+            let deadline = Date().addingTimeInterval(inPageURLAppleScriptTimeoutSeconds + 1)
+            while process.isRunning && Date() < deadline {
+                try? await Task.sleep(for: .milliseconds(20), clock: .continuous)
+            }
+
+            if process.isRunning {
+                let elapsedMs = (CFAbsoluteTimeGetCurrent() - startTime) * 1_000.0
+                process.terminate()
+                process.waitUntilExit()
+                throw InPageURLCaptureError.scriptFailed(
+                    "Timed out waiting for browser response after \(inPageURLAppleScriptTimeoutSeconds)s (elapsed=\(String(format: "%.1f", elapsedMs))ms)"
+                )
+            }
+
+            let outputData = stdout.fileHandleForReading.readDataToEndOfFile()
+            let errorData = stderr.fileHandleForReading.readDataToEndOfFile()
+            let output = String(data: outputData, encoding: .utf8) ?? ""
+            let errors = String(data: errorData, encoding: .utf8) ?? ""
+            let elapsedMs = (CFAbsoluteTimeGetCurrent() - startTime) * 1_000.0
+
+            if process.terminationStatus != 0 {
+                throw InPageURLCaptureError.scriptFailed(
+                    errors.isEmpty
+                    ? "exit \(process.terminationStatus), elapsed=\(String(format: "%.1f", elapsedMs))ms"
+                    : "\(errors) (elapsed=\(String(format: "%.1f", elapsedMs))ms)"
+                )
+            }
+
+            if elapsedMs >= 1_000 {
+                Log.debug(
+                    "[InPageURL][Capture] AppleScript slow-path elapsed=\(String(format: "%.1f", elapsedMs))ms outputBytes=\(outputData.count)",
+                    category: .app
+                )
+            }
+
+            return output
+        }.value
+    }
+
+    private static func roundedMetadataCoordinate(_ value: Double) -> Double {
+        let rounded = (value * 1_000.0).rounded() / 1_000.0
+        if rounded == -0 {
+            return 0
+        }
+        return rounded
+    }
+
+    private static var inPageURLCaptureJavaScript: String {
+        """
+        (function() {
+            const links = document.links;
+            const maxLinks = \(inPageURLRawLinkLimit);
+            const maxScannedLinks = 800;
+            const scanBudgetMs = 1200;
+            const scanStartTime = (window.performance && typeof window.performance.now === 'function')
+                ? window.performance.now()
+                : Date.now();
+            const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
+            const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+            const out = [];
+
+            for (let index = 0; index < links.length; index += 1) {
+                if (out.length >= maxLinks) break;
+                if (index >= maxScannedLinks) break;
+                const scanNow = (window.performance && typeof window.performance.now === 'function')
+                    ? window.performance.now()
+                    : Date.now();
+                if ((scanNow - scanStartTime) > scanBudgetMs) break;
+                const link = links[index];
+                if (!link) continue;
+                const href = (link.href || '').trim();
+                if (!href) continue;
+
+                const rect = link.getBoundingClientRect();
+                if (!rect || rect.width <= 1 || rect.height <= 1) continue;
+                if (rect.bottom < 0 || rect.right < 0 || rect.top > viewportHeight || rect.left > viewportWidth) continue;
+                const visibleLeft = Math.max(0, rect.left);
+                const visibleTop = Math.max(0, rect.top);
+                const visibleRight = Math.min(viewportWidth, rect.right);
+                const visibleBottom = Math.min(viewportHeight, rect.bottom);
+                const visibleWidth = visibleRight - visibleLeft;
+                const visibleHeight = visibleBottom - visibleTop;
+                if (visibleWidth <= 1 || visibleHeight <= 1) continue;
+
+                const text = ((link.textContent || link.innerText || '').replace(/\\s+/g, ' ').trim());
+                if (!text) continue;
+
+                out.push({
+                    href: href,
+                    text: text,
+                    left: visibleLeft,
+                    top: visibleTop,
+                    width: visibleWidth,
+                    height: visibleHeight
+                });
+            }
+
+            let scrollPosition = (() => {
+                const rawX = Number(window.scrollX);
+                const fallbackX = Number(window.pageXOffset);
+                const rawY = Number(window.scrollY);
+                const fallbackY = Number(window.pageYOffset);
+                return {
+                    x: Number.isFinite(rawX) ? rawX : (Number.isFinite(fallbackX) ? fallbackX : 0),
+                    y: Number.isFinite(rawY) ? rawY : (Number.isFinite(fallbackY) ? fallbackY : 0)
+                };
+            })();
+
+            let videoPosition = null;
+            const videos = document.getElementsByTagName('video');
+            for (let index = 0; index < videos.length; index += 1) {
+                const video = videos[index];
+                if (!video) continue;
+                const rect = video.getBoundingClientRect();
+                if (!rect) continue;
+                if (rect.width <= 1 || rect.height <= 1) continue;
+                if (rect.bottom < 0 || rect.right < 0 || rect.top > viewportHeight || rect.left > viewportWidth) continue;
+
+                const currentTime = Number(video.currentTime);
+                if (!Number.isFinite(currentTime)) continue;
+
+                const durationRaw = Number(video.duration);
+                const duration = Number.isFinite(durationRaw) ? durationRaw : null;
+                videoPosition = {
+                    currentTime: currentTime,
+                    duration: duration,
+                    paused: !!video.paused
+                };
+                break;
+            }
+
+            return JSON.stringify({
+                pageUrl: location.href,
+                links: out,
+                scrollPosition: scrollPosition,
+                videoPosition: videoPosition
+            });
+        })();
+        """
+    }
+
+    private static func appleScriptEscaped(_ input: String) -> String {
+        input
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\n", with: " ")
     }
 }
 
@@ -2467,6 +6272,33 @@ public struct CleanupResult: Sendable {
     public let reclaimedBytes: Int64
 }
 
+public struct FrameDeletionResult: Sendable, Equatable {
+    public static let empty = FrameDeletionResult(completedFrames: 0, queuedFrames: 0)
+
+    public let completedFrames: Int
+    public let queuedFrames: Int
+
+    public init(completedFrames: Int, queuedFrames: Int) {
+        self.completedFrames = completedFrames
+        self.queuedFrames = queuedFrames
+    }
+
+    public var affectedFrames: Int {
+        completedFrames + queuedFrames
+    }
+
+    public var hasQueuedFrames: Bool {
+        queuedFrames > 0
+    }
+
+    public func merging(_ other: FrameDeletionResult) -> FrameDeletionResult {
+        FrameDeletionResult(
+            completedFrames: completedFrames + other.completedFrames,
+            queuedFrames: queuedFrames + other.queuedFrames
+        )
+    }
+}
+
 /// OCR processing status for a frame
 /// Provides detailed status information for UI display
 public struct OCRProcessingStatus: Sendable, Equatable {
@@ -2479,7 +6311,9 @@ public struct OCRProcessingStatus: Sendable, Equatable {
         case queued
         /// Frame is currently being processed (OCR in progress)
         case processing
-        /// OCR failed permanently
+        /// OCR is complete and frame is queued for a video rewrite / re-encode.
+        case rewriting
+        /// OCR or a follow-up rewrite failed permanently
         case failed
         /// Frame not found or status unknown
         case unknown
@@ -2508,7 +6342,8 @@ public struct OCRProcessingStatus: Sendable, Equatable {
             }
             return "Queued"
         case .processing: return "Indexing..."
-        case .failed: return "OCR Failed"
+        case .rewriting: return "Re-encoding..."
+        case .failed: return "Processing Failed"
         case .unknown: return ""
         }
     }
@@ -2516,7 +6351,7 @@ public struct OCRProcessingStatus: Sendable, Equatable {
     /// Whether OCR is still in progress (queued or processing)
     public var isInProgress: Bool {
         switch state {
-        case .queued, .processing, .pending:
+        case .queued, .processing, .pending, .rewriting:
             return true
         case .completed, .failed, .unknown:
             return false
@@ -2527,6 +6362,7 @@ public struct OCRProcessingStatus: Sendable, Equatable {
     public static let completed = OCRProcessingStatus(state: .completed)
     public static let pending = OCRProcessingStatus(state: .pending)
     public static let processing = OCRProcessingStatus(state: .processing)
+    public static let rewriting = OCRProcessingStatus(state: .rewriting)
     public static let failed = OCRProcessingStatus(state: .failed)
     public static let unknown = OCRProcessingStatus(state: .unknown)
 
@@ -2537,10 +6373,33 @@ public struct OCRProcessingStatus: Sendable, Equatable {
 
 public enum AppError: Error {
     case permissionDenied(permission: String)
+    case storageUnavailable(reason: String)
     case notInitialized
     case alreadyRunning
     case notRunning
     case processingQueueNotAvailable
+    case ocrReprocessBlockedForRedactedFrame(frameID: Int64)
+}
+
+extension AppError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .permissionDenied(let permission):
+            return "Missing required permission: \(permission)."
+        case .storageUnavailable(let reason):
+            return "Storage is unavailable: \(reason)"
+        case .notInitialized:
+            return "Retrace is not initialized yet."
+        case .alreadyRunning:
+            return "Recording is already running."
+        case .notRunning:
+            return "Recording is not running."
+        case .processingQueueNotAvailable:
+            return "The processing queue is not available."
+        case .ocrReprocessBlockedForRedactedFrame(let frameID):
+            return "OCR refresh is not available for frame \(frameID) because it contains protected redacted text."
+        }
+    }
 }
 
 // MARK: - Migration Delegate

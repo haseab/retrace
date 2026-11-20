@@ -1,4 +1,6 @@
+import AppKit
 import SwiftUI
+import Darwin
 import Shared
 import App
 
@@ -40,6 +42,25 @@ private enum LayoutSize {
 
 /// Maximum width for the dashboard content area before it centers
 private let dashboardMaxWidth: CGFloat = 1100
+/// Shared breakpoint for compact dashboard-style layouts.
+let dashboardCompactLayoutThreshold: CGFloat = 850
+private let dashboardSettingsStore: UserDefaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
+
+private struct RecordingIndicatorAnchorPreferenceKey: PreferenceKey {
+    static var defaultValue: Anchor<CGRect>? = nil
+
+    static func reduce(value: inout Anchor<CGRect>?, nextValue: () -> Anchor<CGRect>?) {
+        value = nextValue() ?? value
+    }
+}
+
+private struct AppUsageDatePopoverAnchorPreferenceKey: PreferenceKey {
+    static var defaultValue: Anchor<CGRect>? = nil
+
+    static func reduce(value: inout Anchor<CGRect>?, nextValue: () -> Anchor<CGRect>?) {
+        value = nextValue() ?? value
+    }
+}
 
 /// Main dashboard view - analytics and statistics
 /// Default landing screen
@@ -47,111 +68,488 @@ public struct DashboardView: View {
 
     // MARK: - Properties
 
-    @StateObject private var viewModel: DashboardViewModel
+    @ObservedObject var viewModel: DashboardViewModel
     @StateObject private var coordinatorWrapper: AppCoordinatorWrapper
+    @StateObject private var crashRecoveryBannerModel: CrashRecoveryBannerModel
     @ObservedObject var launchOnLoginReminderManager: LaunchOnLoginReminderManager
     @ObservedObject var milestoneCelebrationManager: MilestoneCelebrationManager
+    let debugLaunchOnboarding: (() -> Void)?
+    @ObservedObject private var updaterManager = UpdaterManager.shared
     @State private var isPulsing = false
     @State private var showFeedbackSheet = false
-    @State private var usageViewMode: AppUsageViewMode = Self.loadSavedViewMode()
+    @State private var feedbackLaunchContext: FeedbackLaunchContext?
+    @State private var feedbackPresentationID = UUID()
+    @AppStorage("dashboardAppUsageViewMode", store: dashboardSettingsStore)
+    private var usageViewModeRawValue: String = AppUsageViewMode.list.rawValue
     @State private var selectedApp: AppUsageData? = nil
     @State private var selectedWindow: WindowUsageData? = nil
     @State private var showSessionsSheet = false
+    @State private var usageActionRequest: DashboardUsageActionRequest?
     @State private var showSystemMonitor = false
+    @State private var showAppUsageDatePopover = false
+    @State private var appUsageDateFocusRequestID: UUID?
+    @State private var isHoveringAppUsageRangeReset = false
+    @State private var appUsageRangeShortcutMonitor: Any?
+    @State private var showDiscordFollowup = false
     @State private var currentTheme: MilestoneCelebrationManager.ColorTheme = MilestoneCelebrationManager.getCurrentTheme()
+    @Binding var hasLoadedInitialData: Bool
+    @AppStorage("timelineShortcutConfig", store: dashboardSettingsStore)
+    private var timelineShortcutData = Data()
+    @AppStorage("systemMonitorShortcutConfig", store: dashboardSettingsStore)
+    private var systemMonitorShortcutData = Data()
 
-    enum AppUsageViewMode: String, CaseIterable {
+    enum AppUsageViewMode: String {
         case list = "list"
         case hardDrive = "squares"
+    }
 
-        var icon: String {
+    enum AppUsageSectionBodyState: Equatable {
+        case loading
+        case empty
+        case content
+    }
+
+    enum AppUsageRangeKeyboardShortcut: Equatable {
+        case previousArrow
+        case nextArrow
+        case previousLetter
+        case nextLetter
+        case reset
+
+        var shiftDirection: Int? {
             switch self {
-            case .list: return "list.bullet"
-            case .hardDrive: return "square.grid.2x2"
+            case .previousArrow, .previousLetter:
+                return -1
+            case .nextArrow, .nextLetter:
+                return 1
+            case .reset:
+                return nil
+            }
+        }
+
+        var metricIdentifier: String {
+            switch self {
+            case .previousArrow:
+                return "dashboard.app_usage_date_range.previous_arrow"
+            case .nextArrow:
+                return "dashboard.app_usage_date_range.next_arrow"
+            case .previousLetter:
+                return "dashboard.app_usage_date_range.previous_l"
+            case .nextLetter:
+                return "dashboard.app_usage_date_range.next_semicolon"
+            case .reset:
+                return "dashboard.app_usage_date_range.reset_command_delete"
+            }
+        }
+
+        var source: String {
+            switch self {
+            case .previousArrow, .previousLetter:
+                return "dashboard_app_usage_previous_range_shortcut"
+            case .nextArrow, .nextLetter:
+                return "dashboard_app_usage_next_range_shortcut"
+            case .reset:
+                return "dashboard_app_usage_reset_range_shortcut"
             }
         }
     }
 
-    private static let viewModeDefaultsKey = "dashboardAppUsageViewMode"
-
-    private static func loadSavedViewMode() -> AppUsageViewMode {
-        guard let raw = UserDefaults.standard.string(forKey: viewModeDefaultsKey),
-              let mode = AppUsageViewMode(rawValue: raw) else {
-            return .list
-        }
-        return mode
+    struct AppUsageEmptyStateCopy: Equatable {
+        let title: String
+        let message: String
+        let symbolName: String
     }
 
-    private func saveViewMode(_ mode: AppUsageViewMode) {
-        UserDefaults.standard.set(mode.rawValue, forKey: Self.viewModeDefaultsKey)
+    private static let pauseMenuWidth: CGFloat = 100
+    private static let appUsageDatePopoverWidth: CGFloat = 300
+
+    static func appUsageSectionBodyState(
+        isLoading: Bool,
+        hasAppUsageData: Bool
+    ) -> AppUsageSectionBodyState {
+        if isLoading && !hasAppUsageData {
+            return .loading
+        }
+
+        return hasAppUsageData ? .content : .empty
+    }
+
+    static func appUsageEmptyStateCopy(
+        rangeLabel: String,
+        hasRecordedActivity: Bool
+    ) -> AppUsageEmptyStateCopy {
+        if hasRecordedActivity {
+            return AppUsageEmptyStateCopy(
+                title: "No app usage found",
+                message: "Nothing was recorded for \(rangeLabel). Use the arrows or date picker above to try another range.",
+                symbolName: "tray"
+            )
+        }
+
+        return AppUsageEmptyStateCopy(
+            title: "No activity recorded yet",
+            message: "Start using your Mac and Retrace will track your app usage automatically.",
+            symbolName: "clock.badge.questionmark"
+        )
+    }
+
+    static func appUsageRangeControlLabel(
+        selectedRangeLabel: String,
+        isDefaultLastSevenDays: Bool
+    ) -> String {
+        isDefaultLastSevenDays ? "Last 7 Days" : selectedRangeLabel
+    }
+
+    static func isAppUsageRangeResetEnabled(isDefaultLastSevenDays: Bool) -> Bool {
+        !isDefaultLastSevenDays
+    }
+
+    static func shouldResetAppUsageRangeOnEscape(
+        isDatePopoverPresented: Bool,
+        isDefaultLastSevenDays: Bool
+    ) -> Bool {
+        !isDatePopoverPresented && !isDefaultLastSevenDays
+    }
+
+    static func appUsageRangeKeyboardShortcut(
+        keyCode: UInt16,
+        charactersIgnoringModifiers: String?,
+        modifiers: NSEvent.ModifierFlags,
+        isDatePopoverPresented: Bool,
+        isFeedbackPresented: Bool,
+        isSessionsPresented: Bool,
+        isTextInputFocused: Bool
+    ) -> AppUsageRangeKeyboardShortcut? {
+        guard !isDatePopoverPresented,
+              !isFeedbackPresented,
+              !isSessionsPresented,
+              !isTextInputFocused else {
+            return nil
+        }
+
+        let normalizedModifiers = modifiers.intersection([.command, .shift, .option, .control])
+        if normalizedModifiers == [.command] && (keyCode == 51 || keyCode == 117) {
+            return .reset
+        }
+        guard normalizedModifiers.isEmpty else {
+            return nil
+        }
+
+        switch keyCode {
+        case 123:
+            return .previousArrow
+        case 124:
+            return .nextArrow
+        default:
+            break
+        }
+
+        guard let key = charactersIgnoringModifiers?.lowercased(),
+              key.count == 1 else {
+            return nil
+        }
+
+        switch key {
+        case "l":
+            return .previousLetter
+        case ";":
+            return .nextLetter
+        default:
+            return nil
+        }
+    }
+
+    private var usageViewMode: AppUsageViewMode {
+        AppUsageViewMode(rawValue: usageViewModeRawValue) ?? .list
+    }
+
+    private func toggleAppUsageDatePopoverFromShortcut() {
+        viewModel.recordKeyboardShortcut("cmd+g")
+        withAnimation(.easeOut(duration: 0.15)) {
+            showAppUsageDatePopover.toggle()
+        }
+    }
+
+    private func focusAppUsageDateInputFromShortcut() {
+        guard showAppUsageDatePopover else { return }
+        viewModel.recordKeyboardShortcut("cmd+k")
+        appUsageDateFocusRequestID = UUID()
+    }
+
+    private func resetAppUsageRangeFromInlineButton() {
+        Task {
+            await viewModel.resetAppUsageDateRangeToDefault(
+                source: "dashboard_app_usage_inline_reset"
+            )
+        }
+    }
+
+    private func resetAppUsageRangeFromEscapeShortcut() {
+        guard Self.shouldResetAppUsageRangeOnEscape(
+            isDatePopoverPresented: showAppUsageDatePopover,
+            isDefaultLastSevenDays: viewModel.isDefaultAppUsageRangeSelected
+        ) else {
+            return
+        }
+
+        viewModel.recordKeyboardShortcut("dashboard.app_usage_date_range.reset_escape")
+        Task {
+            await viewModel.resetAppUsageDateRangeToDefault(
+                source: "dashboard_app_usage_escape_reset"
+            )
+        }
+    }
+
+    private func installAppUsageRangeShortcutMonitorIfNeeded() {
+        guard appUsageRangeShortcutMonitor == nil else { return }
+
+        appUsageRangeShortcutMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [self] event in
+            guard usageActionRequest == nil else { return event }
+            guard event.window?.windowNumber == DashboardWindowController.shared.window?.windowNumber else {
+                return event
+            }
+
+            let shortcut = Self.appUsageRangeKeyboardShortcut(
+                keyCode: event.keyCode,
+                charactersIgnoringModifiers: event.charactersIgnoringModifiers,
+                modifiers: event.modifierFlags,
+                isDatePopoverPresented: showAppUsageDatePopover,
+                isFeedbackPresented: showFeedbackSheet,
+                isSessionsPresented: showSessionsSheet,
+                isTextInputFocused: Self.isTextInputFocused(event.window?.firstResponder)
+            )
+
+            guard let shortcut else {
+                return event
+            }
+
+            guard isAppUsageRangeShortcutEnabled(shortcut) else {
+                return event
+            }
+
+            handleAppUsageRangeShortcut(shortcut)
+            return nil
+        }
+    }
+
+    private func removeAppUsageRangeShortcutMonitor() {
+        guard let appUsageRangeShortcutMonitor else { return }
+        NSEvent.removeMonitor(appUsageRangeShortcutMonitor)
+        self.appUsageRangeShortcutMonitor = nil
+    }
+
+    private func isAppUsageRangeShortcutEnabled(_ shortcut: AppUsageRangeKeyboardShortcut) -> Bool {
+        switch shortcut {
+        case .previousArrow, .previousLetter:
+            return viewModel.canShiftAppUsageRangeBackward
+        case .nextArrow, .nextLetter:
+            return viewModel.canShiftAppUsageRangeForward
+        case .reset:
+            return Self.isAppUsageRangeResetEnabled(
+                isDefaultLastSevenDays: viewModel.isDefaultAppUsageRangeSelected
+            )
+        }
+    }
+
+    private func handleAppUsageRangeShortcut(_ shortcut: AppUsageRangeKeyboardShortcut) {
+        viewModel.recordKeyboardShortcut(shortcut.metricIdentifier)
+        Task {
+            switch shortcut {
+            case .previousArrow, .previousLetter, .nextArrow, .nextLetter:
+                guard let shiftDirection = shortcut.shiftDirection else { return }
+                await viewModel.shiftAppUsageDateRange(
+                    by: shiftDirection,
+                    source: shortcut.source
+                )
+            case .reset:
+                await viewModel.resetAppUsageDateRangeToDefault(
+                    source: shortcut.source
+                )
+            }
+        }
+    }
+
+    private static func isTextInputFocused(_ responder: NSResponder?) -> Bool {
+        responder is NSTextView
+    }
+
+    private var hasDashboardBanners: Bool {
+        viewModel.showAccessibilityWarning
+            || viewModel.showScreenRecordingWarning
+            || launchOnLoginReminderManager.shouldShowReminder
+            || viewModel.conferencePrivacyBanner != nil
+            || crashRecoveryBannerModel.state != nil
+            || viewModel.unexpectedRecordingStop != nil
+            || viewModel.storageHealthBanner != nil
+            || viewModel.recentWALFailureCrash != nil
+            || viewModel.recentCrashReport != nil
     }
 
     // MARK: - Initialization
 
     public init(
+        viewModel: DashboardViewModel,
         coordinator: AppCoordinator,
         launchOnLoginReminderManager: LaunchOnLoginReminderManager,
-        milestoneCelebrationManager: MilestoneCelebrationManager
+        milestoneCelebrationManager: MilestoneCelebrationManager,
+        debugLaunchOnboarding: (() -> Void)? = nil,
+        hasLoadedInitialData: Binding<Bool> = .constant(false)
     ) {
-        _viewModel = StateObject(wrappedValue: DashboardViewModel(coordinator: coordinator))
+        self.viewModel = viewModel
         _coordinatorWrapper = StateObject(wrappedValue: AppCoordinatorWrapper(coordinator: coordinator))
+        _crashRecoveryBannerModel = StateObject(
+            wrappedValue: CrashRecoveryBannerModel(coordinator: coordinator)
+        )
         self.launchOnLoginReminderManager = launchOnLoginReminderManager
         self.milestoneCelebrationManager = milestoneCelebrationManager
+        self.debugLaunchOnboarding = debugLaunchOnboarding
+        self._hasLoadedInitialData = hasLoadedInitialData
     }
 
     // MARK: - Body
 
     public var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // Accessibility permission warning banner
-            if viewModel.showAccessibilityWarning {
-                PermissionBanner(
-                    message: "Retrace needs Accessibility permission to detect display changes and exclude private/incognito windows and excluded apps.",
-                    actionTitle: "Open Settings",
-                    action: {
-                        SystemSettingsOpener.openAccessibilitySettings()
-                    },
-                    onDismiss: {
-                        viewModel.dismissAccessibilityWarning()
+            if hasDashboardBanners {
+                VStack(spacing: 12) {
+                    if viewModel.showAccessibilityWarning {
+                        PermissionBanner(
+                            message: "Retrace needs Accessibility permission to detect display changes and exclude private/incognito windows and excluded apps.",
+                            actionTitle: "Open Settings",
+                            action: {
+                                SystemSettingsOpener.openAccessibilitySettings()
+                            },
+                            onDismiss: {
+                                viewModel.dismissAccessibilityWarning()
+                            }
+                        )
                     }
-                )
+
+                    if viewModel.showScreenRecordingWarning {
+                        PermissionBanner(
+                            message: "Retrace needs Screen Recording permission to capture your screen.",
+                            actionTitle: "Open Settings",
+                            action: {
+                                SystemSettingsOpener.openScreenRecordingSettings()
+                            },
+                            onDismiss: {
+                                viewModel.dismissScreenRecordingWarning()
+                            }
+                        )
+                    }
+
+                    if launchOnLoginReminderManager.shouldShowReminder {
+                        PermissionBanner(
+                            message: "Retrace works best when it launches automatically on login so you never miss a moment.",
+                            actionTitle: "Launch on Login",
+                            action: {
+                                launchOnLoginReminderManager.enableLaunchAtLogin()
+                            },
+                            onDismiss: {
+                                launchOnLoginReminderManager.dismissReminder()
+                            }
+                        )
+                    }
+
+                    if viewModel.conferencePrivacyBanner != nil {
+                        ConferencePrivacyDashboardBanner()
+                    }
+
+                    if let statusBanner = crashRecoveryBannerModel.state {
+                        CrashRecoveryStatusBanner(
+                            state: statusBanner,
+                            onOpenSettings: statusBanner.showsOpenSettingsAction ? {
+                                crashRecoveryBannerModel.openSettings()
+                            } : nil,
+                            onRetry: {
+                                crashRecoveryBannerModel.retry()
+                            },
+                            onDismiss: {
+                                crashRecoveryBannerModel.dismiss()
+                            }
+                        )
+                    }
+
+                    if let unexpectedRecordingStop = viewModel.unexpectedRecordingStop {
+                        UnexpectedRecordingStopBanner(
+                            state: unexpectedRecordingStop,
+                            onSubmitBugReport: {
+                                viewModel.recordUnexpectedRecordingStopFeedbackOpened()
+                                presentFeedbackSheet(
+                                    launchContext: FeedbackLaunchContext(
+                                        feedbackType: .bug,
+                                        prefilledDescription: DashboardViewModel.makeUnexpectedRecordingStopFeedbackDescription(
+                                            for: unexpectedRecordingStop
+                                        ),
+                                        preferredFocusField: .email
+                                    )
+                                )
+                            },
+                            onDismiss: {
+                                viewModel.dismissUnexpectedRecordingStop()
+                            }
+                        )
+                    }
+
+                    if let storageHealthBanner = viewModel.storageHealthBanner {
+                        StorageHealthBanner(
+                            state: storageHealthBanner,
+                            onDismiss: {
+                                viewModel.dismissStorageHealthBanner()
+                            }
+                        )
+                    }
+
+                    if let recentWALFailureCrash = viewModel.recentWALFailureCrash {
+                        WALFailureCrashBanner(
+                            report: recentWALFailureCrash,
+                            onSubmitBugReport: {
+                                presentFeedbackSheet(
+                                    launchContext: DashboardViewModel.makeWALFailureFeedbackLaunchContext(
+                                        for: recentWALFailureCrash
+                                    )
+                                )
+                            },
+                            onDetails: {
+                                viewModel.recordRecentWALFailureCrashDetailsOpened()
+                                NSWorkspace.shared.selectFile(
+                                    recentWALFailureCrash.fileURL.path,
+                                    inFileViewerRootedAtPath: recentWALFailureCrash.fileURL.deletingLastPathComponent().path
+                                )
+                            },
+                            onDismiss: {
+                                viewModel.dismissRecentWALFailureCrash()
+                            }
+                        )
+                    }
+
+                    if let recentCrashReport = viewModel.recentCrashReport {
+                        CrashReportBanner(
+                            report: recentCrashReport,
+                            onSubmitBugReport: {
+                                presentFeedbackSheet(
+                                    launchContext: DashboardViewModel.makeCrashFeedbackLaunchContext(
+                                        for: recentCrashReport
+                                    )
+                                )
+                            },
+                            onDetails: {
+                                viewModel.recordRecentCrashReportDetailsOpened()
+                                NSWorkspace.shared.selectFile(
+                                    recentCrashReport.fileURL.path,
+                                    inFileViewerRootedAtPath: recentCrashReport.fileURL.deletingLastPathComponent().path
+                                )
+                            },
+                            onDismiss: {
+                                viewModel.dismissRecentCrashReport()
+                            }
+                        )
+                    }
+                }
                 .frame(maxWidth: dashboardMaxWidth)
                 .frame(maxWidth: .infinity)
+                .padding(.horizontal, 24)
                 .padding(.top, 20)
-            }
-
-            // Screen recording permission warning banner
-            if viewModel.showScreenRecordingWarning {
-                PermissionBanner(
-                    message: "Retrace needs Screen Recording permission to capture your screen.",
-                    actionTitle: "Open Settings",
-                    action: {
-                        SystemSettingsOpener.openScreenRecordingSettings()
-                    },
-                    onDismiss: {
-                        viewModel.dismissScreenRecordingWarning()
-                    }
-                )
-                .frame(maxWidth: dashboardMaxWidth)
-                .frame(maxWidth: .infinity)
-                .padding(.top, viewModel.showAccessibilityWarning ? 12 : 20)
-            }
-
-            // Launch on login reminder banner
-            if launchOnLoginReminderManager.shouldShowReminder {
-                PermissionBanner(
-                    message: "Retrace works best when it launches automatically on login so you never miss a moment.",
-                    actionTitle: "Launch on Login",
-                    action: {
-                        launchOnLoginReminderManager.enableLaunchAtLogin()
-                    },
-                    onDismiss: {
-                        launchOnLoginReminderManager.dismissReminder()
-                    }
-                )
-                .frame(maxWidth: dashboardMaxWidth)
-                .frame(maxWidth: .infinity)
-                .padding(.top, (viewModel.showAccessibilityWarning || viewModel.showScreenRecordingWarning) ? 12 : 20)
             }
 
             // Header
@@ -166,32 +564,36 @@ public struct DashboardView: View {
             // This section expands to fill remaining height
             GeometryReader { geometry in
                 let layoutSize = LayoutSize.from(width: geometry.size.width)
+                let isCompactLayout = geometry.size.width < dashboardCompactLayoutThreshold
 
-                HStack(alignment: .top, spacing: 24) {
-                    // Left column: Stats cards (single column, fixed width)
-                    ZStack {
-                        ScrollView(showsIndicators: false) {
-                            VStack(spacing: 16) {
-                                ForEach(statsCards) { card in
-                                    statCard(
-                                        icon: card.icon,
-                                        title: card.title,
-                                        value: card.value,
-                                        subtitle: card.subtitle,
-                                        graphData: card.graphData,
-                                        graphColor: card.graphColor,
-                                        theme: currentTheme,
-                                        valueFormatter: card.valueFormatter,
-                                        layoutSize: layoutSize
-                                    )
+                HStack(alignment: .top, spacing: isCompactLayout ? 0 : 24) {
+                    if !isCompactLayout {
+                        // Left column: Stats cards (single column, fixed width)
+                        ZStack {
+                            ScrollView(showsIndicators: false) {
+                                VStack(spacing: 16) {
+                                    ForEach(statsCards) { card in
+                                        statCard(
+                                            icon: card.icon,
+                                            title: card.title,
+                                            value: card.value,
+                                            subtitle: card.subtitle,
+                                            graphData: card.graphData,
+                                            graphColor: card.graphColor,
+                                            theme: currentTheme,
+                                            valueFormatter: card.valueFormatter,
+                                            layoutSize: layoutSize
+                                        )
+                                    }
                                 }
+                                .padding(.top, 2)
+                                .padding(.bottom, 20) // Extra padding for scroll affordance
                             }
-                            .padding(.bottom, 20) // Extra padding for scroll affordance
-                        }
 
-                        ScrollAffordance(height: 32, color: themeBaseBackground)
+                            ScrollAffordance(height: 32, color: themeScrollAffordanceColor)
+                        }
+                        .frame(width: layoutSize.cardWidth)
                     }
-                    .frame(width: layoutSize.cardWidth)
 
                     // Right column: App usage (scrolls internally)
                     appUsageSection(layoutSize: layoutSize)
@@ -209,6 +611,21 @@ public struct DashboardView: View {
                 .padding(.horizontal, 32)
                 .padding(.bottom, 24)
         }
+        .sheet(
+            isPresented: $showFeedbackSheet,
+            onDismiss: {
+                feedbackLaunchContext = nil
+            }
+        ) {
+            FeedbackFormView(launchContext: feedbackLaunchContext)
+                .id(feedbackPresentationID)
+            .environmentObject(coordinatorWrapper)
+        }
+        .sheet(item: $usageActionRequest) { request in
+            DashboardUsageConfirmationView(viewModel: viewModel, request: request) {
+                usageActionRequest = nil
+            }
+        }
         .background(
             ZStack {
                 // Theme-aware base background color
@@ -219,12 +636,36 @@ public struct DashboardView: View {
             }
             .ignoresSafeArea()
         )
+        .background(
+            Button("") {
+                Task { await viewModel.loadStatistics(reason: "manual_refresh") }
+            }
+            .keyboardShortcut("r", modifiers: .command)
+            .frame(width: 0, height: 0)
+            .opacity(0)
+        )
+        .onAppear {
+            installAppUsageRangeShortcutMonitorIfNeeded()
+        }
+        .onDisappear {
+            removeAppUsageRangeShortcutMonitor()
+        }
         .task {
             viewModel.isWindowVisible = true
-            await viewModel.loadStatistics()
+            crashRecoveryBannerModel.refresh()
+            if !hasLoadedInitialData {
+                hasLoadedInitialData = true
+                Log.debug("[Dashboard] Initial load - first appearance", category: .ui)
+                if !viewModel.hasLoadedStatistics {
+                    await viewModel.loadStatistics(reason: "initial_appearance")
+                }
+            } else {
+                Log.debug("[Dashboard] Tab switch - skipping reload", category: .ui)
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: .dashboardDidBecomeKey)) { _ in
-            Task { await viewModel.loadStatistics() }
+            Log.debug("[Dashboard] Window became key - refreshing", category: .ui)
+            Task { await viewModel.loadStatistics(reason: "window_became_key") }
         }
         .onReceive(NotificationCenter.default.publisher(for: .dashboardDidOpen)) { _ in
             viewModel.isWindowVisible = true
@@ -236,6 +677,69 @@ public struct DashboardView: View {
             if let newTheme = notification.object as? MilestoneCelebrationManager.ColorTheme {
                 currentTheme = newTheme
             }
+        }
+        .overlayPreferenceValue(RecordingIndicatorAnchorPreferenceKey.self) { anchor in
+            GeometryReader { proxy in
+                if showPauseOptionsPopover, let anchor {
+                    let anchorRect = proxy[anchor]
+                    ZStack(alignment: .topLeading) {
+                        Color.black.opacity(0.001)
+                            .ignoresSafeArea()
+                            .contentShape(Rectangle())
+                            .onTapGesture {
+                                withAnimation(.easeOut(duration: 0.12)) {
+                                    showPauseOptionsPopover = false
+                                }
+                            }
+
+                        pauseRecordingMenu
+                            .frame(width: Self.pauseMenuWidth)
+                            .offset(
+                                x: pauseMenuOriginX(
+                                    anchorRect: anchorRect,
+                                    containerWidth: proxy.size.width,
+                                    menuWidth: Self.pauseMenuWidth
+                                ),
+                                y: anchorRect.maxY + 6
+                            )
+                            .transition(
+                                .opacity.combined(with: .scale(scale: 0.96, anchor: .top))
+                            )
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                }
+            }
+            .zIndex(showPauseOptionsPopover ? 20 : 0)
+        }
+        .overlayPreferenceValue(AppUsageDatePopoverAnchorPreferenceKey.self) { anchor in
+            GeometryReader { proxy in
+                if showAppUsageDatePopover, let anchor {
+                    let anchorRect = proxy[anchor]
+                    ZStack(alignment: .topLeading) {
+                        Color.black.opacity(0.001)
+                            .ignoresSafeArea()
+                            .contentShape(Rectangle())
+                            .onTapGesture {
+                                withAnimation(.easeOut(duration: 0.15)) {
+                                    showAppUsageDatePopover = false
+                                    appUsageDateFocusRequestID = nil
+                                }
+                            }
+
+                        appUsageDatePopover
+                            .shadow(color: .black.opacity(0.4), radius: 12, y: 4)
+                            .offset(
+                                x: max(anchorRect.maxX - Self.appUsageDatePopoverWidth, 0),
+                                y: anchorRect.maxY + 8
+                            )
+                            .transition(
+                                .opacity.combined(with: .scale(scale: 0.95, anchor: .topTrailing))
+                            )
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                }
+            }
+            .zIndex(showAppUsageDatePopover ? 15 : 0)
         }
         .overlay {
             // Sessions detail overlay (replaces .sheet for faster presentation)
@@ -306,30 +810,66 @@ public struct DashboardView: View {
             }
         }
         .overlay {
-            // Milestone celebration dialog
-            if let milestone = milestoneCelebrationManager.currentMilestone {
-                ZStack {
-                    // Dimmed background
-                    Color.black.opacity(0.6)
-                        .ignoresSafeArea()
-                        .onTapGesture {
-                            // Dismiss on background tap
-                            milestoneCelebrationManager.dismissCurrentMilestone()
-                        }
+            ZStack {
+                // Milestone celebration dialog
+                if let milestone = milestoneCelebrationManager.currentMilestone {
+                    ZStack {
+                        // Dimmed background
+                        Color.black.opacity(0.6)
+                            .ignoresSafeArea()
+                            .onTapGesture {
+                                // Dismiss on background tap
+                                milestoneCelebrationManager.dismissCurrentMilestone()
+                            }
 
-                    // Celebration dialog
-                    MilestoneCelebrationView(
-                        milestone: milestone,
-                        onDismiss: {
-                            milestoneCelebrationManager.dismissCurrentMilestone()
-                        },
-                        onSupport: {
-                            milestoneCelebrationManager.openSupportLink()
-                        }
-                    )
-                    .transition(.scale.combined(with: .opacity))
+                        // Celebration dialog
+                        MilestoneCelebrationView(
+                            milestone: milestone,
+                            onDismiss: {
+                                milestoneCelebrationManager.dismissCurrentMilestone()
+                            },
+                            onMaybeLater: {
+                                milestoneCelebrationManager.dismissCurrentMilestone()
+                                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                                    showDiscordFollowup = true
+                                }
+                            },
+                            onSupport: {
+                                milestoneCelebrationManager.openSupportLink()
+                            }
+                        )
+                        .transition(.scale.combined(with: .opacity))
+                    }
+                    .animation(.spring(response: 0.3, dampingFraction: 0.8), value: milestone)
                 }
-                .animation(.spring(response: 0.3, dampingFraction: 0.8), value: milestone)
+
+                if showDiscordFollowup {
+                    ZStack {
+                        Color.black.opacity(0.65)
+                            .ignoresSafeArea()
+                            .onTapGesture {
+                                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                                    showDiscordFollowup = false
+                                }
+                            }
+
+                        DiscordFollowupView(
+                            onJoin: {
+                                milestoneCelebrationManager.openDiscordLink()
+                                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                                    showDiscordFollowup = false
+                                }
+                            },
+                            onMaybeLater: {
+                                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                                    showDiscordFollowup = false
+                                }
+                            }
+                        )
+                        .transition(.scale.combined(with: .opacity))
+                    }
+                    .animation(.spring(response: 0.3, dampingFraction: 0.8), value: showDiscordFollowup)
+                }
             }
         }
     }
@@ -345,46 +885,18 @@ public struct DashboardView: View {
     }
 
     private func handleWindowTapped(_ app: AppUsageData, _ window: WindowUsageData) {
-        // Log the start of the tab click flow
         let clickStartTime = CFAbsoluteTimeGetCurrent()
-        logTabClickTiming("DASHBOARD_TAB_CLICKED", startTime: clickStartTime, filter: window.browserUrl ?? app.appBundleID)
-
-        // Calculate week date range (same as dashboard uses)
-        let calendar = Calendar.current
-        let now = Date()
-        let weekStart = calendar.date(byAdding: .day, value: -6, to: calendar.startOfDay(for: now))!
-        let weekEnd = now
+        let selectedRange = viewModel.appUsageQueryRange
 
         // Launch filtered timeline instantly instead of showing sessions dialog
         TimelineWindowController.shared.showWithFilter(
             bundleID: app.appBundleID,
             windowName: window.windowName,
             browserUrl: window.browserUrl,
-            startDate: weekStart,
-            endDate: weekEnd,
+            startDate: selectedRange.start,
+            endDate: selectedRange.end,
             clickStartTime: clickStartTime
         )
-    }
-
-    // MARK: - Tab Click Timing
-
-    private static let tabClickLogPath = URL(fileURLWithPath: "/tmp/retrace_debug.log")
-
-    private func logTabClickTiming(_ checkpoint: String, startTime: CFAbsoluteTime, filter: String) {
-        let elapsed = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
-        let line = "[\(Log.timestamp())] [TAB_CLICK] \(checkpoint): \(String(format: "%.1f", elapsed))ms (filter: \(filter))\n"
-
-        if let data = line.data(using: .utf8) {
-            if FileManager.default.fileExists(atPath: Self.tabClickLogPath.path) {
-                if let handle = try? FileHandle(forWritingTo: Self.tabClickLogPath) {
-                    handle.seekToEndOfFile()
-                    handle.write(data)
-                    handle.closeFile()
-                }
-            } else {
-                try? data.write(to: Self.tabClickLogPath)
-            }
-        }
     }
 
     private func openTimelineAt(date: Date) {
@@ -423,14 +935,13 @@ public struct DashboardView: View {
                 recordingIndicator
 
                 // Action buttons
-                refreshButton
+                openTimelineButton
                 monitorButton
+                if updaterManager.shouldShowWhatsNew {
+                    changelogButton
+                }
                 settingsButton
             }
-        }
-        .sheet(isPresented: $showFeedbackSheet) {
-            FeedbackFormView()
-                .environmentObject(coordinatorWrapper)
         }
     }
 
@@ -446,7 +957,7 @@ public struct DashboardView: View {
             }
             .foregroundColor(.retraceSecondary)
             .padding(.horizontal, label != nil ? 14 : 10)
-            .padding(.vertical, 8)
+            .padding(.vertical, label != nil ? 8 : 10)
             .background(Color.white.opacity(0.05))
             .cornerRadius(8)
             .overlay(
@@ -467,10 +978,27 @@ public struct DashboardView: View {
 
     // MARK: - Action Button States
 
-    @State private var isHoveringRefresh = false
-    @State private var refreshRotation: Double = 0
+    @State private var isHoveringTimeline = false
     @State private var isHoveringSettings = false
     @State private var settingsRotation: Double = 0
+
+    private var timelineTooltipText: String {
+        tooltipText(
+            title: "Open Timeline",
+            shortcut: decodedShortcut(from: timelineShortcutData, fallback: .defaultTimeline)
+        )
+    }
+
+    private var systemMonitorTooltipText: String {
+        tooltipText(
+            title: "Open System Monitor",
+            shortcut: decodedShortcut(from: systemMonitorShortcutData, fallback: .defaultSystemMonitor)
+        )
+    }
+
+    private var settingsTooltipText: String {
+        tooltipText(title: "Open Settings", shortcutText: "⌘,")
+    }
 
     // MARK: - Footer Hover States
 
@@ -478,21 +1006,15 @@ public struct DashboardView: View {
     @State private var isHoveringSupportMe = false
     @State private var isHoveringFeedback = false
 
-    // MARK: - Refresh Button
+    // MARK: - Timeline Button
 
-    private var refreshButton: some View {
+    private var openTimelineButton: some View {
         Button(action: {
-            // Spin animation on click
-            withAnimation(.easeInOut(duration: 0.5)) {
-                refreshRotation += 360
-            }
-            Task { await viewModel.loadStatistics() }
+            TimelineWindowController.shared.show()
         }) {
-            Image(systemName: "arrow.clockwise")
+            Image(systemName: "clock.arrow.circlepath")
                 .font(.retraceCalloutMedium)
                 .foregroundColor(.retraceSecondary)
-                .rotationEffect(.degrees(refreshRotation + (isHoveringRefresh ? 45 : 0)))
-                .animation(.easeInOut(duration: 0.2), value: isHoveringRefresh)
                 .padding(10)
                 .background(Color.white.opacity(0.05))
                 .cornerRadius(8)
@@ -503,8 +1025,11 @@ public struct DashboardView: View {
         }
         .buttonStyle(.plain)
         .contentShape(Rectangle())
+        .scaleEffect(isHoveringTimeline ? 1.03 : 1.0)
+        .animation(.easeOut(duration: 0.12), value: isHoveringTimeline)
+        .compactTopTooltip(timelineTooltipText, isVisible: $isHoveringTimeline)
         .onHover { hovering in
-            isHoveringRefresh = hovering
+            isHoveringTimeline = hovering
             if hovering {
                 NSCursor.pointingHand.push()
             } else {
@@ -516,7 +1041,22 @@ public struct DashboardView: View {
     // MARK: - Monitor Button
 
     private var monitorButton: some View {
-        MonitorButton(isProcessing: viewModel.ocrQueueDepth > 0)
+        MonitorButton(
+            isProcessing: viewModel.ocrQueueDepth > 0,
+            tooltipText: systemMonitorTooltipText
+        )
+    }
+
+    // MARK: - Changelog Button
+
+    private var changelogButton: some View {
+        actionButton(icon: "sparkles", label: "What's New") {
+            NotificationCenter.default.post(
+                name: .openDashboard,
+                object: nil,
+                userInfo: ["target": "changelog"]
+            )
+        }
     }
 
     // MARK: - Settings Button
@@ -544,6 +1084,9 @@ public struct DashboardView: View {
         }
         .buttonStyle(.plain)
         .contentShape(Rectangle())
+        .scaleEffect(isHoveringSettings ? 1.03 : 1.0)
+        .animation(.easeOut(duration: 0.12), value: isHoveringSettings)
+        .compactTopTooltip(settingsTooltipText, isVisible: $isHoveringSettings)
         .onHover { hovering in
             isHoveringSettings = hovering
             if hovering {
@@ -554,14 +1097,42 @@ public struct DashboardView: View {
         }
     }
 
+    private func decodedShortcut(from data: Data, fallback: ShortcutConfig) -> ShortcutConfig {
+        guard !data.isEmpty,
+              let shortcut = try? JSONDecoder().decode(ShortcutConfig.self, from: data) else {
+            return fallback
+        }
+        return shortcut
+    }
+
+    private func tooltipText(title: String, shortcut: ShortcutConfig) -> String {
+        guard !shortcut.key.isEmpty else { return title }
+        return tooltipText(title: title, shortcutText: formattedShortcut(shortcut))
+    }
+
+    private func tooltipText(title: String, shortcutText: String) -> String {
+        "\(title)\n(\(shortcutText))"
+    }
+
+    private func formattedShortcut(_ shortcut: ShortcutConfig) -> String {
+        shortcut.modifiers.displaySymbols.joined() + shortcut.key
+    }
+
     // MARK: - Recording Indicator
 
     @State private var isHoveringRecordingIndicator = false
+    @State private var showPauseOptionsPopover = false
 
     private var recordingIndicator: some View {
         Button(action: {
-            Task {
-                await viewModel.toggleRecording(to: !viewModel.isRecording)
+            if viewModel.isRecording {
+                withAnimation(.easeOut(duration: 0.12)) {
+                    showPauseOptionsPopover.toggle()
+                }
+            } else {
+                Task {
+                    await viewModel.toggleRecording(to: true)
+                }
             }
         }) {
             HStack(spacing: 6) {
@@ -570,6 +1141,18 @@ public struct DashboardView: View {
                         .font(.system(size: 8))
                         .foregroundColor(.retraceSecondary)
                         .frame(width: 6)
+                        .transition(.opacity)
+                } else if viewModel.recordingPauseRemainingSeconds != nil {
+                    Image(systemName: "timer")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(.retraceSecondary)
+                        .frame(width: 8)
+                        .transition(.opacity)
+                } else if viewModel.isRecordingPaused {
+                    Image(systemName: "pause.circle")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(.retraceSecondary)
+                        .frame(width: 8)
                         .transition(.opacity)
                 } else {
                     Circle()
@@ -582,10 +1165,10 @@ public struct DashboardView: View {
                     .font(.retraceCaptionMedium)
                     .foregroundColor(.retraceSecondary)
                     .contentTransition(.interpolate)
-                    .frame(width: 65, alignment: .center)
+                    .frame(width: 74, alignment: .center)
             }
             .padding(.horizontal, 14)
-            .padding(.vertical, 8)
+            .padding(.vertical, 10)
             .background(Color.white.opacity(0.05))
             .cornerRadius(8)
             .overlay(
@@ -596,6 +1179,8 @@ public struct DashboardView: View {
         .buttonStyle(.plain)
         .animation(.easeInOut(duration: 0.15), value: isHoveringRecordingIndicator)
         .animation(.easeInOut(duration: 0.15), value: viewModel.isRecording)
+        .anchorPreference(key: RecordingIndicatorAnchorPreferenceKey.self, value: .bounds) { $0 }
+        // .instantTooltip("Toggle Recording  ⌘⇧R", isVisible: $isHoveringRecordingIndicator)
         .onHover { hovering in
             isHoveringRecordingIndicator = hovering
             if hovering {
@@ -609,15 +1194,106 @@ public struct DashboardView: View {
     private var recordingIndicatorLabel: String {
         if viewModel.isRecording {
             return isHoveringRecordingIndicator ? "Pause" : "Recording"
+        } else if let seconds = viewModel.recordingPauseRemainingSeconds {
+            return isHoveringRecordingIndicator ? "Start Rec." : formatPauseCountdown(seconds)
+        } else if viewModel.isRecordingPaused {
+            return isHoveringRecordingIndicator ? "Start Rec." : "Paused"
         } else {
             return isHoveringRecordingIndicator ? "Start Rec." : "Off"
+        }
+    }
+
+    private func formatPauseCountdown(_ seconds: Int) -> String {
+        let clamped = max(0, seconds)
+        let hours = clamped / 3600
+        let minutes = (clamped % 3600) / 60
+        let remainingSeconds = clamped % 60
+
+        if hours > 0 {
+            return String(format: "%d:%02d:%02d", hours, minutes, remainingSeconds)
+        }
+        return String(format: "%02d:%02d", minutes, remainingSeconds)
+    }
+
+    private var pauseRecordingMenu: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            PauseMenuOptionRow(title: "5 min") {
+                handlePauseSelection(duration: 5 * 60)
+            }
+            PauseMenuOptionRow(title: "30 min") {
+                handlePauseSelection(duration: 30 * 60)
+            }
+            PauseMenuOptionRow(title: "60 min") {
+                handlePauseSelection(duration: 60 * 60)
+            }
+
+            Divider()
+                .background(Color.white.opacity(0.1))
+                .padding(.vertical, 1)
+
+            PauseMenuOptionRow(title: "Turn Off") {
+                handlePauseSelection(duration: nil)
+            }
+        }
+        .padding(4)
+        .retraceMenuContainer(addPadding: false)
+    }
+
+    private func handlePauseSelection(duration: TimeInterval?) {
+        withAnimation(.easeOut(duration: 0.12)) {
+            showPauseOptionsPopover = false
+        }
+        Task {
+            await viewModel.pauseRecording(for: duration)
+        }
+    }
+
+    private func pauseMenuOriginX(anchorRect: CGRect, containerWidth: CGFloat, menuWidth: CGFloat) -> CGFloat {
+        let horizontalPadding: CGFloat = 16
+        let desiredX = anchorRect.minX
+        return min(
+            max(horizontalPadding, desiredX),
+            max(horizontalPadding, containerWidth - menuWidth - horizontalPadding)
+        )
+    }
+
+    private struct PauseMenuOptionRow: View {
+        let title: String
+        let action: () -> Void
+
+        @State private var isHovering = false
+
+        var body: some View {
+            Button(action: action) {
+                HStack(spacing: 0) {
+                    Text(title)
+                        .font(.system(size: 12.5, weight: .medium))
+                        .foregroundColor(isHovering ? .white : .white.opacity(0.78))
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 10)
+                .frame(height: 24)
+                .background(
+                    RoundedRectangle(cornerRadius: 5)
+                        .fill(isHovering ? Color.white.opacity(0.12) : Color.clear)
+                )
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .onHover { hovering in
+                withAnimation(.easeOut(duration: 0.1)) {
+                    isHovering = hovering
+                }
+                if hovering { NSCursor.pointingHand.push() }
+                else { NSCursor.pop() }
+            }
         }
     }
 
     // MARK: - Stats Cards Row
 
     private struct StatCardData: Identifiable {
-        let id = UUID()
+        let id: String
         let icon: String
         let title: String
         let value: String
@@ -627,6 +1303,7 @@ public struct DashboardView: View {
         let valueFormatter: ((Int64) -> String)?
 
         init(icon: String, title: String, value: String, subtitle: String, graphData: [DailyDataPoint]? = nil, graphColor: Color = .retraceAccent, valueFormatter: ((Int64) -> String)? = nil) {
+            self.id = title
             self.icon = icon
             self.title = title
             self.value = value
@@ -638,18 +1315,30 @@ public struct DashboardView: View {
     }
 
     private var statsCards: [StatCardData] {
-        [
+        let selectedRangeLabel = viewModel.appUsageRangeLabel
+        let isDefaultLastSevenDays = viewModel.isDefaultAppUsageRangeSelected
+        let activitySubtitle = isDefaultLastSevenDays ? "Last 7 days" : selectedRangeLabel
+        let daysRecordedTitle = isDefaultLastSevenDays ? "Total Days Recorded" : "Days Selected"
+        let daysRecordedSubtitle = formatRecordedHoursSubtitle(
+            isDefaultLastSevenDays ? viewModel.totalCapturedDuration : viewModel.totalWeeklyTime
+        )
+        let storageTitle = isDefaultLastSevenDays ? "Total Storage Used" : "Storage Used"
+        let storageValue = formatStorageSize(isDefaultLastSevenDays ? viewModel.totalStorageBytes : viewModel.weeklyStorageBytes)
+        let storageSubtitle = isDefaultLastSevenDays ? formatStoragePerMonth() : selectedRangeLabel
+        let totalDaysValue = isDefaultLastSevenDays ? viewModel.daysRecorded : viewModel.appUsageRangeDaySpan
+
+        return [
             StatCardData(
                 icon: "calendar",
-                title: "Total Days Recorded",
-                value: "\(viewModel.daysRecorded) days",
-                subtitle: formatOldestDateSubtitle(viewModel.oldestRecordedDate)
+                title: daysRecordedTitle,
+                value: "\(totalDaysValue) days",
+                subtitle: daysRecordedSubtitle
             ),
             StatCardData(
                 icon: "clock.fill",
                 title: "Screen Time",
                 value: formatScreenTimeFromDaily(viewModel.dailyScreenTimeData),
-                subtitle: "Last 7 days",
+                subtitle: activitySubtitle,
                 graphData: viewModel.dailyScreenTimeData.isEmpty ? nil : viewModel.dailyScreenTimeData,
                 graphColor: .blue,
                 valueFormatter: { milliseconds in
@@ -659,9 +1348,9 @@ public struct DashboardView: View {
             ),
             StatCardData(
                 icon: "externaldrive.fill",
-                title: "Total Storage Used",
-                value: formatStorageSize(viewModel.totalStorageBytes),
-                subtitle: formatStoragePerMonth(),
+                title: storageTitle,
+                value: storageValue,
+                subtitle: storageSubtitle,
                 graphData: viewModel.dailyStorageData.isEmpty ? nil : viewModel.dailyStorageData,
                 graphColor: .cyan
             ),
@@ -669,7 +1358,7 @@ public struct DashboardView: View {
                 icon: "timelapse",
                 title: "Timeline Opens",
                 value: "\(viewModel.timelineOpensThisWeek)",
-                subtitle: "Last 7 days",
+                subtitle: activitySubtitle,
                 graphData: viewModel.dailyTimelineOpensData.isEmpty ? nil : viewModel.dailyTimelineOpensData,
                 graphColor: .purple
             ),
@@ -677,7 +1366,7 @@ public struct DashboardView: View {
                 icon: "magnifyingglass",
                 title: "Searches",
                 value: "\(viewModel.searchesThisWeek)",
-                subtitle: "Last 7 days",
+                subtitle: activitySubtitle,
                 graphData: viewModel.dailySearchesData.isEmpty ? nil : viewModel.dailySearchesData,
                 graphColor: .orange
             ),
@@ -685,7 +1374,7 @@ public struct DashboardView: View {
                 icon: "doc.on.doc",
                 title: "Text Copies",
                 value: "\(viewModel.textCopiesThisWeek)",
-                subtitle: "Last 7 days",
+                subtitle: activitySubtitle,
                 graphData: viewModel.dailyTextCopiesData.isEmpty ? nil : viewModel.dailyTextCopiesData,
                 graphColor: .green
             ),
@@ -774,7 +1463,7 @@ public struct DashboardView: View {
         let dailyData = viewModel.dailyStorageData
         guard !dailyData.isEmpty else { return "est. 0 GB/month" }
 
-        // Sum all daily values and extrapolate to 30 days
+        // Estimate based on current loaded daily storage series.
         let totalBytes = dailyData.reduce(0) { $0 + $1.value }
         let daysWithData = dailyData.count
         let bytesPerDay = Double(totalBytes) / Double(daysWithData)
@@ -783,85 +1472,118 @@ public struct DashboardView: View {
         return String(format: "est. %.1f GB/month", gbPerMonth)
     }
 
-    private func formatOldestDateSubtitle(_ date: Date?) -> String {
-        guard let date = date else { return "" }
-        let formatter = DateFormatter()
-        formatter.dateFormat = "MMM yyyy"
-        return "since \(formatter.string(from: date))"
-    }
-
     // MARK: - App Usage Section
 
     private func appUsageSection(layoutSize: LayoutSize) -> some View {
         let appUsageLayout: AppUsageLayoutSize = .normal
 
         return VStack(alignment: .leading, spacing: 0) {
-            if viewModel.isLoading && viewModel.weeklyAppUsage.isEmpty {
-                loadingStateView
-            } else if viewModel.weeklyAppUsage.isEmpty {
-                emptyStateView
-            } else {
-                VStack(spacing: 0) {
-                    // Header row with view mode toggle
-                    HStack {
-                        Text("App Usage")
-                            .font(.retraceHeadline)
-                            .foregroundColor(.retracePrimary)
+            // Header row
+            HStack {
+                Text("App Usage")
+                    .font(.retraceHeadline)
+                    .foregroundColor(.retracePrimary)
 
-                        Spacer()
+                Spacer()
 
-                        Text("\(formatTotalTime(viewModel.weeklyAppUsage.reduce(0) { $0 + $1.duration }))  ·  Last 7 days")
-                            .font(.retraceCaptionMedium)
-                            .foregroundColor(.retraceSecondary)
+                appUsageRangeControls
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 16)
+            .zIndex(showAppUsageDatePopover ? 10 : 1)
 
-                        // View mode toggle
-                        viewModeToggle
+            Divider()
+                .background(Color.white.opacity(0.06))
+                .zIndex(showAppUsageDatePopover ? 9 : 0)
+
+            appUsageSectionBody(layoutSize: appUsageLayout)
+        }
+        .background(Color.white.opacity(0.03))
+        .cornerRadius(16)
+        .overlay(
+            RoundedRectangle(cornerRadius: 16)
+                .stroke(themeBorderColor.opacity(1.2), lineWidth: 1.2)
+        )
+    }
+
+    @ViewBuilder
+    private func appUsageSectionBody(layoutSize: AppUsageLayoutSize) -> some View {
+        switch Self.appUsageSectionBodyState(
+            isLoading: viewModel.isLoading,
+            hasAppUsageData: !viewModel.weeklyAppUsage.isEmpty
+        ) {
+        case .loading:
+            appUsageLoadingBody
+        case .empty:
+            appUsageEmptyBody
+        case .content:
+            switch usageViewMode {
+            case .list:
+                AppUsageListView(
+                    apps: viewModel.weeklyAppUsage,
+                    totalTime: viewModel.totalWeeklyTime,
+                    layoutSize: layoutSize,
+                    scrollAffordanceColor: themeScrollAffordanceColor,
+                    loadWindowUsage: { bundleID, visibleCount in
+                        await viewModel.getWindowUsageForApp(bundleID: bundleID, limit: visibleCount)
+                    },
+                    loadTabsForDomain: { bundleID, domain in
+                        await viewModel.getBrowserTabsForDomain(bundleID: bundleID, domain: domain)
+                    },
+                    onWindowTapped: { app, window in
+                        handleWindowTapped(app, window)
+                    },
+                    onUsageAction: { target, action in
+                        usageActionRequest = DashboardUsageActionRequest(target: target, action: action)
                     }
-                    .padding(.horizontal, 20)
-                    .padding(.vertical, 16)
-
-                    Divider()
-                        .background(Color.white.opacity(0.06))
-
-                    // Content based on view mode
-                    switch usageViewMode {
-                    case .list:
-                        AppUsageListView(
-                            apps: viewModel.weeklyAppUsage,
-                            totalTime: viewModel.totalWeeklyTime,
-                            layoutSize: appUsageLayout,
-                            loadWindowUsage: { bundleID in
-                                await viewModel.getWindowUsageForApp(bundleID: bundleID)
-                            },
-                            loadTabsForDomain: { bundleID, domain in
-                                await viewModel.getBrowserTabsForDomain(bundleID: bundleID, domain: domain)
-                            },
-                            onWindowTapped: { app, window in
-                                handleWindowTapped(app, window)
-                            }
-                        )
-                    case .hardDrive:
-                        AppUsageHardDriveView(
-                            apps: viewModel.weeklyAppUsage,
-                            totalTime: viewModel.totalWeeklyTime,
-                            onAppTapped: { app in
-                                handleAppTapped(app)
-                            }
-                        )
-                    }
-                }
-                .background(Color.white.opacity(0.03))
-                .cornerRadius(16)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 16)
-                        .stroke(themeBorderColor.opacity(1.2), lineWidth: 1.2)
                 )
+                .id(
+                    "app-usage-list-\(Int(viewModel.appUsageRangeStart.timeIntervalSince1970))-\(Int(viewModel.appUsageRangeEnd.timeIntervalSince1970))"
+                )
+                .zIndex(0)
+            case .hardDrive:
+                AppUsageHardDriveView(
+                    apps: viewModel.weeklyAppUsage,
+                    totalTime: viewModel.totalWeeklyTime,
+                    onAppTapped: { app in
+                        handleAppTapped(app)
+                    },
+                    onUsageAction: { target, action in
+                        usageActionRequest = DashboardUsageActionRequest(target: target, action: action)
+                    }
+                )
+                .id(
+                    "app-usage-hard-drive-\(Int(viewModel.appUsageRangeStart.timeIntervalSince1970))-\(Int(viewModel.appUsageRangeEnd.timeIntervalSince1970))"
+                )
+                .zIndex(0)
             }
         }
     }
 
     private var themeBorderColor: Color {
         currentTheme.controlBorderColor
+    }
+
+    /// Keeps the scroll fades aligned with the selected accent without changing
+    /// the dashboard's actual background surface.
+    private var themeScrollAffordanceColor: Color {
+        let baseColor = NSColor(themeBaseBackground).usingColorSpace(.sRGB) ?? NSColor.black
+        let accentColor = NSColor(currentTheme.glowColor).usingColorSpace(.sRGB) ?? baseColor
+
+        let tintStrength: CGFloat = 0.22
+        let darknessScale: CGFloat = 0.60
+
+        let red = ((baseColor.redComponent * (1 - tintStrength)) + (accentColor.redComponent * tintStrength)) * darknessScale
+        let green = ((baseColor.greenComponent * (1 - tintStrength)) + (accentColor.greenComponent * tintStrength)) * darknessScale
+        let blue = ((baseColor.blueComponent * (1 - tintStrength)) + (accentColor.blueComponent * tintStrength)) * darknessScale
+
+        return Color(
+            .sRGB,
+            red: Double(min(max(red, 0), 1)),
+            green: Double(min(max(green, 0), 1)),
+            blue: Double(min(max(blue, 0), 1)),
+            opacity: 1
+        )
     }
 
     /// Theme-aware base background color
@@ -981,44 +1703,285 @@ public struct DashboardView: View {
         }
     }
 
-    private var viewModeToggle: some View {
-        HStack(spacing: 4) {
-            ForEach(AppUsageViewMode.allCases, id: \.self) { mode in
-                Button(action: {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        usageViewMode = mode
-                    }
-                    saveViewMode(mode)
-                }) {
-                    Image(systemName: mode.icon)
-                        .font(.retraceCaption2Medium)
-                        .foregroundColor(usageViewMode == mode ? .retracePrimary : .retraceSecondary)
-                        .frame(width: 28, height: 28)
-                        .contentShape(Rectangle())
-                        .background(
-                            RoundedRectangle(cornerRadius: 6)
-                                .fill(usageViewMode == mode ? Color.white.opacity(0.1) : Color.clear)
+    private var appUsageRangeControls: some View {
+        let rangeControlLabel = Self.appUsageRangeControlLabel(
+            selectedRangeLabel: viewModel.appUsageRangeLabel,
+            isDefaultLastSevenDays: viewModel.isDefaultAppUsageRangeSelected
+        )
+        let isResetEnabled = Self.isAppUsageRangeResetEnabled(
+            isDefaultLastSevenDays: viewModel.isDefaultAppUsageRangeSelected
+        )
+
+        return HStack(spacing: 8) {
+            HStack(spacing: 0) {
+                rangeShiftButton(
+                    icon: "chevron.left",
+                    position: .leading,
+                    isEnabled: viewModel.canShiftAppUsageRangeBackward
+                ) {
+                    Task {
+                        await viewModel.shiftAppUsageDateRange(
+                            by: -1,
+                            source: "dashboard_app_usage_previous_range"
                         )
+                    }
                 }
-                .buttonStyle(.plain)
-                .onHover { hovering in
-                    if hovering {
-                        NSCursor.pointingHand.push()
-                    } else {
-                        NSCursor.pop()
+
+                Rectangle()
+                    .fill(Color.white.opacity(0.08))
+                    .frame(width: 1, height: 30)
+
+                HStack(spacing: 2) {
+                    Button(action: {
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            showAppUsageDatePopover.toggle()
+                        }
+                    }) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "calendar")
+                                .font(.retraceCaption2Medium)
+                            Text(rangeControlLabel)
+                                .font(.retraceCaptionMedium)
+                        }
+                        .foregroundColor(.retraceSecondary)
+                        .padding(.leading, 12)
+                        .padding(.trailing, isResetEnabled ? 4 : 12)
+                        .frame(height: 30)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .onHover { hovering in
+                        if hovering {
+                            NSCursor.pointingHand.push()
+                        } else {
+                            NSCursor.pop()
+                        }
+                    }
+
+                    if isResetEnabled {
+                        Button(action: {
+                            resetAppUsageRangeFromInlineButton()
+                        }) {
+                            Image(systemName: "arrow.counterclockwise")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundColor(.retraceSecondary.opacity(0.9))
+                                .padding(.leading, 2)
+                                .padding(.trailing, 12)
+                                .frame(height: 30)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .onHover { hovering in
+                            isHoveringAppUsageRangeReset = hovering
+                            if hovering {
+                                NSCursor.pointingHand.push()
+                            } else {
+                                NSCursor.pop()
+                            }
+                        }
+                        .instantTooltip(
+                            "Reset Range (⌘⌫)",
+                            isVisible: $isHoveringAppUsageRangeReset,
+                            placement: .bottom
+                        )
+                        .zIndex(isHoveringAppUsageRangeReset ? 2 : 0)
+                    }
+                }
+                .frame(height: 30)
+                .background(showAppUsageDatePopover ? Color.white.opacity(0.06) : Color.clear)
+                .anchorPreference(
+                    key: AppUsageDatePopoverAnchorPreferenceKey.self,
+                    value: .bounds
+                ) { $0 }
+                .background {
+                    Group {
+                        Button(action: {
+                            toggleAppUsageDatePopoverFromShortcut()
+                        }) {
+                            EmptyView()
+                        }
+                        .buttonStyle(.plain)
+                        .keyboardShortcut("g", modifiers: .command)
+                        .frame(width: 0, height: 0)
+                        .opacity(0)
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
+
+                        Button(action: {
+                            focusAppUsageDateInputFromShortcut()
+                        }) {
+                            EmptyView()
+                        }
+                        .buttonStyle(.plain)
+                        .keyboardShortcut("k", modifiers: .command)
+                        .frame(width: 0, height: 0)
+                        .opacity(0)
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
+
+                        if Self.shouldResetAppUsageRangeOnEscape(
+                            isDatePopoverPresented: showAppUsageDatePopover,
+                            isDefaultLastSevenDays: viewModel.isDefaultAppUsageRangeSelected
+                        ) {
+                            Button(action: {
+                                resetAppUsageRangeFromEscapeShortcut()
+                            }) {
+                                EmptyView()
+                            }
+                            .buttonStyle(.plain)
+                            .keyboardShortcut(.escape, modifiers: [])
+                            .frame(width: 0, height: 0)
+                            .opacity(0)
+                            .allowsHitTesting(false)
+                            .accessibilityHidden(true)
+                        }
+                    }
+                }
+
+                Rectangle()
+                    .fill(Color.white.opacity(0.08))
+                    .frame(width: 1, height: 30)
+
+                rangeShiftButton(
+                    icon: "chevron.right",
+                    position: .trailing,
+                    isEnabled: viewModel.canShiftAppUsageRangeForward
+                ) {
+                    Task {
+                        await viewModel.shiftAppUsageDateRange(
+                            by: 1,
+                            source: "dashboard_app_usage_next_range"
+                        )
                     }
                 }
             }
+            .background(
+                UnevenRoundedRectangle(
+                    topLeadingRadius: 8,
+                    bottomLeadingRadius: 8,
+                    bottomTrailingRadius: 8,
+                    topTrailingRadius: 8
+                )
+                .fill(Color.white.opacity(0.06))
+            )
+            .overlay(
+                UnevenRoundedRectangle(
+                    topLeadingRadius: 8,
+                    bottomLeadingRadius: 8,
+                    bottomTrailingRadius: 8,
+                    topTrailingRadius: 8
+                )
+                .stroke(Color.white.opacity(showAppUsageDatePopover ? 0.22 : 0.1), lineWidth: 1)
+            )
         }
-        .padding(4)
-        .background(
-            RoundedRectangle(cornerRadius: 8)
-                .fill(Color.white.opacity(0.05))
+    }
+
+    @ViewBuilder
+    private var appUsageDatePopover: some View {
+        let isResetEnabled = Self.isAppUsageRangeResetEnabled(
+            isDefaultLastSevenDays: viewModel.isDefaultAppUsageRangeSelected
+        )
+
+        DateRangeFilterPopover(
+            dateRanges: [viewModel.appUsageDateRange],
+            onApply: { ranges in
+                withAnimation(.easeOut(duration: 0.15)) {
+                    showAppUsageDatePopover = false
+                    appUsageDateFocusRequestID = nil
+                }
+                guard let selectedRange = ranges.first else { return }
+                Task {
+                    await viewModel.setAppUsageDateRange(
+                        from: selectedRange,
+                        source: "dashboard_app_usage_calendar_apply"
+                    )
+                }
+            },
+            onClear: {
+                withAnimation(.easeOut(duration: 0.15)) {
+                    showAppUsageDatePopover = false
+                    appUsageDateFocusRequestID = nil
+                }
+                Task {
+                    await viewModel.resetAppUsageDateRangeToDefault(
+                        source: "dashboard_app_usage_calendar_clear"
+                    )
+                }
+            },
+            width: Self.appUsageDatePopoverWidth,
+            enableKeyboardNavigation: true,
+            allowMultipleRanges: false,
+            maxRangeDays: DashboardViewModel.maxAppUsageRangeDays,
+            onQuickPresetShortcut: { preset in
+                viewModel.recordKeyboardShortcut("dashboard.app_usage_date_range.\(preset.rawValue)")
+            },
+            onClearShortcut: {
+                viewModel.recordKeyboardShortcut("dashboard.app_usage_date_range.clear")
+            },
+            focusPrimaryInputRequestID: appUsageDateFocusRequestID,
+            isResetEnabled: isResetEnabled,
+            onDismiss: {
+                withAnimation(.easeOut(duration: 0.15)) {
+                    showAppUsageDatePopover = false
+                    appUsageDateFocusRequestID = nil
+                }
+            }
         )
     }
 
-    private var loadingStateView: some View {
-        VStack(spacing: 16) {
+    private enum RangeShiftButtonPosition {
+        case leading
+        case trailing
+    }
+
+    private func rangeShiftButton(
+        icon: String,
+        position: RangeShiftButtonPosition,
+        isEnabled: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundColor(.retraceSecondary.opacity(isEnabled ? 0.9 : 0.35))
+                .frame(width: 30, height: 30)
+                .background(
+                    Group {
+                        if position == .leading {
+                            UnevenRoundedRectangle(
+                                topLeadingRadius: 8,
+                                bottomLeadingRadius: 8,
+                                bottomTrailingRadius: 0,
+                                topTrailingRadius: 0
+                            )
+                            .fill(Color.white.opacity(isEnabled ? 0.03 : 0.01))
+                        } else {
+                            UnevenRoundedRectangle(
+                                topLeadingRadius: 0,
+                                bottomLeadingRadius: 0,
+                                bottomTrailingRadius: 8,
+                                topTrailingRadius: 8
+                            )
+                            .fill(Color.white.opacity(isEnabled ? 0.03 : 0.01))
+                        }
+                    }
+                )
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!isEnabled)
+        .onHover { hovering in
+            guard isEnabled else { return }
+            if hovering {
+                NSCursor.pointingHand.push()
+            } else {
+                NSCursor.pop()
+            }
+        }
+    }
+
+    private var appUsageLoadingBody: some View {
+        return VStack(spacing: 16) {
             SpinnerView(size: 32, lineWidth: 3)
 
             Text("Loading activity...")
@@ -1026,46 +1989,40 @@ public struct DashboardView: View {
                 .foregroundColor(.retraceSecondary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color.white.opacity(0.02))
-        .cornerRadius(16)
-        .overlay(
-            RoundedRectangle(cornerRadius: 16)
-                .stroke(themeBorderColor, lineWidth: 1)
-        )
+        .padding(.vertical, 48)
     }
 
-    private var emptyStateView: some View {
-        VStack(spacing: 16) {
+    private var appUsageEmptyBody: some View {
+        let copy = Self.appUsageEmptyStateCopy(
+            rangeLabel: viewModel.appUsageRangeLabel,
+            hasRecordedActivity: viewModel.daysRecorded > 0
+        )
+
+        return VStack(spacing: 16) {
             ZStack {
                 Circle()
                     .fill(LinearGradient.retraceAccentGradient.opacity(0.2))
                     .frame(width: 80, height: 80)
 
-                Image(systemName: "clock.badge.questionmark")
+                Image(systemName: copy.symbolName)
                     .font(.retraceDisplay3)
                     .foregroundStyle(LinearGradient.retraceAccentGradient)
             }
 
             VStack(spacing: 8) {
-                Text("No activity recorded yet")
+                Text(copy.title)
                     .font(.retraceHeadline)
                     .foregroundColor(.retracePrimary)
 
-                Text("Start using your Mac and Retrace will track your app usage automatically.")
+                Text(copy.message)
                     .font(.retraceCallout)
                     .foregroundColor(.retraceSecondary)
                     .multilineTextAlignment(.center)
-                    .frame(maxWidth: 320)
+                    .frame(maxWidth: 360)
             }
         }
-        .frame(maxWidth: .infinity)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(.vertical, 48)
-        .background(Color.white.opacity(0.02))
-        .cornerRadius(16)
-        .overlay(
-            RoundedRectangle(cornerRadius: 16)
-                .stroke(themeBorderColor, lineWidth: 1)
-        )
     }
 
     // MARK: - Footer
@@ -1075,7 +2032,7 @@ public struct DashboardView: View {
             Spacer()
 
             HStack(spacing: 16) {
-                Link(destination: URL(string: "https://dub.sh/haseab-twitter")!) {
+                Link(destination: URL(string: "https://retrace.to/l/haseab-twitter")!) {
                     HStack(spacing: 4) {
                         Text("Made with")
                             .foregroundColor(.retraceSecondary)
@@ -1103,7 +2060,7 @@ public struct DashboardView: View {
                     .fill(Color.retraceSecondary.opacity(0.5))
                     .frame(width: 3, height: 3)
 
-                Link(destination: URL(string: "https://dub.sh/support-haseab")!) {
+                Link(destination: URL(string: "https://retrace.to/l/support-haseab")!) {
                     HStack(spacing: 6) {
                         Image(systemName: "cup.and.saucer.fill")
                             .font(.retraceCaption2)
@@ -1128,7 +2085,9 @@ public struct DashboardView: View {
                     .fill(Color.retraceSecondary.opacity(0.5))
                     .frame(width: 3, height: 3)
 
-                Button(action: { showFeedbackSheet = true }) {
+                Button(action: {
+                    presentFeedbackSheet()
+                }) {
                     HStack(spacing: 6) {
                         Image(systemName: "questionmark.circle")
                             .font(.retraceCalloutMedium)
@@ -1148,6 +2107,7 @@ public struct DashboardView: View {
                     .animation(.easeInOut(duration: 0.15), value: isHoveringFeedback)
                 }
                 .buttonStyle(.plain)
+                .keyboardShortcut("h", modifiers: [.command, .shift])
                 .onHover { hovering in
                     isHoveringFeedback = hovering
                     if hovering {
@@ -1156,6 +2116,24 @@ public struct DashboardView: View {
                         NSCursor.pop()
                     }
                 }
+
+                Circle()
+                    .fill(Color.retraceSecondary.opacity(0.5))
+                    .frame(width: 3, height: 3)
+
+                Group {
+                    if let url = BuildInfo.commitURL {
+                        Text(BuildInfo.displayVersion)
+                            .onTapGesture { NSWorkspace.shared.open(url) }
+                            .onHover { hovering in
+                                if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+                            }
+                    } else {
+                        Text(BuildInfo.displayVersion)
+                    }
+                }
+                .font(.retraceCaption2)
+                .foregroundColor(.retraceSecondary.opacity(0.5))
 
                 #if DEBUG
                 Circle()
@@ -1179,7 +2157,34 @@ public struct DashboardView: View {
                     Button("Show Launch on Login Banner") {
                         launchOnLoginReminderManager.shouldShowReminder = true
                     }
+                    Button("Show Low Storage Banner") {
+                        viewModel.showDebugStorageHealthBanner(
+                            severity: .warning,
+                            availableGB: 4.25,
+                            shouldStop: false
+                        )
+                    }
+                    Button("Show Critical Storage Banner") {
+                        viewModel.showDebugStorageHealthBanner(
+                            severity: .critical,
+                            availableGB: 1.10,
+                            shouldStop: false
+                        )
+                    }
+                    Button("Show Storage Stop Banner") {
+                        viewModel.showDebugStorageHealthBanner(
+                            severity: .critical,
+                            availableGB: 0.28,
+                            shouldStop: true
+                        )
+                    }
                     Divider()
+                    if let debugLaunchOnboarding {
+                        Button("Relaunch Onboarding") {
+                            debugLaunchOnboarding()
+                        }
+                        Divider()
+                    }
                     Menu("Set Color Theme") {
                         Button("Blue") {
                             MilestoneCelebrationManager.setDebugThemeOverride(.blue)
@@ -1195,6 +2200,24 @@ public struct DashboardView: View {
                             MilestoneCelebrationManager.setDebugThemeOverride(nil)
                         }
                     }
+                    Divider()
+                    Button("Trigger Crash (SIGABRT)") {
+                        triggerDebugCrash()
+                    }
+                    Button("Trigger Forced Termination (SIGKILL)") {
+                        triggerDebugForcedTermination()
+                    }
+                    Button("Trigger Watchdog Hang (15s)") {
+                        triggerDebugWatchdogHang()
+                    }
+                    Button("Interrupt Capture") {
+                        triggerDebugCaptureInterruption()
+                    }
+                    .disabled(!viewModel.isRecording)
+                    Button("Interrupt Encoding") {
+                        triggerDebugEncodingInterruption()
+                    }
+                    .disabled(!viewModel.isRecording)
                 } label: {
                     HStack(spacing: 6) {
                         Image(systemName: "ant.fill")
@@ -1227,6 +2250,23 @@ public struct DashboardView: View {
         }
     }
 
+    private func formatRecordedHoursSubtitle(_ seconds: TimeInterval) -> String {
+        guard seconds > 0 else { return "0 hours on Retrace" }
+
+        let roundedHours = Int((seconds / 3600).rounded())
+        let hours = max(0, roundedHours)
+
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        formatter.minimumFractionDigits = 0
+        formatter.maximumFractionDigits = 0
+
+        let hoursText = formatter.string(from: NSNumber(value: hours))
+            ?? String(hours)
+
+        return "\(hoursText) \(hours == 1 ? "hour" : "hours") on Retrace"
+    }
+
     private func formatScreenTimeFromDaily(_ data: [DailyDataPoint]) -> String {
         // Data is in milliseconds, sum and convert to hours/minutes
         let totalMs = data.reduce(0) { $0 + $1.value }
@@ -1241,9 +2281,451 @@ public struct DashboardView: View {
         }
     }
 
+    private func triggerDebugWatchdogHang() {
+        DashboardViewModel.recordDebugWatchdogHangTriggered(coordinator: coordinatorWrapper.coordinator)
+        Log.warning("[DEBUG] Scheduling intentional main-thread hang to exercise watchdog auto-quit", category: .ui)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+            // DEBUG-only: intentionally block the main thread long enough to trigger
+            // the watchdog auto-quit/relaunch path and generate a watchdog report.
+            Thread.sleep(forTimeInterval: 15)
+        }
+    }
+
+    private func triggerDebugCrash() {
+        DashboardViewModel.recordDebugCrashTriggered(coordinator: coordinatorWrapper.coordinator)
+        Log.warning("[DEBUG] Scheduling intentional SIGABRT to exercise crash-report generation and crash recovery", category: .ui)
+
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 1) {
+            Darwin.abort()
+        }
+    }
+
+    private func triggerDebugForcedTermination() {
+        DashboardViewModel.recordDebugForcedTerminationTriggered(coordinator: coordinatorWrapper.coordinator)
+        Log.warning("[DEBUG] Scheduling intentional SIGKILL to exercise forced-termination recovery without crash diagnostics", category: .ui)
+
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 1) {
+            Darwin.kill(getpid(), SIGKILL)
+        }
+    }
+
+    #if DEBUG
+    private func triggerDebugCaptureInterruption() {
+        DashboardViewModel.recordDebugCaptureInterruptionTriggered(
+            coordinator: coordinatorWrapper.coordinator
+        )
+        Log.warning("[DEBUG] Interrupting capture underneath the coordinator to exercise unexpected-stop detection", category: .ui)
+
+        Task {
+            await coordinatorWrapper.coordinator.debugInterruptCapturePipeline()
+        }
+    }
+
+    private func triggerDebugEncodingInterruption() {
+        DashboardViewModel.recordDebugEncodingInterruptionTriggered(
+            coordinator: coordinatorWrapper.coordinator
+        )
+        Log.warning("[DEBUG] Arming writer interruption for the next frame append to exercise unexpected-stop detection", category: .ui)
+
+        Task {
+            await coordinatorWrapper.coordinator.debugInterruptEncodingPipeline()
+        }
+    }
+    #endif
+
+    private func presentFeedbackSheet(launchContext: FeedbackLaunchContext? = nil) {
+        Log.info(
+            "[FeedbackSheet] dashboard presentFeedbackSheet source=\(launchContext?.source.rawValue ?? FeedbackLaunchContext.Source.manual.rawValue) " +
+            "showFeedbackSheet(before)=\(showFeedbackSheet)",
+            category: .ui
+        )
+        feedbackLaunchContext = launchContext
+        feedbackPresentationID = UUID()
+        if launchContext?.source == .crashBanner {
+            viewModel.recordRecentCrashReportFeedbackOpened()
+        } else if launchContext?.source == .walFailureCrashBanner {
+            viewModel.recordRecentWALFailureCrashFeedbackOpened()
+        } else if launchContext == nil {
+            DashboardViewModel.recordHelpOpened(
+                coordinator: coordinatorWrapper.coordinator,
+                source: "dashboard_footer"
+            )
+        }
+        showFeedbackSheet = true
+        Log.info(
+            "[FeedbackSheet] dashboard presentFeedbackSheet showFeedbackSheet(after)=\(showFeedbackSheet) " +
+            "feedbackPresentationID=\(feedbackPresentationID)",
+            category: .ui
+        )
+    }
+
 }
 
 // MARK: - Preview
+
+private struct UnexpectedRecordingStopBanner: View {
+    let state: UnexpectedRecordingStopState
+    let onSubmitBugReport: () -> Void
+    let onDismiss: () -> Void
+
+    private var messageText: String {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return "Recording stopped unexpectedly at \(formatter.string(from: state.stoppedAt)). Please submit a bug report."
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "record.circle")
+                .foregroundColor(.orange)
+                .font(.retraceTitle3)
+
+            Text(messageText)
+                .font(.retraceCaption)
+                .foregroundColor(.primary)
+                .fixedSize(horizontal: false, vertical: true)
+                .multilineTextAlignment(.leading)
+
+            Spacer(minLength: 12)
+
+            HStack(spacing: 10) {
+                Button("Submit Bug Report", action: onSubmitBugReport)
+                    .font(.retraceCaption2Medium)
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(Color.orange.opacity(0.9))
+                    .cornerRadius(6)
+                    .buttonStyle(.plain)
+            }
+
+            Button(action: onDismiss) {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.retraceHeadline)
+                    .foregroundColor(.secondary)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 9)
+        .background(
+            Color(red: 0.42, green: 0.18, blue: 0.11).opacity(0.22)
+        )
+        .cornerRadius(8)
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.orange.opacity(0.3), lineWidth: 1)
+        )
+    }
+}
+
+private struct ConferencePrivacyDashboardBanner: View {
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(Color.white.opacity(0.14))
+                    .frame(width: 36, height: 36)
+
+                Image(systemName: "eye.slash.fill")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(.white)
+            }
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Video calls are automatically blurred to protect the privacy of others.")
+                    .font(.retraceCaptionBold)
+                    .foregroundColor(.white)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .minimumScaleFactor(0.94)
+
+                Text("Go to the menu bar icon options to disable blurring (must disable each time you join a call)")
+                    .font(.retraceCaption2)
+                    .foregroundColor(Color.white.opacity(0.92))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .minimumScaleFactor(0.94)
+            }
+
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(
+            LinearGradient(
+                colors: [
+                    Color(red: 0.12, green: 0.35, blue: 0.85).opacity(0.32),
+                    Color(red: 0.10, green: 0.24, blue: 0.63).opacity(0.24)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(Color(red: 0.43, green: 0.68, blue: 1.0).opacity(0.45), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+}
+
+private struct CrashReportBanner: View {
+    let report: DashboardCrashReportSummary
+    let onSubmitBugReport: () -> Void
+    let onDetails: () -> Void
+    let onDismiss: () -> Void
+
+    private var messageText: String {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        let timestamp = formatter.string(from: report.capturedAt)
+        switch report.source {
+        case .watchdogAutoQuit:
+            return "Retrace auto-quit after a recent freeze at \(timestamp). Please submit a bug report."
+        case .macOSDiagnosticReport:
+            return "macOS saved a recent Retrace crash report at \(timestamp). Please submit a bug report."
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "exclamationmark.arrow.trianglehead.2.clockwise.rotate.90")
+                .foregroundColor(.orange)
+                .font(.retraceTitle3)
+
+            Text(messageText)
+                .font(.retraceCaption)
+                .foregroundColor(.primary)
+                .fixedSize(horizontal: false, vertical: true)
+                .multilineTextAlignment(.leading)
+
+            Spacer(minLength: 12)
+
+            HStack(spacing: 10) {
+                Button("Details", action: onDetails)
+                    .font(.retraceCaption2Medium)
+                    .foregroundColor(.white.opacity(0.92))
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(Color.white.opacity(0.08))
+                    .cornerRadius(6)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6)
+                            .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                    )
+                    .buttonStyle(.plain)
+
+                Button("Submit Bug Report", action: onSubmitBugReport)
+                    .font(.retraceCaption2Medium)
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(Color.orange.opacity(0.9))
+                    .cornerRadius(6)
+                    .buttonStyle(.plain)
+            }
+
+            Button(action: onDismiss) {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.retraceHeadline)
+                    .foregroundColor(.secondary)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 9)
+        .background(
+            Color(red: 0.42, green: 0.18, blue: 0.11).opacity(0.22)
+        )
+        .cornerRadius(8)
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.orange.opacity(0.3), lineWidth: 1)
+        )
+    }
+}
+
+private struct CrashRecoveryStatusBanner: View {
+    let state: CrashRecoveryStatusBannerState
+    let onOpenSettings: (() -> Void)?
+    let onRetry: () -> Void
+    let onDismiss: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "arrow.trianglehead.2.clockwise.rotate.90.circle.fill")
+                .foregroundColor(.orange)
+                .font(.retraceTitle3)
+
+            Text(state.messageText)
+                .font(.retraceCaption)
+                .foregroundColor(.primary)
+                .fixedSize(horizontal: false, vertical: true)
+                .multilineTextAlignment(.leading)
+
+            Spacer(minLength: 12)
+
+            HStack(spacing: 10) {
+                if let onOpenSettings {
+                    Button("Open Settings", action: onOpenSettings)
+                        .font(.retraceCaption2Medium)
+                        .foregroundColor(.white.opacity(0.92))
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background(Color.white.opacity(0.08))
+                        .cornerRadius(6)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 6)
+                                .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                        )
+                        .buttonStyle(.plain)
+                }
+
+                Button("Retry", action: onRetry)
+                    .font(.retraceCaption2Medium)
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(Color.orange.opacity(0.9))
+                    .cornerRadius(6)
+                    .buttonStyle(.plain)
+            }
+
+            Button(action: onDismiss) {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.retraceHeadline)
+                    .foregroundColor(.secondary)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 9)
+        .background(Color.orange.opacity(0.12))
+        .cornerRadius(8)
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.orange.opacity(0.3), lineWidth: 1)
+        )
+    }
+}
+
+private struct WALFailureCrashBanner: View {
+    let report: WALFailureCrashReportSummary
+    let onSubmitBugReport: () -> Void
+    let onDetails: () -> Void
+    let onDismiss: () -> Void
+
+    private var messageText: String {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return "Retrace couldn't complete recovery at \(formatter.string(from: report.capturedAt)). New recordings may fail until storage is repaired."
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "externaldrive.badge.exclamationmark")
+                .foregroundColor(.orange)
+                .font(.retraceTitle3)
+
+            Text(messageText)
+                .font(.retraceCaption)
+                .foregroundColor(.primary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .multilineTextAlignment(.leading)
+
+            Spacer(minLength: 12)
+
+            HStack(spacing: 10) {
+                Button("Details", action: onDetails)
+                    .font(.retraceCaption2Medium)
+                    .foregroundColor(.white.opacity(0.92))
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(Color.white.opacity(0.08))
+                    .cornerRadius(6)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6)
+                            .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                    )
+                    .buttonStyle(.plain)
+
+                Button("Submit Bug Report", action: onSubmitBugReport)
+                    .font(.retraceCaption2Medium)
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(Color.orange.opacity(0.9))
+                    .cornerRadius(6)
+                    .buttonStyle(.plain)
+            }
+
+            Button(action: onDismiss) {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.retraceHeadline)
+                    .foregroundColor(.secondary)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 9)
+        .background(
+            Color(red: 0.42, green: 0.18, blue: 0.11).opacity(0.22)
+        )
+        .cornerRadius(8)
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.orange.opacity(0.3), lineWidth: 1)
+        )
+    }
+}
+
+private struct StorageHealthBanner: View {
+    let state: StorageHealthBannerState
+    let onDismiss: () -> Void
+
+    private var accentColor: Color {
+        state.shouldStop ? .red : .orange
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: state.shouldStop ? "externaldrive.fill.badge.xmark" : "externaldrive.badge.exclamationmark")
+                .foregroundColor(accentColor)
+                .font(.retraceTitle3)
+
+            Text(state.messageText)
+                .font(.retraceCaption)
+                .foregroundColor(.primary)
+                .fixedSize(horizontal: false, vertical: true)
+                .multilineTextAlignment(.leading)
+
+            Spacer(minLength: 12)
+
+            Button(action: onDismiss) {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.retraceHeadline)
+                    .foregroundColor(.secondary)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 9)
+        .background(
+            (state.shouldStop ? Color.red : Color.orange).opacity(0.16)
+        )
+        .cornerRadius(8)
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(accentColor.opacity(0.28), lineWidth: 1)
+        )
+    }
+}
 
 // MARK: - Scroll Affordance
 
@@ -1291,6 +2773,7 @@ private struct LogoTriangle: Shape {
 /// Extracted to its own view so animation state changes don't cause DashboardView to re-render
 private struct MonitorButton: View {
     let isProcessing: Bool
+    let tooltipText: String
 
     @State private var heartbeatScale: CGFloat = 1.0
     @State private var isHovering = false
@@ -1303,7 +2786,7 @@ private struct MonitorButton: View {
                 Image(systemName: "waveform.path.ecg")
                     .font(.retraceCalloutMedium)
                     .foregroundColor(isProcessing ? .green : .retraceSecondary)
-                    .scaleEffect(isHovering ? 1.15 : (isProcessing ? heartbeatScale : 1.0))
+                    .scaleEffect(isProcessing ? heartbeatScale : 1.0)
             }
             .padding(10)
             .background(Color.white.opacity(0.05))
@@ -1315,6 +2798,9 @@ private struct MonitorButton: View {
         }
         .buttonStyle(.plain)
         .contentShape(Rectangle())
+        .scaleEffect(isHovering ? 1.03 : 1.0)
+        .animation(.easeOut(duration: 0.12), value: isHovering)
+        .compactTopTooltip(tooltipText, isVisible: $isHovering)
         .onHover { hovering in
             isHovering = hovering
             if hovering {
@@ -1331,31 +2817,76 @@ private struct MonitorButton: View {
                     withAnimation(.easeOut(duration: 0.1)) {
                         heartbeatScale = 1.25
                     }
-                    try? await Task.sleep(nanoseconds: 100_000_000)
+                    try? await Task.sleep(for: .nanoseconds(Int64(100_000_000)), clock: .continuous)
 
                     // Contract back
                     withAnimation(.easeIn(duration: 0.15)) {
                         heartbeatScale = 1.05
                     }
-                    try? await Task.sleep(nanoseconds: 150_000_000)
+                    try? await Task.sleep(for: .nanoseconds(Int64(150_000_000)), clock: .continuous)
 
                     // Beat 2: smaller secondary beat
                     withAnimation(.easeOut(duration: 0.08)) {
                         heartbeatScale = 1.15
                     }
-                    try? await Task.sleep(nanoseconds: 80_000_000)
+                    try? await Task.sleep(for: .nanoseconds(Int64(80_000_000)), clock: .continuous)
 
                     // Contract and rest
                     withAnimation(.easeIn(duration: 0.2)) {
                         heartbeatScale = 1.05
                     }
-                    try? await Task.sleep(nanoseconds: 600_000_000)
+                    try? await Task.sleep(for: .nanoseconds(Int64(600_000_000)), clock: .continuous)
                 } else {
                     heartbeatScale = 1.0
-                    try? await Task.sleep(nanoseconds: 500_000_000)
+                    try? await Task.sleep(for: .nanoseconds(Int64(500_000_000)), clock: .continuous)
                 }
             }
         }
+    }
+}
+
+// MARK: - Compact Tooltip
+
+private struct CompactTopTooltip: ViewModifier {
+    let text: String
+    @Binding var isVisible: Bool
+
+    private var isMultiline: Bool {
+        text.contains("\n")
+    }
+
+    private var verticalOffset: CGFloat {
+        isMultiline ? -34 : -26
+    }
+
+    func body(content: Content) -> some View {
+        content
+            .overlay(alignment: .top) {
+                if isVisible {
+                    Text(text)
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.95))
+                        .lineLimit(isMultiline ? 2 : 1)
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: true, vertical: true)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, isMultiline ? 5 : 3)
+                        .background(
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .fill(Color.black.opacity(0.82))
+                        )
+                        .offset(y: verticalOffset)
+                        .transition(.opacity.combined(with: .offset(y: 3)))
+                        .allowsHitTesting(false)
+                }
+            }
+            .animation(.easeOut(duration: 0.12), value: isVisible)
+    }
+}
+
+private extension View {
+    func compactTopTooltip(_ text: String, isVisible: Binding<Bool>) -> some View {
+        modifier(CompactTopTooltip(text: text, isVisible: isVisible))
     }
 }
 
@@ -1367,6 +2898,7 @@ struct DashboardView_Previews: PreviewProvider {
         let milestoneManager = MilestoneCelebrationManager(coordinator: coordinator)
 
         DashboardView(
+            viewModel: DashboardViewModel(coordinator: coordinator),
             coordinator: coordinator,
             launchOnLoginReminderManager: launchOnLoginManager,
             milestoneCelebrationManager: milestoneManager

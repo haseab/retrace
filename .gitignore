@@ -1,3 +1,6 @@
+# Wrangler
+.wrangler/
+
 # Dependencies
 .build
 node_modules/
@@ -50,6 +53,8 @@ coverage/
 # Temporary files
 tmp/
 temp/
+UI/BuildInfo.swift.bak
+UI/BuildMetadata.generated.swift
 
 # Downloaded AI models (runtime downloads)
 # Models are downloaded on first launch, not bundled in repo
@@ -65,6 +70,7 @@ temp/
 !README.md
 !AGENTS.md
 !CONTRIBUTING.md
+!AI_ISSUE_TEMPLATE.md
 !*/README.md
 !*/AGENTS.md
 
@@ -107,6 +113,10 @@ fix_triangles.py
 # DMG creation script (contains credentials)
 scripts/create-dmg.sh
 
+# Maintainer-only release automation (contains machine-specific paths)
+scripts/release.sh
+
 # Release artifacts
 releases/
 .build_codex_check/
+local/

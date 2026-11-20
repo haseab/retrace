@@ -71,72 +71,16 @@ public struct Segment: Codable, Sendable, Equatable, Identifiable {
     }
 }
 
-// MARK: - Encoding Status
+public extension Sequence where Element == SegmentID {
+    func uniquePreservingOrder() -> [SegmentID] {
+        var seen = Set<Int64>()
+        var ordered: [SegmentID] = []
 
-/// Status of frame encoding in async pipeline
-public enum EncodingStatus: String, Codable, Sendable {
-    /// Frame captured, awaiting encoding
-    case pending = "pending"
+        for segmentID in self where seen.insert(segmentID.value).inserted {
+            ordered.append(segmentID)
+        }
 
-    /// Currently being encoded
-    case encoding = "encoding"
-
-    /// Successfully encoded to video segment
-    case success = "success"
-
-    /// Encoding failed (see error message)
-    case failed = "failed"
-
-    /// Encoding job was cancelled
-    case cancelled = "cancelled"
-}
-
-// MARK: - Encoding Job
-
-/// Represents a frame waiting to be encoded asynchronously
-public struct EncodingJob: Codable, Sendable, Equatable {
-    /// Database row ID
-    public let id: Int64?
-
-    /// Frame to encode
-    public let frameID: FrameID
-
-    /// Priority (higher = process first)
-    public let priority: Int
-
-    /// Number of retry attempts
-    public let retryCount: Int
-
-    /// Error message if failed
-    public let errorMessage: String?
-
-    /// Current status
-    public let status: EncodingStatus
-
-    /// When the job was created
-    public let createdAt: Date
-
-    /// When the job was last updated
-    public let updatedAt: Date
-
-    public init(
-        id: Int64? = nil,
-        frameID: FrameID,
-        priority: Int = 0,
-        retryCount: Int = 0,
-        errorMessage: String? = nil,
-        status: EncodingStatus = .pending,
-        createdAt: Date = Date(),
-        updatedAt: Date = Date()
-    ) {
-        self.id = id
-        self.frameID = frameID
-        self.priority = priority
-        self.retryCount = retryCount
-        self.errorMessage = errorMessage
-        self.status = status
-        self.createdAt = createdAt
-        self.updatedAt = updatedAt
+        return ordered
     }
 }
 

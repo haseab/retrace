@@ -5,25 +5,58 @@ import Shared
 
 /// Converts CapturedFrame raw BGRA bytes into CVPixelBuffer.
 enum FrameConverter {
-    private static var hasLoggedMismatch = false
     static func createPixelBuffer(from frame: CapturedFrame) throws -> CVPixelBuffer {
-        var pixelBuffer: CVPixelBuffer?
-        let attrs: [String: Any] = [
-            kCVPixelBufferCGImageCompatibilityKey as String: true,
-            kCVPixelBufferCGBitmapContextCompatibilityKey as String: true,
-            kCVPixelBufferBytesPerRowAlignmentKey as String: frame.bytesPerRow
-        ]
+        try createPixelBuffer(from: frame, pool: nil)
+    }
 
-        let status = CVPixelBufferCreate(
-            kCFAllocatorDefault,
-            frame.width,
-            frame.height,
-            kCVPixelFormatType_32BGRA,
-            attrs as CFDictionary,
-            &pixelBuffer
-        )
-        guard status == kCVReturnSuccess, let buffer = pixelBuffer else {
-            throw StorageModuleError.encodingFailed(underlying: "CVPixelBufferCreate failed: \(status)")
+    static func createPixelBuffer(
+        from frame: CapturedFrame,
+        pool: CVPixelBufferPool?
+    ) throws -> CVPixelBuffer {
+        guard frame.width > 0, frame.height > 0 else {
+            throw StorageModuleError.encodingFailed(underlying: "Invalid frame dimensions: \(frame.width)x\(frame.height)")
+        }
+
+        let (pixelDataPerRow, rowOverflow) = frame.width.multipliedReportingOverflow(by: 4)
+        guard !rowOverflow else {
+            throw StorageModuleError.encodingFailed(underlying: "Frame width overflow when computing BGRA bytesPerRow")
+        }
+
+        guard frame.bytesPerRow >= pixelDataPerRow else {
+            throw StorageModuleError.encodingFailed(
+                underlying: "Invalid source stride: \(frame.bytesPerRow) < required \(pixelDataPerRow)"
+            )
+        }
+
+        let (requiredSourceBytes, sourceOverflow) = frame.bytesPerRow.multipliedReportingOverflow(by: frame.height)
+        guard !sourceOverflow, frame.imageData.count >= requiredSourceBytes else {
+            throw StorageModuleError.encodingFailed(
+                underlying: "Frame data too small: \(frame.imageData.count) < required \(requiredSourceBytes)"
+            )
+        }
+
+        let buffer: CVPixelBuffer
+        if let pool, let pooledBuffer = try makePixelBuffer(from: pool) {
+            buffer = pooledBuffer
+        } else {
+            var pixelBuffer: CVPixelBuffer?
+            let attrs: [String: Any] = [
+                kCVPixelBufferCGImageCompatibilityKey as String: true,
+                kCVPixelBufferCGBitmapContextCompatibilityKey as String: true
+            ]
+
+            let status = CVPixelBufferCreate(
+                kCFAllocatorDefault,
+                frame.width,
+                frame.height,
+                kCVPixelFormatType_32BGRA,
+                attrs as CFDictionary,
+                &pixelBuffer
+            )
+            guard status == kCVReturnSuccess, let createdBuffer = pixelBuffer else {
+                throw StorageModuleError.encodingFailed(underlying: "CVPixelBufferCreate failed: \(status)")
+            }
+            buffer = createdBuffer
         }
 
         CVPixelBufferLockBaseAddress(buffer, [])
@@ -34,44 +67,67 @@ enum FrameConverter {
         }
 
         // Get the actual bytesPerRow of the CVPixelBuffer (may differ from frame.bytesPerRow due to alignment)
+        guard !CVPixelBufferIsPlanar(buffer) else {
+            throw StorageModuleError.encodingFailed(underlying: "Unexpected planar pixel buffer for BGRA frame")
+        }
+
         let destBytesPerRow = CVPixelBufferGetBytesPerRow(buffer)
         let srcBytesPerRow = frame.bytesPerRow
 
-        // The actual pixel data per row is width * 4 bytes (BGRA)
-        // bytesPerRow may include padding for alignment
-        let pixelDataPerRow = frame.width * 4
-
-        // Log frame info once for debugging
-        if !hasLoggedMismatch {
-            hasLoggedMismatch = true
-            let hasMismatch = srcBytesPerRow != pixelDataPerRow || destBytesPerRow != pixelDataPerRow
-            Log.info("[FrameConverter] First frame: src=\(srcBytesPerRow), dest=\(destBytesPerRow), pixelData=\(pixelDataPerRow), width=\(frame.width), height=\(frame.height), dataSize=\(frame.imageData.count), mismatch=\(hasMismatch)", category: .storage)
+        guard destBytesPerRow >= pixelDataPerRow else {
+            throw StorageModuleError.encodingFailed(
+                underlying: "Invalid destination stride: \(destBytesPerRow) < required \(pixelDataPerRow)"
+            )
         }
 
-        frame.imageData.withUnsafeBytes { srcPtr in
-            guard let srcBase = srcPtr.baseAddress else { return }
-
-            // Copy row by row to handle bytesPerRow mismatch
-            // Always copy only the actual pixel data (width * 4), not the padding
-            // Fast path only when ALL strides match AND equal actual pixel width
-            let canUseFastPath = srcBytesPerRow == destBytesPerRow &&
-                                 srcBytesPerRow == pixelDataPerRow &&
-                                 frame.imageData.count == pixelDataPerRow * frame.height
-
-            if canUseFastPath {
-                // Fast path: no padding anywhere, single memcpy
-                memcpy(baseAddress, srcBase, frame.imageData.count)
-            } else {
-                // Slow path: copy row by row, reading only actual pixel data
-                for row in 0..<frame.height {
-                    let srcOffset = row * srcBytesPerRow
-                    let destOffset = row * destBytesPerRow
-                    guard srcOffset + pixelDataPerRow <= frame.imageData.count else { break }
-                    memcpy(baseAddress + destOffset, srcBase + srcOffset, pixelDataPerRow)
+        let (requiredDestBytes, destOverflow) = destBytesPerRow.multipliedReportingOverflow(by: frame.height)
+        if !destOverflow {
+            let destCapacity = CVPixelBufferGetDataSize(buffer)
+            if destCapacity > 0 {
+                guard destCapacity >= requiredDestBytes else {
+                    throw StorageModuleError.encodingFailed(
+                        underlying: "Destination buffer too small: \(destCapacity) < required \(requiredDestBytes)"
+                    )
                 }
             }
         }
 
+        try frame.imageData.withUnsafeBytes { srcPtr in
+            guard let srcBase = srcPtr.baseAddress else {
+                throw StorageModuleError.encodingFailed(underlying: "Frame data base address is nil")
+            }
+            // Copy row-by-row to avoid stride/padding assumptions.
+            for row in 0..<frame.height {
+                let srcOffset = row * srcBytesPerRow
+                let destOffset = row * destBytesPerRow
+
+                guard srcOffset + pixelDataPerRow <= frame.imageData.count else {
+                    throw StorageModuleError.encodingFailed(
+                        underlying: "Source row \(row) out of bounds during pixel copy"
+                    )
+                }
+
+                memcpy(
+                    baseAddress.advanced(by: destOffset),
+                    srcBase.advanced(by: srcOffset),
+                    pixelDataPerRow
+                )
+            }
+        }
+
         return buffer
+    }
+
+    private static func makePixelBuffer(from pool: CVPixelBufferPool) throws -> CVPixelBuffer? {
+        var pixelBuffer: CVPixelBuffer?
+        let status = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pixelBuffer)
+        switch status {
+        case kCVReturnSuccess:
+            return pixelBuffer
+        case kCVReturnWouldExceedAllocationThreshold:
+            return nil
+        default:
+            throw StorageModuleError.encodingFailed(underlying: "CVPixelBufferPoolCreatePixelBuffer failed: \(status)")
+        }
     }
 }

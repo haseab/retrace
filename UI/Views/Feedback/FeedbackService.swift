@@ -1,7 +1,5 @@
 import Foundation
-import AppKit
 import Shared
-import OSLog
 
 // MARK: - Feedback Stats Provider
 
@@ -13,310 +11,29 @@ public protocol FeedbackStatsProvider {
 
 // MARK: - Feedback Service
 
-/// Collects diagnostic information and submits feedback
-public final class FeedbackService {
+/// Collects diagnostic information and submits feedback.
+///
+/// **Why this exists:** Retrace has no pre-existing telemetry, analytics, or crash reporting SDK.
+/// This service is the *only* mechanism for understanding user-reported issues. All data is
+/// collected on-demand when the user explicitly submits feedback — nothing is collected in the
+/// background or sent automatically.
+///
+/// **Privacy preserved:** Process info reports category counts only, never app names.
+/// Memory-spike diagnostics add only a small allowlist of Retrace/media-system helper process
+/// names (for example `VTDecoderXPCService`) because those are directly relevant to decoder leaks.
+/// No file paths, no user data. Settings use a strict whitelist (see `collectSanitizedSettingsSnapshot`).
+public final class FeedbackService: @unchecked Sendable {
 
     public static let shared = FeedbackService()
+    static let diagnosticsLogLimit = 1_000
+    static let submissionDiagnosticsLogLimit = 10_000
+    static let groupedFeedbackLogLimitPerFamily = 2_000
+    static let feedbackEndpoint = URL(string: "https://retrace.to/api/feedback")!
 
     private init() {}
 
-    // MARK: - Diagnostic Collection
-
-    /// Collect current diagnostic information (with placeholder database stats)
-    public func collectDiagnostics() -> DiagnosticInfo {
-        let logs = collectRecentLogs()
-        let errors = logs.filter { $0.contains("[ERROR]") || $0.contains("[FAULT]") }
-
-        return DiagnosticInfo(
-            appVersion: appVersion,
-            buildNumber: buildNumber,
-            macOSVersion: macOSVersion,
-            deviceModel: deviceModel,
-            totalDiskSpace: totalDiskSpace,
-            freeDiskSpace: freeDiskSpace,
-            databaseStats: collectDatabaseStats(),
-            recentErrors: errors,
-            recentLogs: logs
-        )
-    }
-
-    /// Collect current diagnostic information with real database stats from provider
-    public func collectDiagnostics(with stats: DiagnosticInfo.DatabaseStats) -> DiagnosticInfo {
-        // Use file-based logs for submission (more complete, includes all logs)
-        let logs = Log.getRecentLogs(maxCount: 500)
-        let errors = Log.getRecentErrors(maxCount: 50)
-
-        return DiagnosticInfo(
-            appVersion: appVersion,
-            buildNumber: buildNumber,
-            macOSVersion: macOSVersion,
-            deviceModel: deviceModel,
-            totalDiskSpace: totalDiskSpace,
-            freeDiskSpace: freeDiskSpace,
-            databaseStats: stats,
-            recentErrors: errors,
-            recentLogs: logs
-        )
-    }
-
-    /// Collect diagnostics quickly for preview using in-memory log buffer (instant)
-    /// This avoids the slow OSLogStore query entirely
-    public func collectDiagnosticsQuick(with stats: DiagnosticInfo.DatabaseStats) -> DiagnosticInfo {
-        // Use the fast file-based log buffer instead of OSLogStore
-        let logs = Log.getRecentLogs(maxCount: 100)
-        let errors = Log.getRecentErrors(maxCount: 20)
-
-        return DiagnosticInfo(
-            appVersion: appVersion,
-            buildNumber: buildNumber,
-            macOSVersion: macOSVersion,
-            deviceModel: deviceModel,
-            totalDiskSpace: totalDiskSpace,
-            freeDiskSpace: freeDiskSpace,
-            databaseStats: stats,
-            recentErrors: errors,
-            recentLogs: logs
-        )
-    }
-
-    /// Collect diagnostics without any logs (instant, for immediate display)
-    /// Database stats should be passed in, logs will show as empty
-    public func collectDiagnosticsNoLogs(with stats: DiagnosticInfo.DatabaseStats) -> DiagnosticInfo {
-        return DiagnosticInfo(
-            appVersion: appVersion,
-            buildNumber: buildNumber,
-            macOSVersion: macOSVersion,
-            deviceModel: deviceModel,
-            totalDiskSpace: totalDiskSpace,
-            freeDiskSpace: freeDiskSpace,
-            databaseStats: stats,
-            recentErrors: [],
-            recentLogs: []
-        )
-    }
-
-    // MARK: - App Info
-
-    /// Get the app bundle - handles both running as .app bundle and debug mode
-    private var appBundle: Bundle {
-        // First try Bundle.main
-        if let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String, !version.isEmpty {
-            return Bundle.main
-        }
-
-        // If running in debug mode, try to find the app bundle by identifier
-        if let bundle = Bundle(identifier: "io.retrace.app") {
-            return bundle
-        }
-
-        // Fallback to main bundle
-        return Bundle.main
-    }
-
-    private var appVersion: String {
-        // First try bundle lookup
-        if let version = appBundle.infoDictionary?["CFBundleShortVersionString"] as? String, !version.isEmpty {
-            return version
-        }
-        // Fallback to hardcoded version for debug builds
-        return "0.5.0"
-    }
-
-    private var buildNumber: String {
-        // First try bundle lookup
-        if let build = appBundle.infoDictionary?["CFBundleVersion"] as? String, !build.isEmpty {
-            return build
-        }
-        // Fallback to hardcoded build for debug builds
-        return "dev"
-    }
-
-    // MARK: - System Info
-
-    private var macOSVersion: String {
-        let version = ProcessInfo.processInfo.operatingSystemVersion
-        return "\(version.majorVersion).\(version.minorVersion).\(version.patchVersion)"
-    }
-
-    private var deviceModel: String {
-        var size = 0
-        sysctlbyname("hw.model", nil, &size, nil, 0)
-        var model = [CChar](repeating: 0, count: size)
-        sysctlbyname("hw.model", &model, &size, nil, 0)
-        return String(cString: model)
-    }
-
-    // MARK: - Disk Space
-
-    private var totalDiskSpace: String {
-        guard let attrs = try? FileManager.default.attributesOfFileSystem(forPath: NSHomeDirectory()),
-              let total = attrs[.systemSize] as? Int64 else {
-            return "Unknown"
-        }
-        return ByteCountFormatter.string(fromByteCount: total, countStyle: .file)
-    }
-
-    private var freeDiskSpace: String {
-        guard let attrs = try? FileManager.default.attributesOfFileSystem(forPath: NSHomeDirectory()),
-              let free = attrs[.systemFreeSize] as? Int64 else {
-            return "Unknown"
-        }
-        return ByteCountFormatter.string(fromByteCount: free, countStyle: .file)
-    }
-
-    // MARK: - Database Stats
-
-    private func collectDatabaseStats() -> DiagnosticInfo.DatabaseStats {
-        // Get database file size
-        let dbPath = NSString(string: AppPaths.databasePath).expandingTildeInPath
-        let dbSize: Double
-        if let attrs = try? FileManager.default.attributesOfItem(atPath: dbPath),
-           let size = attrs[.size] as? Int64 {
-            dbSize = Double(size) / (1024 * 1024) // MB
-        } else {
-            dbSize = 0
-        }
-
-        // For now, return placeholder counts
-        // In production, query actual counts from DatabaseManager
-        return DiagnosticInfo.DatabaseStats(
-            sessionCount: 0,
-            frameCount: 0,
-            segmentCount: 0,
-            databaseSizeMB: dbSize
-        )
-    }
-
-    // MARK: - Log Collection
-
-    /// Collect recent logs using OSLogStore
-    /// - Parameters:
-    ///   - minutes: Time window to fetch logs from (default 60 minutes)
-    ///   - maxEntries: Maximum number of log entries to return (default 200)
-    /// - Returns: Array of formatted log strings
-    private func collectRecentLogs(minutes: Int = 60, maxEntries: Int = 200) -> [String] {
-        guard #available(macOS 12.0, *) else {
-            return ["Log collection requires macOS 12.0+"]
-        }
-
-        do {
-            let store = try OSLogStore(scope: .currentProcessIdentifier)
-            let startTime = Date().addingTimeInterval(-Double(minutes * 60))
-            let position = store.position(date: startTime)
-
-            let entries = try store.getEntries(at: position)
-                .compactMap { $0 as? OSLogEntryLog }
-                .filter { $0.subsystem == "io.retrace.app" }
-                .suffix(maxEntries)
-
-            return entries.map { entry in
-                let level = logLevelString(entry.level)
-                return "[\(Log.timestamp(from: entry.date))] [\(level)] [\(entry.category)] \(entry.composedMessage)"
-            }
-        } catch {
-            return ["Failed to collect logs: \(error.localizedDescription)"]
-        }
-    }
-
-    /// Convert OSLogEntryLog.Level to readable string
-    @available(macOS 12.0, *)
-    private func logLevelString(_ level: OSLogEntryLog.Level) -> String {
-        switch level {
-        case .debug: return "DEBUG"
-        case .info: return "INFO"
-        case .notice: return "NOTICE"
-        case .error: return "ERROR"
-        case .fault: return "FAULT"
-        default: return "UNKNOWN"
-        }
-    }
-
-    // MARK: - Submission
-
-    /// Submit feedback to the backend
-    /// - Parameter submission: The feedback to submit
-    /// - Returns: True if successful
-    public func submitFeedback(_ submission: FeedbackSubmission) async throws -> Bool {
-        // TODO: Replace with your actual feedback endpoint
-        let endpoint = URL(string: "https://retrace.to/api/feedback")!
-
-        Log.info("[FeedbackService] Submitting feedback to \(endpoint.absoluteString)", category: .app)
-        Log.debug("[FeedbackService] Type: \(submission.type), Email: \(submission.email ?? "none"), HasImage: \(submission.screenshotData != nil)", category: .app)
-
-        var request = URLRequest(url: endpoint)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        request.httpBody = try encoder.encode(submission)
-
-        do {
-            let (data, response) = try await URLSession.shared.data(for: request)
-            guard let httpResponse = response as? HTTPURLResponse else {
-                Log.error("[FeedbackService] Invalid response type", category: .app)
-                throw FeedbackError.submissionFailed
-            }
-
-            Log.info("[FeedbackService] Response status: \(httpResponse.statusCode)", category: .app)
-
-            if !(200...299).contains(httpResponse.statusCode) {
-                let responseBody = String(data: data, encoding: .utf8) ?? "no body"
-                Log.error("[FeedbackService] Submission failed with status \(httpResponse.statusCode): \(responseBody)", category: .app)
-                throw FeedbackError.submissionFailed
-            }
-
-            Log.info("[FeedbackService] Feedback submitted successfully", category: .app)
-            return true
-        } catch let urlError as URLError {
-            Log.error("[FeedbackService] Network error (code: \(urlError.code.rawValue))", category: .app, error: urlError)
-            throw FeedbackError.networkError(urlError.localizedDescription)
-        } catch {
-            Log.error("[FeedbackService] Submission error", category: .app, error: error)
-            throw error
-        }
-    }
-
-    // MARK: - Screenshot
-
-    /// Capture current screen (main display)
-    public func captureScreenshot() -> Data? {
-        guard let screen = NSScreen.main else { return nil }
-
-        let rect = screen.frame
-        guard let image = CGWindowListCreateImage(
-            rect,
-            .optionOnScreenOnly,
-            kCGNullWindowID,
-            .bestResolution
-        ) else { return nil }
-
-        let nsImage = NSImage(cgImage: image, size: rect.size)
-        guard let tiffData = nsImage.tiffRepresentation,
-              let bitmap = NSBitmapImageRep(data: tiffData),
-              let pngData = bitmap.representation(using: .png, properties: [:]) else {
-            return nil
-        }
-
-        return pngData
-    }
-
-    // MARK: - Export
-
-    /// Export diagnostics as a shareable text file
-    public func exportDiagnostics() -> URL? {
-        let diagnostics = collectDiagnostics()
-        let content = diagnostics.formattedText()
-
-        let fileName = "retrace-diagnostics-\(Log.timestamp()).txt"
-        let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
-
-        do {
-            try content.write(to: tempURL, atomically: true, encoding: .utf8)
-            return tempURL
-        } catch {
-            return nil
-        }
+    static func submissionRawLogBudget(memorySummaryCount: Int) -> Int {
+        max(0, submissionDiagnosticsLogLimit - max(0, memorySummaryCount))
     }
 }
 

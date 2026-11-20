@@ -1,18 +1,45 @@
 import Foundation
-import SQLite3
+import SQLCipher
 import Shared
 
 // MARK: - Daily Metrics Queries
 
-/// SQL queries for daily_metrics table
-/// Tracks engagement events (timeline opens, searches, text copies) as individual rows
+/// SQL queries for daily_metrics table.
+/// Tracks engagement events (timeline opens, searches, text copies) as individual rows.
+/// Privacy boundary: this table is local, on-device user analytics for Retrace features.
+/// It is not a third-party/developer analytics pipeline; data only leaves the device when
+/// the user explicitly exports/shares diagnostics.
 /// Owner: DATABASE agent
 public enum DailyMetricsQueries {
+
+    public struct RecentEvent: Sendable, Equatable {
+        public let metricType: MetricType
+        public let timestamp: Date
+        public let metadata: String?
+
+        public init(
+            metricType: MetricType,
+            timestamp: Date,
+            metadata: String?
+        ) {
+            self.metricType = metricType
+            self.timestamp = timestamp
+            self.metadata = metadata
+        }
+    }
 
     // MARK: - Metric Types
 
     /// Standard metric type identifiers
-    public enum MetricType: String {
+    public enum MetricType: String, Sendable {
+        // Count-only OCR processing aggregates; geometry and recognized text are never included.
+        // metadata: {frames, failures, layoutRegions, fallbackFrames, processingMilliseconds}
+        // metadata: JSON {action: toggle|switch|pin|unpin, enabled: Bool?, outcome: String?}
+        case multiDisplayAction = "multi_display_action"
+        case windowOCR = "window_ocr"
+
+        // metadata: JSON {phase: processed, frames: Int, unavailable: Int}; batched once per minute and stop; no captured text or URLs.
+        case accessibilityCorrection = "accessibility_correction"
         case timelineOpens = "timeline_opens"
         case searches = "searches"
         case textCopies = "text_copies"
@@ -22,16 +49,106 @@ public enum DailyMetricsQueries {
         case imageSaves = "image_saves"
         case deeplinkCopies = "deeplink_copies"
         case timelineSessionDuration = "timeline_session_duration"  // metadata: duration in ms
-        case filteredSearchQuery = "filtered_search_query"  // metadata: JSON {query, filters}
-        case timelineFilterQuery = "timeline_filter_query"  // metadata: JSON {bundleID, windowName, browserUrl, startDate, endDate}
+        case filteredSearchQuery = "filtered_search_query"  // metadata: JSON {queryLength, filterCount}
+        case timelineFilterQuery = "timeline_filter_query"  // metadata: JSON {hasAppFilter, hasWindowFilter, hasURLFilter, hasStartDate, hasEndDate}
         case scrubDistance = "scrub_distance"  // metadata: distance in pixels per session
         case searchDialogOpens = "search_dialog_opens"
+        case timelineAutoDismissed = "timeline_auto_dismissed"  // metadata: JSON {trigger: "app_activation", activatedBundleID?}
+        // metadata: JSON {source: button|keyboard, outcome: started|succeeded|no_text|failed|protected, live: Bool}. No recognized text.
+        case timelineTextScan = "timeline_text_scan"
         case ocrReprocessRequests = "ocr_reprocess_requests"
         case arrowKeyNavigation = "arrow_key_navigation"  // metadata: "left" or "right"
         case shiftDragZoomRegion = "shift_drag_zoom_region"  // metadata: JSON {region, screenSize}
         case shiftDragTextCopy = "shift_drag_text_copy"  // metadata: copied text
+        case stillFrameDragOCR = "still_frame_drag_ocr"  // metadata: JSON {gesture, frameID}
         case appLaunches = "app_launches"
+        case launchSurfaceReveal = "launch_surface_reveal"  // metadata: JSON {source, action, appWasHidden, dashboardWasVisible, isInitialized}
         case keyboardShortcut = "keyboard_shortcut"  // metadata: shortcut identifier (e.g. "cmd+c", "cmd+f")
+        case dateSearchSubmitted = "date_search_submitted"
+        case dateSearchOutcome = "date_search_outcome"
+        // Timeline tagging/comments/playback metrics
+        case segmentHide = "segment_hide"
+        // metadata: JSON {source, action: hide|delete, phase: prepared|submitted|succeeded|failed,
+        // segmentCount, frameCount, rangeStartMs, rangeEndMs}. No titles or URLs.
+        case dashboardUsageAction = "dashboard_usage_action"
+        case segmentUnhide = "segment_unhide"
+        case tagSubmenuOpen = "tag_submenu_open"
+        case tagToggleOnBlock = "tag_toggle_on_block"
+        case tagCreateAndAddOnBlock = "tag_create_and_add_on_block"
+        case commentSubmenuOpen = "comment_submenu_open"
+        case quickCommentOpened = "quick_comment_opened"  // metadata: JSON {source}
+        case quickCommentClosed = "quick_comment_closed"  // metadata: JSON {source}
+        case quickCommentContextPreviewToggle = "quick_comment_context_preview_toggle"  // metadata: JSON {source, isCollapsed}
+        case commentAdded = "comment_added"
+        case commentDeletedFromBlock = "comment_deleted_from_block"
+        case commentAttachmentPickerOpened = "comment_attachment_picker_opened"
+        case commentAttachmentOpened = "comment_attachment_opened"
+        case allCommentsOpened = "all_comments_opened"
+        case playbackToggled = "playback_toggled"
+        case playbackSpeedChanged = "playback_speed_changed"
+
+        // Recording/pause/system-monitor/settings metrics
+        case recordingStartedFromMenu = "recording_started_from_menu"
+        case recordingPauseSelected = "recording_pause_selected"
+        case recordingTurnedOff = "recording_turned_off"
+        case recordingAutoResumed = "recording_auto_resumed"
+        case systemMonitorOpened = "system_monitor_opened"
+        case helpOpened = "help_opened"  // metadata: JSON {source}
+        case timelinePositionRecoveryHintAction = "timeline_position_recovery_hint_action"  // metadata: JSON {action, source, seconds?}
+        case settingsSearchOpened = "settings_search_opened"
+        case dockIconVisibilityToggle = "dock_icon_visibility_toggle"  // metadata: JSON {enabled, source}
+        case redactionRulesUpdated = "redaction_rules_updated"
+        case masterKeyFlow = "master_key_flow"  // metadata: JSON {action, source, ...}
+        case phraseLevelRedactionModeUpdated = "phrase_level_redaction_mode_updated" // metadata: JSON {mode: scramble|permanent, source}
+        case phraseLevelRedactionRulesUpdated = "phrase_level_redaction_rules_updated"
+        case phraseLevelRedactionReveal = "phrase_level_redaction_reveal"
+        case phraseLevelRedactionQueuedHover = "phrase_level_redaction_queued_hover"  // metadata: JSON {nodeID, frameID, processingStatus}
+        case privateWindowRedactionToggle = "private_window_redaction_toggle"
+        case systemMonitorSettingsOpened = "system_monitor_settings_opened"
+        case systemMonitorOpenPowerOCRCard = "system_monitor_open_power_ocr_card"
+        case systemMonitorOpenPowerOCRPriority = "system_monitor_open_power_ocr_priority"
+        case systemMonitorMemoryLogToggle = "system_monitor_memory_log_toggle"
+        case inPageURLCollectionToggle = "in_page_url_collection_toggle"
+        case mousePositionCaptureToggle = "mouse_position_capture_toggle"
+        case mouseMovementDeduplicationToggle = "mouse_movement_deduplication_toggle"
+        case mouseClickCapture = "mouse_click_capture"
+        case mouseClickCaptureToggle = "mouse_click_capture_toggle"
+        case captureIntervalUpdated = "capture_interval_updated"  // metadata: JSON {seconds, mode, source}
+        case videoQualityUpdated = "video_quality_updated"
+        // JSON {action, outcome, source, conferenceKind?}; excludes call IDs, titles and URLs.
+        // Capture outcomes are recorded on transitions, not on every frame.
+        case conferencePrivacy = "conference_privacy"
+        case inPageURLPermissionProbe = "in_page_url_permission_probe"
+        case inPageURLVerification = "in_page_url_verification"
+        case inPageURLHover = "in_page_url_hover"  // metadata: JSON {url, linkText, nodeID}
+        case inPageURLClick = "in_page_url_click"  // metadata: JSON {url, linkText, nodeID}
+        case inPageURLRightClick = "in_page_url_right_click"  // metadata: JSON {url, linkText, nodeID}
+        case inPageURLCopyLink = "in_page_url_copy_link"  // metadata: JSON {url, linkText, nodeID}
+        case browserLinkOpened = "browser_link_opened"
+        case feedbackReportExport = "feedback_report_export"  // metadata: JSON {outcome, source, feedbackType, includeLogs, includeScreenshot, exportedFileCount}
+        case watchdogCrashBannerAction = "watchdog_crash_banner_action"  // metadata: JSON {action, fileName, reportAgeSeconds}
+        case walFailureBannerAction = "wal_failure_banner_action"  // metadata: JSON {action, fileName, reportAgeSeconds}
+        // One aggregate per finalized recording segment. storedBytes includes record headers;
+        // rawBytes counts the original pixel bytes, excluding metadata sidecars and ID maps.
+        // metadata: JSON {codec, outcome, frameCount, compressedFrameCount, rawBytes, storedBytes, compressionMilliseconds}
+        case walCompression = "wal_compression"
+        case unexpectedRecordingStopAction = "unexpected_recording_stop_action"  // metadata: JSON {action, reason, ...}
+        case storageHealthBannerAction = "storage_health_banner_action"  // metadata: JSON {action, severity, availableGB, shouldStop}
+        case crashRecoveryApprovalBannerAction = "crash_recovery_approval_banner_action"  // metadata: JSON {action, status}
+        case debugWatchdogHangTriggered = "debug_watchdog_hang_triggered"
+        case debugCaptureInterruptionTriggered = "debug_capture_interruption_triggered"
+        case debugEncodingInterruptionTriggered = "debug_encoding_interruption_triggered"
+        case debugForcedTerminationTriggered = "debug_forced_termination_triggered"
+        case debugOnboardingRelaunchTriggered = "debug_onboarding_relaunch_triggered"
+        case developerSettingToggle = "developer_setting_toggle"  // metadata: JSON {source, settingKey, isEnabled}
+        case debugCrashTriggered = "debug_crash_triggered"
+        case crashAutoRestart = "crash_auto_restart"  // metadata: JSON {source}
+        case rewindCutoffDateUpdated = "rewind_cutoff_date_updated"  // metadata: JSON {cutoffTimestampMs}
+
+        // Delete actions
+        case frameDeleted = "frame_deleted"
+        case segmentDeleted = "segment_deleted"
+        case videoRewriteOutcome = "video_rewrite_outcome"
     }
 
     // MARK: - Insert
@@ -86,23 +203,20 @@ public enum DailyMetricsQueries {
         db: OpaquePointer,
         metricType: MetricType,
         from startDate: Date,
-        to endDate: Date
+        to endDate: Date,
+        preserveTimeBounds: Bool = false
     ) throws -> [(date: Date, value: Int64)] {
-        let startTimestamp = startOfDay(startDate)
-        let endTimestamp = endOfDay(endDate)
+        let startTimestamp = preserveTimeBounds ? Int64(startDate.timeIntervalSince1970 * 1000) : startOfDay(startDate)
+        let endTimestamp = preserveTimeBounds ? Int64(endDate.timeIntervalSince1970 * 1000) : endOfDay(endDate)
 
-        // Get local timezone offset in milliseconds
-        let tzOffsetMs = Int64(TimeZone.current.secondsFromGMT()) * 1000
-
-        // Group by local day by adding timezone offset before grouping
         let sql = """
             SELECT
-                ((timestamp + ?) / 86400000) * 86400000 - ? as day,
+                date(timestamp / 1000.0, 'unixepoch', 'localtime') as local_day,
                 COUNT(*) as count
             FROM daily_metrics
             WHERE metricType = ? AND timestamp >= ? AND timestamp <= ?
-            GROUP BY ((timestamp + ?) / 86400000)
-            ORDER BY day ASC
+            GROUP BY local_day
+            ORDER BY local_day ASC
             """
 
         var statement: OpaquePointer?
@@ -116,19 +230,17 @@ public enum DailyMetricsQueries {
         }
 
         let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-        sqlite3_bind_int64(statement, 1, tzOffsetMs)
-        sqlite3_bind_int64(statement, 2, tzOffsetMs)
-        sqlite3_bind_text(statement, 3, metricType.rawValue, -1, SQLITE_TRANSIENT)
-        sqlite3_bind_int64(statement, 4, startTimestamp)
-        sqlite3_bind_int64(statement, 5, endTimestamp)
-        sqlite3_bind_int64(statement, 6, tzOffsetMs)
+        sqlite3_bind_text(statement, 1, metricType.rawValue, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int64(statement, 2, startTimestamp)
+        sqlite3_bind_int64(statement, 3, endTimestamp)
 
         var results: [(date: Date, value: Int64)] = []
 
         while sqlite3_step(statement) == SQLITE_ROW {
-            let dayTimestamp = sqlite3_column_int64(statement, 0)
+            guard let date = parseLocalDay(sqlite3_column_text(statement, 0)) else {
+                continue
+            }
             let count = sqlite3_column_int64(statement, 1)
-            let date = Date(timeIntervalSince1970: Double(dayTimestamp) / 1000)
             results.append((date: date, value: count))
         }
 
@@ -173,6 +285,74 @@ public enum DailyMetricsQueries {
         return sqlite3_column_int64(statement, 0)
     }
 
+    static func getRecentEvents(
+        db: OpaquePointer,
+        limit: Int,
+        excluding excludedMetricTypes: Set<MetricType> = []
+    ) throws -> [RecentEvent] {
+        let boundedLimit = max(0, limit)
+        guard boundedLimit > 0 else { return [] }
+        let excludedMetricTypeRawValues = excludedMetricTypes
+            .map(\.rawValue)
+            .sorted()
+        let exclusionClause = excludedMetricTypeRawValues.isEmpty
+            ? ""
+            : "WHERE metricType NOT IN (\(Array(repeating: "?", count: excludedMetricTypeRawValues.count).joined(separator: ", ")))"
+
+        let sql = """
+            SELECT metricType, timestamp, metadata
+            FROM daily_metrics
+            \(exclusionClause)
+            ORDER BY timestamp DESC, id DESC
+            LIMIT ?
+            """
+
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        var bindIndex: Int32 = 1
+        for metricTypeRawValue in excludedMetricTypeRawValues {
+            sqlite3_bind_text(statement, bindIndex, metricTypeRawValue, -1, SQLITE_TRANSIENT)
+            bindIndex += 1
+        }
+
+        sqlite3_bind_int(statement, bindIndex, Int32(boundedLimit))
+
+        var results: [RecentEvent] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard let metricTypeText = sqlite3_column_text(statement, 0) else {
+                continue
+            }
+
+            let metricTypeRawValue = String(cString: metricTypeText)
+            guard let metricType = MetricType(rawValue: metricTypeRawValue) else {
+                continue
+            }
+
+            let timestampMs = sqlite3_column_int64(statement, 1)
+            let timestamp = Date(timeIntervalSince1970: Double(timestampMs) / 1000)
+            let metadata = sqlite3_column_text(statement, 2).map { String(cString: $0) }
+
+            results.append(
+                RecentEvent(
+                    metricType: metricType,
+                    timestamp: timestamp,
+                    metadata: metadata
+                )
+            )
+        }
+
+        return results.reversed()
+    }
+
     // MARK: - Helpers
 
     /// Get timestamp for start of day (midnight) in milliseconds
@@ -188,5 +368,22 @@ public enum DailyMetricsQueries {
         let startOfDay = calendar.startOfDay(for: date)
         let endOfDay = calendar.date(byAdding: .day, value: 1, to: startOfDay)!.addingTimeInterval(-0.001)
         return Int64(endOfDay.timeIntervalSince1970 * 1000)
+    }
+
+    private static func parseLocalDay(_ localDayText: UnsafePointer<UInt8>?) -> Date? {
+        guard let localDayText else { return nil }
+
+        let components = String(cString: localDayText).split(separator: "-")
+        guard components.count == 3,
+              let year = Int(components[0]),
+              let month = Int(components[1]),
+              let day = Int(components[2]) else {
+            return nil
+        }
+
+        var calendar = Calendar.current
+        calendar.timeZone = .current
+
+        return calendar.date(from: DateComponents(year: year, month: month, day: day))
     }
 }

@@ -7,8 +7,10 @@ public struct PauseReminderView: View {
 
     // MARK: - Properties
 
+    let title: String
     let onResumeCapturing: () -> Void
     let onRemindMeLater: () -> Void
+    let onEditIntervalInSettings: () -> Void
     let onDismiss: () -> Void
 
     @State private var isHovering = false
@@ -39,7 +41,7 @@ public struct PauseReminderView: View {
             // Main content
             VStack(spacing: 16) {
                 // Status text
-                Text("Retrace is paused.")
+                Text(title)
                     .font(.retraceCalloutMedium)
                     .foregroundColor(.white)
 
@@ -68,6 +70,15 @@ public struct PauseReminderView: View {
                             RoundedRectangle(cornerRadius: 8)
                                 .stroke(Color.white.opacity(0.2), lineWidth: 1)
                         )
+                }
+                .buttonStyle(.plain)
+
+                // Settings shortcut link
+                Button(action: onEditIntervalInSettings) {
+                    Text("Edit interval in Settings")
+                        .font(.retraceCaption2)
+                        .foregroundColor(.white.opacity(0.65))
+                        .underline()
                 }
                 .buttonStyle(.plain)
             }
@@ -100,9 +111,11 @@ struct PauseReminderView_Previews: PreviewProvider {
                 HStack {
                     Spacer()
                     PauseReminderView(
-                        onResumeCapturing: { print("Resume") },
-                        onRemindMeLater: { print("Remind me later") },
-                        onDismiss: { print("Dismiss") }
+                        title: "Retrace is paused.",
+                        onResumeCapturing: {},
+                        onRemindMeLater: {},
+                        onEditIntervalInSettings: {},
+                        onDismiss: {}
                     )
                     .padding()
                 }

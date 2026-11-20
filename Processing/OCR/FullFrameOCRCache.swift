@@ -6,6 +6,14 @@ import Shared
 /// This cache stores regions from full-frame OCR and allows incremental updates
 /// when only parts of the screen change.
 public actor FullFrameOCRCache {
+    public struct MemoryEstimate: Sendable {
+        public let totalBytes: Int64
+        public let regionBytes: Int64
+        public let tileGridBytes: Int64
+        public let regionCount: Int
+        public let tileCount: Int
+    }
+
 
     /// Cached OCR regions from the last processed frame
     private var cachedRegions: [TextRegion] = []
@@ -19,6 +27,9 @@ public actor FullFrameOCRCache {
 
     /// Current app bundle ID (cache invalidated on change)
     private var currentAppBundleID: String?
+    private var currentOCRRegions: [CGRect]?
+    private var currentDisplayID: UInt32 = 0
+    private var processedFrame = false
 
     /// Statistics
     private var hitCount: Int = 0
@@ -31,9 +42,17 @@ public actor FullFrameOCRCache {
     public func validateForFrame(
         width: Int,
         height: Int,
-        appBundleID: String?
+        appBundleID: String?,
+        ocrRegions: [CGRect]? = nil,
+        displayID: UInt32 = 0
     ) -> Bool {
         var invalidated = false
+        if ocrRegions != currentOCRRegions || displayID != currentDisplayID {
+            invalidateAll()
+            currentOCRRegions = ocrRegions
+            currentDisplayID = displayID
+            invalidated = true
+        }
 
         // Invalidate on resolution change
         if width != currentWidth || height != currentHeight {
@@ -53,6 +72,8 @@ public actor FullFrameOCRCache {
         return invalidated
     }
 
+    func hasProcessedFrame() -> Bool { processedFrame }
+
     /// Check if we have cached regions
     public func hasCachedRegions() -> Bool {
         return !cachedRegions.isEmpty
@@ -71,6 +92,7 @@ public actor FullFrameOCRCache {
     /// Store full-frame OCR results
     public func setFullFrameResults(regions: [TextRegion], tileGrid: [TileInfo]) {
         cachedRegions = regions
+        processedFrame = true
         cachedTileGrid = tileGrid
         hitCount += 1
     }
@@ -119,6 +141,7 @@ public actor FullFrameOCRCache {
     /// Invalidate entire cache
     public func invalidateAll() {
         cachedRegions = []
+        processedFrame = false
         cachedTileGrid = []
     }
 
@@ -133,5 +156,34 @@ public actor FullFrameOCRCache {
     public func resetStats() {
         hitCount = 0
         missCount = 0
+    }
+
+    public func memoryEstimate() -> MemoryEstimate {
+        let regionBytes = cachedRegions.reduce(into: Int64(0)) { total, region in
+            total += Self.estimatedTextRegionBytes(region)
+        }
+        let tileGridBytes = cachedTileGrid.reduce(into: Int64(0)) { total, tile in
+            total += Self.estimatedTileInfoBytes(tile)
+        }
+
+        return MemoryEstimate(
+            totalBytes: regionBytes + tileGridBytes,
+            regionBytes: regionBytes,
+            tileGridBytes: tileGridBytes,
+            regionCount: cachedRegions.count,
+            tileCount: cachedTileGrid.count
+        )
+    }
+
+    private static func estimatedTextRegionBytes(_ region: TextRegion) -> Int64 {
+        Int64(MemoryLayout<TextRegion>.stride) + estimatedStringBytes(region.text)
+    }
+
+    private static func estimatedTileInfoBytes(_ tile: TileInfo) -> Int64 {
+        Int64(MemoryLayout<TileInfo>.stride) + estimatedStringBytes(tile.cacheKey)
+    }
+
+    private static func estimatedStringBytes(_ string: String) -> Int64 {
+        Int64(MemoryLayout<String>.stride + string.utf8.count)
     }
 }

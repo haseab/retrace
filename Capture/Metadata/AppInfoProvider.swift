@@ -6,62 +6,167 @@ import Shared
 /// Provides information about the currently active application
 struct AppInfoProvider: Sendable {
 
-    // MARK: - Constants
-
-    /// Known browser bundle identifiers for URL extraction (references shared list)
-    static var browserBundleIDs: Set<String> { AppInfo.browserBundleIDs }
-
     // MARK: - App Info Retrieval
 
     /// Get information about the frontmost application
     /// - Returns: FrameMetadata with app info, or minimal metadata if unavailable
-    @MainActor
-    func getFrontmostAppInfo() -> FrameMetadata {
-        // Get frontmost app from NSWorkspace
-        guard let frontApp = NSWorkspace.shared.frontmostApplication else {
-            return FrameMetadata(displayID: CGMainDisplayID())
+    /// - Parameters:
+    ///   - includeBrowserURL: Whether browser URL extraction should run (can be expensive)
+    ///   - preferredDisplayID: Optional display ID used to select the foreground app window on that display
+    func getFrontmostAppInfo(
+        includeBrowserURL: Bool = true,
+        preferredDisplayID: CGDirectDisplayID? = nil
+    ) async -> FrameMetadata {
+        let displayID = preferredDisplayID ?? CGMainDisplayID()
+        guard let frontApp = await MainActor.run(body: {
+            NSWorkspace.shared.frontmostApplication
+        }) else {
+            return FrameMetadata(displayID: displayID)
         }
 
-        // Use bundleIdentifier if available, otherwise check if it's the current app (dev build)
+        guard !ForegroundWindowSelection.isComputerUse(bundleID: frontApp.bundleIdentifier) else {
+            return FrameMetadata(displayID: displayID)
+        }
+
         var bundleID = frontApp.bundleIdentifier
         var appName = frontApp.localizedName
 
-        // Dev build fix: if bundleID is nil but this is Retrace (same PID), use known bundle ID
         if bundleID == nil && frontApp.processIdentifier == ProcessInfo.processInfo.processIdentifier {
             bundleID = Bundle.main.bundleIdentifier ?? "io.retrace.app"
             appName = appName ?? "Retrace"
         }
 
-        // Get window title via Accessibility API
-        let windowName = getWindowTitle(for: frontApp.processIdentifier)
+        let windowName = getWindowTitle(
+            for: frontApp.processIdentifier,
+            bundleID: bundleID,
+            appName: appName,
+            preferredDisplayID: preferredDisplayID
+        )
 
-        // Get browser URL if applicable
-        var browserURL: String? = nil
-        if let bundleID = bundleID, Self.browserBundleIDs.contains(bundleID) {
-            browserURL = BrowserURLExtractor.getURL(
-                bundleID: bundleID,
-                pid: frontApp.processIdentifier
-            )
-        }
+        let browserURL = await resolveBrowserURL(
+            includeBrowserURL: includeBrowserURL,
+            pid: frontApp.processIdentifier,
+            bundleID: bundleID,
+            appName: appName,
+            windowName: windowName
+        )
 
-        return FrameMetadata(
+        let metadata = FrameMetadata(
             appBundleID: bundleID,
             appName: appName,
             windowName: windowName,
             browserURL: browserURL,
-            displayID: CGMainDisplayID()
+            displayID: displayID
         )
+        return metadata
     }
 
     // MARK: - Private Helpers
 
-    /// Get the title of the focused window using Accessibility API
-    /// Uses safe wrappers to prevent crashes if permissions are revoked
-    /// - Parameter pid: Process ID of the application
-    /// - Returns: Window title if available
-    private func getWindowTitle(for pid: pid_t) -> String? {
-        // Use safe wrapper that checks permissions first
-        return PermissionMonitor.shared.safeGetWindowTitle(for: pid)
+    private func getWindowTitle(
+        for pid: pid_t,
+        bundleID: String?,
+        appName: String?,
+        preferredDisplayID: CGDirectDisplayID?
+    ) -> String? {
+        if let title = getWindowTitleFromWindowList(
+            for: pid,
+            bundleID: bundleID,
+            preferredDisplayID: preferredDisplayID
+        ) {
+            return title
+        }
+
+        if pid == ProcessInfo.processInfo.processIdentifier {
+            return normalizedWindowTitle(appName)
+        }
+
+        if let title = normalizedWindowTitle(PermissionMonitor.shared.safeGetWindowTitle(for: pid)) {
+            let isSharingIndicator = title == "Window" && PermissionMonitor.shared.safeGetWindowFrame(for: pid).map {
+                ForegroundWindowSelection.isSharingIndicator(title: title, size: $0.size)
+            } == true
+            if !isSharingIndicator {
+                return title
+            }
+        }
+
+        if let bundleID,
+           bundleID.hasPrefix("com.google.Chrome.app."),
+           let appName = normalizedWindowTitle(appName) {
+            return appName
+        }
+
+        return nil
+    }
+
+    private func normalizedWindowTitle(_ title: String?) -> String? {
+        guard let title = title?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !title.isEmpty else {
+            return nil
+        }
+        return title
+    }
+
+    private func resolveBrowserURL(
+        includeBrowserURL: Bool,
+        pid: pid_t,
+        bundleID: String?,
+        appName: String?,
+        windowName: String?
+    ) async -> String? {
+        guard includeBrowserURL,
+              pid != ProcessInfo.processInfo.processIdentifier,
+              let bundleID,
+              (BrowserURLExtractor.isBrowser(bundleID) || bundleID == "com.apple.finder") else {
+            return nil
+        }
+
+        let urlExtractionStart = CFAbsoluteTimeGetCurrent()
+        let browserURL = await BrowserURLExtractor.getURL(
+            bundleID: bundleID,
+            pid: pid,
+            windowCacheKey: windowName ?? appName
+        )
+        let elapsedMs = (CFAbsoluteTimeGetCurrent() - urlExtractionStart) * 1000
+        if elapsedMs >= 250 {
+            Log.warning(
+                "[AppInfoProvider] Slow browser URL extraction bundle=\(bundleID), pid=\(pid), elapsed=\(String(format: "%.1f", elapsedMs))ms, foundURL=\(browserURL != nil)",
+                category: .capture
+            )
+        } else if elapsedMs >= 120 {
+            Log.debug(
+                "[AppInfoProvider] Browser URL extraction bundle=\(bundleID), pid=\(pid), elapsed=\(String(format: "%.1f", elapsedMs))ms, foundURL=\(browserURL != nil)",
+                category: .capture
+            )
+        }
+        return browserURL
+    }
+
+    private func getWindowTitleFromWindowList(
+        for pid: pid_t,
+        bundleID: String?,
+        preferredDisplayID: CGDirectDisplayID?
+    ) -> String? {
+        guard let windowList = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements],
+            kCGNullWindowID
+        ) as? [[String: Any]] else {
+            return nil
+        }
+
+        let displayBounds = preferredDisplayID.map(CGDisplayBounds)
+        guard let window = windowList.first(where: {
+            ForegroundWindowSelection.isEligible(
+                $0,
+                foregroundPID: pid,
+                bundleID: bundleID,
+                displayBounds: displayBounds
+            )
+        }) else {
+            return nil
+        }
+
+        return normalizedWindowTitle(window[kCGWindowName as String] as? String)
     }
 
     /// Check if accessibility permissions are granted

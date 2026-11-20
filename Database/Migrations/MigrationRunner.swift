@@ -94,7 +94,21 @@ actor MigrationRunner {
             V4_DailyMetrics(),
             V5_FTSUnicode61(),
             V6_FrameProcessedAt(),
-            V7_MultiDisplaySupport()
+            V7_FrameRedactionReason(),
+            V8_SegmentComments(),
+            V9_SegmentCommentFrameAnchor(),
+            V10_SegmentCommentSearchIndex(),
+            V11_SegmentCommentLinkCompositeIndex(),
+            V12_FrameMetadata(),
+            V13_RemoveInPageURLRects(),
+            V14_DBStorageSnapshot(),
+            V15_NodeRedactionFlag(),
+            V16_ProcessingQueueFrameIDIndex(),
+            V17_FrameCaptureTrigger(),
+            V18_DailyMetricsRecencyIndex(),
+            V19_FrameEncodedAt(),
+            V20_PartialProcessingStatusIndex(),
+            V21_MultiDisplaySupport()
         ]
     }
 
@@ -158,6 +172,7 @@ actor MigrationRunner {
             throw DatabaseError.queryFailed(query: sql, underlying: message)
         }
     }
+
 }
 
 // MARK: - Migration Utilities

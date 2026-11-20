@@ -1,3 +1,4 @@
+import Foundation
 import SwiftUI
 import AVKit
 import Shared
@@ -20,6 +21,7 @@ private func debugLog(_ message: String) {
         }
     }
 }
+private let timelineSettingsStore: UserDefaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
 
 /// Redesigned fullscreen timeline view with scrolling tape and fixed playhead
 /// The timeline tape moves left/right while the playhead stays fixed in center
@@ -29,6 +31,8 @@ public struct SimpleTimelineView: View {
 
     @ObservedObject private var viewModel: SimpleTimelineViewModel
     @State private var hasInitialized = false
+    /// Forces a SwiftUI refresh when global appearance preferences change.
+    @State private var appearanceRefreshTick = 0
     /// Tracks whether the live screenshot has been displayed, allowing AVPlayer to pre-mount underneath
     @State private var liveScreenshotHasAppeared = false
     /// Persistent offset for draggable secondary display stack
@@ -53,6 +57,13 @@ public struct SimpleTimelineView: View {
     private let displayRoleAnimationDuration: Double = 0.231
     /// Keep participant gating active long enough for the role transition to complete.
     private let displayRoleAnimationGateDuration: Double = 0.3
+    /// Keep comment submenu mounted during fade-out so dismissal is visibly animated.
+    @State private var isCommentSubmenuMounted = false
+    @State private var commentSubmenuVisibility: Double = 0
+    @State private var isSearchHighlightControlsHintDismissed = false
+    @State private var browserURLDebugWindowPosition = CGSize(width: 320, height: 16)
+    @State private var isInFrameSearchFieldFocused = false
+    @AppStorage("showFrameIDs", store: timelineSettingsStore) private var showFrameCard = SettingsDefaults.showFrameIDs
 
     let coordinator: AppCoordinator
     let onClose: () -> Void
@@ -64,6 +75,19 @@ public struct SimpleTimelineView: View {
         self.coordinator = coordinator
         self.viewModel = viewModel
         self.onClose = onClose
+    }
+
+    nonisolated static func shouldLoadMostRecentFrameOnAppear(hasInitialized: Bool, frameCount: Int) -> Bool {
+        !hasInitialized && frameCount == 0
+    }
+
+    private var currentBrowserURLForDebugWindow: String? {
+        guard let rawURL = viewModel.currentFrame?.metadata.browserURL?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !rawURL.isEmpty else {
+            return nil
+        }
+        return rawURL
     }
 
     // MARK: - Body
@@ -81,6 +105,12 @@ public struct SimpleTimelineView: View {
                 items: displayPreviewItems,
                 bottomPadding: displayCardsBottomPadding
             )
+            let shouldShowSearchHighlightControlsHint = shouldShowSearchHighlightControlsHint(
+                containerSize: geometry.size,
+                actualFrameRect: actualFrameRect
+            )
+            let shouldRenderSearchHighlightControlsHint =
+                shouldShowSearchHighlightControlsHint && !isSearchHighlightControlsHintDismissed
 
             ZStack {
                 // Full screen frame display
@@ -258,6 +288,8 @@ public struct SimpleTimelineView: View {
                     .allowsHitTesting(!viewModel.areControlsHidden)
                     .opacity(viewModel.areControlsHidden ? 0.5 : 1)
                 }
+                // Search-result highlights should sit above the frame, but below timeline controls/tape.
+                searchHighlightOverlay(containerSize: geometry.size, actualFrameRect: actualFrameRect)
 
                 // Bottom blur + gradient backdrop (behind timeline controls)
                 VStack {
@@ -307,9 +339,7 @@ public struct SimpleTimelineView: View {
                         .ignoresSafeArea()
                         .onTapGesture {
                             withAnimation(.spring(response: 0.25, dampingFraction: 0.9)) {
-                                viewModel.isCalendarPickerVisible = false
-                                viewModel.hoursWithFrames = []
-                                viewModel.selectedCalendarDate = nil
+                                viewModel.closeCalendarPicker()
                             }
                         }
                 }
@@ -353,13 +383,14 @@ public struct SimpleTimelineView: View {
                     .transition(.opacity.animation(.easeInOut(duration: 0.2).delay(0.1)))
                 }
 
-                // Debug frame ID badge, OCR status indicator, and developer actions menu (top-left)
+                // Debug frame card, OCR status indicator, and developer actions menu (top-left)
                 VStack {
                     HStack(spacing: 8) {
-                        if viewModel.showFrameIDs {
+                        if showFrameCard {
                             DebugFrameIDBadge(viewModel: viewModel)
                         }
-                        // OCR status indicator (only visible when OCR is in progress)
+                        FrameTextScanButton(viewModel: viewModel)
+                        // Background processing status remains separate from an on-demand scan.
                         OCRStatusIndicator(viewModel: viewModel)
                         #if DEBUG
                         DeveloperActionsMenu(viewModel: viewModel, onClose: onClose)
@@ -371,8 +402,21 @@ public struct SimpleTimelineView: View {
                         .allowsHitTesting(false)
                 }
                 .padding(.spacingL)
-                .offset(y: viewModel.areControlsHidden ? TimelineScaleFactor.closeButtonHiddenYOffset : 0)
-                .opacity(viewModel.areControlsHidden || viewModel.isDraggingZoomRegion ? 0 : 1)
+                .offset(y: viewModel.areControlsHidden && viewModel.frameTextScanState == .idle ? TimelineScaleFactor.closeButtonHiddenYOffset : 0)
+                .opacity((viewModel.areControlsHidden && viewModel.frameTextScanState == .idle) || viewModel.isDraggingZoomRegion ? 0 : 1)
+
+                #if DEBUG
+                if viewModel.showBrowserURLDebugWindow {
+                    DebugBrowserURLWindow(
+                        browserURL: currentBrowserURLForDebugWindow,
+                        panelPosition: $browserURLDebugWindowPosition,
+                        isPresented: $viewModel.showBrowserURLDebugWindow
+                    )
+                    .offset(y: viewModel.areControlsHidden ? TimelineScaleFactor.closeButtonHiddenYOffset : 0)
+                    .opacity(viewModel.areControlsHidden || viewModel.isDraggingZoomRegion ? 0 : 1)
+                    .zIndex(110)
+                }
+                #endif
 
                 // Reset zoom button (top center)
                 if viewModel.isFrameZoomed {
@@ -416,17 +460,38 @@ public struct SimpleTimelineView: View {
                     .animation(.easeInOut(duration: 0.45), value: viewModel.showTimelineHUDToast)
                 }
 
-                // Close button (top-right) - always visible
+                // Persistent redaction reason banner (top center)
+                if let redactionContext = currentRedactionContext {
+                    VStack {
+                        RedactionReasonBanner(
+                            reason: redactionContext.reason,
+                            appBundleID: redactionContext.appBundleID
+                        )
+                            .padding(.top, redactionBannerTopPadding(topSafeAreaInset: geometry.safeAreaInsets.top))
+                            .padding(.horizontal, .spacingL)
+                        Spacer()
+                            .allowsHitTesting(false)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .transition(.asymmetric(
+                        insertion: .move(edge: .top).combined(with: .opacity),
+                        removal: .opacity
+                    ))
+                    .animation(.spring(response: 0.28, dampingFraction: 0.82), value: redactionContext.reason)
+                }
+
+                // Top-right controls (in-frame search + close)
                 VStack {
                     HStack {
                         Spacer()
                             .allowsHitTesting(false)
-                        closeButton
+                        topRightControls
                     }
                     Spacer()
                         .allowsHitTesting(false)
                 }
                 .padding(.spacingL)
+                .padding(.top, 12) // Match ResetZoomButton vertical row alignment
                 .zIndex(100)
 
 
@@ -438,6 +503,8 @@ public struct SimpleTimelineView: View {
                 // Error overlay
                 if let error = viewModel.error {
                     errorOverlay(error)
+                        .transition(.scale(scale: 0.9).combined(with: .opacity))
+                        .animation(.spring(response: 0.35, dampingFraction: 0.75), value: viewModel.error)
                 }
 
                 // Delete confirmation dialog
@@ -459,30 +526,29 @@ public struct SimpleTimelineView: View {
                 // Search overlay (Cmd+K) - uses persistent searchViewModel to preserve results
                 searchOverlay
 
-                // Search highlight overlay
-                searchHighlightOverlay(containerSize: geometry.size, actualFrameRect: actualFrameRect)
+                // A brief outline makes freshly recognized text discoverable without selecting it.
+                if viewModel.frameTextScanState == .ready, !viewModel.isZoomRegionActive {
+                    Path { path in
+                        for node in viewModel.ocrNodes {
+                            path.addRoundedRect(in: CGRect(
+                                x: actualFrameRect.minX + node.x * actualFrameRect.width,
+                                y: actualFrameRect.minY + node.y * actualFrameRect.height,
+                                width: node.width * actualFrameRect.width,
+                                height: node.height * actualFrameRect.height
+                            ), cornerSize: CGSize(width: 2, height: 2))
+                        }
+                    }
+                    .stroke(Color.accentColor.opacity(0.55), lineWidth: 1)
+                    .scaleEffect(viewModel.frameZoomScale)
+                    .offset(viewModel.frameZoomOffset)
+                    .allowsHitTesting(false)
+                    .transition(.opacity)
+                }
 
                 // OCR debug overlay (dev setting)
                 ocrDebugOverlay(containerSize: geometry.size, actualFrameRect: actualFrameRect)
 
-                // Text selection hint toast (top center)
-                if viewModel.showTextSelectionHint {
-                    VStack {
-                        TextSelectionHintBanner(
-                            onDismiss: {
-                                viewModel.dismissTextSelectionHint()
-                            }
-                        )
-                        .fixedSize()
-                        .padding(.top, 60)
-                        .transition(.asymmetric(
-                            insertion: .move(edge: .top).combined(with: .opacity),
-                            removal: .opacity
-                        ))
-                        Spacer()
-                    }
-                    .animation(.spring(response: 0.3, dampingFraction: 0.8), value: viewModel.showTextSelectionHint)
-                }
+                topHintOverlay(shouldRenderSearchHighlightControlsHint: shouldRenderSearchHighlightControlsHint)
 
                 // Persistent pinned-display banner (top center)
                 if viewModel.isPrimaryDisplayPinned, viewModel.primaryDisplayID != 0 {
@@ -528,29 +594,139 @@ public struct SimpleTimelineView: View {
                     FilterDropdownOverlay(viewModel: viewModel)
                 }
 
-	                // Timeline segment context menu (for right-click on timeline tape)
-	                // Placed at the end of ZStack to ensure it renders above all other content
-	                 if viewModel.showTimelineContextMenu {
-	                    TimelineSegmentContextMenu(
-	                        viewModel: viewModel,
-	                        isPresented: $viewModel.showTimelineContextMenu,
-	                        location: viewModel.timelineContextMenuLocation,
-	                        containerSize: geometry.size
-	                    )
-	                }
+                // Timeline segment context menu (for right-click on timeline tape)
+                // Placed at the end of ZStack to ensure it renders above all other content
+                if viewModel.showTimelineContextMenu {
+                    TimelineSegmentContextMenu(
+                        viewModel: viewModel,
+                        isPresented: $viewModel.showTimelineContextMenu,
+                        location: viewModel.timelineContextMenuLocation,
+                        containerSize: geometry.size
+                    )
+                }
 
-	            }
+                if isCommentSubmenuMounted {
+                    Color.black.opacity(0.35)
+                        .opacity(commentSubmenuVisibility)
+                        .ignoresSafeArea()
+                        .allowsHitTesting(viewModel.showCommentSubmenu)
+                        .onTapGesture {
+                            viewModel.dismissCommentSubmenu()
+                        }
+
+                    VStack {
+                        CommentSubmenu(viewModel: viewModel) {
+                            viewModel.dismissCommentSubmenu()
+                        }
+                        .frame(maxWidth: min(geometry.size.width - 40, 560))
+                    }
+                    .padding(.horizontal, 20)
+                    .opacity(commentSubmenuVisibility)
+                    .scaleEffect(0.98 + (0.02 * commentSubmenuVisibility))
+                    .allowsHitTesting(viewModel.showCommentSubmenu)
+                }
+
+                // Toast feedback overlay (centered, larger for errors)
+                if viewModel.toastMessage != nil {
+                    let isErrorToast = viewModel.toastTone == .error
+                    let toastAccentColor = isErrorToast ? Color.red : Color.green
+
+                    VStack {
+                        Spacer()
+                        HStack(spacing: 12) {
+                            if let icon = viewModel.toastIcon {
+                                Image(systemName: icon)
+                                    .font(.system(size: 22, weight: .semibold))
+                                    .foregroundColor(toastAccentColor)
+                            }
+                            if let message = viewModel.toastMessage {
+                                Text(message)
+                                    .font(.system(size: 17, weight: .semibold))
+                                    .foregroundColor(.white)
+                            }
+                        }
+                        .padding(.horizontal, 28)
+                        .padding(.vertical, 18)
+                        .timelineGlassSurface(.banner, cornerRadius: 16, borderColor: toastAccentColor.opacity(0.35))
+                        .scaleEffect(viewModel.toastVisible ? 1.0 : 0.85)
+                        .opacity(viewModel.toastVisible ? 1.0 : 0.0)
+                        Spacer()
+                    }
+                        .allowsHitTesting(false)
+                }
+
+                // Delete undo action banner (interactive)
+                if let undoMessage = viewModel.pendingDeleteUndoMessage {
+                    VStack {
+                        HStack(spacing: 10) {
+                            Image(systemName: "trash.fill")
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundColor(.orange.opacity(0.95))
+
+                            Text(undoMessage)
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundColor(.white.opacity(0.92))
+                                .lineLimit(1)
+
+                            Button("Undo") {
+                                viewModel.undoPendingDelete()
+                            }
+                            .buttonStyle(.plain)
+                            .font(.system(size: 12, weight: .bold))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(
+                                Capsule()
+                                    .fill(Color.white.opacity(0.18))
+                            )
+                            .overlay(
+                                Capsule()
+                                    .stroke(Color.white.opacity(0.26), lineWidth: 1)
+                            )
+
+                            Button(action: {
+                                viewModel.dismissPendingDeleteUndo()
+                            }) {
+                                Image(systemName: "xmark")
+                                    .font(.system(size: 9, weight: .bold))
+                                    .foregroundColor(.white.opacity(0.7))
+                                    .padding(6)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 10)
+                        .timelineGlassSurface(.banner, cornerRadius: 12)
+                        .padding(.top, max(geometry.safeAreaInsets.top + 18, 56))
+                        Spacer()
+                    }
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                    .animation(.spring(response: 0.3, dampingFraction: 0.8), value: undoMessage)
+                }
+
+            }
             .coordinateSpace(name: "timelineContent")
-            .background(Color.black)
+            .background(frameCanvasBackgroundColor)
             .ignoresSafeArea()
             .onAppear {
-                if !hasInitialized {
+                if Self.shouldLoadMostRecentFrameOnAppear(
+                    hasInitialized: hasInitialized,
+                    frameCount: viewModel.frames.count
+                ) {
                     hasInitialized = true
                     previousPrimaryDisplayIDForDebug = viewModel.primaryDisplayID
                     Task {
                         await viewModel.loadMostRecentFrame()
                     }
+                } else {
+                    hasInitialized = true
                 }
+                if viewModel.showCommentSubmenu {
+                    isCommentSubmenuMounted = true
+                    commentSubmenuVisibility = 1
+                }
+                viewModel.handleTimelineOpened()
                 // Start periodic refresh of processing statuses
                 viewModel.startPeriodicStatusRefresh()
             }
@@ -593,8 +769,55 @@ public struct SimpleTimelineView: View {
                 viewModel.stopPeriodicStatusRefresh()
                 // Stop video playback when timeline is closed
                 viewModel.stopPlayback()
+                viewModel.handleTimelineClosed()
             }
-            // Note: Keyboard shortcuts (Cmd+F, Escape) are handled by TimelineWindowController
+            .onReceive(NotificationCenter.default.publisher(for: .colorThemeDidChange)) { _ in
+                appearanceRefreshTick &+= 1
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .fontStyleDidChange)) { _ in
+                appearanceRefreshTick &+= 1
+            }
+            .onChange(of: viewModel.showCommentSubmenu) { isVisible in
+                let animationDuration = 0.16
+                if isVisible {
+                    if !isCommentSubmenuMounted {
+                        isCommentSubmenuMounted = true
+                        commentSubmenuVisibility = 0
+                    }
+                    withAnimation(.easeOut(duration: animationDuration)) {
+                        commentSubmenuVisibility = 1
+                    }
+                } else if isCommentSubmenuMounted {
+                    withAnimation(.easeOut(duration: animationDuration)) {
+                        commentSubmenuVisibility = 0
+                    }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + animationDuration) {
+                        guard !viewModel.showCommentSubmenu else { return }
+                        isCommentSubmenuMounted = false
+                    }
+                }
+            }
+            .animation(.easeOut(duration: 0.16), value: viewModel.showCommentSubmenu)
+            .onChange(of: viewModel.focusInFrameSearchFieldSignal) { _ in
+                guard viewModel.isInFrameSearchVisible else { return }
+                DispatchQueue.main.async {
+                    isInFrameSearchFieldFocused = true
+                }
+            }
+            .onChange(of: viewModel.isInFrameSearchVisible) { isVisible in
+                if !isVisible {
+                    isInFrameSearchFieldFocused = false
+                }
+            }
+            .onChange(of: shouldShowSearchHighlightControlsHint) { isVisible in
+                if !isVisible {
+                    isSearchHighlightControlsHintDismissed = false
+                }
+            }
+            .onChange(of: viewModel.searchHighlightQuery) { _ in
+                isSearchHighlightControlsHintDismissed = false
+            }
+            // Note: Keyboard shortcuts (Cmd+F, Option+F, Cmd+Shift+F, Escape) are handled by TimelineWindowController
             // at the window level for more reliable event handling
         }
     }
@@ -634,6 +857,215 @@ public struct SimpleTimelineView: View {
             thumbnailHeight: thumbnailHeight,
             currentDisplayCardHeight: currentDisplayCardHeight
         )
+    }
+
+    private var isAwaitingLiveScreenshot: Bool {
+        viewModel.isInLiveMode && viewModel.liveScreenshot == nil
+    }
+
+    private struct RedactionBannerContext {
+        let reason: String
+        let appBundleID: String?
+    }
+
+    private var currentRedactionContext: RedactionBannerContext? {
+        guard let reason = viewModel.currentFrame?.metadata.redactionReason?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !reason.isEmpty else {
+            return nil
+        }
+
+        let fallbackBundleID = viewModel.currentFrame?.metadata.appBundleID
+        let (baseReason, suffix) = splitRedactionReasonSuffix(reason)
+
+        if let excludedBundleID = extractQuotedValue(
+            from: baseReason,
+            prefix: "excludedApp contains '"
+        ) {
+            let appName = appDisplayName(forBundleID: excludedBundleID)
+            return RedactionBannerContext(
+                reason: "Excluded app: \(appName)\(suffix)",
+                appBundleID: excludedBundleID
+            )
+        }
+
+        if let pattern = extractQuotedValue(
+            from: baseReason,
+            prefix: "windowTitle contains '"
+        ) {
+            return RedactionBannerContext(
+                reason: "Window title matches '\(pattern)'\(suffix)",
+                appBundleID: fallbackBundleID
+            )
+        }
+
+        if let pattern = extractQuotedValue(
+            from: baseReason,
+            prefix: "browserURL contains '"
+        ) {
+            return RedactionBannerContext(
+                reason: "Browser URL matches '\(pattern)'\(suffix)",
+                appBundleID: fallbackBundleID
+            )
+        }
+
+        return RedactionBannerContext(
+            reason: reason,
+            appBundleID: fallbackBundleID
+        )
+    }
+
+    private func splitRedactionReasonSuffix(_ reason: String) -> (base: String, suffix: String) {
+        guard let suffixStart = reason.range(of: " (+", options: .backwards),
+              reason.hasSuffix(")") else {
+            return (reason, "")
+        }
+
+        return (
+            String(reason[..<suffixStart.lowerBound]),
+            String(reason[suffixStart.lowerBound...])
+        )
+    }
+
+    private func extractQuotedValue(from text: String, prefix: String) -> String? {
+        guard text.hasPrefix(prefix), text.hasSuffix("'") else { return nil }
+        let valueStart = text.index(text.startIndex, offsetBy: prefix.count)
+        let valueEnd = text.index(before: text.endIndex)
+        guard valueStart <= valueEnd else { return nil }
+        let value = text[valueStart..<valueEnd].trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
+    }
+
+    private func appDisplayName(forBundleID bundleID: String) -> String {
+        if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
+            let appName = appURL.deletingPathExtension().lastPathComponent
+            if !appName.isEmpty {
+                return appName
+            }
+        }
+
+        if let fallbackName = bundleID.split(separator: ".").last, !fallbackName.isEmpty {
+            return String(fallbackName)
+        }
+
+        return "this app"
+    }
+
+    private func redactionBannerTopPadding(topSafeAreaInset: CGFloat) -> CGFloat {
+        // Keep redaction UI below the notch/menu bar even when we ignore safe areas.
+        let baseTopPadding = max(44, topSafeAreaInset + 12)
+
+        if viewModel.isPeeking {
+            return viewModel.isFrameZoomed ? baseTopPadding + 94 : baseTopPadding + 46
+        }
+        return viewModel.isFrameZoomed ? baseTopPadding + 48 : baseTopPadding
+    }
+
+    private static let topHintTransition: AnyTransition = .asymmetric(
+        insertion: .move(edge: .top).combined(with: .opacity),
+        removal: .opacity
+    )
+
+    @ViewBuilder
+    private func topHintOverlay(shouldRenderSearchHighlightControlsHint: Bool) -> some View {
+        let hasVisibleHints =
+            viewModel.showControlsHiddenRestoreHintBanner ||
+            viewModel.showPositionRecoveryHintBanner ||
+            viewModel.showTextSelectionHint ||
+            shouldRenderSearchHighlightControlsHint ||
+            viewModel.showTimelineTapeRightClickHintBanner ||
+            viewModel.showScrollOrientationHintBanner
+
+        if hasVisibleHints {
+            TimelineHintOverlayStack {
+                if viewModel.showControlsHiddenRestoreHintBanner {
+                    ControlsHiddenRestoreHintBanner(
+                        onDismiss: { viewModel.dismissControlsHiddenRestoreHint() }
+                    )
+                    .fixedSize()
+                    .transition(Self.topHintTransition)
+                }
+
+                if viewModel.showPositionRecoveryHintBanner {
+                    PositionRecoveryHintBanner(
+                        onDismiss: { viewModel.dismissPositionRecoveryHint() }
+                    )
+                    .fixedSize()
+                    .transition(Self.topHintTransition)
+                }
+
+                if viewModel.showTextSelectionHint {
+                    TextSelectionHintBanner(
+                        onDismiss: { viewModel.dismissTextSelectionHint() }
+                    )
+                    .fixedSize()
+                    .transition(Self.topHintTransition)
+                }
+
+                if shouldRenderSearchHighlightControlsHint {
+                    SearchHighlightControlsHintBanner(
+                        onDismiss: {
+                            withAnimation(.easeOut(duration: 0.2)) {
+                                isSearchHighlightControlsHintDismissed = true
+                            }
+                        }
+                    )
+                    .fixedSize()
+                    .transition(Self.topHintTransition)
+                }
+
+                if viewModel.showTimelineTapeRightClickHintBanner {
+                    TimelineTapeRightClickHintBanner(
+                        onDismiss: { viewModel.dismissTimelineTapeRightClickHint() }
+                    )
+                    .fixedSize()
+                    .transition(Self.topHintTransition)
+                }
+
+                if viewModel.showScrollOrientationHintBanner {
+                    ScrollOrientationHintBanner(
+                        currentOrientation: viewModel.scrollOrientationHintCurrentOrientation,
+                        onSwitch: { viewModel.openTimelineScrollOrientationSettings() },
+                        onDismiss: { viewModel.dismissScrollOrientationHint() }
+                    )
+                    .fixedSize()
+                    .transition(Self.topHintTransition)
+                }
+            }
+        }
+    }
+
+    private var frameCanvasBackgroundColor: Color {
+        isAwaitingLiveScreenshot ? .clear : .black
+    }
+
+    private func shouldShowSearchHighlightControlsHint(
+        containerSize: CGSize,
+        actualFrameRect: CGRect
+    ) -> Bool {
+        guard viewModel.isShowingSearchHighlight else { return false }
+        guard !viewModel.areControlsHidden else { return false }
+        guard !viewModel.isInFrameSearchVisible else { return false }
+
+        let highlightCutoffY = containerSize.height * 0.88
+        var seenNodeIDs = Set<Int>()
+        for match in viewModel.searchHighlightNodes {
+            guard seenNodeIDs.insert(match.node.id).inserted else { continue }
+
+            let rect = CGRect(
+                x: actualFrameRect.origin.x + (match.node.x * actualFrameRect.width),
+                y: actualFrameRect.origin.y + (match.node.y * actualFrameRect.height),
+                width: match.node.width * actualFrameRect.width,
+                height: match.node.height * actualFrameRect.height
+            )
+
+            guard !rect.isEmpty else { continue }
+            if rect.maxY >= highlightCutoffY {
+                return true
+            }
+        }
+
+        return false
     }
 
     // MARK: - Search Overlay
@@ -690,88 +1122,154 @@ public struct SimpleTimelineView: View {
 
 	    @ViewBuilder
 	    private var frameDisplay: some View {
-	        // Error states shown without layering
-	        if viewModel.frameLoadError {
-	            // Frame failed to load - show error message on black background
-	            VStack(spacing: .spacingM) {
-	                Image(systemName: "clock")
-	                    .font(.retraceDisplay)
-	                    .foregroundColor(.white.opacity(0.3))
-	                Text("Come back in a few frames")
-	                    .font(.retraceBody)
-	                    .foregroundColor(.white.opacity(0.5))
-	                Text("This frame is still being processed")
-	                    .font(.retraceCaption)
-	                    .foregroundColor(.white.opacity(0.3))
-	            }
-	        } else if viewModel.frameNotReady {
-	            // Frame not yet written to video file - show placeholder
-	            VStack(spacing: .spacingM) {
-	                Image(systemName: "clock")
-	                    .font(.retraceDisplay)
-	                    .foregroundColor(.white.opacity(0.3))
-	                Text("Frame not ready yet")
-	                    .font(.retraceBody)
-	                    .foregroundColor(.white.opacity(0.5))
-	                Text("Still encoding...")
-	                    .font(.retraceCaption)
-	                    .foregroundColor(.white.opacity(0.3))
-	            }
-	        } else {
-	            // Main content with live mode overlay using ZStack
-	            // AVPlayer mounts underneath and preloads while live screenshot is visible
-	            ZStack {
-	                // Base layer: Video or static image (loads in background during live mode)
-	                // Only mount after live screenshot has appeared to prevent initial black flash
-	                if liveScreenshotHasAppeared || !viewModel.isInLiveMode {
-	                    if let videoInfo = viewModel.displayedPrimaryVideoInfo {
-	                        videoFrameContent(videoInfo: videoInfo)
-	                    } else if let image = viewModel.currentImage {
-	                        // Static image (Retrace) with URL overlay
-	                        FrameWithURLOverlay(viewModel: viewModel, onURLClicked: onClose) {
-	                            Image(nsImage: image)
-	                                .resizable()
-	                                .aspectRatio(contentMode: .fit)
-	                        }
-	                    } else if !viewModel.isLoading {
-	                        // Empty state - no video or image available
-	                        VStack(spacing: .spacingM) {
-	                            Image(systemName: viewModel.frames.isEmpty ? "photo.on.rectangle.angled" : "clock")
-	                                .font(.retraceDisplay)
-	                                .foregroundColor(.white.opacity(0.3))
-	                            Text(viewModel.frames.isEmpty ? "No frames recorded" : "Frame not ready yet")
-	                                .font(.retraceBody)
-	                                .foregroundColor(.white.opacity(0.5))
-	                            if !viewModel.frames.isEmpty {
-	                                Text("Relaunch timeline in a few seconds")
-	                                    .font(.retraceCaption)
-	                                    .foregroundColor(.white.opacity(0.3))
-	                            }
-	                        }
-	                    }
-	                }
+            if isAwaitingLiveScreenshot {
+                // Live-mode launch: hide the frame canvas until live screenshot arrives.
+                // The tape and controls still render above this.
+                Color.clear
+            } else {
+                // Main content with live mode overlay using ZStack.
+                // Live screenshot always overlays historical/error content when available.
+                ZStack {
+                    // Base layer: historical frame/error content.
+                    // Only mount after live screenshot has appeared to prevent initial black flash.
+                    if liveScreenshotHasAppeared || !viewModel.isInLiveMode {
+                        historicalFrameContent
+                    }
 
-	                // Overlay layer: Live screenshot with text selection (covers AVPlayer while it loads)
-	                if viewModel.isInLiveMode, let liveImage = viewModel.liveScreenshot {
-	                    FrameWithURLOverlay(viewModel: viewModel, onURLClicked: onClose) {
-	                        Image(nsImage: liveImage)
-	                            .resizable()
-	                            .aspectRatio(contentMode: .fit)
-	                    }
-	                    .onAppear {
-	                        // Mark that live screenshot has appeared, allowing AVPlayer to mount
-	                        liveScreenshotHasAppeared = true
-	                    }
-	                }
-	            }
-	        }
+                    // Overlay layer: Live screenshot with text selection.
+                    if viewModel.isInLiveMode, let liveImage = viewModel.liveScreenshot {
+                        FrameWithURLOverlay(viewModel: viewModel, onURLClicked: onClose) {
+                            Image(nsImage: liveImage)
+                                .resizable()
+                                .aspectRatio(contentMode: .fit)
+                        }
+                        .onAppear {
+                            // Mark that live screenshot has appeared, allowing AVPlayer to mount.
+                            liveScreenshotHasAppeared = true
+                        }
+                    }
+                }
+            }
 	    }
+
+    @ViewBuilder
+    private var historicalFrameContent: some View {
+        if viewModel.frameLoadError {
+            // Frame failed to load.
+            VStack(spacing: .spacingM) {
+                Image(systemName: "clock")
+                    .font(.retraceDisplay)
+                    .foregroundColor(.white.opacity(0.3))
+                Text("Come back in a few frames")
+                    .font(.retraceBody)
+                    .foregroundColor(.white.opacity(0.5))
+                Text("This frame is still being processed")
+                    .font(.retraceCaption)
+                    .foregroundColor(.white.opacity(0.3))
+            }
+        } else if viewModel.frameNotReady,
+                  viewModel.displayableCurrentImage == nil,
+                  viewModel.waitingVideoFallbackImage == nil {
+            // Frame not yet written to video file.
+            VStack(spacing: .spacingM) {
+                Image(systemName: "clock")
+                    .font(.retraceDisplay)
+                    .foregroundColor(.white.opacity(0.3))
+                Text("Frame not ready yet")
+                    .font(.retraceBody)
+                    .foregroundColor(.white.opacity(0.5))
+                Text("Still encoding...")
+                    .font(.retraceCaption)
+                    .foregroundColor(.white.opacity(0.3))
+            }
+        } else if let videoInfo = viewModel.displayedPrimaryVideoInfo {
+            let isDecodedVideoInteractable =
+                viewModel.currentFrameMediaDisplayMode == .decodedVideo &&
+                viewModel.currentFrameStillDisplayMode == .none
+
+            ZStack {
+                // Keep the video view mounted behind still overlays so AVPlayer can preload
+                // and preserve its last rendered frame across still -> video handoffs.
+                videoFrameContent(videoInfo: videoInfo)
+                    .opacity(viewModel.currentFrameMediaDisplayMode == .decodedVideo ? 1 : 0.001)
+                    .allowsHitTesting(isDecodedVideoInteractable)
+
+                if let image = viewModel.displayableCurrentImage {
+                    frameStillContent(image, interactive: true)
+                } else if let fallbackImage = viewModel.waitingVideoFallbackImage {
+                    frameStillContent(fallbackImage, interactive: false)
+                }
+            }
+        } else if let image = viewModel.displayableCurrentImage {
+            // Static image (Retrace) with URL overlay.
+            frameStillContent(image, interactive: true)
+        } else if !viewModel.isLoading {
+            // Empty state - no video or image available.
+            let isFilteredEmptyState = viewModel.frames.isEmpty && viewModel.filterCriteria.hasActiveFilters
+            VStack(spacing: .spacingM) {
+                Image(systemName: isFilteredEmptyState ? "line.3.horizontal.decrease.circle" : (viewModel.frames.isEmpty ? "photo.on.rectangle.angled" : "clock"))
+                    .font(.retraceDisplay)
+                    .foregroundColor(.white.opacity(0.3))
+                Text(isFilteredEmptyState ? "No results for current filters" : (viewModel.frames.isEmpty ? "No frames recorded" : "Frame not ready yet"))
+                    .font(.retraceBody)
+                    .foregroundColor(.white.opacity(0.5))
+                if isFilteredEmptyState {
+                    Text("Adjust or clear filters to view timeline frames.")
+                        .font(.retraceCaption)
+                        .foregroundColor(.white.opacity(0.3))
+                } else if !viewModel.frames.isEmpty {
+                    Text("Relaunch timeline in a few seconds")
+                        .font(.retraceCaption)
+                        .foregroundColor(.white.opacity(0.3))
+                }
+            }
+        }
+    }
+
+    private func fittedStillImage(_ image: NSImage) -> some View {
+        Image(nsImage: image)
+            .resizable()
+            .aspectRatio(contentMode: .fit)
+    }
+
+    @ViewBuilder
+    private func frameStillContent(_ image: NSImage, interactive: Bool) -> some View {
+        if interactive {
+            FrameWithURLOverlay(viewModel: viewModel, onURLClicked: onClose) {
+                fittedStillImage(image)
+            }
+        } else {
+            fittedStillImage(image)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .scaleEffect(viewModel.frameZoomScale)
+                .offset(viewModel.frameZoomOffset)
+        }
+    }
 
 	    /// Video frame content extracted to separate view builder for cleaner code
 	    @ViewBuilder
 	    private func videoFrameContent(videoInfo: FrameVideoInfo) -> some View {
 	        let path = videoInfo.videoPath
 	        let pathWithExt = path + ".mp4"
+            let hasActiveFilters = viewModel.filterCriteria.hasActiveFilters
+            let selectedApps = (viewModel.filterCriteria.selectedApps ?? []).sorted()
+            let filteredFrameIndicesForVideo: Set<Int> = hasActiveFilters
+                ? Set(viewModel.frames.compactMap { entry in
+                    guard let info = entry.videoInfo, info.videoPath == videoInfo.videoPath else { return nil }
+                    return info.frameIndex
+                })
+                : []
+            let debugContext = viewModel.currentTimelineFrame.map {
+                VideoSeekDebugContext(
+                    frameID: $0.frame.id.value,
+                    timestamp: $0.frame.timestamp,
+                    currentIndex: viewModel.currentIndex,
+                    frameBundleID: $0.frame.metadata.appBundleID,
+                    hasActiveFilters: hasActiveFilters,
+                    selectedApps: selectedApps,
+                    filteredFrameIndicesForVideo: filteredFrameIndicesForVideo
+                )
+            }
 
 	        // Check if file exists FIRST - before trying to load it
 	        let fileExists = FileManager.default.fileExists(atPath: path) || FileManager.default.fileExists(atPath: pathWithExt)
@@ -802,29 +1300,36 @@ public struct SimpleTimelineView: View {
 	            let minFragmentSize: Int64 = 200_000  // 200KB threshold (~2 fragments)
 	            let fileReady = videoInfo.isVideoFinalized || fileSize >= minFragmentSize
 
-	            // Don't render video if we already know it will fail to load
-	            if fileReady && !viewModel.frameLoadError {
-	                FrameWithURLOverlay(viewModel: viewModel, onURLClicked: onClose) {
-	                    SimpleVideoFrameView(videoInfo: videoInfo, forceReload: .init(
-	                        get: { viewModel.forceVideoReload },
-	                        set: { viewModel.forceVideoReload = $0 }
-	                    ), onLoadFailed: {
-	                        // Don't set frameNotReady=true for completed frames (processingStatus=2) or Rewind frames (-1)
-	                        // Temporary video reload issues shouldn't show "Still encoding..." for ready frames
-	                        let status = viewModel.currentTimelineFrame?.processingStatus
-	                        if status != 2 && status != -1 {
-	                            viewModel.frameNotReady = true
-	                            viewModel.frameLoadError = false
-	                        } else {
-	                            // For completed frames or Rewind frames, this is a real error
-	                            viewModel.frameNotReady = false
-	                            viewModel.frameLoadError = true
-	                        }
-	                    }, onLoadSuccess: {
-	                        viewModel.frameNotReady = false
-	                        viewModel.frameLoadError = false
-	                    })
-	                }
+            let frameID = viewModel.currentTimelineFrame?.frame.id
+            let processingStatus = viewModel.currentTimelineFrame?.processingStatus
+
+            // Don't render video if we already know it will fail to load
+            if fileReady && !viewModel.frameLoadError {
+                FrameWithURLOverlay(viewModel: viewModel, onURLClicked: onClose) {
+                    SimpleVideoFrameView(videoInfo: videoInfo, debugContext: debugContext, forceReload: .init(
+                        get: { viewModel.forceVideoReload },
+                        set: { viewModel.forceVideoReload = $0 }
+                    ), onLoadFailed: {
+                        guard viewModel.currentTimelineFrame?.frame.id == frameID else { return }
+                        // Don't set frameNotReady=true for successful frames (processingStatus=2/7)
+                        // or Rewind frames (-1). Temporary reload issues shouldn't show
+                        // "Still encoding..." for already-ready frames.
+                        if processingStatus != 2 && processingStatus != 7 && processingStatus != -1 {
+                            viewModel.frameNotReady = true
+                            viewModel.frameLoadError = false
+                        } else {
+                            // For ready frames or Rewind frames, this is a real error
+                            viewModel.frameNotReady = false
+                            viewModel.frameLoadError = true
+                        }
+                    }, onLoadSuccess: {
+                        guard let frameID else { return }
+                        viewModel.markVideoPresentationReady(frameID: frameID)
+                        guard viewModel.currentTimelineFrame?.frame.id == frameID else { return }
+                        viewModel.frameNotReady = false
+                        viewModel.frameLoadError = false
+                    })
+                }
 	            } else {
 	                let _ = Log.warning("[FrameDisplay] Video file too small (no fragments yet) and not finalized, showing placeholder. Size=\(fileSize), isFinalized=\(videoInfo.isVideoFinalized)", category: .ui)
 	                // Video file not ready - show friendly message
@@ -843,9 +1348,193 @@ public struct SimpleTimelineView: View {
 	        }
 	    }
 
+    // MARK: - Top Right Controls
+
+    @State private var isHelpButtonHovering = false
+    @State private var isCloseButtonHovering = false
+
+    private var topRightControls: some View {
+        let scale = TimelineScaleFactor.current
+        let searchResultNavigationState = viewModel.searchResultHighlightNavigationState
+
+        return VStack(alignment: .trailing, spacing: 10 * scale) {
+            HStack(spacing: 10 * scale) {
+                if viewModel.isInFrameSearchVisible {
+                    inFrameSearchBar
+                        .transition(.move(edge: .trailing).combined(with: .opacity))
+                }
+                // helpButton
+                closeButton
+            }
+
+            if let searchResultNavigationState {
+                SearchResultNavigationToast(
+                    state: searchResultNavigationState,
+                    onNavigatePrevious: {
+                        Task {
+                            await viewModel.navigateToAdjacentSearchResult(
+                                offset: -1,
+                                trigger: .button
+                            )
+                        }
+                    },
+                    onNavigateNext: {
+                        Task {
+                            await viewModel.navigateToAdjacentSearchResult(
+                                offset: 1,
+                                trigger: .button
+                            )
+                        }
+                    }
+                )
+                .fixedSize()
+                .transition(.move(edge: .trailing).combined(with: .opacity))
+            }
+        }
+        .animation(.easeOut(duration: 0.15), value: viewModel.isInFrameSearchVisible)
+        .animation(.spring(response: 0.24, dampingFraction: 0.84), value: searchResultNavigationState)
+    }
+
+    private var inFrameSearchBinding: Binding<String> {
+        Binding(
+            get: { viewModel.inFrameSearchQuery },
+            set: { viewModel.setInFrameSearchQuery($0) }
+        )
+    }
+
+    private var isInFrameSearchGlowActive: Bool {
+        isInFrameSearchFieldFocused || !viewModel.inFrameSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var inFrameSearchBar: some View {
+        let scale = TimelineScaleFactor.current
+        let height = 44 * scale
+
+        return HStack(spacing: 8 * scale) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 13 * scale, weight: .semibold))
+                .foregroundColor(.white.opacity(0.72))
+
+            FocusableTextInput(
+                text: inFrameSearchBinding,
+                placeholder: "Search this frame",
+                font: .systemFont(ofSize: 14 * scale, weight: .medium),
+                isFocused: { isInFrameSearchFieldFocused },
+                setFocused: { isFocused in
+                    isInFrameSearchFieldFocused = isFocused
+                }
+            )
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Button {
+                viewModel.setInFrameSearchQuery("")
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 12 * scale, weight: .medium))
+                    .foregroundColor(.white.opacity(0.6))
+            }
+            .buttonStyle(.plain)
+            .disabled(viewModel.inFrameSearchQuery.isEmpty)
+            .opacity(viewModel.inFrameSearchQuery.isEmpty ? 0 : 1)
+            .allowsHitTesting(!viewModel.inFrameSearchQuery.isEmpty)
+            .help("Clear search")
+
+            Button {
+                viewModel.closeInFrameSearch(clearQuery: true)
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 12 * scale, weight: .semibold))
+                    .foregroundColor(.white.opacity(0.78))
+            }
+            .buttonStyle(.plain)
+            .help("Close in-frame search (Esc)")
+        }
+        .padding(.leading, 14 * scale)
+        .padding(.trailing, 12 * scale)
+        .frame(width: 340 * scale, height: height)
+        .timelineGlassSurface(.panel, cornerRadius: 14 * scale)
+        .overlay(
+            RoundedRectangle(cornerRadius: 14 * scale)
+                .stroke(
+                    Color.white.opacity(isInFrameSearchGlowActive ? 0.46 : 0.24),
+                    lineWidth: isInFrameSearchGlowActive ? 1.2 : 0.8
+                )
+        )
+        .shadow(
+            color: Color.white.opacity(isInFrameSearchGlowActive ? 0.20 : 0.08),
+            radius: (isInFrameSearchGlowActive ? 9 : 5) * scale,
+            x: 0,
+            y: 0
+        )
+        .shadow(
+            color: Color.black.opacity(isInFrameSearchGlowActive ? 0.20 : 0.10),
+            radius: (isInFrameSearchGlowActive ? 15 : 8) * scale,
+            x: 0,
+            y: 0
+        )
+        .contentShape(Rectangle())
+        .onTapGesture {
+            isInFrameSearchFieldFocused = true
+        }
+        .animation(.easeOut(duration: 0.18), value: isInFrameSearchGlowActive)
+        .onAppear {
+            DispatchQueue.main.async {
+                isInFrameSearchFieldFocused = true
+            }
+        }
+    }
+
     // MARK: - Close Button
 
-    @State private var isCloseButtonHovering = false
+    private func openHelpFromTimeline() {
+        DashboardViewModel.recordHelpOpened(coordinator: coordinator, source: "timeline_header")
+        viewModel.dismissContextMenu()
+
+        Task { @MainActor in
+            if TimelineWindowController.shared.isVisible {
+                TimelineWindowController.shared.hideToShowDashboard()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                    NotificationCenter.default.post(name: .openFeedback, object: nil)
+                }
+            } else {
+                NotificationCenter.default.post(name: .openFeedback, object: nil)
+            }
+        }
+    }
+
+    private var helpButton: some View {
+        let scale = TimelineScaleFactor.current
+        let buttonSize = 44 * scale
+        let expandedWidth = 118 * scale
+
+        return Button(action: openHelpFromTimeline) {
+            ZStack(alignment: .trailing) {
+                Color.clear
+                    .frame(width: expandedWidth, height: buttonSize)
+
+                HStack(spacing: 10 * scale) {
+                    Image(systemName: "questionmark.circle")
+                        .font(.system(size: 18 * scale, weight: .semibold))
+                    if isHelpButtonHovering {
+                        Text("Help")
+                            .font(.system(size: 17 * scale, weight: .medium))
+                    }
+                }
+                .foregroundColor(isHelpButtonHovering ? .white : .white.opacity(0.8))
+                .frame(width: isHelpButtonHovering ? nil : buttonSize, height: buttonSize)
+                .padding(.horizontal, isHelpButtonHovering ? 20 * scale : 0)
+                .timelineGlassSurface(.chip, cornerRadius: buttonSize / 2)
+                .animation(.easeOut(duration: 0.15), value: isHelpButtonHovering)
+            }
+        }
+        .buttonStyle(.plain)
+        .contentShape(Rectangle())
+        .keyboardShortcut("h", modifiers: [.command, .shift])
+        .help("Help")
+        .onHover { hovering in
+            isHelpButtonHovering = hovering
+        }
+    }
 
     private var closeButton: some View {
         let scale = TimelineScaleFactor.current
@@ -873,14 +1562,7 @@ public struct SimpleTimelineView: View {
                 .foregroundColor(isCloseButtonHovering ? .white : .white.opacity(0.8))
                 .frame(width: isCloseButtonHovering ? nil : buttonSize, height: buttonSize)
                 .padding(.horizontal, isCloseButtonHovering ? 20 * scale : 0)
-                .background(
-                    Capsule()
-                        .fill(Color.black.opacity(isCloseButtonHovering ? 0.7 : 0.5))
-                )
-                .overlay(
-                    Capsule()
-                        .stroke(Color.white.opacity(0.2), lineWidth: 0.5)
-                )
+                .timelineGlassSurface(.chip, cornerRadius: buttonSize / 2)
                 .animation(.easeOut(duration: 0.15), value: isCloseButtonHovering)
             }
         }
@@ -905,6 +1587,7 @@ public struct SimpleTimelineView: View {
                 .font(.retraceBody)
                 .foregroundColor(.white.opacity(0.7))
         }
+        .allowsHitTesting(false)
     }
 
     // MARK: - Helper Methods
@@ -1169,20 +1852,24 @@ public struct SimpleTimelineView: View {
     // MARK: - Error Overlay
 
     private func errorOverlay(_ message: String) -> some View {
-        VStack(spacing: .spacingM) {
-            Image(systemName: "exclamationmark.triangle")
-                .font(.retraceDisplay3)
-                .foregroundColor(.retraceWarning)
+        let accentColor = Color.orange
+
+        return HStack(spacing: 12) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 22, weight: .semibold))
+                .foregroundColor(accentColor)
             Text(message)
-                .font(.retraceBody)
-                .foregroundColor(.white.opacity(0.7))
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundColor(.white)
                 .multilineTextAlignment(.center)
+                .lineLimit(3)
         }
-        .padding(.spacingL)
-        .background(
-            RoundedRectangle(cornerRadius: .cornerRadiusM)
-                .fill(Color.black.opacity(0.8))
-        )
+        .padding(.horizontal, 28)
+        .padding(.vertical, 18)
+        .fixedSize(horizontal: true, vertical: false)
+        .timelineGlassSurface(.banner, cornerRadius: 16, borderColor: accentColor.opacity(0.35))
+        .padding(.horizontal, 24)
+        .allowsHitTesting(false)
     }
 }
 
@@ -1261,7 +1948,7 @@ private struct DisplayRoleAnimationDebugProbe: ViewModifier {
 
 // MARK: - Reset Zoom Button
 
-/// Floating button that appears when the frame is zoomed, allowing quick reset to 100%
+/// Floating button that appears when the frame is zoomed, allowing quick reset to fit-to-screen.
 struct ResetZoomButton: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel
     @State private var isHovering = false
@@ -1281,14 +1968,7 @@ struct ResetZoomButton: View {
             .foregroundColor(isHovering ? .white : .white.opacity(0.8))
             .padding(.horizontal, 20 * scale)
             .padding(.vertical, 12 * scale)
-            .background(
-                Capsule()
-                    .fill(Color.black.opacity(isHovering ? 0.7 : 0.5))
-            )
-            .overlay(
-                Capsule()
-                    .stroke(Color.white.opacity(0.2), lineWidth: 0.5)
-            )
+            .timelineGlassSurface(.chip, cornerRadius: 22 * scale)
         }
         .buttonStyle(.plain)
         .onHover { hovering in
@@ -1299,7 +1979,7 @@ struct ResetZoomButton: View {
                 NSCursor.pop()
             }
         }
-        .help("Reset zoom to 100% (Cmd+0)")
+        .help("Reset zoom to \(TimelineZoomSettings.resetLabel) (Cmd+0)")
     }
 }
 
@@ -1371,19 +2051,37 @@ struct PeekModeBanner: View {
         }
         .padding(.horizontal, 16 * scale)
         .padding(.vertical, 10 * scale)
-        .background(
-            Capsule()
-                .fill(Color.black.opacity(0.6))
-                .background(
-                    Capsule()
-                        .fill(.ultraThinMaterial)
-                )
-                .clipShape(Capsule())
-        )
-        .overlay(
-            Capsule()
-                .stroke(Color.white.opacity(0.15), lineWidth: 0.5)
-        )
+        .timelineGlassSurface(.banner, cornerRadius: 18 * scale)
+    }
+}
+
+struct VideoSeekDebugContext {
+    let frameID: Int64
+    let timestamp: Date
+    let currentIndex: Int
+    let frameBundleID: String?
+    let hasActiveFilters: Bool
+    let selectedApps: [String]
+    let filteredFrameIndicesForVideo: Set<Int>
+
+    var selectedAppsLabel: String {
+        selectedApps.isEmpty ? "none" : selectedApps.joined(separator: ",")
+    }
+
+    func containsFilteredFrameIndex(_ frameIndex: Int) -> Bool {
+        guard frameIndex >= 0 else { return false }
+        return filteredFrameIndicesForVideo.contains(frameIndex)
+    }
+
+    func nearestFilteredFrameIndices(around frameIndex: Int, limit: Int = 6) -> String {
+        guard !filteredFrameIndicesForVideo.isEmpty else { return "none" }
+        let nearest = filteredFrameIndicesForVideo
+            .sorted { lhs, rhs in
+                abs(lhs - frameIndex) < abs(rhs - frameIndex)
+            }
+            .prefix(limit)
+            .sorted()
+        return nearest.map(String.init).joined(separator: ",")
     }
 }
 
@@ -1560,6 +2258,7 @@ private struct CurrentDisplayRowView: View {
 /// in a hidden player and swapping visibility once ready
 struct SimpleVideoFrameView: NSViewRepresentable {
     let videoInfo: FrameVideoInfo
+    let debugContext: VideoSeekDebugContext?
     @Binding var forceReload: Bool
     var onLoadFailed: (() -> Void)?
     var onLoadSuccess: (() -> Void)?
@@ -1575,6 +2274,13 @@ struct SimpleVideoFrameView: NSViewRepresentable {
         // Update callbacks in case they changed
         containerView.onLoadFailed = onLoadFailed
         containerView.onLoadSuccess = onLoadSuccess
+
+        if let debugContext, debugContext.hasActiveFilters {
+            Log.debug(
+                "[FILTER-VIDEO] renderRequest frameID=\(debugContext.frameID) idx=\(debugContext.currentIndex) ts=\(debugContext.timestamp) bundle=\(debugContext.frameBundleID ?? "nil") selectedApps=[\(debugContext.selectedAppsLabel)] targetVideoFrame=\(videoInfo.frameIndex) videoPathSuffix=\(videoInfo.videoPath.suffix(40))",
+                category: .ui
+            )
+        }
 
         let isWindowVisible = containerView.window?.isVisible ?? false
         let needsForceReload = forceReload
@@ -1593,6 +2299,9 @@ struct SimpleVideoFrameView: NSViewRepresentable {
 
         // If same video and same frame, nothing to do
         if effectivePath == videoInfo.videoPath && effectiveFrameIdx == videoInfo.frameIndex {
+            DispatchQueue.main.async {
+                self.onLoadSuccess?()
+            }
             return
         }
 
@@ -1604,7 +2313,12 @@ struct SimpleVideoFrameView: NSViewRepresentable {
         // If same video, just seek on the active player (fast path)
         if effectivePath == videoInfo.videoPath {
             let time = videoInfo.frameTimeCMTime
-            containerView.seekActivePlayer(to: time)
+            containerView.seekActivePlayer(
+                to: time,
+                expectedFrameIndex: videoInfo.frameIndex,
+                frameRate: videoInfo.frameRate,
+                debugContext: debugContext
+            )
             return
         }
 
@@ -1635,6 +2349,7 @@ struct SimpleVideoFrameView: NSViewRepresentable {
 
             do {
                 try FileManager.default.createSymbolicLink(atPath: symlinkPath, withDestinationPath: actualVideoPath)
+                context.coordinator.trackSymlink(symlinkPath)
             } catch {
                 Log.error("[SimpleVideoFrameView] Failed to create symlink: \(error)", category: .app)
                 return
@@ -1645,16 +2360,39 @@ struct SimpleVideoFrameView: NSViewRepresentable {
         // Load video into buffer player and swap when ready
         let targetTime = videoInfo.frameTimeCMTime
         let targetFrameIndex = videoInfo.frameIndex
-        containerView.loadVideoIntoBuffer(url: url, seekTime: targetTime, frameIndex: targetFrameIndex)
+        containerView.loadVideoIntoBuffer(
+            url: url,
+            seekTime: targetTime,
+            frameIndex: targetFrameIndex,
+            frameRate: videoInfo.frameRate,
+            debugContext: debugContext
+        )
     }
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
     }
 
+    static func dismantleNSView(_ nsView: DoubleBufferedVideoView, coordinator: Coordinator) {
+        nsView.releaseDecoderResources(reason: "SimpleVideoFrameView dismantled")
+        coordinator.cleanupSymlinks()
+    }
+
     class Coordinator {
         var currentVideoPath: String?
         var currentFrameIndex: Int?
+        private var symlinkPaths: Set<String> = []
+
+        func trackSymlink(_ path: String) {
+            symlinkPaths.insert(path)
+        }
+
+        func cleanupSymlinks() {
+            for path in symlinkPaths {
+                try? FileManager.default.removeItem(atPath: path)
+            }
+            symlinkPaths.removeAll()
+        }
     }
 }
 
@@ -1680,6 +2418,20 @@ class DoubleBufferedVideoView: NSView {
     /// Incremented each time a new load is initiated
     private var loadGeneration: UInt64 = 0
 
+    /// Generation counter for same-video seeks (used to detect stale completion callbacks).
+    private var seekGeneration: UInt64 = 0
+
+    /// Enable detailed seek diagnostics in release builds with:
+    /// `defaults write io.retrace.app retrace.debug.filteredSeekDiagnostics -bool YES`
+    private static let isFilteredSeekDiagnosticsEnabled: Bool = {
+        #if DEBUG
+        return true
+        #else
+        return (UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard)
+            .bool(forKey: "retrace.debug.filteredSeekDiagnostics")
+        #endif
+    }()
+
     /// Callback when video loading fails (e.g., frame not yet in video file)
     var onLoadFailed: (() -> Void)?
 
@@ -1696,20 +2448,29 @@ class DoubleBufferedVideoView: NSView {
         setupPlayers()
     }
 
-	    private func setupPlayers() {
-	        wantsLayer = true
-	        layer?.backgroundColor = NSColor.black.cgColor
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        super.viewWillMove(toWindow: newWindow)
+        if newWindow == nil {
+            releaseDecoderResources(reason: "view removed from window")
+        }
+    }
+
+    private func setupPlayers() {
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.black.cgColor
 
         // Create player A
         playerViewA = createPlayerView()
         playerA = AVPlayer()
         playerA.actionAtItemEnd = .pause
+        playerA.automaticallyWaitsToMinimizeStalling = false
         playerViewA.player = playerA
 
         // Create player B
         playerViewB = createPlayerView()
         playerB = AVPlayer()
         playerB.actionAtItemEnd = .pause
+        playerB.automaticallyWaitsToMinimizeStalling = false
         playerViewB.player = playerB
 
         // Add both to view hierarchy
@@ -1725,14 +2486,14 @@ class DoubleBufferedVideoView: NSView {
         setupConstraints(for: playerViewB)
     }
 
-	    private func createPlayerView() -> AVPlayerView {
-	        let playerView = AVPlayerView()
+    private func createPlayerView() -> AVPlayerView {
+        let playerView = AVPlayerView()
         playerView.controlsStyle = .none
         playerView.showsFrameSteppingButtons = false
         playerView.showsSharingServiceButton = false
-	        playerView.showsFullScreenToggleButton = false
-	        playerView.wantsLayer = true
-	        playerView.layer?.backgroundColor = NSColor.black.cgColor
+        playerView.showsFullScreenToggleButton = false
+        playerView.wantsLayer = true
+        playerView.layer?.backgroundColor = NSColor.black.cgColor
 
         if #available(macOS 13.0, *) {
             playerView.allowsVideoFrameAnalysis = false
@@ -1751,14 +2512,100 @@ class DoubleBufferedVideoView: NSView {
         ])
     }
 
-    /// Seek the currently active player to a specific time
-    func seekActivePlayer(to time: CMTime) {
+    private func ensurePlayersReady() {
+        if playerViewA == nil || playerViewB == nil {
+            setupPlayers()
+            return
+        }
+
+        if playerA == nil {
+            let player = AVPlayer()
+            player.actionAtItemEnd = .pause
+            player.automaticallyWaitsToMinimizeStalling = false
+            playerA = player
+            playerViewA.player = player
+        } else if playerViewA.player == nil {
+            playerViewA.player = playerA
+        }
+
+        if playerB == nil {
+            let player = AVPlayer()
+            player.actionAtItemEnd = .pause
+            player.automaticallyWaitsToMinimizeStalling = false
+            playerB = player
+            playerViewB.player = player
+        } else if playerViewB.player == nil {
+            playerViewB.player = playerB
+        }
+
+        playerViewA.isHidden = !isPlayerAActive
+        playerViewB.isHidden = isPlayerAActive
+    }
+
+    /// Seek the currently active player to a specific time.
+    func seekActivePlayer(
+        to time: CMTime,
+        expectedFrameIndex: Int,
+        frameRate: Double,
+        debugContext: VideoSeekDebugContext?
+    ) {
+        ensurePlayersReady()
+        seekGeneration &+= 1
+        let currentSeekGeneration = seekGeneration
+        let tolerance = seekTolerance(for: frameRate)
+        let toleranceFrames = configuredSeekToleranceFrames()
         let activePlayer = isPlayerAActive ? playerA : playerB
-        activePlayer?.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero)
+
+        activePlayer?.seek(to: time, toleranceBefore: tolerance, toleranceAfter: tolerance) { [weak self, weak activePlayer] finished in
+            guard let self = self else { return }
+
+            guard finished else {
+                if self.shouldLogSeekDiagnostics(for: debugContext) {
+                    Log.debug(
+                        "[FILTER-VIDEO] seekCancelled path=same-video expectedFrame=\(expectedFrameIndex) toleranceFrames=\(toleranceFrames)",
+                        category: .ui
+                    )
+                }
+                return
+            }
+
+            guard currentSeekGeneration == self.seekGeneration else {
+                if self.shouldLogSeekDiagnostics(for: debugContext) {
+                    Log.debug(
+                        "[FILTER-VIDEO] seekStale path=same-video expectedFrame=\(expectedFrameIndex) finishedGeneration=\(currentSeekGeneration) currentGeneration=\(self.seekGeneration)",
+                        category: .ui
+                    )
+                }
+                return
+            }
+
+            let actualTime = activePlayer?.currentTime() ?? .zero
+            let actualFrameIndex = Self.frameIndex(for: actualTime, frameRate: frameRate)
+            self.logSeekResult(
+                phase: "same-video",
+                expectedFrameIndex: expectedFrameIndex,
+                actualFrameIndex: actualFrameIndex,
+                frameRate: frameRate,
+                toleranceFrames: toleranceFrames,
+                debugContext: debugContext
+            )
+
+            DispatchQueue.main.async {
+                self.onLoadSuccess?()
+            }
+        }
     }
 
     /// Load a video into the buffer player and swap when ready
-    func loadVideoIntoBuffer(url: URL, seekTime: CMTime, frameIndex: Int) {
+    func loadVideoIntoBuffer(
+        url: URL,
+        seekTime: CMTime,
+        frameIndex: Int,
+        frameRate: Double,
+        debugContext: VideoSeekDebugContext?
+    ) {
+        ensurePlayersReady()
+
         // Increment generation to invalidate any pending async callbacks
         loadGeneration &+= 1
         let currentGeneration = loadGeneration
@@ -1777,8 +2624,12 @@ class DoubleBufferedVideoView: NSView {
 
         let asset = AVURLAsset(url: url, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
         let playerItem = AVPlayerItem(asset: asset)
+        playerItem.preferredForwardBufferDuration = 0
 
+        clearCurrentItem(for: bufferPlayer)
         bufferPlayer?.replaceCurrentItem(with: playerItem)
+        let tolerance = seekTolerance(for: frameRate)
+        let toleranceFrames = configuredSeekToleranceFrames()
 
         // Observe when buffer player is ready
         let observer = playerItem.observe(\.status, options: [.new, .initial]) { [weak self] item, _ in
@@ -1791,6 +2642,12 @@ class DoubleBufferedVideoView: NSView {
             }
 
             if item.status == .failed {
+                if self.shouldLogSeekDiagnostics(for: debugContext) {
+                    Log.warning(
+                        "[FILTER-VIDEO] bufferLoadFailed expectedFrame=\(frameIndex) toleranceFrames=\(toleranceFrames)",
+                        category: .ui
+                    )
+                }
                 DispatchQueue.main.async {
                     self.onLoadFailed?()
                 }
@@ -1800,11 +2657,32 @@ class DoubleBufferedVideoView: NSView {
             guard item.status == .readyToPlay else { return }
 
             // Seek to target frame
-            bufferPlayer?.seek(to: seekTime, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
-                guard let self = self, finished else { return }
+            bufferPlayer?.seek(to: seekTime, toleranceBefore: tolerance, toleranceAfter: tolerance) { [weak self] finished in
+                guard let self = self else { return }
+
+                guard finished else {
+                    if self.shouldLogSeekDiagnostics(for: debugContext) {
+                        Log.debug(
+                            "[FILTER-VIDEO] seekCancelled path=buffer expectedFrame=\(frameIndex) toleranceFrames=\(toleranceFrames)",
+                            category: .ui
+                        )
+                    }
+                    return
+                }
 
                 // Re-check generation after async seek completes
                 guard currentGeneration == self.loadGeneration else { return }
+
+                let actualTime = bufferPlayer?.currentTime() ?? .zero
+                let actualFrameIndex = Self.frameIndex(for: actualTime, frameRate: frameRate)
+                self.logSeekResult(
+                    phase: "buffer",
+                    expectedFrameIndex: frameIndex,
+                    actualFrameIndex: actualFrameIndex,
+                    frameRate: frameRate,
+                    toleranceFrames: toleranceFrames,
+                    debugContext: debugContext
+                )
 
                 DispatchQueue.main.async {
                     // Final generation check on main thread before swap
@@ -1829,6 +2707,102 @@ class DoubleBufferedVideoView: NSView {
         }
     }
 
+    func releaseDecoderResources(reason: String) {
+        loadGeneration &+= 1
+        seekGeneration &+= 1
+
+        observerA?.invalidate()
+        observerA = nil
+        observerB?.invalidate()
+        observerB = nil
+
+        release(player: playerA, playerView: playerViewA)
+        release(player: playerB, playerView: playerViewB)
+        playerA = nil
+        playerB = nil
+
+        isPlayerAActive = true
+        playerViewA?.isHidden = false
+        playerViewB?.isHidden = true
+    }
+
+    private func release(player: AVPlayer?, playerView: AVPlayerView?) {
+        guard let player else {
+            playerView?.player = nil
+            return
+        }
+
+        clearCurrentItem(for: player)
+        playerView?.player = nil
+    }
+
+    private func clearCurrentItem(for player: AVPlayer?) {
+        guard let player else { return }
+        player.pause()
+        player.cancelPendingPrerolls()
+        if let item = player.currentItem {
+            item.cancelPendingSeeks()
+            item.asset.cancelLoading()
+        }
+        player.replaceCurrentItem(with: nil)
+    }
+
+    private func configuredSeekToleranceFrames() -> Int {
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
+        if let value = defaults.object(forKey: "retrace.debug.timelineSeekToleranceFrames") as? NSNumber {
+            return max(0, value.intValue)
+        }
+        return 1
+    }
+
+    private func seekTolerance(for frameRate: Double) -> CMTime {
+        let toleranceFrames = configuredSeekToleranceFrames()
+        guard toleranceFrames > 0 else { return .zero }
+        let fps = frameRate > 0 ? frameRate : 30.0
+        return CMTime(seconds: Double(toleranceFrames) / fps, preferredTimescale: 600)
+    }
+
+    private static func frameIndex(for time: CMTime, frameRate: Double) -> Int {
+        let seconds = CMTimeGetSeconds(time)
+        guard seconds.isFinite else { return -1 }
+        let fps = frameRate > 0 ? frameRate : 30.0
+        return Int((seconds * fps).rounded())
+    }
+
+    private func shouldLogSeekDiagnostics(for debugContext: VideoSeekDebugContext?) -> Bool {
+        Self.isFilteredSeekDiagnosticsEnabled && (debugContext?.hasActiveFilters ?? false)
+    }
+
+    private func logSeekResult(
+        phase: String,
+        expectedFrameIndex: Int,
+        actualFrameIndex: Int,
+        frameRate: Double,
+        toleranceFrames: Int,
+        debugContext: VideoSeekDebugContext?
+    ) {
+        guard shouldLogSeekDiagnostics(for: debugContext), let debugContext else { return }
+
+        let expectedInFilteredSet = debugContext.containsFilteredFrameIndex(expectedFrameIndex)
+        let actualInFilteredSet = debugContext.containsFilteredFrameIndex(actualFrameIndex)
+        let mismatch = actualFrameIndex != expectedFrameIndex
+        let unexpectedFilteredFrame = !actualInFilteredSet
+        let nearestFiltered = debugContext.nearestFilteredFrameIndices(around: actualFrameIndex)
+        let level = (mismatch || unexpectedFilteredFrame) ? "warning" : "debug"
+
+        let message =
+            "[FILTER-VIDEO] seekResult phase=\(phase) level=\(level) frameID=\(debugContext.frameID) idx=\(debugContext.currentIndex) ts=\(debugContext.timestamp) " +
+            "bundle=\(debugContext.frameBundleID ?? "nil") selectedApps=[\(debugContext.selectedAppsLabel)] " +
+            "expectedFrame=\(expectedFrameIndex) actualFrame=\(actualFrameIndex) expectedInFilteredSet=\(expectedInFilteredSet) actualInFilteredSet=\(actualInFilteredSet) " +
+            "nearestFiltered=[\(nearestFiltered)] frameRate=\(String(format: "%.3f", frameRate)) toleranceFrames=\(toleranceFrames)"
+
+        if mismatch || unexpectedFilteredFrame {
+            Log.warning(message, category: .ui)
+        } else {
+            Log.debug(message, category: .ui)
+        }
+    }
+
     /// Swap which player is visible
     private func swapPlayers() {
         let activePlayerView = isPlayerAActive ? playerViewA : playerViewB
@@ -1842,17 +2816,14 @@ class DoubleBufferedVideoView: NSView {
         activePlayerView?.isHidden = true
 
         // Clear the old active player's item to free memory
-        oldActivePlayer?.replaceCurrentItem(with: nil)
+        clearCurrentItem(for: oldActivePlayer)
 
         // Swap roles
         isPlayerAActive.toggle()
-
-        Log.debug("[VideoView] Players swapped, now active: \(isPlayerAActive ? "A" : "B")", category: .ui)
     }
 
     deinit {
-        observerA?.invalidate()
-        observerB?.invalidate()
+        releaseDecoderResources(reason: "DoubleBufferedVideoView deinit")
     }
 }
 
@@ -1865,6 +2836,7 @@ class DoubleBufferedVideoView: NSView {
 struct FrameWithURLOverlay<Content: View>: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel
     @EnvironmentObject var coordinatorWrapper: AppCoordinatorWrapper
+    @AppStorage("captureMousePosition", store: timelineSettingsStore) private var captureMousePosition = true
     let onURLClicked: () -> Void
     let content: () -> Content
 
@@ -1880,6 +2852,89 @@ struct FrameWithURLOverlay<Content: View>: View {
                 containerSize: geometry.size,
                 viewModel: viewModel
             )
+            let framePixelSize = currentFramePixelSize(viewModel: viewModel)
+            let capturedMouseCursorPoint = capturedMouseOverlayPoint(
+                mousePosition: viewModel.frameMousePosition,
+                framePixelSize: framePixelSize,
+                actualFrameRect: actualFrameRect
+            )
+            let highlightControlsVisibilityRow =
+                viewModel.highlightShowControlsContextMenuRow ||
+                shouldGuideHideControlsRow(
+                    containerSize: geometry.size,
+                    actualFrameRect: actualFrameRect
+                )
+            let showsHyperlinkVisualOverlays = !viewModel.isInLiveMode
+            let openHyperlink: (OCRHyperlinkMatch) -> Void = { match in
+                let didOpen = viewModel.openHyperlinkMatch(match)
+                if didOpen {
+                    // Keep browser frontmost after opening external link.
+                    TimelineWindowController.shared.hide(restorePreviousFocus: false)
+                }
+            }
+            let redactedNodes = viewModel.ocrNodes.filter(\.isRedacted)
+            let hyperlinkContextMenuEntries = (showsHyperlinkVisualOverlays ? viewModel.hyperlinkMatches : []).compactMap { match -> HyperlinkContextMenuEntry? in
+                let rect = transformedHyperlinkContextMenuRect(
+                    for: match,
+                    actualFrameRect: actualFrameRect,
+                    containerSize: geometry.size,
+                    scale: viewModel.frameZoomScale,
+                    offset: viewModel.frameZoomOffset
+                )
+                guard rect.width > 1, rect.height > 1 else { return nil }
+                return HyperlinkContextMenuEntry(match: match, rect: rect)
+            }
+            let redactionContextMenuEntries: [RedactedNodeContextMenuEntry] = {
+                if showFinal, let zoomRegion = viewModel.zoomRegion {
+                    let zoomedRect = zoomedFrameRectForContextMenu(
+                        zoomRegion: zoomRegion,
+                        containerSize: geometry.size,
+                        actualFrameRect: actualFrameRect
+                    )
+                    guard zoomedRect.width > 1, zoomedRect.height > 1 else { return [] }
+                    return redactedNodes.compactMap { node in
+                        guard let rect = zoomedRedactionContextMenuRect(
+                            for: node,
+                            zoomRegion: zoomRegion,
+                            zoomedRect: zoomedRect
+                        ),
+                        rect.width > 1,
+                        rect.height > 1 else {
+                            return nil
+                        }
+                        return RedactedNodeContextMenuEntry(
+                            node: node,
+                            rect: rect,
+                            tooltipState: SimpleTimelineViewModel.phraseLevelRedactionTooltipState(
+                                for: viewModel.currentTimelineFrame?.processingStatus ?? -1,
+                                isRevealed: viewModel.revealedRedactedNodePatches[node.id] != nil,
+                            isPermanent: node.isPermanentlyRedacted
+                            )
+                        )
+                    }
+                }
+
+                guard showNormal else { return [] }
+                return redactedNodes.compactMap { node in
+                    let rect = transformedRedactionContextMenuRect(
+                        for: node,
+                        actualFrameRect: actualFrameRect,
+                        containerSize: geometry.size,
+                        scale: viewModel.frameZoomScale,
+                        offset: viewModel.frameZoomOffset
+                    )
+                    guard rect.width > 1, rect.height > 1 else { return nil }
+                    return RedactedNodeContextMenuEntry(
+                        node: node,
+                        rect: rect,
+                        tooltipState: SimpleTimelineViewModel.phraseLevelRedactionTooltipState(
+                            for: viewModel.currentTimelineFrame?.processingStatus ?? -1,
+                            isRevealed: viewModel.revealedRedactedNodePatches[node.id] != nil,
+                            isPermanent: node.isPermanentlyRedacted
+                        )
+                    )
+                }
+            }()
 
             ZStack {
                 // The actual frame content (always present as base layer)
@@ -1908,6 +2963,15 @@ struct FrameWithURLOverlay<Content: View>: View {
                 if showNormal {
                     // Normal mode overlays
 
+                    if captureMousePosition,
+                       !viewModel.isInLiveMode,
+                       let cursorPoint = capturedMouseCursorPoint {
+                        CapturedMouseCursorOverlay(point: cursorPoint)
+                            .scaleEffect(viewModel.frameZoomScale)
+                            .offset(viewModel.frameZoomOffset)
+                            .allowsHitTesting(false)
+                    }
+
                     // Zoom region drag preview (shown while Shift+dragging)
                     if viewModel.isDraggingZoomRegion,
                        let start = viewModel.zoomRegionDragStart,
@@ -1923,18 +2987,38 @@ struct FrameWithURLOverlay<Content: View>: View {
                         .offset(viewModel.frameZoomOffset)
                     }
 
+                    if !viewModel.ocrNodes.isEmpty {
+                        RedactedNodeRevealOverlay(
+                            viewModel: viewModel,
+                            nodes: redactedNodes,
+                            actualFrameRect: actualFrameRect
+                        )
+                        .scaleEffect(viewModel.frameZoomScale)
+                        .offset(viewModel.frameZoomOffset)
+                        .allowsHitTesting(false)
+                    }
+
                     // Text selection overlay (for drag selection and zoom region creation)
-                    // Always render to allow shift-drag zoom region even when OCR nodes are empty (e.g., during/after scrolling)
+                    // Keep this above revealed patches so selection highlights remain visible after reveal.
+                    // Always render to allow shift-drag zoom region even when OCR nodes are empty.
                     TextSelectionOverlay(
                         viewModel: viewModel,
                         containerSize: geometry.size,
                         actualFrameRect: actualFrameRect,
+                        hyperlinkMatches: viewModel.hyperlinkMatches,
+                        onHyperlinkOpen: openHyperlink,
                         isInteractionDisabled: viewModel.isInLiveMode && viewModel.ocrNodes.isEmpty,
-                        onDragStart: { point in
-                            viewModel.startDragSelection(at: point)
+                        onDragStart: { point, isCommandDrag in
+                            viewModel.startDragSelection(
+                                at: point,
+                                mode: isCommandDrag ? .box : .character
+                            )
                         },
-                        onDragUpdate: { point in
-                            viewModel.updateDragSelection(to: point)
+                        onDragUpdate: { point, isCommandDrag in
+                            viewModel.updateDragSelection(
+                                to: point,
+                                mode: isCommandDrag ? .box : .character
+                            )
                             // Show hint banner when user drags through the screen
                             viewModel.showTextSelectionHintBannerOnce()
                         },
@@ -1966,7 +3050,7 @@ struct FrameWithURLOverlay<Content: View>: View {
                     .offset(viewModel.frameZoomOffset)
 
                     // URL bounding box overlay (if URL detected)
-                    if let box = viewModel.urlBoundingBox {
+                    if showsHyperlinkVisualOverlays, let box = viewModel.urlBoundingBox {
                         URLBoundingBoxOverlay(
                             boundingBox: box,
                             containerSize: geometry.size,
@@ -1977,20 +3061,59 @@ struct FrameWithURLOverlay<Content: View>: View {
                             },
                             onClick: {
                                 viewModel.openURLInBrowser()
-                                // Close the timeline view after opening URL
-                                onURLClicked()
+                                // Keep browser frontmost after opening external link.
+                                TimelineWindowController.shared.hide(restorePreviousFocus: false)
                             }
                         )
                         // Apply the same zoom transformations as the frame content
                         .scaleEffect(viewModel.frameZoomScale)
                         .offset(viewModel.frameZoomOffset)
                     }
+
+                    if showsHyperlinkVisualOverlays, !viewModel.hyperlinkMatches.isEmpty {
+                        OCRHyperlinkOverlay(
+                            matches: viewModel.hyperlinkMatches,
+                            actualFrameRect: actualFrameRect,
+                            onHoverChanged: { match in
+                                viewModel.updateInPageURLHoverState(match)
+                            },
+                            onOpen: openHyperlink
+                        )
+                        .scaleEffect(viewModel.frameZoomScale)
+                        .offset(viewModel.frameZoomOffset)
+                    }
                 }
 
             }
-            .onRightClick { location in
+            .overlay {
+                if !redactionContextMenuEntries.isEmpty {
+                    RedactionTooltipOverlay(
+                        viewModel: viewModel,
+                        entries: redactionContextMenuEntries,
+                        containerSize: geometry.size,
+                        onToggleReveal: { node in
+                            viewModel.togglePhraseLevelRedactionReveal(for: node)
+                        }
+                    )
+                }
+            }
+            .onRightClick(
+                hyperlinkEntries: hyperlinkContextMenuEntries,
+                onHyperlinkRightClick: { match in
+                    viewModel.dismissRedactionTooltip()
+                    viewModel.recordInPageURLRightClick(for: match)
+                },
+                onHyperlinkCopy: { match in
+                    _ = viewModel.copyHyperlinkMatch(match)
+                }
+            ) { location in
+                // Keep right-clicks on the floating filter card from opening the frame menu behind it.
+                guard !viewModel.isFilterPanelVisible else { return }
+                viewModel.dismissRedactionTooltip()
                 viewModel.contextMenuLocation = location
-                viewModel.showContextMenu = true
+                withAnimation(.easeOut(duration: 0.16)) {
+                    viewModel.showContextMenu = true
+                }
             }
             .overlay(
                 // Floating context menu at click location
@@ -2000,7 +3123,8 @@ struct FrameWithURLOverlay<Content: View>: View {
                             viewModel: viewModel,
                             isPresented: $viewModel.showContextMenu,
                             location: viewModel.contextMenuLocation,
-                            containerSize: geometry.size
+                            containerSize: geometry.size,
+                            highlightControlsVisibilityRow: highlightControlsVisibilityRow
                         )
                     }
                 }
@@ -2020,24 +3144,7 @@ struct FrameWithURLOverlay<Content: View>: View {
     /// Calculate the actual displayed frame rect within the container
     /// Takes into account aspect ratio fitting
     private func calculateActualDisplayedFrameRect(containerSize: CGSize, viewModel: SimpleTimelineViewModel) -> CGRect {
-        // Get the actual frame dimensions from videoInfo (database)
-        // Don't use NSImage.size as that requires extracting the frame from video first
-        let frameSize: CGSize
-        if viewModel.isInLiveMode, let liveImage = viewModel.liveScreenshot {
-            // Live mode: use screenshot dimensions (must check BEFORE videoInfo,
-            // since videoInfo may still be set from the last recorded frame with a different aspect ratio)
-            frameSize = CGSize(
-                width: liveImage.representations.first?.pixelsWide ?? Int(liveImage.size.width),
-                height: liveImage.representations.first?.pixelsHigh ?? Int(liveImage.size.height)
-            )
-        } else if let videoInfo = viewModel.displayedPrimaryVideoInfo,
-           let width = videoInfo.width,
-           let height = videoInfo.height {
-            frameSize = CGSize(width: width, height: height)
-        } else {
-            // Fallback to standard macOS screen dimensions (should rarely be needed)
-            frameSize = CGSize(width: 1920, height: 1080)
-        }
+        let frameSize = currentFramePixelSize(viewModel: viewModel)
 
         // Calculate aspect-fit dimensions
         let containerAspect = containerSize.width / containerSize.height
@@ -2070,6 +3177,367 @@ struct FrameWithURLOverlay<Content: View>: View {
 
         return CGRect(origin: offset, size: displayedSize)
     }
+
+    private func currentFramePixelSize(viewModel: SimpleTimelineViewModel) -> CGSize {
+        // Get the actual frame dimensions from videoInfo (database)
+        // Don't use NSImage.size as that requires extracting the frame from video first
+        let frameSize: CGSize
+        if viewModel.isInLiveMode, let liveImage = viewModel.liveScreenshot {
+            // Live mode: use screenshot dimensions (must check BEFORE videoInfo,
+            // since videoInfo may still be set from the last recorded frame with a different aspect ratio)
+            frameSize = CGSize(
+                width: liveImage.representations.first?.pixelsWide ?? Int(liveImage.size.width),
+                height: liveImage.representations.first?.pixelsHigh ?? Int(liveImage.size.height)
+            )
+        } else if let videoInfo = viewModel.displayedPrimaryVideoInfo,
+           let width = videoInfo.width,
+           let height = videoInfo.height {
+            frameSize = CGSize(width: width, height: height)
+        } else if let image = viewModel.displayableCurrentImage {
+            frameSize = CGSize(
+                width: image.representations.first?.pixelsWide ?? Int(image.size.width),
+                height: image.representations.first?.pixelsHigh ?? Int(image.size.height)
+            )
+        } else if let fallbackImage = viewModel.waitingVideoFallbackImage {
+            frameSize = CGSize(
+                width: fallbackImage.representations.first?.pixelsWide ?? Int(fallbackImage.size.width),
+                height: fallbackImage.representations.first?.pixelsHigh ?? Int(fallbackImage.size.height)
+            )
+        } else {
+            // Fallback to standard macOS screen dimensions (should rarely be needed)
+            frameSize = CGSize(width: 1920, height: 1080)
+        }
+
+        return frameSize
+    }
+
+    private func capturedMouseOverlayPoint(
+        mousePosition: CGPoint?,
+        framePixelSize: CGSize,
+        actualFrameRect: CGRect
+    ) -> CGPoint? {
+        guard let mousePosition else { return nil }
+        guard framePixelSize.width > 1, framePixelSize.height > 1 else { return nil }
+
+        let normalizedX = min(max(mousePosition.x / framePixelSize.width, 0), 1)
+        let normalizedY = min(max(mousePosition.y / framePixelSize.height, 0), 1)
+
+        return CGPoint(
+            x: actualFrameRect.origin.x + (normalizedX * actualFrameRect.width),
+            y: actualFrameRect.origin.y + (normalizedY * actualFrameRect.height)
+        )
+    }
+
+    /// Keep menu guidance behavior aligned with the top hint shown when highlighted OCR sits near the tape.
+    private func shouldGuideHideControlsRow(containerSize: CGSize, actualFrameRect: CGRect) -> Bool {
+        guard viewModel.isShowingSearchHighlight else { return false }
+        guard !viewModel.areControlsHidden else { return false }
+        guard !viewModel.isInFrameSearchVisible else { return false }
+
+        let highlightCutoffY = containerSize.height * 0.75
+        var seenNodeIDs = Set<Int>()
+
+        for match in viewModel.searchHighlightNodes {
+            guard seenNodeIDs.insert(match.node.id).inserted else { continue }
+
+            let rect = CGRect(
+                x: actualFrameRect.origin.x + (match.node.x * actualFrameRect.width),
+                y: actualFrameRect.origin.y + (match.node.y * actualFrameRect.height),
+                width: match.node.width * actualFrameRect.width,
+                height: match.node.height * actualFrameRect.height
+            )
+
+            guard !rect.isEmpty else { continue }
+            if rect.maxY >= highlightCutoffY {
+                return true
+            }
+        }
+
+        return false
+    }
+}
+
+private struct CapturedMouseCursorOverlay: View {
+    let point: CGPoint
+    private static let targetCursorSize = CGSize(width: 29, height: 40)
+    private static let macCursorVisualScale: CGFloat = 1.12
+    private static let fallbackHotspot = CGPoint(x: 3.26, y: 3.26)
+    private static let fallbackOuterCursorFontSize: CGFloat = 32.6
+    private static let fallbackInnerCursorFontSize: CGFloat = 29.4
+    private static let cursorOpacity: Double = 0.5
+
+    private static let macStyledCursor: (image: NSImage, hotSpot: CGPoint)? = {
+        let cursor = NSCursor.arrow
+        let image = cursor.image
+        guard image.size.width > 0, image.size.height > 0,
+              let recolored = recoloredMacCursorImage(image) else {
+            return nil
+        }
+        return (image: recolored, hotSpot: cursor.hotSpot)
+    }()
+
+    private static func resolvedRenderedCursorSize() -> CGSize {
+        guard let cursor = Self.macStyledCursor else { return Self.targetCursorSize }
+
+        let widthScale = Self.targetCursorSize.width / cursor.image.size.width
+        let heightScale = Self.targetCursorSize.height / cursor.image.size.height
+        let scale = min(widthScale, heightScale) * Self.macCursorVisualScale
+        return CGSize(
+            width: cursor.image.size.width * scale,
+            height: cursor.image.size.height * scale
+        )
+    }
+
+    /// Keep hotspot in the same orientation as the rendered cursor image.
+    /// The previous Y flip pushed the cursor image upward near top-edge frames.
+    private static func resolvedRenderedHotspot(for renderedCursorSize: CGSize) -> CGPoint {
+        guard let cursor = Self.macStyledCursor else { return Self.fallbackHotspot }
+        guard cursor.image.size.width > 0, cursor.image.size.height > 0 else { return Self.fallbackHotspot }
+
+        let scale = renderedCursorSize.width / cursor.image.size.width
+        return CGPoint(
+            x: cursor.hotSpot.x * scale,
+            y: cursor.hotSpot.y * scale
+        )
+    }
+
+    private var renderedCursorSize: CGSize {
+        Self.resolvedRenderedCursorSize()
+    }
+
+    private var renderedHotspot: CGPoint {
+        Self.resolvedRenderedHotspot(for: renderedCursorSize)
+    }
+
+    var body: some View {
+        Group {
+            if let cursor = Self.macStyledCursor {
+                Image(nsImage: cursor.image)
+                    .resizable()
+                    .interpolation(.high)
+            } else {
+                ZStack(alignment: .topLeading) {
+                    Image(systemName: "cursorarrow")
+                        .font(.system(size: Self.fallbackOuterCursorFontSize, weight: .black))
+                        .foregroundStyle(.white.opacity(0.96))
+                        .offset(x: 1.2, y: 1.2)
+
+                    Image(systemName: "cursorarrow")
+                        .font(.system(size: Self.fallbackInnerCursorFontSize, weight: .black))
+                        .foregroundStyle(Color.retraceBrandBlue) // #0B336C
+                        .offset(x: 0.56, y: 0.56)
+                }
+            }
+        }
+        .shadow(color: .black.opacity(0.22), radius: 1.6, x: 0, y: 0)
+        .opacity(Self.cursorOpacity)
+        .frame(width: renderedCursorSize.width, height: renderedCursorSize.height, alignment: .topLeading)
+        .position(
+            x: point.x + (renderedCursorSize.width / 2) - renderedHotspot.x,
+            y: point.y + (renderedCursorSize.height / 2) - renderedHotspot.y
+        )
+    }
+
+    /// Keep native white edge pixels and recolor only the dark cursor core to brand blue.
+    private static func recoloredMacCursorImage(_ image: NSImage) -> NSImage? {
+        let pointSize = image.size
+        guard pointSize.width > 0, pointSize.height > 0 else { return nil }
+
+        let pixelWidth = image.representations.map(\.pixelsWide).max() ?? Int(image.size.width.rounded())
+        let pixelHeight = image.representations.map(\.pixelsHigh).max() ?? Int(image.size.height.rounded())
+        guard pixelWidth > 0, pixelHeight > 0 else { return nil }
+
+        guard let bitmap = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: pixelWidth,
+            pixelsHigh: pixelHeight,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ) else {
+            return nil
+        }
+
+        // Preserve point-space sizing so cursor hotspot coordinates stay in the same unit space.
+        bitmap.size = pointSize
+        NSGraphicsContext.saveGraphicsState()
+        defer { NSGraphicsContext.restoreGraphicsState() }
+
+        guard let context = NSGraphicsContext(bitmapImageRep: bitmap) else { return nil }
+        NSGraphicsContext.current = context
+        image.draw(
+            in: NSRect(origin: .zero, size: pointSize),
+            from: .zero,
+            operation: .copy,
+            fraction: 1
+        )
+        context.flushGraphics()
+
+        guard let data = bitmap.bitmapData else { return nil }
+        let bytesPerRow = bitmap.bytesPerRow
+
+        let brandRed = 11.0
+        let brandGreen = 51.0
+        let brandBlue = 108.0
+
+        for row in 0 ..< pixelHeight {
+            for col in 0 ..< pixelWidth {
+                let offset = (row * bytesPerRow) + (col * 4)
+                let r = Double(data[offset + 0])
+                let g = Double(data[offset + 1])
+                let b = Double(data[offset + 2])
+                let a = Double(data[offset + 3])
+
+                guard a > 0 else { continue }
+
+                let luminance = ((0.2126 * r) + (0.7152 * g) + (0.0722 * b)) / 255.0
+                let shouldTintCore = (a >= 150.0 && luminance <= 0.76) || (a >= 100.0 && luminance <= 0.50)
+                guard shouldTintCore else { continue }
+
+                let edgeBlend = min(max((luminance - 0.10) / 0.60, 0.0), 1.0)
+                let tone = 0.84 + (0.16 * edgeBlend)
+
+                data[offset + 0] = UInt8(max(0, min(255, Int((brandRed * tone).rounded()))))
+                data[offset + 1] = UInt8(max(0, min(255, Int((brandGreen * tone).rounded()))))
+                data[offset + 2] = UInt8(max(0, min(255, Int((brandBlue * tone).rounded()))))
+            }
+        }
+
+        let output = NSImage(size: pointSize)
+        output.addRepresentation(bitmap)
+        return output
+    }
+}
+
+private func transformedHyperlinkContextMenuRect(
+    for match: OCRHyperlinkMatch,
+    actualFrameRect: CGRect,
+    containerSize: CGSize,
+    scale: CGFloat,
+    offset: CGSize
+) -> CGRect {
+    let rect = CGRect(
+        x: actualFrameRect.origin.x + (match.highlightX * actualFrameRect.width),
+        y: actualFrameRect.origin.y + (match.y * actualFrameRect.height),
+        width: match.highlightWidth * actualFrameRect.width,
+        height: match.height * actualFrameRect.height
+    )
+
+    guard scale != 1 else {
+        return rect.offsetBy(dx: offset.width, dy: offset.height)
+    }
+
+    let center = CGPoint(x: containerSize.width / 2, y: containerSize.height / 2)
+    let scaledOrigin = CGPoint(
+        x: center.x + ((rect.origin.x - center.x) * scale) + offset.width,
+        y: center.y + ((rect.origin.y - center.y) * scale) + offset.height
+    )
+
+    return CGRect(
+        origin: scaledOrigin,
+        size: CGSize(width: rect.width * scale, height: rect.height * scale)
+    )
+}
+
+private func transformedRedactionContextMenuRect(
+    for node: OCRNodeWithText,
+    actualFrameRect: CGRect,
+    containerSize: CGSize,
+    scale: CGFloat,
+    offset: CGSize
+) -> CGRect {
+    let rect = CGRect(
+        x: actualFrameRect.origin.x + (node.x * actualFrameRect.width),
+        y: actualFrameRect.origin.y + (node.y * actualFrameRect.height),
+        width: node.width * actualFrameRect.width,
+        height: node.height * actualFrameRect.height
+    )
+
+    guard scale != 1 else {
+        return rect.offsetBy(dx: offset.width, dy: offset.height)
+    }
+
+    let center = CGPoint(x: containerSize.width / 2, y: containerSize.height / 2)
+    let scaledOrigin = CGPoint(
+        x: center.x + ((rect.origin.x - center.x) * scale) + offset.width,
+        y: center.y + ((rect.origin.y - center.y) * scale) + offset.height
+    )
+
+    return CGRect(
+        origin: scaledOrigin,
+        size: CGSize(width: rect.width * scale, height: rect.height * scale)
+    )
+}
+
+private func zoomedFrameRectForContextMenu(
+    zoomRegion: CGRect,
+    containerSize: CGSize,
+    actualFrameRect: CGRect
+) -> CGRect {
+    let menuWidth: CGFloat = 180
+    let menuGap: CGFloat = 30
+    let maxWidth = containerSize.width * 0.70
+    let maxHeight = containerSize.height * 0.75
+    let regionWidth = zoomRegion.width * actualFrameRect.width
+    let regionHeight = zoomRegion.height * actualFrameRect.height
+    guard regionWidth > 0, regionHeight > 0 else { return .zero }
+
+    let scaleToFit = min(maxWidth / regionWidth, maxHeight / regionHeight)
+    let enlargedWidth = regionWidth * scaleToFit
+    let enlargedHeight = regionHeight * scaleToFit
+    let availableWidth = containerSize.width - menuWidth - menuGap
+
+    return CGRect(
+        x: (availableWidth - enlargedWidth) / 2,
+        y: (containerSize.height - enlargedHeight) / 2,
+        width: enlargedWidth,
+        height: enlargedHeight
+    )
+}
+
+private func zoomedRedactionContextMenuRect(
+    for node: OCRNodeWithText,
+    zoomRegion: CGRect,
+    zoomedRect: CGRect
+) -> CGRect? {
+    let regionMaxX = zoomRegion.origin.x + zoomRegion.width
+    let regionMaxY = zoomRegion.origin.y + zoomRegion.height
+    let nodeMaxX = node.x + node.width
+    let nodeMaxY = node.y + node.height
+
+    guard nodeMaxX > zoomRegion.origin.x,
+          node.x < regionMaxX,
+          nodeMaxY > zoomRegion.origin.y,
+          node.y < regionMaxY else {
+        return nil
+    }
+
+    let relativeX = (node.x - zoomRegion.origin.x) / zoomRegion.width
+    let relativeY = (node.y - zoomRegion.origin.y) / zoomRegion.height
+    let relativeWidth = node.width / zoomRegion.width
+    let relativeHeight = node.height / zoomRegion.height
+
+    return CGRect(
+        x: zoomedRect.origin.x + (relativeX * zoomedRect.width),
+        y: zoomedRect.origin.y + (relativeY * zoomedRect.height),
+        width: relativeWidth * zoomedRect.width,
+        height: relativeHeight * zoomedRect.height
+    )
+}
+
+struct HyperlinkContextMenuEntry {
+    let match: OCRHyperlinkMatch
+    let rect: CGRect
+}
+
+struct RedactedNodeContextMenuEntry {
+    let node: OCRNodeWithText
+    let rect: CGRect
+    let tooltipState: SimpleTimelineViewModel.PhraseLevelRedactionTooltipState?
 }
 
 // MARK: - Frame Zoom Indicator
@@ -2082,7 +3550,7 @@ struct FrameZoomIndicator: View {
         HStack(spacing: .spacingS) {
             Image(systemName: zoomScale > 1.0 ? "plus.magnifyingglass" : "minus.magnifyingglass")
                 .font(.retraceCaption)
-            Text("\(Int(zoomScale * 100))%")
+            Text(TimelineZoomSettings.percentLabel(forScale: zoomScale))
                 .font(.retraceCaption.monospacedDigit())
         }
         .foregroundColor(.white)
@@ -2093,6 +3561,553 @@ struct FrameZoomIndicator: View {
                 .fill(Color.black.opacity(0.6))
         )
         .transition(.opacity.combined(with: .scale))
+    }
+}
+
+private struct DemystifiedRevealPatchView: View {
+    let patch: NSImage
+    let size: CGSize
+    let isVisible: Bool
+
+    @State private var revealProgress: CGFloat = 0
+
+    private static let revealAnimation = Animation.spring(response: 0.46, dampingFraction: 0.84)
+
+    var body: some View {
+        ZStack {
+            Image(nsImage: patch)
+                .resizable()
+                .interpolation(.none)
+                .frame(width: size.width, height: size.height)
+                .blur(radius: (1.0 - revealProgress) * 12.0)
+                .saturation(0.65 + (0.35 * revealProgress))
+                .brightness((1.0 - revealProgress) * 0.08)
+                .scaleEffect(1.03 - (0.03 * revealProgress))
+
+            LinearGradient(
+                colors: [
+                    Color.white.opacity(0.0),
+                    Color.white.opacity(0.55),
+                    Color.white.opacity(0.0)
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            .frame(width: max(size.width * 0.28, 18), height: size.height * 1.5)
+            .rotationEffect(.degrees(16))
+            .offset(x: (size.width * 1.35 * revealProgress) - (size.width * 0.7))
+            .opacity(1.0 - min(revealProgress * 1.1, 1.0))
+            .blendMode(.screen)
+        }
+        .compositingGroup()
+        .clipShape(RoundedRectangle(cornerRadius: 4))
+        .onAppear {
+            revealProgress = isVisible ? 0 : 1
+            withAnimation(Self.revealAnimation) {
+                revealProgress = isVisible ? 1 : 0
+            }
+        }
+        .onChange(of: isVisible) { visible in
+            withAnimation(Self.revealAnimation) {
+                revealProgress = visible ? 1 : 0
+            }
+        }
+    }
+}
+
+struct RedactedNodeRevealOverlay: View {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+    let nodes: [OCRNodeWithText]
+    let actualFrameRect: CGRect
+
+    private var processingStatus: Int {
+        viewModel.currentTimelineFrame?.processingStatus ?? -1
+    }
+
+    var body: some View {
+        ZStack {
+            ForEach(nodes, id: \.id) { node in
+                let rect = nodeRect(for: node)
+                if rect.width > 1, rect.height > 1 {
+                    let isTooltipActive = viewModel.activeRedactionTooltipNodeID == node.id
+                    let outlineState = SimpleTimelineViewModel.phraseLevelRedactionOutlineState(
+                        for: processingStatus,
+                        isTooltipActive: isTooltipActive
+                    )
+                    let patch = viewModel.revealedRedactedNodePatches[node.id]
+                        ?? viewModel.hidingRedactedNodePatches[node.id]
+                    ZStack {
+                        if let patch {
+                            DemystifiedRevealPatchView(
+                                patch: patch,
+                                size: CGSize(width: rect.width, height: rect.height),
+                                isVisible: viewModel.revealedRedactedNodePatches[node.id] != nil
+                            )
+                                .frame(width: rect.width, height: rect.height)
+                        }
+
+                        if outlineState != .hidden {
+                            RoundedRectangle(cornerRadius: 4)
+                                .stroke(
+                                    outlineColor(for: outlineState),
+                                    style: StrokeStyle(
+                                        lineWidth: 1.5,
+                                        dash: outlineState == .queued ? [4, 3] : []
+                                    )
+                                )
+                        }
+                    }
+                    .frame(width: rect.width, height: rect.height)
+                    .position(x: rect.midX, y: rect.midY)
+                }
+            }
+        }
+    }
+
+    private func nodeRect(for node: OCRNodeWithText) -> CGRect {
+        CGRect(
+            x: actualFrameRect.origin.x + (node.x * actualFrameRect.width),
+            y: actualFrameRect.origin.y + (node.y * actualFrameRect.height),
+            width: node.width * actualFrameRect.width,
+            height: node.height * actualFrameRect.height
+        )
+    }
+
+    private func outlineColor(
+        for state: SimpleTimelineViewModel.PhraseLevelRedactionOutlineState
+    ) -> Color {
+        switch state {
+        case .hidden:
+            return .clear
+        case .queued:
+            return Color.white.opacity(0.22)
+        case .active:
+            return Color.white.opacity(0.82)
+        }
+    }
+}
+
+struct ZoomedRedactedNodeRevealOverlay: View {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+    let zoomRegion: CGRect
+    let zoomedRect: CGRect
+
+    private var processingStatus: Int {
+        viewModel.currentTimelineFrame?.processingStatus ?? -1
+    }
+
+    var body: some View {
+        ZStack {
+            ForEach(viewModel.ocrNodes.filter(\.isRedacted), id: \.id) { node in
+                if let rect = transformedRect(for: node), rect.width > 1, rect.height > 1 {
+                    let isTooltipActive = viewModel.activeRedactionTooltipNodeID == node.id
+                    let outlineState = SimpleTimelineViewModel.phraseLevelRedactionOutlineState(
+                        for: processingStatus,
+                        isTooltipActive: isTooltipActive
+                    )
+                    let patch = viewModel.revealedRedactedNodePatches[node.id]
+                        ?? viewModel.hidingRedactedNodePatches[node.id]
+
+                    ZStack {
+                        if let patch {
+                            DemystifiedRevealPatchView(
+                                patch: patch,
+                                size: CGSize(width: rect.width, height: rect.height),
+                                isVisible: viewModel.revealedRedactedNodePatches[node.id] != nil
+                            )
+                                .frame(width: rect.width, height: rect.height)
+                        }
+
+                        if outlineState != .hidden {
+                            RoundedRectangle(cornerRadius: 4)
+                                .stroke(
+                                    outlineColor(for: outlineState),
+                                    style: StrokeStyle(
+                                        lineWidth: 1.5,
+                                        dash: outlineState == .queued ? [4, 3] : []
+                                    )
+                                )
+                        }
+                    }
+                    .frame(width: rect.width, height: rect.height)
+                    .position(x: rect.midX, y: rect.midY)
+                }
+            }
+        }
+        .mask(
+            Rectangle()
+                .frame(width: zoomedRect.width, height: zoomedRect.height)
+                .position(x: zoomedRect.midX, y: zoomedRect.midY)
+        )
+    }
+
+    private func transformedRect(for node: OCRNodeWithText) -> CGRect? {
+        let regionMaxX = zoomRegion.origin.x + zoomRegion.width
+        let regionMaxY = zoomRegion.origin.y + zoomRegion.height
+        let nodeMaxX = node.x + node.width
+        let nodeMaxY = node.y + node.height
+
+        guard nodeMaxX > zoomRegion.origin.x,
+              node.x < regionMaxX,
+              nodeMaxY > zoomRegion.origin.y,
+              node.y < regionMaxY else {
+            return nil
+        }
+
+        let relativeX = (node.x - zoomRegion.origin.x) / zoomRegion.width
+        let relativeY = (node.y - zoomRegion.origin.y) / zoomRegion.height
+        let relativeWidth = node.width / zoomRegion.width
+        let relativeHeight = node.height / zoomRegion.height
+
+        return CGRect(
+            x: zoomedRect.origin.x + (relativeX * zoomedRect.width),
+            y: zoomedRect.origin.y + (relativeY * zoomedRect.height),
+            width: relativeWidth * zoomedRect.width,
+            height: relativeHeight * zoomedRect.height
+        )
+    }
+
+    private func outlineColor(
+        for state: SimpleTimelineViewModel.PhraseLevelRedactionOutlineState
+    ) -> Color {
+        switch state {
+        case .hidden:
+            return .clear
+        case .queued:
+            return Color.white.opacity(0.26)
+        case .active:
+            return Color.white.opacity(0.9)
+        }
+    }
+}
+
+struct RedactionTooltipOverlay: View {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+    let entries: [RedactedNodeContextMenuEntry]
+    let containerSize: CGSize
+    let onToggleReveal: (OCRNodeWithText) -> Void
+    @State private var escapeMonitor: Any?
+    @State private var hoveredNodeID: Int?
+
+    private let tooltipHeight: CGFloat = TimelineHoverTooltipStyle.height
+    private let edgePadding: CGFloat = 14
+    private let tooltipGap: CGFloat = 10
+
+    private var hoverEntries: [RedactionTooltipHoverEntry] {
+        entries.compactMap { entry in
+            guard let tooltipState = entry.tooltipState else { return nil }
+            return RedactionTooltipHoverEntry(
+                nodeID: entry.node.id,
+                triggerFrame: Self.triggerFrame(for: entry.rect),
+                tooltipState: tooltipState
+            )
+        }
+    }
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            RedactionTooltipHoverTracker(
+                entries: hoverEntries,
+                onHoveredNodeChanged: handleHoveredNodeChanged,
+                onPrimaryClick: handlePrimaryClick(at:)
+            )
+            .frame(width: containerSize.width, height: containerSize.height)
+
+            ForEach(entries, id: \.node.id) { entry in
+                if let tooltipState = entry.tooltipState {
+                    let tooltipFrame = Self.tooltipFrame(
+                        for: entry.rect,
+                        state: tooltipState,
+                        containerSize: containerSize,
+                        edgePadding: edgePadding,
+                        tooltipHeight: tooltipHeight,
+                        tooltipGap: tooltipGap
+                    )
+
+                    if hoveredNodeID == entry.node.id {
+                        tooltipLabel(for: tooltipState)
+                        .frame(width: tooltipFrame.width, height: tooltipFrame.height)
+                        .offset(x: tooltipFrame.minX, y: tooltipFrame.minY)
+                        .allowsHitTesting(false)
+                        .transition(.opacity.combined(with: .scale(scale: 0.94)))
+                        .zIndex(1)
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .animation(.easeOut(duration: 0.12), value: hoveredNodeID)
+        .onChange(of: entries.map(\.node.id)) { nodeIDs in
+            if let hoveredNodeID, !nodeIDs.contains(hoveredNodeID) {
+                clearHoveredNode()
+            }
+        }
+        .onAppear {
+            guard escapeMonitor == nil else { return }
+            escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+                guard event.keyCode == 53 else { return event }
+                guard hoveredNodeID != nil else { return event }
+                clearHoveredNode()
+                return nil
+            }
+        }
+        .onDisappear {
+            clearHoveredNode()
+            if let escapeMonitor {
+                NSEvent.removeMonitor(escapeMonitor)
+                self.escapeMonitor = nil
+            }
+        }
+    }
+
+    private func handleHoveredNodeChanged(_ nodeID: Int?) {
+        guard let nodeID,
+              let hoveredEntry = hoverEntries.first(where: { $0.nodeID == nodeID }) else {
+            clearHoveredNode()
+            return
+        }
+
+        guard hoveredNodeID != nodeID else { return }
+
+        hoveredNodeID = nodeID
+        viewModel.showRedactionTooltip(for: nodeID)
+        viewModel.showRedactionTooltip(for: nodeID, state: hoveredEntry.tooltipState)
+    }
+
+    private func handlePrimaryAction(
+        for node: OCRNodeWithText,
+        state: SimpleTimelineViewModel.PhraseLevelRedactionTooltipState
+    ) {
+        switch state {
+        case .queued, .permanent:
+            break
+        case .reveal, .hide:
+            onToggleReveal(node)
+        }
+    }
+
+    private func handlePrimaryClick(at location: CGPoint) -> Bool {
+        guard let matchedEntry = entries.first(where: { Self.triggerFrame(for: $0.rect).contains(location) }),
+              let tooltipState = matchedEntry.tooltipState,
+              tooltipState.isInteractive else {
+            return false
+        }
+
+        handlePrimaryAction(for: matchedEntry.node, state: tooltipState)
+        return true
+    }
+
+    private func clearHoveredNode() {
+        hoveredNodeID = nil
+        viewModel.dismissRedactionTooltip()
+    }
+
+    static func triggerFrame(for rect: CGRect) -> CGRect {
+        CGRect(
+            x: rect.minX,
+            y: rect.minY,
+            width: max(rect.width, 1),
+            height: max(rect.height, 1)
+        )
+    }
+
+    private func tooltipWidth(
+        for state: SimpleTimelineViewModel.PhraseLevelRedactionTooltipState
+    ) -> CGFloat {
+        TimelineHoverTooltipStyle.width(for: state.tooltipText)
+    }
+
+    private func tooltipForegroundColor(
+        for state: SimpleTimelineViewModel.PhraseLevelRedactionTooltipState
+    ) -> Color {
+        state.isInteractive ? .white : .white.opacity(0.5)
+    }
+
+    private func tooltipBackgroundColor(
+        for state: SimpleTimelineViewModel.PhraseLevelRedactionTooltipState
+    ) -> Color {
+        state.isInteractive
+            ? TimelineHoverTooltipStyle.backgroundColor
+            : TimelineHoverTooltipStyle.backgroundColor.opacity(0.72)
+    }
+
+    @ViewBuilder
+    private func tooltipLabel(
+        for state: SimpleTimelineViewModel.PhraseLevelRedactionTooltipState
+    ) -> some View {
+        Text(state.tooltipText)
+            .font(TimelineHoverTooltipStyle.font)
+            .foregroundColor(tooltipForegroundColor(for: state))
+            .lineLimit(1)
+            .fixedSize()
+            .padding(.horizontal, TimelineHoverTooltipStyle.horizontalPadding)
+            .padding(.vertical, TimelineHoverTooltipStyle.verticalPadding)
+            .background(
+                Capsule()
+                    .fill(tooltipBackgroundColor(for: state))
+            )
+    }
+
+    static func tooltipFrame(
+        for rect: CGRect,
+        state: SimpleTimelineViewModel.PhraseLevelRedactionTooltipState,
+        containerSize: CGSize,
+        edgePadding: CGFloat = 14,
+        tooltipHeight: CGFloat = 28,
+        tooltipGap: CGFloat = 10
+    ) -> CGRect {
+        let tooltipWidth = TimelineHoverTooltipStyle.width(for: state.tooltipText)
+
+        var originX = rect.midX - (tooltipWidth / 2)
+        originX = min(
+            max(originX, edgePadding),
+            containerSize.width - tooltipWidth - edgePadding
+        )
+
+        let preferredTopY = rect.minY - tooltipHeight - tooltipGap
+        let fallbackBottomY = rect.maxY + tooltipGap
+        let originY: CGFloat
+        if preferredTopY >= edgePadding {
+            originY = preferredTopY
+        } else {
+            originY = min(
+                max(fallbackBottomY, edgePadding),
+                containerSize.height - tooltipHeight - edgePadding
+            )
+        }
+
+        return CGRect(x: originX, y: originY, width: tooltipWidth, height: tooltipHeight)
+    }
+}
+
+private struct RedactionTooltipHoverEntry: Equatable {
+    let nodeID: Int
+    let triggerFrame: CGRect
+    let tooltipState: SimpleTimelineViewModel.PhraseLevelRedactionTooltipState
+}
+
+private struct RedactionTooltipHoverTracker: NSViewRepresentable {
+    let entries: [RedactionTooltipHoverEntry]
+    let onHoveredNodeChanged: (Int?) -> Void
+    let onPrimaryClick: (CGPoint) -> Bool
+
+    func makeNSView(context: Context) -> RedactionTooltipHoverTrackingView {
+        let view = RedactionTooltipHoverTrackingView()
+        view.onHoveredNodeChanged = onHoveredNodeChanged
+        view.onPrimaryClick = onPrimaryClick
+        return view
+    }
+
+    func updateNSView(_ nsView: RedactionTooltipHoverTrackingView, context: Context) {
+        let didEntriesChange = nsView.entries != entries
+        nsView.entries = entries
+        nsView.onHoveredNodeChanged = onHoveredNodeChanged
+        nsView.onPrimaryClick = onPrimaryClick
+        if didEntriesChange || !nsView.hasPerformedInitialHoverSync {
+            nsView.refreshHoverStateForCurrentMouseLocation()
+            nsView.hasPerformedInitialHoverSync = true
+        }
+    }
+}
+
+private final class RedactionTooltipHoverTrackingView: NSView {
+    var entries: [RedactionTooltipHoverEntry] = []
+    var onHoveredNodeChanged: ((Int?) -> Void)?
+    var onPrimaryClick: ((CGPoint) -> Bool)?
+    var hasPerformedInitialHoverSync = false
+
+    private var trackingArea: NSTrackingArea?
+    private var localMouseDownMonitor: Any?
+
+    override var isFlipped: Bool {
+        true
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        hasPerformedInitialHoverSync = false
+        if window == nil {
+            removeLocalMouseDownMonitor()
+        } else {
+            installLocalMouseDownMonitorIfNeeded()
+        }
+    }
+
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        if newWindow == nil {
+            removeLocalMouseDownMonitor()
+        }
+        super.viewWillMove(toWindow: newWindow)
+    }
+
+    deinit {
+        removeLocalMouseDownMonitor()
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea {
+            removeTrackingArea(trackingArea)
+        }
+
+        let options: NSTrackingArea.Options = [
+            .activeInKeyWindow,
+            .mouseEnteredAndExited,
+            .mouseMoved,
+            .inVisibleRect
+        ]
+        let trackingArea = NSTrackingArea(rect: .zero, options: options, owner: self, userInfo: nil)
+        self.trackingArea = trackingArea
+        addTrackingArea(trackingArea)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        let location = convert(event.locationInWindow, from: nil)
+        onHoveredNodeChanged?(hoveredNodeID(at: location))
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        let location = convert(event.locationInWindow, from: nil)
+        onHoveredNodeChanged?(hoveredNodeID(at: location))
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        onHoveredNodeChanged?(nil)
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        nil
+    }
+
+    func refreshHoverStateForCurrentMouseLocation() {
+        guard let window else { return }
+        let location = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        onHoveredNodeChanged?(hoveredNodeID(at: location))
+    }
+
+    private func installLocalMouseDownMonitorIfNeeded() {
+        guard localMouseDownMonitor == nil else { return }
+
+        localMouseDownMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
+            guard let self, let eventWindow = event.window, eventWindow == self.window else {
+                return event
+            }
+
+            let location = self.convert(event.locationInWindow, from: nil)
+            guard self.onPrimaryClick?(location) == true else { return event }
+            return nil
+        }
+    }
+
+    private func removeLocalMouseDownMonitor() {
+        if let localMouseDownMonitor {
+            NSEvent.removeMonitor(localMouseDownMonitor)
+            self.localMouseDownMonitor = nil
+        }
+    }
+
+    private func hoveredNodeID(at location: CGPoint) -> Int? {
+        entries.first(where: { $0.triggerFrame.contains(location) })?.nodeID
     }
 }
 
@@ -2251,7 +4266,7 @@ struct ZoomUnifiedOverlay<Content: View>: View {
         animationProgress = 0
         // Kick to next run loop so the 0 state is committed before we animate to 1.
         DispatchQueue.main.async {
-            withAnimation(.spring(response: 0.4, dampingFraction: 0.85)) {
+            withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
                 animationProgress = 1.0
             }
         }
@@ -2267,12 +4282,34 @@ struct ZoomUnifiedOverlay<Content: View>: View {
 
     @ViewBuilder
     private func zoomedContentView() -> some View {
-        if let snapshot = frozenZoomSnapshot {
-            Image(nsImage: snapshot)
-                .resizable()
-                .aspectRatio(contentMode: .fit)
+        if viewModel.isInLiveMode {
+            ZStack {
+                Color.black
+                if let snapshot = frozenZoomSnapshot {
+                    Image(nsImage: snapshot)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .transition(.identity)
+                } else {
+                    content()
+                        .transition(.identity)
+                }
+            }
         } else {
-            content()
+            // Historical mode prefers extractor-backed snapshots for frame accuracy.
+            // Fall back to content() when extraction misses so we don't render a black pane.
+            ZStack {
+                Color.black
+                if let snapshot = frozenZoomSnapshot {
+                    Image(nsImage: snapshot)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .transition(.identity)
+                } else {
+                    content()
+                        .transition(.identity)
+                }
+            }
         }
     }
 
@@ -2352,19 +4389,39 @@ struct ZoomUnifiedOverlay<Content: View>: View {
         // Content and border animate together from start position
         // Dimming stays constant throughout - no fade, just like during drag
         ZStack {
-            // Light blur on the background - fades in as image centers
+            // LAYER 1: Dismiss overlay - full screen, tappable to exit zoom
+            // Bottom layer to catch clicks that pass through all other layers
+            if !isTransitioning && !isExitTransitioning {
+                Color.clear
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        Log.debug("[ZoomDismiss] Dismiss overlay tapped - exiting zoom region", category: .ui)
+                        viewModel.exitZoomRegion()
+                    }
+            }
+
+            // LAYER 2: Light blur on the background - visual only, no interaction
             Rectangle()
                 .fill(.regularMaterial)
-                .opacity(progress * 0.3)
+                .opacity(targetBlur * 0.3)
+                .allowsHitTesting(false)
 
-            // Darken outside the rectangle - constant opacity to match drag preview
+            // LAYER 3: Darken outside the rectangle - visual only, no interaction
             InverseRoundedRectCutout(
                 cutoutRect: targetRect,
                 cornerRadius: 12
             )
             .fill(Color.black.opacity(0.6), style: FillStyle(eoFill: true))
+            .allowsHitTesting(false)
 
-            // The zoomed content that animates from original position to center
+            // LAYER 4: The zoomed content - visual only (interaction handled by overlay on top)
+            RoundedRectangle(cornerRadius: 12)
+                .fill(Color.black)
+                .frame(width: targetRect.width, height: targetRect.height)
+                .position(x: targetRect.midX, y: targetRect.midY)
+                .allowsHitTesting(false)
+
+            // LAYER 5: The zoomed content - visual only (interaction handled by overlay on top)
             zoomedContentView()
                 .frame(width: containerSize.width, height: containerSize.height)
                 .scaleEffect(targetScale, anchor: .center)
@@ -2375,14 +4432,16 @@ struct ZoomUnifiedOverlay<Content: View>: View {
                         .frame(width: targetRect.width, height: targetRect.height)
                         .position(x: targetRect.midX, y: targetRect.midY)
                 }
+                .allowsHitTesting(false)
 
-            // White border around the rectangle
+            // LAYER 6: White border - visual only, no interaction
             RoundedRectangle(cornerRadius: 12)
                 .stroke(Color.white.opacity(0.9), lineWidth: lerp(2, 3, progress))
                 .frame(width: targetRect.width, height: targetRect.height)
                 .position(x: targetRect.midX, y: targetRect.midY)
+                .allowsHitTesting(false)
 
-            // Text selection overlay - only show when NOT transitioning (final state)
+            // LAYER 7: Text selection overlay - interactive within zoomed region only
             if !isTransitioning && !isExitTransitioning && !viewModel.ocrNodes.isEmpty {
                 ZoomedTextSelectionOverlay(
                     viewModel: viewModel,
@@ -2390,9 +4449,17 @@ struct ZoomUnifiedOverlay<Content: View>: View {
                     containerSize: containerSize,
                     zoomedRect: endRect
                 )
+                // This layer handles text selection - allows hit testing only within its bounds
+
+                ZoomedRedactedNodeRevealOverlay(
+                    viewModel: viewModel,
+                    zoomRegion: zoomRegion,
+                    zoomedRect: endRect
+                )
+                .allowsHitTesting(false)
             }
 
-            // Action menu on the right side - animate in with the zoom
+            // LAYER 8: Action menu - interactive, should receive clicks
             ZoomActionMenu(
                 viewModel: viewModel,
                 zoomRegion: zoomRegion
@@ -2400,15 +4467,21 @@ struct ZoomUnifiedOverlay<Content: View>: View {
             .frame(width: menuWidth)
             .position(x: menuX + menuWidth / 2, y: menuY)
             .opacity(progress)
-            .offset(x: lerp(30, 0, progress))  // Slide in from right
+            .offset(x: lerp(30, 0, progress))
+            .onTapGesture {
+                // This catches clicks on the menu background to prevent dismissal
+                Log.debug("[ZoomDismiss] Menu area tapped - ignoring", category: .ui)
+            }
         }
         .allowsHitTesting(!isTransitioning && !isExitTransitioning)
         // Animate all interpolated values together
-        .animation(.spring(response: 0.4, dampingFraction: 0.85), value: animationProgress)
+        .animation(.spring(response: 0.35, dampingFraction: 0.85), value: animationProgress)
+        // Never fade/cross-dissolve when snapshot is swapped mid-transition.
+        .animation(nil, value: viewModel.shiftDragDisplaySnapshotFrameID)
         .onAppear {
             // Always capture fresh snapshot when appearing - don't reuse stale snapshots
             // from previous zoom sessions that may have persisted in @State
-            frozenZoomSnapshot = viewModel.currentImage
+            frozenZoomSnapshot = (viewModel.isInLiveMode ? viewModel.liveScreenshot : nil) ?? viewModel.shiftDragDisplaySnapshot
 
             // Start at 0 when appearing during enter transition
             if isTransitioning {
@@ -2423,7 +4496,7 @@ struct ZoomUnifiedOverlay<Content: View>: View {
         }
         .onChange(of: isTransitioning) { newValue in
             if newValue {
-                frozenZoomSnapshot = viewModel.currentImage
+                frozenZoomSnapshot = (viewModel.isInLiveMode ? viewModel.liveScreenshot : nil) ?? viewModel.shiftDragDisplaySnapshot
                 startLocalTransitionAnimation()
             }
         }
@@ -2432,11 +4505,14 @@ struct ZoomUnifiedOverlay<Content: View>: View {
                 startExitAnimation()
             }
         }
-        .onChange(of: viewModel.currentImage) { newValue in
-            // If we didn't have a snapshot at transition start (e.g. image still loading),
-            // freeze it as soon as it's available to avoid instantiating a second AVPlayer view.
-            if isTransitioning, frozenZoomSnapshot == nil, let image = newValue {
-                frozenZoomSnapshot = image
+        .onChange(of: viewModel.shiftDragDisplaySnapshot) { newValue in
+            // If the extractor snapshot arrives after transition start, adopt it immediately.
+            if (isTransitioning || !viewModel.isInLiveMode), let image = newValue {
+                var noAnimationTransaction = Transaction()
+                noAnimationTransaction.animation = nil
+                withTransaction(noAnimationTransaction) {
+                    frozenZoomSnapshot = image
+                }
             }
         }
     }
@@ -2517,24 +4593,12 @@ struct ZoomActionMenu: View {
     private func shareZoomedImage() {
         getZoomedImage { image in
             guard let image = image else {
-                #if DEBUG
-                print("[Share] No image to share")
-                #endif
                 return
             }
 
-            #if DEBUG
-            print("[Share] Got image, creating picker")
-            #endif
             let picker = NSSharingServicePicker(items: [image])
             if let window = NSApp.keyWindow,
                let contentView = window.contentView {
-                #if DEBUG
-                print("[Share] Showing picker, window level: \(window.level.rawValue)")
-                #endif
-
-                let windowCountBefore = NSApp.windows.count
-
                 // Show share picker near the right side of the window where the action menu is
                 // Position it roughly where the Share button would be (right side, upper-middle area)
                 let menuRect = CGRect(
@@ -2548,12 +4612,8 @@ struct ZoomActionMenu: View {
                 // Check multiple times for the picker window to appear
                 for delay in [0.05, 0.1, 0.2, 0.5] {
                     DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-                        #if DEBUG
-                        print("[Share] Checking windows after \(delay)s, count: \(NSApp.windows.count) (was \(windowCountBefore))")
                         for appWindow in NSApp.windows {
                             let className = String(describing: type(of: appWindow))
-                            let objcClassName = appWindow.className
-                            print("[Share] Window: \(className) / \(objcClassName), level: \(appWindow.level.rawValue), visible: \(appWindow.isVisible)")
 
                             // Raise any window that's not our main windows and is below screenSaver level
                             // Exclude: status bar, timeline (KeyableWindow), and dashboard (NSWindow at level 0)
@@ -2566,54 +4626,22 @@ struct ZoomActionMenu: View {
                                !isStatusBar &&
                                !isTimeline &&
                                !isDashboard {
-                                print("[Share] Raising window level for: \(className)")
                                 appWindow.level = .screenSaver + 1
                             }
                         }
-                        #endif
                     }
                 }
-            } else {
-                #if DEBUG
-                print("[Share] No key window or content view")
-                #endif
             }
         }
     }
 
     private func copyZoomedImageToClipboard() {
-        getZoomedImage { image in
-            guard let image = image else { return }
-            let pasteboard = NSPasteboard.general
-            pasteboard.clearContents()
-            pasteboard.writeObjects([image])
-        }
+        viewModel.copyZoomedRegionImage()
         viewModel.exitZoomRegion()
     }
 
     private func copyTextFromZoomRegion() {
-        // Get text from OCR nodes within the zoom region
-        let textInRegion = viewModel.ocrNodes
-            .filter { node in
-                let nodeRight = node.x + node.width
-                let nodeBottom = node.y + node.height
-                let regionRight = zoomRegion.origin.x + zoomRegion.width
-                let regionBottom = zoomRegion.origin.y + zoomRegion.height
-
-                return nodeRight > zoomRegion.origin.x &&
-                       node.x < regionRight &&
-                       nodeBottom > zoomRegion.origin.y &&
-                       node.y < regionBottom
-            }
-            .sorted { ($0.y, $0.x) < ($1.y, $1.x) }  // Sort top-to-bottom, left-to-right
-            .map { $0.text }
-            .joined(separator: " ")
-
-        if !textInRegion.isEmpty {
-            let pasteboard = NSPasteboard.general
-            pasteboard.clearContents()
-            pasteboard.setString(textInRegion, forType: .string)
-        }
+        viewModel.copyZoomedRegionText()
         viewModel.exitZoomRegion()
     }
 
@@ -2639,7 +4667,7 @@ struct ZoomActionMenu: View {
     }
 
     private func getZoomedImage(completion: @escaping (NSImage?) -> Void) {
-        guard let fullImage = viewModel.currentImage else {
+        guard let fullImage = (viewModel.isInLiveMode ? viewModel.liveScreenshot : nil) ?? viewModel.displayableCurrentImage else {
             completion(nil)
             return
         }
@@ -2819,6 +4847,7 @@ struct ZoomFinalStateOverlay<Content: View>: View {
             }
         }
     }
+
 }
 
 // MARK: - Zoomed Region View
@@ -2901,8 +4930,18 @@ struct ZoomedTextSelectionNSView: NSViewRepresentable {
     func makeNSView(context: Context) -> ZoomedSelectionView {
         Log.debug("[ZoomedTextSelectionNSView] makeNSView - creating new ZoomedSelectionView", category: .ui)
         let view = ZoomedSelectionView()
-        view.onDragStart = { point in viewModel.startDragSelection(at: point) }
-        view.onDragUpdate = { point in viewModel.updateDragSelection(to: point) }
+        view.onDragStart = { point, isCommandDrag in
+            viewModel.startDragSelection(
+                at: point,
+                mode: isCommandDrag ? .box : .character
+            )
+        }
+        view.onDragUpdate = { point, isCommandDrag in
+            viewModel.updateDragSelection(
+                to: point,
+                mode: isCommandDrag ? .box : .character
+            )
+        }
         view.onDragEnd = { viewModel.endDragSelection() }
         view.onClearSelection = {
             Log.debug("[ZoomedTextSelectionNSView] onClearSelection callback triggered", category: .ui)
@@ -2915,7 +4954,6 @@ struct ZoomedTextSelectionNSView: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: ZoomedSelectionView, context: Context) {
-        Log.debug("[ZoomedTextSelectionNSView] updateNSView called, selectionStart=\(viewModel.selectionStart != nil)", category: .ui)
         nsView.zoomRegion = zoomRegion
         nsView.enlargedSize = enlargedSize
 
@@ -2947,8 +4985,14 @@ struct ZoomedTextSelectionNSView: NSViewRepresentable {
             let textLength = node.text.count
             let visibleStartFraction = (clippedX - node.x) / node.width
             let visibleEndFraction = (clippedRight - node.x) / node.width
-            let visibleStartChar = Int(visibleStartFraction * CGFloat(textLength))
-            let visibleEndChar = Int(visibleEndFraction * CGFloat(textLength))
+            let visibleStartChar = OCRTextLayoutEstimator.characterIndex(
+                in: node.text,
+                atFraction: visibleStartFraction
+            )
+            let visibleEndChar = OCRTextLayoutEstimator.characterIndex(
+                in: node.text,
+                atFraction: visibleEndFraction
+            )
 
             // Extract only the visible portion of text
             let visibleText: String
@@ -2992,6 +5036,7 @@ struct ZoomedTextSelectionNSView: NSViewRepresentable {
                 rect: rect,
                 text: visibleText,
                 selectionRange: adjustedSelectionRange,
+                isRedacted: node.isRedacted,
                 visibleCharOffset: visibleStartChar,
                 originalX: node.x,
                 originalY: node.y,
@@ -3000,17 +5045,26 @@ struct ZoomedTextSelectionNSView: NSViewRepresentable {
             )
         }
 
+        // Keep cursor state in sync when node geometry changes while hovering.
+        nsView.refreshCursorForCurrentMouseLocation()
         nsView.needsDisplay = true
     }
 }
 
 /// Custom NSView for text selection within the zoomed region
 class ZoomedSelectionView: NSView {
+    enum CursorMode: Equatable {
+        case none
+        case iBeam
+        case pointingHand
+    }
+
     struct NodeData {
         let id: Int
         let rect: NSRect
         let text: String
         let selectionRange: (start: Int, end: Int)?
+        let isRedacted: Bool
         /// Offset of the first visible character (for clipped nodes)
         let visibleCharOffset: Int
         /// Original normalized coordinates (for debugging hit-testing)
@@ -3024,8 +5078,8 @@ class ZoomedSelectionView: NSView {
     var zoomRegion: CGRect = .zero
     var enlargedSize: CGSize = .zero
 
-    var onDragStart: ((CGPoint) -> Void)?
-    var onDragUpdate: ((CGPoint) -> Void)?
+    var onDragStart: ((CGPoint, Bool) -> Void)?
+    var onDragUpdate: ((CGPoint, Bool) -> Void)?
     var onDragEnd: (() -> Void)?
     var onClearSelection: (() -> Void)?
     var onCopyImage: (() -> Void)?
@@ -3033,11 +5087,22 @@ class ZoomedSelectionView: NSView {
     var onTripleClick: ((CGPoint) -> Void)?
 
     private var isDragging = false
+    private var isCommandDragging = false
     private var hasMoved = false
     private var mouseDownPoint: CGPoint = .zero
+    private var commandDragStartPoint: CGPoint?
+    private var commandDragCurrentPoint: CGPoint?
     private var trackingArea: NSTrackingArea?
+    private var cursorMode: CursorMode = .none
+    private let boundingBoxPadding: CGFloat = 8.0
 
     override var acceptsFirstResponder: Bool { true }
+
+    deinit {
+        if cursorMode != .none {
+            NSCursor.pop()
+        }
+    }
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
@@ -3047,30 +5112,99 @@ class ZoomedSelectionView: NSView {
         let options: NSTrackingArea.Options = [.activeInKeyWindow, .mouseMoved, .mouseEnteredAndExited]
         trackingArea = NSTrackingArea(rect: bounds, options: options, owner: self, userInfo: nil)
         addTrackingArea(trackingArea!)
+        refreshCursorForCurrentMouseLocation()
+    }
+
+    func refreshCursorForCurrentMouseLocation() {
+        guard let window else { return }
+        let location = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        updateCursorForLocation(location)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        let location = convert(event.locationInWindow, from: nil)
+        updateCursorForLocation(location)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        applyCursorMode(.none)
+    }
+
+    private func applyCursorMode(_ mode: CursorMode) {
+        guard mode != cursorMode else { return }
+
+        if cursorMode != .none {
+            NSCursor.pop()
+        }
+
+        switch mode {
+        case .none:
+            break
+        case .iBeam:
+            NSCursor.iBeam.push()
+        case .pointingHand:
+            NSCursor.pointingHand.push()
+        }
+
+        cursorMode = mode
+    }
+
+    static func preferredCursorMode(
+        at screenPoint: CGPoint,
+        nodeData: [NodeData],
+        boundingBoxPadding: CGFloat = 8
+    ) -> CursorMode {
+        guard let node = nodeData.first(where: {
+            $0.rect.insetBy(dx: -boundingBoxPadding, dy: -boundingBoxPadding).contains(screenPoint)
+        }) else {
+            return .none
+        }
+
+        return node.isRedacted ? .pointingHand : .iBeam
+    }
+
+    private func updateCursorForLocation(_ location: CGPoint) {
+        applyCursorMode(
+            Self.preferredCursorMode(
+                at: location,
+                nodeData: nodeData,
+                boundingBoxPadding: boundingBoxPadding
+            )
+        )
     }
 
     override func mouseDown(with event: NSEvent) {
         let location = convert(event.locationInWindow, from: nil)
         mouseDownPoint = location
         hasMoved = false
+        commandDragStartPoint = nil
+        commandDragCurrentPoint = nil
 
         // Convert to original frame coordinates
         let normalizedPoint = screenToOriginalCoords(location)
+        let isCommandDrag = event.modifierFlags.contains(.command)
 
         // Handle multi-click (double-click = word, triple-click = line)
         let clickCount = event.clickCount
         Log.debug("[ZoomedSelectionView] mouseDown clickCount=\(clickCount) isDragging=\(isDragging)", category: .ui)
-        if clickCount == 2 {
+        if clickCount == 2, !isCommandDrag {
             Log.debug("[ZoomedSelectionView] Double-click detected, calling onDoubleClick", category: .ui)
             onDoubleClick?(normalizedPoint)
             isDragging = false
-        } else if clickCount >= 3 {
+            isCommandDragging = false
+        } else if clickCount >= 3, !isCommandDrag {
             Log.debug("[ZoomedSelectionView] Triple-click detected, calling onTripleClick", category: .ui)
             onTripleClick?(normalizedPoint)
             isDragging = false
+            isCommandDragging = false
         } else {
             isDragging = true
-            onDragStart?(normalizedPoint)
+            isCommandDragging = isCommandDrag
+            if isCommandDragging {
+                commandDragStartPoint = location
+                commandDragCurrentPoint = location
+            }
+            onDragStart?(normalizedPoint, isCommandDragging)
         }
         needsDisplay = true
     }
@@ -3088,7 +5222,10 @@ class ZoomedSelectionView: NSView {
         let clampedY = max(0, min(bounds.height, location.y))
 
         let normalizedPoint = screenToOriginalCoords(CGPoint(x: clampedX, y: clampedY))
-        onDragUpdate?(normalizedPoint)
+        if isCommandDragging {
+            commandDragCurrentPoint = CGPoint(x: clampedX, y: clampedY)
+        }
+        onDragUpdate?(normalizedPoint, isCommandDragging)
         needsDisplay = true
     }
 
@@ -3106,6 +5243,9 @@ class ZoomedSelectionView: NSView {
                 onDragEnd?()
             }
         }
+        isCommandDragging = false
+        commandDragStartPoint = nil
+        commandDragCurrentPoint = nil
         needsDisplay = true
     }
 
@@ -3155,19 +5295,46 @@ class ZoomedSelectionView: NSView {
             let textLength = node.text.count
             guard textLength > 0 else { continue }
 
-            let startFraction = CGFloat(range.start) / CGFloat(textLength)
-            let endFraction = CGFloat(range.end) / CGFloat(textLength)
+            let spanFractions = OCRTextLayoutEstimator.spanFractions(
+                in: node.text,
+                start: range.start,
+                end: range.end
+            )
 
             let highlightRect = NSRect(
-                x: node.rect.origin.x + node.rect.width * startFraction,
+                x: node.rect.origin.x + node.rect.width * spanFractions.start,
                 y: node.rect.origin.y,
-                width: node.rect.width * (endFraction - startFraction),
+                width: node.rect.width * max(spanFractions.end - spanFractions.start, 0),
                 height: node.rect.height
             )
 
             selectionColor.setFill()
             let path = NSBezierPath(roundedRect: highlightRect, xRadius: 2, yRadius: 2)
             path.fill()
+        }
+
+        // Show marquee preview while Cmd+dragging.
+        if isDragging,
+           isCommandDragging,
+           let start = commandDragStartPoint,
+           let end = commandDragCurrentPoint {
+            let marqueeRect = NSRect(
+                x: min(start.x, end.x),
+                y: min(start.y, end.y),
+                width: abs(end.x - start.x),
+                height: abs(end.y - start.y)
+            )
+
+            let fillColor = NSColor(red: 100/255, green: 160/255, blue: 230/255, alpha: 0.15)
+            fillColor.setFill()
+            let fillPath = NSBezierPath(roundedRect: marqueeRect, xRadius: 4, yRadius: 4)
+            fillPath.fill()
+
+            let borderPath = NSBezierPath(roundedRect: marqueeRect, xRadius: 4, yRadius: 4)
+            borderPath.lineWidth = 1.5
+            borderPath.setLineDash([6, 4], count: 2, phase: 0)
+            NSColor(red: 100/255, green: 160/255, blue: 230/255, alpha: 0.95).setStroke()
+            borderPath.stroke()
         }
     }
 }
@@ -3271,6 +5438,8 @@ struct URLBoundingBoxOverlay: NSViewRepresentable {
 /// Custom NSView for URL overlay with mouse tracking
 /// Only intercepts mouse events inside the bounding rect, passes through events outside
 class URLOverlayView: NSView {
+    static let outlinePadding: CGFloat = 4
+
     var boundingRect: NSRect = .zero
     var isHoveringURL: Bool = false
     var url: String = ""
@@ -3288,10 +5457,11 @@ class URLOverlayView: NSView {
         }
 
         // Add new tracking area for the bounding box
-        guard !boundingRect.isEmpty else { return }
+        let outlineRect = Self.outlineRect(for: boundingRect)
+        guard !outlineRect.isEmpty else { return }
 
         let options: NSTrackingArea.Options = [.mouseEnteredAndExited, .activeInKeyWindow, .mouseMoved]
-        trackingArea = NSTrackingArea(rect: boundingRect, options: options, owner: self, userInfo: nil)
+        trackingArea = NSTrackingArea(rect: outlineRect, options: options, owner: self, userInfo: nil)
         addTrackingArea(trackingArea!)
     }
 
@@ -3309,7 +5479,7 @@ class URLOverlayView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         let location = convert(event.locationInWindow, from: nil)
-        if boundingRect.contains(location) {
+        if Self.outlineRect(for: boundingRect).contains(location) {
             onClick?()
         } else {
             // Pass event to next responder (TextSelectionView)
@@ -3319,7 +5489,7 @@ class URLOverlayView: NSView {
 
     /// Only accept events inside the bounding rect - pass through elsewhere
     override func hitTest(_ point: NSPoint) -> NSView? {
-        if boundingRect.contains(point) {
+        if Self.outlineRect(for: boundingRect).contains(point) {
             return super.hitTest(point)
         }
         // Return nil to let the event pass through to views below
@@ -3330,10 +5500,11 @@ class URLOverlayView: NSView {
         super.draw(dirtyRect)
 
         // Only draw when hovering and we have a valid bounding rect
-        guard isHoveringURL, !boundingRect.isEmpty else { return }
+        let outlineRect = Self.outlineRect(for: boundingRect)
+        guard isHoveringURL, !outlineRect.isEmpty else { return }
 
         // Draw dotted rectangle around URL
-        let path = NSBezierPath(roundedRect: boundingRect, xRadius: 4, yRadius: 4)
+        let path = NSBezierPath(roundedRect: outlineRect, xRadius: 4, yRadius: 4)
         path.lineWidth = 2.0
 
         // Set up dotted line pattern
@@ -3346,6 +5517,190 @@ class URLOverlayView: NSView {
         path.stroke()
         path.fill()
     }
+
+    static func outlineRect(for boundingRect: CGRect) -> CGRect {
+        boundingRect.insetBy(dx: -outlinePadding, dy: -outlinePadding)
+    }
+}
+
+struct OCRHyperlinkOverlay: NSViewRepresentable {
+    let matches: [OCRHyperlinkMatch]
+    let actualFrameRect: CGRect
+    let onHoverChanged: (OCRHyperlinkMatch?) -> Void
+    let onOpen: (OCRHyperlinkMatch) -> Void
+
+    func makeNSView(context: Context) -> OCRHyperlinkOverlayView {
+        let view = OCRHyperlinkOverlayView()
+        view.onHoverChanged = onHoverChanged
+        view.onOpen = onOpen
+        return view
+    }
+
+    func updateNSView(_ nsView: OCRHyperlinkOverlayView, context: Context) {
+        nsView.onHoverChanged = onHoverChanged
+        nsView.onOpen = onOpen
+        nsView.entries = matches.compactMap { match in
+            let rect = CGRect(
+                x: actualFrameRect.origin.x + (match.highlightX * actualFrameRect.width),
+                y: actualFrameRect.origin.y + (match.y * actualFrameRect.height),
+                width: match.highlightWidth * actualFrameRect.width,
+                height: match.height * actualFrameRect.height
+            )
+            guard rect.width > 1, rect.height > 1 else { return nil }
+            return OCRHyperlinkOverlayView.Entry(match: match, rect: rect)
+        }
+    }
+}
+
+final class OCRHyperlinkOverlayView: NSView {
+    struct Entry {
+        let match: OCRHyperlinkMatch
+        let rect: CGRect
+
+        // Ignore transient row order so the same logical link stays hovered across remaps.
+        var hoverKey: String {
+            "\(match.nodeID)|\(match.url)"
+        }
+    }
+
+    var entries: [Entry] = [] {
+        didSet {
+            if hoveredMatchKey.flatMap({ key in entries.first(where: { $0.hoverKey == key }) }) == nil {
+                hoveredMatchKey = nil
+            }
+            needsDisplay = true
+            needsLayout = true
+            window?.invalidateCursorRects(for: self)
+        }
+    }
+
+    var onHoverChanged: ((OCRHyperlinkMatch?) -> Void)?
+    var onOpen: ((OCRHyperlinkMatch) -> Void)?
+
+    private var trackingArea: NSTrackingArea?
+    private var hoveredMatchKey: String?
+    private let idleBorderOffset: CGFloat = 2.5
+    private let idleBorderThickness: CGFloat = 1.25
+    private let borderCornerRadius: CGFloat = 6
+    private let interactionPadding: CGFloat = 3
+
+    override var isFlipped: Bool { true }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+
+        if let trackingArea {
+            removeTrackingArea(trackingArea)
+        }
+
+        let options: NSTrackingArea.Options = [.activeInKeyWindow, .mouseMoved, .mouseEnteredAndExited, .inVisibleRect]
+        let newTrackingArea = NSTrackingArea(rect: bounds, options: options, owner: self, userInfo: nil)
+        addTrackingArea(newTrackingArea)
+        trackingArea = newTrackingArea
+    }
+
+    override func resetCursorRects() {
+        discardCursorRects()
+        for entry in entries {
+            addCursorRect(interactionRect(for: entry), cursor: .pointingHand)
+        }
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard match(at: point) != nil else { return nil }
+        return self
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        updateHoverState(at: convert(event.locationInWindow, from: nil))
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        updateHoverState(at: convert(event.locationInWindow, from: nil))
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        setHoveredMatch(nil)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let location = convert(event.locationInWindow, from: nil)
+        guard let match = match(at: location) else {
+            super.mouseDown(with: event)
+            return
+        }
+
+        onOpen?(match)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+
+        for entry in entries {
+            guard entry.hoverKey != hoveredMatchKey else { continue }
+            drawIdleBorder(for: entry)
+        }
+
+        if let hoveredEntry {
+            let hoverRect = outlineRect(for: hoveredEntry)
+            let path = NSBezierPath(
+                roundedRect: hoverRect,
+                xRadius: borderCornerRadius,
+                yRadius: borderCornerRadius
+            )
+            path.lineWidth = 2
+            path.setLineDash([5, 3], count: 2, phase: 0)
+
+            NSColor.systemBlue.withAlphaComponent(0.20).setFill()
+            path.fill()
+
+            NSColor.systemBlue.withAlphaComponent(0.95).setStroke()
+            path.stroke()
+        }
+    }
+
+    private func match(at point: CGPoint) -> OCRHyperlinkMatch? {
+        entries.first(where: { interactionRect(for: $0).contains(point) })?.match
+    }
+
+    private func updateHoverState(at point: CGPoint) {
+        setHoveredMatch(
+            entries.first(where: { interactionRect(for: $0).contains(point) })?.hoverKey
+        )
+    }
+
+    private func setHoveredMatch(_ hoverKey: String?) {
+        guard hoveredMatchKey != hoverKey else { return }
+        hoveredMatchKey = hoverKey
+        onHoverChanged?(hoveredEntry?.match)
+        needsDisplay = true
+    }
+
+    private var hoveredEntry: Entry? {
+        guard let hoveredMatchKey else { return nil }
+        return entries.first(where: { $0.hoverKey == hoveredMatchKey })
+    }
+
+    private func drawIdleBorder(for entry: Entry) {
+        let borderPath = NSBezierPath(
+            roundedRect: outlineRect(for: entry),
+            xRadius: borderCornerRadius,
+            yRadius: borderCornerRadius
+        )
+        borderPath.lineWidth = idleBorderThickness
+        NSColor.systemBlue.withAlphaComponent(0.58).setStroke()
+        borderPath.stroke()
+    }
+
+    private func outlineRect(for entry: Entry) -> CGRect {
+        entry.rect.insetBy(dx: -idleBorderOffset, dy: -idleBorderOffset)
+    }
+
+    private func interactionRect(for entry: Entry) -> CGRect {
+        entry.rect.insetBy(dx: -interactionPadding, dy: -interactionPadding)
+    }
 }
 
 // MARK: - Text Selection Overlay
@@ -3357,9 +5712,11 @@ struct TextSelectionOverlay: NSViewRepresentable {
     @ObservedObject var viewModel: SimpleTimelineViewModel
     let containerSize: CGSize
     let actualFrameRect: CGRect
+    let hyperlinkMatches: [OCRHyperlinkMatch]
+    let onHyperlinkOpen: (OCRHyperlinkMatch) -> Void
     var isInteractionDisabled: Bool = false
-    let onDragStart: (CGPoint) -> Void
-    let onDragUpdate: (CGPoint) -> Void
+    let onDragStart: (CGPoint, Bool) -> Void
+    let onDragUpdate: (CGPoint, Bool) -> Void
     let onDragEnd: () -> Void
     let onClearSelection: () -> Void
     // Zoom region callbacks
@@ -3381,6 +5738,7 @@ struct TextSelectionOverlay: NSViewRepresentable {
         view.onZoomRegionEnd = onZoomRegionEnd
         view.onDoubleClick = onDoubleClick
         view.onTripleClick = onTripleClick
+        view.onHyperlinkOpen = onHyperlinkOpen
         return view
     }
 
@@ -3398,41 +5756,94 @@ struct TextSelectionOverlay: NSViewRepresentable {
                 id: node.id,
                 rect: rect,
                 text: node.text,
-                selectionRange: selectionRange
+                selectionRange: selectionRange,
+                isRedacted: node.isRedacted
             )
         }
+        nsView.searchHighlightedRects = searchHighlightedRects()
 
         nsView.containerSize = containerSize
         nsView.actualFrameRect = actualFrameRect
+        nsView.onHyperlinkOpen = onHyperlinkOpen
+        nsView.hyperlinkEntries = hyperlinkMatches.compactMap { match in
+            let rect = NSRect(
+                x: actualFrameRect.origin.x + (match.highlightX * actualFrameRect.width),
+                y: actualFrameRect.origin.y + ((1.0 - match.y - match.height) * actualFrameRect.height),
+                width: match.highlightWidth * actualFrameRect.width,
+                height: match.height * actualFrameRect.height
+            )
+            guard rect.width > 1, rect.height > 1 else { return nil }
+            return TextSelectionView.HyperlinkEntry(match: match, rect: rect)
+        }
         nsView.isDraggingSelection = viewModel.dragStartPoint != nil
         nsView.isDraggingZoomRegion = viewModel.isDraggingZoomRegion
         nsView.isInteractionDisabled = isInteractionDisabled
+        nsView.refreshCursorForCurrentMouseLocation()
 
         nsView.needsDisplay = true
+    }
+
+    private func searchHighlightedRects() -> [CGRect] {
+        guard viewModel.isShowingSearchHighlight else { return [] }
+
+        return viewModel.searchHighlightNodes.flatMap { match in
+            let rects = match.ranges.compactMap { range -> CGRect? in
+                let rect = TextSelectionView.searchHighlightRect(
+                    for: match.node,
+                    range: range,
+                    in: actualFrameRect
+                )
+                return rect.isEmpty ? nil : rect
+            }
+
+            if rects.isEmpty {
+                let fallbackRect = TextSelectionView.searchHighlightRect(
+                    for: match.node,
+                    in: actualFrameRect
+                )
+                return fallbackRect.isEmpty ? [] : [fallbackRect]
+            }
+
+            return rects
+        }
     }
 }
 
 /// Custom NSView for text selection with mouse tracking
 /// Supports both text selection (normal drag) and zoom region (Shift+Drag)
 class TextSelectionView: NSView {
+    enum CursorMode: Equatable {
+        case none
+        case iBeam
+        case pointingHand
+    }
+
     /// Data for each OCR node including selection state
     struct NodeData {
         let id: Int
         let rect: NSRect
         let text: String
         let selectionRange: (start: Int, end: Int)?  // Character range selected within this node
+        let isRedacted: Bool
+    }
+
+    struct HyperlinkEntry {
+        let match: OCRHyperlinkMatch
+        let rect: NSRect
     }
 
     var nodeData: [NodeData] = []
+    var searchHighlightedRects: [CGRect] = []
     var containerSize: CGSize = .zero
     var actualFrameRect: CGRect = .zero
+    var hyperlinkEntries: [HyperlinkEntry] = []
     var isDraggingSelection: Bool = false
     var isDraggingZoomRegion: Bool = false
     var isInteractionDisabled: Bool = false
 
     // Text selection callbacks
-    var onDragStart: ((CGPoint) -> Void)?
-    var onDragUpdate: ((CGPoint) -> Void)?
+    var onDragStart: ((CGPoint, Bool) -> Void)?
+    var onDragUpdate: ((CGPoint, Bool) -> Void)?
     var onDragEnd: (() -> Void)?
     var onClearSelection: (() -> Void)?
 
@@ -3444,17 +5855,28 @@ class TextSelectionView: NSView {
     // Multi-click callbacks
     var onDoubleClick: ((CGPoint) -> Void)?
     var onTripleClick: ((CGPoint) -> Void)?
+    var onHyperlinkOpen: ((OCRHyperlinkMatch) -> Void)?
 
     private var isDragging = false
+    private var isCommandDragging = false
     private var isZoomDragging = false  // Shift+Drag mode
     private var hasMoved = false  // Track if mouse moved during drag
     private var mouseDownPoint: CGPoint = .zero
+    private var commandDragStartPoint: CGPoint?
+    private var commandDragCurrentPoint: CGPoint?
     private var trackingArea: NSTrackingArea?
-    private var isShowingIBeamCursor = false  // Track cursor state to avoid redundant push/pop
+    private var cursorMode: CursorMode = .none
 
     /// Padding in screen points to expand hit area around OCR bounding boxes
     /// This makes it easier to start selection from slightly outside the text
     private let boundingBoxPadding: CGFloat = 8.0
+    private let hyperlinkPadding: CGFloat = 3.0
+
+    deinit {
+        if cursorMode != .none {
+            NSCursor.pop()
+        }
+    }
 
     override var acceptsFirstResponder: Bool { true }
 
@@ -3488,38 +5910,127 @@ class TextSelectionView: NSView {
     }
 
     override func mouseExited(with event: NSEvent) {
-        // Reset cursor when leaving the view
-        if isShowingIBeamCursor {
-            NSCursor.pop()
-            isShowingIBeamCursor = false
-        }
+        applyCursorMode(.none)
     }
 
-    /// Check if a screen point is near any OCR bounding box (within padding tolerance)
-    private func isNearAnyNode(screenPoint: CGPoint) -> Bool {
-        for node in nodeData {
-            // Expand the rect by padding on all sides
-            let expandedRect = node.rect.insetBy(dx: -boundingBoxPadding, dy: -boundingBoxPadding)
+    /// Returns the hyperlink entry near the point, if any.
+    private func hyperlinkEntryContaining(screenPoint: CGPoint) -> HyperlinkEntry? {
+        for entry in hyperlinkEntries {
+            let expandedRect = entry.rect.insetBy(dx: -hyperlinkPadding, dy: -hyperlinkPadding)
             if expandedRect.contains(screenPoint) {
-                return true
+                return entry
             }
         }
-        return false
+        return nil
+    }
+
+    private func applyCursorMode(_ mode: CursorMode) {
+        guard mode != cursorMode else { return }
+
+        if cursorMode != .none {
+            NSCursor.pop()
+        }
+
+        switch mode {
+        case .none:
+            break
+        case .iBeam:
+            NSCursor.iBeam.push()
+        case .pointingHand:
+            NSCursor.pointingHand.push()
+        }
+
+        cursorMode = mode
+    }
+
+    static func preferredCursorMode(
+        at screenPoint: CGPoint,
+        nodeData: [NodeData],
+        hyperlinkEntries: [HyperlinkEntry],
+        searchHighlightedRects: [CGRect] = [],
+        boundingBoxPadding: CGFloat = 8,
+        hyperlinkPadding: CGFloat = 3
+    ) -> CursorMode {
+        if searchHighlightedRects.contains(where: { $0.contains(screenPoint) }) {
+            return .pointingHand
+        }
+
+        if hyperlinkEntries.contains(where: {
+            $0.rect.insetBy(dx: -hyperlinkPadding, dy: -hyperlinkPadding).contains(screenPoint)
+        }) {
+            return .pointingHand
+        }
+
+        guard let node = nodeData.first(where: {
+            $0.rect.insetBy(dx: -boundingBoxPadding, dy: -boundingBoxPadding).contains(screenPoint)
+        }) else {
+            return .none
+        }
+
+        return node.isRedacted ? .pointingHand : .iBeam
+    }
+
+    static func searchHighlightRect(
+        for node: OCRNodeWithText,
+        in actualFrameRect: CGRect
+    ) -> CGRect {
+        let rect = CGRect(
+            x: actualFrameRect.origin.x + (node.x * actualFrameRect.width),
+            y: actualFrameRect.origin.y + ((1.0 - node.y - node.height) * actualFrameRect.height),
+            width: node.width * actualFrameRect.width,
+            height: node.height * actualFrameRect.height
+        )
+        return SearchHighlightOverlay.paddedHighlightRect(rect, within: actualFrameRect)
+    }
+
+    static func searchHighlightRect(
+        for node: OCRNodeWithText,
+        range: Range<String.Index>,
+        in actualFrameRect: CGRect
+    ) -> CGRect {
+        guard !node.text.isEmpty else {
+            return searchHighlightRect(for: node, in: actualFrameRect)
+        }
+
+        let spanFractions = OCRTextLayoutEstimator.spanFractions(in: node.text, range: range)
+        let rect = CGRect(
+            x: actualFrameRect.origin.x + ((node.x + (node.width * spanFractions.start)) * actualFrameRect.width),
+            y: actualFrameRect.origin.y + ((1.0 - node.y - node.height) * actualFrameRect.height),
+            width: node.width * max(spanFractions.end - spanFractions.start, 0) * actualFrameRect.width,
+            height: node.height * actualFrameRect.height
+        )
+        return SearchHighlightOverlay.paddedHighlightRect(rect, within: actualFrameRect)
+    }
+
+    /// Re-evaluate cursor using the current pointer location when overlays/data update
+    /// without a fresh mouse-move event.
+    func refreshCursorForCurrentMouseLocation() {
+        guard let window else {
+            applyCursorMode(.none)
+            return
+        }
+
+        let location = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        guard bounds.contains(location) else {
+            applyCursorMode(.none)
+            return
+        }
+
+        updateCursorForLocation(location)
     }
 
     /// Update cursor based on whether we're near an OCR bounding box
     private func updateCursorForLocation(_ location: CGPoint) {
-        let isNearNode = isNearAnyNode(screenPoint: location)
-
-        if isNearNode && !isShowingIBeamCursor {
-            // Entering text area - show IBeam cursor
-            NSCursor.iBeam.push()
-            isShowingIBeamCursor = true
-        } else if !isNearNode && isShowingIBeamCursor {
-            // Leaving text area - restore normal cursor
-            NSCursor.pop()
-            isShowingIBeamCursor = false
-        }
+        applyCursorMode(
+            Self.preferredCursorMode(
+                at: location,
+                nodeData: nodeData,
+                hyperlinkEntries: hyperlinkEntries,
+                searchHighlightedRects: searchHighlightedRects,
+                boundingBoxPadding: boundingBoxPadding,
+                hyperlinkPadding: hyperlinkPadding
+            )
+        )
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -3528,30 +6039,51 @@ class TextSelectionView: NSView {
         let location = convert(event.locationInWindow, from: nil)
         mouseDownPoint = location
         hasMoved = false
+        commandDragStartPoint = nil
+        commandDragCurrentPoint = nil
+        let hyperlinkModifierFlags: NSEvent.ModifierFlags = [.shift, .command, .control, .option]
+        let hasHyperlinkOverrideModifiers = !event.modifierFlags.intersection(hyperlinkModifierFlags).isEmpty
+
+        if event.clickCount == 1,
+           !hasHyperlinkOverrideModifiers,
+           let hyperlinkEntry = hyperlinkEntryContaining(screenPoint: location)
+        {
+            onHyperlinkOpen?(hyperlinkEntry.match)
+            return
+        }
 
         // Convert screen coordinates to normalized frame coordinates
         let normalizedPoint = screenToNormalizedCoords(location)
+        let isCommandDrag = event.modifierFlags.contains(.command)
 
         // Check if Shift is held - start zoom region mode
         if event.modifierFlags.contains(.shift) {
             isZoomDragging = true
             isDragging = false
+            isCommandDragging = false
             onZoomRegionStart?(normalizedPoint)
         } else {
             // Handle multi-click (double-click = word, triple-click = line)
             let clickCount = event.clickCount
-            if clickCount == 2 {
+            if clickCount == 2, !isCommandDrag {
                 onDoubleClick?(normalizedPoint)
                 isDragging = false
                 isZoomDragging = false
-            } else if clickCount >= 3 {
+                isCommandDragging = false
+            } else if clickCount >= 3, !isCommandDrag {
                 onTripleClick?(normalizedPoint)
                 isDragging = false
                 isZoomDragging = false
+                isCommandDragging = false
             } else {
                 isDragging = true
                 isZoomDragging = false
-                onDragStart?(normalizedPoint)
+                isCommandDragging = isCommandDrag
+                if isCommandDragging {
+                    commandDragStartPoint = location
+                    commandDragCurrentPoint = location
+                }
+                onDragStart?(normalizedPoint, isCommandDragging)
             }
         }
         needsDisplay = true
@@ -3578,7 +6110,10 @@ class TextSelectionView: NSView {
         if isZoomDragging {
             onZoomRegionUpdate?(normalizedPoint)
         } else if isDragging {
-            onDragUpdate?(normalizedPoint)
+            if isCommandDragging {
+                commandDragCurrentPoint = CGPoint(x: clampedX, y: clampedY)
+            }
+            onDragUpdate?(normalizedPoint, isCommandDragging)
         }
         needsDisplay = true
     }
@@ -3598,6 +6133,9 @@ class TextSelectionView: NSView {
                 onDragEnd?()
             }
         }
+        isCommandDragging = false
+        commandDragStartPoint = nil
+        commandDragCurrentPoint = nil
         needsDisplay = true
     }
 
@@ -3634,39 +6172,66 @@ class TextSelectionView: NSView {
             let textLength = node.text.count
             guard textLength > 0 else { continue }
 
-            let startFraction = CGFloat(range.start) / CGFloat(textLength)
-            let endFraction = CGFloat(range.end) / CGFloat(textLength)
+            let spanFractions = OCRTextLayoutEstimator.spanFractions(
+                in: node.text,
+                start: range.start,
+                end: range.end
+            )
 
             let highlightRect = NSRect(
-                x: node.rect.origin.x + node.rect.width * startFraction,
+                x: node.rect.origin.x + node.rect.width * spanFractions.start,
                 y: node.rect.origin.y,
-                width: node.rect.width * (endFraction - startFraction),
+                width: node.rect.width * max(spanFractions.end - spanFractions.start, 0),
                 height: node.rect.height
             )
             highlightRects.append(highlightRect)
         }
 
-        guard !highlightRects.isEmpty else { return }
+        if !highlightRects.isEmpty {
+            // Use transparency layer to prevent opacity stacking when rects overlap
+            // All rects are composited together first, then the alpha is applied once to the result
+            guard let context = NSGraphicsContext.current?.cgContext else { return }
 
-        // Use transparency layer to prevent opacity stacking when rects overlap
-        // All rects are composited together first, then the alpha is applied once to the result
-        guard let context = NSGraphicsContext.current?.cgContext else { return }
+            context.saveGState()
+            context.setAlpha(0.4)  // Apply alpha to the entire layer, not per-rect
+            context.beginTransparencyLayer(auxiliaryInfo: nil)
 
-        context.saveGState()
-        context.setAlpha(0.4)  // Apply alpha to the entire layer, not per-rect
-        context.beginTransparencyLayer(auxiliaryInfo: nil)
+            // Draw all rects with solid color (alpha will be applied to the layer)
+            let selectionColor = NSColor(red: 100/255, green: 160/255, blue: 230/255, alpha: 1.0)
+            selectionColor.setFill()
 
-        // Draw all rects with solid color (alpha will be applied to the layer)
-        let selectionColor = NSColor(red: 100/255, green: 160/255, blue: 230/255, alpha: 1.0)
-        selectionColor.setFill()
+            for rect in highlightRects {
+                let path = NSBezierPath(roundedRect: rect, xRadius: 2, yRadius: 2)
+                path.fill()
+            }
 
-        for rect in highlightRects {
-            let path = NSBezierPath(roundedRect: rect, xRadius: 2, yRadius: 2)
-            path.fill()
+            context.endTransparencyLayer()
+            context.restoreGState()
         }
 
-        context.endTransparencyLayer()
-        context.restoreGState()
+        // Show marquee preview while Cmd+dragging.
+        if isDragging,
+           isCommandDragging,
+           let start = commandDragStartPoint,
+           let end = commandDragCurrentPoint {
+            let marqueeRect = NSRect(
+                x: min(start.x, end.x),
+                y: min(start.y, end.y),
+                width: abs(end.x - start.x),
+                height: abs(end.y - start.y)
+            )
+
+            let fillColor = NSColor(red: 100/255, green: 160/255, blue: 230/255, alpha: 0.15)
+            fillColor.setFill()
+            let fillPath = NSBezierPath(roundedRect: marqueeRect, xRadius: 4, yRadius: 4)
+            fillPath.fill()
+
+            let borderPath = NSBezierPath(roundedRect: marqueeRect, xRadius: 4, yRadius: 4)
+            borderPath.lineWidth = 1.5
+            borderPath.setLineDash([6, 4], count: 2, phase: 0)
+            NSColor(red: 100/255, green: 160/255, blue: 230/255, alpha: 0.95).setStroke()
+            borderPath.stroke()
+        }
     }
 }
 
@@ -3709,11 +6274,6 @@ struct DeleteConfirmationDialog: View {
                     Text("Choose to delete this frame or the entire segment.")
                         .font(.retraceCallout)
                         .foregroundColor(.white.opacity(0.6))
-
-                    Text("Note: Removes from database only. Video files remain on disk.")
-                        .font(.retraceCaption2)
-                        .foregroundColor(.white.opacity(0.4))
-                        .italic()
                 }
                 .multilineTextAlignment(.center)
 
@@ -3788,15 +6348,7 @@ struct DeleteConfirmationDialog: View {
                 .padding(.top, 8)
             }
             .padding(32)
-            .background(
-                RoundedRectangle(cornerRadius: 16)
-                    .fill(Color(white: 0.15))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 16)
-                            .stroke(Color.white.opacity(0.1), lineWidth: 1)
-                    )
-            )
-            .shadow(color: .black.opacity(0.5), radius: 30, y: 10)
+            .retraceMattePanel(addPadding: false, cornerRadius: 16)
         }
         .transition(.opacity.combined(with: .scale(scale: 0.95)))
         .animation(.spring(response: 0.3, dampingFraction: 0.8), value: true)
@@ -3806,7 +6358,7 @@ struct DeleteConfirmationDialog: View {
 // MARK: - Search Highlight Overlay
 
 /// Overlay that highlights search matches on the current frame
-/// Darkens everything except the matched lines for a spotlight effect
+/// Darkens everything except the matched nodes for a spotlight effect
 struct SearchHighlightOverlay: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel
     let containerSize: CGSize
@@ -3814,58 +6366,328 @@ struct SearchHighlightOverlay: View {
 
     @State private var highlightScale: CGFloat = 0.3
 
-    // Cache the highlight nodes on appear to prevent re-renders from changing them
-    @State private var cachedNodes: [(node: OCRNodeWithText, ranges: [Range<String.Index>])] = []
+    @State private var tooltipAnchorPoint: CGPoint?
+
+    private let tooltipSize = CGSize(
+        width: TimelineHoverTooltipStyle.width(for: "Copy All Highlighted Text"),
+        height: TimelineHoverTooltipStyle.height
+    )
+    private let tooltipInset: CGFloat = 12
+    private let tooltipGap: CGFloat = 10
+
+    private var liveMatches: [(node: OCRNodeWithText, ranges: [Range<String.Index>])] {
+        viewModel.searchHighlightNodes
+    }
 
     var body: some View {
-        ZStack {
-            // Dark overlay
-            Color.black.opacity(0.25)
+        ZStack(alignment: .topLeading) {
+            highlightLayer
+                .allowsHitTesting(false)
 
-            // Cutout holes for highlights - use compositingGroup for blend mode to work
-            ForEach(Array(cachedNodes.enumerated()), id: \.offset) { _, match in
-                let node = match.node
-                let screenX = actualFrameRect.origin.x + (node.x * actualFrameRect.width)
-                let screenY = actualFrameRect.origin.y + (node.y * actualFrameRect.height)
-                let screenWidth = node.width * actualFrameRect.width
-                let screenHeight = node.height * actualFrameRect.height
+            SearchHighlightHoverTracker(
+                highlightedRects: highlightedRects,
+                onHoverLocationChanged: handleHoverLocationChanged,
+                onPrimaryClick: handlePrimaryClick(at:)
+            )
+            .frame(width: containerSize.width, height: containerSize.height)
 
-                RoundedRectangle(cornerRadius: 3)
-                    .fill(Color.white)
-                    .frame(width: screenWidth, height: screenHeight)
-                    .scaleEffect(highlightScale)
-                    .position(x: screenX + screenWidth / 2, y: screenY + screenHeight / 2)
-                    .blendMode(.destinationOut)
+            if let tooltipPosition = tooltipPosition {
+                Text("Copy All Highlighted Text")
+                    .font(TimelineHoverTooltipStyle.font)
+                    .foregroundColor(.white)
+                    .lineLimit(1)
+                    .fixedSize()
+                    .padding(.horizontal, TimelineHoverTooltipStyle.horizontalPadding)
+                    .padding(.vertical, TimelineHoverTooltipStyle.verticalPadding)
+                    .background(
+                        Capsule()
+                            .fill(TimelineHoverTooltipStyle.backgroundColor)
+                    )
+                    .shadow(color: .black.opacity(0.28), radius: 8, y: 4)
+                    .offset(x: tooltipPosition.x, y: tooltipPosition.y)
+                    .allowsHitTesting(false)
             }
         }
-        .compositingGroup()
-        // Yellow borders drawn on top (outside the compositing group)
-        .overlay(
-            ZStack {
-                ForEach(Array(cachedNodes.enumerated()), id: \.offset) { _, match in
-                    let node = match.node
-                    let screenX = actualFrameRect.origin.x + (node.x * actualFrameRect.width)
-                    let screenY = actualFrameRect.origin.y + (node.y * actualFrameRect.height)
-                    let screenWidth = node.width * actualFrameRect.width
-                    let screenHeight = node.height * actualFrameRect.height
-
-                    RoundedRectangle(cornerRadius: 3)
-                        .stroke(Color.yellow.opacity(0.9), lineWidth: 2)
-                        .frame(width: screenWidth, height: screenHeight)
-                        .scaleEffect(highlightScale)
-                        .position(x: screenX + screenWidth / 2, y: screenY + screenHeight / 2)
-                }
-            }
-        )
-        .allowsHitTesting(false)
         .onAppear {
-            // Cache the nodes immediately to prevent re-render issues
-            cachedNodes = viewModel.searchHighlightNodes
+            dismissTooltip()
 
             // Animate the scale from 0.3 to 1.0 with spring
             withAnimation(.spring(response: 0.4, dampingFraction: 0.7, blendDuration: 0)) {
                 highlightScale = 1.0
             }
+        }
+        .onDisappear {
+            dismissTooltip()
+        }
+    }
+
+    private var highlightLayer: some View {
+        Group {
+            if highlightedRects.isEmpty {
+                if viewModel.isSearchResultNavigationModeActive,
+                   viewModel.searchHighlightMode == .matchedNodes {
+                    Color.black.opacity(0.25)
+                } else {
+                    Color.clear
+                }
+            } else {
+                ZStack {
+                    // Dark overlay
+                    Color.black.opacity(0.25)
+
+                    // Cutout holes for highlights - use compositingGroup for blend mode to work
+                    ForEach(Array(highlightedRects.enumerated()), id: \.offset) { _, rect in
+                        RoundedRectangle(cornerRadius: 3)
+                            .fill(Color.white)
+                            .frame(width: rect.width, height: rect.height)
+                            .scaleEffect(highlightScale)
+                            .position(x: rect.midX, y: rect.midY)
+                            .blendMode(.destinationOut)
+                    }
+                }
+                .compositingGroup()
+                // Yellow borders drawn on top (outside the compositing group)
+                .overlay(
+                    ZStack {
+                        ForEach(Array(highlightedRects.enumerated()), id: \.offset) { _, rect in
+                            RoundedRectangle(cornerRadius: 3)
+                                .stroke(Color.yellow.opacity(0.9), lineWidth: 2)
+                                .frame(width: rect.width, height: rect.height)
+                                .scaleEffect(highlightScale)
+                                .position(x: rect.midX, y: rect.midY)
+                        }
+                    }
+                )
+            }
+        }
+    }
+
+    private var tooltipPosition: CGPoint? {
+        guard let anchor = tooltipAnchorPoint else { return nil }
+
+        let maxX = max(tooltipInset, containerSize.width - tooltipSize.width - tooltipInset)
+        let preferredX = anchor.x - (tooltipSize.width / 2)
+        let clampedX = min(max(preferredX, tooltipInset), maxX)
+
+        let preferredAboveY = anchor.y - tooltipSize.height - tooltipGap
+        let maxY = max(tooltipInset, containerSize.height - tooltipSize.height - tooltipInset)
+        let y: CGFloat
+        if preferredAboveY >= tooltipInset {
+            y = preferredAboveY
+        } else {
+            y = min(maxY, anchor.y + tooltipGap)
+        }
+
+        return CGPoint(x: clampedX, y: y)
+    }
+
+    private var highlightedRects: [CGRect] {
+        liveMatches.flatMap { match in
+            let rects = match.ranges.compactMap { range -> CGRect? in
+                let rect = screenRect(for: match.node, range: range)
+                return rect.isEmpty ? nil : rect
+            }
+
+            if rects.isEmpty {
+                let fallbackRect = screenRect(for: match.node)
+                return fallbackRect.isEmpty ? [] : [fallbackRect]
+            }
+
+            return rects
+        }
+    }
+
+    private func handleHoverLocationChanged(_ location: CGPoint?) {
+        guard let location,
+              let hoveredRect = highlightedRects.first(where: { $0.contains(location) }) else {
+            dismissTooltip()
+            return
+        }
+
+        tooltipAnchorPoint = CGPoint(x: hoveredRect.midX, y: hoveredRect.minY)
+    }
+
+    private func handlePrimaryClick(at location: CGPoint) -> Bool {
+        guard highlightedRects.contains(where: { $0.contains(location) }) else {
+            return false
+        }
+
+        viewModel.copySearchHighlightedTextByLine(from: liveMatches)
+        dismissTooltip()
+        return true
+    }
+
+    private func dismissTooltip() {
+        tooltipAnchorPoint = nil
+    }
+
+    static func shouldDismissTooltip(
+        for location: CGPoint,
+        highlightedRects: [CGRect],
+        tooltipFrame _: CGRect?
+    ) -> Bool {
+        return !highlightedRects.contains(where: { $0.contains(location) })
+    }
+
+    static func paddedHighlightRect(_ rect: CGRect, within frameRect: CGRect) -> CGRect {
+        guard !rect.isEmpty else { return .zero }
+        guard !frameRect.isEmpty else { return rect }
+
+        // Push the border slightly beyond the OCR bounds so it does not sit directly on the glyphs.
+        let horizontalOutset = min(max(rect.height * 0.21, 4), 10)
+        let verticalOutset = min(max(rect.height * 0.12, 3), 8)
+        return rect
+            .insetBy(dx: -horizontalOutset, dy: -verticalOutset)
+            .intersection(frameRect)
+    }
+
+    private func screenRect(for node: OCRNodeWithText) -> CGRect {
+        let rect = CGRect(
+            x: actualFrameRect.origin.x + (node.x * actualFrameRect.width),
+            y: actualFrameRect.origin.y + (node.y * actualFrameRect.height),
+            width: node.width * actualFrameRect.width,
+            height: node.height * actualFrameRect.height
+        )
+        return Self.paddedHighlightRect(rect, within: actualFrameRect)
+    }
+
+    private func screenRect(
+        for node: OCRNodeWithText,
+        range: Range<String.Index>
+    ) -> CGRect {
+        guard !node.text.isEmpty else { return screenRect(for: node) }
+
+        let spanFractions = OCRTextLayoutEstimator.spanFractions(in: node.text, range: range)
+
+        let rect = CGRect(
+            x: actualFrameRect.origin.x + ((node.x + (node.width * spanFractions.start)) * actualFrameRect.width),
+            y: actualFrameRect.origin.y + (node.y * actualFrameRect.height),
+            width: node.width * max(spanFractions.end - spanFractions.start, 0) * actualFrameRect.width,
+            height: node.height * actualFrameRect.height
+        )
+        return Self.paddedHighlightRect(rect, within: actualFrameRect)
+    }
+}
+
+private struct SearchHighlightHoverTracker: NSViewRepresentable {
+    let highlightedRects: [CGRect]
+    let onHoverLocationChanged: (CGPoint?) -> Void
+    let onPrimaryClick: (CGPoint) -> Bool
+
+    func makeNSView(context: Context) -> SearchHighlightHoverTrackingView {
+        let view = SearchHighlightHoverTrackingView()
+        view.onHoverLocationChanged = onHoverLocationChanged
+        view.onPrimaryClick = onPrimaryClick
+        return view
+    }
+
+    func updateNSView(_ nsView: SearchHighlightHoverTrackingView, context: Context) {
+        let didRectsChange = nsView.highlightedRects != highlightedRects
+        nsView.highlightedRects = highlightedRects
+        nsView.onHoverLocationChanged = onHoverLocationChanged
+        nsView.onPrimaryClick = onPrimaryClick
+        if didRectsChange || !nsView.hasPerformedInitialHoverSync {
+            nsView.refreshHoverStateForCurrentMouseLocation()
+            nsView.hasPerformedInitialHoverSync = true
+        }
+    }
+}
+
+private final class SearchHighlightHoverTrackingView: NSView {
+    var highlightedRects: [CGRect] = []
+    var onHoverLocationChanged: ((CGPoint?) -> Void)?
+    var onPrimaryClick: ((CGPoint) -> Bool)?
+    var hasPerformedInitialHoverSync = false
+
+    private var trackingArea: NSTrackingArea?
+    private var localMouseDownMonitor: Any?
+
+    override var isFlipped: Bool {
+        true
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        hasPerformedInitialHoverSync = false
+        if window == nil {
+            removeLocalMouseDownMonitor()
+        } else {
+            installLocalMouseDownMonitorIfNeeded()
+        }
+    }
+
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        if newWindow == nil {
+            removeLocalMouseDownMonitor()
+        }
+        super.viewWillMove(toWindow: newWindow)
+    }
+
+    deinit {
+        removeLocalMouseDownMonitor()
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea {
+            removeTrackingArea(trackingArea)
+        }
+
+        let options: NSTrackingArea.Options = [
+            .activeInKeyWindow,
+            .mouseEnteredAndExited,
+            .mouseMoved,
+            .inVisibleRect
+        ]
+        let trackingArea = NSTrackingArea(rect: .zero, options: options, owner: self, userInfo: nil)
+        self.trackingArea = trackingArea
+        addTrackingArea(trackingArea)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        let location = convert(event.locationInWindow, from: nil)
+        onHoverLocationChanged?(location)
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        let location = convert(event.locationInWindow, from: nil)
+        onHoverLocationChanged?(location)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        onHoverLocationChanged?(nil)
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        nil
+    }
+
+    func refreshHoverStateForCurrentMouseLocation() {
+        guard let window else { return }
+        let location = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        onHoverLocationChanged?(location)
+    }
+
+    private func installLocalMouseDownMonitorIfNeeded() {
+        guard localMouseDownMonitor == nil else { return }
+
+        localMouseDownMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: .leftMouseDown
+        ) { [weak self] event in
+            guard let self, let eventWindow = event.window, eventWindow == self.window else {
+                return event
+            }
+
+            let location = self.convert(event.locationInWindow, from: nil)
+            guard self.onPrimaryClick?(location) == true else { return event }
+            return nil
+        }
+    }
+
+    private func removeLocalMouseDownMonitor() {
+        if let localMouseDownMonitor {
+            NSEvent.removeMonitor(localMouseDownMonitor)
+            self.localMouseDownMonitor = nil
         }
     }
 }
@@ -4082,6 +6904,86 @@ struct DebugFrameIDBadge: View {
     @State private var showCopiedFeedback = false
     @State private var isHovering = false
 
+    private var renderedMediaText: String {
+        if viewModel.currentFrameStillDisplayMode == .waitingFallback {
+            return viewModel.currentFrameStillUsesFreshCaptureSource ? "live still (fallback)" : "decoded still (fallback)"
+        }
+
+        if viewModel.isInLiveMode {
+            return viewModel.liveScreenshot != nil ? "live still" : "--"
+        }
+
+        switch viewModel.currentFrameMediaDisplayMode {
+        case .still:
+            return viewModel.currentFrameStillUsesFreshCaptureSource ? "live still" : "decoded still"
+        case .decodedVideo:
+            return "decoded video"
+        case .noContent:
+            return "--"
+        }
+    }
+
+    private var renderedMediaColor: Color {
+        if viewModel.currentFrameStillDisplayMode == .waitingFallback {
+            return viewModel.currentFrameStillUsesFreshCaptureSource ? .blue.opacity(0.9) : .orange.opacity(0.85)
+        }
+
+        if viewModel.isInLiveMode {
+            return viewModel.liveScreenshot != nil ? .blue.opacity(0.9) : .white.opacity(0.5)
+        }
+
+        switch viewModel.currentFrameMediaDisplayMode {
+        case .still:
+            return viewModel.currentFrameStillUsesFreshCaptureSource ? .blue.opacity(0.9) : .green.opacity(0.85)
+        case .decodedVideo:
+            return .cyan.opacity(0.9)
+        case .noContent:
+            return .white.opacity(0.5)
+        }
+    }
+
+    private var videoReencodeText: String {
+        guard let videoInfo = viewModel.displayedPrimaryVideoInfo else {
+            return "n/a"
+        }
+
+        return videoInfo.isVideoReencoded ? "yes" : "no"
+    }
+
+    private var videoReencodeColor: Color {
+        guard let videoInfo = viewModel.displayedPrimaryVideoInfo else {
+            return .blue.opacity(0.8)
+        }
+
+        return videoInfo.isVideoReencoded ? .green.opacity(0.85) : .white.opacity(0.75)
+    }
+
+    private var bitrateText: String {
+        guard let videoInfo = viewModel.displayedPrimaryVideoInfo,
+              let bitsPerSecond = videoInfo.averageBitrateBitsPerSecond,
+              bitsPerSecond.isFinite,
+              bitsPerSecond > 0 else {
+            return "--"
+        }
+
+        if bitsPerSecond >= 1_000_000 {
+            return String(format: "%.2f Mbps", bitsPerSecond / 1_000_000)
+        }
+
+        return String(format: "%.0f kbps", bitsPerSecond / 1_000)
+    }
+
+    private var kibPerFrameText: String {
+        guard let videoInfo = viewModel.displayedPrimaryVideoInfo,
+              let kibPerFrame = videoInfo.kibibytesPerFrame,
+              kibPerFrame.isFinite,
+              kibPerFrame > 0 else {
+            return "--"
+        }
+
+        return String(format: "%.1f", kibPerFrame)
+    }
+
     var body: some View {
         Button(action: {
             viewModel.copyCurrentFrameID()
@@ -4112,11 +7014,23 @@ struct DebugFrameIDBadge: View {
                             .foregroundColor(.white.opacity(0.5))
                     }
 
+                    Text("Memory JPEG: \(viewModel.currentFrameHasInMemoryJPEGCache ? "yes" : "no")")
+                        .font(.retraceMonoSmall)
+                        .foregroundColor(viewModel.currentFrameHasInMemoryJPEGCache ? .green.opacity(0.85) : .white.opacity(0.7))
+
                     // Debug: Show video frame index being requested
                     if let videoInfo = viewModel.displayedPrimaryVideoInfo {
                         Text("VidIdx: \(videoInfo.frameIndex)")
                             .font(.retraceMonoSmall)
                             .foregroundColor(.orange.opacity(0.8))
+
+                        Text("Bitrate: \(bitrateText)")
+                            .font(.retraceMonoSmall)
+                            .foregroundColor(.white.opacity(0.85))
+
+                        Text("KiB/f: \(kibPerFrameText)")
+                            .font(.retraceMonoSmall)
+                            .foregroundColor(.white.opacity(0.78))
                     }
 
                     // Debug: Show processing status
@@ -4129,23 +7043,37 @@ struct DebugFrameIDBadge: View {
                             case 2: "completed"
                             case 3: "failed"
                             case 4: "not readable"
+                            case 5: "rewrite pending"
+                            case 6: "rewrite processing"
+                            case 7: "rewrite completed"
+                            case 8: "rewrite failed"
                             default: "unknown"
                         }
                         Text("p=\(status) (\(statusText))")
                             .font(.retraceMonoSmall)
-                            .foregroundColor(status == -1 ? .blue.opacity(0.8) : status == 4 ? .red.opacity(0.8) : status == 2 ? .green.opacity(0.8) : .yellow.opacity(0.8))
+                            .foregroundColor(
+                                status == -1 ? .blue.opacity(0.8)
+                                : (status == 4 || status == 3 || status == 8) ? .red.opacity(0.8)
+                                : (status == 2 || status == 7) ? .green.opacity(0.8)
+                                : .yellow.opacity(0.8)
+                            )
                     }
+
+                    Text("Re-encoded: \(videoReencodeText)")
+                        .font(.retraceMonoSmall)
+                        .foregroundColor(videoReencodeColor)
+
+                    Text("Shown: \(renderedMediaText)")
+                        .font(.retraceMonoSmall)
+                        .foregroundColor(renderedMediaColor)
                 }
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 6)
-            .background(
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(Color(white: 0.15).opacity(0.9))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(isHovering ? Color.white.opacity(0.3) : Color.white.opacity(0.15), lineWidth: 0.5)
+            .timelineGlassSurface(
+                .chip,
+                cornerRadius: 8,
+                borderColor: isHovering ? Color.white.opacity(0.3) : Color.white.opacity(0.15)
             )
         }
         .buttonStyle(.plain)
@@ -4158,6 +7086,185 @@ struct DebugFrameIDBadge: View {
             }
         }
         .help("Click to copy frame ID")
+    }
+}
+
+// MARK: - Debug Browser URL Window
+
+/// Draggable debug panel for inspecting full browser URLs while scrubbing.
+/// Wraps URL text every 100 characters to keep very long URLs readable.
+struct DebugBrowserURLWindow: View {
+    let browserURL: String?
+    @Binding var panelPosition: CGSize
+    @Binding var isPresented: Bool
+
+    @GestureState private var dragOffset: CGSize = .zero
+    @State private var isDraggingHeader = false
+    @State private var isCloseHovered = false
+
+    private var wrappedURLText: String {
+        guard let browserURL else {
+            return "No browser URL on this frame"
+        }
+        return Self.wrapText(browserURL, maxCharactersPerLine: 100)
+    }
+
+    private var hasURL: Bool {
+        browserURL != nil
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 8) {
+                Image(systemName: "link")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(.cyan.opacity(0.9))
+
+                Text("Browser URL")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(.white.opacity(0.88))
+
+                Spacer()
+
+                Button(action: {
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        isPresented = false
+                    }
+                }) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(isCloseHovered ? .white.opacity(0.9) : .white.opacity(0.55))
+                }
+                .buttonStyle(.plain)
+                .onHover { hovering in
+                    isCloseHovered = hovering
+                    if hovering {
+                        NSCursor.pointingHand.push()
+                    } else {
+                        NSCursor.pop()
+                    }
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+            .background(Color.white.opacity(0.06))
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0, coordinateSpace: .global)
+                    .updating($dragOffset) { value, state, _ in
+                        state = value.translation
+                    }
+                    .onChanged { _ in
+                        if !isDraggingHeader {
+                            isDraggingHeader = true
+                        }
+                    }
+                    .onEnded { value in
+                        panelPosition.width += value.translation.width
+                        panelPosition.height += value.translation.height
+                        isDraggingHeader = false
+                    }
+            )
+            .onHover { hovering in
+                if hovering && !isDraggingHeader {
+                    NSCursor.openHand.push()
+                } else if !hovering {
+                    NSCursor.pop()
+                }
+            }
+
+            Divider()
+                .overlay(Color.white.opacity(0.08))
+
+            ScrollView(.vertical, showsIndicators: true) {
+                Text(wrappedURLText)
+                    .font(.system(size: 12, weight: .regular, design: .monospaced))
+                    .foregroundColor(hasURL ? .cyan.opacity(0.95) : .white.opacity(0.6))
+                    .lineSpacing(2)
+                    .multilineTextAlignment(.leading)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(12)
+            }
+            .frame(maxHeight: 170)
+        }
+        .frame(width: 720, alignment: .leading)
+        .retraceMattePanel(addPadding: false, cornerRadius: 10)
+        .offset(
+            x: panelPosition.width + dragOffset.width,
+            y: panelPosition.height + dragOffset.height
+        )
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .padding(.spacingL)
+    }
+
+    private static func wrapText(_ text: String, maxCharactersPerLine: Int) -> String {
+        guard maxCharactersPerLine > 0, !text.isEmpty else { return text }
+
+        var lines: [String] = []
+        var currentStart = text.startIndex
+
+        while currentStart < text.endIndex {
+            let nextEnd = text.index(currentStart, offsetBy: maxCharactersPerLine, limitedBy: text.endIndex) ?? text.endIndex
+            lines.append(String(text[currentStart..<nextEnd]))
+            currentStart = nextEnd
+        }
+
+        return lines.joined(separator: "\n")
+    }
+}
+
+/// The action stays in place while its spinner and label communicate progress.
+struct FrameTextScanButton: View {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+
+    private var title: String {
+        switch viewModel.frameTextScanState {
+        case .idle: return "Scan Text"
+        case .scanning: return "Scanning Text…"
+        case .ready: return "Text Ready"
+        case .empty: return "No Text Found"
+        case .failed: return "Scan Failed · Retry"
+        case .protected: return "Protected Frame"
+        }
+    }
+
+    private var symbol: String {
+        switch viewModel.frameTextScanState {
+        case .ready: return "checkmark.circle"
+        case .failed: return "arrow.clockwise"
+        case .protected: return "lock"
+        default: return "text.viewfinder"
+        }
+    }
+
+    var body: some View {
+        Button { viewModel.scanCurrentFrameText() } label: {
+            HStack(spacing: 6) {
+                if viewModel.frameTextScanState == .scanning {
+                    ProgressView().controlSize(.small)
+                        .frame(width: 16, height: 16)
+                } else {
+                    Image(systemName: symbol).frame(width: 16, height: 16)
+                }
+                Text(title)
+            }
+            .font(.system(size: 12, weight: .medium))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+            .background(
+                viewModel.frameTextScanState == .scanning ? Color.accentColor.opacity(0.25) : Color.black.opacity(0.65),
+                in: RoundedRectangle(cornerRadius: 8)
+            )
+            .foregroundStyle(.white)
+        }
+        .buttonStyle(.plain)
+        .disabled(!viewModel.canScanCurrentFrameText || viewModel.frameTextScanState == .scanning)
+        .help(viewModel.frameTextScanState == .protected
+              ? "Scanning is unavailable while privacy processing is pending or the frame contains redacted text."
+              : "Scan text in this frame (⌘⇧O). Text is available for this viewing session.")
+        .accessibilityLabel(title)
+        .accessibilityHint("Recognize text in the current frame. Command Shift O.")
     }
 }
 
@@ -4183,6 +7290,8 @@ struct OCRStatusIndicator: View {
             return "tray.and.arrow.down"
         case .processing:
             return "gearshape.2"
+        case .rewriting:
+            return "eye.slash"
         default:
             return "doc.text"
         }
@@ -4197,6 +7306,8 @@ struct OCRStatusIndicator: View {
             return .orange
         case .processing:
             return .blue
+        case .rewriting:
+            return .orange
         case .failed:
             return .red
         default:
@@ -4219,14 +7330,7 @@ struct OCRStatusIndicator: View {
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 6)
-            .background(
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(Color(white: 0.15).opacity(0.9))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(statusColor.opacity(0.4), lineWidth: 0.5)
-            )
+            .timelineGlassSurface(.chip, cornerRadius: 8, borderColor: statusColor.opacity(0.4))
             .transition(.opacity.combined(with: .scale(scale: 0.9)))
             .animation(.easeInOut(duration: 0.2), value: viewModel.ocrStatus)
         }
@@ -4236,13 +7340,14 @@ struct OCRStatusIndicator: View {
 // MARK: - Developer Actions Menu
 
 #if DEBUG
-/// Developer actions menu with OCR refresh and video boundary visualization options
+/// Developer actions menu with OCR refresh and timeline debug visualization options
 /// Only visible in DEBUG builds, positioned in top-left corner beside the frame ID badge
 struct DeveloperActionsMenu: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel
     let onClose: () -> Void
     @State private var isHovering = false
     @State private var showReprocessFeedback = false
+    @AppStorage("showFrameIDs", store: timelineSettingsStore) private var showFrameCard = SettingsDefaults.showFrameIDs
 
     /// Whether the current frame can be reprocessed (only Retrace frames)
     private var canReprocess: Bool {
@@ -4251,6 +7356,19 @@ struct DeveloperActionsMenu: View {
 
     var body: some View {
         Menu {
+            Button(action: {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    viewModel.toggleFrameIDBadgeVisibilityFromDevMenu()
+                }
+            }) {
+                Label(
+                    showFrameCard ? "Hide Frame Card" : "Show Frame Card",
+                    systemImage: "info.square"
+                )
+            }
+
+            Divider()
+
             // Refresh OCR button
             Button(action: {
                 Task {
@@ -4286,6 +7404,30 @@ struct DeveloperActionsMenu: View {
                 )
             }
 
+            // Show/Hide Segment Placements toggle
+            Button(action: {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    viewModel.showSegmentBoundaries.toggle()
+                }
+            }) {
+                Label(
+                    viewModel.showSegmentBoundaries ? "Hide Segment Placements" : "Show Segment Placements",
+                    systemImage: "square.stack.3d.down.forward"
+                )
+            }
+
+            // Show/Hide Browser URL debug window toggle
+            Button(action: {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    viewModel.showBrowserURLDebugWindow.toggle()
+                }
+            }) {
+                Label(
+                    viewModel.showBrowserURLDebugWindow ? "Hide Browser URL Window" : "Show Browser URL Window",
+                    systemImage: "link"
+                )
+            }
+
             Divider()
 
             // Open Video File button - opens in QuickTime at the current frame's timestamp
@@ -4297,45 +7439,39 @@ struct DeveloperActionsMenu: View {
                 // Close the timeline before opening the video
                 onClose()
 
-                // Small delay to allow the timeline to fully close before opening QuickTime
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                Task.detached(priority: .userInitiated) {
+                    // Give the timeline a moment to close before starting QuickTime.
+                    try? await Task.sleep(for: .milliseconds(200), clock: .continuous)
+
                     // Create a hard link with .mp4 extension so QuickTime recognizes the format
-                    // (files are stored without extension but are valid MP4 containers)
-                    // Hard links work better than symlinks with QuickTime
+                    // (files are stored without extension but are valid MP4 containers).
                     let tempDir = FileManager.default.temporaryDirectory
                     let filename = (originalPath as NSString).lastPathComponent
                     let tempURL = tempDir.appendingPathComponent("\(filename).mp4")
 
                     do {
-                        // Remove existing file if present
                         if FileManager.default.fileExists(atPath: tempURL.path) {
                             try FileManager.default.removeItem(at: tempURL)
                         }
-                        // Create hard link with .mp4 extension (no data duplication)
                         try FileManager.default.linkItem(atPath: originalPath, toPath: tempURL.path)
                     } catch {
                         Log.error("[Dev] Failed to create hard link for video: \(error)", category: .ui)
                         return
                     }
 
-                    // Use AppleScript to open QuickTime and seek to the specific time
-                    let script = """
-                        tell application "QuickTime Player"
-                            activate
-                            open POSIX file "\(tempURL.path)"
-                            delay 0.5
-                            tell front document
-                                set current time to \(timeInSeconds)
-                            end tell
-                        end tell
-                        """
+                    do {
+                        let process = Process()
+                        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+                        process.arguments = DeveloperActionsMenu.quickTimeOpenScriptLines(path: tempURL.path, timeInSeconds: timeInSeconds)
+                            .flatMap { ["-e", $0] }
+                        try process.run()
+                        process.waitUntilExit()
 
-                    if let appleScript = NSAppleScript(source: script) {
-                        var error: NSDictionary?
-                        appleScript.executeAndReturnError(&error)
-                        if let error = error {
-                            Log.error("[Dev] AppleScript error: \(error)", category: .ui)
+                        if process.terminationStatus != 0 {
+                            Log.error("[Dev] osascript exited with status \(process.terminationStatus) while opening video", category: .ui)
                         }
+                    } catch {
+                        Log.error("[Dev] Failed to run osascript for video open: \(error)", category: .ui)
                     }
                 }
             }) {
@@ -4354,13 +7490,10 @@ struct DeveloperActionsMenu: View {
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 6)
-            .background(
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(Color(white: 0.15).opacity(0.9))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(isHovering ? Color.orange.opacity(0.5) : Color.white.opacity(0.15), lineWidth: 0.5)
+            .timelineGlassSurface(
+                .chip,
+                cornerRadius: 8,
+                borderColor: isHovering ? Color.orange.opacity(0.5) : Color.white.opacity(0.15)
             )
         }
         .menuStyle(.borderlessButton)
@@ -4374,18 +7507,103 @@ struct DeveloperActionsMenu: View {
             }
         }
     }
+
+    nonisolated private static func quickTimeOpenScriptLines(path: String, timeInSeconds: Double) -> [String] {
+        let escapedPath = escapeAppleScriptString(path)
+        let safeTime = max(0, timeInSeconds)
+        return [
+            "tell application \"QuickTime Player\"",
+            "activate",
+            "open POSIX file \"\(escapedPath)\"",
+            "delay 0.5",
+            "tell front document",
+            "set current time to \(safeTime)",
+            "end tell",
+            "end tell"
+        ]
+    }
+
+    nonisolated private static func escapeAppleScriptString(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+    }
 }
 #endif
+
+// MARK: - Controls Hidden Restore Hint Banner
+
+/// Banner displayed after Cmd+H hides the timeline controls.
+/// Guides the user to right-click anywhere on the frame to restore them.
+struct ControlsHiddenRestoreHintBanner: View {
+    let onDismiss: () -> Void
+    private var scale: CGFloat { TimelineScaleFactor.current }
+
+    var body: some View {
+        TimelineHintBanner(style: .capsule, scale: scale, onDismiss: onDismiss) {
+            Image(systemName: "menubar.arrow.down.rectangle")
+                .font(.system(size: 16 * scale, weight: .medium))
+                .foregroundColor(.white.opacity(0.9))
+
+            Text("Controls hidden")
+                .font(.system(size: 15 * scale, weight: .medium))
+                .foregroundColor(.white.opacity(0.92))
+
+            Rectangle()
+                .fill(Color.white.opacity(0.28))
+                .frame(width: 1, height: 16 * scale)
+
+            KeyboardBadge(symbol: "Right-click")
+
+            Text("on screen to bring them back")
+                .font(.system(size: 14 * scale, weight: .medium))
+                .foregroundColor(.white.opacity(0.76))
+        }
+    }
+}
+
+/// Banner displayed after hidden-state cache expiry snaps the timeline to the newest frame.
+/// Reminds the user that Cmd+Z restores the previous playhead position.
+struct PositionRecoveryHintBanner: View {
+    let onDismiss: () -> Void
+    private var scale: CGFloat { TimelineScaleFactor.current }
+
+    var body: some View {
+        TimelineHintBanner(style: .capsule, scale: scale, onDismiss: onDismiss) {
+            Image(systemName: "arrow.uturn.backward.circle.fill")
+                .font(.system(size: 16 * scale, weight: .medium))
+                .foregroundColor(.white.opacity(0.9))
+
+            Text("Lost your place?")
+                .font(.system(size: 15 * scale, weight: .medium))
+                .foregroundColor(.white.opacity(0.92))
+
+            Rectangle()
+                .fill(Color.white.opacity(0.28))
+                .frame(width: 1, height: 16 * scale)
+
+            Text("Press")
+                .font(.system(size: 14 * scale, weight: .medium))
+                .foregroundColor(.white.opacity(0.76))
+
+            KeyboardBadge(symbol: "⌘ Z")
+
+            Text("to return to your previous position")
+                .font(.system(size: 14 * scale, weight: .medium))
+                .foregroundColor(.white.opacity(0.76))
+        }
+    }
+}
 
 // MARK: - Text Selection Hint Banner
 
 /// Banner displayed at the top of the screen when user attempts text selection
-/// Suggests using Shift + Drag for area selection mode (like Rewind)
+/// Suggests available drag-selection shortcuts.
 struct TextSelectionHintBanner: View {
     let onDismiss: () -> Void
 
     var body: some View {
-        HStack(spacing: 12) {
+        TimelineHintBanner(style: .card, onDismiss: onDismiss) {
             // Info icon
             Image(systemName: "info.circle.fill")
                 .font(.retraceHeadline)
@@ -4396,41 +7614,30 @@ struct TextSelectionHintBanner: View {
                 .font(.retraceCaptionMedium)
                 .foregroundColor(.white.opacity(0.9))
 
-            Text("Try area selection mode:")
-                .font(.retraceCaption)
-                .foregroundColor(.white.opacity(0.7))
-
-            // Keyboard shortcut badges
+            // Keyboard shortcut guidance
             HStack(spacing: 4) {
+                Text("Try Area Selection")
+                    .font(.retraceCaption)
+                    .foregroundColor(.white.opacity(0.75))
                 KeyboardBadge(symbol: "⇧ Shift")
                 Text("+")
                     .font(.retraceCaption2Medium)
                     .foregroundColor(.white.opacity(0.5))
                 KeyboardBadge(symbol: "⊹ Drag")
-            }
-
-            // Dismiss button
-            Button(action: onDismiss) {
-                Image(systemName: "xmark")
+                Text("OR")
                     .font(.retraceCaption2Bold)
-                    .foregroundColor(.white.opacity(0.6))
-                    .frame(width: 24, height: 24)
-                    .background(Color.white.opacity(0.1))
-                    .clipShape(Circle())
+                    .foregroundColor(.white.opacity(0.55))
+                    .padding(.horizontal, 2)
+                Text("Box Selection")
+                    .font(.retraceCaption)
+                    .foregroundColor(.white.opacity(0.75))
+                KeyboardBadge(symbol: "⌘ Cmd")
+                Text("+")
+                    .font(.retraceCaption2Medium)
+                    .foregroundColor(.white.opacity(0.5))
+                KeyboardBadge(symbol: "⊹ Drag")
             }
-            .buttonStyle(.plain)
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
-        .background(
-            RoundedRectangle(cornerRadius: 10)
-                .fill(Color(white: 0.2).opacity(0.95))
-                .shadow(color: .black.opacity(0.3), radius: 10, y: 4)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 10)
-                .stroke(Color.white.opacity(0.15), lineWidth: 1)
-        )
     }
 }
 
@@ -4466,6 +7673,345 @@ struct PinnedDisplayBanner: View {
     }
 }
 
+private struct SearchResultNavigationToast: View {
+    let state: SearchViewModel.ResultNavigationState
+    let onNavigatePrevious: () -> Void
+    let onNavigateNext: () -> Void
+    private var scale: CGFloat { TimelineScaleFactor.current }
+
+    var body: some View {
+        VStack(alignment: .center, spacing: 10 * scale) {
+            HStack(spacing: 10 * scale) {
+                Image(systemName: "text.magnifyingglass")
+                    .font(.system(size: 16 * scale, weight: .medium))
+                    .foregroundColor(.white.opacity(0.9))
+
+                Text("\(state.currentPosition) of \(state.loadedCount)\(state.canLoadMore || state.isLoadingMore ? "+" : "")")
+                    .font(.system(size: 15 * scale, weight: .medium))
+                    .foregroundColor(.white.opacity(0.88))
+                    .monospacedDigit()
+            }
+
+            HStack(spacing: 10 * scale) {
+                SearchResultNavigationButton(
+                    systemImage: "chevron.left",
+                    isDisabled: !state.canNavigatePrevious,
+                    tooltipText: "⌘ ⇧ ←",
+                    scale: scale,
+                    action: onNavigatePrevious
+                )
+
+                SearchResultNavigationButton(
+                    systemImage: "chevron.right",
+                    isDisabled: !state.canNavigateNext && !state.canLoadMore,
+                    tooltipText: "⌘ ⇧ →",
+                    scale: scale,
+                    action: onNavigateNext
+                )
+            }
+
+            if state.isLoadingMore {
+                HStack(spacing: 6 * scale) {
+                    SpinnerView(size: 12 * scale, lineWidth: 1.8, color: .white.opacity(0.85))
+                    Text("Loading more")
+                        .font(.system(size: 14 * scale, weight: .medium))
+                        .foregroundColor(.white.opacity(0.76))
+                }
+            }
+        }
+        .padding(.horizontal, 16 * scale)
+        .padding(.vertical, 12 * scale)
+        .timelineGlassSurface(.banner, cornerRadius: 18 * scale)
+    }
+}
+
+private struct SearchResultNavigationButton: View {
+    let systemImage: String
+    let isDisabled: Bool
+    let tooltipText: String
+    var scale: CGFloat = 1
+    let action: () -> Void
+
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .font(.system(size: 12 * scale, weight: .semibold))
+                .foregroundColor(.white.opacity(isDisabled ? 0.38 : 0.88))
+                .frame(width: 34 * scale, height: 34 * scale)
+                .background(
+                    RoundedRectangle(cornerRadius: 10 * scale)
+                        .fill(buttonBackgroundColor)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10 * scale)
+                        .stroke(Color.white.opacity(isDisabled ? 0.08 : 0.16), lineWidth: 1)
+                )
+        }
+        .buttonStyle(.plain)
+        .disabled(isDisabled)
+        .instantTooltip(tooltipText, isVisible: $isHovering)
+        .onHover { hovering in
+            isHovering = !isDisabled && hovering
+        }
+        .onChange(of: isDisabled) { disabled in
+            if disabled {
+                isHovering = false
+            }
+        }
+        .onDisappear {
+            isHovering = false
+        }
+    }
+
+    private var buttonBackgroundColor: Color {
+        if isDisabled {
+            return Color.white.opacity(0.04)
+        }
+        return Color.white.opacity(isHovering ? 0.18 : 0.1)
+    }
+}
+
+/// Banner shown when highlighted OCR text is near the timeline tape region.
+/// Suggests hiding controls or opening the context menu for better visibility/actions.
+struct SearchHighlightControlsHintBanner: View {
+    let onDismiss: () -> Void
+
+    var body: some View {
+        TimelineHintBanner(style: .card, onDismiss: onDismiss) {
+            Image(systemName: "lightbulb.fill")
+                .font(.retraceHeadline)
+                .foregroundColor(.white.opacity(0.9))
+
+            Text("Highlighted text is under timeline controls.")
+                .font(.retraceCaptionMedium)
+                .foregroundColor(.white.opacity(0.9))
+
+            Text("Press")
+                .font(.retraceCaption)
+                .foregroundColor(.white.opacity(0.7))
+
+            KeyboardBadge(symbol: "⌘ H")
+
+            Text("to hide/show controls, or right-click.")
+                .font(.retraceCaption)
+                .foregroundColor(.white.opacity(0.7))
+        }
+    }
+}
+
+struct TimelineTapeRightClickHintBanner: View {
+    let onDismiss: () -> Void
+
+    var body: some View {
+        TimelineHintBanner(style: .card, onDismiss: onDismiss) {
+            Image(systemName: "lightbulb.fill")
+                .font(.retraceHeadline)
+                .foregroundColor(.white.opacity(0.9))
+
+            Text("Hint: You can also right-click the timeline tape to open the same tape menu!")
+                .font(.retraceCaptionMedium)
+                .foregroundColor(.white.opacity(0.9))
+
+            // Text("That works even if the hover bubble disappears while you scroll.")
+                .font(.retraceCaption)
+                .foregroundColor(.white.opacity(0.7))
+        }
+    }
+}
+
+/// Banner suggesting the user switch scroll orientation when scrolling the wrong axis.
+struct ScrollOrientationHintBanner: View {
+    let currentOrientation: String
+    let onSwitch: () -> Void
+    let onDismiss: () -> Void
+
+    private var isHorizontal: Bool { currentOrientation == "horizontal" }
+    @State private var isSwitchHovered = false
+
+    var body: some View {
+        TimelineHintBanner(style: .card, onDismiss: onDismiss) {
+            // Direction icon
+            Image(systemName: isHorizontal ? "arrow.up.arrow.down" : "arrow.left.arrow.right")
+                .font(.retraceHeadline)
+                .foregroundColor(.white.opacity(0.9))
+
+            // Message
+            Text(isHorizontal ? "Vertical scrolling detected." : "Horizontal scrolling detected.")
+                .font(.retraceCaptionMedium)
+                .foregroundColor(.white.opacity(0.9))
+
+            Text(isHorizontal ? "Timeline is currently set to Left/Right." : "Timeline is currently set to Up/Down.")
+                .font(.retraceCaption)
+                .foregroundColor(.white.opacity(0.7))
+
+            // Switch action button
+            Button(action: onSwitch) {
+                Text(isHorizontal ? "Switch to Up/Down" : "Switch to Left/Right")
+                    .font(.retraceCaptionMedium)
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(
+                        Capsule()
+                            .fill(Color.retraceSubmitAccent.opacity(isSwitchHovered ? 0.42 : 0.32))
+                            .overlay(
+                                Capsule()
+                                    .stroke(Color.white.opacity(isSwitchHovered ? 0.45 : 0.3), lineWidth: 1)
+                            )
+                    )
+            }
+            .buttonStyle(.plain)
+            .onHover { hovering in
+                isSwitchHovered = hovering
+                if hovering {
+                    NSCursor.pointingHand.push()
+                } else {
+                    NSCursor.pop()
+                }
+            }
+
+        }
+    }
+}
+
+private struct TimelineHintOverlayStack<Content: View>: View {
+    @ViewBuilder let content: () -> Content
+    private var scale: CGFloat { TimelineScaleFactor.current }
+
+    var body: some View {
+        VStack(spacing: 10 * scale) {
+            content()
+        }
+        .padding(.top, 60)
+        .padding(.horizontal, .spacingL)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    }
+}
+
+private enum TimelineHintBannerStyle {
+    case capsule
+    case card
+}
+
+private struct TimelineHintBanner<Content: View>: View {
+    let style: TimelineHintBannerStyle
+    var scale: CGFloat = 1
+    let onDismiss: (() -> Void)?
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        HStack(spacing: 12 * scale) {
+            content()
+
+            if let onDismiss {
+                TimelineHintDismissButton(scale: scale, onDismiss: onDismiss)
+            }
+        }
+        .padding(.horizontal, horizontalPadding)
+        .padding(.vertical, verticalPadding)
+        .timelineGlassSurface(.banner, cornerRadius: style.cornerRadius(scale: scale))
+    }
+
+    private var horizontalPadding: CGFloat {
+        switch style {
+        case .capsule:
+            18 * scale
+        case .card:
+            16
+        }
+    }
+
+    private var verticalPadding: CGFloat {
+        switch style {
+        case .capsule:
+            10 * scale
+        case .card:
+            10
+        }
+    }
+
+}
+
+private extension TimelineHintBannerStyle {
+    func cornerRadius(scale: CGFloat) -> CGFloat {
+        switch self {
+        case .capsule:
+            return 999
+        case .card:
+            return 10
+        }
+    }
+}
+
+private struct TimelineHintDismissButton: View {
+    var scale: CGFloat = 1
+    let onDismiss: () -> Void
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: onDismiss) {
+            Image(systemName: "xmark")
+                .font(.system(size: 11 * scale, weight: .bold))
+                .foregroundColor(.white.opacity(isHovering ? 0.88 : 0.66))
+                .frame(width: 24 * scale, height: 24 * scale)
+                .background(
+                    Circle()
+                        .fill(Color.white.opacity(isHovering ? 0.16 : 0.1))
+                )
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            isHovering = hovering
+            if hovering {
+                NSCursor.pointingHand.push()
+            } else {
+                NSCursor.pop()
+            }
+        }
+    }
+}
+
+/// Persistent banner that explains why the current frame is redacted.
+private struct RedactionReasonBanner: View {
+    let reason: String
+    let appBundleID: String?
+
+    var body: some View {
+        HStack(spacing: 10) {
+            if let appBundleID, !appBundleID.isEmpty {
+                AppIconView(bundleID: appBundleID, size: 18)
+                    .frame(width: 18, height: 18)
+            } else {
+                Image(systemName: "eye.slash.fill")
+                    .font(.retraceCaptionMedium)
+                    .foregroundColor(Color.orange.opacity(0.95))
+            }
+
+            Text("Redacted")
+                .font(.retraceCaptionMedium)
+                .foregroundColor(.white.opacity(0.95))
+
+            Rectangle()
+                .fill(Color.white.opacity(0.22))
+                .frame(width: 1, height: 14)
+
+            Text(reason)
+                .font(.retraceCaption)
+                .foregroundColor(.white.opacity(0.8))
+                .lineLimit(1)
+                .truncationMode(.tail)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .frame(maxWidth: 680)
+        .timelineGlassSurface(.banner, cornerRadius: 10, borderColor: Color.orange.opacity(0.35))
+        .allowsHitTesting(false)
+        .help("Current frame is redacted")
+    }
+}
+
 /// Small keyboard shortcut badge
 private struct KeyboardBadge: View {
     let symbol: String
@@ -4498,9 +8044,72 @@ extension Notification.Name {
 /// NSViewRepresentable that detects right-clicks and reports the location
 /// View modifier that monitors for right-clicks using a local event monitor
 struct RightClickOverlay: ViewModifier {
+    final class HyperlinkMenuTarget: NSObject {
+        var match: OCRHyperlinkMatch?
+        var onCopyHyperlink: (OCRHyperlinkMatch) -> Void = { _ in }
+
+        @objc func copyLinkAction(_ sender: Any?) {
+            guard let match else { return }
+            onCopyHyperlink(match)
+        }
+    }
+
+    final class RedactionMenuTarget: NSObject {
+        var node: OCRNodeWithText?
+        var onToggleReveal: (OCRNodeWithText) -> Void = { _ in }
+
+        @objc func toggleRevealAction(_ sender: Any?) {
+            guard let node else { return }
+            onToggleReveal(node)
+        }
+    }
+
+    final class MonitorState: ObservableObject {
+        var hyperlinkEntries: [HyperlinkContextMenuEntry] = []
+        var redactionEntries: [RedactedNodeContextMenuEntry] = []
+        var onHyperlinkRightClick: (OCRHyperlinkMatch) -> Void = { _ in }
+        var onCopyHyperlink: (OCRHyperlinkMatch) -> Void = { _ in }
+        var onRedactionRevealToggle: (OCRNodeWithText) -> Void = { _ in }
+        var onRightClick: (CGPoint) -> Void = { _ in }
+        var viewBounds: CGRect = .zero
+        let hyperlinkMenuTarget = HyperlinkMenuTarget()
+        let redactionMenuTarget = RedactionMenuTarget()
+    }
+
+    struct MonitorStateSyncView: NSViewRepresentable {
+        let monitorState: MonitorState
+        let hyperlinkEntries: [HyperlinkContextMenuEntry]
+        let redactionEntries: [RedactedNodeContextMenuEntry]
+        let onHyperlinkRightClick: (OCRHyperlinkMatch) -> Void
+        let onHyperlinkCopy: (OCRHyperlinkMatch) -> Void
+        let onRedactionRevealToggle: (OCRNodeWithText) -> Void
+        let onRightClick: (CGPoint) -> Void
+        let viewBounds: CGRect
+
+        func makeNSView(context: Context) -> NSView {
+            NSView(frame: .zero)
+        }
+
+        func updateNSView(_ nsView: NSView, context: Context) {
+            monitorState.hyperlinkEntries = hyperlinkEntries
+            monitorState.redactionEntries = redactionEntries
+            monitorState.onHyperlinkRightClick = onHyperlinkRightClick
+            monitorState.onCopyHyperlink = onHyperlinkCopy
+            monitorState.onRedactionRevealToggle = onRedactionRevealToggle
+            monitorState.onRightClick = onRightClick
+            monitorState.viewBounds = viewBounds
+        }
+    }
+
+    let hyperlinkEntries: [HyperlinkContextMenuEntry]
+    let redactionEntries: [RedactedNodeContextMenuEntry]
+    let onHyperlinkRightClick: (OCRHyperlinkMatch) -> Void
+    let onHyperlinkCopy: (OCRHyperlinkMatch) -> Void
+    let onRedactionRevealToggle: (OCRNodeWithText) -> Void
     let onRightClick: (CGPoint) -> Void
     @State private var eventMonitor: Any?
     @State private var viewBounds: CGRect = .zero
+    @StateObject private var monitorState = MonitorState()
 
     /// Height of the timeline tape area at the bottom (tape height + bottom padding)
     /// Clicks in this area are passed through to SwiftUI's native contextMenu
@@ -4511,17 +8120,30 @@ struct RightClickOverlay: ViewModifier {
     func body(content: Content) -> some View {
         content
             .background(
+                MonitorStateSyncView(
+                    monitorState: monitorState,
+                    hyperlinkEntries: hyperlinkEntries,
+                    redactionEntries: redactionEntries,
+                    onHyperlinkRightClick: onHyperlinkRightClick,
+                    onHyperlinkCopy: onHyperlinkCopy,
+                    onRedactionRevealToggle: onRedactionRevealToggle,
+                    onRightClick: onRightClick,
+                    viewBounds: viewBounds
+                )
+            )
+            .background(
                 GeometryReader { geo in
                     Color.clear
                         .onAppear {
-                            viewBounds = geo.frame(in: .global)
+                            updateViewBoundsIfNeeded(geo.frame(in: .global))
                         }
                         .onChange(of: geo.frame(in: .global)) { newFrame in
-                            viewBounds = newFrame
+                            updateViewBoundsIfNeeded(newFrame)
                         }
                 }
             )
             .onAppear {
+                syncMonitorState()
                 setupEventMonitor()
             }
             .onDisappear {
@@ -4529,9 +8151,37 @@ struct RightClickOverlay: ViewModifier {
             }
     }
 
+    private func updateViewBoundsIfNeeded(_ newFrame: CGRect) {
+        let epsilon: CGFloat = 0.5
+        let hasMeaningfulDelta =
+            abs(viewBounds.minX - newFrame.minX) > epsilon ||
+            abs(viewBounds.minY - newFrame.minY) > epsilon ||
+            abs(viewBounds.width - newFrame.width) > epsilon ||
+            abs(viewBounds.height - newFrame.height) > epsilon
+
+        if hasMeaningfulDelta || viewBounds == .zero {
+            viewBounds = newFrame
+            monitorState.viewBounds = newFrame
+        }
+    }
+
+    private func syncMonitorState() {
+        monitorState.hyperlinkEntries = hyperlinkEntries
+        monitorState.redactionEntries = redactionEntries
+        monitorState.onHyperlinkRightClick = onHyperlinkRightClick
+        monitorState.onCopyHyperlink = onHyperlinkCopy
+        monitorState.onRedactionRevealToggle = onRedactionRevealToggle
+        monitorState.onRightClick = onRightClick
+        monitorState.viewBounds = viewBounds
+    }
+
     private func setupEventMonitor() {
         eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .rightMouseDown) { event in
             guard let window = event.window else { return event }
+
+            if FocusableTextInputSupport.shouldDeferRightClickToTextInput(window: window, event: event) {
+                return event
+            }
 
             // Get click location in window coordinates (origin at bottom-left of window)
             let windowLocation = event.locationInWindow
@@ -4544,21 +8194,63 @@ struct RightClickOverlay: ViewModifier {
             )
 
             // Check if click is within our view bounds (in SwiftUI global coordinates)
-            if viewBounds.contains(swiftUILocation) {
+            let currentViewBounds = monitorState.viewBounds
+            if currentViewBounds.contains(swiftUILocation) {
                 // Convert to view-local coordinates
-                let localX = swiftUILocation.x - viewBounds.minX
-                let localY = swiftUILocation.y - viewBounds.minY
+                let localX = swiftUILocation.x - currentViewBounds.minX
+                let localY = swiftUILocation.y - currentViewBounds.minY
+                let localPoint = CGPoint(x: localX, y: localY)
+                let hyperlinkEntries = monitorState.hyperlinkEntries
+                let matchedHyperlink = hyperlinkEntries.first(where: { $0.rect.contains(localPoint) })
+                let redactionEntries = monitorState.redactionEntries
+                let matchedRedaction = redactionEntries.first(where: { $0.rect.contains(localPoint) })
 
                 // Check if click is in the timeline tape area at the bottom
                 // If so, let the event pass through to SwiftUI's native contextMenu
-                let distanceFromBottom = viewBounds.height - localY
+                let distanceFromBottom = currentViewBounds.height - localY
+
+                if let matchedHyperlink, let contentView = window.contentView {
+                    let target = monitorState.hyperlinkMenuTarget
+                    target.match = matchedHyperlink.match
+                    monitorState.onHyperlinkRightClick(matchedHyperlink.match)
+                    target.onCopyHyperlink = monitorState.onCopyHyperlink
+
+                    let menu = NSMenu()
+                    let copyItem = NSMenuItem(title: "Copy Link", action: #selector(HyperlinkMenuTarget.copyLinkAction(_:)), keyEquivalent: "")
+                    copyItem.target = target
+                    menu.addItem(copyItem)
+                    NSMenu.popUpContextMenu(menu, with: event, for: contentView)
+                    return nil
+                }
+
+                if let matchedRedaction,
+                   let tooltipState = matchedRedaction.tooltipState,
+                   let contentView = window.contentView {
+                    let target = monitorState.redactionMenuTarget
+                    target.node = matchedRedaction.node
+                    target.onToggleReveal = monitorState.onRedactionRevealToggle
+
+                    let menu = NSMenu()
+                    let title = tooltipState.title
+                    let toggleItem = NSMenuItem(
+                        title: title,
+                        action: #selector(RedactionMenuTarget.toggleRevealAction(_:)),
+                        keyEquivalent: ""
+                    )
+                    toggleItem.target = target
+                    toggleItem.isEnabled = tooltipState.isInteractive
+                    menu.addItem(toggleItem)
+                    NSMenu.popUpContextMenu(menu, with: event, for: contentView)
+                    return nil
+                }
+
                 if distanceFromBottom < timelineExclusionHeight {
                     // Pass through to SwiftUI for timeline tape context menu
                     return event
                 }
 
                 DispatchQueue.main.async {
-                    onRightClick(CGPoint(x: localX, y: localY))
+                    monitorState.onRightClick(localPoint)
                 }
                 return nil // Consume the event
             }
@@ -4575,8 +8267,24 @@ struct RightClickOverlay: ViewModifier {
 }
 
 extension View {
-    func onRightClick(perform action: @escaping (CGPoint) -> Void) -> some View {
-        modifier(RightClickOverlay(onRightClick: action))
+    func onRightClick(
+        hyperlinkEntries: [HyperlinkContextMenuEntry] = [],
+        redactionEntries: [RedactedNodeContextMenuEntry] = [],
+        onHyperlinkRightClick: @escaping (OCRHyperlinkMatch) -> Void = { _ in },
+        onHyperlinkCopy: @escaping (OCRHyperlinkMatch) -> Void = { _ in },
+        onRedactionRevealToggle: @escaping (OCRNodeWithText) -> Void = { _ in },
+        perform action: @escaping (CGPoint) -> Void
+    ) -> some View {
+        modifier(
+            RightClickOverlay(
+                hyperlinkEntries: hyperlinkEntries,
+                redactionEntries: redactionEntries,
+                onHyperlinkRightClick: onHyperlinkRightClick,
+                onHyperlinkCopy: onHyperlinkCopy,
+                onRedactionRevealToggle: onRedactionRevealToggle,
+                onRightClick: action
+            )
+        )
     }
 }
 
@@ -4589,10 +8297,11 @@ struct FloatingContextMenu: View {
     @Binding var isPresented: Bool
     let location: CGPoint
     let containerSize: CGSize
+    let highlightControlsVisibilityRow: Bool
 
     // Menu dimensions (approximate)
-    private let menuWidth: CGFloat = 200
-    private let menuHeight: CGFloat = 220
+    private let menuWidth: CGFloat = 272
+    private let menuHeight: CGFloat = 252
     private let edgePadding: CGFloat = 16
 
     var body: some View {
@@ -4607,13 +8316,17 @@ struct FloatingContextMenu: View {
                 }
 
             // Menu content - uses shared ContextMenuContent from UI/Components
-            ContextMenuContent(viewModel: viewModel, showMenu: $isPresented)
+            ContextMenuContent(
+                viewModel: viewModel,
+                showMenu: $isPresented,
+                highlightControlsVisibilityRow: highlightControlsVisibilityRow
+            )
                 .retraceMenuContainer()
                 .fixedSize()
                 .position(adjustedPosition)
         }
-        .transition(.opacity.combined(with: .scale(scale: 0.95, anchor: anchorPoint)))
-        .animation(.spring(response: 0.2, dampingFraction: 0.8), value: isPresented)
+        .transition(.opacity)
+        .animation(.easeInOut(duration: 0.16), value: isPresented)
     }
 
     /// Whether menu should appear above the click (bottom-left at cursor) vs below (top-left at cursor)
@@ -4647,10 +8360,6 @@ struct FloatingContextMenu: View {
         return CGPoint(x: x, y: y)
     }
 
-    /// Determine anchor point for animation based on position
-    private var anchorPoint: UnitPoint {
-        shouldShowAbove ? .bottomLeading : .topLeading
-    }
 }
 
 // MARK: - Context Menu Dismiss Overlay
@@ -4678,9 +8387,7 @@ class ContextMenuDismissNSView: NSView {
         // Left-click dismisses the menu
         guard let viewModel = viewModel else { return }
         DispatchQueue.main.async {
-            withAnimation(.easeOut(duration: 0.15)) {
-                viewModel.dismissTimelineContextMenu()
-            }
+            viewModel.dismissTimelineContextMenu()
         }
     }
 
@@ -4705,7 +8412,7 @@ class ContextMenuDismissNSView: NSView {
 
 // MARK: - Timeline Segment Context Menu
 
-/// Context menu for right-clicking on timeline segments (Add Tag, Hide, Delete)
+/// Context menu for right-clicking on timeline segments (Add Tag, Add Comment, Hide, Delete)
 struct TimelineSegmentContextMenu: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel
     @Binding var isPresented: Bool
@@ -4713,10 +8420,16 @@ struct TimelineSegmentContextMenu: View {
     let containerSize: CGSize
 
     // Menu dimensions
-    private let menuWidth: CGFloat = 180
-    private let menuHeight: CGFloat = 140
-    private let submenuWidth: CGFloat = 160
+    private let menuWidth: CGFloat = 208
+    private let menuHeight: CGFloat = 172
+    private let tagSubmenuWidth: CGFloat = 188
     private let edgePadding: CGFloat = 16
+
+    private var selectedTagsForContextMenu: [Tag] {
+        viewModel.availableTags
+            .filter { !($0.isHidden) && viewModel.selectedSegmentTags.contains($0.id) }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
 
     var body: some View {
         ZStack {
@@ -4726,53 +8439,83 @@ struct TimelineSegmentContextMenu: View {
             // Main menu content
             VStack(alignment: .leading, spacing: 0) {
                 // Add Tag button (with submenu that opens on hover)
-                TimelineMenuButton(
-                    icon: "tag",
-                    title: "Add Tag",
-                    showChevron: true,
+                TimelineTagMenuButton(
+                    selectedTags: selectedTagsForContextMenu,
                     onHoverChanged: { isHovering in
                         viewModel.isHoveringAddTagButton = isHovering
                         if isHovering && !viewModel.showTagSubmenu {
+                            viewModel.recordTagSubmenuOpen(source: "context_menu_hover")
                             withAnimation(.easeOut(duration: 0.15)) {
+                                viewModel.showCommentSubmenu = false
                                 viewModel.showTagSubmenu = true
                             }
                         }
                     }
                 ) {
                     // Toggle on click as well
+                    if !viewModel.showTagSubmenu {
+                        viewModel.recordTagSubmenuOpen(source: "context_menu_click")
+                    }
                     withAnimation(.easeOut(duration: 0.15)) {
+                        viewModel.showCommentSubmenu = false
                         viewModel.showTagSubmenu.toggle()
                     }
                 }
 
-                // Filter button
+                // Add Comment button (opens a dedicated comment overlay)
                 TimelineMenuButton(
-                    icon: "line.3.horizontal.decrease",
-                    title: "Filter",
+                    icon: "text.bubble",
+                    title: "Add Comment",
+                    shortcut: "⌥C",
                     onHoverChanged: { isHovering in
                         // Close tag submenu when hovering over other items
                         if isHovering && viewModel.showTagSubmenu {
                             withAnimation(.easeOut(duration: 0.15)) {
                                 viewModel.showTagSubmenu = false
+                            }
+                        }
+                    }
+                ) {
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        viewModel.showTagSubmenu = false
+                        viewModel.showTimelineContextMenu = false
+                        viewModel.showCommentSubmenu = true
+                    }
+                    viewModel.recordCommentSubmenuOpen(source: "context_menu_click")
+                    Task { await viewModel.loadCommentsForSelectedTimelineBlock() }
+                }
+
+                // Filter button
+                TimelineMenuButton(
+                    icon: "line.3.horizontal.decrease",
+                    title: "Filter App",
+                    shortcut: "⌥F",
+                    onHoverChanged: { isHovering in
+                        // Close submenus when hovering over other items
+                        if isHovering && (viewModel.showTagSubmenu || viewModel.showCommentSubmenu) {
+                            withAnimation(.easeOut(duration: 0.15)) {
+                                viewModel.showTagSubmenu = false
+                                viewModel.showCommentSubmenu = false
                                 viewModel.showNewTagInput = false
                                 viewModel.newTagName = ""
                             }
                         }
                     }
                 ) {
-                    viewModel.dismissTimelineContextMenu()
-                    viewModel.openFilterPanel()
+                    viewModel.toggleQuickAppFilterForSelectedTimelineSegment()
                 }
 
                 // Hide button
                 TimelineMenuButton(
                     icon: "eye.slash",
                     title: "Hide",
+                    shortcut: "⌥H",
                     onHoverChanged: { isHovering in
-                        // Close tag submenu when hovering over other items
-                        if isHovering && viewModel.showTagSubmenu {
+                        // Close submenus when hovering over other items
+                        if isHovering && (viewModel.showTagSubmenu || viewModel.showCommentSubmenu) {
                             withAnimation(.easeOut(duration: 0.15)) {
                                 viewModel.showTagSubmenu = false
+                                viewModel.showCommentSubmenu = false
                                 viewModel.showNewTagInput = false
                                 viewModel.newTagName = ""
                             }
@@ -4790,12 +8533,14 @@ struct TimelineSegmentContextMenu: View {
                 TimelineMenuButton(
                     icon: "trash",
                     title: "Delete",
+                    shortcut: "⌫",
                     isDestructive: true,
                     onHoverChanged: { isHovering in
-                        // Close tag submenu when hovering over other items
-                        if isHovering && viewModel.showTagSubmenu {
+                        // Close submenus when hovering over other items
+                        if isHovering && (viewModel.showTagSubmenu || viewModel.showCommentSubmenu) {
                             withAnimation(.easeOut(duration: 0.15)) {
                                 viewModel.showTagSubmenu = false
+                                viewModel.showCommentSubmenu = false
                                 viewModel.showNewTagInput = false
                                 viewModel.newTagName = ""
                             }
@@ -4813,13 +8558,20 @@ struct TimelineSegmentContextMenu: View {
             // Tag submenu (appears when "Add Tag" is hovered/clicked)
             if viewModel.showTagSubmenu {
                 TagSubmenu(viewModel: viewModel)
-                    .position(submenuPosition)
+                    .position(tagSubmenuPosition)
                     .transition(.opacity.combined(with: .scale(scale: 0.95, anchor: .leading)))
             }
+
         }
-        .transition(.opacity.combined(with: .scale(scale: 0.95, anchor: anchorPoint)))
-        .animation(.spring(response: 0.2, dampingFraction: 0.8), value: isPresented)
+        .transition(
+            .asymmetric(
+                insertion: .opacity.combined(with: .scale(scale: 0.95, anchor: anchorPoint)),
+                removal: .opacity.combined(with: .scale(scale: 0.98, anchor: anchorPoint))
+            )
+        )
+        .animation(.easeOut(duration: 0.15), value: isPresented)
         .animation(.spring(response: 0.2, dampingFraction: 0.8), value: viewModel.showTagSubmenu)
+        .animation(.spring(response: 0.2, dampingFraction: 0.8), value: viewModel.showCommentSubmenu)
     }
 
     /// Whether menu should appear above the click
@@ -4852,9 +8604,9 @@ struct TimelineSegmentContextMenu: View {
     }
 
     /// Calculate submenu position (to the right of main menu)
-    private var submenuPosition: CGPoint {
+    private func submenuPosition(rowOffset: CGFloat, submenuWidth: CGFloat) -> CGPoint {
         var x = adjustedPosition.x + menuWidth / 2 + submenuWidth / 2 + 4
-        let y = adjustedPosition.y - menuHeight / 2 + 40 // Align with "Add Tag" row
+        let y = adjustedPosition.y - menuHeight / 2 + rowOffset
 
         // If submenu would go off right edge, show on left side instead
         if x + submenuWidth / 2 > containerSize.width - edgePadding {
@@ -4862,6 +8614,11 @@ struct TimelineSegmentContextMenu: View {
         }
 
         return CGPoint(x: x, y: y)
+    }
+
+    /// Submenu position aligned with the "Add Tag" row
+    private var tagSubmenuPosition: CGPoint {
+        submenuPosition(rowOffset: 40, submenuWidth: tagSubmenuWidth)
     }
 
     private var anchorPoint: UnitPoint {
@@ -4875,169 +8632,2776 @@ struct TimelineSegmentContextMenu: View {
 // TimelineMenuButton: now uses the unified RetraceMenuButton from AppTheme
 typealias TimelineMenuButton = RetraceMenuButton
 
+/// Specialized tag row for the timeline context menu.
+/// Shows compact selected-tag badges, and only shows the shortcut hint in the neutral "Add Tag" state.
+struct TimelineTagMenuButton: View {
+    let selectedTags: [Tag]
+    var onHoverChanged: ((Bool) -> Void)? = nil
+    let action: () -> Void
+
+    @State private var isHovering = false
+
+    private var isTagged: Bool { !selectedTags.isEmpty }
+    private var icon: String { "tag" }
+    private var visibleTags: [Tag] { Array(selectedTags.prefix(2)) }
+    private var overflowCount: Int { max(0, selectedTags.count - visibleTags.count) }
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: RetraceMenuStyle.iconTextSpacing) {
+                Image(systemName: icon)
+                    .font(.system(size: RetraceMenuStyle.iconSize, weight: RetraceMenuStyle.fontWeight))
+                    .foregroundColor(foregroundColor)
+                    .frame(width: RetraceMenuStyle.iconFrameWidth)
+
+                if isTagged {
+                    HStack(spacing: 4) {
+                        ForEach(visibleTags) { tag in
+                            tagBadge(tag)
+                        }
+
+                        if overflowCount > 0 {
+                            Text("+\(overflowCount)")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundColor(.white.opacity(isHovering ? 0.9 : 0.75))
+                                .padding(.horizontal, 4)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                } else {
+                    Text("Add Tag")
+                        .font(RetraceMenuStyle.font)
+                        .foregroundColor(foregroundColor)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .layoutPriority(1)
+
+                    Spacer(minLength: 0)
+
+                    Text("⌥T")
+                        .font(RetraceMenuStyle.shortcutFont)
+                        .foregroundColor(shortcutColor)
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .frame(minWidth: RetraceMenuStyle.shortcutColumnMinWidth, alignment: .trailing)
+                }
+
+                Image(systemName: "chevron.right")
+                    .font(.system(size: RetraceMenuStyle.chevronSize, weight: .bold))
+                    .foregroundColor(RetraceMenuStyle.chevronColor)
+            }
+            .padding(.horizontal, RetraceMenuStyle.itemPaddingH)
+            .padding(.vertical, RetraceMenuStyle.itemPaddingV)
+            .background(
+                RoundedRectangle(cornerRadius: RetraceMenuStyle.itemCornerRadius)
+                    .fill(isHovering ? RetraceMenuStyle.itemHoverColor : Color.clear)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            withAnimation(.easeOut(duration: RetraceMenuStyle.hoverAnimationDuration)) {
+                isHovering = hovering
+            }
+            if hovering { NSCursor.pointingHand.push() }
+            else { NSCursor.pop() }
+            onHoverChanged?(hovering)
+        }
+    }
+
+    private var foregroundColor: Color {
+        isHovering ? RetraceMenuStyle.textColor : RetraceMenuStyle.textColorMuted
+    }
+
+    private var shortcutColor: Color {
+        RetraceMenuStyle.textColorMuted.opacity(isHovering ? 0.95 : 0.7)
+    }
+
+    @ViewBuilder
+    private func tagBadge(_ tag: Tag) -> some View {
+        let tint = TagColorStore.color(for: tag)
+        HStack(spacing: 4) {
+            Circle()
+                .fill(tint.opacity(0.95))
+                .frame(width: 5, height: 5)
+
+            Text(tag.name)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundColor(.white.opacity(isHovering ? 0.95 : 0.85))
+                .lineLimit(1)
+                .truncationMode(.tail)
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 3)
+        .frame(maxWidth: 62)
+        .background(
+            Capsule()
+                .fill(tint.opacity(isHovering ? 0.26 : 0.18))
+        )
+        .overlay(
+            Capsule()
+                .stroke(tint.opacity(isHovering ? 0.45 : 0.32), lineWidth: 0.8)
+        )
+    }
+}
+
 // MARK: - Tag Submenu
 
 /// Submenu showing available tags with search/create functionality
 struct TagSubmenu: View {
+    enum Presentation {
+        case contextMenu
+        case commentOverlay
+    }
+
     @ObservedObject var viewModel: SimpleTimelineViewModel
+    let presentation: Presentation
     @State private var isHoveringSubmenu = false
     @State private var closeTask: Task<Void, Never>?
-    @State private var searchText = ""
-    @FocusState private var isSearchFocused: Bool
 
-    // Filter out the "hidden" tag, apply search filter, and sort with selected tags first
-    private var visibleTags: [Tag] {
-        let nonHidden = viewModel.availableTags.filter { !$0.isHidden }
-        let filtered = searchText.isEmpty
-            ? nonHidden
-            : nonHidden.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
+    init(viewModel: SimpleTimelineViewModel, presentation: Presentation = .contextMenu) {
+        self.viewModel = viewModel
+        self.presentation = presentation
+    }
 
-        // Sort: selected tags first, then alphabetically within each group
-        return filtered.sorted { tag1, tag2 in
-            let tag1Selected = viewModel.selectedSegmentTags.contains(tag1.id)
-            let tag2Selected = viewModel.selectedSegmentTags.contains(tag2.id)
-
-            if tag1Selected != tag2Selected {
-                return tag1Selected // Selected tags come first
-            }
-            return tag1.name.localizedCaseInsensitiveCompare(tag2.name) == .orderedAscending
+    private var style: CommentTagPickerStyle {
+        switch presentation {
+        case .contextMenu:
+            return .contextMenu
+        case .commentOverlay:
+            return .commentOverlay
         }
-    }
-
-    // Check if search text matches an existing tag exactly
-    private var exactTagMatch: Bool {
-        viewModel.availableTags.contains { $0.name.lowercased() == searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
-    }
-
-    // Show "Create" option if there's search text that doesn't match an existing tag
-    private var showCreateOption: Bool {
-        !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !exactTagMatch
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            // Search/Create input field - always visible
-            HStack(spacing: 8) {
-                Image(systemName: "magnifyingglass")
-                    .font(.system(size: 12))
-                    .foregroundColor(.white.opacity(0.5))
+        CommentTagPickerMenu(
+            tags: viewModel.availableTags.filter { !$0.isHidden },
+            selectedTagIDs: viewModel.selectedSegmentTags,
+            style: style,
+            onHoverChanged: handleHoverChange,
+            onSelectTag: { tag in
+                viewModel.toggleTagOnSelectedSegment(tag: tag)
+            },
+            onCreateTag: { tagName in
+                viewModel.newTagName = tagName
+                viewModel.createAndAddTag()
+            },
+            onOpenSettings: openTagSettings
+        )
+    }
 
-                TextField("Search or create...", text: $searchText)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 13))
-                    .foregroundColor(.white)
-                    .focused($isSearchFocused)
-                    .onSubmit {
-                        if showCreateOption {
-                            createTagFromSearch()
-                        } else if visibleTags.count == 1 {
-                            // If only one result, toggle it
-                            viewModel.toggleTagOnSelectedSegment(tag: visibleTags[0])
-                        }
-                    }
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 5)
-            .background(
-                RoundedRectangle(cornerRadius: 6)
-                    .fill(Color.white.opacity(0.08))
-            )
-            .padding(.horizontal, 8)
-            .padding(.top, 4)
-            .padding(.bottom, 6)
+    private func openTagSettings() {
+        closeTask?.cancel()
+        withAnimation(.easeOut(duration: 0.12)) {
+            viewModel.showTagSubmenu = false
+            viewModel.showTimelineContextMenu = false
+        }
 
-            Divider()
-                .background(Color.white.opacity(0.1))
-                .padding(.horizontal, 8)
+        TimelineWindowController.shared.hideToShowDashboard()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+            DashboardWindowController.shared.show()
+            NotificationCenter.default.post(name: .openSettingsTags, object: nil)
+        }
+    }
 
-            // Tag list
-            if visibleTags.isEmpty && !showCreateOption {
-                Text("No tags found")
-                    .font(.system(size: 12))
-                    .foregroundColor(.white.opacity(0.5))
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-            } else {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 0) {
-                        // Existing tags that match search
-                        ForEach(visibleTags) { tag in
-                            TagSubmenuRow(
-                                tag: tag,
-                                isSelected: viewModel.selectedSegmentTags.contains(tag.id)
-                            ) {
-                                viewModel.toggleTagOnSelectedSegment(tag: tag)
-                            }
-                        }
-
-                        // "Create [searchtext]" option if search text doesn't match existing tag
-                        if showCreateOption {
-                            Button(action: createTagFromSearch) {
-                                HStack(spacing: 10) {
-                                    Image(systemName: "plus")
-                                        .font(.system(size: 12, weight: .medium))
-                                        .foregroundStyle(LinearGradient.retraceAccentGradient)
-
-                                    Text("Create \"\(searchText.trimmingCharacters(in: .whitespacesAndNewlines))\"")
-                                        .font(.system(size: 13, weight: .medium))
-                                        .foregroundStyle(LinearGradient.retraceAccentGradient)
-
-                                    Spacer()
-                                }
-                                .padding(.horizontal, 12)
-                                .padding(.vertical, 8)
-                                .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                            .onHover { hovering in
-                                if hovering { NSCursor.pointingHand.push() }
-                                else { NSCursor.pop() }
-                            }
+    private func handleHoverChange(_ hovering: Bool) {
+        isHoveringSubmenu = hovering
+        if !hovering {
+            closeTask?.cancel()
+            closeTask = Task {
+                try? await Task.sleep(for: .nanoseconds(Int64(220_000_000)), clock: .continuous)
+                if !Task.isCancelled && !isHoveringSubmenu && !viewModel.isHoveringAddTagButton {
+                    await MainActor.run {
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            viewModel.showTagSubmenu = false
                         }
                     }
                 }
-                .frame(maxHeight: 120) // Limit height for scrolling
+            }
+        } else {
+            closeTask?.cancel()
+        }
+    }
+}
+
+// MARK: - Comment Overlay
+
+/// Dedicated overlay for creating rich comments and browsing the existing thread for the selected block.
+struct CommentSubmenu: View {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+    let onClose: () -> Void
+    @State private var commentKeyboardMonitor: Any?
+    @State private var isCommentFocused = false
+    @State private var editorCommand: CommentEditorCommand = .bold
+    @State private var editorCommandNonce: Int = 0
+    @State private var isLinkPopoverPresented = false
+    @State private var pendingLinkURL = "https://"
+    @State private var hoveredCommentID: SegmentCommentID?
+    @State private var hoveredAllCommentsRowID: SegmentCommentID?
+    @State private var highlightedCommentSearchResultID: SegmentCommentID?
+    @State private var pendingDeleteComment: SegmentComment?
+    @State private var isDeletingComment: Bool = false
+    @State private var commentBrowserMode: CommentBrowserMode = .thread
+    @State private var allCommentsAnchorID: SegmentCommentID?
+    @State private var allCommentsVisibleBeforeCount: Int = 0
+    @State private var allCommentsVisibleAfterCount: Int = 0
+    @State private var hasPerformedAllCommentsInitialScroll = false
+    @State private var isRequestingOlderCommentPage = false
+    @State private var isRequestingNewerCommentPage = false
+    @State private var pendingAnchorPinnedCommentID: SegmentCommentID?
+    @State private var isNavigatingLinkedCommentFrame = false
+    @State private var commentTargetPreviewImage: NSImage?
+    @State private var isLoadingCommentTargetPreview = false
+    @FocusState private var isAllCommentsSearchFieldFocused: Bool
+    @FocusState private var isLinkFieldFocused: Bool
+    private let submenuWidth: CGFloat = 450
+    private let submenuHeight: CGFloat = 720
+    private let sectionCornerRadius: CGFloat = 14
+    private let allCommentsPageSize: Int = 10
+    private let commentTargetTagOverlayOffsetY: CGFloat = 30
+
+    private enum CommentBrowserMode {
+        case thread
+        case allComments
+    }
+
+    private static let threadDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = .autoupdatingCurrent
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter
+    }()
+
+    private var trimmedComment: String {
+        viewModel.newCommentText.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var canSubmit: Bool {
+        !trimmedComment.isEmpty && !viewModel.isAddingComment
+    }
+
+    private var hasActiveCommentSearch: Bool {
+        !viewModel.commentSearchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var commentSearchBinding: Binding<String> {
+        Binding(
+            get: { viewModel.commentSearchText },
+            set: { viewModel.updateCommentSearchQuery($0) }
+        )
+    }
+
+    private var normalizedPendingLinkURL: URL? {
+        Self.normalizedURL(from: pendingLinkURL)
+    }
+
+    private var commentTarget: CommentComposerTargetDisplayInfo? {
+        viewModel.selectedCommentComposerTarget
+    }
+
+    private var commentTargetFrameIDValue: Int64? {
+        commentTarget?.frameID.value
+    }
+
+    private var isDeleteConfirmationPresented: Binding<Bool> {
+        Binding(
+            get: { pendingDeleteComment != nil },
+            set: { shouldShow in
+                if !shouldShow {
+                    pendingDeleteComment = nil
+                    isDeletingComment = false
+                }
+            }
+        )
+    }
+
+    private var shouldShowThreadSection: Bool {
+        commentBrowserMode == .thread
+    }
+
+    private var commentHeaderTitle: String {
+        commentBrowserMode == .allComments ? "All Comments" : "Comments"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            commentHeader
+            if commentBrowserMode == .thread {
+                commentTargetSection
+                    .fixedSize(horizontal: false, vertical: true)
+                if shouldShowThreadSection {
+                    commentThreadSection
+                        .frame(maxHeight: .infinity)
+                        .layoutPriority(1)
+                        .transition(
+                            .asymmetric(
+                                insertion: .move(edge: .top).combined(with: .opacity),
+                                removal: .scale(scale: 0.96, anchor: .top).combined(with: .opacity)
+                            )
+                        )
+                }
+                commentComposerSection
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                allCommentsSection
+                    .frame(maxHeight: .infinity)
+                    .layoutPriority(1)
             }
         }
-        .padding(.vertical, 2)
-        .frame(width: 180)
-        .retraceMenuContainer()
+        .frame(width: submenuWidth)
+        .frame(height: submenuHeight, alignment: .top)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 15)
+        .retraceMenuContainer(addPadding: false)
+        .animation(.spring(response: 0.26, dampingFraction: 0.88), value: shouldShowThreadSection)
+        .animation(.spring(response: 0.26, dampingFraction: 0.88), value: commentBrowserMode)
         .onAppear {
-            // Delay focus slightly to ensure the view is in the responder chain
+            installCommentKeyboardMonitor()
+            commentBrowserMode = .thread
+            allCommentsAnchorID = nil
+            allCommentsVisibleBeforeCount = 0
+            allCommentsVisibleAfterCount = 0
+            hasPerformedAllCommentsInitialScroll = false
+            isRequestingOlderCommentPage = false
+            isRequestingNewerCommentPage = false
+            pendingAnchorPinnedCommentID = nil
+            highlightedCommentSearchResultID = nil
+            isAllCommentsSearchFieldFocused = false
+            viewModel.isAllCommentsBrowserActive = false
+            commentTargetPreviewImage = nil
+            isLoadingCommentTargetPreview = false
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                isSearchFocused = true
+                isCommentFocused = true
             }
+            Task { await viewModel.loadTags() }
         }
-        .onHover { hovering in
-            isHoveringSubmenu = hovering
-            if !hovering {
-                // Small delay before closing to allow mouse to move back to main menu or Add Tag button
-                closeTask?.cancel()
-                closeTask = Task {
-                    try? await Task.sleep(nanoseconds: 150_000_000) // 150ms delay
-                    if !Task.isCancelled && !isHoveringSubmenu && !viewModel.isHoveringAddTagButton {
-                        await MainActor.run {
-                            withAnimation(.easeOut(duration: 0.15)) {
-                                viewModel.showTagSubmenu = false
-                                searchText = ""
-                            }
-                        }
-                    }
+        .onChange(of: commentBrowserMode) { mode in
+            viewModel.isAllCommentsBrowserActive = (mode == .allComments)
+            if mode == .allComments {
+                syncHighlightedCommentSearchSelection()
+                DispatchQueue.main.async {
+                    isAllCommentsSearchFieldFocused = true
                 }
             } else {
-                // Cancel any pending close
-                closeTask?.cancel()
+                highlightedCommentSearchResultID = nil
+                isAllCommentsSearchFieldFocused = false
+            }
+        }
+        .onChange(of: viewModel.returnToThreadCommentsSignal) { _ in
+            guard commentBrowserMode == .allComments else { return }
+            withAnimation(.easeOut(duration: 0.14)) {
+                exitAllCommentsView()
+            }
+        }
+        .onChange(of: viewModel.commentSearchText) { _ in
+            syncHighlightedCommentSearchSelection()
+        }
+        .onChange(of: viewModel.commentSearchResults.map { $0.id.value }) { _ in
+            syncHighlightedCommentSearchSelection()
+        }
+        .onChange(of: viewModel.showTagSubmenu) { isPresented in
+            if isPresented {
+                // Prevent the markdown editor from stealing first responder
+                // while the tag submenu search field is trying to become active.
+                isCommentFocused = false
+            } else if commentBrowserMode == .thread && !isLinkPopoverPresented {
+                DispatchQueue.main.async {
+                    isCommentFocused = true
+                }
+            }
+        }
+        .onChange(of: isLinkPopoverPresented) { isPresented in
+            viewModel.isCommentLinkPopoverPresented = isPresented
+        }
+        .onChange(of: viewModel.closeCommentLinkPopoverSignal) { _ in
+            guard isLinkPopoverPresented else { return }
+            isLinkPopoverPresented = false
+            isCommentFocused = true
+        }
+        .onDisappear {
+            removeCommentKeyboardMonitor()
+            viewModel.isCommentLinkPopoverPresented = false
+            viewModel.isAllCommentsBrowserActive = false
+            isAllCommentsSearchFieldFocused = false
+            commentTargetPreviewImage = nil
+            isLoadingCommentTargetPreview = false
+            viewModel.resetCommentTimelineState()
+        }
+        .task(id: commentTargetFrameIDValue) {
+            await refreshCommentTargetPreview()
+        }
+        .alert(
+            "Delete comment?",
+            isPresented: isDeleteConfirmationPresented,
+            presenting: pendingDeleteComment
+        ) { comment in
+            Button("Cancel", role: .cancel) {
+                pendingDeleteComment = nil
+            }
+            Button(isDeletingComment ? "Deleting..." : "Delete", role: .destructive) {
+                confirmDelete(comment)
+            }
+            .disabled(isDeletingComment)
+        } message: { _ in
+            Text("This removes the comment from all segments in this selected block. If it has no remaining links, it will be deleted permanently.")
+        }
+    }
+
+    private var commentHeader: some View {
+        CommentChromeHeader(title: commentHeaderTitle, onClose: onClose) {
+            if commentBrowserMode == .allComments {
+                CommentChromeCircleButton(
+                    icon: "chevron.left",
+                    action: exitAllCommentsView,
+                    iconFont: .system(size: 12, weight: .semibold),
+                    baseForeground: Color.retracePrimary.opacity(0.9),
+                    hoverForeground: Color.retracePrimary.opacity(0.98),
+                    baseFill: Color.white.opacity(0.08),
+                    hoverFill: Color.white.opacity(0.12),
+                    baseStroke: .clear,
+                    hoverStroke: .clear
+                )
+            }
+        } accessory: {
+            if commentBrowserMode == .thread {
+                CommentChromeCapsuleButton(
+                    action: { openAllComments(anchoredAt: allCommentsLaunchAnchorComment) },
+                    horizontalPadding: 9,
+                    verticalPadding: 5,
+                    style: .accentOutline
+                ) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "list.bullet")
+                            .font(.system(size: 10, weight: .semibold))
+                        Text("All Comments")
+                            .font(.system(size: 11, weight: .semibold))
+                        Text("⌥A")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundColor(.retraceSecondary.opacity(0.85))
+                            .padding(.leading, 2)
+                    }
+                }
+                .help("Open All Comments (Option+A)")
             }
         }
     }
 
-    private func createTagFromSearch() {
-        let tagName = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !tagName.isEmpty else { return }
+    private var commentThreadSection: some View {
+        CommentChromeSectionCard(cornerRadius: sectionCornerRadius) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 8) {
+                    Text(threadCountLabel)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(.retraceSecondary)
+                }
 
-        viewModel.newTagName = tagName
-        viewModel.createAndAddTag()
-        searchText = ""
+                if viewModel.isLoadingBlockComments {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Loading thread...")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundColor(.retraceSecondary)
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 58, alignment: .center)
+                } else if let loadError = viewModel.blockCommentsLoadError {
+                    HStack(spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundColor(.retraceDanger.opacity(0.9))
+                        Text(loadError)
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundColor(.retraceSecondary)
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 58, alignment: .center)
+                } else if viewModel.selectedBlockComments.isEmpty {
+                    commentThreadEmptyState
+                } else {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 10) {
+                            ForEach(viewModel.selectedBlockComments) { comment in
+                                commentThreadCard(comment)
+                            }
+                        }
+                        .padding(.vertical, 3)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        }
+        .zIndex(0)
+    }
+
+    private var commentThreadEmptyState: some View {
+        VStack(spacing: 8) {
+            Image(systemName: "text.bubble")
+                .font(.system(size: 18, weight: .semibold))
+                .foregroundColor(.retracePrimary.opacity(0.92))
+                .frame(width: 34, height: 34)
+                .background(
+                    Circle()
+                        .fill(Color.white.opacity(0.06))
+                )
+
+            Text("No comments yet.")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundColor(.retracePrimary.opacity(0.95))
+
+            Text("Start the thread below.")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundColor(.retraceSecondary)
+        }
+        .frame(maxWidth: .infinity, minHeight: 72, alignment: .center)
+    }
+
+    @ViewBuilder
+    private var commentTargetSection: some View {
+        if let context = commentTarget {
+            CommentContextPreviewCard(
+                title: context.title,
+                subtitle: context.subtitle,
+                timestamp: context.timestamp,
+                appBundleID: context.appBundleID,
+                previewImage: commentTargetPreviewImage,
+                isPreviewLoading: isLoadingCommentTargetPreview,
+                shouldUseExpandedTitle: context.shouldUseExpandedWindowTitle,
+                metadataLayout: .stacked
+            ) {
+                commentTargetTagRow(context.tagNames)
+            }
+            .zIndex(viewModel.showTagSubmenu ? 8 : 1)
+        }
+    }
+
+    private func commentTargetTagRow(_ tagNames: [String]) -> some View {
+        let selectedTags = commentTargetDisplayTags(orderedBy: tagNames)
+
+        return ScrollView(.horizontal, showsIndicators: false) {
+            HStack(alignment: .center, spacing: 8) {
+                commentTargetAddTagPill
+
+                if !selectedTags.isEmpty {
+                    ForEach(selectedTags) { tag in
+                        commentTargetTagChip(tag)
+                    }
+                } else {
+                    ForEach(tagNames, id: \.self) { tagName in
+                        commentMetaChip(
+                            text: tagName,
+                            icon: "tag.fill",
+                            accent: Color.retracePrimary.opacity(0.9)
+                        )
+                    }
+                }
+            }
+            .padding(.vertical, 1)
+            .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .overlay(alignment: .topLeading) {
+            if viewModel.showTagSubmenu {
+                TagSubmenu(viewModel: viewModel, presentation: .commentOverlay)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .offset(y: commentTargetTagOverlayOffsetY)
+                    .transition(.opacity.combined(with: .scale(scale: 0.96, anchor: .topLeading)))
+                    .zIndex(1)
+            }
+        }
+    }
+
+    private func commentTargetDisplayTags(orderedBy tagNames: [String]) -> [Tag] {
+        let preferredOrder = Dictionary(
+            uniqueKeysWithValues: tagNames.enumerated().map { (offset, name) in
+                (name, offset)
+            }
+        )
+
+        return viewModel.availableTags
+            .filter { !($0.isHidden) && viewModel.selectedSegmentTags.contains($0.id) }
+            .sorted { lhs, rhs in
+                let lhsOrder = preferredOrder[lhs.name] ?? Int.max
+                let rhsOrder = preferredOrder[rhs.name] ?? Int.max
+                if lhsOrder != rhsOrder {
+                    return lhsOrder < rhsOrder
+                }
+                return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+            }
+    }
+
+    private func commentTargetTagChip(_ tag: Tag) -> some View {
+        CommentChromeChip(
+            text: tag.name,
+            icon: "tag.fill",
+            foregroundColor: Color.retracePrimary.opacity(0.9),
+            backgroundColor: Color.white.opacity(0.08),
+            borderColor: Color.white.opacity(0.12)
+        ) { isHovering in
+            if isHovering {
+                Button {
+                    viewModel.toggleTagOnSelectedSegment(
+                        tag: tag,
+                        source: "comment_target_tag_chip_remove"
+                    )
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 7, weight: .bold))
+                        .foregroundColor(.white.opacity(0.9))
+                        .frame(width: 13, height: 13)
+                        .background(
+                            Circle()
+                                .fill(Color.white.opacity(0.12))
+                        )
+                }
+                .buttonStyle(.plain)
+                .transition(.opacity.combined(with: .scale(scale: 0.9)))
+            }
+        }
+    }
+
+    private var commentTargetAddTagPill: some View {
+        CommentChromeCapsuleButton(
+            action: {
+                isCommentFocused = false
+                viewModel.openTagSubmenuForSelectedCommentTarget(source: "comment_target_add_tag")
+            },
+            horizontalPadding: 11,
+            verticalPadding: 5,
+            style: .accentOutline,
+            onHoverChanged: { hovering in
+                viewModel.isHoveringAddTagButton = hovering
+            }
+        ) {
+            HStack(spacing: 7) {
+                Image(systemName: "plus")
+                    .font(.system(size: 10, weight: .bold))
+
+                Text("Add tag")
+                    .font(.system(size: 11, weight: .semibold))
+            }
+        }
+    }
+
+    private var allCommentsAnchorIndex: Int? {
+        let rows = viewModel.commentTimelineRows
+        guard !rows.isEmpty else { return nil }
+
+        if let explicitAnchor = allCommentsAnchorID,
+           let index = rows.firstIndex(where: { $0.id == explicitAnchor }) {
+            return index
+        }
+
+        if let vmAnchor = viewModel.commentTimelineAnchorCommentID,
+           let index = rows.firstIndex(where: { $0.id == vmAnchor }) {
+            return index
+        }
+
+        return rows.count / 2
+    }
+
+    private var allCommentsAvailableBeforeCount: Int {
+        allCommentsAnchorIndex ?? 0
+    }
+
+    private var allCommentsAvailableAfterCount: Int {
+        guard let anchorIndex = allCommentsAnchorIndex else { return 0 }
+        return max(0, viewModel.commentTimelineRows.count - anchorIndex - 1)
+    }
+
+    private var allCommentsVisibleRows: [CommentTimelineRow] {
+        let rows = viewModel.commentTimelineRows
+        guard let anchorIndex = allCommentsAnchorIndex, !rows.isEmpty else { return [] }
+
+        let clampedBefore = min(allCommentsVisibleBeforeCount, allCommentsAvailableBeforeCount)
+        let clampedAfter = min(allCommentsVisibleAfterCount, allCommentsAvailableAfterCount)
+        let startIndex = max(0, anchorIndex - clampedBefore)
+        let endIndex = min(rows.count - 1, anchorIndex + clampedAfter)
+        guard startIndex <= endIndex else { return [] }
+        return Array(rows[startIndex...endIndex])
+    }
+
+    private var allCommentsSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(hasActiveCommentSearch ? "Search Results (\(viewModel.commentSearchResults.count))" : allCommentsCountLabel)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(.retraceSecondary)
+
+            allCommentsSearchField
+
+            if hasActiveCommentSearch {
+                allCommentsSearchResultsSection
+            } else if viewModel.isLoadingCommentTimeline {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Loading all comments...")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(.retraceSecondary)
+                }
+                .frame(maxWidth: .infinity, minHeight: 80, alignment: .center)
+            } else if let loadError = viewModel.commentTimelineLoadError,
+                      viewModel.commentTimelineRows.isEmpty {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(.retraceDanger.opacity(0.9))
+                    Text(loadError)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(.retraceSecondary)
+                }
+                .frame(maxWidth: .infinity, minHeight: 80, alignment: .center)
+            } else if viewModel.commentTimelineRows.isEmpty {
+                Text("No related comments found.")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(.retraceSecondary)
+                    .frame(maxWidth: .infinity, minHeight: 80, alignment: .center)
+            } else {
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 10) {
+                            if viewModel.isLoadingOlderCommentTimeline {
+                                HStack(spacing: 8) {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                    Text("Loading older...")
+                                        .font(.system(size: 11, weight: .medium))
+                                        .foregroundColor(.retraceSecondary)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .center)
+                                .padding(.vertical, 2)
+                            }
+
+                            ForEach(allCommentsVisibleRows) { row in
+                                allCommentsTimelineCard(row)
+                                    .id(row.id)
+                                    .onAppear {
+                                        handleAllCommentsRowAppear(row)
+                                    }
+                            }
+
+                            if viewModel.isLoadingNewerCommentTimeline {
+                                HStack(spacing: 8) {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                    Text("Loading newer...")
+                                        .font(.system(size: 11, weight: .medium))
+                                        .foregroundColor(.retraceSecondary)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .center)
+                                .padding(.vertical, 2)
+                            }
+                        }
+                        .padding(.vertical, 3)
+                    }
+                    .onAppear {
+                        syncAllCommentsVisibleWindow(forceReset: true)
+                        scrollToAllCommentsAnchorIfNeeded(proxy: proxy)
+                        restorePinnedAllCommentsAnchorIfNeeded(proxy: proxy)
+                    }
+                    .onChange(of: viewModel.commentTimelineRows.count) { _ in
+                        syncAllCommentsVisibleWindow(forceReset: false)
+                        if viewModel.isLoadingCommentTimeline
+                            || viewModel.isLoadingOlderCommentTimeline
+                            || viewModel.isLoadingNewerCommentTimeline {
+                            pinAllCommentsAnchorForNextViewportUpdate()
+                        }
+                        scrollToAllCommentsAnchorIfNeeded(proxy: proxy)
+                        restorePinnedAllCommentsAnchorIfNeeded(proxy: proxy)
+                    }
+                    .onChange(of: allCommentsVisibleBeforeCount) { _ in
+                        restorePinnedAllCommentsAnchorIfNeeded(proxy: proxy)
+                    }
+                    .onChange(of: allCommentsVisibleAfterCount) { _ in
+                        restorePinnedAllCommentsAnchorIfNeeded(proxy: proxy)
+                    }
+                    .onChange(of: pendingAnchorPinnedCommentID) { _ in
+                        restorePinnedAllCommentsAnchorIfNeeded(proxy: proxy)
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .padding(14)
+        .background(
+            RoundedRectangle(cornerRadius: sectionCornerRadius)
+                .fill(Color.white.opacity(0.03))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: sectionCornerRadius)
+                .stroke(Color.white.opacity(0.06), lineWidth: 1)
+        )
+    }
+
+    private var allCommentsSearchField: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(.retraceSecondary.opacity(0.85))
+
+            TextField("Search comments", text: commentSearchBinding)
+                .textFieldStyle(.plain)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundColor(.retracePrimary)
+                .focused($isAllCommentsSearchFieldFocused)
+                .onSubmit {
+                    _ = openHighlightedCommentSearchResultIfPossible()
+                }
+
+            if !viewModel.commentSearchText.isEmpty {
+                Button(action: { viewModel.updateCommentSearchQuery("") }) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 11))
+                        .foregroundColor(.retraceSecondary.opacity(0.85))
+                }
+                .buttonStyle(.plain)
+                .onHover { hovering in
+                    if hovering { NSCursor.pointingHand.push() }
+                    else { NSCursor.pop() }
+                }
+            }
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 7)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color.white.opacity(0.06))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.white.opacity(0.12), lineWidth: 1)
+        )
+        .contentShape(Rectangle())
+        .onTapGesture {
+            isAllCommentsSearchFieldFocused = true
+        }
+    }
+
+    @ViewBuilder
+    private var allCommentsSearchResultsSection: some View {
+        if viewModel.isSearchingComments && viewModel.commentSearchResults.isEmpty {
+            HStack(spacing: 8) {
+                ProgressView()
+                    .controlSize(.small)
+                Text("Searching comments...")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(.retraceSecondary)
+            }
+            .frame(maxWidth: .infinity, minHeight: 80, alignment: .center)
+        } else if let searchError = viewModel.commentSearchError,
+                  viewModel.commentSearchResults.isEmpty {
+            VStack(alignment: .center, spacing: 8) {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(.retraceDanger.opacity(0.9))
+                    Text(searchError)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(.retraceSecondary)
+                }
+
+                Button("Retry") {
+                    viewModel.retryCommentSearch()
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(.retracePrimary.opacity(0.9))
+            }
+            .frame(maxWidth: .infinity, minHeight: 80, alignment: .center)
+        } else if viewModel.commentSearchResults.isEmpty {
+            Text("No matching comments.")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundColor(.retraceSecondary)
+                .frame(maxWidth: .infinity, minHeight: 80, alignment: .center)
+        } else {
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 10) {
+                        ForEach(viewModel.commentSearchResults) { row in
+                            allCommentsTimelineCard(row)
+                                .id(row.id)
+                                .onAppear {
+                                    viewModel.loadMoreCommentSearchResultsIfNeeded(currentCommentID: row.id)
+                                }
+                        }
+
+                        if viewModel.isSearchingComments && !viewModel.commentSearchResults.isEmpty {
+                            HStack(spacing: 8) {
+                                ProgressView()
+                                    .controlSize(.small)
+                                Text("Loading more...")
+                                    .font(.system(size: 11, weight: .medium))
+                                    .foregroundColor(.retraceSecondary)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .center)
+                            .padding(.vertical, 2)
+                        }
+                    }
+                    .padding(.vertical, 3)
+                }
+                .onChange(of: highlightedCommentSearchResultID) { selectedID in
+                    guard let selectedID else { return }
+                    DispatchQueue.main.async {
+                        withAnimation(.easeOut(duration: 0.14)) {
+                            proxy.scrollTo(selectedID, anchor: .center)
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            }
+        }
+    }
+
+    private var commentComposerSection: some View {
+        CommentChromeSectionCard(cornerRadius: sectionCornerRadius) {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 6) {
+                    formattingButton(icon: "bold") { sendEditorCommand(.bold) }
+                    formattingButton(icon: "italic") { sendEditorCommand(.italic) }
+                    linkFormattingButton
+                    formattingButton(icon: "clock") { viewModel.insertCommentTimestampMarkup() }
+                    formattingButton(icon: "paperclip") { viewModel.selectCommentAttachmentFiles() }
+                    Spacer()
+                    CommentChromeCapsuleButton(
+                        action: {
+                            viewModel.addCommentToSelectedSegment()
+                        },
+                        isEnabled: canSubmit,
+                        style: .submit
+                    ) {
+                        HStack(spacing: 5) {
+                            if viewModel.isAddingComment {
+                                ProgressView()
+                                    .controlSize(.small)
+                            }
+                            Text(viewModel.isAddingComment ? "Adding..." : "Add Comment")
+                                .font(.system(size: 12, weight: .semibold))
+                        }
+                    }
+                }
+                .padding(8)
+                .background(
+                    RoundedRectangle(cornerRadius: 10)
+                        .fill(Color.white.opacity(0.035))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10)
+                        .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                )
+
+                CommentChromeEditorSurface(
+                    isFocused: isCommentFocused,
+                    textIsEmpty: viewModel.newCommentText.isEmpty,
+                    placeholder: "Write a comment... Markdown supported."
+                ) {
+                    CommentMarkdownEditor(
+                        text: $viewModel.newCommentText,
+                        isFocused: $isCommentFocused,
+                        onSubmit: submitCommentFromKeyboard,
+                        formatting: .init(
+                            command: editorCommand,
+                            commandNonce: editorCommandNonce,
+                            onRequestLink: presentLinkPopover
+                        )
+                    )
+                    .frame(minHeight: 78, maxHeight: 78)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                }
+
+                if !viewModel.newCommentAttachmentDrafts.isEmpty {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            ForEach(viewModel.newCommentAttachmentDrafts) { draft in
+                                draftAttachmentChip(draft)
+                            }
+                        }
+                        .padding(.vertical, 1)
+                    }
+                }
+            }
+        }
+    }
+
+    private func sendEditorCommand(_ command: CommentEditorCommand) {
+        editorCommand = command
+        editorCommandNonce += 1
+    }
+
+    private func submitCommentFromKeyboard() {
+        guard canSubmit else { return }
+        viewModel.addCommentToSelectedSegment()
+    }
+
+    private func confirmDelete(_ comment: SegmentComment) {
+        guard !isDeletingComment else { return }
+        isDeletingComment = true
+
+        Task { @MainActor in
+            let wasDeleted = await viewModel.removeCommentFromSelectedTimelineBlock(comment: comment)
+            isDeletingComment = false
+            if wasDeleted {
+                pendingDeleteComment = nil
+                if hoveredCommentID == comment.id {
+                    hoveredCommentID = nil
+                }
+            }
+        }
+    }
+
+    private var threadCountLabel: String {
+        "Thread (\(viewModel.selectedBlockComments.count))"
+    }
+
+    private var allCommentsCountLabel: String {
+        "All Comments (\(viewModel.commentTimelineRows.count))"
+    }
+
+    private var allCommentsLaunchAnchorComment: SegmentComment? {
+        let sorted = viewModel.selectedBlockComments.sorted {
+            if $0.createdAt == $1.createdAt {
+                return $0.id.value < $1.id.value
+            }
+            return $0.createdAt < $1.createdAt
+        }
+        guard !sorted.isEmpty else { return nil }
+        return sorted[sorted.count / 2]
+    }
+
+    private func openAllComments(anchoredAt comment: SegmentComment?) {
+        pendingDeleteComment = nil
+        isDeletingComment = false
+        viewModel.resetCommentSearchState()
+        highlightedCommentSearchResultID = nil
+        isAllCommentsSearchFieldFocused = false
+        allCommentsAnchorID = comment?.id
+        allCommentsVisibleBeforeCount = 0
+        allCommentsVisibleAfterCount = 0
+        hasPerformedAllCommentsInitialScroll = false
+        isRequestingOlderCommentPage = false
+        isRequestingNewerCommentPage = false
+        pendingAnchorPinnedCommentID = nil
+        withAnimation(.easeOut(duration: 0.14)) {
+            commentBrowserMode = .allComments
+        }
+
+        Task { @MainActor in
+            await viewModel.loadCommentTimeline(anchoredAt: comment)
+            syncAllCommentsVisibleWindow(forceReset: true)
+        }
+    }
+
+    private func exitAllCommentsView() {
+        commentBrowserMode = .thread
+        highlightedCommentSearchResultID = nil
+        isAllCommentsSearchFieldFocused = false
+        allCommentsAnchorID = nil
+        allCommentsVisibleBeforeCount = 0
+        allCommentsVisibleAfterCount = 0
+        hasPerformedAllCommentsInitialScroll = false
+        isRequestingOlderCommentPage = false
+        isRequestingNewerCommentPage = false
+        pendingAnchorPinnedCommentID = nil
+        viewModel.resetCommentTimelineState()
+    }
+
+    private func syncAllCommentsVisibleWindow(forceReset: Bool) {
+        guard commentBrowserMode == .allComments,
+              let anchorIndex = allCommentsAnchorIndex else {
+            return
+        }
+
+        let availableBefore = anchorIndex
+        let availableAfter = max(0, viewModel.commentTimelineRows.count - anchorIndex - 1)
+
+        if forceReset || (allCommentsVisibleBeforeCount == 0 && allCommentsVisibleAfterCount == 0) {
+            var before = min(allCommentsPageSize / 2, availableBefore)
+            var after = min(max(0, allCommentsPageSize - before - 1), availableAfter)
+
+            let selectedCommentIDs = Set(viewModel.selectedBlockComments.map(\.id))
+            if !selectedCommentIDs.isEmpty {
+                let selectedIndexes = viewModel.commentTimelineRows.enumerated().compactMap { index, row in
+                    selectedCommentIDs.contains(row.id) ? index : nil
+                }
+                if let minSelectedIndex = selectedIndexes.min(),
+                   let maxSelectedIndex = selectedIndexes.max() {
+                    before = max(before, anchorIndex - minSelectedIndex)
+                    after = max(after, maxSelectedIndex - anchorIndex)
+                }
+            }
+
+            before = min(before, availableBefore)
+            after = min(after, availableAfter)
+
+            let visibleCount = before + after + 1
+            if visibleCount < allCommentsPageSize {
+                let remaining = allCommentsPageSize - visibleCount
+                let extraBefore = min(remaining, max(0, availableBefore - before))
+                before += extraBefore
+                let extraAfter = min(
+                    allCommentsPageSize - (before + after + 1),
+                    max(0, availableAfter - after)
+                )
+                after += extraAfter
+            }
+            allCommentsVisibleBeforeCount = before
+            allCommentsVisibleAfterCount = after
+            return
+        }
+
+        allCommentsVisibleBeforeCount = min(allCommentsVisibleBeforeCount, availableBefore)
+        allCommentsVisibleAfterCount = min(allCommentsVisibleAfterCount, availableAfter)
+    }
+
+    private func scrollToAllCommentsAnchorIfNeeded(proxy: ScrollViewProxy) {
+        guard commentBrowserMode == .allComments,
+              !hasPerformedAllCommentsInitialScroll else {
+            return
+        }
+
+        let anchorID = allCommentsAnchorID ?? viewModel.commentTimelineAnchorCommentID
+        guard let anchorID else { return }
+        guard allCommentsVisibleRows.contains(where: { $0.id == anchorID }) else { return }
+
+        hasPerformedAllCommentsInitialScroll = true
+        DispatchQueue.main.async {
+            withAnimation(.easeOut(duration: 0.18)) {
+                proxy.scrollTo(anchorID, anchor: .center)
+            }
+        }
+    }
+
+    private func restorePinnedAllCommentsAnchorIfNeeded(proxy: ScrollViewProxy) {
+        guard commentBrowserMode == .allComments,
+              let pinnedID = pendingAnchorPinnedCommentID,
+              allCommentsVisibleRows.contains(where: { $0.id == pinnedID }) else {
+            return
+        }
+
+        pendingAnchorPinnedCommentID = nil
+        DispatchQueue.main.async {
+            proxy.scrollTo(pinnedID, anchor: .center)
+        }
+    }
+
+    private func pinAllCommentsAnchorForNextViewportUpdate() {
+        guard commentBrowserMode == .allComments else { return }
+        if let anchorID = allCommentsAnchorID ?? viewModel.commentTimelineAnchorCommentID {
+            pendingAnchorPinnedCommentID = anchorID
+        }
+    }
+
+    private func handleAllCommentsRowAppear(_ row: CommentTimelineRow) {
+        guard commentBrowserMode == .allComments else { return }
+        guard !allCommentsVisibleRows.isEmpty else { return }
+
+        if let firstID = allCommentsVisibleRows.first?.id, row.id == firstID {
+            requestOlderCommentRowsIfNeeded()
+        }
+
+        if let lastID = allCommentsVisibleRows.last?.id, row.id == lastID {
+            requestNewerCommentRowsIfNeeded()
+        }
+    }
+
+    private func requestOlderCommentRowsIfNeeded() {
+        let availableBefore = allCommentsAvailableBeforeCount
+        if allCommentsVisibleBeforeCount < availableBefore {
+            pinAllCommentsAnchorForNextViewportUpdate()
+            allCommentsVisibleBeforeCount = min(
+                availableBefore,
+                allCommentsVisibleBeforeCount + allCommentsPageSize
+            )
+            return
+        }
+
+        guard viewModel.commentTimelineHasOlder,
+              !viewModel.isLoadingOlderCommentTimeline,
+              !isRequestingOlderCommentPage else {
+            return
+        }
+
+        isRequestingOlderCommentPage = true
+        Task { @MainActor in
+            defer { isRequestingOlderCommentPage = false }
+            pinAllCommentsAnchorForNextViewportUpdate()
+            await viewModel.loadOlderCommentTimelinePage()
+            syncAllCommentsVisibleWindow(forceReset: false)
+            let refreshedBefore = allCommentsAvailableBeforeCount
+            if allCommentsVisibleBeforeCount < refreshedBefore {
+                pinAllCommentsAnchorForNextViewportUpdate()
+                allCommentsVisibleBeforeCount = min(
+                    refreshedBefore,
+                    allCommentsVisibleBeforeCount + allCommentsPageSize
+                )
+            }
+        }
+    }
+
+    private func requestNewerCommentRowsIfNeeded() {
+        let availableAfter = allCommentsAvailableAfterCount
+        if allCommentsVisibleAfterCount < availableAfter {
+            pinAllCommentsAnchorForNextViewportUpdate()
+            allCommentsVisibleAfterCount = min(
+                availableAfter,
+                allCommentsVisibleAfterCount + allCommentsPageSize
+            )
+            return
+        }
+
+        guard viewModel.commentTimelineHasNewer,
+              !viewModel.isLoadingNewerCommentTimeline,
+              !isRequestingNewerCommentPage else {
+            return
+        }
+
+        isRequestingNewerCommentPage = true
+        Task { @MainActor in
+            defer { isRequestingNewerCommentPage = false }
+            pinAllCommentsAnchorForNextViewportUpdate()
+            await viewModel.loadNewerCommentTimelinePage()
+            syncAllCommentsVisibleWindow(forceReset: false)
+            let refreshedAfter = allCommentsAvailableAfterCount
+            if allCommentsVisibleAfterCount < refreshedAfter {
+                pinAllCommentsAnchorForNextViewportUpdate()
+                allCommentsVisibleAfterCount = min(
+                    refreshedAfter,
+                    allCommentsVisibleAfterCount + allCommentsPageSize
+                )
+            }
+        }
+    }
+
+    private func allCommentsTimelineCard(_ row: CommentTimelineRow) -> some View {
+        let anchorID = allCommentsAnchorID ?? viewModel.commentTimelineAnchorCommentID
+        let isAnchor = row.id == anchorID &&
+            (highlightedCommentSearchResultID == nil || highlightedCommentSearchResultID == anchorID)
+        let isNavigable = true
+        let isSearchHighlighted = row.id == highlightedCommentSearchResultID
+        let isHoveringInteractiveRow = isNavigable && hoveredAllCommentsRowID == row.id
+        let rowHeaderLabel = row.context?.appName ?? row.context?.appBundleID ?? row.comment.author
+        let rowHeaderSubtitle = row.context?.appName == nil ? nil : row.context?.appBundleID
+
+        return VStack(alignment: .leading, spacing: 9) {
+            HStack(alignment: .top, spacing: 10) {
+                if let bundleID = row.context?.appBundleID {
+                    AppIconView(bundleID: bundleID, size: 20)
+                        .frame(width: 20, height: 20)
+                } else {
+                    Image(systemName: "text.bubble")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.retracePrimary.opacity(0.9))
+                        .frame(width: 20, height: 20)
+                        .background(
+                            RoundedRectangle(cornerRadius: 6)
+                                .fill(Color.white.opacity(0.07))
+                        )
+                }
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(rowHeaderLabel)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(.retracePrimary.opacity(0.95))
+                        .lineLimit(1)
+
+                    if let rowHeaderSubtitle {
+                        Text(rowHeaderSubtitle)
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundColor(.retraceSecondary.opacity(0.82))
+                            .lineLimit(1)
+                    }
+                }
+
+                Spacer(minLength: 8)
+
+                VStack(alignment: .trailing, spacing: 6) {
+                    if let tagName = row.primaryTagName {
+                        commentMetaChip(
+                            text: tagName,
+                            icon: "tag.fill",
+                            accent: Color.retracePrimary.opacity(0.88)
+                        )
+                    }
+
+                    commentMetaChip(
+                        text: Self.threadDateFormatter.string(from: row.comment.createdAt),
+                        icon: "clock",
+                        accent: Color.retraceSecondary.opacity(0.88)
+                    )
+                }
+            }
+
+            Text(commentPreviewText(from: row.comment.body))
+                .font(.system(size: 12, weight: .medium))
+                .foregroundColor(.retracePrimary.opacity(0.95))
+                .lineLimit(2)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            if let browserURL = row.context?.browserURL {
+                HStack(alignment: .top, spacing: 7) {
+                    Image(systemName: "globe")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.retraceSecondary.opacity(0.84))
+                    Text(browserURL)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(.retraceSecondary.opacity(0.88))
+                        .lineLimit(1)
+                }
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(
+                    isAnchor
+                    ? Color.retraceSubmitAccent.opacity(0.16)
+                    : (isSearchHighlighted ? Color.retraceSubmitAccent.opacity(0.12) : Color.white.opacity(0.055))
+                )
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(
+                    isAnchor
+                    ? Color.retraceSubmitAccent.opacity(0.42)
+                    : (isSearchHighlighted ? Color.retraceSubmitAccent.opacity(0.34) : Color.white.opacity(0.1)),
+                    lineWidth: 1
+                )
+        )
+        .scaleEffect(isHoveringInteractiveRow ? 1.01 : 1.0)
+        .animation(.easeOut(duration: 0.12), value: isHoveringInteractiveRow)
+        .contentShape(RoundedRectangle(cornerRadius: 12))
+        .onTapGesture {
+            guard isNavigable else { return }
+            openLinkedComment(row.comment, preferredSegmentID: row.context?.segmentID)
+        }
+        .onHover { hovering in
+            if hovering {
+                hoveredAllCommentsRowID = row.id
+                highlightedCommentSearchResultID = row.id
+                if isNavigable {
+                    NSCursor.pointingHand.push()
+                }
+            } else if hoveredAllCommentsRowID == row.id {
+                hoveredAllCommentsRowID = nil
+                if isNavigable {
+                    NSCursor.pop()
+                }
+            }
+        }
+    }
+
+    private func commentPreviewText(from body: String) -> String {
+        let normalized = body
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        let candidate = normalized
+            .components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first(where: { !$0.isEmpty }) ?? "No preview"
+
+        if candidate.count <= 180 {
+            return candidate
+        }
+        let index = candidate.index(candidate.startIndex, offsetBy: 180)
+        return "\(candidate[..<index])..."
+    }
+
+    private func commentMetaChip(text: String, icon: String, accent: Color) -> some View {
+        CommentChromeChip(
+            text: text,
+            icon: icon,
+            foregroundColor: accent,
+            backgroundColor: Color.white.opacity(0.08),
+            borderColor: Color.white.opacity(0.12)
+        )
+    }
+
+    private func refreshCommentTargetPreview() async {
+        if viewModel.isInLiveMode, let liveScreenshot = viewModel.liveScreenshot {
+            commentTargetPreviewImage = liveScreenshot
+            isLoadingCommentTargetPreview = false
+            return
+        }
+
+        guard let frameID = commentTarget?.frameID else {
+            commentTargetPreviewImage = nil
+            isLoadingCommentTargetPreview = false
+            return
+        }
+
+        commentTargetPreviewImage = nil
+        isLoadingCommentTargetPreview = true
+
+        let previewImage = await viewModel.loadCommentPreviewImage(for: frameID)
+        guard !Task.isCancelled else { return }
+        guard commentTarget?.frameID == frameID else { return }
+
+        commentTargetPreviewImage = previewImage
+        isLoadingCommentTargetPreview = false
+    }
+
+    private var linkFormattingButton: some View {
+        formattingButton(icon: "link") { presentLinkPopover() }
+            .popover(
+                isPresented: $isLinkPopoverPresented,
+                attachmentAnchor: .point(.bottom),
+                arrowEdge: .top
+            ) {
+                linkPopoverContent
+            }
+    }
+
+    private var linkPopoverContent: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Insert Link")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(.retracePrimary)
+
+            TextField("https://example.com", text: $pendingLinkURL)
+                .textFieldStyle(.plain)
+                .font(.system(size: 12))
+                .foregroundColor(.retracePrimary)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 7)
+                .background(
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(Color.white.opacity(0.07))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(Color.white.opacity(0.12), lineWidth: 1)
+                )
+                .focused($isLinkFieldFocused)
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    isLinkFieldFocused = true
+                }
+                .onSubmit { insertLinkFromPopover() }
+
+            HStack(spacing: 8) {
+                Spacer()
+
+                Button("Cancel") {
+                    isLinkPopoverPresented = false
+                    isCommentFocused = true
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(.retraceSecondary)
+
+                Button("Insert") {
+                    insertLinkFromPopover()
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(normalizedPendingLinkURL == nil ? .retraceSecondary : .white)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(
+                    Capsule()
+                        .fill(
+                            normalizedPendingLinkURL == nil
+                            ? Color.white.opacity(0.08)
+                            : Color.retraceSubmitAccent.opacity(0.9)
+                        )
+                )
+                .overlay(
+                    Capsule()
+                        .stroke(
+                            normalizedPendingLinkURL == nil
+                            ? Color.white.opacity(0.12)
+                            : Color.retraceSubmitAccent.opacity(0.35),
+                            lineWidth: 1
+                        )
+                )
+                .disabled(normalizedPendingLinkURL == nil)
+            }
+        }
+        .padding(12)
+        .frame(width: 280)
+        .background(Color.clear)
+        .onAppear {
+            DispatchQueue.main.async {
+                isLinkFieldFocused = true
+            }
+        }
+        .onDisappear {
+            isLinkFieldFocused = false
+            DispatchQueue.main.async {
+                isCommentFocused = true
+            }
+        }
+    }
+
+    private func formattingButton(icon: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(.retracePrimary.opacity(0.9))
+                .frame(width: 26, height: 24)
+                .background(
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(Color.white.opacity(0.07))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6)
+                        .stroke(Color.white.opacity(0.11), lineWidth: 1)
+                )
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            if hovering { NSCursor.pointingHand.push() }
+            else { NSCursor.pop() }
+        }
+    }
+
+    private func presentLinkPopover() {
+        if pendingLinkURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            pendingLinkURL = "https://"
+        }
+        // Prevent the NSTextView wrapper from re-claiming first responder while popover input is active.
+        isCommentFocused = false
+        isLinkPopoverPresented = true
+        DispatchQueue.main.async {
+            isLinkFieldFocused = true
+        }
+    }
+
+    private func insertLinkFromPopover() {
+        guard let url = normalizedPendingLinkURL else { return }
+        isLinkPopoverPresented = false
+        sendEditorCommand(.link(url: url.absoluteString))
+        DispatchQueue.main.async {
+            isCommentFocused = true
+        }
+    }
+
+    private static func normalizedURL(from rawValue: String) -> URL? {
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if let direct = URL(string: trimmed), direct.scheme != nil {
+            return direct
+        }
+        return URL(string: "https://\(trimmed)")
+    }
+
+    private func draftAttachmentChip(_ draft: CommentAttachmentDraft) -> some View {
+        HStack(spacing: 7) {
+            Image(systemName: "doc.fill")
+                .font(.system(size: 10))
+                .foregroundColor(.retraceSecondary.opacity(0.9))
+            VStack(alignment: .leading, spacing: 1) {
+                Text(draft.fileName)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(.retracePrimary.opacity(0.95))
+                    .lineLimit(1)
+                if let sizeBytes = draft.sizeBytes {
+                    Text(ByteCountFormatter.string(fromByteCount: sizeBytes, countStyle: .file))
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(.retraceSecondary)
+                }
+            }
+            Button(action: { viewModel.removeCommentAttachmentDraft(draft) }) {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 11))
+                    .foregroundColor(.retraceSecondary.opacity(0.9))
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(
+            Capsule()
+                .fill(Color.white.opacity(0.06))
+        )
+        .overlay(
+            Capsule()
+                .stroke(Color.white.opacity(0.11), lineWidth: 1)
+        )
+    }
+
+    private func commentThreadCard(_ comment: SegmentComment) -> some View {
+        let isHoveringCard = hoveredCommentID == comment.id
+        let isNavigable = true
+        let isHoveringInteractiveCard = isNavigable && isHoveringCard
+
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text(comment.author)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(.retracePrimary)
+
+                Text(Self.threadDateFormatter.string(from: comment.createdAt))
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(.retraceSecondary.opacity(0.85))
+
+                Spacer()
+
+                Button(role: .destructive) {
+                    pendingDeleteComment = comment
+                } label: {
+                    Image(systemName: "trash")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.retraceDanger.opacity(0.95))
+                        .frame(width: 20, height: 20)
+                        .background(
+                            Circle()
+                                .fill(Color.retraceDanger.opacity(0.14))
+                        )
+                        .overlay(
+                            Circle()
+                                .stroke(Color.retraceDanger.opacity(0.28), lineWidth: 1)
+                        )
+                }
+                .buttonStyle(.plain)
+                .frame(width: 20, height: 20)
+                .opacity(isHoveringCard ? 1 : 0)
+                .allowsHitTesting(isHoveringCard)
+                .animation(.easeOut(duration: 0.12), value: isHoveringCard)
+                .onHover { hovering in
+                    if hovering { NSCursor.pointingHand.push() }
+                    else { NSCursor.pop() }
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                renderedMarkdownView(from: comment.body)
+                    .foregroundColor(.retracePrimary.opacity(0.95))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .environment(\.openURL, OpenURLAction { url in
+                        NSWorkspace.shared.open(url)
+                        return .handled
+                    })
+
+                if !comment.attachments.isEmpty {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(comment.attachments) { attachment in
+                            Button(action: { viewModel.openCommentAttachment(attachment) }) {
+                                HStack(spacing: 8) {
+                                    Image(systemName: "paperclip")
+                                        .font(.system(size: 10, weight: .semibold))
+                                        .foregroundColor(.retraceSecondary.opacity(0.9))
+                                    Text(attachment.fileName)
+                                        .font(.system(size: 11, weight: .semibold))
+                                        .foregroundColor(.retracePrimary.opacity(0.95))
+                                        .lineLimit(1)
+                                    Spacer()
+                                    if let sizeBytes = attachment.sizeBytes {
+                                        Text(ByteCountFormatter.string(fromByteCount: sizeBytes, countStyle: .file))
+                                            .font(.system(size: 10, weight: .medium))
+                                            .foregroundColor(.retraceSecondary)
+                                    }
+                                }
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 6)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 8)
+                                        .fill(Color.white.opacity(0.05))
+                                )
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 8)
+                                        .stroke(Color.white.opacity(0.09), lineWidth: 1)
+                                )
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .background(
+                RoundedRectangle(cornerRadius: 12)
+                    .fill(
+                        LinearGradient(
+                            colors: [
+                                Color.white.opacity(0.075),
+                                Color.white.opacity(0.038)
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 12)
+                    .stroke(Color.white.opacity(0.12), lineWidth: 1)
+            )
+            .scaleEffect(isHoveringInteractiveCard ? 1.01 : 1.0)
+            .animation(.easeOut(duration: 0.12), value: isHoveringInteractiveCard)
+        }
+        .padding(.trailing, 26)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            guard isNavigable else { return }
+            openLinkedComment(
+                comment,
+                preferredSegmentID: viewModel.preferredSegmentIDForSelectedBlockComment(comment.id)
+            )
+        }
+        .onHover { hovering in
+            if hovering {
+                hoveredCommentID = comment.id
+                if isNavigable {
+                    NSCursor.pointingHand.push()
+                }
+            } else if hoveredCommentID == comment.id {
+                hoveredCommentID = nil
+                if isNavigable {
+                    NSCursor.pop()
+                }
+            }
+        }
+    }
+
+    private func openLinkedComment(_ comment: SegmentComment, preferredSegmentID: SegmentID? = nil) {
+        guard !isNavigatingLinkedCommentFrame else { return }
+        isNavigatingLinkedCommentFrame = true
+        Task { @MainActor in
+            defer { isNavigatingLinkedCommentFrame = false }
+            let didNavigate = await viewModel.navigateToComment(
+                comment: comment,
+                preferredSegmentID: preferredSegmentID
+            )
+            if didNavigate {
+                onClose()
+            }
+        }
+    }
+
+    private func installCommentKeyboardMonitor() {
+        guard commentKeyboardMonitor == nil else { return }
+        commentKeyboardMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            if handleCommentSubmenuKeyEvent(event) {
+                return nil
+            }
+            return event
+        }
+    }
+
+    private func removeCommentKeyboardMonitor() {
+        if let monitor = commentKeyboardMonitor {
+            NSEvent.removeMonitor(monitor)
+            commentKeyboardMonitor = nil
+        }
+    }
+
+    private func handleCommentSubmenuKeyEvent(_ event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
+
+        if modifiers.isEmpty && event.keyCode == 53 {
+            guard pendingDeleteComment == nil else { return false }
+
+            if viewModel.showTagSubmenu {
+                withAnimation(.easeOut(duration: 0.12)) {
+                    viewModel.showTagSubmenu = false
+                    viewModel.showNewTagInput = false
+                    viewModel.newTagName = ""
+                    viewModel.isHoveringAddTagButton = false
+                }
+                return true
+            }
+
+            if isLinkPopoverPresented {
+                isLinkPopoverPresented = false
+                isCommentFocused = true
+                return true
+            }
+
+            if commentBrowserMode == .allComments {
+                withAnimation(.easeOut(duration: 0.14)) {
+                    exitAllCommentsView()
+                }
+                return true
+            }
+
+            onClose()
+            return true
+        }
+
+        // Option+A opens all-comments when currently in thread mode.
+        if modifiers == [.option], event.keyCode == 0, commentBrowserMode == .thread {
+            openAllComments(anchoredAt: allCommentsLaunchAnchorComment)
+            return true
+        }
+
+        guard commentBrowserMode == .allComments else { return false }
+
+        // Cmd+[ and Escape should return to the local thread comments when browsing all comments.
+        let isCommandBack = modifiers == [.command] &&
+            (event.keyCode == 33 || event.charactersIgnoringModifiers == "[")
+        if isCommandBack || (modifiers.isEmpty && event.keyCode == 53) {
+            withAnimation(.easeOut(duration: 0.14)) {
+                exitAllCommentsView()
+            }
+            return true
+        }
+
+        guard pendingDeleteComment == nil else { return false }
+        guard !isLinkPopoverPresented else { return false }
+
+        // Tab focuses the all-comments search bar. If already focused, seed
+        // keyboard highlight to the first eligible result.
+        if modifiers.isEmpty, event.keyCode == 48 {
+            if isAllCommentsSearchFieldFocused {
+                seedHighlightedCommentSearchSelectionIfNeeded()
+            } else {
+                isAllCommentsSearchFieldFocused = true
+            }
+            return true
+        }
+
+        guard modifiers.isEmpty else { return false }
+
+        switch event.keyCode {
+        case 125: // Down arrow
+            moveCommentSearchHighlight(by: 1)
+            return true
+        case 126: // Up arrow
+            moveCommentSearchHighlight(by: -1)
+            return true
+        case 36, 76: // Return / Enter
+            return openHighlightedCommentSearchResultIfPossible()
+        default:
+            return false
+        }
+    }
+
+    private var keyboardNavigableCommentRows: [CommentTimelineRow] {
+        hasActiveCommentSearch ? viewModel.commentSearchResults : allCommentsVisibleRows
+    }
+
+    private func syncHighlightedCommentSearchSelection() {
+        guard commentBrowserMode == .allComments else {
+            highlightedCommentSearchResultID = nil
+            return
+        }
+
+        let results = keyboardNavigableCommentRows
+        guard !results.isEmpty else {
+            highlightedCommentSearchResultID = nil
+            return
+        }
+
+        if let current = highlightedCommentSearchResultID,
+           results.contains(where: { $0.id == current }) {
+            return
+        }
+
+        if let preferredIndex = preferredCommentKeyboardStartIndex(in: results) {
+            highlightedCommentSearchResultID = results[preferredIndex].id
+        } else {
+            highlightedCommentSearchResultID = results.first?.id
+        }
+    }
+
+    private func moveCommentSearchHighlight(by delta: Int) {
+        let results = keyboardNavigableCommentRows
+        guard !results.isEmpty else {
+            highlightedCommentSearchResultID = nil
+            return
+        }
+
+        let nextIndex: Int
+        if let highlightedID = highlightedCommentSearchResultID,
+           let index = results.firstIndex(where: { $0.id == highlightedID }) {
+            nextIndex = min(max(index + delta, 0), results.count - 1)
+        } else if let preferredIndex = preferredCommentKeyboardStartIndex(in: results) {
+            // When opened from a thread anchor, arrow navigation should move relative to that anchor.
+            nextIndex = min(max(preferredIndex + delta, 0), results.count - 1)
+        } else {
+            // No anchor context (e.g. opened without a thread): start at first result.
+            nextIndex = 0
+        }
+
+        highlightedCommentSearchResultID = results[nextIndex].id
+    }
+
+    private func seedHighlightedCommentSearchSelectionIfNeeded() {
+        guard commentBrowserMode == .allComments else { return }
+        guard highlightedCommentSearchResultID == nil else { return }
+        let results = keyboardNavigableCommentRows
+        guard !results.isEmpty else { return }
+
+        if let preferredIndex = preferredCommentKeyboardStartIndex(in: results) {
+            highlightedCommentSearchResultID = results[preferredIndex].id
+        } else {
+            highlightedCommentSearchResultID = results.first?.id
+        }
+    }
+
+    private func preferredCommentKeyboardStartIndex(in results: [CommentTimelineRow]) -> Int? {
+        let anchorID = allCommentsAnchorID ?? viewModel.commentTimelineAnchorCommentID
+        guard let anchorID else { return nil }
+        return results.firstIndex(where: { $0.id == anchorID })
+    }
+
+    private func openHighlightedCommentSearchResultIfPossible() -> Bool {
+        guard commentBrowserMode == .allComments else { return false }
+        let rows = keyboardNavigableCommentRows
+        guard !rows.isEmpty else { return false }
+
+        let targetRow: CommentTimelineRow
+        if let highlightedID = highlightedCommentSearchResultID,
+           let row = rows.first(where: { $0.id == highlightedID }) {
+            targetRow = row
+        } else if let first = rows.first {
+            targetRow = first
+            highlightedCommentSearchResultID = first.id
+        } else {
+            return false
+        }
+
+        openLinkedComment(targetRow.comment, preferredSegmentID: targetRow.context?.segmentID)
+        return true
+    }
+
+    @ViewBuilder
+    private func renderedMarkdownView(from source: String) -> some View {
+        let normalized = source
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        let lines = normalized.components(separatedBy: "\n")
+
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
+                if line.isEmpty {
+                    Text(" ")
+                } else if let headingLevel = markdownHeadingLevel(in: line) {
+                    Text(renderedMarkdownLine(from: line))
+                        .font(markdownHeadingFont(for: headingLevel))
+                } else {
+                    Text(renderedMarkdownLine(from: line))
+                }
+            }
+        }
+    }
+
+    private func renderedMarkdownLine(from source: String) -> AttributedString {
+        let options = AttributedString.MarkdownParsingOptions(
+            interpretedSyntax: .full,
+            failurePolicy: .returnPartiallyParsedIfPossible
+        )
+        if let parsed = try? AttributedString(markdown: source, options: options) {
+            return parsed
+        }
+        return AttributedString(source)
+    }
+
+    private func markdownHeadingLevel(in line: String) -> Int? {
+        let trimmedLeading = line.drop { $0 == " " || $0 == "\t" }
+        guard !trimmedLeading.isEmpty else { return nil }
+
+        var index = trimmedLeading.startIndex
+        var level = 0
+        while index < trimmedLeading.endIndex,
+              trimmedLeading[index] == "#",
+              level < 6 {
+            level += 1
+            index = trimmedLeading.index(after: index)
+        }
+
+        guard level > 0, index < trimmedLeading.endIndex else { return nil }
+        guard trimmedLeading[index].isWhitespace else { return nil }
+        return level
+    }
+
+    private func markdownHeadingFont(for level: Int) -> Font {
+        let size = max(13.0, 20.0 - (Double(level - 1) * 1.8))
+        return .system(size: size, weight: .semibold)
+    }
+}
+
+enum CommentEditorCommand: Equatable {
+    case bold
+    case italic
+    case link(url: String)
+}
+
+struct CommentMarkdownEditor: NSViewRepresentable {
+    struct FormattingBridge {
+        let command: CommentEditorCommand
+        let commandNonce: Int
+        let onRequestLink: (() -> Void)?
+    }
+
+    @Binding var text: String
+    @Binding var isFocused: Bool
+    let onSubmit: (() -> Void)?
+    let formatting: FormattingBridge?
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(parent: self)
+    }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSScrollView()
+        scrollView.drawsBackground = false
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.borderType = .noBorder
+
+        let textStorage = NSTextStorage(
+            attributedString: Coordinator.attributedString(fromMarkdown: text)
+        )
+        let layoutManager = NSLayoutManager()
+        textStorage.addLayoutManager(layoutManager)
+
+        let textContainer = NSTextContainer(containerSize: NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude))
+        textContainer.widthTracksTextView = true
+        layoutManager.addTextContainer(textContainer)
+
+        let textView = CommentMarkdownTextView(frame: .zero, textContainer: textContainer)
+        textView.delegate = context.coordinator
+        textView.isEditable = true
+        textView.isSelectable = true
+        textView.isRichText = true
+        textView.importsGraphics = false
+        textView.allowsImageEditing = false
+        textView.isAutomaticQuoteSubstitutionEnabled = false
+        textView.isAutomaticDashSubstitutionEnabled = false
+        textView.isAutomaticDataDetectionEnabled = false
+        textView.isAutomaticTextReplacementEnabled = false
+        textView.backgroundColor = NSColor.clear
+        textView.drawsBackground = false
+        textView.textContainerInset = NSSize(width: 0, height: 4)
+        textView.textContainer?.lineFragmentPadding = 0
+        textView.minSize = NSSize(width: 0, height: 0)
+        textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.autoresizingMask = [.width]
+        textView.commandHandler = { command in
+            context.coordinator.apply(command: command, in: textView)
+        }
+        textView.requestLinkHandler = {
+            context.coordinator.parent.formatting?.onRequestLink?()
+        }
+        textView.submitHandler = {
+            context.coordinator.parent.onSubmit?()
+        }
+
+        scrollView.documentView = textView
+        context.coordinator.normalizeEditorAttributes(in: textView)
+        textView.typingAttributes = Coordinator.baseTypingAttributes
+        context.coordinator.lastSerializedMarkdown = text
+        return scrollView
+    }
+
+    func updateNSView(_ nsView: NSScrollView, context: Context) {
+        guard let textView = nsView.documentView as? CommentMarkdownTextView else { return }
+        context.coordinator.parent = self
+
+        if context.coordinator.lastSerializedMarkdown != text {
+            context.coordinator.isApplyingProgrammaticUpdate = true
+            context.coordinator.replaceContents(of: textView, withMarkdown: text)
+            context.coordinator.isApplyingProgrammaticUpdate = false
+            context.coordinator.lastSerializedMarkdown = text
+        }
+
+        if let formatting,
+           context.coordinator.lastHandledCommandNonce != formatting.commandNonce {
+            context.coordinator.lastHandledCommandNonce = formatting.commandNonce
+            context.coordinator.apply(command: formatting.command, in: textView)
+        }
+
+        textView.submitHandler = {
+            context.coordinator.parent.onSubmit?()
+        }
+        textView.requestLinkHandler = {
+            context.coordinator.parent.formatting?.onRequestLink?()
+        }
+
+        if isFocused, let window = textView.window, window.firstResponder !== textView {
+            window.makeFirstResponder(textView)
+        }
+    }
+
+    final class Coordinator: NSObject, NSTextViewDelegate {
+        var parent: CommentMarkdownEditor
+        var isApplyingProgrammaticUpdate = false
+        var lastHandledCommandNonce: Int?
+        var lastSerializedMarkdown: String = ""
+
+        private static let baseFont = NSFont.systemFont(ofSize: 12, weight: .regular)
+        private static let baseColor = NSColor(white: 0.95, alpha: 1.0)
+        private static let linkColor = NSColor(red: 0.56, green: 0.76, blue: 0.98, alpha: 1.0)
+        private static let inlinePresentationIntentKey = NSAttributedString.Key("NSInlinePresentationIntent")
+        private static let headingLevelAttributeKey = NSAttributedString.Key("RetraceHeadingLevel")
+        private static let markdownParsingOptions = AttributedString.MarkdownParsingOptions(
+            interpretedSyntax: .inlineOnlyPreservingWhitespace,
+            failurePolicy: .returnPartiallyParsedIfPossible
+        )
+
+        static let baseTypingAttributes: [NSAttributedString.Key: Any] = [
+            .font: baseFont,
+            .foregroundColor: baseColor
+        ]
+
+        private enum InlineStyle {
+            case bold
+            case italic
+        }
+
+        private struct HeadingShortcut {
+            let level: Int
+            let markerLength: Int
+        }
+
+        init(parent: CommentMarkdownEditor) {
+            self.parent = parent
+            self.lastHandledCommandNonce = parent.formatting?.commandNonce
+            self.lastSerializedMarkdown = parent.text
+        }
+
+        func textDidChange(_ notification: Notification) {
+            guard let textView = notification.object as? NSTextView else { return }
+            guard !isApplyingProgrammaticUpdate else { return }
+
+            isApplyingProgrammaticUpdate = true
+            applyHeadingShortcutIfNeeded(in: textView)
+            normalizeEditorAttributes(in: textView)
+            syncMarkdownBinding(from: textView)
+            isApplyingProgrammaticUpdate = false
+        }
+
+        func apply(command: CommentEditorCommand, in textView: NSTextView) {
+            isApplyingProgrammaticUpdate = true
+            switch command {
+            case .bold:
+                toggle(style: .bold, in: textView)
+            case .italic:
+                toggle(style: .italic, in: textView)
+            case .link(let urlString):
+                insertLink(in: textView, urlString: urlString)
+            }
+            normalizeEditorAttributes(in: textView)
+            syncMarkdownBinding(from: textView)
+            isApplyingProgrammaticUpdate = false
+        }
+
+        private func insertLink(in textView: NSTextView, urlString: String) {
+            let selectedRange = textView.selectedRange()
+            guard selectedRange.location != NSNotFound else { return }
+            guard let storage = textView.textStorage else { return }
+            guard let url = Self.normalizeLink(urlString) else { return }
+
+            if selectedRange.length == 0 {
+                let placeholder = "link text"
+                textView.insertText(placeholder, replacementRange: selectedRange)
+                let insertedRange = NSRange(location: selectedRange.location, length: (placeholder as NSString).length)
+                applyLinkAttributes(in: insertedRange, storage: storage, url: url)
+                textView.setSelectedRange(insertedRange)
+                return
+            }
+
+            applyLinkAttributes(in: selectedRange, storage: storage, url: url)
+            textView.setSelectedRange(selectedRange)
+        }
+
+        private func applyLinkAttributes(in range: NSRange, storage: NSTextStorage, url: URL?) {
+            var attributes: [NSAttributedString.Key: Any] = [
+                .foregroundColor: Self.linkColor,
+                .underlineStyle: NSUnderlineStyle.single.rawValue
+            ]
+            if let url {
+                attributes[.link] = url
+            }
+            storage.addAttributes(attributes, range: range)
+        }
+
+        private func toggle(style: InlineStyle, in textView: NSTextView) {
+            let selectedRange = textView.selectedRange()
+            guard selectedRange.location != NSNotFound else { return }
+
+            if selectedRange.length == 0 {
+                var typingAttributes = textView.typingAttributes
+                let currentFont = normalizeFont(typingAttributes[.font] as? NSFont)
+                let shouldEnable = !font(currentFont, contains: style)
+                typingAttributes[.font] = font(currentFont, setting: style, enabled: shouldEnable)
+                typingAttributes[.foregroundColor] = Self.baseColor
+                textView.typingAttributes = typingAttributes
+                return
+            }
+
+            guard let storage = textView.textStorage else { return }
+            let shouldEnable = !selectionFullyContains(style: style, range: selectedRange, storage: storage)
+            storage.beginEditing()
+            storage.enumerateAttribute(.font, in: selectedRange, options: []) { value, range, _ in
+                let currentFont = normalizeFont(value as? NSFont)
+                let updatedFont = font(currentFont, setting: style, enabled: shouldEnable)
+                storage.addAttribute(.font, value: updatedFont, range: range)
+            }
+            storage.endEditing()
+            textView.setSelectedRange(selectedRange)
+        }
+
+        private func selectionFullyContains(style: InlineStyle, range: NSRange, storage: NSTextStorage) -> Bool {
+            var allStyled = true
+            storage.enumerateAttribute(.font, in: range, options: []) { value, _, stop in
+                let currentFont = normalizeFont(value as? NSFont)
+                if !self.font(currentFont, contains: style) {
+                    allStyled = false
+                    stop.pointee = true
+                }
+            }
+            return allStyled
+        }
+
+        func replaceContents(of textView: NSTextView, withMarkdown markdown: String) {
+            guard let storage = textView.textStorage else { return }
+            let attributed = Self.attributedString(fromMarkdown: markdown)
+            storage.setAttributedString(attributed)
+            normalizeEditorAttributes(in: textView)
+            let insertionPoint = NSRange(location: storage.length, length: 0)
+            textView.setSelectedRange(insertionPoint)
+            textView.typingAttributes = Self.baseTypingAttributes
+        }
+
+        private func syncMarkdownBinding(from textView: NSTextView) {
+            let markdown = Self.markdownString(from: textView.attributedString())
+            lastSerializedMarkdown = markdown
+            parent.text = markdown
+        }
+
+        private func applyHeadingShortcutIfNeeded(in textView: NSTextView) {
+            guard let storage = textView.textStorage else { return }
+            let source = storage.string as NSString
+            guard source.length > 0 else { return }
+
+            let selection = textView.selectedRange()
+            guard selection.location != NSNotFound else { return }
+
+            let lineLookupLocation = min(max(selection.location, 0), max(source.length - 1, 0))
+            let lineRange = source.lineRange(for: NSRange(location: lineLookupLocation, length: 0))
+            let contentRange = Self.lineContentRange(from: lineRange, in: source)
+            guard contentRange.length > 0 else { return }
+
+            let lineText = source.substring(with: contentRange)
+            guard let shortcut = Self.parseHeadingShortcut(in: lineText) else { return }
+            guard shortcut.markerLength > 0, shortcut.markerLength <= contentRange.length else { return }
+
+            let markerRange = NSRange(location: contentRange.location, length: shortcut.markerLength)
+            storage.replaceCharacters(in: markerRange, with: "")
+
+            let updatedLineRange = NSRange(
+                location: contentRange.location,
+                length: max(0, contentRange.length - shortcut.markerLength)
+            )
+            if updatedLineRange.length > 0 {
+                storage.addAttribute(Self.headingLevelAttributeKey, value: shortcut.level, range: updatedLineRange)
+            }
+
+            var adjustedSelection = selection
+            let markerUpperBound = markerRange.location + markerRange.length
+            if adjustedSelection.location >= markerUpperBound {
+                adjustedSelection.location -= markerRange.length
+            } else if adjustedSelection.location > markerRange.location {
+                adjustedSelection.location = markerRange.location
+            }
+            if adjustedSelection.length > 0 {
+                let selectionEnd = selection.location + selection.length
+                let overlapStart = max(selection.location, markerRange.location)
+                let overlapEnd = min(selectionEnd, markerUpperBound)
+                if overlapEnd > overlapStart {
+                    adjustedSelection.length = max(0, adjustedSelection.length - (overlapEnd - overlapStart))
+                }
+            }
+            adjustedSelection.location = min(adjustedSelection.location, storage.length)
+            textView.setSelectedRange(adjustedSelection)
+
+            var typing = textView.typingAttributes
+            typing[.font] = Self.headingBaseFont(for: shortcut.level)
+            typing[.foregroundColor] = Self.baseColor
+            typing[Self.headingLevelAttributeKey] = shortcut.level
+            textView.typingAttributes = typing
+        }
+
+        private func normalizeHeadingAttributes(in storage: NSTextStorage) {
+            let source = storage.string as NSString
+            guard source.length > 0 else { return }
+
+            var lineStart = 0
+            while lineStart < source.length {
+                let lineRange = source.lineRange(for: NSRange(location: lineStart, length: 0))
+                let contentRange = Self.lineContentRange(from: lineRange, in: source)
+
+                if contentRange.length > 0 {
+                    if let level = Self.headingLevel(in: storage, range: contentRange) {
+                        storage.addAttribute(Self.headingLevelAttributeKey, value: level, range: contentRange)
+                    } else {
+                        storage.removeAttribute(Self.headingLevelAttributeKey, range: contentRange)
+                    }
+                }
+
+                let newlineLength = lineRange.length - contentRange.length
+                if newlineLength > 0 {
+                    let newlineRange = NSRange(location: contentRange.location + contentRange.length, length: newlineLength)
+                    storage.removeAttribute(Self.headingLevelAttributeKey, range: newlineRange)
+                }
+
+                lineStart = lineRange.location + lineRange.length
+            }
+        }
+
+        func normalizeEditorAttributes(in textView: NSTextView) {
+            guard let storage = textView.textStorage else { return }
+            let fullRange = NSRange(location: 0, length: storage.length)
+            guard fullRange.length > 0 else {
+                textView.typingAttributes = Self.baseTypingAttributes
+                return
+            }
+
+            let selectedRanges = textView.selectedRanges
+
+            storage.beginEditing()
+            normalizeHeadingAttributes(in: storage)
+            storage.addAttribute(.foregroundColor, value: Self.baseColor, range: fullRange)
+            storage.addAttribute(.underlineStyle, value: 0, range: fullRange)
+
+            storage.enumerateAttributes(in: fullRange, options: []) { attributes, range, _ in
+                let currentFont = normalizeFont(attributes[.font] as? NSFont)
+                let headingLevel = Self.headingLevelValue(from: attributes[Self.headingLevelAttributeKey])
+
+                var targetFont = headingLevel.map(Self.headingBaseFont(for:)) ?? Self.baseFont
+                let traits = currentFont.fontDescriptor.symbolicTraits
+                if traits.contains(.bold) {
+                    targetFont = NSFontManager.shared.convert(targetFont, toHaveTrait: .boldFontMask)
+                }
+                if traits.contains(.italic) {
+                    targetFont = NSFontManager.shared.convert(targetFont, toHaveTrait: .italicFontMask)
+                }
+                storage.addAttribute(.font, value: targetFont, range: range)
+            }
+
+            storage.enumerateAttribute(.link, in: fullRange, options: []) { value, range, _ in
+                guard Self.normalizeLink(value) != nil else { return }
+                storage.addAttributes(
+                    [
+                        .foregroundColor: Self.linkColor,
+                        .underlineStyle: NSUnderlineStyle.single.rawValue
+                    ],
+                    range: range
+                )
+            }
+
+            storage.endEditing()
+            textView.setSelectedRanges(selectedRanges, affinity: .downstream, stillSelecting: false)
+            textView.typingAttributes = typingAttributes(for: textView)
+        }
+
+        private func typingAttributes(for textView: NSTextView) -> [NSAttributedString.Key: Any] {
+            let currentFont = normalizeFont(textView.typingAttributes[.font] as? NSFont)
+
+            var headingLevel: Int?
+            if let storage = textView.textStorage, storage.length > 0 {
+                let source = storage.string as NSString
+                let selection = textView.selectedRange()
+                let location = min(max(selection.location, 0), max(source.length - 1, 0))
+                let lineRange = source.lineRange(for: NSRange(location: location, length: 0))
+                let contentRange = Self.lineContentRange(from: lineRange, in: source)
+                headingLevel = Self.headingLevel(in: storage, range: contentRange)
+            }
+
+            var targetFont = headingLevel.map(Self.headingBaseFont(for:)) ?? Self.baseFont
+            let traits = currentFont.fontDescriptor.symbolicTraits
+            if traits.contains(.bold) {
+                targetFont = NSFontManager.shared.convert(targetFont, toHaveTrait: .boldFontMask)
+            }
+            if traits.contains(.italic) {
+                targetFont = NSFontManager.shared.convert(targetFont, toHaveTrait: .italicFontMask)
+            }
+
+            var result: [NSAttributedString.Key: Any] = [
+                .font: targetFont,
+                .foregroundColor: Self.baseColor
+            ]
+            if let headingLevel {
+                result[Self.headingLevelAttributeKey] = headingLevel
+            }
+            return result
+        }
+
+        private func normalizeFont(_ font: NSFont?) -> NSFont {
+            let source = font ?? Self.baseFont
+            let descriptor = source.fontDescriptor.symbolicTraits
+            var normalized = Self.baseFont
+            if descriptor.contains(.bold) {
+                normalized = NSFontManager.shared.convert(normalized, toHaveTrait: .boldFontMask)
+            }
+            if descriptor.contains(.italic) {
+                normalized = NSFontManager.shared.convert(normalized, toHaveTrait: .italicFontMask)
+            }
+            return normalized
+        }
+
+        private func font(_ font: NSFont, contains style: InlineStyle) -> Bool {
+            let traits = font.fontDescriptor.symbolicTraits
+            switch style {
+            case .bold:
+                return traits.contains(.bold)
+            case .italic:
+                return traits.contains(.italic)
+            }
+        }
+
+        private func font(_ base: NSFont, setting style: InlineStyle, enabled: Bool) -> NSFont {
+            let trait: NSFontTraitMask = {
+                switch style {
+                case .bold:
+                    return .boldFontMask
+                case .italic:
+                    return .italicFontMask
+                }
+            }()
+
+            if enabled {
+                return NSFontManager.shared.convert(base, toHaveTrait: trait)
+            }
+            return NSFontManager.shared.convert(base, toNotHaveTrait: trait)
+        }
+
+        static func attributedString(fromMarkdown markdown: String) -> NSAttributedString {
+            let normalized = markdown
+                .replacingOccurrences(of: "\r\n", with: "\n")
+                .replacingOccurrences(of: "\r", with: "\n")
+            guard !normalized.isEmpty else {
+                return NSAttributedString(string: "", attributes: baseTypingAttributes)
+            }
+
+            let output = NSMutableAttributedString()
+            let lines = normalized.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+
+            for (index, line) in lines.enumerated() {
+                if let shortcut = parseHeadingShortcut(in: line) {
+                    let contentStart = line.index(line.startIndex, offsetBy: min(shortcut.markerLength, line.count))
+                    let content = String(line[contentStart...])
+                    let attributedLine = attributedInlineString(fromInlineMarkdown: content)
+                    if attributedLine.length > 0 {
+                        attributedLine.addAttribute(headingLevelAttributeKey, value: shortcut.level, range: NSRange(location: 0, length: attributedLine.length))
+                    }
+                    output.append(attributedLine)
+                } else {
+                    output.append(attributedInlineString(fromInlineMarkdown: line))
+                }
+
+                if index < lines.count - 1 {
+                    output.append(NSAttributedString(string: "\n", attributes: baseTypingAttributes))
+                }
+            }
+
+            return output
+        }
+
+        private static func attributedInlineString(fromInlineMarkdown markdown: String) -> NSMutableAttributedString {
+            guard let parsed = try? AttributedString(markdown: markdown, options: markdownParsingOptions) else {
+                return NSMutableAttributedString(string: markdown, attributes: baseTypingAttributes)
+            }
+
+            let source = NSAttributedString(parsed)
+            let output = NSMutableAttributedString(string: source.string, attributes: baseTypingAttributes)
+            let fullRange = NSRange(location: 0, length: output.length)
+            guard fullRange.length > 0 else { return output }
+
+            source.enumerateAttribute(inlinePresentationIntentKey, in: fullRange, options: []) { value, range, _ in
+                guard let intent = inlineIntent(from: value) else { return }
+                var font = baseFont
+                if intent.contains(.stronglyEmphasized) {
+                    font = NSFontManager.shared.convert(font, toHaveTrait: .boldFontMask)
+                }
+                if intent.contains(.emphasized) {
+                    font = NSFontManager.shared.convert(font, toHaveTrait: .italicFontMask)
+                }
+                output.addAttribute(.font, value: font, range: range)
+            }
+
+            source.enumerateAttribute(.link, in: fullRange, options: []) { value, range, _ in
+                guard let link = normalizeLink(value) else { return }
+                output.addAttributes(
+                    [
+                        .link: link,
+                        .foregroundColor: linkColor,
+                        .underlineStyle: NSUnderlineStyle.single.rawValue
+                    ],
+                    range: range
+                )
+            }
+
+            return output
+        }
+
+        static func markdownString(from attributedText: NSAttributedString) -> String {
+            guard attributedText.length > 0 else { return "" }
+
+            let source = attributedText.string as NSString
+            var lineStart = 0
+            var lines: [String] = []
+
+            while lineStart < source.length {
+                let lineRange = source.lineRange(for: NSRange(location: lineStart, length: 0))
+                let contentRange = lineContentRange(from: lineRange, in: source)
+                let headingLevel = headingLevel(in: attributedText, range: contentRange)
+
+                var lineMarkdown = markdownInlineString(
+                    from: attributedText,
+                    range: contentRange,
+                    suppressBoldFromHeading: headingLevel != nil
+                )
+                if let headingLevel {
+                    lineMarkdown = "\(String(repeating: "#", count: headingLevel)) \(lineMarkdown)"
+                }
+                lines.append(lineMarkdown)
+                lineStart = lineRange.location + lineRange.length
+            }
+
+            var markdown = lines.joined(separator: "\n")
+            if source.character(at: source.length - 1) == 10 {
+                markdown += "\n"
+            }
+            return markdown
+        }
+
+        private static func markdownInlineString(
+            from attributedText: NSAttributedString,
+            range: NSRange,
+            suppressBoldFromHeading: Bool
+        ) -> String {
+            guard range.length > 0 else { return "" }
+
+            let source = attributedText.string as NSString
+            var markdown = ""
+            var index = range.location
+            let end = range.location + range.length
+
+            while index < end {
+                var effectiveRange = NSRange(location: 0, length: 0)
+                let attributes = attributedText.attributes(
+                    at: index,
+                    longestEffectiveRange: &effectiveRange,
+                    in: range
+                )
+                let segment = source.substring(with: effectiveRange)
+                markdown += markdownFragment(
+                    for: segment,
+                    attributes: attributes,
+                    suppressBoldFromHeading: suppressBoldFromHeading
+                )
+                index = effectiveRange.location + effectiveRange.length
+            }
+
+            return markdown
+        }
+
+        private static func headingLevel(in attributedText: NSAttributedString, range: NSRange) -> Int? {
+            guard range.length > 0 else { return nil }
+            var foundLevel: Int?
+            attributedText.enumerateAttribute(
+                headingLevelAttributeKey,
+                in: range,
+                options: [.longestEffectiveRangeNotRequired]
+            ) { value, _, stop in
+                if let level = headingLevelValue(from: value) {
+                    foundLevel = level
+                    stop.pointee = true
+                }
+            }
+            return foundLevel
+        }
+
+        private static func headingLevelValue(from value: Any?) -> Int? {
+            let level: Int?
+            if let intValue = value as? Int {
+                level = intValue
+            } else if let numberValue = value as? NSNumber {
+                level = numberValue.intValue
+            } else {
+                level = nil
+            }
+            guard let level, (1...6).contains(level) else { return nil }
+            return level
+        }
+
+        private static func lineContentRange(from lineRange: NSRange, in source: NSString) -> NSRange {
+            guard lineRange.length > 0 else { return lineRange }
+            let lineEnd = lineRange.location + lineRange.length
+            if lineEnd > 0, lineEnd <= source.length, source.character(at: lineEnd - 1) == 10 {
+                return NSRange(location: lineRange.location, length: lineRange.length - 1)
+            }
+            return lineRange
+        }
+
+        private static func headingBaseFont(for level: Int) -> NSFont {
+            let size = headingPointSize(for: level)
+            return NSFont.systemFont(ofSize: size, weight: .regular)
+        }
+
+        private static func headingPointSize(for level: Int) -> CGFloat {
+            max(13.0, 20.0 - (CGFloat(level - 1) * 1.8))
+        }
+
+        private static func parseHeadingShortcut(in line: String) -> HeadingShortcut? {
+            let source = line as NSString
+            guard source.length > 1 else { return nil }
+
+            var index = 0
+            var level = 0
+            while index < source.length, source.character(at: index) == 35, level < 6 {
+                level += 1
+                index += 1
+            }
+
+            guard level > 0, index < source.length else { return nil }
+            guard let firstWhitespaceScalar = UnicodeScalar(Int(source.character(at: index))),
+                  CharacterSet.whitespaces.contains(firstWhitespaceScalar) else {
+                return nil
+            }
+
+            while index < source.length,
+                  let scalar = UnicodeScalar(Int(source.character(at: index))),
+                  CharacterSet.whitespaces.contains(scalar) {
+                index += 1
+            }
+
+            return HeadingShortcut(level: level, markerLength: index)
+        }
+
+        private static func markdownFragment(
+            for segment: String,
+            attributes: [NSAttributedString.Key: Any],
+            suppressBoldFromHeading: Bool
+        ) -> String {
+            guard !segment.isEmpty else { return "" }
+
+            if let link = normalizeLink(attributes[.link]) {
+                let text = escapeMarkdownText(segment)
+                let destination = link.absoluteString.replacingOccurrences(of: ")", with: "%29")
+                return "[\(text)](\(destination))"
+            }
+
+            let font = attributes[.font] as? NSFont ?? baseFont
+            let traits = font.fontDescriptor.symbolicTraits
+            let isBold = traits.contains(.bold) && !suppressBoldFromHeading
+            let isItalic = traits.contains(.italic)
+
+            let escaped = escapeMarkdownText(segment)
+            guard !segment.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return escaped
+            }
+
+            if isBold && isItalic {
+                return "***\(escaped)***"
+            }
+            if isBold {
+                return "**\(escaped)**"
+            }
+            if isItalic {
+                return "*\(escaped)*"
+            }
+            return escaped
+        }
+
+        private static func escapeMarkdownText(_ text: String) -> String {
+            var escaped = ""
+            escaped.reserveCapacity(text.count)
+
+            for character in text {
+                switch character {
+                case "\\", "*", "_", "[", "]", "(", ")":
+                    escaped.append("\\")
+                    escaped.append(character)
+                default:
+                    escaped.append(character)
+                }
+            }
+            return escaped
+        }
+
+        private static func inlineIntent(from value: Any?) -> InlinePresentationIntent? {
+            if let intent = value as? InlinePresentationIntent {
+                return intent
+            }
+            if let number = value as? NSNumber {
+                return InlinePresentationIntent(rawValue: number.uintValue)
+            }
+            return nil
+        }
+
+        private static func normalizeLink(_ value: Any?) -> URL? {
+            if let url = value as? URL {
+                return url
+            }
+            if let string = value as? String {
+                return URL(string: string)
+            }
+            if let string = value as? NSString {
+                return URL(string: string as String)
+            }
+            return nil
+        }
+    }
+}
+
+class CommentMarkdownTextView: NSTextView {
+    var commandHandler: ((CommentEditorCommand) -> Void)?
+    var submitHandler: (() -> Void)?
+    var requestLinkHandler: (() -> Void)?
+
+    override func keyDown(with event: NSEvent) {
+        if isSubmitKeyEquivalent(event), let submitHandler {
+            submitHandler()
+            return
+        }
+        super.keyDown(with: event)
+    }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if isSubmitKeyEquivalent(event), let submitHandler {
+            submitHandler()
+            return true
+        }
+
+        let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
+        guard modifiers == [.command],
+              let key = event.charactersIgnoringModifiers?.lowercased() else {
+            return super.performKeyEquivalent(with: event)
+        }
+
+        switch key {
+        case "a":
+            selectAll(nil)
+            return true
+        case "c":
+            copy(nil)
+            return true
+        case "x":
+            cut(nil)
+            return true
+        case "v":
+            paste(nil)
+            return true
+        case "b":
+            commandHandler?(.bold)
+            return true
+        case "i":
+            commandHandler?(.italic)
+            return true
+        case "k":
+            if let requestLinkHandler {
+                requestLinkHandler()
+                return true
+            }
+            return super.performKeyEquivalent(with: event)
+        default:
+            return super.performKeyEquivalent(with: event)
+        }
+    }
+
+    private func isSubmitKeyEquivalent(_ event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
+        guard modifiers == [.command] else { return false }
+        return event.keyCode == 36 || event.keyCode == 76
     }
 }
 
@@ -5047,6 +11411,8 @@ struct TagSubmenu: View {
 struct TagSubmenuRow: View {
     let tag: Tag
     let isSelected: Bool
+    let isKeyboardHighlighted: Bool
+    var onHoverChanged: ((Bool) -> Void)? = nil
     let action: () -> Void
 
     @State private var isHovering = false
@@ -5054,10 +11420,13 @@ struct TagSubmenuRow: View {
     var body: some View {
         Button(action: action) {
             HStack(spacing: 10) {
-                // TODO: Add color picker/editing for tags later
-                // Circle()
-                //     .fill(Color.segmentColor(for: tag.name))
-                //     .frame(width: 8, height: 8)
+                Circle()
+                    .fill(TagColorStore.color(for: tag))
+                    .frame(width: 8, height: 8)
+                    .overlay(
+                        Circle()
+                            .stroke(Color.white.opacity(0.35), lineWidth: 0.5)
+                    )
 
                 Text(tag.name)
                     .font(.system(size: 13, weight: .medium))
@@ -5075,7 +11444,7 @@ struct TagSubmenuRow: View {
             .padding(.vertical, 8)
             .background(
                 RoundedRectangle(cornerRadius: 6)
-                    .fill(isHovering ? Color.white.opacity(0.1) : Color.clear)
+                    .fill((isHovering || isKeyboardHighlighted) ? Color.white.opacity(0.1) : Color.clear)
             )
             .contentShape(Rectangle())
         }
@@ -5086,6 +11455,7 @@ struct TagSubmenuRow: View {
             }
             if hovering { NSCursor.pointingHand.push() }
             else { NSCursor.pop() }
+            onHoverChanged?(hovering)
         }
     }
 }
@@ -5094,17 +11464,28 @@ struct TagSubmenuRow: View {
 
 /// Floating vertical card panel for timeline filtering
 /// Shared UserDefaults store for accessing settings
-private let filterPanelSettingsStore = UserDefaults(suiteName: "io.retrace.app")
+private let filterPanelSettingsStore = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
 
 struct FilterPanel: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel
+    @StateObject private var advancedFilterDraftState = TimelineAdvancedFilterDraftState()
     @GestureState private var dragOffset: CGSize = .zero
     @State private var panelPosition: CGSize = .zero
     @State private var escapeMonitor: Any?
     @State private var tabKeyMonitor: Any?
+    @State private var isCloseHovered = false
+    @State private var isClearHovered = false
+    @State private var isApplyHovered = false
+    @State private var focusedActionButton: ActionButtonFocus?
 
-    /// Filter order for Tab navigation: Apps(1) → Tags(2) → Visibility(3) → Date(4) → back to Apps
-    private let filterOrder: [SimpleTimelineViewModel.FilterDropdownType] = [.apps, .tags, .visibility, .dateRange]
+    private enum ActionButtonFocus: Hashable {
+        case clear
+        case apply
+    }
+
+    /// Filter order for Tab navigation:
+    /// Apps(1) → Tags(2) → Visibility(3) → Comments(4) → Date(5) → Advanced(6) → Action buttons → back to Apps
+    private let filterOrder: [SimpleTimelineViewModel.FilterDropdownType] = [.apps, .tags, .visibility, .comments, .dateRange, .advanced]
 
     /// Border color for filter panel
     private var themeBorderColor: Color {
@@ -5157,10 +11538,27 @@ struct FilterPanel: View {
         }
     }
 
+    /// Label for comment filter dropdown
+    private var commentFilterLabel: String {
+        switch viewModel.pendingFilterCriteria.commentFilter {
+        case .allFrames:
+            return "All Frames"
+        case .commentsOnly:
+            return "Comments Only"
+        case .noComments:
+            return "No Comments"
+        }
+    }
+
     /// Label for date range filter
     private var dateRangeLabel: String {
-        let startDate = viewModel.pendingFilterCriteria.startDate
-        let endDate = viewModel.pendingFilterCriteria.endDate
+        let ranges = viewModel.pendingFilterCriteria.effectiveDateRanges
+        if ranges.count > 1 {
+            return "\(ranges.count) date ranges"
+        }
+
+        let startDate = ranges.first?.start ?? viewModel.pendingFilterCriteria.startDate
+        let endDate = ranges.first?.end ?? viewModel.pendingFilterCriteria.endDate
         let formatter = DateFormatter()
         formatter.dateFormat = "MMM d"
 
@@ -5172,6 +11570,76 @@ struct FilterPanel: View {
             return "Until \(formatter.string(from: end))"
         }
         return "Any Time"
+    }
+
+    /// Auto-apply mode starts after at least one filter is applied.
+    private var isAutoApplyMode: Bool {
+        viewModel.filterCriteria.hasActiveFilters
+    }
+
+    /// Clear button is visible when pending OR applied filters are active.
+    private var hasClearButton: Bool {
+        viewModel.pendingFilterCriteria.hasActiveFilters || viewModel.filterCriteria.hasActiveFilters
+    }
+
+    /// Apply button is shown only before the first filter is applied.
+    private var hasApplyButton: Bool {
+        !isAutoApplyMode
+    }
+
+    /// First action button in keyboard order.
+    private var leadingActionButtonFocus: ActionButtonFocus? {
+        if hasClearButton { return .clear }
+        if hasApplyButton { return .apply }
+        return nil
+    }
+
+    /// Last action button in keyboard order.
+    private var trailingActionButtonFocus: ActionButtonFocus? {
+        if hasApplyButton { return .apply }
+        if hasClearButton { return .clear }
+        return nil
+    }
+
+    /// Submit button target for advanced-field keyboard traversal.
+    private var submitActionButtonFocus: ActionButtonFocus? {
+        if hasApplyButton { return .apply }
+        if hasClearButton { return .clear }
+        return nil
+    }
+
+    private var clearButtonTitle: String {
+        isClearHovered ? "Clear (⌘⌫)" : "Clear"
+    }
+
+    private var applyButtonTitle: String {
+        isApplyHovered ? "Apply Filters (⌘↩)" : "Apply Filters"
+    }
+
+    private func commitAdvancedDraftInputs() {
+        advancedFilterDraftState.commitDraftInputs()
+        var pendingCriteria = viewModel.pendingFilterCriteria
+        advancedFilterDraftState.applyMetadataFilters(to: &pendingCriteria)
+        if pendingCriteria != viewModel.pendingFilterCriteria {
+            viewModel.pendingFilterCriteria = pendingCriteria
+        }
+    }
+
+    private func applyFiltersByCommittingAdvancedDrafts(dismissPanel: Bool = true) {
+        focusedActionButton = nil
+        commitAdvancedDraftInputs()
+        withAnimation(.easeOut(duration: 0.15)) {
+            viewModel.applyFilters(dismissPanel: dismissPanel)
+        }
+    }
+
+    private func clearFiltersByResettingAdvancedDrafts() {
+        focusedActionButton = nil
+        advancedFilterDraftState.clearDraftInputs()
+        viewModel.clearPendingFilters()
+        withAnimation(.easeOut(duration: 0.15)) {
+            viewModel.applyFilters(dismissPanel: false)
+        }
     }
 
     var body: some View {
@@ -5193,10 +11661,22 @@ struct FilterPanel: View {
                         .font(.system(size: 10, weight: .bold))
                         .foregroundColor(.white.opacity(0.4))
                         .frame(width: 22, height: 22)
-                        .background(Color.white.opacity(0.1))
-                        .clipShape(Circle())
+                        .background(
+                            Circle()
+                                .fill(Color.white.opacity(0.1))
+                        )
+                        .overlay(
+                            Circle()
+                                .stroke(
+                                    isCloseHovered ? RetraceMenuStyle.filterStrokeStrong : Color.clear,
+                                    lineWidth: 1.2
+                                )
+                        )
                 }
                 .buttonStyle(.plain)
+                .onHover { hovering in
+                    isCloseHovered = hovering
+                }
             }
             .padding(.horizontal, 16)
             .padding(.top, 14)
@@ -5217,133 +11697,127 @@ struct FilterPanel: View {
                 else { NSCursor.pop() }
             }
 
-            // Source section (compact)
-            VStack(alignment: .leading, spacing: 8) {
-                Text("SOURCE")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundColor(.white.opacity(0.4))
-                    .tracking(0.5)
-
-                HStack(spacing: 8) {
-                    let sources = viewModel.pendingFilterCriteria.selectedSources
-                    // Default to only Retrace selected (nil means only native)
-                    let retraceSelected = sources == nil || sources!.contains(.native)
-                    let rewindSelected = sources != nil && sources!.contains(.rewind)
-
-                    SourceFilterChip(
-                        label: "Retrace",
-                        isRetrace: true,
-                        isSelected: retraceSelected
-                    ) {
-                        viewModel.toggleSourceFilter(.native)
-                    }
-
-                    SourceFilterChip(
-                        label: "Rewind",
-                        isRetrace: false,
-                        isSelected: rewindSelected
-                    ) {
-                        viewModel.toggleSourceFilter(.rewind)
-                    }
-                }
-            }
-            .padding(.horizontal, 16)
-            .padding(.bottom, 12)
-
             // Divider
             Rectangle()
                 .fill(Color.white.opacity(0.08))
                 .frame(height: 1)
                 .padding(.horizontal, 16)
 
-            // Two-column grid for Apps, Tags, Visibility, Date Range
-            HStack(alignment: .top, spacing: 12) {
-                // Left column: Apps and Visibility
-                VStack(alignment: .leading, spacing: 12) {
-                    // Apps
-                    CompactAppsFilterDropdown(
-                        label: "APPS",
-                        selectedApps: viewModel.pendingFilterCriteria.selectedApps,
-                        isExcludeMode: viewModel.pendingFilterCriteria.appFilterMode == .exclude,
-                        onTap: { frame in
-                            withAnimation(.easeOut(duration: 0.15)) {
-                                if viewModel.activeFilterDropdown == .apps {
-                                    viewModel.dismissFilterDropdown()
-                                } else {
-                                    viewModel.showFilterDropdown(.apps, anchorFrame: frame)
+            // Two-column grid plus dedicated date row
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(alignment: .top, spacing: 12) {
+                    // Left column: Apps and Visibility
+                    VStack(alignment: .leading, spacing: 12) {
+                        // Apps
+                        CompactAppsFilterDropdown(
+                            label: "APPS",
+                            selectedApps: viewModel.pendingFilterCriteria.selectedApps,
+                            isExcludeMode: viewModel.pendingFilterCriteria.appFilterMode == .exclude,
+                            isOpen: viewModel.activeFilterDropdown == .apps,
+                            onTap: { frame in
+                                withAnimation(.easeOut(duration: 0.15)) {
+                                    if viewModel.activeFilterDropdown == .apps {
+                                        viewModel.dismissFilterDropdown()
+                                    } else {
+                                        viewModel.showFilterDropdown(.apps, anchorFrame: frame)
+                                    }
                                 }
+                            },
+                            onFrameAvailable: { frame in
+                                viewModel.filterAnchorFrames[.apps] = frame
                             }
-                        },
-                        onFrameAvailable: { frame in
-                            viewModel.filterAnchorFrames[.apps] = frame
-                        }
-                    )
+                        )
 
-                    // Visibility
-                    CompactFilterDropdown(
-                        label: "VISIBILITY",
-                        value: hiddenFilterLabel,
-                        icon: "eye",
-                        isActive: viewModel.pendingFilterCriteria.hiddenFilter != .hide,
-                        onTap: { frame in
-                            withAnimation(.easeOut(duration: 0.15)) {
-                                if viewModel.activeFilterDropdown == .visibility {
-                                    viewModel.dismissFilterDropdown()
-                                } else {
-                                    viewModel.showFilterDropdown(.visibility, anchorFrame: frame)
+                        // Visibility
+                        CompactFilterDropdown(
+                            label: "VISIBILITY",
+                            value: hiddenFilterLabel,
+                            icon: "eye",
+                            isActive: viewModel.pendingFilterCriteria.hiddenFilter != .hide,
+                            isOpen: viewModel.activeFilterDropdown == .visibility,
+                            onTap: { frame in
+                                withAnimation(.easeOut(duration: 0.15)) {
+                                    if viewModel.activeFilterDropdown == .visibility {
+                                        viewModel.dismissFilterDropdown()
+                                    } else {
+                                        viewModel.showFilterDropdown(.visibility, anchorFrame: frame)
+                                    }
                                 }
+                            },
+                            onFrameAvailable: { frame in
+                                viewModel.filterAnchorFrames[.visibility] = frame
                             }
-                        },
-                        onFrameAvailable: { frame in
-                            viewModel.filterAnchorFrames[.visibility] = frame
-                        }
-                    )
+                        )
+                    }
+                    .frame(maxWidth: .infinity)
+
+                    // Right column: Tags and Comments
+                    VStack(alignment: .leading, spacing: 12) {
+                        // Tags
+                        CompactFilterDropdown(
+                            label: "TAGS",
+                            value: tagsLabel,
+                            icon: "tag",
+                            isActive: viewModel.pendingFilterCriteria.selectedTags != nil && !viewModel.pendingFilterCriteria.selectedTags!.isEmpty,
+                            isOpen: viewModel.activeFilterDropdown == .tags,
+                            onTap: { frame in
+                                withAnimation(.easeOut(duration: 0.15)) {
+                                    if viewModel.activeFilterDropdown == .tags {
+                                        viewModel.dismissFilterDropdown()
+                                    } else {
+                                        viewModel.showFilterDropdown(.tags, anchorFrame: frame)
+                                    }
+                                }
+                            },
+                            onFrameAvailable: { frame in
+                                viewModel.filterAnchorFrames[.tags] = frame
+                            }
+                        )
+
+                        // Comments
+                        CompactFilterDropdown(
+                            label: "COMMENTS",
+                            value: commentFilterLabel,
+                            icon: "text.bubble",
+                            isActive: viewModel.pendingFilterCriteria.commentFilter != .allFrames,
+                            isOpen: viewModel.activeFilterDropdown == .comments,
+                            onTap: { frame in
+                                withAnimation(.easeOut(duration: 0.15)) {
+                                    if viewModel.activeFilterDropdown == .comments {
+                                        viewModel.dismissFilterDropdown()
+                                    } else {
+                                        viewModel.showFilterDropdown(.comments, anchorFrame: frame)
+                                    }
+                                }
+                            },
+                            onFrameAvailable: { frame in
+                                viewModel.filterAnchorFrames[.comments] = frame
+                            }
+                        )
+                    }
+                    .frame(maxWidth: .infinity)
                 }
-                .frame(maxWidth: .infinity)
 
-                // Right column: Tags and Date Range
-                VStack(alignment: .leading, spacing: 12) {
-                    // Tags
-                    CompactFilterDropdown(
-                        label: "TAGS",
-                        value: tagsLabel,
-                        icon: "tag",
-                        isActive: viewModel.pendingFilterCriteria.selectedTags != nil && !viewModel.pendingFilterCriteria.selectedTags!.isEmpty,
-                        onTap: { frame in
-                            withAnimation(.easeOut(duration: 0.15)) {
-                                if viewModel.activeFilterDropdown == .tags {
-                                    viewModel.dismissFilterDropdown()
-                                } else {
-                                    viewModel.showFilterDropdown(.tags, anchorFrame: frame)
-                                }
+                // Date row (full width)
+                CompactFilterDropdown(
+                    label: "DATE",
+                    value: dateRangeLabel,
+                    icon: "calendar",
+                    isActive: !viewModel.pendingFilterCriteria.effectiveDateRanges.isEmpty,
+                    isOpen: viewModel.activeFilterDropdown == .dateRange,
+                    onTap: { frame in
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            if viewModel.activeFilterDropdown == .dateRange {
+                                viewModel.dismissFilterDropdown()
+                            } else {
+                                viewModel.showFilterDropdown(.dateRange, anchorFrame: frame)
                             }
-                        },
-                        onFrameAvailable: { frame in
-                            viewModel.filterAnchorFrames[.tags] = frame
                         }
-                    )
-
-                    // Date Range
-                    CompactFilterDropdown(
-                        label: "DATE",
-                        value: dateRangeLabel,
-                        icon: "calendar",
-                        isActive: viewModel.pendingFilterCriteria.startDate != nil || viewModel.pendingFilterCriteria.endDate != nil,
-                        onTap: { frame in
-                            withAnimation(.easeOut(duration: 0.15)) {
-                                if viewModel.activeFilterDropdown == .dateRange {
-                                    viewModel.dismissFilterDropdown()
-                                } else {
-                                    viewModel.showFilterDropdown(.dateRange, anchorFrame: frame)
-                                }
-                            }
-                        },
-                        onFrameAvailable: { frame in
-                            viewModel.filterAnchorFrames[.dateRange] = frame
-                        }
-                    )
-                }
-                .frame(maxWidth: .infinity)
+                    },
+                    onFrameAvailable: { frame in
+                        viewModel.filterAnchorFrames[.dateRange] = frame
+                    }
+                )
             }
             .padding(.horizontal, 16)
             .padding(.top, 12)
@@ -5356,7 +11830,10 @@ struct FilterPanel: View {
                 .padding(.horizontal, 16)
 
             // Advanced filters section (collapsible)
-            AdvancedFiltersSection(viewModel: viewModel)
+            AdvancedFiltersSection(
+                viewModel: viewModel,
+                draftState: advancedFilterDraftState
+            )
 
             // Divider before apply button
             Rectangle()
@@ -5366,59 +11843,90 @@ struct FilterPanel: View {
 
             // Action buttons
             HStack(spacing: 10) {
-                // Clear button (only when pending filters are active)
-                if viewModel.pendingFilterCriteria.hasActiveFilters {
+                // Clear button
+                if hasClearButton {
                     Button(action: {
-                        viewModel.clearPendingFilters()
-                        withAnimation(.easeOut(duration: 0.15)) {
-                            viewModel.applyFilters()
-                        }
+                        clearFiltersByResettingAdvancedDrafts()
                     }) {
-                        Text("Clear")
+                        Text(clearButtonTitle)
                             .font(.system(size: 14, weight: .semibold))
                             .foregroundColor(.white.opacity(0.7))
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 11)
                             .background(
                                 RoundedRectangle(cornerRadius: 8)
-                                    .fill(Color.white.opacity(0.1))
+                                    .fill(
+                                        (focusedActionButton == .clear || isClearHovered)
+                                            ? Color.white.opacity(0.16)
+                                            : Color.white.opacity(0.1)
+                                    )
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 8)
+                                    .stroke(
+                                        (focusedActionButton == .clear || isClearHovered)
+                                            ? RetraceMenuStyle.filterStrokeStrong
+                                            : Color.clear,
+                                        lineWidth: 1.4
+                                    )
                             )
                     }
                     .buttonStyle(.plain)
+                    .onHover { hovering in
+                        isClearHovered = hovering
+                    }
                 }
 
                 // Apply button
-                Button(action: {
-                    withAnimation(.easeOut(duration: 0.15)) {
-                        viewModel.applyFilters()
+                if hasApplyButton {
+                    Button(action: {
+                        applyFiltersByCommittingAdvancedDrafts()
+                    }) {
+                        Text(applyButtonTitle)
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundColor(.white)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 11)
+                            .background(
+                                RoundedRectangle(cornerRadius: 8)
+                                    .fill(
+                                        (focusedActionButton == .apply || isApplyHovered)
+                                            ? RetraceMenuStyle.actionBlue
+                                            : RetraceMenuStyle.actionBlue.opacity(0.8)
+                                    )
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 8)
+                                    .stroke(
+                                        (focusedActionButton == .apply || isApplyHovered)
+                                            ? RetraceMenuStyle.filterStrokeStrong
+                                            : Color.clear,
+                                        lineWidth: 2.25
+                                    )
+                            )
+                            .shadow(
+                                color: (focusedActionButton == .apply || isApplyHovered)
+                                    ? RetraceMenuStyle.actionBlue.opacity(0.65)
+                                    : .clear,
+                                radius: 8
+                            )
                     }
-                }) {
-                    Text("Apply Filters")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundColor(.white)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 11)
-                        .background(
-                            RoundedRectangle(cornerRadius: 8)
-                                .fill(RetraceMenuStyle.actionBlue.opacity(0.8))
-                        )
+                    .buttonStyle(.plain)
+                    .onHover { hovering in
+                        isApplyHovered = hovering
+                    }
                 }
-                .buttonStyle(.plain)
             }
             .padding(.horizontal, 16)
             .padding(.top, 12)
             .padding(.bottom, 14)
         }
         .frame(width: 360)
-        .background(
+        .retraceMattePanel(addPadding: false, cornerRadius: 16)
+        .overlay(
             RoundedRectangle(cornerRadius: 16)
-                .fill(Color(white: 0.12))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 16)
-                        .stroke(themeBorderColor, lineWidth: 1)
-                )
+                .stroke(themeBorderColor, lineWidth: 1)
         )
-        .shadow(color: .black.opacity(0.4), radius: 30, y: 15)
         .offset(
             x: panelPosition.width + dragOffset.width,
             y: panelPosition.height + dragOffset.height
@@ -5427,13 +11935,22 @@ struct FilterPanel: View {
             // Set up escape key monitor
             escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
                 if event.keyCode == 53 { // Escape key
-                    // Close any open dropdown first
+                    // While date-range calendar is open, Escape should dismiss the date dropdown.
+                    if viewModel.activeFilterDropdown == .dateRange && viewModel.isDateRangeCalendarEditing {
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            viewModel.dismissFilterDropdown()
+                        }
+                        return nil // Consume the event
+                    }
+
+                    // Close any open dropdown
                     if viewModel.activeFilterDropdown != .none {
                         withAnimation(.easeOut(duration: 0.15)) {
                             viewModel.dismissFilterDropdown()
                         }
                         return nil // Consume the event
                     }
+
                     // No dropdowns open - close the filter panel and consume event
                     withAnimation(.easeOut(duration: 0.15)) {
                         viewModel.dismissFilterPanel()
@@ -5443,13 +11960,230 @@ struct FilterPanel: View {
                 return event
             }
 
-            // Set up Tab key monitor for cycling through filters
+            // Set up keyboard monitor for cycling through filters
             tabKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+                // Let comment submenu own keyboard navigation while it's open.
+                if viewModel.showCommentSubmenu {
+                    return event
+                }
+
+                let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
+
+                // Cmd+Enter applies filters from anywhere in the filter panel.
+                if (event.keyCode == 36 || event.keyCode == 76) && modifiers == [.command] {
+                    viewModel.recordKeyboardShortcut("timeline.filter_panel.apply")
+                    applyFiltersByCommittingAdvancedDrafts(dismissPanel: hasApplyButton)
+                    return nil
+                }
+
+                // Cmd+Backspace clears active filters without closing the panel.
+                if event.keyCode == 51 && modifiers == [.command] {
+                    guard hasClearButton else { return event }
+                    viewModel.recordKeyboardShortcut("timeline.filter_panel.clear")
+                    clearFiltersByResettingAdvancedDrafts()
+                    return nil
+                }
+
+                // Handle Enter on Advanced highlight (toggle while keeping header selected)
+                if (event.keyCode == 36 || event.keyCode == 76) &&
+                    viewModel.activeFilterDropdown == .advanced &&
+                    viewModel.advancedFocusedFieldIndex == 0 {
+                    // Enter on highlighted Advanced header toggles the section.
+                    // Tab then enters Window Name when the section is open,
+                    // preserving a predictable order:
+                    // header -> window -> browser -> submit.
+                    viewModel.advancedFocusedFieldIndex = -1
+                    return nil
+                }
+
+                // Handle Enter while action buttons are keyboard-highlighted.
+                if (event.keyCode == 36 || event.keyCode == 76), let focusedButton = focusedActionButton {
+                    if focusedButton == .clear {
+                        clearFiltersByResettingAdvancedDrafts()
+                    } else {
+                        applyFiltersByCommittingAdvancedDrafts()
+                    }
+                    return nil
+                }
+
+                // Left/Right arrows navigate between filter fields while panel is open.
+                // Keep native caret movement when an advanced text field is focused.
+                if modifiers.isEmpty && (event.keyCode == 123 || event.keyCode == 124) {
+                    let isAdvancedTextFieldFocused =
+                        viewModel.activeFilterDropdown == .advanced &&
+                        (viewModel.advancedFocusedFieldIndex == 1 || viewModel.advancedFocusedFieldIndex == 2)
+                    if isAdvancedTextFieldFocused {
+                        return event
+                    }
+
+                    // Date-range calendar uses arrow keys for day navigation.
+                    if viewModel.activeFilterDropdown == .dateRange && viewModel.isDateRangeCalendarEditing {
+                        return event
+                    }
+
+                    // If action buttons are focused, Left/Right toggles within those buttons.
+                    if focusedActionButton != nil {
+                        if hasClearButton && hasApplyButton {
+                            focusedActionButton = event.keyCode == 123 ? .clear : .apply
+                        } else if hasClearButton {
+                            focusedActionButton = .clear
+                        } else if hasApplyButton {
+                            focusedActionButton = .apply
+                        } else {
+                            focusedActionButton = nil
+                        }
+                        return nil
+                    }
+
+                    let moveBackward = event.keyCode == 123
+                    let currentDropdown = viewModel.activeFilterDropdown
+                    let nextDropdown: SimpleTimelineViewModel.FilterDropdownType
+
+                    if currentDropdown == .none {
+                        nextDropdown = moveBackward ? filterOrder[filterOrder.count - 1] : filterOrder[0]
+                    } else {
+                        guard let currentIndex = filterOrder.firstIndex(of: currentDropdown) else { return event }
+                        let delta = moveBackward ? -1 : 1
+                        let nextIndex = (currentIndex + delta + filterOrder.count) % filterOrder.count
+                        nextDropdown = filterOrder[nextIndex]
+                    }
+
+                    if nextDropdown == .advanced {
+                        // Keep keyboard highlight on Advanced header when entering via arrows.
+                        viewModel.advancedFocusedFieldIndex = 0
+                    }
+
+                    let nextAnchorFrame = viewModel.filterAnchorFrames[nextDropdown] ?? .zero
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        viewModel.showFilterDropdown(nextDropdown, anchorFrame: nextAnchorFrame)
+                    }
+                    return nil
+                }
+
+                // Up/Down arrows switch between Advanced text fields.
+                // Window Name (1) <-> Browser URL (2)
+                if modifiers.isEmpty && (event.keyCode == 125 || event.keyCode == 126) {
+                    if focusedActionButton != nil,
+                       event.keyCode == 126,
+                       viewModel.activeFilterDropdown == .advanced {
+                        // Up from action buttons returns to Browser URL.
+                        focusedActionButton = nil
+                        viewModel.advancedFocusedFieldIndex = 2
+                        return nil
+                    }
+
+                    let fieldIndex = viewModel.advancedFocusedFieldIndex
+                    if event.keyCode == 125, fieldIndex == 1 { // Down from Window Name
+                        viewModel.advancedFocusedFieldIndex = 2
+                        return nil
+                    }
+                    if event.keyCode == 125, fieldIndex == 2 { // Down from Browser URL -> Apply
+                        viewModel.advancedFocusedFieldIndex = -4
+                        focusedActionButton = hasApplyButton ? .apply : .clear
+                        return nil
+                    }
+                    if event.keyCode == 126, fieldIndex == 2 { // Up from Browser URL
+                        viewModel.advancedFocusedFieldIndex = 1
+                        return nil
+                    }
+                    if event.keyCode == 126, fieldIndex == 1 { // Up from Window Name -> Date
+                        focusedActionButton = nil
+                        viewModel.advancedFocusedFieldIndex = 0
+                        let nextAnchorFrame = viewModel.filterAnchorFrames[.dateRange] ?? .zero
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            viewModel.showFilterDropdown(.dateRange, anchorFrame: nextAnchorFrame)
+                        }
+                        return nil
+                    }
+                }
+
                 // Only handle Tab key (keycode 48)
                 guard event.keyCode == 48 else { return event }
 
                 // Check if Shift is held for reverse direction
-                let isShiftHeld = event.modifierFlags.contains(.shift)
+                let isShiftHeld = modifiers.contains(.shift)
+
+                // Handle Tab while action buttons are focused
+                if let focusedButton = focusedActionButton {
+                    if isShiftHeld {
+                        if viewModel.activeFilterDropdown == .advanced {
+                            // Reverse traversal inside Advanced is:
+                            // submit -> browser -> window -> header.
+                            focusedActionButton = nil
+                            viewModel.advancedFocusedFieldIndex = -2
+                            return nil
+                        }
+                        if focusedButton == .apply && hasClearButton {
+                            focusedActionButton = .clear
+                            return nil
+                        }
+                        // Shift+Tab from Clear (or Apply when Clear is hidden) -> previous focus target.
+                        focusedActionButton = nil
+                    } else {
+                        if focusedButton == .clear {
+                            if hasApplyButton {
+                                focusedActionButton = .apply
+                                return nil
+                            }
+                            // Tab on Clear (only action button) -> cycle to Apps dropdown
+                            focusedActionButton = nil
+                            viewModel.advancedFocusedFieldIndex = 0
+                            let nextAnchorFrame = viewModel.filterAnchorFrames[.apps] ?? .zero
+                            withAnimation(.easeOut(duration: 0.15)) {
+                                viewModel.showFilterDropdown(.apps, anchorFrame: nextAnchorFrame)
+                            }
+                            return nil
+                        }
+                        // Tab on Apply -> cycle to Apps dropdown
+                        focusedActionButton = nil
+                        viewModel.advancedFocusedFieldIndex = 0
+                        let nextAnchorFrame = viewModel.filterAnchorFrames[.apps] ?? .zero
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            viewModel.showFilterDropdown(.apps, anchorFrame: nextAnchorFrame)
+                        }
+                        return nil
+                    }
+                }
+
+                // Handle Tab within advanced fields (Window Name / Browser URL)
+                if viewModel.activeFilterDropdown == .advanced {
+                    let fieldIndex = viewModel.advancedFocusedFieldIndex
+                    if fieldIndex == 0 {
+                        // Advanced header is highlighted: Tab enters the first field.
+                        if !isShiftHeld {
+                            focusedActionButton = nil
+                            viewModel.advancedFocusedFieldIndex = 1
+                            return nil
+                        }
+                    } else if !isShiftHeld && fieldIndex == 1 {
+                        // Tab on Window Name -> explicitly focus Browser URL.
+                        viewModel.advancedFocusedFieldIndex = 2
+                        return nil
+                    } else if !isShiftHeld && fieldIndex == 2 {
+                        // Tab on Browser URL -> submit button.
+                        viewModel.advancedFocusedFieldIndex = -4
+                        focusedActionButton = submitActionButtonFocus
+                        return nil
+                    } else if isShiftHeld && fieldIndex == 2 {
+                        // Shift+Tab on Browser URL -> explicitly focus Window Name.
+                        viewModel.advancedFocusedFieldIndex = -3
+                        return nil
+                    } else if isShiftHeld && fieldIndex == 1 {
+                        // Shift+Tab on Window Name -> return to the Advanced header.
+                        focusedActionButton = nil
+                        viewModel.advancedFocusedFieldIndex = 0
+                        return nil
+                    }
+                }
+
+                // Shift+Tab on Apps dropdown should go to Submit (Apply button), not Advanced.
+                if isShiftHeld && viewModel.activeFilterDropdown == .apps {
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        viewModel.dismissFilterDropdown()
+                    }
+                    focusedActionButton = trailingActionButtonFocus
+                    return nil
+                }
 
                 // Determine current and next dropdown
                 let nextDropdown: SimpleTimelineViewModel.FilterDropdownType
@@ -5477,16 +12211,35 @@ struct FilterPanel: View {
                 // If no frame is stored, the dropdown won't position correctly, but will still open
                 let nextAnchorFrame = viewModel.filterAnchorFrames[nextDropdown] ?? .zero
 
-                #if DEBUG
-                print("[FilterPanel] Tab cycling to \(nextDropdown), anchorFrame=\(nextAnchorFrame), storedFrames=\(viewModel.filterAnchorFrames.keys)")
-                #endif
-
                 // Open the next dropdown at its correct position
                 withAnimation(.easeOut(duration: 0.15)) {
                     viewModel.showFilterDropdown(nextDropdown, anchorFrame: nextAnchorFrame)
                 }
 
                 return nil // Consume the event
+            }
+        }
+        .onChange(of: viewModel.pendingFilterCriteria) { newCriteria in
+            // Once filters are active, additional panel changes apply immediately.
+            guard isAutoApplyMode else { return }
+            guard newCriteria != viewModel.filterCriteria else { return }
+            focusedActionButton = nil
+            withAnimation(.easeOut(duration: 0.15)) {
+                viewModel.applyFilters(dismissPanel: false)
+            }
+        }
+        .onChange(of: viewModel.pendingFilterCriteria.hasActiveFilters) { _ in
+            if focusedActionButton == .clear && !hasClearButton {
+                focusedActionButton = hasApplyButton ? .apply : nil
+            } else if focusedActionButton == .apply && !hasApplyButton {
+                focusedActionButton = hasClearButton ? .clear : nil
+            }
+        }
+        .onChange(of: viewModel.filterCriteria.hasActiveFilters) { _ in
+            if focusedActionButton == .apply && !hasApplyButton {
+                focusedActionButton = hasClearButton ? .clear : nil
+            } else if focusedActionButton == .clear && !hasClearButton {
+                focusedActionButton = hasApplyButton ? .apply : nil
             }
         }
         .onDisappear {
@@ -5500,34 +12253,338 @@ struct FilterPanel: View {
                 NSEvent.removeMonitor(monitor)
                 tabKeyMonitor = nil
             }
+            focusedActionButton = nil
         }
     }
 }
 
 // MARK: - Advanced Filters Section
 
+@MainActor
+final class TimelineAdvancedFilterDraftState: ObservableObject {
+    @Published var windowInputText = ""
+    @Published var browserInputText = ""
+    @Published var windowNameIncludeTerms: [String] = []
+    @Published var windowNameExcludeTerms: [String] = []
+    @Published var windowNameFilterMode: AppFilterMode = .include
+    @Published var browserUrlIncludeTerms: [String] = []
+    @Published var browserUrlExcludeTerms: [String] = []
+    @Published var browserUrlFilterMode: AppFilterMode = .include
+
+    static let metadataFilterPrefix = "__retrace_meta_filter_v1__"
+
+    struct EncodedMetadataFilterPayload: Codable {
+        let includeTerms: [String]?
+        let excludeTerms: [String]?
+        // Legacy fields for backward compatibility.
+        let mode: AppFilterMode?
+        let terms: [String]?
+    }
+
+    struct DecodedMetadataFilter: Equatable {
+        let includeTerms: [String]
+        let excludeTerms: [String]
+        let mode: AppFilterMode
+
+        static let empty = DecodedMetadataFilter(includeTerms: [], excludeTerms: [], mode: .include)
+
+        var hasActiveFilters: Bool {
+            !includeTerms.isEmpty || !excludeTerms.isEmpty
+        }
+    }
+
+    struct MetadataChipTerm: Identifiable {
+        let term: String
+        let mode: AppFilterMode
+        var id: String { "\(mode.rawValue):\(term.lowercased())" }
+    }
+
+    var windowNameChips: [MetadataChipTerm] {
+        Self.deduplicatedTerms(windowNameIncludeTerms).map { MetadataChipTerm(term: $0, mode: .include) } +
+        Self.deduplicatedTerms(windowNameExcludeTerms).map { MetadataChipTerm(term: $0, mode: .exclude) }
+    }
+
+    var browserUrlChips: [MetadataChipTerm] {
+        Self.deduplicatedTerms(browserUrlIncludeTerms).map { MetadataChipTerm(term: $0, mode: .include) } +
+        Self.deduplicatedTerms(browserUrlExcludeTerms).map { MetadataChipTerm(term: $0, mode: .exclude) }
+    }
+
+    func commitDraftInputs() {
+        commitWindowNameDraft()
+        commitBrowserUrlDraft()
+    }
+
+    func commitWindowNameDraft() {
+        let candidate = windowInputText
+        windowInputText = ""
+        Self.commit(
+            candidate,
+            mode: windowNameFilterMode,
+            includeTerms: &windowNameIncludeTerms,
+            excludeTerms: &windowNameExcludeTerms
+        )
+    }
+
+    func commitBrowserUrlDraft() {
+        let candidate = browserInputText
+        browserInputText = ""
+        Self.commit(
+            candidate,
+            mode: browserUrlFilterMode,
+            includeTerms: &browserUrlIncludeTerms,
+            excludeTerms: &browserUrlExcludeTerms
+        )
+    }
+
+    func removeWindowNameTerm(_ term: String, mode: AppFilterMode) {
+        let needle = term.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !needle.isEmpty else { return }
+        if mode == .include {
+            windowNameIncludeTerms.removeAll { existing in
+                existing.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == needle
+            }
+        } else {
+            windowNameExcludeTerms.removeAll { existing in
+                existing.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == needle
+            }
+        }
+    }
+
+    func removeBrowserUrlTerm(_ term: String, mode: AppFilterMode) {
+        let needle = term.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !needle.isEmpty else { return }
+        if mode == .include {
+            browserUrlIncludeTerms.removeAll { existing in
+                existing.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == needle
+            }
+        } else {
+            browserUrlExcludeTerms.removeAll { existing in
+                existing.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == needle
+            }
+        }
+    }
+
+    func clearDraftInputs() {
+        windowInputText = ""
+        browserInputText = ""
+    }
+
+    func sync(from criteria: FilterCriteria) {
+        let decodedWindowFilter = Self.decodeMetadataFilter(criteria.windowNameFilter)
+        if windowNameIncludeTerms != decodedWindowFilter.includeTerms {
+            windowNameIncludeTerms = decodedWindowFilter.includeTerms
+        }
+        if windowNameExcludeTerms != decodedWindowFilter.excludeTerms {
+            windowNameExcludeTerms = decodedWindowFilter.excludeTerms
+        }
+        if windowNameFilterMode != decodedWindowFilter.mode {
+            windowNameFilterMode = decodedWindowFilter.mode
+        }
+
+        let decodedBrowserFilter = Self.decodeMetadataFilter(criteria.browserUrlFilter)
+        if browserUrlIncludeTerms != decodedBrowserFilter.includeTerms {
+            browserUrlIncludeTerms = decodedBrowserFilter.includeTerms
+        }
+        if browserUrlExcludeTerms != decodedBrowserFilter.excludeTerms {
+            browserUrlExcludeTerms = decodedBrowserFilter.excludeTerms
+        }
+        if browserUrlFilterMode != decodedBrowserFilter.mode {
+            browserUrlFilterMode = decodedBrowserFilter.mode
+        }
+    }
+
+    func applyMetadataFilters(to criteria: inout FilterCriteria) {
+        criteria.windowNameFilter = Self.encodedMetadataFilter(
+            includeTerms: windowNameIncludeTerms,
+            excludeTerms: windowNameExcludeTerms
+        )
+        criteria.browserUrlFilter = Self.encodedMetadataFilter(
+            includeTerms: browserUrlIncludeTerms,
+            excludeTerms: browserUrlExcludeTerms
+        )
+    }
+
+    static func encodedMetadataFilter(includeTerms: [String], excludeTerms: [String]) -> String? {
+        let normalizedIncludeTerms = deduplicatedTerms(includeTerms)
+        let includeKeys = Set(normalizedIncludeTerms.map { $0.lowercased() })
+        let normalizedExcludeTerms = deduplicatedTerms(excludeTerms).filter { !includeKeys.contains($0.lowercased()) }
+        guard !normalizedIncludeTerms.isEmpty || !normalizedExcludeTerms.isEmpty else { return nil }
+
+        let payload = EncodedMetadataFilterPayload(
+            includeTerms: normalizedIncludeTerms,
+            excludeTerms: normalizedExcludeTerms,
+            mode: nil,
+            terms: nil
+        )
+        guard let data = try? JSONEncoder().encode(payload) else { return nil }
+        return metadataFilterPrefix + data.base64EncodedString()
+    }
+
+    static func decodeMetadataFilter(_ rawValue: String?) -> DecodedMetadataFilter {
+        guard let rawValue else { return .empty }
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return .empty }
+
+        guard trimmed.hasPrefix(metadataFilterPrefix) else {
+            let normalizedTerms = deduplicatedTerms([trimmed])
+            return DecodedMetadataFilter(includeTerms: normalizedTerms, excludeTerms: [], mode: .include)
+        }
+
+        let encodedPayload = String(trimmed.dropFirst(metadataFilterPrefix.count))
+        guard let data = Data(base64Encoded: encodedPayload),
+              let payload = try? JSONDecoder().decode(EncodedMetadataFilterPayload.self, from: data) else {
+            return .empty
+        }
+
+        let normalizedIncludeTerms = deduplicatedTerms(payload.includeTerms ?? [])
+        let includeKeys = Set(normalizedIncludeTerms.map { $0.lowercased() })
+        let normalizedExcludeTerms = deduplicatedTerms(payload.excludeTerms ?? []).filter { !includeKeys.contains($0.lowercased()) }
+        if !normalizedIncludeTerms.isEmpty || !normalizedExcludeTerms.isEmpty {
+            let preferredMode: AppFilterMode = normalizedIncludeTerms.isEmpty && !normalizedExcludeTerms.isEmpty ? .exclude : .include
+            return DecodedMetadataFilter(
+                includeTerms: normalizedIncludeTerms,
+                excludeTerms: normalizedExcludeTerms,
+                mode: preferredMode
+            )
+        }
+
+        let normalizedLegacyTerms = deduplicatedTerms(payload.terms ?? [])
+        if payload.mode == .exclude {
+            return DecodedMetadataFilter(includeTerms: [], excludeTerms: normalizedLegacyTerms, mode: .exclude)
+        }
+        return DecodedMetadataFilter(includeTerms: normalizedLegacyTerms, excludeTerms: [], mode: .include)
+    }
+
+    static func deduplicatedTerms(_ terms: [String]) -> [String] {
+        var seen = Set<String>()
+        var normalizedTerms: [String] = []
+
+        for term in terms {
+            guard let normalized = normalizedTerm(term) else { continue }
+            let key = normalized.lowercased()
+            if seen.insert(key).inserted {
+                normalizedTerms.append(normalized)
+            }
+        }
+
+        return normalizedTerms
+    }
+
+    static func normalizedTerm(_ term: String) -> String? {
+        let collapsed = term
+            .split(whereSeparator: \.isWhitespace)
+            .map(String.init)
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return collapsed.isEmpty ? nil : collapsed
+    }
+
+    private static func commit(
+        _ candidate: String,
+        mode: AppFilterMode,
+        includeTerms: inout [String],
+        excludeTerms: inout [String]
+    ) {
+        guard let normalized = normalizedTerm(candidate) else { return }
+        if mode == .include {
+            includeTerms = deduplicatedTerms(includeTerms + [normalized])
+            excludeTerms.removeAll { $0.caseInsensitiveCompare(normalized) == .orderedSame }
+        } else {
+            excludeTerms = deduplicatedTerms(excludeTerms + [normalized])
+            includeTerms.removeAll { $0.caseInsensitiveCompare(normalized) == .orderedSame }
+        }
+    }
+}
+
 /// Collapsible section for advanced text filters (Window Name and Browser URL)
 struct AdvancedFiltersSection: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel
+    @ObservedObject var draftState: TimelineAdvancedFilterDraftState
     @State private var isExpanded: Bool = false
+    @State private var isHeaderHovered = false
+    @State private var isWindowHovered = false
+    @State private var isBrowserHovered = false
+    @State private var lastFocusedField: AdvancedField?
+
+    private enum AdvancedField: Hashable {
+        case windowName
+        case browserUrl
+    }
+    @State private var focusedField: AdvancedField?
 
     /// Whether any advanced filter is active
     private var hasActiveAdvancedFilters: Bool {
         viewModel.pendingFilterCriteria.hasAdvancedFilters
     }
 
+    /// Whether the advanced dropdown is active (for highlight)
+    private var isAdvancedActive: Bool {
+        viewModel.activeFilterDropdown == .advanced
+    }
+
+    /// Keyboard highlight when tab focus is on the Advanced header row.
+    private var isHeaderKeyboardHighlighted: Bool {
+        isAdvancedActive && viewModel.advancedFocusedFieldIndex == 0
+    }
+
+    private func commitDraftForPreviousFocus(_ previousField: AdvancedField?, newField: AdvancedField?) {
+        guard previousField != newField else { return }
+
+        switch previousField {
+        case .windowName:
+            draftState.commitWindowNameDraft()
+            updatePendingWindowFilter()
+        case .browserUrl:
+            draftState.commitBrowserUrlDraft()
+            updatePendingBrowserFilter()
+        case nil:
+            break
+        }
+    }
+
+    private func syncStateFromPendingFilters() {
+        draftState.sync(from: viewModel.pendingFilterCriteria)
+    }
+
+    private func updatePendingWindowFilter() {
+        let encoded = TimelineAdvancedFilterDraftState.encodedMetadataFilter(
+            includeTerms: draftState.windowNameIncludeTerms,
+            excludeTerms: draftState.windowNameExcludeTerms
+        )
+        if viewModel.pendingFilterCriteria.windowNameFilter != encoded {
+            viewModel.pendingFilterCriteria.windowNameFilter = encoded
+        }
+    }
+
+    private func updatePendingBrowserFilter() {
+        let encoded = TimelineAdvancedFilterDraftState.encodedMetadataFilter(
+            includeTerms: draftState.browserUrlIncludeTerms,
+            excludeTerms: draftState.browserUrlExcludeTerms
+        )
+        if viewModel.pendingFilterCriteria.browserUrlFilter != encoded {
+            viewModel.pendingFilterCriteria.browserUrlFilter = encoded
+        }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             // Toggle header
             Button(action: {
+                let willExpand = !isExpanded
                 withAnimation(.easeInOut(duration: 0.2)) {
-                    isExpanded.toggle()
+                    isExpanded = willExpand
+                }
+                focusedField = nil
+                if willExpand {
+                    viewModel.advancedFocusedFieldIndex = 0
+                } else {
+                    viewModel.advancedFocusedFieldIndex = 0
                 }
             }) {
                 HStack {
                     Text("ADVANCED")
                         .font(.system(size: 11, weight: .semibold))
-                        .foregroundColor(.white.opacity(0.4))
+                        .foregroundColor(isAdvancedActive ? .white.opacity(0.8) : .white.opacity(0.4))
                         .tracking(0.5)
 
                     if hasActiveAdvancedFilters {
@@ -5540,14 +12597,35 @@ struct AdvancedFiltersSection: View {
 
                     Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
                         .font(.system(size: 10, weight: .semibold))
-                        .foregroundColor(.white.opacity(0.4))
+                        .foregroundColor(isAdvancedActive ? .white.opacity(0.6) : .white.opacity(0.4))
                 }
+                .padding(.horizontal, 12)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .padding(.horizontal, 16)
             .padding(.top, 12)
             .padding(.bottom, isExpanded ? 8 : 12)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(isAdvancedActive && !isExpanded ? Color.white.opacity(0.08) : Color.clear)
+                    .padding(.horizontal, 16)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(
+                        (isHeaderHovered || isHeaderKeyboardHighlighted)
+                            ? RetraceMenuStyle.filterStrokeStrong
+                            : Color.clear,
+                        lineWidth: 1.2
+                    )
+                    .padding(.horizontal, 16)
+            )
+            .onHover { hovering in
+                isHeaderHovered = hovering
+                if hovering { NSCursor.pointingHand.push() }
+                else { NSCursor.pop() }
+            }
 
             if isExpanded {
                 VStack(alignment: .leading, spacing: 12) {
@@ -5557,15 +12635,28 @@ struct AdvancedFiltersSection: View {
                             .font(.system(size: 12, weight: .medium))
                             .foregroundColor(.white.opacity(0.6))
 
-                        TextField("Search titles...", text: Binding(
-                            get: { viewModel.pendingFilterCriteria.windowNameFilter ?? "" },
-                            set: { viewModel.pendingFilterCriteria.windowNameFilter = $0.isEmpty ? nil : $0 }
-                        ))
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 13))
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 11)
-                        .padding(.vertical, 9)
+                        HStack(spacing: 10) {
+                            FocusableTextInput(
+                                text: $draftState.windowInputText,
+                                placeholder: "Search titles...",
+                                onSubmit: {
+                                    draftState.commitWindowNameDraft()
+                                },
+                                isFocused: { focusedField == .windowName },
+                                setFocused: { isFocused in
+                                    if isFocused {
+                                        focusedField = .windowName
+                                    } else if focusedField == .windowName {
+                                        focusedField = nil
+                                    }
+                                }
+                            )
+
+                            IncludeExcludeModeToggle(mode: $draftState.windowNameFilterMode)
+                                .frame(width: 138)
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 7)
                         .background(
                             RoundedRectangle(cornerRadius: 6)
                                 .fill(Color.white.opacity(0.08))
@@ -5573,14 +12664,33 @@ struct AdvancedFiltersSection: View {
                         .overlay(
                             RoundedRectangle(cornerRadius: 6)
                                 .stroke(
-                                    viewModel.pendingFilterCriteria.windowNameFilter != nil && !viewModel.pendingFilterCriteria.windowNameFilter!.isEmpty
-                                        ? RetraceMenuStyle.actionBlue.opacity(0.5)
-                                        : Color.white.opacity(0.1),
+                                    focusedField == .windowName
+                                        ? RetraceMenuStyle.filterStrokeStrong
+                                        : (!draftState.windowNameChips.isEmpty
+                                            ? RetraceMenuStyle.filterStrokeMedium
+                                            : (isWindowHovered ? Color.white.opacity(0.65) : RetraceMenuStyle.filterStrokeSubtle)),
                                     lineWidth: 1
                                 )
                         )
-                        .onSubmit {
-                            viewModel.applyFilters()
+                        .onHover { hovering in
+                            isWindowHovered = hovering
+                        }
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            focusedField = .windowName
+                        }
+
+                        if !draftState.windowNameChips.isEmpty {
+                            ScrollView(.horizontal, showsIndicators: false) {
+                                HStack(spacing: 8) {
+                                    ForEach(draftState.windowNameChips) { chip in
+                                        TimelineMetadataTermChip(term: chip.term, mode: chip.mode) {
+                                            draftState.removeWindowNameTerm(chip.term, mode: chip.mode)
+                                        }
+                                    }
+                                }
+                                .padding(.vertical, 2)
+                            }
                         }
                     }
 
@@ -5590,15 +12700,28 @@ struct AdvancedFiltersSection: View {
                             .font(.system(size: 12, weight: .medium))
                             .foregroundColor(.white.opacity(0.6))
 
-                        TextField("Search URLs...", text: Binding(
-                            get: { viewModel.pendingFilterCriteria.browserUrlFilter ?? "" },
-                            set: { viewModel.pendingFilterCriteria.browserUrlFilter = $0.isEmpty ? nil : $0 }
-                        ))
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 13))
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 11)
-                        .padding(.vertical, 9)
+                        HStack(spacing: 10) {
+                            FocusableTextInput(
+                                text: $draftState.browserInputText,
+                                placeholder: "Search URLs...",
+                                onSubmit: {
+                                    draftState.commitBrowserUrlDraft()
+                                },
+                                isFocused: { focusedField == .browserUrl },
+                                setFocused: { isFocused in
+                                    if isFocused {
+                                        focusedField = .browserUrl
+                                    } else if focusedField == .browserUrl {
+                                        focusedField = nil
+                                    }
+                                }
+                            )
+
+                            IncludeExcludeModeToggle(mode: $draftState.browserUrlFilterMode)
+                                .frame(width: 138)
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 7)
                         .background(
                             RoundedRectangle(cornerRadius: 6)
                                 .fill(Color.white.opacity(0.08))
@@ -5606,14 +12729,33 @@ struct AdvancedFiltersSection: View {
                         .overlay(
                             RoundedRectangle(cornerRadius: 6)
                                 .stroke(
-                                    viewModel.pendingFilterCriteria.browserUrlFilter != nil && !viewModel.pendingFilterCriteria.browserUrlFilter!.isEmpty
-                                        ? RetraceMenuStyle.actionBlue.opacity(0.5)
-                                        : Color.white.opacity(0.1),
+                                    focusedField == .browserUrl
+                                        ? RetraceMenuStyle.filterStrokeStrong
+                                        : (!draftState.browserUrlChips.isEmpty
+                                            ? RetraceMenuStyle.filterStrokeMedium
+                                            : (isBrowserHovered ? Color.white.opacity(0.65) : RetraceMenuStyle.filterStrokeSubtle)),
                                     lineWidth: 1
                                 )
                         )
-                        .onSubmit {
-                            viewModel.applyFilters()
+                        .onHover { hovering in
+                            isBrowserHovered = hovering
+                        }
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            focusedField = .browserUrl
+                        }
+
+                        if !draftState.browserUrlChips.isEmpty {
+                            ScrollView(.horizontal, showsIndicators: false) {
+                                HStack(spacing: 8) {
+                                    ForEach(draftState.browserUrlChips) { chip in
+                                        TimelineMetadataTermChip(term: chip.term, mode: chip.mode) {
+                                            draftState.removeBrowserUrlTerm(chip.term, mode: chip.mode)
+                                        }
+                                    }
+                                }
+                                .padding(.vertical, 2)
+                            }
                         }
                     }
                 }
@@ -5622,10 +12764,144 @@ struct AdvancedFiltersSection: View {
             }
         }
         .onAppear {
+            syncStateFromPendingFilters()
             // Auto-expand if there are active advanced filters
             if hasActiveAdvancedFilters {
                 isExpanded = true
             }
+        }
+        .onChange(of: draftState.windowNameIncludeTerms) { _ in
+            updatePendingWindowFilter()
+        }
+        .onChange(of: draftState.windowNameExcludeTerms) { _ in
+            updatePendingWindowFilter()
+        }
+        .onChange(of: draftState.browserUrlIncludeTerms) { _ in
+            updatePendingBrowserFilter()
+        }
+        .onChange(of: draftState.browserUrlExcludeTerms) { _ in
+            updatePendingBrowserFilter()
+        }
+        .onChange(of: viewModel.pendingFilterCriteria.windowNameFilter) { _ in
+            syncStateFromPendingFilters()
+        }
+        .onChange(of: viewModel.pendingFilterCriteria.browserUrlFilter) { _ in
+            syncStateFromPendingFilters()
+        }
+        .onChange(of: viewModel.activeFilterDropdown) { newValue in
+            if newValue != .advanced {
+                // Leaving advanced: collapse section and unfocus fields
+                focusedField = nil
+                if newValue != .none {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        isExpanded = false
+                    }
+                }
+            }
+        }
+        .onChange(of: viewModel.advancedFocusedFieldIndex) { newValue in
+            if newValue == 1 {
+                focusedField = .windowName
+            } else if newValue == 2 {
+                focusedField = .browserUrl
+            } else if newValue == -1 && viewModel.activeFilterDropdown == .advanced {
+                // Enter on the Advanced header toggles the section while keeping
+                // keyboard focus on the header.
+                let willExpand = !isExpanded
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    isExpanded = willExpand
+                }
+                focusedField = nil
+                DispatchQueue.main.async {
+                    viewModel.advancedFocusedFieldIndex = 0
+                }
+            } else if (newValue == 0 || newValue == -4) && viewModel.activeFilterDropdown == .advanced {
+                // Advanced header (0) or action-button sentinel (-4): clear text-field focus/caret.
+                focusedField = nil
+            } else if newValue == -2 && viewModel.activeFilterDropdown == .advanced {
+                // Shift+Tab from filter action buttons -> focus Browser URL.
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    isExpanded = true
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                    focusedField = .browserUrl
+                }
+            } else if newValue == -3 && viewModel.activeFilterDropdown == .advanced {
+                // Shift+Tab from Browser URL -> focus Window Name.
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    isExpanded = true
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                    focusedField = .windowName
+                }
+            }
+        }
+        .onChange(of: focusedField) { newValue in
+            commitDraftForPreviousFocus(lastFocusedField, newField: newValue)
+            lastFocusedField = newValue
+            // Sync focus state to viewModel for tab monitor
+            switch newValue {
+            case .windowName: viewModel.advancedFocusedFieldIndex = 1
+            case .browserUrl: viewModel.advancedFocusedFieldIndex = 2
+            case nil:
+                // Preserve the "action buttons focused" sentinel so the Advanced header
+                // does not also appear keyboard-highlighted.
+                if viewModel.advancedFocusedFieldIndex != -4 {
+                    viewModel.advancedFocusedFieldIndex = 0
+                }
+            }
+        }
+    }
+}
+
+private struct TimelineMetadataTermChip: View {
+    let term: String
+    let mode: AppFilterMode
+    let onRemove: () -> Void
+
+    @State private var isHovered = false
+
+    private var iconName: String {
+        mode == .include ? "plus.circle.fill" : "minus.circle.fill"
+    }
+
+    private var iconTint: Color {
+        mode == .include ? .blue.opacity(0.88) : .orange.opacity(0.9)
+    }
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: iconName)
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundColor(iconTint)
+
+            Text(term)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(.white)
+                .lineLimit(1)
+
+            Button(action: onRemove) {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(.white.opacity(0.7))
+            }
+            .buttonStyle(.plain)
+            .onHover { hovering in
+                if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+            }
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 6)
+        .background(
+            Capsule()
+                .fill(Color.white.opacity(isHovered ? 0.2 : 0.14))
+        )
+        .overlay(
+            Capsule()
+                .stroke(Color.white.opacity(isHovered ? 0.35 : 0.2), lineWidth: 0.8)
+        )
+        .onHover { hovering in
+            isHovered = hovering
         }
     }
 }
@@ -5638,6 +12914,7 @@ struct CompactFilterDropdown: View {
     let value: String
     let icon: String
     let isActive: Bool
+    let isOpen: Bool
     let onTap: (CGRect) -> Void
     var onFrameAvailable: ((CGRect) -> Void)? = nil
 
@@ -5673,11 +12950,16 @@ struct CompactFilterDropdown: View {
                     .padding(.vertical, 9)
                     .background(
                         RoundedRectangle(cornerRadius: 8)
-                            .fill(isActive ? Color.white.opacity(0.15) : (isHovered ? Color.white.opacity(0.12) : Color.white.opacity(0.08)))
+                            .fill(isActive ? Color.white.opacity(0.15) : ((isHovered || isOpen) ? Color.white.opacity(0.12) : Color.white.opacity(0.08)))
                     )
                     .overlay(
                         RoundedRectangle(cornerRadius: 8)
-                            .stroke(Color.white.opacity(isActive ? 0.25 : 0.1), lineWidth: 1)
+                            .stroke(
+                                (isHovered || isOpen)
+                                    ? RetraceMenuStyle.filterStrokeStrong
+                                    : (isActive ? RetraceMenuStyle.filterStrokeMedium : RetraceMenuStyle.filterStrokeSubtle),
+                                lineWidth: (isHovered || isOpen) ? 1.2 : 1
+                            )
                     )
                 }
                 .buttonStyle(.plain)
@@ -5703,13 +12985,15 @@ struct CompactAppsFilterDropdown: View {
     let label: String
     let selectedApps: Set<String>?
     let isExcludeMode: Bool
+    let isOpen: Bool
     let onTap: (CGRect) -> Void
     var onFrameAvailable: ((CGRect) -> Void)? = nil
 
+    @StateObject private var appMetadata = AppMetadataCache.shared
     @State private var isHovered = false
 
     private let maxVisibleIcons = 5
-    private let iconSize: CGFloat = 18
+    private let iconSize: CGFloat = 13
 
     private var sortedApps: [String] {
         guard let apps = selectedApps else { return [] }
@@ -5734,7 +13018,8 @@ struct CompactAppsFilterDropdown: View {
                         // Show exclude indicator
                         if isExcludeMode && isActive {
                             Image(systemName: "minus.circle.fill")
-                                .font(.system(size: 11))
+                                .font(.system(size: 10))
+                                .frame(width: iconSize, height: iconSize)
                                 .foregroundColor(.orange)
                         }
 
@@ -5771,6 +13056,7 @@ struct CompactAppsFilterDropdown: View {
                             // Default state - no apps selected
                             Image(systemName: "square.grid.2x2")
                                 .font(.system(size: 11))
+                                .frame(width: iconSize, height: iconSize)
                                 .foregroundColor(.white.opacity(0.5))
 
                             Text("All Apps")
@@ -5784,15 +13070,21 @@ struct CompactAppsFilterDropdown: View {
                             .font(.system(size: 9, weight: .semibold))
                             .foregroundColor(.white.opacity(0.4))
                     }
+                    .frame(height: iconSize)
                     .padding(.horizontal, 11)
                     .padding(.vertical, 9)
                     .background(
                         RoundedRectangle(cornerRadius: 8)
-                            .fill(isActive ? Color.white.opacity(0.15) : (isHovered ? Color.white.opacity(0.12) : Color.white.opacity(0.08)))
+                            .fill(isActive ? Color.white.opacity(0.15) : ((isHovered || isOpen) ? Color.white.opacity(0.12) : Color.white.opacity(0.08)))
                     )
                     .overlay(
                         RoundedRectangle(cornerRadius: 8)
-                            .stroke(Color.white.opacity(isActive ? 0.25 : 0.1), lineWidth: 1)
+                            .stroke(
+                                (isHovered || isOpen)
+                                    ? RetraceMenuStyle.filterStrokeStrong
+                                    : (isActive ? RetraceMenuStyle.filterStrokeMedium : RetraceMenuStyle.filterStrokeSubtle),
+                                lineWidth: (isHovered || isOpen) ? 1.2 : 1
+                            )
                     )
                 }
                 .buttonStyle(.plain)
@@ -5810,28 +13102,24 @@ struct CompactAppsFilterDropdown: View {
             }
             .frame(height: 38)
         }
+        .onAppear {
+            appMetadata.prefetch(bundleIDs: sortedApps)
+        }
+        .onChange(of: sortedApps) { bundleIDs in
+            appMetadata.prefetch(bundleIDs: bundleIDs)
+        }
     }
 
-    @ViewBuilder
     private func appIcon(for bundleID: String) -> some View {
-        if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
-            Image(nsImage: NSWorkspace.shared.icon(forFile: appURL.path))
-                .resizable()
-                .aspectRatio(contentMode: .fit)
-        } else {
-            Image(systemName: "app.fill")
-                .resizable()
-                .aspectRatio(contentMode: .fit)
-                .foregroundColor(.white.opacity(0.6))
-        }
+        AppIconView(bundleID: bundleID, size: iconSize)
     }
 
     private func appName(for bundleID: String) -> String {
-        if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
-            return FileManager.default.displayName(atPath: appURL.path)
-        }
-        // Fallback: extract last component of bundle ID
-        return bundleID.components(separatedBy: ".").last ?? bundleID
+        appMetadata.name(for: bundleID) ?? fallbackName(for: bundleID)
+    }
+
+    private func fallbackName(for bundleID: String) -> String {
+        bundleID.components(separatedBy: ".").last ?? bundleID
     }
 }
 
@@ -5861,7 +13149,12 @@ struct FilterToggleChipCompact: View {
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 8)
-                    .stroke(isSelected ? Color.white.opacity(0.2) : Color.white.opacity(0.08), lineWidth: 1)
+                    .stroke(
+                        isHovered
+                            ? RetraceMenuStyle.filterStrokeStrong
+                            : (isSelected ? RetraceMenuStyle.filterStrokeMedium : RetraceMenuStyle.filterStrokeSubtle),
+                        lineWidth: isHovered ? 1.2 : 1
+                    )
             )
         }
         .buttonStyle(.plain)
@@ -5871,129 +13164,160 @@ struct FilterToggleChipCompact: View {
     }
 }
 
-/// Source filter chip with app logo (Retrace or Rewind)
-struct SourceFilterChip: View {
-    let label: String
-    let isRetrace: Bool
-    let isSelected: Bool
-    let action: () -> Void
-
-    private var retraceIcon: NSImage {
-        // Load Retrace app icon from /Applications
-        NSWorkspace.shared.icon(forFile: "/Applications/Retrace.app")
-    }
-
-    private var rewindIcon: NSImage? {
-        // Load Rewind app icon from /Applications, fallback to nil (will use system icon)
-        let rewindPath = "/Applications/Rewind.app"
-        if FileManager.default.fileExists(atPath: rewindPath) {
-            return NSWorkspace.shared.icon(forFile: rewindPath)
-        }
-        return nil
-    }
-
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 7) {
-                if isRetrace {
-                    // Retrace app icon from /Applications
-                    Image(nsImage: retraceIcon)
-                        .resizable()
-                        .frame(width: 16, height: 16)
-                } else {
-                    // Rewind app icon - load from /Applications
-                    if let icon = rewindIcon {
-                        Image(nsImage: icon)
-                            .resizable()
-                            .frame(width: 16, height: 16)
-                    } else {
-                        Image(systemName: "arrow.counterclockwise")
-                            .font(.system(size: 11))
-                    }
-                }
-                Text(label)
-                    .font(.system(size: 12, weight: .medium))
-            }
-            .foregroundColor(isSelected ? .white : .white.opacity(0.5))
-            .padding(.horizontal, 14)
-            .padding(.vertical, 9)
-            .background(
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(isSelected ? Color.white.opacity(0.15) : Color.white.opacity(0.05))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(isSelected ? Color.white.opacity(0.2) : Color.white.opacity(0.08), lineWidth: 1)
-            )
-        }
-        .buttonStyle(.plain)
-    }
-}
-
 // MARK: - Filter Dropdown Overlay
 
 /// Renders filter dropdowns at the top level of SimpleTimelineView to avoid clipping issues
 /// The dropdowns are positioned absolutely based on the anchor frame from the ViewModel
 /// Using the "timelineContent" coordinate space for proper alignment
+private struct FilterDropdownSizePreferenceKey: PreferenceKey {
+    static var defaultValue: CGSize = .zero
+
+    static func reduce(value: inout CGSize, nextValue: () -> CGSize) {
+        value = nextValue()
+    }
+}
+
 struct FilterDropdownOverlay: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel
+    @State private var measuredDropdownSize: CGSize = .zero
 
     var body: some View {
-        Group {
-            if viewModel.activeFilterDropdown != .none {
-                let anchor = viewModel.filterDropdownAnchorFrame
-                #if DEBUG
-                let _ = print("[FilterDropdownOverlay] Rendering dropdown=\(viewModel.activeFilterDropdown), anchor=\(anchor)")
-                #endif
+        GeometryReader { proxy in
+            Group {
+                if viewModel.activeFilterDropdown != .none && viewModel.activeFilterDropdown != .advanced {
+                    let anchor = viewModel.filterDropdownAnchorFrame
+                    let fallbackSize = estimatedDropdownSize(for: viewModel.activeFilterDropdown)
+                    let dropdownSize = resolvedDropdownSize(fallback: fallbackSize)
+                    let origin = dropdownOrigin(containerSize: proxy.size, anchor: anchor, dropdownSize: dropdownSize)
 
-                ZStack {
-                    // Full-screen dismiss layer (below dropdown)
-                    Color.black.opacity(0.001)
-                        .ignoresSafeArea()
-                        .contentShape(Rectangle())
-                        .onTapGesture {
-                            withAnimation(.easeOut(duration: 0.15)) {
-                                viewModel.dismissFilterDropdown()
+                    ZStack(alignment: .topLeading) {
+                        // Full-screen dismiss layer (below dropdown)
+                        Color.black.opacity(0.001)
+                            .ignoresSafeArea()
+                            .contentShape(Rectangle())
+                            .onTapGesture {
+                                withAnimation(.easeOut(duration: 0.15)) {
+                                    viewModel.dismissFilterDropdown()
+                                }
                             }
-                        }
 
-                    // All dropdowns open downward
-                    VStack(spacing: 0) {
-                        // Top spacer to push content down to anchor.maxY + gap
-                        Spacer()
-                            .frame(height: anchor.maxY + 8)
-
-                        HStack(spacing: 0) {
-                            // Left spacer to push content to anchor.minX
-                            Spacer()
-                                .frame(width: anchor.minX)
-
-                            // The actual dropdown content
-                            // Scroll events are handled at TimelineWindowController level
-                            dropdownContent
-                                .background(
-                                    RoundedRectangle(cornerRadius: 10)
-                                        .fill(Color(white: 0.12))
-                                )
-                                .clipShape(RoundedRectangle(cornerRadius: 10))
-                                .shadow(color: .black.opacity(0.5), radius: 15, y: 8)
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 10)
-                                        .stroke(Color.white.opacity(0.15), lineWidth: 1)
-                                )
-                                .fixedSize()
-
-                            Spacer()
-                        }
-
-                        Spacer()
+                        // Scroll events are handled at TimelineWindowController level
+                        dropdownContent
+                            .retraceMattePanel(addPadding: false, cornerRadius: 10)
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                            .fixedSize()
+                            .background(
+                                GeometryReader { geo in
+                                    Color.clear
+                                        .preference(key: FilterDropdownSizePreferenceKey.self, value: geo.size)
+                                }
+                            )
+                            .offset(x: origin.x, y: origin.y)
                     }
+                    .onPreferenceChange(FilterDropdownSizePreferenceKey.self) { size in
+                        guard size.width > 0, size.height > 0 else { return }
+                        let normalizedSize = normalizedDropdownSize(size)
+                        guard shouldUpdateMeasuredDropdownSize(to: normalizedSize) else { return }
+                        measuredDropdownSize = normalizedSize
+                    }
+                    .transition(.opacity)
+                    .zIndex(2000)
                 }
-                .transition(.opacity)
-                .zIndex(2000)
             }
         }
         .animation(.easeOut(duration: 0.15), value: viewModel.activeFilterDropdown)
+        .animation(.easeOut(duration: 0.15), value: viewModel.isDateRangeCalendarEditing)
+        .onChange(of: viewModel.activeFilterDropdown) { _ in
+            if measuredDropdownSize != .zero {
+                measuredDropdownSize = .zero
+            }
+        }
+        .onChange(of: viewModel.isDateRangeCalendarEditing) { _ in
+            if viewModel.activeFilterDropdown == .dateRange, measuredDropdownSize != .zero {
+                measuredDropdownSize = .zero
+            }
+        }
+    }
+
+    private func normalizedDropdownSize(_ size: CGSize) -> CGSize {
+        // Round to half-points so tiny float jitter does not churn layout.
+        let width = (size.width * 2).rounded() / 2
+        let height = (size.height * 2).rounded() / 2
+        return CGSize(width: width, height: height)
+    }
+
+    private func shouldUpdateMeasuredDropdownSize(to newSize: CGSize) -> Bool {
+        let epsilon: CGFloat = 0.5
+        return
+            abs(measuredDropdownSize.width - newSize.width) > epsilon ||
+            abs(measuredDropdownSize.height - newSize.height) > epsilon ||
+            measuredDropdownSize == .zero
+    }
+
+    private func resolvedDropdownSize(fallback: CGSize) -> CGSize {
+        if measuredDropdownSize.width > 0, measuredDropdownSize.height > 0 {
+            return measuredDropdownSize
+        }
+        return fallback
+    }
+
+    private func estimatedDropdownSize(for type: SimpleTimelineViewModel.FilterDropdownType) -> CGSize {
+        switch type {
+        case .apps:
+            return CGSize(width: 220, height: 320)
+        case .tags:
+            return CGSize(width: 220, height: 320)
+        case .visibility:
+            return CGSize(width: 240, height: 180)
+        case .comments:
+            return CGSize(width: 240, height: 160)
+        case .dateRange:
+            let height: CGFloat = viewModel.isDateRangeCalendarEditing ? 430 : 250
+            return CGSize(width: 300, height: height)
+        case .advanced, .none:
+            return CGSize(width: 260, height: 200)
+        }
+    }
+
+    private func dropdownOrigin(containerSize: CGSize, anchor: CGRect, dropdownSize: CGSize) -> CGPoint {
+        // Keep the date popover's bottom edge stable while the inline calendar expands/collapses.
+        // This prevents visual jumping when height changes.
+        if viewModel.activeFilterDropdown == .dateRange, viewModel.isDateRangeCalendarEditing {
+            let collapsedHeight: CGFloat = 250
+            let collapsedSize = CGSize(width: dropdownSize.width, height: collapsedHeight)
+            let baseOrigin = defaultDropdownOrigin(containerSize: containerSize, anchor: anchor, dropdownSize: collapsedSize)
+            let baseBottomY = baseOrigin.y + collapsedHeight
+
+            let margin: CGFloat = 8
+            let maxY = max(margin, containerSize.height - dropdownSize.height - margin)
+            let anchoredY = baseBottomY - dropdownSize.height
+            let clampedY = min(max(anchoredY, margin), maxY)
+
+            return CGPoint(x: baseOrigin.x, y: clampedY)
+        }
+
+        return defaultDropdownOrigin(containerSize: containerSize, anchor: anchor, dropdownSize: dropdownSize)
+    }
+
+    private func defaultDropdownOrigin(containerSize: CGSize, anchor: CGRect, dropdownSize: CGSize) -> CGPoint {
+        let margin: CGFloat = 8
+        let gap: CGFloat = 8
+
+        let availableBelow = containerSize.height - anchor.maxY - margin
+        let availableAbove = anchor.minY - margin
+        let openUpward = availableBelow < (dropdownSize.height + gap) && availableAbove > availableBelow
+
+        let rawY = openUpward
+            ? (anchor.minY - gap - dropdownSize.height)
+            : (anchor.maxY + gap)
+        let maxY = max(margin, containerSize.height - dropdownSize.height - margin)
+        let clampedY = min(max(rawY, margin), maxY)
+
+        let rawX = anchor.minX
+        let maxX = max(margin, containerSize.width - dropdownSize.width - margin)
+        let clampedX = min(max(rawX, margin), maxX)
+
+        return CGPoint(x: clampedX, y: clampedY)
     }
 
     @ViewBuilder
@@ -6006,17 +13330,13 @@ struct FilterDropdownOverlay: View {
                 selectedApps: viewModel.pendingFilterCriteria.selectedApps,
                 filterMode: viewModel.pendingFilterCriteria.appFilterMode,
                 allowMultiSelect: true,
+                isLoading: viewModel.isLoadingAppsForFilter,
+                isLoadingOtherApps: viewModel.isRefreshingRewindAppsForFilter,
                 onSelectApp: { bundleID in
                     if let bundleID = bundleID {
                         viewModel.toggleAppFilter(bundleID)
                     } else {
-                        #if DEBUG
-                        print("[Filter] All Apps selected - clearing pendingFilterCriteria.selectedApps (was: \(String(describing: viewModel.pendingFilterCriteria.selectedApps)))")
-                        #endif
                         viewModel.pendingFilterCriteria.selectedApps = nil
-                        #if DEBUG
-                        print("[Filter] After clearing: pendingFilterCriteria.selectedApps = \(String(describing: viewModel.pendingFilterCriteria.selectedApps))")
-                        #endif
                     }
                 },
                 onFilterModeChange: { mode in
@@ -6050,17 +13370,56 @@ struct FilterDropdownOverlay: View {
                     withAnimation(.easeOut(duration: 0.15)) {
                         viewModel.dismissFilterDropdown()
                     }
+                },
+                onKeyboardSelect: {
+                    let nextAnchorFrame = viewModel.filterAnchorFrames[.comments] ?? .zero
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        viewModel.showFilterDropdown(.comments, anchorFrame: nextAnchorFrame)
+                    }
+                }
+            )
+        case .comments:
+            CommentFilterPopover(
+                currentFilter: viewModel.pendingFilterCriteria.commentFilter,
+                onSelect: { filter in
+                    viewModel.setCommentFilter(filter)
+                },
+                onDismiss: {
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        viewModel.dismissFilterDropdown()
+                    }
+                },
+                onKeyboardSelect: {
+                    let nextAnchorFrame = viewModel.filterAnchorFrames[.dateRange] ?? .zero
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        viewModel.showFilterDropdown(.dateRange, anchorFrame: nextAnchorFrame)
+                    }
                 }
             )
         case .dateRange:
             DateRangeFilterPopover(
-                startDate: viewModel.pendingFilterCriteria.startDate,
-                endDate: viewModel.pendingFilterCriteria.endDate,
-                onApply: { start, end in
-                    viewModel.setDateRange(start: start, end: end)
+                dateRanges: viewModel.pendingFilterCriteria.effectiveDateRanges,
+                onApply: { ranges in
+                    viewModel.setDateRanges(ranges)
                 },
                 onClear: {
-                    viewModel.setDateRange(start: nil, end: nil)
+                    viewModel.setDateRanges([])
+                },
+                enableKeyboardNavigation: true,
+                onMoveToNextFilter: {
+                    let nextAnchorFrame = viewModel.filterAnchorFrames[.advanced] ?? .zero
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        viewModel.showFilterDropdown(.advanced, anchorFrame: nextAnchorFrame)
+                    }
+                },
+                onCalendarEditingChange: { isEditing in
+                    viewModel.isDateRangeCalendarEditing = isEditing
+                },
+                onQuickPresetShortcut: { preset in
+                    viewModel.recordKeyboardShortcut("timeline.date_range.\(preset.rawValue)")
+                },
+                onClearShortcut: {
+                    viewModel.recordKeyboardShortcut("timeline.date_range.clear")
                 },
                 onDismiss: {
                     withAnimation(.easeOut(duration: 0.15)) {
@@ -6068,6 +13427,9 @@ struct FilterDropdownOverlay: View {
                     }
                 }
             )
+        case .advanced:
+            // Advanced filters are inline in the FilterPanel, not a dropdown popover
+            EmptyView()
         case .none:
             EmptyView()
         }

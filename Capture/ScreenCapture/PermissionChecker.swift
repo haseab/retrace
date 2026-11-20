@@ -11,20 +11,9 @@ struct PermissionChecker: Sendable {
     /// Check if screen recording permission is currently granted
     /// - Returns: True if permission is granted, false otherwise
     static func hasScreenRecordingPermission() async -> Bool {
-        // On macOS 10.15+, we check permission by attempting to get shareable content
-        // If permission is denied, this will return empty content or fail
-        do {
-            let content = try await SCShareableContent.excludingDesktopWindows(
-                false,
-                onScreenWindowsOnly: false
-            )
-
-            // If we can get displays, permission is granted
-            return !content.displays.isEmpty
-        } catch {
-            // If we get an error, permission is likely denied
-            return false
-        }
+        // Use CoreGraphics preflight to avoid triggering the system permission prompt.
+        // Requesting should happen only from explicit user actions.
+        CGPreflightScreenCaptureAccess()
     }
 
     /// Request screen recording permission from the user

@@ -3,57 +3,25 @@ import SwiftUI
 import App
 import Shared
 import CoreGraphics
+import AVFoundation
+import UniformTypeIdentifiers
 
 /// Manages the full-screen timeline overlay window
 /// This is a singleton that can be triggered from anywhere via keyboard shortcut
 @MainActor
 public class TimelineWindowController: NSObject {
 
+    private static let accessibilityPermissionRevokedNotification = Notification.Name("AccessibilityPermissionRevoked")
+
     // MARK: - Singleton
 
     public static let shared = TimelineWindowController()
-
-    // MARK: - Performance Tracking
-
-    /// Tracks timing from hotkey press to animation complete
-    private var showStartTime: CFAbsoluteTime = 0
-
-    /// Path to the performance log file
-    private static let perfLogPath = URL(fileURLWithPath: "/tmp/retrace_timeline_perf.log")
 
     // MARK: - Session Duration Tracking
 
     /// Tracks when the timeline was opened for duration tracking
     private var sessionStartTime: Date?
     private var sessionScrubDistance: Double = 0
-
-    /// Log detailed timing breakdown for timeline show (writes to temp file)
-    private func logShowTiming(_ checkpoint: String) {
-        guard showStartTime > 0 else { return }
-        let elapsed = (CFAbsoluteTimeGetCurrent() - showStartTime) * 1000
-        let line = "[\(Log.timestamp())] \(checkpoint): \(String(format: "%.1f", elapsed))ms\n"
-
-        // Append to file
-        if let data = line.data(using: .utf8) {
-            if FileManager.default.fileExists(atPath: Self.perfLogPath.path) {
-                if let handle = try? FileHandle(forWritingTo: Self.perfLogPath) {
-                    handle.seekToEndOfFile()
-                    handle.write(data)
-                    handle.closeFile()
-                }
-            } else {
-                try? data.write(to: Self.perfLogPath)
-            }
-        }
-    }
-
-    /// Start a new performance trace (clears previous entries and logs header)
-    private func startPerfTrace() {
-        showStartTime = CFAbsoluteTimeGetCurrent()
-        let header = "\n--- Timeline Show @ \(Log.timestamp()) ---\n"
-        try? header.data(using: .utf8)?.write(to: Self.perfLogPath)
-        Log.info("[TIMELINE-PERF] ⏱️ Logging to: \(Self.perfLogPath.path)", category: .ui)
-    }
 
     // MARK: - Properties
 
@@ -64,43 +32,116 @@ public class TimelineWindowController: NSObject {
     private var localEventMonitor: Any?
     private var mouseEventMonitor: Any?  // Debug monitor for shift-drag investigation
     private var timelineViewModel: SimpleTimelineViewModel?
+    private var pendingTimelineViewModelWaiters: [CheckedContinuation<SimpleTimelineViewModel, Never>] = []
     private var hostingView: NSView?
+    private var deferredHostingViewDetachTask: Task<Void, Never>?
     private var tapeShowAnimationTask: Task<Void, Never>?
+    private var liveModeCaptureTask: Task<Void, Never>?
+    private var prefetchedLiveScreenshot: NSImage?
+    private var windowFadeInTask: Task<Void, Never>?
+    private var deferredSearchOverlayRestoreTask: Task<Void, Never>?
+    private var deferredLiveActivationTask: Task<Void, Never>?
+    private var shouldRestoreSearchOverlayAfterNextShow = false
+    private var windowFadeInGeneration: UInt64 = 0
+    private var coordinatorTimelineVisibilityGeneration: UInt64 = 0
+    private var workspaceActivationObserver: Any?
+    private let hideCompletionCoordinator = HideCompletionCoordinator()
     private var isHiding = false
+    private var presentationState: PresentationState = .hidden
+    /// Ignore scroll-wheel input for a short grace period after opening in live mode.
+    /// This prevents residual trackpad momentum from immediately exiting live mode.
+    private var suppressLiveScrollUntil: CFAbsoluteTime = 0
 
     // MARK: - Emergency Escape (CGEvent tap for when main thread is blocked)
 
     /// CGEvent tap for emergency escape - runs on a dedicated background thread
     /// This allows closing the timeline even when the main thread is frozen
-    private nonisolated(unsafe) static var emergencyEventTap: CFMachPort?
-    private nonisolated(unsafe) static var emergencyRunLoopSource: CFRunLoopSource?
-    private nonisolated(unsafe) static var emergencyRunLoop: CFRunLoop?
-    private nonisolated(unsafe) static var isTimelineVisible: Bool = false
-    /// Whether a dialog/overlay is open that uses escape to close (search, filter, etc.)
-    private nonisolated(unsafe) static var isDialogOpen: Bool = false
-    /// Track escape key timestamps for triple-escape detection
-    private nonisolated(unsafe) static var escapeTimestamps: [CFAbsoluteTime] = []
+    private struct EmergencyTapState {
+        var eventTap: CFMachPort?
+        var runLoopSource: CFRunLoopSource?
+        var runLoop: CFRunLoop?
+        var tapThread: Thread?
+        var isInstallingTap = false
+        var setupToken: UInt64 = 0
+        var isTimelineVisible = false
+    }
 
-    /// Whether the window has been pre-rendered and is ready to show
+    private nonisolated(unsafe) static var emergencyTapState = EmergencyTapState()
+    private nonisolated(unsafe) static var emergencyTapStateLock = NSLock()
+
+    /// Whether a prepared headless timeline state exists and is ready to mount on demand.
     private var isPrepared = false
 
     /// When the timeline was last hidden (for cache expiry check)
     private var lastHiddenAt: Date?
 
-    /// Cached live screenshot for instant toggle without re-capture
-    private var cachedLiveScreenshot: NSImage?
-
-    /// Timer that periodically refreshes timeline data in the background
-    private var backgroundRefreshTimer: Timer?
-
     /// Whether the timeline overlay is currently visible
-    public private(set) var isVisible = false
+    public var isVisible: Bool {
+        presentationState.isVisibleToClients
+    }
+
+    /// Shared hidden-state cache expiry used by timeline and search-state invalidation.
+    nonisolated static let hiddenStateCacheExpirationSeconds: TimeInterval = 60
+    /// Show the Cmd+Z recovery hint only for a short window after cache expiry actually snaps away from history.
+    nonisolated static let positionRecoveryHintGracePeriodSeconds: TimeInterval = 60
+    /// Reopen policy: when playhead is within this many latest loaded frames, open in live mode immediately.
+    /// This only applies when the newest loaded frame is still recent.
+    private static let instantLiveReopenFrameThreshold: Int = 3
+    /// Reopen policy: hidden duration required before instant near-edge positions auto-advance to newest.
+    private static let instantLiveReopenExpirationSeconds: TimeInterval = 2
+    /// Reopen policy: if playhead is this close (< threshold) to latest frame, allow auto-advance after expiry.
+    /// This only applies when the newest loaded frame is still recent.
+    private static let nearLiveReopenFrameThreshold: Int = 50
+    /// Reopen policy: hidden duration required before near-live positions auto-advance to newest.
+    private static let nearLiveReopenExpirationSeconds: TimeInterval = 10
+    /// Delay before detaching hosting view after hide to keep rapid reopen seamless.
+    private static let hostingViewDetachDelay: Duration = .milliseconds(350)
+    /// Delay preserved spotlight overlay reopen until after live-mode presentation settles.
+    private static let liveSearchOverlayRestoreDelayMs = 180
+    /// Delay app activation for live opens until the visual transition has settled.
+    private static let liveActivationDelayMs = 180
+    /// Small delay after the historical fade completes so the search pops after the reveal.
+    private static let historicalSearchOverlayRestoreDelayMs = 80
+
+    /// Monotonic counter for deeplink search invocations (debug tracing).
+    private var deeplinkSearchInvocationCounter = 0
 
     /// Whether the dashboard was the key window when timeline opened
     private var dashboardWasKeyWindow = false
 
     /// Whether the timeline is hiding to show dashboard/settings (don't auto-hide dashboard in this case)
     private var isHidingToShowDashboard = false
+
+    struct FocusRestoreTarget: Equatable {
+        let processIdentifier: pid_t
+        let bundleIdentifier: String?
+    }
+
+    @MainActor
+    final class HideCompletionCoordinator {
+        private var continuations: [CheckedContinuation<Bool, Never>] = []
+
+        func wait() async -> Bool {
+            await withCheckedContinuation { continuation in
+                continuations.append(continuation)
+            }
+        }
+
+        func append(_ continuation: CheckedContinuation<Bool, Never>) {
+            continuations.append(continuation)
+        }
+
+        func resumeAll(hidden: Bool) {
+            let pendingContinuations = continuations
+            continuations.removeAll()
+            for continuation in pendingContinuations {
+                continuation.resume(returning: hidden)
+            }
+        }
+    }
+
+    /// The app that was frontmost before the timeline was shown.
+    private var focusRestoreTarget: FocusRestoreTarget?
 
     /// Callback when timeline closes
     public var onClose: (() -> Void)?
@@ -119,8 +160,14 @@ public class TimelineWindowController: NSObject {
     /// The mouse X position where the tape drag started (for minimum distance threshold)
     private var tapeDragStartX: CGFloat = 0
 
+    /// The full mouse position where the tape drag started (for click diagnostics)
+    private var tapeDragStartPoint: CGPoint = .zero
+
     /// Whether drag has passed the minimum distance threshold to be considered a drag (vs a click)
     private var tapeDragDidExceedThreshold = false
+
+    /// Whether the current drag candidate started near the playback controls area
+    private var tapeDragStartedNearPlaybackControls = false
 
     /// Minimum pixel distance before a mouseDown+mouseDragged is treated as a drag (not a tap)
     private static let tapeDragMinDistance: CGFloat = 3.0
@@ -130,104 +177,1039 @@ public class TimelineWindowController: NSObject {
 
     /// Maximum age of velocity samples to consider (seconds)
     private static let velocitySampleWindow: CFAbsoluteTime = 0.08
+    /// Live-mode scroll suppression window (seconds) applied on open.
+    private static let liveScrollSuppressDuration: CFAbsoluteTime = 0.30
+    private static let timelineSettingsStore = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
+
+    /// Accumulated wrong-axis and right-axis scroll magnitudes for orientation mismatch detection
+    private var wrongAxisScrollAccum: CGFloat = 0
+    private var rightAxisScrollAccum: CGFloat = 0
+    /// Timestamp when accumulation started
+    private var scrollAccumStartTime: CFAbsoluteTime = 0
+    /// Whether the orientation hint has already been shown this session (don't repeat)
+    private var hasShownScrollOrientationHint: Bool = false
+
+    private enum TimelineScrollOrientation: String {
+        case horizontal
+        case vertical
+    }
+
+    enum PresentationState: String {
+        case hidden
+        case showing
+        case visible
+        case hiding
+
+        var isVisibleToClients: Bool {
+            switch self {
+            case .hidden:
+                return false
+            case .showing, .visible, .hiding:
+                return true
+            }
+        }
+    }
+
+    enum ToggleAction: Equatable {
+        case show
+        case hide
+    }
+
+    enum SearchOverlayShortcutAction: Equatable {
+        case open
+        case focusField
+        case close
+    }
+
+    enum SearchResultNavigationDirection: Equatable {
+        case previous
+        case next
+    }
+
+    private struct VisibilitySnapshot {
+        let windowExists: Bool
+        let windowVisible: Bool
+        let windowMiniaturized: Bool
+        let windowAlphaValue: CGFloat
+        let appHidden: Bool
+
+        var isActuallyVisible: Bool {
+            TimelineWindowController.isActuallyVisible(
+                windowExists: windowExists,
+                windowVisible: windowVisible,
+                windowMiniaturized: windowMiniaturized,
+                windowAlphaValue: windowAlphaValue,
+                appHidden: appHidden
+            )
+        }
+    }
+
+    nonisolated static func shouldCaptureFocusRestoreTarget(frontmostProcessID: pid_t?, currentProcessID: pid_t) -> Bool {
+        guard let frontmostProcessID else { return false }
+        return frontmostProcessID != currentProcessID
+    }
+
+    nonisolated static func shouldRestoreFocus(
+        requestedRestore: Bool,
+        isHidingToShowDashboard: Bool,
+        targetProcessID: pid_t?,
+        currentProcessID: pid_t
+    ) -> Bool {
+        guard requestedRestore, !isHidingToShowDashboard, let targetProcessID else { return false }
+        return targetProcessID != currentProcessID
+    }
+
+    nonisolated static func shouldHandleTimelineKeyboardShortcuts(
+        isTimelineVisible: Bool,
+        frontmostProcessID: pid_t?,
+        currentProcessID: pid_t,
+        eventTargetsKeyTimelineWindow: Bool = false
+    ) -> Bool {
+        guard isTimelineVisible else { return false }
+        // Nonactivating panels can own keyboard focus without owning the menu bar.
+        // Trust a local event addressed to the key timeline window; global events
+        // still require Retrace to be frontmost.
+        if eventTargetsKeyTimelineWindow { return true }
+        guard let frontmostProcessID else { return false }
+        return frontmostProcessID == currentProcessID
+    }
+
+    nonisolated static func shouldDismissTimelineForActivatedApplication(
+        isTimelineVisible: Bool,
+        activatedProcessID: pid_t?,
+        currentProcessID: pid_t,
+        timelineDisplayID: CGDirectDisplayID?,
+        activatedWindowDisplayIDs: Set<CGDirectDisplayID>?
+    ) -> Bool {
+        guard isTimelineVisible, let activatedProcessID else { return false }
+        guard activatedProcessID != currentProcessID else { return false }
+        guard let timelineDisplayID,
+              let activatedWindowDisplayIDs,
+              activatedWindowDisplayIDs.contains(timelineDisplayID) else {
+            return false
+        }
+        return true
+    }
+
+    nonisolated static func shouldToggleSearchOverlayFromShortcut(
+        isActivelyScrolling: Bool,
+        isSettledAtAbsoluteTimelineBoundary: Bool = false
+    ) -> Bool {
+        !isActivelyScrolling || isSettledAtAbsoluteTimelineBoundary
+    }
+
+    nonisolated static func shouldShowPositionRecoveryHintOnReopen(
+        hiddenElapsedSeconds: TimeInterval,
+        didSnapToNewest: Bool
+    ) -> Bool {
+        guard didSnapToNewest, hiddenElapsedSeconds.isFinite else { return false }
+        guard hiddenElapsedSeconds > hiddenStateCacheExpirationSeconds else { return false }
+        return hiddenElapsedSeconds <= hiddenStateCacheExpirationSeconds + positionRecoveryHintGracePeriodSeconds
+    }
+
+    nonisolated static func searchOverlayShortcutAction(
+        isSearchOverlayVisible: Bool,
+        shouldRefocusSearchFieldBeforeClose: Bool
+    ) -> SearchOverlayShortcutAction {
+        guard isSearchOverlayVisible else { return .open }
+        return shouldRefocusSearchFieldBeforeClose ? .focusField : .close
+    }
+
+    nonisolated static func isActuallyVisible(
+        windowExists: Bool,
+        windowVisible: Bool,
+        windowMiniaturized: Bool,
+        windowAlphaValue: CGFloat,
+        appHidden: Bool
+    ) -> Bool {
+        windowExists &&
+            windowVisible &&
+            !windowMiniaturized &&
+            windowAlphaValue > 0.01 &&
+            !appHidden
+    }
+
+    nonisolated static func shouldApplyDeferredCoordinatorTimelineVisible(
+        requestedVisible: Bool,
+        requestGeneration: UInt64,
+        currentGeneration: UInt64,
+        isTimelineVisibleToClients: Bool,
+        windowExists: Bool,
+        windowVisible: Bool,
+        windowMiniaturized: Bool,
+        appHidden: Bool
+    ) -> Bool {
+        guard requestGeneration == currentGeneration else { return false }
+
+        let hasVisibleTimelineWindow = windowExists &&
+            windowVisible &&
+            !windowMiniaturized &&
+            !appHidden
+
+        if requestedVisible {
+            return isTimelineVisibleToClients && hasVisibleTimelineWindow
+        }
+
+        return !isTimelineVisibleToClients || !hasVisibleTimelineWindow
+    }
+
+    nonisolated static func reconciledPresentationState(
+        currentState: PresentationState,
+        windowExists: Bool,
+        isActuallyVisible: Bool
+    ) -> PresentationState {
+        switch currentState {
+        case .hidden:
+            return isActuallyVisible ? .visible : .hidden
+        case .showing:
+            if isActuallyVisible {
+                return .visible
+            }
+            return windowExists ? .showing : .hidden
+        case .visible:
+            return isActuallyVisible ? .visible : .hidden
+        case .hiding:
+            return isActuallyVisible ? .hiding : .hidden
+        }
+    }
+
+    nonisolated static func toggleAction(
+        presentationState: PresentationState,
+        isActuallyVisible: Bool
+    ) -> ToggleAction {
+        let effectiveState: PresentationState
+        switch presentationState {
+        case .visible where !isActuallyVisible:
+            effectiveState = .hidden
+        case .hidden where isActuallyVisible:
+            effectiveState = .visible
+        default:
+            effectiveState = presentationState
+        }
+
+        switch effectiveState {
+        case .hidden, .hiding:
+            return .show
+        case .showing, .visible:
+            return .hide
+        }
+    }
+
+    nonisolated private static func withEmergencyTapState<T>(
+        _ body: (inout EmergencyTapState) -> T
+    ) -> T {
+        emergencyTapStateLock.lock()
+        defer { emergencyTapStateLock.unlock() }
+        return body(&emergencyTapState)
+    }
+
+    nonisolated private static func readEmergencyTapState<T>(
+        _ body: (EmergencyTapState) -> T
+    ) -> T {
+        emergencyTapStateLock.lock()
+        defer { emergencyTapStateLock.unlock() }
+        return body(emergencyTapState)
+    }
+
+    nonisolated private static func emergencyEventTapIfValid() -> CFMachPort? {
+        readEmergencyTapState { state in
+            guard let eventTap = state.eventTap, CFMachPortIsValid(eventTap) else {
+                return nil
+            }
+            return eventTap
+        }
+    }
+
+    nonisolated private static func setEmergencyTimelineVisible(_ visible: Bool) {
+        withEmergencyTapState { state in
+            state.isTimelineVisible = visible
+        }
+    }
+
+    nonisolated private static func isEmergencyTimelineVisible() -> Bool {
+        readEmergencyTapState(\.isTimelineVisible)
+    }
+
+    nonisolated static func shouldDismissTimelineWithCommandW(
+        keyCode: UInt16,
+        charactersIgnoringModifiers: String?,
+        modifiers: NSEvent.ModifierFlags
+    ) -> Bool {
+        let normalizedModifiers = modifiers.intersection([.command, .shift, .option, .control])
+        guard normalizedModifiers == [.command] else {
+            return false
+        }
+
+        let key = charactersIgnoringModifiers?.lowercased()
+        return keyCode == 13 || key == "w"
+    }
+
+    nonisolated static func shouldDeferCommandAToTextInput(
+        isTextFieldActive: Bool,
+        isSearchOverlayVisible: Bool,
+        isFilterPanelVisible: Bool,
+        isDateSearchActive: Bool,
+        isCommentSubmenuVisible: Bool
+    ) -> Bool {
+        isTextFieldActive ||
+            isSearchOverlayVisible ||
+            isFilterPanelVisible ||
+            isDateSearchActive ||
+            isCommentSubmenuVisible
+    }
+
+    nonisolated static func shouldNavigateTimelineBackward(
+        keyCode: UInt16,
+        charactersIgnoringModifiers: String?,
+        modifiers: NSEvent.ModifierFlags
+    ) -> Bool {
+        let normalizedModifiers = modifiers.intersection([.command, .shift, .option, .control])
+        guard normalizedModifiers.isEmpty || normalizedModifiers == [.option] else {
+            return false
+        }
+
+        let key = charactersIgnoringModifiers?.lowercased()
+        return keyCode == 123 || key == "j" || key == "l"
+    }
+
+    nonisolated static func shouldNavigateTimelineForward(
+        keyCode: UInt16,
+        charactersIgnoringModifiers: String?,
+        modifiers: NSEvent.ModifierFlags
+    ) -> Bool {
+        let normalizedModifiers = modifiers.intersection([.command, .shift, .option, .control])
+        guard normalizedModifiers.isEmpty || normalizedModifiers == [.option] else {
+            return false
+        }
+
+        let key = charactersIgnoringModifiers?.lowercased()
+        return keyCode == 124 || key == "k" || key == ";"
+    }
+
+    nonisolated static func searchResultNavigationDirection(
+        keyCode: UInt16,
+        modifiers: NSEvent.ModifierFlags,
+        isSearchResultHighlightVisible: Bool
+    ) -> SearchResultNavigationDirection? {
+        guard isSearchResultHighlightVisible else { return nil }
+
+        let normalizedModifiers = modifiers.intersection([.command, .shift, .option, .control])
+        guard normalizedModifiers == [.command, .shift] else {
+            return nil
+        }
+
+        switch keyCode {
+        case 123:
+            return .previous
+        case 124:
+            return .next
+        default:
+            return nil
+        }
+    }
+
+    private func shouldHandleTimelineKeyboardShortcuts(for event: NSEvent? = nil) -> Bool {
+        let currentProcessID = ProcessInfo.processInfo.processIdentifier
+        let frontmostProcessID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        let eventTargetsKeyTimelineWindow: Bool
+        if let eventWindow = event?.window, let window {
+            eventTargetsKeyTimelineWindow = eventWindow === window && window.isKeyWindow
+        } else {
+            eventTargetsKeyTimelineWindow = false
+        }
+        return Self.shouldHandleTimelineKeyboardShortcuts(
+            isTimelineVisible: isVisible,
+            frontmostProcessID: frontmostProcessID,
+            currentProcessID: currentProcessID,
+            eventTargetsKeyTimelineWindow: eventTargetsKeyTimelineWindow
+        )
+    }
+
+    private func startObservingApplicationActivation() {
+        guard workspaceActivationObserver == nil else { return }
+        let currentProcessID = ProcessInfo.processInfo.processIdentifier
+        workspaceActivationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            let activatedApp = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let activatedProcessID = activatedApp?.processIdentifier
+                guard self.isVisible,
+                      let activatedProcessID,
+                      activatedProcessID != currentProcessID else {
+                    return
+                }
+
+                let timelineDisplayID = self.timelineWindowDisplayID
+                let activatedWindowDisplayIDs = await Self.topmostOnScreenWindowDisplayIDs(
+                    forProcessID: activatedProcessID
+                )
+                guard Self.shouldDismissTimelineForActivatedApplication(
+                    isTimelineVisible: self.isVisible,
+                    activatedProcessID: activatedProcessID,
+                    currentProcessID: currentProcessID,
+                    timelineDisplayID: timelineDisplayID,
+                    activatedWindowDisplayIDs: activatedWindowDisplayIDs
+                ) else {
+                    Log.debug(
+                        "[TIMELINE-AUTO-DISMISS] Ignoring activation outside timeline display activatedPID=\(activatedProcessID) activatedBundleID=\(activatedApp?.bundleIdentifier ?? "nil") timelineDisplayID=\(timelineDisplayID.map(String.init) ?? "nil") activatedWindowDisplayIDs=\(Self.displayIDListDescription(activatedWindowDisplayIDs))",
+                        category: .ui
+                    )
+                    return
+                }
+                self.dismissForActivatedApplication(
+                    activatedApp,
+                    timelineDisplayID: timelineDisplayID,
+                    activatedWindowDisplayIDs: activatedWindowDisplayIDs
+                )
+            }
+        }
+    }
+
+    private var timelineWindowDisplayID: CGDirectDisplayID? {
+        guard let window else { return nil }
+        if let screen = window.screen ?? NSScreen.screens.first(where: { $0.frame.intersects(window.frame) }) {
+            return screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID
+        }
+        return nil
+    }
+
+    private nonisolated static func topmostOnScreenWindowDisplayIDs(
+        forProcessID processID: pid_t
+    ) async -> Set<CGDirectDisplayID>? {
+        await Task.detached(priority: .utility) {
+            topmostOnScreenWindowDisplayIDsSync(forProcessID: processID)
+        }.value
+    }
+
+    private nonisolated static func topmostOnScreenWindowDisplayIDsSync(
+        forProcessID processID: pid_t
+    ) -> Set<CGDirectDisplayID>? {
+        guard let windowInfoList = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements],
+            kCGNullWindowID
+        ) as? [[String: Any]] else {
+            return nil
+        }
+
+        for windowInfo in windowInfoList {
+            guard windowInfoProcessID(windowInfo) == processID,
+                  windowInfoLayer(windowInfo) == 0,
+                  windowInfoAlpha(windowInfo) > 0.01,
+                  windowInfoIsOnScreen(windowInfo),
+                  let bounds = windowInfoBounds(windowInfo),
+                  bounds.width > 1,
+                  bounds.height > 1 else {
+                continue
+            }
+
+            let displayIDs = displayIDs(intersectingWindowBounds: bounds)
+            return displayIDs.isEmpty ? nil : displayIDs
+        }
+
+        return nil
+    }
+
+    private nonisolated static func windowInfoProcessID(_ windowInfo: [String: Any]) -> pid_t? {
+        guard let value = windowInfo[kCGWindowOwnerPID as String] as? NSNumber else { return nil }
+        return pid_t(value.intValue)
+    }
+
+    private nonisolated static func windowInfoLayer(_ windowInfo: [String: Any]) -> Int {
+        (windowInfo[kCGWindowLayer as String] as? NSNumber)?.intValue ?? Int.max
+    }
+
+    private nonisolated static func windowInfoAlpha(_ windowInfo: [String: Any]) -> Double {
+        (windowInfo[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1
+    }
+
+    private nonisolated static func windowInfoIsOnScreen(_ windowInfo: [String: Any]) -> Bool {
+        guard let value = windowInfo[kCGWindowIsOnscreen as String] as? NSNumber else { return true }
+        return value.boolValue
+    }
+
+    private nonisolated static func windowInfoBounds(_ windowInfo: [String: Any]) -> CGRect? {
+        guard let boundsDictionary = windowInfo[kCGWindowBounds as String] as? NSDictionary else {
+            return nil
+        }
+        var bounds = CGRect.zero
+        guard CGRectMakeWithDictionaryRepresentation(boundsDictionary, &bounds) else {
+            return nil
+        }
+        return bounds
+    }
+
+    private nonisolated static func displayIDs(intersectingWindowBounds bounds: CGRect) -> Set<CGDirectDisplayID> {
+        guard bounds.width > 0, bounds.height > 0 else { return [] }
+
+        var displayCount: UInt32 = 0
+        guard CGGetDisplaysWithRect(bounds, 0, nil, &displayCount) == .success,
+              displayCount > 0 else {
+            return []
+        }
+
+        var displays = [CGDirectDisplayID](repeating: 0, count: Int(displayCount))
+        let result = displays.withUnsafeMutableBufferPointer { buffer in
+            CGGetDisplaysWithRect(bounds, displayCount, buffer.baseAddress, &displayCount)
+        }
+        guard result == .success else { return [] }
+
+        return Set(displays.prefix(Int(displayCount)).filter { $0 != 0 })
+    }
+
+    private nonisolated static func displayIDListDescription(_ displayIDs: Set<CGDirectDisplayID>?) -> String {
+        guard let displayIDs else { return "nil" }
+        return "[" + displayIDs.sorted().map(String.init).joined(separator: ",") + "]"
+    }
+
+    private func stopObservingApplicationActivation() {
+        guard let workspaceActivationObserver else { return }
+        NSWorkspace.shared.notificationCenter.removeObserver(workspaceActivationObserver)
+        self.workspaceActivationObserver = nil
+    }
+
+    private var currentVisibilitySnapshot: VisibilitySnapshot {
+        VisibilitySnapshot(
+            windowExists: window != nil,
+            windowVisible: window?.isVisible ?? false,
+            windowMiniaturized: window?.isMiniaturized ?? false,
+            windowAlphaValue: window?.alphaValue ?? 0,
+            appHidden: NSApp.isHidden
+        )
+    }
+
+    private var isActuallyVisible: Bool {
+        currentVisibilitySnapshot.isActuallyVisible
+    }
+
+    private func advanceCoordinatorTimelineVisibilityGeneration() -> UInt64 {
+        coordinatorTimelineVisibilityGeneration &+= 1
+        return coordinatorTimelineVisibilityGeneration
+    }
+
+    private func scheduleCoordinatorTimelineVisible(_ visible: Bool) {
+        let generation = advanceCoordinatorTimelineVisibilityGeneration()
+        Task { @MainActor [weak self] in
+            await self?.setCoordinatorTimelineVisibleIfCurrent(visible, generation: generation)
+        }
+    }
+
+    private func setCoordinatorTimelineVisibleIfCurrent(_ visible: Bool, generation: UInt64) async {
+        guard let coordinator else { return }
+
+        let snapshot = currentVisibilitySnapshot
+        guard Self.shouldApplyDeferredCoordinatorTimelineVisible(
+            requestedVisible: visible,
+            requestGeneration: generation,
+            currentGeneration: coordinatorTimelineVisibilityGeneration,
+            isTimelineVisibleToClients: presentationState.isVisibleToClients,
+            windowExists: snapshot.windowExists,
+            windowVisible: snapshot.windowVisible,
+            windowMiniaturized: snapshot.windowMiniaturized,
+            appHidden: snapshot.appHidden
+        ) else {
+            Log.debug(
+                "[TimelineVisibility] dropped stale coordinator update requestedVisible=\(visible) generation=\(generation) currentGeneration=\(coordinatorTimelineVisibilityGeneration) state=\(presentationState.rawValue) windowExists=\(snapshot.windowExists) windowVisible=\(snapshot.windowVisible) windowMini=\(snapshot.windowMiniaturized) appHidden=\(snapshot.appHidden)",
+                category: .ui
+            )
+            return
+        }
+
+        await coordinator.setTimelineVisible(visible, generation: generation)
+    }
+
+    private func reconcileVisibilityState(reason: String) {
+        let snapshot = currentVisibilitySnapshot
+        let previousState = presentationState
+        let reconciledState = Self.reconciledPresentationState(
+            currentState: previousState,
+            windowExists: snapshot.windowExists,
+            isActuallyVisible: snapshot.isActuallyVisible
+        )
+
+        guard reconciledState != previousState else { return }
+        presentationState = reconciledState
+
+        if reconciledState == .visible {
+            Self.setEmergencyTimelineVisible(true)
+            startObservingApplicationActivation()
+        } else if reconciledState == .hidden {
+            Self.setEmergencyTimelineVisible(false)
+            stopObservingApplicationActivation()
+        }
+
+        Log.info(
+            "[TimelineVisibility] reconciled reason=\(reason) from=\(previousState.rawValue) to=\(reconciledState.rawValue) actualVisible=\(snapshot.isActuallyVisible) windowExists=\(snapshot.windowExists) windowVisible=\(snapshot.windowVisible) windowMini=\(snapshot.windowMiniaturized) windowAlpha=\(String(format: "%.2f", snapshot.windowAlphaValue)) appHidden=\(snapshot.appHidden)",
+            category: .ui
+        )
+
+        guard previousState == .visible, reconciledState == .hidden, !isHiding else {
+            return
+        }
+
+        synchronizeHiddenStateAfterExternalDismissal(reason: reason, force: true)
+    }
+
+    private func recordVisibleSessionMetricsIfNeeded() {
+        guard let startTime = sessionStartTime, let coordinator = coordinator else { return }
+
+        let durationMs = Int64(Date().timeIntervalSince(startTime) * 1000)
+        DashboardViewModel.recordTimelineSession(coordinator: coordinator, durationMs: durationMs)
+
+        if sessionScrubDistance > 0 {
+            DashboardViewModel.recordScrubDistance(coordinator: coordinator, distancePixels: sessionScrubDistance)
+        }
+
+        sessionStartTime = nil
+        sessionScrubDistance = 0
+    }
+
+    private func dismissTransientTimelineUIForHide() {
+        tapeShowAnimationTask?.cancel()
+        guard let viewModel = timelineViewModel else { return }
+
+        withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+            viewModel.isTapeHidden = true
+        }
+        // Abort in-flight search work now that the timeline is dismissing.
+        viewModel.searchViewModel.cancelSearch()
+        // Ensure right-click menus don't persist across timeline sessions.
+        viewModel.dismissContextMenu()
+        viewModel.dismissTimelineContextMenu()
+        viewModel.clearTimelineTapeRightClickHint(animated: false)
+
+        // Dismiss any open overlays (filter panel, date search, etc.)
+        if viewModel.isFilterPanelVisible {
+            viewModel.dismissFilterPanel()
+        }
+        if viewModel.isCalendarPickerVisible {
+            viewModel.closeCalendarPicker()
+        }
+        if viewModel.isDateSearchActive {
+            viewModel.closeDateSearch()
+        }
+        if viewModel.isSearchOverlayVisible {
+            // Preserve overlay state across timeline toggle, but do not keep the
+            // spotlight view mounted during the next timeline-open animation.
+            viewModel.searchViewModel.requestDismissRecentEntriesPopoverByUser()
+            viewModel.searchViewModel.suppressRecentEntriesForNextOverlayOpen()
+            shouldRestoreSearchOverlayAfterNextShow = true
+            viewModel.isSearchOverlayVisible = false
+        }
+        if viewModel.isInFrameSearchVisible ||
+            !viewModel.inFrameSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            viewModel.closeInFrameSearch(clearQuery: true)
+        }
+    }
+
+    private func prepareForHiddenStateTransition(reason: String) {
+        stopObservingApplicationActivation()
+        cancelWindowFadeIn(reason: reason)
+        if deferredSearchOverlayRestoreTask != nil {
+            shouldRestoreSearchOverlayAfterNextShow = true
+        }
+        cancelDeferredSearchOverlayRestore()
+        liveModeCaptureTask?.cancel()
+        liveModeCaptureTask = nil
+        recordVisibleSessionMetricsIfNeeded()
+        dismissTransientTimelineUIForHide()
+        removeEventMonitors()
+    }
+
+    private func synchronizeHiddenStateAfterExternalDismissal(
+        reason: String,
+        force: Bool = false,
+        restorePreviousFocus: Bool = false
+    ) {
+        let snapshot = currentVisibilitySnapshot
+        let needsSynchronization = force ||
+            presentationState != .hidden ||
+            snapshot.windowVisible
+        guard needsSynchronization else { return }
+        guard !isHiding else { return }
+
+        Log.warning(
+            "[TimelineVisibility] synchronizing hidden state after external dismissal reason=\(reason) state=\(presentationState.rawValue) windowExists=\(snapshot.windowExists) windowVisible=\(snapshot.windowVisible) windowMini=\(snapshot.windowMiniaturized) windowAlpha=\(String(format: "%.2f", snapshot.windowAlphaValue)) appHidden=\(snapshot.appHidden)",
+            category: .ui
+        )
+
+        prepareForHiddenStateTransition(reason: "external-dismissal.\(reason)")
+        applyHiddenState(
+            restorePreviousFocus: restorePreviousFocus,
+            hideRequestedAt: nil,
+            reason: "external-dismissal.\(reason)"
+        )
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.finishHideTransitionCleanup()
+        }
+    }
+
+    private func dismissForActivatedApplication(
+        _ activatedApplication: NSRunningApplication?,
+        timelineDisplayID: CGDirectDisplayID?,
+        activatedWindowDisplayIDs: Set<CGDirectDisplayID>?
+    ) {
+        guard isVisible, !isHiding else { return }
+        stopObservingApplicationActivation()
+        if let coordinator {
+            DashboardViewModel.recordTimelineAutoDismissed(
+                coordinator: coordinator,
+                activatedBundleID: activatedApplication?.bundleIdentifier
+            )
+        }
+        Log.info(
+            "[TIMELINE-AUTO-DISMISS] Dismissing timeline trigger=app_activation activatedPID=\(activatedApplication?.processIdentifier ?? -1) activatedBundleID=\(activatedApplication?.bundleIdentifier ?? "nil") timelineDisplayID=\(timelineDisplayID.map(String.init) ?? "nil") activatedWindowDisplayIDs=\(Self.displayIDListDescription(activatedWindowDisplayIDs))",
+            category: .ui
+        )
+        hide(restorePreviousFocus: false)
+    }
+
+    func hideAndWait(restorePreviousFocus: Bool = true) async -> Bool {
+        reconcileVisibilityState(reason: "hideAndWait")
+        if isHiding {
+            return await hideCompletionCoordinator.wait()
+        }
+
+        guard isVisible else { return true }
+        guard window != nil else {
+            return await withCheckedContinuation { continuation in
+                hideCompletionCoordinator.append(continuation)
+                synchronizeHiddenStateAfterExternalDismissal(
+                    reason: "hideAndWaitMissingWindow",
+                    restorePreviousFocus: restorePreviousFocus
+                )
+            }
+        }
+
+        return await withCheckedContinuation { continuation in
+            hideCompletionCoordinator.append(continuation)
+            hide(restorePreviousFocus: restorePreviousFocus)
+        }
+    }
+
+    private func captureFocusRestoreTarget() {
+        let currentProcessID = ProcessInfo.processInfo.processIdentifier
+        guard let frontmost = NSWorkspace.shared.frontmostApplication,
+              Self.shouldCaptureFocusRestoreTarget(
+                  frontmostProcessID: frontmost.processIdentifier,
+                  currentProcessID: currentProcessID
+              ) else {
+            focusRestoreTarget = nil
+            return
+        }
+
+        focusRestoreTarget = FocusRestoreTarget(
+            processIdentifier: frontmost.processIdentifier,
+            bundleIdentifier: frontmost.bundleIdentifier
+        )
+    }
+
+    private func restoreFocusIfNeeded(
+        requestedRestore: Bool,
+        wasHidingToShowDashboard: Bool,
+        hideRequestedAt: CFAbsoluteTime? = nil
+    ) {
+        defer {
+            focusRestoreTarget = nil
+        }
+
+        let currentProcessID = ProcessInfo.processInfo.processIdentifier
+        guard Self.shouldRestoreFocus(
+            requestedRestore: requestedRestore,
+            isHidingToShowDashboard: wasHidingToShowDashboard,
+            targetProcessID: focusRestoreTarget?.processIdentifier,
+            currentProcessID: currentProcessID
+        ), let target = focusRestoreTarget else {
+            return
+        }
+
+        let hideElapsedMs = hideRequestedAt.map { (CFAbsoluteTimeGetCurrent() - $0) * 1000 }
+        guard let app = NSRunningApplication(processIdentifier: target.processIdentifier),
+              !app.isTerminated else { return }
+
+        if let hideElapsedMs {
+            Log.recordLatency(
+                "timeline.focus.restore_after_hide_ms",
+                valueMs: hideElapsedMs,
+                category: .ui,
+                summaryEvery: 10,
+                warningThresholdMs: 350,
+                criticalThresholdMs: 700
+            )
+        }
+
+        _ = app.activate(options: [.activateIgnoringOtherApps])
+    }
+
+    private func applyHiddenState(
+        restorePreviousFocus: Bool,
+        hideRequestedAt: CFAbsoluteTime?,
+        reason _: String
+    ) {
+        let wasHidingToShowDashboard = isHidingToShowDashboard
+        isHiding = false
+
+        // Only hide dashboard if it wasn't the active window before timeline opened
+        // AND we're not hiding specifically to show the dashboard/settings.
+        if dashboardWasKeyWindow != true,
+           !wasHidingToShowDashboard,
+           DashboardWindowController.shared.window?.attachedSheet == nil {
+            DashboardWindowController.shared.hide()
+        }
+        isHidingToShowDashboard = false
+
+        if let window {
+            // Ignore mouse events while hidden to prevent blocking clicks on other windows.
+            window.ignoresMouseEvents = true
+            window.orderOut(nil)
+        }
+        presentationState = .hidden
+        Self.setEmergencyTimelineVisible(false)
+        lastHiddenAt = Date()
+        suppressLiveScrollUntil = 0
+
+        if let hideRequestedAt {
+            let hideElapsedMs = (CFAbsoluteTimeGetCurrent() - hideRequestedAt) * 1000
+            Log.recordLatency(
+                "timeline.hide.window_hidden_ms",
+                valueMs: hideElapsedMs,
+                category: .ui,
+                summaryEvery: 10,
+                warningThresholdMs: 300,
+                criticalThresholdMs: 600
+            )
+        }
+
+        restoreFocusIfNeeded(
+            requestedRestore: restorePreviousFocus,
+            wasHidingToShowDashboard: wasHidingToShowDashboard,
+            hideRequestedAt: hideRequestedAt
+        )
+    }
+
+    private func finishHideTransitionCleanup() async {
+        // Mark timeline hidden before post-hide refresh so frame reads can use relaxed timing.
+        let generation = advanceCoordinatorTimelineVisibilityGeneration()
+        await setCoordinatorTimelineVisibleIfCurrent(false, generation: generation)
+
+        hideCompletionCoordinator.resumeAll(hidden: true)
+
+        await compactHiddenPresentationState()
+
+        onClose?()
+        TimelineScaleFactor.resetCache()
+        NotificationCenter.default.post(name: .timelineDidClose, object: nil)
+    }
 
     // MARK: - Initialization
 
     private override init() {
         super.init()
+        setupEmergencyTapPermissionObservers()
         setupEmergencyEscapeTap()
     }
 
     // MARK: - Emergency Escape CGEvent Tap
 
-    /// Sets up a CGEvent tap on a background thread to handle Escape key
-    /// This works even when the main thread is completely frozen
-    private func setupEmergencyEscapeTap() {
-        DispatchQueue.global(qos: .userInteractive).async {
-            // Create event tap for key down events
-            let eventMask = (1 << CGEventType.keyDown.rawValue)
-
-            guard let eventTap = CGEvent.tapCreate(
-                tap: .cgSessionEventTap,
-                place: .headInsertEventTap,
-                options: .defaultTap,
-                eventsOfInterest: CGEventMask(eventMask),
-                callback: { (proxy, type, event, refcon) -> Unmanaged<CGEvent>? in
-                    // Only process if timeline is visible
-                    guard TimelineWindowController.isTimelineVisible else {
-                        return Unmanaged.passRetained(event)
-                    }
-
-                    // Check for Escape key (keycode 53) or Cmd+Option+Escape
-                    let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
-                    let flags = event.flags
-
-                    let isCmdOptEscape = keyCode == 53 &&
-                        flags.contains(.maskCommand) &&
-                        flags.contains(.maskAlternate)
-
-                    // Cmd+Option+Escape: EMERGENCY - terminate app immediately
-                    if isCmdOptEscape {
-                        TimelineWindowController.isTimelineVisible = false
-                        exit(0)
-                    }
-
-                    // Track escape presses for triple-escape detection
-                    // Skip if a dialog is open (search, filter, tag submenu) since escape closes those
-                    if keyCode == 53 &&
-                       flags.rawValue & (CGEventFlags.maskCommand.rawValue | CGEventFlags.maskAlternate.rawValue | CGEventFlags.maskControl.rawValue) == 0 &&
-                       !TimelineWindowController.isDialogOpen {
-                        let now = CFAbsoluteTimeGetCurrent()
-
-                        // Remove old timestamps (older than 1.5 seconds)
-                        TimelineWindowController.escapeTimestamps = TimelineWindowController.escapeTimestamps.filter { now - $0 < 1.5 }
-
-                        // Add current timestamp
-                        TimelineWindowController.escapeTimestamps.append(now)
-
-                        // Check for triple-escape (3 presses within 1.5 seconds)
-                        if TimelineWindowController.escapeTimestamps.count >= 3 {
-                            TimelineWindowController.escapeTimestamps.removeAll()
-                            TimelineWindowController.isTimelineVisible = false
-                            exit(0)  // Force quit immediately
-                        }
-                    }
-
-                    return Unmanaged.passRetained(event)
-                },
-                userInfo: nil
-            ) else {
-                Log.error("[TIMELINE] Failed to create emergency escape event tap - check accessibility permissions", category: .ui)
-                return
+    private func setupEmergencyTapPermissionObservers() {
+        NotificationCenter.default.addObserver(
+            forName: Self.accessibilityPermissionRevokedNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.suspendEmergencyEscapeTapForPermissionLoss()
             }
+        }
 
-            TimelineWindowController.emergencyEventTap = eventTap
-
-            // Create run loop source
-            let runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventTap, 0)
-            TimelineWindowController.emergencyRunLoopSource = runLoopSource
-
-            // Get current run loop for this thread
-            let runLoop = CFRunLoopGetCurrent()
-            TimelineWindowController.emergencyRunLoop = runLoop
-
-            // Add to run loop
-            CFRunLoopAddSource(runLoop, runLoopSource, .commonModes)
-
-            // Enable the tap
-            CGEvent.tapEnable(tap: eventTap, enable: true)
-
-            Log.info("[TIMELINE] Emergency escape event tap installed on background thread", category: .ui)
-
-            // Run the loop (this blocks the thread, keeping it alive)
-            CFRunLoopRun()
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.resumeEmergencyEscapeTapIfNeeded()
+            }
         }
     }
 
-    /// Update whether a dialog/overlay is open (search, filter, tag submenu, etc.)
-    /// This prevents triple-escape from triggering while dialogs are open
-    public func setDialogOpen(_ isOpen: Bool) {
-        Self.isDialogOpen = isOpen
+    private nonisolated static func hasEmergencyTapPermission() -> Bool {
+        CGPreflightListenEventAccess()
+    }
+
+    /// Sets up a CGEvent tap on a dedicated thread to handle Escape key
+    /// This works even when the main thread is completely frozen
+    private func setupEmergencyEscapeTap() {
+        guard Self.hasEmergencyTapPermission() else {
+            Log.warning("[TIMELINE] Skipping emergency escape event tap setup because listen-event access is unavailable", category: .ui)
+            return
+        }
+
+        if let eventTap = Self.emergencyEventTapIfValid() {
+            CGEvent.tapEnable(tap: eventTap, enable: true)
+            return
+        }
+
+        let setupToken: UInt64? = Self.withEmergencyTapState { state in
+            guard !state.isInstallingTap else { return nil }
+            state.isInstallingTap = true
+            state.setupToken &+= 1
+            return state.setupToken
+        }
+        guard let setupToken else { return }
+
+        let thread = Thread {
+            Self.installEmergencyEscapeTap(expectedSetupToken: setupToken)
+        }
+        thread.name = "RetraceTimelineEmergencyTap"
+        thread.qualityOfService = .userInteractive
+        Self.withEmergencyTapState { state in
+            state.tapThread = thread
+        }
+        thread.start()
+    }
+
+    private func suspendEmergencyEscapeTapForPermissionLoss() {
+        if let eventTap = Self.emergencyEventTapIfValid() {
+            CGEvent.tapEnable(tap: eventTap, enable: false)
+            Log.warning("[TIMELINE] Suspended emergency escape event tap after permission revoke", category: .ui)
+        }
+    }
+
+    private func resumeEmergencyEscapeTapIfNeeded() {
+        guard Self.hasEmergencyTapPermission() else { return }
+
+        if let eventTap = Self.emergencyEventTapIfValid() {
+            CGEvent.tapEnable(tap: eventTap, enable: true)
+            return
+        }
+
+        setupEmergencyEscapeTap()
+    }
+
+    private nonisolated static func installEmergencyEscapeTap(expectedSetupToken: UInt64) {
+        guard shouldContinueInstallingEmergencyTap(expectedSetupToken: expectedSetupToken) else {
+            clearEmergencyTapInstallStateIfCurrent(expectedSetupToken: expectedSetupToken)
+            return
+        }
+
+        let eventMask = (1 << CGEventType.keyDown.rawValue)
+
+        guard let eventTap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .listenOnly,
+            eventsOfInterest: CGEventMask(eventMask),
+            callback: { (proxy, type, event, refcon) -> Unmanaged<CGEvent>? in
+                if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                    guard TimelineWindowController.hasEmergencyTapPermission() else {
+                        Log.warning("[TIMELINE] Emergency escape tap disabled while permission is unavailable; leaving tap suspended", category: .ui)
+                        return Unmanaged.passUnretained(event)
+                    }
+
+                    if let tap = TimelineWindowController.emergencyEventTapIfValid() {
+                        CGEvent.tapEnable(tap: tap, enable: true)
+                    }
+                    return Unmanaged.passUnretained(event)
+                }
+
+                guard type == .keyDown else {
+                    return Unmanaged.passUnretained(event)
+                }
+
+                // Only process if timeline is visible
+                guard TimelineWindowController.isEmergencyTimelineVisible() else {
+                    return Unmanaged.passUnretained(event)
+                }
+
+                // Check for Escape key (keycode 53) or Cmd+Option+Escape
+                let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
+                let flags = event.flags
+
+                let isCmdOptEscape = keyCode == 53 &&
+                    flags.contains(.maskCommand) &&
+                    flags.contains(.maskAlternate)
+
+                // Cmd+Option+Escape: EMERGENCY - capture diagnostics then terminate
+                if isCmdOptEscape {
+                    EmergencyDiagnostics.capture(trigger: "cmd_opt_escape")
+                    TimelineWindowController.setEmergencyTimelineVisible(false)
+                    exit(0)
+                }
+
+                // Triple-escape emergency termination is disabled for now.
+                // The watchdog auto-quit path remains the fallback for frozen UI recovery.
+
+                return Unmanaged.passUnretained(event)
+            },
+            userInfo: nil
+        ) else {
+            Self.withEmergencyTapState { state in
+                guard state.setupToken == expectedSetupToken else { return }
+                state.isInstallingTap = false
+                state.tapThread = nil
+            }
+            Log.error("[TIMELINE] Failed to create emergency escape event tap - check accessibility permissions", category: .ui)
+            return
+        }
+
+        let runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventTap, 0)
+        let runLoop = CFRunLoopGetCurrent()
+        let thread = Thread.current
+
+        guard shouldContinueInstallingEmergencyTap(expectedSetupToken: expectedSetupToken) else {
+            CGEvent.tapEnable(tap: eventTap, enable: false)
+            CFMachPortInvalidate(eventTap)
+            clearEmergencyTapInstallStateIfCurrent(expectedSetupToken: expectedSetupToken)
+            return
+        }
+
+        Self.withEmergencyTapState { state in
+            state.eventTap = eventTap
+            state.runLoopSource = runLoopSource
+            state.runLoop = runLoop
+            state.tapThread = thread
+        }
+
+        if let runLoopSource {
+            CFRunLoopAddSource(runLoop, runLoopSource, .commonModes)
+        }
+
+        CGEvent.tapEnable(tap: eventTap, enable: true)
+        Self.withEmergencyTapState { state in
+            state.isInstallingTap = false
+        }
+
+        Log.info("[TIMELINE] Emergency escape event tap installed on dedicated thread", category: .ui)
+
+        CFRunLoopRun()
+
+        Self.withEmergencyTapState { state in
+            if state.tapThread === thread {
+                state.tapThread = nil
+            }
+            state.isInstallingTap = false
+        }
+    }
+
+    private nonisolated static func shouldContinueInstallingEmergencyTap(expectedSetupToken: UInt64) -> Bool {
+        readEmergencyTapState { state in
+            state.setupToken == expectedSetupToken
+        }
+    }
+
+    private nonisolated static func clearEmergencyTapInstallStateIfCurrent(expectedSetupToken: UInt64) {
+        withEmergencyTapState { state in
+            guard state.setupToken == expectedSetupToken else { return }
+            state.isInstallingTap = false
+            if state.tapThread === Thread.current {
+                state.tapThread = nil
+            }
+        }
     }
 
     // MARK: - Shortcut Loading
@@ -236,12 +1218,10 @@ public class TimelineWindowController: NSObject {
 
     /// Load the current timeline shortcut from UserDefaults
     private func loadTimelineShortcut() -> ShortcutConfig {
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
-        guard let data = defaults.data(forKey: Self.timelineShortcutKey),
-              let config = try? JSONDecoder().decode(ShortcutConfig.self, from: data) else {
-            return .defaultTimeline
-        }
-        return config
+        OnboardingManager.loadShortcutConfig(
+            forKey: Self.timelineShortcutKey,
+            fallback: .defaultTimeline
+        )
     }
 
     // MARK: - Configuration
@@ -253,7 +1233,7 @@ public class TimelineWindowController: NSObject {
         // Pre-render the window in the background for instant show()
         Task { @MainActor in
             // Small delay to let app finish launching
-            try? await Task.sleep(nanoseconds: 500_000_000) // 0.5 seconds
+            try? await Task.sleep(for: .nanoseconds(Int64(500_000_000)), clock: .continuous) // 0.5 seconds
             prepareWindow()
         }
 
@@ -262,6 +1242,12 @@ public class TimelineWindowController: NSObject {
             self,
             selector: #selector(handleDisplayChange(_:)),
             name: .activeDisplayDidChange,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleApplicationDidHide(_:)),
+            name: NSApplication.didHideNotification,
             object: nil
         )
 
@@ -278,10 +1264,23 @@ public class TimelineWindowController: NSObject {
             name: .openSettings,
             object: nil
         )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleOpenSettings(_:)),
+            name: .openSettingsTags,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleOpenSettings(_:)),
+            name: .openSettingsPauseReminderInterval,
+            object: nil
+        )
     }
 
     /// Handle toggle dashboard notification - if timeline is visible, hide it first
     @objc private func handleToggleDashboard(_ notification: Notification) {
+        reconcileVisibilityState(reason: "toggleDashboardNotification")
         guard isVisible else { return }
         // Timeline is visible, so hide it properly before showing dashboard
         hideToShowDashboard()
@@ -289,6 +1288,7 @@ public class TimelineWindowController: NSObject {
 
     /// Handle open settings notification - if timeline is visible, hide it first
     @objc private func handleOpenSettings(_ notification: Notification) {
+        reconcileVisibilityState(reason: "openSettingsNotification")
         guard isVisible else { return }
         // Timeline is visible, so hide it properly before showing settings
         hideToShowDashboard()
@@ -299,126 +1299,142 @@ public class TimelineWindowController: NSObject {
         moveWindowToMouseScreen()
     }
 
+    @objc private func handleApplicationDidHide(_ notification: Notification) {
+        guard isVisible else { return }
+        synchronizeHiddenStateAfterExternalDismissal(reason: "applicationDidHide")
+    }
+
     // MARK: - Pre-rendering
 
-    /// Pre-create the window and SwiftUI view hierarchy (hidden) for instant display on hotkey press
-    /// This should be called at app startup to eliminate the ~260ms delay when showing the timeline
+    /// Prepare a metadata-only timeline state at startup.
+    /// The hidden window/view hierarchy is no longer kept alive; we only warm the view model.
     public func prepareWindow() {
-        let prepareStartTime = CFAbsoluteTimeGetCurrent()
-        Log.info("[TIMELINE-PRERENDER] 🚀 prepareWindow() started", category: .ui)
+        guard let coordinator = coordinator else { return }
 
-        guard let coordinator = coordinator else {
-            Log.info("[TIMELINE-PRERENDER] ⚠️ prepareWindow() skipped - no coordinator", category: .ui)
-            return
-        }
+        if isPrepared, timelineViewModel != nil { return }
 
-        // Don't re-prepare if already prepared and window exists
-        if isPrepared && window != nil {
-            Log.info("[TIMELINE-PRERENDER] ⚠️ prepareWindow() skipped - already prepared", category: .ui)
-            return
-        }
-
-        // Get the main screen for pre-rendering (will move to target screen on show)
-        guard let screen = NSScreen.main else {
-            Log.info("[TIMELINE-PRERENDER] ⚠️ prepareWindow() skipped - no main screen", category: .ui)
-            return
-        }
-        Log.info("[TIMELINE-PRERENDER] 📺 Using screen: \(screen.frame)", category: .ui)
-
-        // Create the window (hidden)
-        let window = createWindow(for: screen)
-        window.alphaValue = 0
-        // CRITICAL: Ignore mouse events while hidden to prevent blocking clicks on other windows
-        window.ignoresMouseEvents = true
-        window.orderOut(nil)
-        Log.info("[TIMELINE-PRERENDER] 🪟 Window created (hidden), elapsed=\(String(format: "%.3f", (CFAbsoluteTimeGetCurrent() - prepareStartTime) * 1000))ms", category: .ui)
-
-        // Create the view model
-        let viewModel = SimpleTimelineViewModel(coordinator: coordinator)
-        self.timelineViewModel = viewModel
-        // Pre-set tape as hidden so view renders with tape off-screen initially
+        let viewModel = ensurePreparedViewModel(coordinator: coordinator)
         viewModel.isTapeHidden = true
-        Log.info("[TIMELINE-PRERENDER] 📊 ViewModel created, elapsed=\(String(format: "%.3f", (CFAbsoluteTimeGetCurrent() - prepareStartTime) * 1000))ms", category: .ui)
-
-        // Create the SwiftUI view
-        guard let coordinatorWrapper = coordinatorWrapper else {
-            Log.error("[TIMELINE-PRERENDER] Coordinator wrapper not initialized", category: .ui)
-            return
-        }
-
-        let timelineView = SimpleTimelineView(
-            coordinator: coordinator,
-            viewModel: viewModel,
-            onClose: { [weak self] in
-                self?.hide()
-            }
-        )
-        .environmentObject(coordinatorWrapper)
-        Log.info("[TIMELINE-PRERENDER] 📺 SwiftUI view created, elapsed=\(String(format: "%.3f", (CFAbsoluteTimeGetCurrent() - prepareStartTime) * 1000))ms", category: .ui)
-
-        // Host the SwiftUI view
-        let hostingView = FirstMouseHostingView(rootView: timelineView)
-        hostingView.frame = window.contentView?.bounds ?? .zero
-        hostingView.autoresizingMask = [.width, .height]
-        window.contentView?.addSubview(hostingView)
-        Log.info("[TIMELINE-PRERENDER] 🎨 Hosting view added, elapsed=\(String(format: "%.3f", (CFAbsoluteTimeGetCurrent() - prepareStartTime) * 1000))ms", category: .ui)
-
-        // Store references
-        self.window = window
-        self.hostingView = hostingView
-        
-        // Trigger initial layout pass to pre-render the SwiftUI view hierarchy
-        hostingView.layoutSubtreeIfNeeded()
-        Log.info("[TIMELINE-PRERENDER] 🔄 Initial layout completed, elapsed=\(String(format: "%.3f", (CFAbsoluteTimeGetCurrent() - prepareStartTime) * 1000))ms", category: .ui)
 
         // Load the most recent frame data in the background
         Task { @MainActor in
-            await viewModel.loadMostRecentFrame()
-            Log.info("[TIMELINE-PRERENDER] 📊 Frame data loaded, total elapsed=\(String(format: "%.3f", (CFAbsoluteTimeGetCurrent() - prepareStartTime) * 1000))ms", category: .ui)
+            await viewModel.loadMostRecentFrame(refreshPresentation: false)
         }
 
         isPrepared = true
-        Log.info("[TIMELINE-PRERENDER] ✅ prepareWindow() completed, total=\(String(format: "%.3f", (CFAbsoluteTimeGetCurrent() - prepareStartTime) * 1000))ms", category: .ui)
     }
 
     // MARK: - Show/Hide
 
 	    /// Show the timeline overlay on the current screen
-	    public func show() {
-        // Start performance tracking
-        startPerfTrace()
+    public func show() {
+        // A newer explicit timeline command supersedes a pending Dock reveal.
+        let revealScheduler = DashboardRevealScheduler.shared
+        revealScheduler.cancelPendingReveal()
+        reconcileVisibilityState(reason: "show")
+        cancelDeferredHostingViewDetach()
+        cancelWindowFadeIn(reason: "show")
+        cancelDeferredSearchOverlayRestore()
+        cancelDeferredLiveActivation()
 
         // If we're in the middle of hiding, cancel the animation and snap back to visible
         if isHiding, let window = window {
+            revealScheduler.finishDeeplinkPresentation()
             isHiding = false
+            presentationState = .visible
             // Cancel any running animation by setting duration to 0
             NSAnimationContext.runAnimationGroup({ context in
                 context.duration = 0
                 window.animator().alphaValue = 1
             })
-            isVisible = true
-            Self.isTimelineVisible = true
-            logShowTiming("cancelled hide, snapping back to visible")
+            Self.setEmergencyTimelineVisible(true)
+            hideCompletionCoordinator.resumeAll(hidden: false)
+            startObservingApplicationActivation()
             return
         }
 
         guard !isVisible, let coordinator = coordinator else {
+            revealScheduler.finishDeeplinkPresentation()
             return
         }
-        logShowTiming("guard passed")
-
-        // Only capture/use live screenshot if playhead is at or near the latest frame (last 2 frames)
+        revealScheduler.beginDeeplinkPresentation()
+        Task { @MainActor [weak self] in
+            // Covers failed presentations too, including a disconnected screen.
+            defer { revealScheduler.finishDeeplinkPresentation() }
+            guard let self, !self.isVisible, self.coordinator === coordinator else { return }
+        let showStartTime = CFAbsoluteTimeGetCurrent()
+        liveModeCaptureTask?.cancel()
+        liveModeCaptureTask = nil
+        captureFocusRestoreTarget()
+        // Only capture/use live screenshot if playhead is at or near the latest frame (last 3 frames)
         // Otherwise, user was viewing a historical frame and should see that instead
-        let shouldUseLiveMode = timelineViewModel?.isNearMostRecentFrame(within: 2) ?? true
+        var shouldUseLiveMode = true
+        var shouldRefreshPreparedMetadataOnShow = false
+        var navigateToNewestOnShowRefresh = true
+        var allowNearLiveAutoAdvanceOnShowRefresh = true
+        var shouldShowPositionRecoveryHintOnShow = false
+        var positionRecoveryHintHiddenElapsedSeconds: TimeInterval?
 
-        let liveScreenshot: NSImage?
-        if shouldUseLiveMode {
-            // Always capture fresh screenshot
-            liveScreenshot = captureLiveScreenshot()
-            logShowTiming("live screenshot captured")
-        } else {
-            liveScreenshot = nil
-            logShowTiming("skipped live screenshot - playhead not at latest frame")
+        if let viewModel = timelineViewModel {
+            let framesFromNewestBefore = max(0, viewModel.frames.count - 1 - viewModel.currentIndex)
+            let hiddenElapsedSeconds = lastHiddenAt.map { Date().timeIntervalSince($0) } ?? .infinity
+            let loadedTapeIsRecent = viewModel.isNewestLoadedFrameRecent()
+            let instantEligible = loadedTapeIsRecent &&
+                framesFromNewestBefore < Self.instantLiveReopenFrameThreshold
+            let nearEligible = loadedTapeIsRecent &&
+                framesFromNewestBefore < Self.nearLiveReopenFrameThreshold
+            let instantLiveExpiryElapsed = hiddenElapsedSeconds >= Self.instantLiveReopenExpirationSeconds
+            let nearLiveExpiryElapsed = hiddenElapsedSeconds >= Self.nearLiveReopenExpirationSeconds
+            let cacheExpired = hiddenElapsedSeconds > Self.hiddenStateCacheExpirationSeconds
+            var hasActiveFilters = viewModel.filterCriteria.hasActiveFilters
+
+            // Hidden-state cache expiry invalidates filters so reopen uses fresh unfiltered metadata.
+            if cacheExpired, hasActiveFilters {
+                viewModel.clearFiltersWithoutReload()
+                hasActiveFilters = false
+            }
+
+            let shouldAutoAdvanceNearLive = !hasActiveFilters &&
+                ((instantEligible && instantLiveExpiryElapsed) || (nearEligible && nearLiveExpiryElapsed))
+            let shouldSnapToNewestOnShow = cacheExpired || shouldAutoAdvanceNearLive
+            let shouldClearSearchForReopenPolicy = shouldSnapToNewestOnShow
+
+            if shouldClearSearchForReopenPolicy {
+                let searchViewModel = viewModel.searchViewModel
+                if searchViewModel.hasResults || !searchViewModel.searchQuery.isEmpty {
+                    searchViewModel.clearSearchResults()
+                }
+            }
+
+            if shouldSnapToNewestOnShow, !viewModel.frames.isEmpty {
+                let newestIndex = max(0, viewModel.frames.count - 1)
+                let didSnapToNewest: Bool
+                if cacheExpired {
+                    didSnapToNewest = viewModel.applyCacheBustReopenSnapToNewest(newestIndex: newestIndex)
+                } else {
+                    if viewModel.currentIndex != newestIndex {
+                        viewModel.currentIndex = newestIndex
+                        didSnapToNewest = true
+                    } else {
+                        didSnapToNewest = false
+                    }
+                }
+
+                shouldShowPositionRecoveryHintOnShow = Self.shouldShowPositionRecoveryHintOnReopen(
+                    hiddenElapsedSeconds: hiddenElapsedSeconds,
+                    didSnapToNewest: didSnapToNewest && cacheExpired
+                )
+                if shouldShowPositionRecoveryHintOnShow {
+                    positionRecoveryHintHiddenElapsedSeconds = hiddenElapsedSeconds
+                }
+            }
+
+            shouldRefreshPreparedMetadataOnShow = true
+            navigateToNewestOnShowRefresh = shouldSnapToNewestOnShow
+            allowNearLiveAutoAdvanceOnShowRefresh = shouldAutoAdvanceNearLive || cacheExpired
+
+            shouldUseLiveMode = loadedTapeIsRecent &&
+                viewModel.isNearLatestLoadedFrame(within: Self.instantLiveReopenFrameThreshold)
         }
 
         // Remember if dashboard was the key window before we take over
@@ -430,129 +1446,80 @@ public class TimelineWindowController: NSObject {
         guard let targetScreen = NSScreen.screens.first(where: { NSMouseInRect(mouseLocation, $0.frame, false) }) ?? NSScreen.main else {
             return
         }
-        logShowTiming("screen detected")
 
         // Reset scale factor cache so it recalculates for the current display
         TimelineScaleFactor.resetCache()
+        prefetchedLiveScreenshot = shouldUseLiveMode ? await captureLiveScreenshotAsync() : nil
 
-	        // Don't stop the background refresh timer - let it keep running
-	        // The timer callback checks isVisible and skips refresh while timeline is open
-
-        // Check if we have a pre-rendered window ready
-        if isPrepared, let window = window, let viewModel = timelineViewModel {
-            logShowTiming("using prerendered window")
-
-            // Set live mode with captured screenshot
-            if let screenshot = liveScreenshot {
-                viewModel.isInLiveMode = true
-                viewModel.liveScreenshot = screenshot
-                logShowTiming("live mode activated")
-                // Auto-trigger OCR on the live screenshot
-                viewModel.performLiveOCR()
-            }
+        // Check if we have a prepared metadata state ready
+        if isPrepared, let viewModel = timelineViewModel {
+            mountPresentationIfNeeded(
+                on: targetScreen,
+                coordinator: coordinator,
+                viewModel: viewModel
+            )
+            prepareLiveModeState(shouldUseLiveMode: shouldUseLiveMode, viewModel: viewModel)
             viewModel.isTapeHidden = true
             tapeShowAnimationTask?.cancel()
 
-            // Move window to target screen if needed (instant, no recreation)
-            if window.frame != targetScreen.frame {
-                window.setFrame(targetScreen.frame, display: false)
-                logShowTiming("moved window to target screen")
+            showPreparedWindow(
+                coordinator: coordinator,
+                openPath: "prepared_headless",
+                showStartTime: showStartTime
+            )
+            if shouldShowPositionRecoveryHintOnShow,
+               let hiddenElapsedSeconds = positionRecoveryHintHiddenElapsedSeconds {
+                viewModel.showPositionRecoveryHint(hiddenElapsedSeconds: hiddenElapsedSeconds)
             }
-
-            // Log cache state
-            if let lastHidden = lastHiddenAt {
-                let elapsed = Date().timeIntervalSince(lastHidden)
-                Log.info("[TIMELINE-SHOW] Using prerendered view (hidden \(Int(elapsed))s ago)", category: .ui)
-            } else {
-                Log.info("[TIMELINE-SHOW] First show after prerender", category: .ui)
+            startLiveModeCaptureIfNeeded(shouldUseLiveMode: shouldUseLiveMode, viewModel: viewModel)
+            if shouldRefreshPreparedMetadataOnShow {
+                refreshTimelineMetadataOnShow(
+                    viewModel: viewModel,
+                    navigateToNewest: navigateToNewestOnShowRefresh,
+                    allowNearLiveAutoAdvance: allowNearLiveAutoAdvanceOnShowRefresh
+                )
             }
-
-            // Show the pre-rendered window
-            showPreparedWindow(coordinator: coordinator)
             return
         }
-        logShowTiming("no prerendered window, creating new")
 
-        // Fallback: Create window from scratch (original behavior)
-	        Log.info("[TIMELINE-SHOW] ⚠️ Using FALLBACK path - creating new window and viewModel from scratch", category: .ui)
-	        let newWindow = createWindow(for: targetScreen)
-
-	        // Create and store the view model so we can forward scroll events
+        // Fallback: Create presentation and view model from scratch (prerender disabled or unavailable).
         let viewModel = SimpleTimelineViewModel(coordinator: coordinator)
-        self.timelineViewModel = viewModel
+        setTimelineViewModel(viewModel)
+        prepareLiveModeState(shouldUseLiveMode: shouldUseLiveMode, viewModel: viewModel)
         viewModel.isTapeHidden = true
         tapeShowAnimationTask?.cancel()
-
-        // Set live mode with captured screenshot
-        if let screenshot = liveScreenshot {
-            viewModel.isInLiveMode = true
-            viewModel.liveScreenshot = screenshot
-            logShowTiming("live mode activated (fallback)")
-            // Auto-trigger OCR on the live screenshot
-            viewModel.performLiveOCR()
-        }
-
-        guard let coordinatorWrapper = coordinatorWrapper else {
-            Log.error("[TIMELINE] Coordinator wrapper not initialized", category: .ui)
-            return
-        }
-
-        // Create the SwiftUI view (using new SimpleTimelineView)
-        let timelineView = SimpleTimelineView(
+        mountPresentationIfNeeded(
+            on: targetScreen,
             coordinator: coordinator,
-            viewModel: viewModel,
-            onClose: { [weak self] in
-                self?.hide()
-            }
+            viewModel: viewModel
         )
-        .environmentObject(coordinatorWrapper)
-
-        // Host the SwiftUI view (using custom hosting view that accepts first mouse for hover)
-        let hostingView = FirstMouseHostingView(rootView: timelineView)
-        hostingView.frame = newWindow.contentView?.bounds ?? .zero
-        hostingView.autoresizingMask = [.width, .height]
-        newWindow.contentView?.addSubview(hostingView)
-
-        // Store references
-        self.window = newWindow
-        self.hostingView = hostingView
         self.isPrepared = true
 
         // Show the window
-        showPreparedWindow(coordinator: coordinator)
-
-        // Start async frame loading in background (non-blocking)
-        Task {
-            await viewModel.loadMostRecentFrame()
-            logShowTiming("background frame load complete (fallback)")
+        showPreparedWindow(
+            coordinator: coordinator,
+            openPath: "fallback",
+            showStartTime: showStartTime
+        )
+        startLiveModeCaptureIfNeeded(shouldUseLiveMode: shouldUseLiveMode, viewModel: viewModel)
+        refreshTimelineMetadataOnShow(
+            viewModel: viewModel,
+            navigateToNewest: true,
+            allowNearLiveAutoAdvance: true
+        )
         }
     }
 
     /// Show the prepared window with animation and setup event monitors
-    private func showPreparedWindow(coordinator: AppCoordinator) {
-        logShowTiming("showPreparedWindow started")
+    private func showPreparedWindow(
+        coordinator: AppCoordinator,
+        openPath: String,
+        showStartTime: CFAbsoluteTime
+    ) {
         guard let window = window else { return }
-
-        // Reattach SwiftUI view if it was detached (on hide, we remove it from superview to stop display cycle)
-        if let hostingView = hostingView, hostingView.superview == nil {
-            hostingView.frame = window.contentView?.bounds ?? .zero
-            window.contentView?.addSubview(hostingView)
-            hostingView.layoutSubtreeIfNeeded()
-            logShowTiming("hosting view reattached")
-            // Force SwiftUI to re-read all @Published properties from the view model.
-            // While detached, SwiftUI missed objectWillChange notifications,
-            // so the timeline tape may show stale/empty state.
-            timelineViewModel?.objectWillChange.send()
-        }
 
         timelineViewModel?.isTapeHidden = true
         tapeShowAnimationTask?.cancel()
-
-        // Log current view model state before showing
-        if let viewModel = timelineViewModel {
-            let currentVideoInfo = viewModel.currentVideoInfo
-            Log.info("[TIMELINE-SHOW] 🎬 About to show window - currentIndex=\(viewModel.currentIndex), frames.count=\(viewModel.frames.count), videoPath=\(currentVideoInfo?.videoPath.suffix(30) ?? "nil"), frameIndex=\(currentVideoInfo?.frameIndex ?? -1)", category: .ui)
-        }
 
         // Force video reload BEFORE showing window to avoid flicker
         // This ensures AVPlayer loads fresh video data with any new frames
@@ -563,29 +1530,74 @@ public class TimelineWindowController: NSObject {
             viewModel.currentIndex = max(0, original - 1)
             viewModel.currentIndex = original
         }
-        logShowTiming("video reload triggered")
+        timelineViewModel?.setPresentationWorkEnabled(true, reason: "showPreparedWindow")
+        timelineViewModel?.refreshStaticPresentationIfNeeded()
 
-        let isLive = (timelineViewModel?.isInLiveMode ?? false) && timelineViewModel?.liveScreenshot != nil
+        let isLive = timelineViewModel?.isInLiveMode ?? false
+        if isLive {
+            suppressLiveScrollUntil = CFAbsoluteTimeGetCurrent() + Self.liveScrollSuppressDuration
+        } else {
+            suppressLiveScrollUntil = 0
+        }
         window.alphaValue = isLive ? 1 : 0
 
         // Re-enable mouse events before showing (was disabled while hidden to prevent blocking clicks)
         window.ignoresMouseEvents = false
 
-        Log.info("[TIMELINE-SHOW] 🚀 WINDOW BECOMING VISIBLE NOW (makeKeyAndOrderFront)", category: .ui)
-        NSApp.activate(ignoringOtherApps: true)
-        window.makeKeyAndOrderFront(nil)
-        logShowTiming("makeKeyAndOrderFront")
+        // Always start visible sessions with context menus closed.
+        if let viewModel = timelineViewModel {
+            viewModel.dismissContextMenu()
+            viewModel.dismissTimelineContextMenu()
+        }
 
-        isVisible = true
-        Self.isTimelineVisible = true  // For emergency escape tap
+        // Re-assert Space behavior before each open so cached windows always
+        // materialize on the currently active Desktop.
+        window.collectionBehavior.remove(.canJoinAllSpaces)
+        window.collectionBehavior.insert(.moveToActiveSpace)
+        // Mark visible before activation to avoid activation-time dashboard reveal
+        // races that can switch Spaces on some machines.
+        presentationState = .showing
+        Self.setEmergencyTimelineVisible(true)  // For emergency escape tap
+        if !isLive {
+            NSApp.activate(ignoringOtherApps: true)
+        }
+        window.makeKeyAndOrderFront(nil)
+        presentationState = .visible
+        startObservingApplicationActivation()
+        if let hostingView = hostingView {
+            DispatchQueue.main.async { [weak hostingView] in
+                hostingView?.layoutSubtreeIfNeeded()
+            }
+        }
+        let openElapsedMs = (CFAbsoluteTimeGetCurrent() - showStartTime) * 1000
+        Log.recordLatency(
+            "timeline.open.window_visible_ms",
+            valueMs: openElapsedMs,
+            category: .ui,
+            summaryEvery: 5,
+            warningThresholdMs: 250,
+            criticalThresholdMs: 600
+        )
+        Log.recordLatency(
+            "timeline.open.\(openPath).window_visible_ms",
+            valueMs: openElapsedMs,
+            category: .ui,
+            summaryEvery: 5,
+            warningThresholdMs: 250,
+            criticalThresholdMs: 600
+        )
 
         // Fade in only for non-live opens (prevents the live screenshot "zoom" feel)
-        if !isLive {
-            NSAnimationContext.runAnimationGroup({ context in
-                context.duration = 0.35
-                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-                window.animator().alphaValue = 1
-            })
+        if !isLive, let viewModel = timelineViewModel {
+            scheduleHistoricalFadeIn(window: window, viewModel: viewModel)
+        }
+
+        if isLive, let viewModel = timelineViewModel {
+            scheduleDeferredLiveActivationIfNeeded(viewModel: viewModel)
+            scheduleDeferredSearchOverlayRestoreIfNeeded(
+                viewModel: viewModel,
+                isLiveMode: isLive
+            )
         }
 
         // Trigger tape slide-up animation (Cmd+H style)
@@ -604,36 +1616,95 @@ public class TimelineWindowController: NSObject {
         setupEventMonitors()
 
         // Notify coordinator to pause frame processing while timeline is visible
-        Task {
-            await coordinator.setTimelineVisible(true)
-        }
+        scheduleCoordinatorTimelineVisible(true)
 
         // Track session start time for duration metrics
         sessionStartTime = Date()
         sessionScrubDistance = 0  // Reset scrub distance for new session
+        timelineViewModel?.resetVisibleSessionScrubTracking()
 
         // Post notification so menu bar can hide recording indicator
         NotificationCenter.default.post(name: .timelineDidOpen, object: nil)
+
+    }
+
+    private func cancelDeferredSearchOverlayRestore() {
+        deferredSearchOverlayRestoreTask?.cancel()
+        deferredSearchOverlayRestoreTask = nil
+    }
+
+    private func cancelDeferredLiveActivation() {
+        deferredLiveActivationTask?.cancel()
+        deferredLiveActivationTask = nil
+    }
+
+    private static func preservedSearchOverlayRestoreDelayMs(isLiveMode: Bool) -> Int {
+        isLiveMode ? liveSearchOverlayRestoreDelayMs : historicalSearchOverlayRestoreDelayMs
+    }
+
+    private func scheduleDeferredSearchOverlayRestoreIfNeeded(
+        viewModel: SimpleTimelineViewModel,
+        isLiveMode: Bool
+    ) {
+        guard shouldRestoreSearchOverlayAfterNextShow else {
+            return
+        }
+
+        shouldRestoreSearchOverlayAfterNextShow = false
+        cancelDeferredSearchOverlayRestore()
+        let delayMs = Self.preservedSearchOverlayRestoreDelayMs(isLiveMode: isLiveMode)
+        Log.info(
+            "[TimelineSearchOverlay] queued preserved overlay restore delayMs=\(delayMs) isLiveMode=\(isLiveMode)",
+            category: .ui
+        )
+
+        deferredSearchOverlayRestoreTask = Task { @MainActor [weak self, weak viewModel] in
+            try? await Task.sleep(for: .milliseconds(delayMs), clock: .continuous)
+            guard let self, let viewModel else { return }
+            defer { self.deferredSearchOverlayRestoreTask = nil }
+            guard !Task.isCancelled,
+                  self.isVisible,
+                  !self.isHiding,
+                  self.timelineViewModel === viewModel else {
+                return
+            }
+
+            Log.info(
+                "[TimelineSearchOverlay] restoring preserved overlay after timeline reveal delayMs=\(delayMs)",
+                category: .ui
+            )
+            viewModel.isSearchOverlayVisible = true
+        }
+    }
+
+    private func scheduleDeferredLiveActivationIfNeeded(viewModel: SimpleTimelineViewModel) {
+        cancelDeferredLiveActivation()
+        let delayMs = Self.liveActivationDelayMs
+        deferredLiveActivationTask = Task { @MainActor [weak self, weak viewModel] in
+            try? await Task.sleep(for: .milliseconds(delayMs), clock: .continuous)
+            guard let self, let viewModel else { return }
+            defer { self.deferredLiveActivationTask = nil }
+            guard !Task.isCancelled,
+                  self.isVisible,
+                  !self.isHiding,
+                  self.timelineViewModel === viewModel,
+                  viewModel.isInLiveMode else {
+                return
+            }
+
+            NSApp.activate(ignoringOtherApps: true)
+            self.window?.makeKey()
+        }
     }
 
     /// Hide the timeline overlay
-    public func hide() {
+    public func hide(restorePreviousFocus: Bool = true) {
+        reconcileVisibilityState(reason: "hide")
         guard isVisible, let window = window, !isHiding else { return }
+        let hideRequestStartedAt = CFAbsoluteTimeGetCurrent()
         isHiding = true
-
-        // Record timeline session duration (only if > 3 seconds)
-        if let startTime = sessionStartTime, let coordinator = coordinator {
-            let durationMs = Int64(Date().timeIntervalSince(startTime) * 1000)
-            DashboardViewModel.recordTimelineSession(coordinator: coordinator, durationMs: durationMs)
-
-            // Record scrub distance metric
-            if sessionScrubDistance > 0 {
-                DashboardViewModel.recordScrubDistance(coordinator: coordinator, distancePixels: sessionScrubDistance)
-            }
-
-            sessionStartTime = nil
-            sessionScrubDistance = 0  // Reset scrub distance for next session
-        }
+        presentationState = .hiding
+        prepareForHiddenStateTransition(reason: "hide")
 
         // Don't save position on hide - window stays in memory
         // Position is only saved on app termination (see savePositionForTermination)
@@ -644,84 +1715,31 @@ public class TimelineWindowController: NSObject {
             window.animator().alphaValue = window.alphaValue  // Snap to current value
         })
 
-        tapeShowAnimationTask?.cancel()
-        if let viewModel = timelineViewModel {
-            withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-                viewModel.isTapeHidden = true
-            }
-        }
-
-        // Remove event monitors
-        removeEventMonitors()
-
         // Animate out
         NSAnimationContext.runAnimationGroup({ context in
             context.duration = 0.25
             context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
             window.animator().alphaValue = 0
         }, completionHandler: { [weak self] in
-            Task { @MainActor in
-                self?.isHiding = false
-                // Only hide dashboard if it wasn't the active window before timeline opened
-                // AND we're not hiding specifically to show the dashboard/settings
-                // This prevents hiding the dashboard when user had it focused and just opened/closed timeline
-                // Also don't hide if a modal sheet (feedback form, etc.) is attached
-                if self?.dashboardWasKeyWindow != true,
-                   self?.isHidingToShowDashboard != true,
-                   DashboardWindowController.shared.window?.attachedSheet == nil {
-                    DashboardWindowController.shared.hide()
-                }
-                // Reset the flag after use
-                self?.isHidingToShowDashboard = false
-
-                // Hide window but keep it around for instant re-show
-                // This is the key optimization - we don't destroy the window or view model
-                // CRITICAL: Ignore mouse events while hidden to prevent blocking clicks on other windows
-                window.ignoresMouseEvents = true
-                window.orderOut(nil)
-                // CRITICAL: Detach SwiftUI view from window to stop display cycle updates
-                // The hosting view stays in memory but is no longer in the view hierarchy,
-                // so AppKit won't trigger layout passes on it (saving significant CPU)
-                self?.hostingView?.removeFromSuperview()
-                self?.isVisible = false
-                Self.isTimelineVisible = false  // For emergency escape tap
-                self?.lastHiddenAt = Date()
-                self?.startBackgroundRefreshTimer()
-
-                // Clean up live mode state AFTER fade-out completes (prevents flicker)
-                if let viewModel = self?.timelineViewModel {
-                    viewModel.isInLiveMode = false
-                    viewModel.liveScreenshot = nil
-                    viewModel.isTapeHidden = true
-                    viewModel.areControlsHidden = false  // Reset controls visibility so they show on next open
-                    viewModel.resetFrameZoom()  // Reset zoom so it's at 100% on next open
-                }
-
-                // Immediately refresh frame data so next open has fresh data
-                // Use navigateToNewest: false to preserve user's position within the 2-minute grace period
-                if let viewModel = self?.timelineViewModel {
-                    await viewModel.refreshFrameData(navigateToNewest: false)
-                    // Reset zoom region state on hide
-                    viewModel.exitZoomRegion()
-                }
-
-                self?.onClose?()
-
-                // Reset the cached scale factor so it recalculates for next window
-                TimelineScaleFactor.resetCache()
-
-                // Notify coordinator to resume frame processing
-                if let coordinator = self?.coordinator {
-                    await coordinator.setTimelineVisible(false)
-                }
-
-                // Post notification so menu bar can restore recording indicator
-                NotificationCenter.default.post(name: .timelineDidClose, object: nil)
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.applyHiddenState(
+                    restorePreviousFocus: restorePreviousFocus,
+                    hideRequestedAt: hideRequestStartedAt,
+                    reason: "hide"
+                )
+                await self.finishHideTransitionCleanup()
             }
         })
+
+        restoreFocusIfNeeded(
+            requestedRestore: restorePreviousFocus,
+            wasHidingToShowDashboard: isHidingToShowDashboard,
+            hideRequestedAt: hideRequestStartedAt
+        )
     }
 
-    // MARK: - Background Refresh Timer
+    // MARK: - Timeline Metadata Refresh
 
     /// Move the hidden window to the screen where the mouse is (for instant show on any screen)
     private func moveWindowToMouseScreen() {
@@ -739,12 +1757,10 @@ public class TimelineWindowController: NSObject {
         }
     }
 
-    /// Capture a live screenshot for seamless timeline launch
-    /// Returns NSImage of the active screen, or nil on failure
-    private func captureLiveScreenshot() -> NSImage? {
-        // Always capture the active screen for live mode OCR.
-        // This avoids combining text from multiple displays into one OCR pass.
-        // "Active" here is the screen currently under the mouse, matching where timeline opens.
+    /// Capture a live screenshot off the main actor to avoid blocking timeline-open path.
+    /// When the timeline window is visible, capture only content below it so we don't
+    /// bake partially hidden timeline controls into the live screenshot.
+    private func captureLiveScreenshotAsync() async -> NSImage? {
         let mouseLocation = NSEvent.mouseLocation
         guard let targetScreen = NSScreen.screens.first(where: {
             NSMouseInRect(mouseLocation, $0.frame, false)
@@ -752,88 +1768,274 @@ public class TimelineWindowController: NSObject {
             return nil
         }
 
-        // Get display ID for this screen
         guard let screenNumber = targetScreen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID else {
             return nil
         }
 
-        // Capture the screen
-        guard let cgImage = CGDisplayCreateImage(screenNumber) else {
+        let screenSize = targetScreen.frame.size
+        let screenBounds = CGDisplayBounds(screenNumber)
+        let timelineWindowID: CGWindowID?
+        if let candidate = window, candidate.isVisible {
+            timelineWindowID = CGWindowID(candidate.windowNumber)
+        } else {
+            timelineWindowID = nil
+        }
+        let captureStartTime = CFAbsoluteTimeGetCurrent()
+        let captureTask = Task.detached(priority: .userInitiated) { [screenBounds, screenNumber, timelineWindowID] () -> CGImage? in
+            // Prefer a below-window capture to avoid including the timeline overlay itself.
+            if let timelineWindowID,
+               let image = CGWindowListCreateImage(
+                   screenBounds,
+                   .optionOnScreenBelowWindow,
+                   timelineWindowID,
+                   [.boundsIgnoreFraming]
+               ) {
+                return image
+            }
+
+            return CGDisplayCreateImage(screenNumber)
+        }
+        let cgImage = await captureTask.value
+        let captureElapsedMs = (CFAbsoluteTimeGetCurrent() - captureStartTime) * 1000
+        Log.recordLatency(
+            "timeline.live_screenshot.capture_ms",
+            valueMs: captureElapsedMs,
+            category: .ui,
+            summaryEvery: 20,
+            warningThresholdMs: 40,
+            criticalThresholdMs: 120
+        )
+
+        guard let cgImage else {
             Log.warning("[TIMELINE-LIVE] Failed to capture live screenshot", category: .ui)
             return nil
         }
 
-        return NSImage(cgImage: cgImage, size: targetScreen.frame.size)
+        return NSImage(cgImage: cgImage, size: screenSize)
     }
 
-    /// Start a repeating timer that keeps timeline data fresh while hidden
-    private func startBackgroundRefreshTimer() {
-        // Don't restart if already running
-        guard backgroundRefreshTimer == nil else {
-            Log.debug("[TIMELINE-CACHE] Timer already running, not restarting", category: .ui)
+    /// Starts asynchronous live screenshot capture and then triggers live OCR.
+    /// This keeps timeline open responsive by removing heavy capture from the critical show path.
+    private func prepareLiveModeState(shouldUseLiveMode: Bool, viewModel: SimpleTimelineViewModel) {
+        if shouldUseLiveMode {
+            // Prime live mode before showing the window so open animation/render path
+            // already has the pre-launch screenshot ready before the panel appears.
+            viewModel.isInLiveMode = true
+            viewModel.liveScreenshot = prefetchedLiveScreenshot
+        } else {
+            viewModel.isInLiveMode = false
+            viewModel.liveScreenshot = nil
+        }
+    }
+
+    /// Starts asynchronous live screenshot capture and then triggers live OCR.
+    /// This keeps timeline open responsive by removing heavy capture from the critical show path.
+    private func startLiveModeCaptureIfNeeded(shouldUseLiveMode: Bool, viewModel: SimpleTimelineViewModel) {
+        guard shouldUseLiveMode else {
+            viewModel.isInLiveMode = false
+            viewModel.liveScreenshot = nil
+            prefetchedLiveScreenshot = nil
             return
         }
 
-        let refreshInterval: TimeInterval = 10
-        Log.info("[TIMELINE-CACHE] ⏱️ Starting background refresh timer (every \(Int(refreshInterval))s)", category: .ui)
+        if let prefetchedLiveScreenshot {
+            viewModel.isInLiveMode = true
+            viewModel.liveScreenshot = prefetchedLiveScreenshot
+            self.prefetchedLiveScreenshot = nil
+            viewModel.performLiveOCR()
+            return
+        }
 
-        backgroundRefreshTimer = Timer.scheduledTimer(withTimeInterval: refreshInterval, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                guard let self = self,
-                      !self.isVisible,
-                      let viewModel = self.timelineViewModel,
-                      let coordinator = self.coordinator else { return }
-
-                // Only refresh if capture is active (no point refreshing if not recording)
-                guard await coordinator.isCapturing() else {
-                    Log.debug("[TIMELINE-CACHE] ⏸️ Skipping background refresh (not capturing)", category: .ui)
-                    return
-                }
-
-                // Check if position cache has expired (1 minute)
-                // If expired, navigate to newest; if not expired, preserve user's position
-                let cacheExpirationSeconds: TimeInterval = 60
-                let cacheExpired: Bool
-                if let lastHidden = self.lastHiddenAt {
-                    cacheExpired = Date().timeIntervalSince(lastHidden) > cacheExpirationSeconds
-                } else {
-                    cacheExpired = true // No lastHiddenAt means first show, navigate to newest
-                }
-
-                Log.info("[TIMELINE-CACHE] 🔄 Background refresh triggered (cacheExpired: \(cacheExpired))", category: .ui)
-                // Only preserve position if cache hasn't expired; after 1 minute, navigate to newest
-                await viewModel.refreshFrameData(navigateToNewest: cacheExpired)
-                // Force video reload so AVPlayer picks up new frames appended to the video file
-                viewModel.forceVideoReload = true
-                Log.info("[TIMELINE-CACHE] ✅ Background refresh complete", category: .ui)
+        let targetViewModel = viewModel
+        liveModeCaptureTask = Task { @MainActor [weak self, weak targetViewModel] in
+            guard let self, let targetViewModel else { return }
+            let screenshot = await self.captureLiveScreenshotAsync()
+            guard !Task.isCancelled else { return }
+            guard self.isVisible, self.timelineViewModel === targetViewModel else { return }
+            guard targetViewModel.isNewestLoadedFrameRecent() else {
+                targetViewModel.isInLiveMode = false
+                targetViewModel.liveScreenshot = nil
+                return
             }
+            guard targetViewModel.isNearLatestLoadedFrame(within: Self.instantLiveReopenFrameThreshold) else { return }
+            guard let screenshot else {
+                // Fall back to historical frame rendering if live capture fails.
+                targetViewModel.isInLiveMode = false
+                targetViewModel.liveScreenshot = nil
+                return
+            }
+
+            targetViewModel.isInLiveMode = true
+            targetViewModel.liveScreenshot = screenshot
+            self.prefetchedLiveScreenshot = nil
+            targetViewModel.performLiveOCR()
+        }
+    }
+
+    /// Refresh metadata when timeline launches so hidden windows don't need periodic background refresh.
+    private func refreshTimelineMetadataOnShow(
+        viewModel: SimpleTimelineViewModel,
+        navigateToNewest: Bool,
+        allowNearLiveAutoAdvance: Bool
+    ) {
+        Task { @MainActor [weak self, weak viewModel] in
+            guard let self, let viewModel else { return }
+            guard self.isVisible, self.timelineViewModel === viewModel else { return }
+
+            await viewModel.refreshFrameData(
+                navigateToNewest: navigateToNewest,
+                allowNearLiveAutoAdvance: allowNearLiveAutoAdvance,
+                refreshPresentation: true
+            )
         }
     }
 
 
     /// Save state for cross-session persistence (call on app termination)
     public func saveStateForTermination() {
-        Log.info("[TIMELINE-PRERENDER] 💾 saveStateForTermination() called", category: .ui)
         timelineViewModel?.saveState()
     }
 
     /// Completely destroy the pre-rendered window (call when memory pressure is high or app is terminating)
     public func destroyPreparedWindow() {
-        Log.info("[TIMELINE-PRERENDER] 🗑️ destroyPreparedWindow() called", category: .ui)
         // Save state before destroying for cross-session persistence
         timelineViewModel?.saveState()
-
-        window?.orderOut(nil)
-        hostingView?.removeFromSuperview()
-        window = nil
-        hostingView = nil
+        timelineViewModel?.compactPresentationState(reason: "destroyPreparedWindow", purgeDiskFrameBuffer: true)
+        destroyMountedPresentation()
+        if let coordinator {
+            Task {
+                await coordinator.purgeVideoDecodingCaches(reason: "destroyPreparedWindow")
+            }
+        }
         timelineViewModel = nil
         isPrepared = false
     }
 
+    @MainActor
+    private func compactHiddenPresentationState() async {
+        let viewModel = timelineViewModel
+
+        if let viewModel {
+            viewModel.isTapeHidden = true
+            viewModel.resetControlsVisibilityForNextOpen()  // Reset controls visibility so they show on next open
+            viewModel.resetFrameZoom()  // Reset zoom so it's at 100% on next open
+            viewModel.compactPresentationState(
+                reason: "hide-keep-headless-state",
+                purgeDiskFrameBuffer: false
+            )
+            // Reset zoom region state on hide.
+            viewModel.exitZoomRegion()
+        }
+
+        // Always detach any mounted presentation and purge decode caches, even if the
+        // prepared view model vanished unexpectedly. Otherwise hidden decoder work can linger.
+        destroyMountedPresentation()
+        if let coordinator {
+            await coordinator.purgeVideoDecodingCaches(reason: "timeline hidden")
+        }
+    }
+
+    private func scheduleDeferredHostingViewDetach() {
+        cancelDeferredHostingViewDetach()
+        deferredHostingViewDetachTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: Self.hostingViewDetachDelay, clock: .continuous)
+            guard let self, !self.isVisible else { return }
+            self.hostingView?.removeFromSuperview()
+        }
+    }
+
+    private func cancelDeferredHostingViewDetach() {
+        deferredHostingViewDetachTask?.cancel()
+        deferredHostingViewDetachTask = nil
+    }
+
+    private func ensurePreparedViewModel(coordinator: AppCoordinator) -> SimpleTimelineViewModel {
+        if let existing = timelineViewModel {
+            isPrepared = true
+            return existing
+        }
+
+        let viewModel = SimpleTimelineViewModel(coordinator: coordinator)
+        setTimelineViewModel(viewModel)
+        isPrepared = true
+        return viewModel
+    }
+
+    func refreshTapeIndicatorsAfterExternalMutation(reason: String) {
+        timelineViewModel?.refreshTapeIndicatorsAfterExternalMutation(reason: reason)
+    }
+
+    private func mountPresentationIfNeeded(
+        on screen: NSScreen,
+        coordinator: AppCoordinator,
+        viewModel: SimpleTimelineViewModel
+    ) {
+        if let window {
+            if window.frame != screen.frame {
+                window.setFrame(screen.frame, display: false)
+            }
+
+            if let hostingView, hostingView.superview == nil {
+                hostingView.frame = window.contentView?.bounds ?? .zero
+                window.contentView?.addSubview(hostingView)
+                hostingView.needsLayout = true
+                window.contentView?.needsLayout = true
+            }
+            return
+        }
+
+        guard let coordinatorWrapper else {
+            Log.error("[TIMELINE] Coordinator wrapper not initialized", category: .ui)
+            return
+        }
+
+        let window = createWindow(for: screen)
+        let timelineView = SimpleTimelineView(
+            coordinator: coordinator,
+            viewModel: viewModel,
+            onClose: { [weak self] in
+                self?.hide()
+            }
+        )
+        .environmentObject(coordinatorWrapper)
+
+        let hostingView = FirstMouseHostingView(rootView: timelineView)
+        hostingView.frame = window.contentView?.bounds ?? .zero
+        hostingView.autoresizingMask = [.width, .height]
+        window.contentView?.addSubview(hostingView)
+
+        self.window = window
+        self.hostingView = hostingView
+    }
+
+    private func destroyMountedPresentation() {
+        cancelDeferredHostingViewDetach()
+        cancelWindowFadeIn(reason: "destroyMountedPresentation")
+        cancelDeferredSearchOverlayRestore()
+        cancelDeferredLiveActivation()
+        liveModeCaptureTask?.cancel()
+        liveModeCaptureTask = nil
+        stopObservingApplicationActivation()
+        isHiding = false
+        presentationState = .hidden
+        Self.setEmergencyTimelineVisible(false)
+        timelineViewModel?.setPresentationWorkEnabled(false, reason: "destroyMountedPresentation")
+
+        window?.orderOut(nil)
+        hostingView?.removeFromSuperview()
+        hostingView = nil
+        window = nil
+    }
+
     /// Toggle timeline visibility
     public func toggle() {
-        if isVisible {
+        reconcileVisibilityState(reason: "toggle")
+        let actualVisible = isActuallyVisible
+        let action = Self.toggleAction(
+            presentationState: presentationState,
+            isActuallyVisible: actualVisible
+        )
+        if action == .hide {
             hide()
         } else {
             show()
@@ -844,7 +2046,7 @@ public class TimelineWindowController: NSObject {
     /// This prevents the dashboard from being auto-hidden when the timeline closes
     public func hideToShowDashboard() {
         isHidingToShowDashboard = true
-        hide()
+        hide(restorePreviousFocus: false)
     }
 
     /// Show the timeline and navigate to a specific date
@@ -853,9 +2055,344 @@ public class TimelineWindowController: NSObject {
 
         // Navigate after a brief delay to allow the view to initialize
         Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 300_000_000) // 0.3 seconds
+            try? await Task.sleep(for: .nanoseconds(Int64(300_000_000)), clock: .continuous) // 0.3 seconds
             await timelineViewModel?.navigateToHour(date)
         }
+    }
+
+    /// Show timeline and apply deeplink search state (`q`, `app`, `t`/`timestamp`).
+    public func showSearch(query: String?, timestamp: Date?, appBundleID: String?, source: String = "unknown") {
+        deeplinkSearchInvocationCounter += 1
+        let invocationID = deeplinkSearchInvocationCounter
+        Log.info(
+            "[DeeplinkSearch] Invocation #\(invocationID) source=\(source), query=\(query ?? "nil"), timestamp=\(String(describing: timestamp)), app=\(appBundleID ?? "nil")",
+            category: .ui
+        )
+
+        if let timestamp {
+            showAndNavigate(to: timestamp)
+        } else {
+            show()
+        }
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard self.coordinator != nil else {
+                Log.warning("[DeeplinkSearch] Invocation #\(invocationID) failed - timeline coordinator unavailable", category: .ui)
+                return
+            }
+            let viewModel = await self.awaitTimelineViewModelReady()
+
+            Log.info("[DeeplinkSearch] Invocation #\(invocationID) applying deeplink payload", category: .ui)
+            viewModel.applySearchDeeplink(query: query, appBundleID: appBundleID, source: source)
+        }
+    }
+
+    /// Show the timeline and open the spotlight search overlay, preserving any existing search state.
+    public func showSearchOverlay(
+        source: String = "unknown",
+        recentEntriesRevealDelay: TimeInterval = 0.3
+    ) {
+        Log.info(
+            "[TimelineSearchOverlay] showSearchOverlay source=\(source) isVisible=\(isVisible) searchOverlayVisible=\(timelineViewModel?.isSearchOverlayVisible ?? false)",
+            category: .ui
+        )
+        show()
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard self.coordinator != nil else {
+                Log.warning(
+                    "[TimelineSearchOverlay] Failed to open search overlay because the timeline coordinator is unavailable source=\(source)",
+                    category: .ui
+                )
+                return
+            }
+            let viewModel = await self.awaitTimelineViewModelReady()
+
+            _ = Self.presentSearchOverlay(
+                on: viewModel,
+                coordinator: self.coordinator,
+                recentEntriesRevealDelay: recentEntriesRevealDelay
+            )
+        }
+    }
+
+    @MainActor
+    private func awaitTimelineViewModelReady() async -> SimpleTimelineViewModel {
+        if let timelineViewModel {
+            return timelineViewModel
+        }
+
+        return await withCheckedContinuation { continuation in
+            pendingTimelineViewModelWaiters.append(continuation)
+        }
+    }
+
+    @discardableResult
+    static func presentSearchOverlay(
+        on viewModel: SimpleTimelineViewModel,
+        coordinator: AppCoordinator?,
+        recentEntriesRevealDelay: TimeInterval = 0.3
+    ) -> Bool {
+        let wasVisible = viewModel.isSearchOverlayVisible
+        viewModel.openSearchOverlay(recentEntriesRevealDelay: recentEntriesRevealDelay)
+
+        if !wasVisible, let coordinator {
+            DashboardViewModel.recordSearchDialogOpen(coordinator: coordinator)
+        }
+
+        return !wasVisible
+    }
+
+    private func setTimelineViewModel(_ viewModel: SimpleTimelineViewModel) {
+        timelineViewModel = viewModel
+
+        let waiters = pendingTimelineViewModelWaiters
+        pendingTimelineViewModelWaiters.removeAll(keepingCapacity: false)
+        for waiter in waiters {
+            waiter.resume(returning: viewModel)
+        }
+    }
+
+    private func isSingleAppOnlyIncludeFilter(_ criteria: FilterCriteria, matching bundleID: String? = nil) -> Bool {
+        guard criteria.appFilterMode == .include,
+              let selectedApps = criteria.selectedApps,
+              selectedApps.count == 1 else {
+            return false
+        }
+        if let bundleID {
+            guard selectedApps.contains(bundleID) else { return false }
+        }
+
+        let hasNoSources = criteria.selectedSources == nil || criteria.selectedSources?.isEmpty == true
+        let hasNoTags = criteria.selectedTags == nil || criteria.selectedTags?.isEmpty == true
+        let hasNoWindowFilter = criteria.windowNameFilter?.isEmpty ?? true
+        let hasNoBrowserFilter = criteria.browserUrlFilter?.isEmpty ?? true
+
+        return hasNoSources &&
+            criteria.hiddenFilter == .hide &&
+            criteria.commentFilter == .allFrames &&
+            hasNoTags &&
+            criteria.tagFilterMode == .include &&
+            hasNoWindowFilter &&
+            hasNoBrowserFilter &&
+            criteria.effectiveDateRanges.isEmpty
+    }
+
+    /// Resolve quick app filter trigger key from an NSEvent.
+    /// Supports Option+F.
+    private func quickAppFilterTrigger(for event: NSEvent, modifiers: NSEvent.ModifierFlags) -> String? {
+        let key = event.charactersIgnoringModifiers?.lowercased() ?? ""
+        if modifiers == [.option] && (key == "f" || event.keyCode == 3) {
+            return "Option+F"
+        }
+        return nil
+    }
+
+    /// Resolve add-tag shortcut key from an NSEvent.
+    /// Supports Cmd+T.
+    private func addTagShortcutTrigger(for event: NSEvent, modifiers: NSEvent.ModifierFlags) -> String? {
+        guard event.keyCode == 17 else { // T key
+            return nil
+        }
+        if modifiers == [.command] {
+            return "Cmd+T"
+        }
+        return nil
+    }
+
+    /// Resolve add-comment shortcut key from an NSEvent.
+    /// Supports Option+C.
+    private func addCommentShortcutTrigger(for event: NSEvent, modifiers: NSEvent.ModifierFlags) -> String? {
+        guard event.keyCode == 8 else { // C key
+            return nil
+        }
+        if modifiers == [.option] {
+            return "Option+C"
+        }
+        return nil
+    }
+
+    /// Resolve open-link shortcut key from an NSEvent.
+    /// Supports Cmd+Shift+L with both keycode and character fallback.
+    private func openLinkShortcutTrigger(for event: NSEvent, modifiers: NSEvent.ModifierFlags) -> String? {
+        let matchesLKey = event.keyCode == 37 || event.charactersIgnoringModifiers?.lowercased() == "l"
+        guard matchesLKey else { return nil }
+        return modifiers == [.command, .shift] ? "Cmd+Shift+L" : nil
+    }
+
+    /// Resolve copy-link shortcut key from an NSEvent.
+    /// Supports Cmd+L with both keycode and character fallback.
+    private func copyLinkShortcutTrigger(for event: NSEvent, modifiers: NSEvent.ModifierFlags) -> String? {
+        let matchesLKey = event.keyCode == 37 || event.charactersIgnoringModifiers?.lowercased() == "l"
+        guard matchesLKey else { return nil }
+        return modifiers == [.command] ? "Cmd+L" : nil
+    }
+
+    /// Resolve copy-YouTube-markdown shortcut key from an NSEvent.
+    /// Supports Option+Cmd+L with both keycode and character fallback.
+    private func copyYouTubeMarkdownLinkShortcutTrigger(
+        for event: NSEvent,
+        modifiers: NSEvent.ModifierFlags
+    ) -> String? {
+        let matchesLKey = event.keyCode == 37 || event.charactersIgnoringModifiers?.lowercased() == "l"
+        guard matchesLKey else { return nil }
+        return modifiers == [.command, .option] ? "Option+Cmd+L" : nil
+    }
+
+    /// Resolve copy-moment-link shortcut key from an NSEvent.
+    /// Supports Option+Shift+L with both keycode and character fallback.
+    private func copyMomentLinkShortcutTrigger(for event: NSEvent, modifiers: NSEvent.ModifierFlags) -> String? {
+        let matchesLKey = event.keyCode == 37 || event.charactersIgnoringModifiers?.lowercased() == "l"
+        guard matchesLKey else { return nil }
+        return modifiers == [.option, .shift] ? "Option+Shift+L" : nil
+    }
+
+    /// Toggle quick app filter for the app at the current playhead.
+    /// First press applies a single-app include filter, second press clears it.
+    private func togglePlayheadAppFilter(trigger: String) {
+        guard let viewModel = timelineViewModel else {
+            return
+        }
+
+        let shortcutMetric = trigger == "Option+F" ? "opt+f" : "cmd+f"
+        recordShortcut(shortcutMetric)
+
+        guard let currentFrame = viewModel.currentTimelineFrame else {
+            return
+        }
+
+        guard let bundleID = currentFrame.frame.metadata.appBundleID, !bundleID.isEmpty else {
+            return
+        }
+
+        if isSingleAppOnlyIncludeFilter(viewModel.filterCriteria, matching: bundleID) {
+            viewModel.beginCmdFQuickFilterLatencyTrace(
+                bundleID: bundleID,
+                action: "clear_app_filter",
+                trigger: trigger,
+                source: currentFrame.frame.source
+            )
+            viewModel.clearAllFilters()
+            return
+        }
+
+        viewModel.beginCmdFQuickFilterLatencyTrace(
+            bundleID: bundleID,
+            action: "apply_app_filter",
+            trigger: trigger,
+            source: currentFrame.frame.source
+        )
+
+        var criteria = FilterCriteria()
+        criteria.selectedApps = Set([bundleID])
+        criteria.appFilterMode = .include
+
+        // Use the same pending+apply path as the filter panel's Apply button.
+        viewModel.pendingFilterCriteria = criteria
+        viewModel.applyFilters()
+    }
+
+    /// Hide or unhide the visible segment block at the current playhead index.
+    private func hidePlayheadSegment(trigger _: String) {
+        guard let viewModel = timelineViewModel else { return }
+        guard !viewModel.frames.isEmpty else { return }
+
+        let clampedIndex = max(0, min(viewModel.currentIndex, viewModel.frames.count - 1))
+        viewModel.timelineContextMenuSegmentIndex = clampedIndex
+
+        let isShowingHiddenSegments = viewModel.filterCriteria.hiddenFilter != .hide
+        let isPlayheadSegmentHidden = viewModel.isFrameHidden(at: clampedIndex)
+
+        if isShowingHiddenSegments && isPlayheadSegmentHidden {
+            viewModel.unhideSelectedTimelineSegment()
+        } else {
+            viewModel.hideSelectedTimelineSegment()
+        }
+    }
+
+    /// Open the timeline segment "Add Tag" submenu for the current playhead index.
+    private func openAddTagSubmenuAtPlayhead(trigger _: String) {
+        guard let viewModel = timelineViewModel else {
+            return
+        }
+        guard !viewModel.frames.isEmpty else {
+            return
+        }
+
+        let clampedIndex = max(0, min(viewModel.currentIndex, viewModel.frames.count - 1))
+        let menuLocation = defaultTimelineContextMenuLocation()
+
+        viewModel.dismissOtherDialogs()
+
+        // Reset menu state before re-opening to avoid stale/half-mounted submenu state.
+        viewModel.timelineContextMenuSegmentIndex = clampedIndex
+        viewModel.timelineContextMenuLocation = menuLocation
+        viewModel.selectedFrameIndex = clampedIndex
+        viewModel.showTimelineContextMenu = false
+        viewModel.showTagSubmenu = false
+        viewModel.showNewTagInput = false
+        viewModel.newTagName = ""
+        viewModel.isHoveringAddTagButton = false
+
+        // Open context menu on next runloop, then load tags, then open submenu.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let viewModel = self.timelineViewModel else {
+                return
+            }
+            let liveIndex = max(0, min(viewModel.currentIndex, max(0, viewModel.frames.count - 1)))
+            viewModel.timelineContextMenuSegmentIndex = liveIndex
+            viewModel.timelineContextMenuLocation = menuLocation
+            viewModel.selectedFrameIndex = liveIndex
+            viewModel.showTimelineContextMenu = true
+            viewModel.isHoveringAddTagButton = true
+
+            Task { @MainActor in
+                await viewModel.loadTags()
+
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, let viewModel = self.timelineViewModel else {
+                        return
+                    }
+                    // Re-assert menu visibility before opening submenu.
+                    viewModel.showTimelineContextMenu = true
+                    viewModel.isHoveringAddTagButton = true
+                    viewModel.recordTagSubmenuOpen(source: "keyboard_cmd_t")
+                    withAnimation(.easeOut(duration: 0.12)) {
+                        viewModel.showTagSubmenu = true
+                    }
+                }
+            }
+        }
+    }
+
+    /// Open the timeline segment "Add Comment" composer for the current playhead index.
+    private func openAddCommentComposerAtPlayhead(source: String) {
+        guard let viewModel = timelineViewModel else {
+            return
+        }
+        guard !viewModel.frames.isEmpty else {
+            return
+        }
+
+        let clampedIndex = max(0, min(viewModel.currentIndex, viewModel.frames.count - 1))
+        guard let block = viewModel.getBlock(forFrameAt: clampedIndex) else {
+            return
+        }
+
+        viewModel.dismissOtherDialogs()
+        withAnimation(.easeOut(duration: 0.15)) {
+            viewModel.openCommentSubmenuForTimelineBlock(block, source: source)
+        }
+    }
+
+    private func defaultTimelineContextMenuLocation() -> CGPoint {
+        guard let contentView = window?.contentView else {
+            return .zero
+        }
+        let size = contentView.bounds.size
+        return CGPoint(x: size.width * 0.5, y: max(48, size.height - 140))
     }
 
     /// Show the timeline with a pre-applied filter for an app and window name
@@ -866,7 +2403,6 @@ public class TimelineWindowController: NSObject {
     ///   - clickStartTime: Optional start time from when the tab was clicked (for end-to-end timing)
     public func showWithFilter(bundleID: String, windowName: String?, browserUrl: String? = nil, startDate: Date? = nil, endDate: Date? = nil, clickStartTime: CFAbsoluteTime? = nil) {
         let startTime = clickStartTime ?? CFAbsoluteTimeGetCurrent()
-        logTabClickTiming("TIMELINE_SHOW_WITH_FILTER", startTime: startTime, bundleID: bundleID, browserUrl: browserUrl)
 
         // Build the filter criteria upfront
         var criteria = FilterCriteria()
@@ -883,41 +2419,39 @@ public class TimelineWindowController: NSObject {
 
         // Prepare window invisibly first (don't show yet)
         prepareWindowInvisibly()
-        logTabClickTiming("WINDOW_PREPARED_INVISIBLY", startTime: startTime, bundleID: bundleID, browserUrl: browserUrl)
 
         // Load data, then fade in once ready
         Task { @MainActor in
             guard let viewModel = timelineViewModel, let coordinator = coordinator else { return }
 
+            // Dashboard-driven timeline opens should not carry stale search highlight overlays.
+            viewModel.resetSearchHighlightState()
+
             // Apply the filter criteria to viewModel
             viewModel.filterCriteria = criteria
             viewModel.pendingFilterCriteria = criteria
-            logTabClickTiming("TIMELINE_FILTER_SET", startTime: startTime, bundleID: bundleID, browserUrl: browserUrl)
 
-            // Query and load timeline payloads
-            logTabClickTiming("QUERY_START", startTime: startTime, bundleID: bundleID, browserUrl: browserUrl)
-            let timelinePayloads = try? await coordinator.getMostRecentTimelineFramesWithSecondaries(limit: 500, filters: criteria)
-            logTabClickTiming("QUERY_DONE (count=\(timelinePayloads?.count ?? 0))", startTime: startTime, bundleID: bundleID, browserUrl: browserUrl)
+            // Query and load frames
+            let frames = try? await coordinator.getMostRecentFramesWithVideoInfo(limit: 50, filters: criteria)
 
             // Load frames directly into viewModel
-            await viewModel.loadFramesDirectly(timelinePayloads ?? [], clickStartTime: startTime)
-            logTabClickTiming("FRAMES_LOADED", startTime: startTime, bundleID: bundleID, browserUrl: browserUrl)
+            await viewModel.loadFramesDirectly(frames ?? [], clickStartTime: startTime)
 
             // Small delay to let the view settle before fade-in
-            try? await Task.sleep(nanoseconds: 100_000_000) // 0.1 seconds
+            try? await Task.sleep(for: .nanoseconds(Int64(100_000_000)), clock: .continuous) // 0.1 seconds
 
             // Now fade in the window with data already loaded
             fadeInPreparedWindow()
-            logTabClickTiming("FADE_IN_STARTED", startTime: startTime, bundleID: bundleID, browserUrl: browserUrl)
 
-            Log.info("[TIMELINE-FILTER] Applied filter for bundleID=\(bundleID), windowName=\(windowName ?? "nil"), browserUrl=\(browserUrl ?? "nil"), dateRange=\(String(describing: startDate))-\(String(describing: endDate))", category: .ui)
         }
     }
 
     /// Prepare the window invisibly without showing it yet
     /// Used by showWithFilter to load data before revealing
     private func prepareWindowInvisibly() {
+        reconcileVisibilityState(reason: "prepareWindowInvisibly")
         guard !isVisible, let coordinator = coordinator else { return }
+        captureFocusRestoreTarget()
 
         // Remember if dashboard was the key window before we take over
         dashboardWasKeyWindow = DashboardWindowController.shared.isVisible &&
@@ -929,65 +2463,29 @@ public class TimelineWindowController: NSObject {
             return
         }
 
-        // Check if we have a pre-rendered window ready
-        if isPrepared, let window = window, let viewModel = timelineViewModel {
-            // Reattach SwiftUI view if it was detached (on hide, we remove it from superview to stop display cycle)
-            if let hostingView = hostingView, hostingView.superview == nil {
-                hostingView.frame = window.contentView?.bounds ?? .zero
-                window.contentView?.addSubview(hostingView)
-                hostingView.layoutSubtreeIfNeeded()
-                timelineViewModel?.objectWillChange.send()
-            }
-            // Move window to target screen if needed
-            if window.frame != targetScreen.frame {
-                window.setFrame(targetScreen.frame, display: false)
-            }
-            // Ensure tape starts hidden for slide-up animation
-            viewModel.isTapeHidden = true
-            return
-        }
+        let viewModel = ensurePreparedViewModel(coordinator: coordinator)
 
-        // Create window from scratch if needed
-        let newWindow = createWindow(for: targetScreen)
-        let viewModel = SimpleTimelineViewModel(coordinator: coordinator)
-        self.timelineViewModel = viewModel
-        // Pre-set tape as hidden so view renders with tape off-screen initially
-        viewModel.isTapeHidden = true
-
-        guard let coordinatorWrapper = coordinatorWrapper else {
-            Log.error("[TIMELINE] Coordinator wrapper not initialized", category: .ui)
-            return
-        }
-
-        let timelineView = SimpleTimelineView(
+        mountPresentationIfNeeded(
+            on: targetScreen,
             coordinator: coordinator,
-            viewModel: viewModel,
-            onClose: { [weak self] in
-                self?.hide()
-            }
+            viewModel: viewModel
         )
-        .environmentObject(coordinatorWrapper)
 
-        let hostingView = FirstMouseHostingView(rootView: timelineView)
-        hostingView.frame = newWindow.contentView?.bounds ?? .zero
-        hostingView.autoresizingMask = [.width, .height]
-        newWindow.contentView?.addSubview(hostingView)
-
-        self.window = newWindow
-        self.hostingView = hostingView
-        self.isPrepared = true
-            }
+        // Ensure tape starts hidden for slide-up animation
+        viewModel.isTapeHidden = true
+    }
 
     /// Fade in the prepared window (called after data is loaded)
     private func fadeInPreparedWindow() {
         guard let window = window, let coordinator = coordinator else { return }
+        cancelWindowFadeIn(reason: "fadeInPreparedWindow")
 
         // Reattach SwiftUI view if it was detached (on hide, we remove it from superview to stop display cycle)
         if let hostingView = hostingView, hostingView.superview == nil {
             hostingView.frame = window.contentView?.bounds ?? .zero
             window.contentView?.addSubview(hostingView)
-            hostingView.layoutSubtreeIfNeeded()
-            timelineViewModel?.objectWillChange.send()
+            hostingView.needsLayout = true
+            window.contentView?.needsLayout = true
         }
 
         // Ensure tape starts hidden and cancel any pending animation
@@ -1006,16 +2504,25 @@ public class TimelineWindowController: NSObject {
         window.alphaValue = 0
         // Re-enable mouse events before showing (was disabled while hidden to prevent blocking clicks)
         window.ignoresMouseEvents = false
+        window.collectionBehavior.remove(.canJoinAllSpaces)
+        window.collectionBehavior.insert(.moveToActiveSpace)
+        // Mark visible before activation to avoid activation-time dashboard reveal
+        // races that can switch Spaces on some machines.
+        presentationState = .showing
+        Self.setEmergencyTimelineVisible(true)
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
-        isVisible = true
-        Self.isTimelineVisible = true
+        presentationState = .visible
+        startObservingApplicationActivation()
+        if let hostingView = hostingView {
+            DispatchQueue.main.async { [weak hostingView] in
+                hostingView?.layoutSubtreeIfNeeded()
+            }
+        }
 
-        NSAnimationContext.runAnimationGroup({ context in
-            context.duration = 0.35
-            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            window.animator().alphaValue = 1
-        })
+        if let viewModel = timelineViewModel {
+            scheduleHistoricalFadeIn(window: window, viewModel: viewModel)
+        }
 
         // Trigger tape slide-up animation
         tapeShowAnimationTask = Task { @MainActor in
@@ -1033,33 +2540,49 @@ public class TimelineWindowController: NSObject {
         setupEventMonitors()
 
         // Notify coordinator to pause frame processing
-        Task {
-            await coordinator.setTimelineVisible(true)
-        }
+        scheduleCoordinatorTimelineVisible(true)
 
         // Post notification so menu bar can hide recording indicator
         NotificationCenter.default.post(name: .timelineDidOpen, object: nil)
     }
 
-    // MARK: - Tab Click Timing
+    private func cancelWindowFadeIn(reason _: String) {
+        windowFadeInTask?.cancel()
+        windowFadeInTask = nil
+        windowFadeInGeneration &+= 1
+    }
 
-    private static let tabClickLogPath = URL(fileURLWithPath: "/tmp/retrace_debug.log")
+    private func scheduleHistoricalFadeIn(window: NSWindow, viewModel: SimpleTimelineViewModel) {
+        cancelWindowFadeIn(reason: "scheduleHistoricalFadeIn")
+        windowFadeInGeneration &+= 1
+        let generation = windowFadeInGeneration
+        windowFadeInTask = Task { @MainActor [weak self, weak viewModel] in
+            guard let self, let viewModel else { return }
 
-    /// Log timing for tab click filter queries
-    private func logTabClickTiming(_ checkpoint: String, startTime: CFAbsoluteTime, bundleID: String, browserUrl: String?) {
-        let elapsed = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
-        let filterInfo = browserUrl ?? bundleID
-        let line = "[\(Log.timestamp())] [TAB_CLICK] \(checkpoint): \(String(format: "%.1f", elapsed))ms (filter: \(filterInfo))\n"
+            _ = await viewModel.prepareHistoricalOpenStillFallbackIfNeeded()
 
-        if let data = line.data(using: .utf8) {
-            if FileManager.default.fileExists(atPath: Self.tabClickLogPath.path) {
-                if let handle = try? FileHandle(forWritingTo: Self.tabClickLogPath) {
-                    handle.seekToEndOfFile()
-                    handle.write(data)
-                    handle.closeFile()
-                }
-            } else {
-                try? data.write(to: Self.tabClickLogPath)
+            guard !Task.isCancelled,
+                  self.windowFadeInGeneration == generation,
+                  self.isVisible,
+                  !self.isHiding,
+                  self.window === window,
+                  self.timelineViewModel === viewModel else {
+                return
+            }
+
+            await NSAnimationContext.runAnimationGroup({ context in
+                context.duration = 0.35
+                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                window.animator().alphaValue = 1
+            })
+
+            self.scheduleDeferredSearchOverlayRestoreIfNeeded(
+                viewModel: viewModel,
+                isLiveMode: false
+            )
+
+            if self.windowFadeInGeneration == generation {
+                self.windowFadeInTask = nil
             }
         }
     }
@@ -1068,12 +2591,13 @@ public class TimelineWindowController: NSObject {
 
     private func createWindow(for screen: NSScreen) -> NSWindow {
         // Use custom window subclass that can become key even when borderless
-        let window = KeyableWindow(
+        let window = KeyablePanel(
             contentRect: screen.frame,
-            styleMask: [.borderless],
+            styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
+        window.delegate = self
 
         // Configure window properties
         window.level = .screenSaver
@@ -1083,21 +2607,43 @@ public class TimelineWindowController: NSObject {
         window.hasShadow = false
         window.ignoresMouseEvents = false
         window.acceptsMouseMovedEvents = true
-        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        window.hidesOnDeactivate = false
+        // Keep timeline opens deterministic across machines/Spaces:
+        // move the overlay to the active Desktop at open time instead of
+        // relying on "join all Spaces" behavior, which can vary with user settings.
+        window.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary, .stationary]
 
         // Make it cover the entire screen including menu bar
         window.setFrame(screen.frame, display: true)
 
-        // Create content view with dark background
+        // Create content view with transparent background.
+        // SwiftUI controls the visible backdrop (black during normal mode,
+        // transparent while awaiting live screenshot when requested).
         let contentView = NSView(frame: screen.frame)
         contentView.wantsLayer = true
-        contentView.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.95).cgColor
+        contentView.layer?.backgroundColor = NSColor.clear.cgColor
         window.contentView = contentView
 
         return window
     }
 
     // MARK: - Event Monitoring
+
+}
+
+// MARK: - NSWindowDelegate
+
+extension TimelineWindowController: NSWindowDelegate {
+    public func windowWillClose(_ notification: Notification) {
+        guard let closedWindow = notification.object as? NSWindow, closedWindow === window else {
+            return
+        }
+        synchronizeHiddenStateAfterExternalDismissal(reason: "windowWillClose")
+    }
+}
+
+@MainActor
+extension TimelineWindowController {
 
     private func setupEventMonitors() {
         // Monitor for mouse events to handle click-drag scrubbing on the timeline tape
@@ -1110,7 +2656,17 @@ public class TimelineWindowController: NSObject {
                 guard !event.modifierFlags.contains(.shift) else { return event }
 
                 // Check if the click is in the tape area
-                if self.isPointInTapeArea(event.locationInWindow) {
+                let clickPoint = event.locationInWindow
+                let isInTapeArea = self.isPointInTapeArea(clickPoint)
+                let startedNearPlaybackControls = self.isPointNearPlaybackControls(clickPoint)
+
+                // Playback controls (play/pause + speed menu) should always receive click
+                // completion; don't prime tape drag in this region.
+                if startedNearPlaybackControls {
+                    return event
+                }
+
+                if isInTapeArea {
                     // Don't start drag if overlays are open
                     if let viewModel = self.timelineViewModel,
                        !viewModel.isSearchOverlayVisible,
@@ -1121,8 +2677,10 @@ public class TimelineWindowController: NSObject {
                         // Cancel any ongoing momentum from a previous drag
                         viewModel.cancelTapeDragMomentum()
 
-                        self.tapeDragStartX = event.locationInWindow.x
-                        self.tapeDragLastX = event.locationInWindow.x
+                        self.tapeDragStartX = clickPoint.x
+                        self.tapeDragLastX = clickPoint.x
+                        self.tapeDragStartPoint = clickPoint
+                        self.tapeDragStartedNearPlaybackControls = startedNearPlaybackControls
                         self.isTapeDragging = true
                         self.tapeDragDidExceedThreshold = false
                         self.tapeDragVelocitySamples.removeAll()
@@ -1147,7 +2705,7 @@ public class TimelineWindowController: NSObject {
                                     if !viewModel.isActivelyScrolling {
                                         viewModel.isActivelyScrolling = true
                                         viewModel.dismissContextMenu()
-                                        viewModel.dismissTimelineContextMenu()
+                                        viewModel.dismissTimelineContextMenu(reason: .scroll)
                                     }
                                 }
                             }
@@ -1208,8 +2766,12 @@ public class TimelineWindowController: NSObject {
                                 viewModel.endTapeDrag(withVelocity: scrollVelocity)
                             }
                         }
+                        self.tapeDragStartedNearPlaybackControls = false
+                        self.tapeDragStartPoint = .zero
                         return nil // Consume the event
                     }
+                    self.tapeDragStartedNearPlaybackControls = false
+                    self.tapeDragStartPoint = .zero
                     // If we never exceeded the threshold, let the event through
                     // so .onTapGesture on FrameSegmentView can handle it
                 }
@@ -1225,46 +2787,138 @@ public class TimelineWindowController: NSObject {
 
         // Monitor for all key events globally (when timeline is visible but not key window)
         eventMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.keyDown, .scrollWheel, .magnify]) { [weak self] event in
+            guard let self else { return }
+
             if event.type == .keyDown {
-                self?.handleKeyEvent(event)
+                // Ignore timeline keyboard shortcuts while another app is frontmost.
+                guard self.shouldHandleTimelineKeyboardShortcuts() else {
+                    return
+                }
+                let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
+                let openLinkTrigger = self.openLinkShortcutTrigger(for: event, modifiers: modifiers)
+                let copyLinkTrigger = self.copyLinkShortcutTrigger(for: event, modifiers: modifiers)
+                let copyMomentLinkTrigger = self.copyMomentLinkShortcutTrigger(for: event, modifiers: modifiers)
+                // Keep Option+C local to the timeline window; do not react globally.
+                if self.addCommentShortcutTrigger(for: event, modifiers: modifiers) != nil {
+                    return
+                }
+                if openLinkTrigger != nil || copyLinkTrigger != nil || copyMomentLinkTrigger != nil {
+                    self.handleKeyEvent(event)
+                    return
+                }
+                self.handleKeyEvent(event)
             } else if event.type == .scrollWheel {
-                // Don't handle scroll events when SwiftUI overlays need native ScrollView handling.
-                if let viewModel = self?.timelineViewModel,
-                   (viewModel.isSearchOverlayVisible ||
+                // Don't handle scroll events when search UI, filter dropdown, or tag submenu should own wheel input.
+                if let viewModel = self.timelineViewModel,
+                   (viewModel.searchViewModel.isRecentEntriesPopoverVisible ||
+                    (viewModel.isSearchOverlayVisible &&
+                     (viewModel.searchViewModel.isDropdownOpen || viewModel.searchViewModel.isSearchOverlayExpanded)) ||
                     viewModel.isFilterDropdownOpen ||
-                    viewModel.showTagSubmenu ||
-                    viewModel.isDisplayStackHovering) {
+                    (viewModel.showTagSubmenu || viewModel.isDisplayStackHovering)) {
                     return // Let SwiftUI handle it
                 }
-                self?.handleScrollEvent(event)
+                self.handleScrollEvent(event, source: "GLOBAL")
             } else if event.type == .magnify {
-                self?.handleMagnifyEvent(event)
+                self.handleMagnifyEvent(event)
             }
         }
 
         // Also monitor local events (when our window is key)
         localEventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .scrollWheel, .magnify]) { [weak self] event in
             if event.type == .keyDown {
-                // Check if a text field is currently active
-                let isTextFieldActive: Bool
-                if let window = self?.window,
-                   let firstResponder = window.firstResponder {
-                    isTextFieldActive = firstResponder is NSTextView || firstResponder is NSTextField
-                } else {
-                    isTextFieldActive = false
-                }
+                let isTextFieldActive: Bool = {
+                    guard let window = self?.window,
+                          let firstResponder = window.firstResponder else {
+                        return false
+                    }
+                    return firstResponder is NSTextView || firstResponder is NSTextField
+                }()
 
                 // Always handle certain shortcuts even when text field is active
                 let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
+                let openLinkTrigger = self?.openLinkShortcutTrigger(for: event, modifiers: modifiers)
+                let copyLinkTrigger = self?.copyLinkShortcutTrigger(for: event, modifiers: modifiers)
+                let copyYouTubeMarkdownLinkTrigger = self?.copyYouTubeMarkdownLinkShortcutTrigger(for: event, modifiers: modifiers)
+                let copyMomentLinkTrigger = self?.copyMomentLinkShortcutTrigger(for: event, modifiers: modifiers)
+                if event.keyCode == 53 { // Escape
+                    if self?.handleKeyEvent(event) == true {
+                        return nil // Always consume when handled
+                    }
 
-                // Cmd+K to toggle search overlay
-                if event.keyCode == 40 && modifiers == [.command] { // Cmd+K
+                    return event
+                }
+
+                if Self.isFrameTextScanShortcut(keyCode: event.keyCode, modifiers: modifiers) {
+                    if self?.handleKeyEvent(event) == true { return nil }
+                }
+
+                // Cmd+F toggles in-frame search even when the in-frame text field is focused.
+                if event.keyCode == 3 && modifiers == [.command] { // Cmd+F
                     _ = self?.handleKeyEvent(event)
                     return nil // Always consume the event to prevent propagation
                 }
 
-                // Cmd+F to toggle filter panel
-                if event.keyCode == 3 && modifiers == [.command] { // Cmd+F
+                // Cmd+W dismisses the timeline even when a timeline text field is focused.
+                if Self.shouldDismissTimelineWithCommandW(
+                    keyCode: event.keyCode,
+                    charactersIgnoringModifiers: event.charactersIgnoringModifiers,
+                    modifiers: modifiers
+                ) {
+                    if self?.handleKeyEvent(event) == true {
+                        return nil
+                    }
+                    return event
+                }
+
+                // When in-frame search text field is focused, let AppKit own other key handling
+                // (selection, clipboard, caret movement, etc.) so timeline shortcuts don't fire.
+                let isInFrameSearchFieldActive: Bool = {
+                    guard isTextFieldActive,
+                          let viewModel = self?.timelineViewModel else {
+                        return false
+                    }
+                    return viewModel.isInFrameSearchVisible
+                }()
+                if isInFrameSearchFieldActive {
+                    if openLinkTrigger == nil
+                        && copyLinkTrigger == nil
+                        && copyYouTubeMarkdownLinkTrigger == nil {
+                        return event
+                    }
+                }
+
+                // Cmd+K to toggle search overlay
+                if event.keyCode == 40 && modifiers == [.command] { // Cmd+K
+                    if let viewModel = self?.timelineViewModel,
+                       viewModel.showCommentSubmenu,
+                       isTextFieldActive {
+                        // Let the in-modal text editor own Cmd+K for link insertion.
+                        return event
+                    }
+                    _ = self?.handleKeyEvent(event)
+                    return nil // Always consume the event to prevent propagation
+                }
+
+                // Option+H to hide the segment at playhead
+                if event.keyCode == 4 && modifiers == [.option] { // Option+H
+                    _ = self?.handleKeyEvent(event)
+                    return nil // Always consume the event to prevent propagation
+                }
+
+                // Add Tag submenu shortcut for segment at playhead (Cmd+T)
+                if self?.addTagShortcutTrigger(for: event, modifiers: modifiers) != nil {
+                    _ = self?.handleKeyEvent(event)
+                    return nil // Always consume the event to prevent propagation
+                }
+
+                // Option+F to quick-filter by the app at playhead
+                if self?.quickAppFilterTrigger(for: event, modifiers: modifiers) != nil {
+                    _ = self?.handleKeyEvent(event)
+                    return nil // Always consume the event to prevent propagation
+                }
+
+                // Cmd+Shift+F to toggle filter panel
+                if event.keyCode == 3 && modifiers == [.command, .shift] { // Cmd+Shift+F
                     _ = self?.handleKeyEvent(event)
                     return nil // Always consume the event to prevent propagation
                 }
@@ -1294,10 +2948,16 @@ public class TimelineWindowController: NSObject {
                 }
 
                 // Cmd+A to select all (handle before system can intercept)
-                // But let it pass through when a dialog with text input is active
+                // But let active text inputs and input-owning overlays keep standard select-all behavior.
                 if event.keyCode == 0 && modifiers == [.command] {
-                    if let viewModel = self?.timelineViewModel,
-                       (viewModel.isSearchOverlayVisible || viewModel.isFilterPanelVisible || viewModel.isDateSearchActive) {
+                    let shouldDeferToTextInput = Self.shouldDeferCommandAToTextInput(
+                        isTextFieldActive: isTextFieldActive,
+                        isSearchOverlayVisible: self?.timelineViewModel?.isSearchOverlayVisible ?? false,
+                        isFilterPanelVisible: self?.timelineViewModel?.isFilterPanelVisible ?? false,
+                        isDateSearchActive: self?.timelineViewModel?.isDateSearchActive ?? false,
+                        isCommentSubmenuVisible: self?.timelineViewModel?.showCommentSubmenu ?? false
+                    )
+                    if shouldDeferToTextInput {
                         return event // Let the text field handle Cmd+A
                     }
                     _ = self?.handleKeyEvent(event)
@@ -1305,7 +2965,32 @@ public class TimelineWindowController: NSObject {
                 }
 
                 // Cmd+C to copy (handle before system can intercept)
-                if event.keyCode == 8 && modifiers == [.command] {
+                if event.charactersIgnoringModifiers == "c" && modifiers == [.command] {
+                    // When editing text (e.g., filter fields), let AppKit handle Cmd+C.
+                    if isTextFieldActive {
+                        return event
+                    }
+                    _ = self?.handleKeyEvent(event)
+                    return nil // Always consume the event to prevent propagation
+                }
+
+                // Cmd+S to save image (handle before system can intercept)
+                if event.charactersIgnoringModifiers == "s" && modifiers == [.command] {
+                    _ = self?.handleKeyEvent(event)
+                    return nil // Always consume the event to prevent propagation
+                }
+
+                // Link shortcuts (Cmd+L / Cmd+Shift+L / Option+Cmd+L / Option+Shift+L): handle before AppKit key-equivalent fallback.
+                if openLinkTrigger != nil
+                    || copyLinkTrigger != nil
+                    || copyYouTubeMarkdownLinkTrigger != nil
+                    || copyMomentLinkTrigger != nil {
+                    _ = self?.handleKeyEvent(event)
+                    return nil // Always consume to avoid dead-end beep
+                }
+
+                // Cmd+; to toggle more options menu (handle before system can intercept)
+                if event.charactersIgnoringModifiers == ";" && modifiers == [.command] {
                     _ = self?.handleKeyEvent(event)
                     return nil // Always consume the event to prevent propagation
                 }
@@ -1337,29 +3022,32 @@ public class TimelineWindowController: NSObject {
                     return nil // Consume the event
                 }
             } else if event.type == .scrollWheel {
-                // Allow scrolling timeline while search overlay is open (don't block)
-                // Don't intercept scroll events when a filter dropdown is open
-                // Let SwiftUI ScrollView handle them for scrolling through the dropdown list
-                if let viewModel = self?.timelineViewModel, viewModel.isFilterDropdownOpen {
-                    return event // Let the dropdown ScrollView handle it
+                // Let UI overlays consume scrolling before timeline navigation.
+                if let viewModel = self?.timelineViewModel {
+                    // Comment overlay thread/composer are scrollable and should own wheel events.
+                    if viewModel.showCommentSubmenu {
+                        return event
+                    }
+                    // Filter-panel popovers are ScrollViews.
+                    if viewModel.isFilterDropdownOpen {
+                        return event
+                    }
+                    // Timeline context-menu tag submenu is also scrollable.
+                    if viewModel.showTagSubmenu || viewModel.isDisplayStackHovering {
+                        return event
+                    }
+                    // The recent-entry popover should own wheel events while open.
+                    if viewModel.searchViewModel.isRecentEntriesPopoverVisible {
+                        return event
+                    }
+                    // Expanded search overlay (and its dropdowns) should own wheel events.
+                    if viewModel.isSearchOverlayVisible &&
+                        (viewModel.searchViewModel.isDropdownOpen ||
+                         viewModel.searchViewModel.isSearchOverlayExpanded) {
+                        return event
+                    }
                 }
-                // Don't intercept scroll events when the tag submenu is open
-                // Let SwiftUI ScrollView handle them for scrolling through tags
-                if let viewModel = self?.timelineViewModel, viewModel.showTagSubmenu {
-                    return event // Let the tag submenu ScrollView handle it
-                }
-                // Don't intercept scroll events while hovering the display stack panel.
-                // Let its internal ScrollView consume wheel/trackpad input.
-                if let viewModel = self?.timelineViewModel, viewModel.isDisplayStackHovering {
-                    return event
-                }
-                // Don't intercept scroll events when search overlay is open with results
-                // Prioritize scrolling the search results over timeline navigation
-                if let viewModel = self?.timelineViewModel,
-                   viewModel.isSearchOverlayVisible && !viewModel.searchViewModel.searchQuery.isEmpty {
-                    return event // Let the search results ScrollView handle it
-                }
-                self?.handleScrollEvent(event)
+                self?.handleScrollEvent(event, source: "LOCAL")
                 return nil // Consume scroll events
             } else if event.type == .magnify {
                 self?.handleMagnifyEvent(event)
@@ -1387,8 +3075,21 @@ public class TimelineWindowController: NSObject {
         }
     }
 
+    static func isFrameTextScanShortcut(keyCode: UInt16, modifiers: NSEvent.ModifierFlags) -> Bool {
+        keyCode == 31 && modifiers.intersection([.command, .shift, .option, .control]) == [.command, .shift]
+    }
+
     @discardableResult
     private func handleKeyEvent(_ event: NSEvent) -> Bool {
+        guard shouldHandleTimelineKeyboardShortcuts(for: event) else {
+            return false
+        }
+
+        let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
+        let addTagTrigger = addTagShortcutTrigger(for: event, modifiers: modifiers)
+        let addCommentTrigger = addCommentShortcutTrigger(for: event, modifiers: modifiers)
+        let isAddTagShortcut = addTagTrigger != nil
+
         // Don't handle escape if a modal panel (save panel, etc.) is open
         if NSApp.modalWindow != nil {
             return false
@@ -1396,12 +3097,58 @@ public class TimelineWindowController: NSObject {
 
         // Don't handle escape if our window is not the key window (e.g., save panel is open)
         if let keyWindow = NSApp.keyWindow, keyWindow != window {
-            return false
+            // Option+C must remain timeline-local; don't steal focus for it.
+            if isAddTagShortcut {
+                NSApp.activate(ignoringOtherApps: true)
+                window?.makeKeyAndOrderFront(nil)
+            } else {
+                return false
+            }
+        }
+
+        if Self.isFrameTextScanShortcut(keyCode: event.keyCode, modifiers: modifiers) {
+            timelineViewModel?.scanCurrentFrameText(source: "keyboard")
+            return true
         }
 
         // Escape key - cascading behavior based on current state
         if event.keyCode == 53 { // Escape
             if let viewModel = timelineViewModel {
+                // If the tag submenu is open, close only the submenu first and keep
+                // the parent right-click menu visible.
+                if viewModel.showTagSubmenu {
+                    withAnimation(.easeOut(duration: 0.12)) {
+                        viewModel.showTagSubmenu = false
+                        viewModel.showNewTagInput = false
+                        viewModel.newTagName = ""
+                        viewModel.isHoveringAddTagButton = false
+                    }
+                    return true
+                }
+                // If the comment link popover is open, close it first.
+                if viewModel.showCommentSubmenu && viewModel.isCommentLinkPopoverPresented {
+                    viewModel.requestCloseCommentLinkPopover()
+                    return true
+                }
+                // In all-comments browser mode, Escape should return to local thread comments
+                // before dismissing the full comment submenu.
+                if viewModel.showCommentSubmenu && viewModel.isAllCommentsBrowserActive {
+                    viewModel.requestReturnToThreadComments()
+                    return true
+                }
+                // Close comment submenu with its dedicated fade-out path.
+                if viewModel.showCommentSubmenu {
+                    viewModel.dismissCommentSubmenu()
+                    return true
+                }
+                // Right-click menus should dismiss before any higher-level escape behavior.
+                if viewModel.showTimelineContextMenu || viewModel.showContextMenu || viewModel.showCommentSubmenu {
+                    withAnimation(.easeOut(duration: 0.12)) {
+                        viewModel.dismissContextMenu()
+                        viewModel.dismissTimelineContextMenu()
+                    }
+                    return true
+                }
                 // If currently dragging to create zoom region, cancel the drag
                 if viewModel.isDraggingZoomRegion {
                     viewModel.cancelZoomRegionDrag()
@@ -1410,9 +3157,7 @@ public class TimelineWindowController: NSObject {
                 // If calendar picker is showing, close it first with animation
                 if viewModel.isCalendarPickerVisible {
                     withAnimation(.spring(response: 0.25, dampingFraction: 0.9)) {
-                        viewModel.isCalendarPickerVisible = false
-                        viewModel.hoursWithFrames = []
-                        viewModel.selectedCalendarDate = nil
+                        viewModel.closeCalendarPicker()
                     }
                     return true
                 }
@@ -1428,9 +3173,44 @@ public class TimelineWindowController: NSObject {
                     viewModel.closeDateSearch()
                     return true
                 }
-                // If search overlay is showing, close it
+                // If recent entries popover is open, hide it before dismissing search overlay.
+                if viewModel.isSearchOverlayVisible && viewModel.searchViewModel.isRecentEntriesPopoverVisible {
+                    viewModel.searchViewModel.requestDismissRecentEntriesPopoverByUser()
+                    return true
+                }
+                // If search overlay is visible and a filter dropdown is open, close the dropdown first.
+                if viewModel.isSearchOverlayVisible && viewModel.searchViewModel.isDropdownOpen {
+                    // When date popover calendar is open, let the popover consume Escape first
+                    // so it can collapse calendar before the entire dropdown is dismissed.
+                    if viewModel.searchViewModel.isDatePopoverHandlingKeys {
+                        return false
+                    }
+                    viewModel.searchViewModel.closeDropdownsSignal += 1
+                    return true
+                }
+                // If search overlay is expanded with no submitted query/results payload,
+                // collapse to compact mode and clear active filters instead of dismissing.
                 if viewModel.isSearchOverlayVisible {
-                    viewModel.isSearchOverlayVisible = false
+                    let searchViewModel = viewModel.searchViewModel
+                    if searchViewModel.isSearchOverlayExpanded &&
+                        !searchViewModel.shouldDismissExpandedOverlayOnEscape {
+                        searchViewModel.clearAllFilters()
+                        searchViewModel.resetSearchOrderToDefault()
+                        searchViewModel.requestOverlayCollapse()
+                        return true
+                    }
+                    if searchViewModel.shouldRefocusSearchFieldOnEscape {
+                        searchViewModel.requestSearchFieldFocus(selectAll: true)
+                        return true
+                    }
+
+                    // Otherwise keep existing behavior: dismiss the overlay.
+                    searchViewModel.requestOverlayDismiss(clearSearchState: true)
+                    return true
+                }
+                // If in-frame search is active, close it before falling through to timeline close.
+                if viewModel.isInFrameSearchVisible || !viewModel.inFrameSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    viewModel.closeInFrameSearch(clearQuery: true)
                     return true
                 }
                 // If search highlight is showing, clear it and return to search results if available
@@ -1462,10 +3242,14 @@ public class TimelineWindowController: NSObject {
                     viewModel.exitPeek()
                     return true
                 }
-                // If filter panel is visible with open dropdown, let the panel handle it
+                // If filter panel is visible with an open dropdown, close dropdown first.
+                // This avoids falling through to timeline close when a dropdown-level Escape
+                // handler does not consume the event in time.
                 if viewModel.isFilterPanelVisible && viewModel.isFilterDropdownOpen {
-                    // The FilterPanel's NSEvent monitor will handle this
-                    return false
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        viewModel.dismissFilterDropdown()
+                    }
+                    return true
                 }
                 // If filter panel is visible (no dropdown), close it
                 if viewModel.isFilterPanelVisible {
@@ -1474,18 +3258,41 @@ public class TimelineWindowController: NSObject {
                     }
                     return true
                 }
+                // If filters are active (but panel is closed), clear them
+                if viewModel.filterCriteria.hasActiveFilters {
+                    viewModel.clearAllFilters()
+                    return true
+                }
             }
             // Otherwise close the timeline
             hide()
             return true
         }
 
+        if Self.shouldDismissTimelineWithCommandW(
+            keyCode: event.keyCode,
+            charactersIgnoringModifiers: event.charactersIgnoringModifiers,
+            modifiers: modifiers
+        ) {
+            recordShortcut("cmd+w")
+            hide()
+            return true
+        }
+
         // Check if it's the toggle shortcut (uses saved shortcut config)
-        let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
         let shortcutConfig = loadTimelineShortcut()
         let expectedKeyCode = keyCodeForString(shortcutConfig.key)
         if event.keyCode == expectedKeyCode && modifiers == shortcutConfig.modifiers.nsModifiers {
             hide()
+            return true
+        }
+
+        // Cmd+F to toggle in-frame search
+        if event.keyCode == 3 && modifiers == [.command] { // F key with Command
+            recordShortcut("cmd+f")
+            if let viewModel = timelineViewModel {
+                viewModel.toggleInFrameSearch()
+            }
             return true
         }
 
@@ -1502,21 +3309,68 @@ public class TimelineWindowController: NSObject {
         if event.keyCode == 40 && modifiers == [.command] { // K key with Command
             recordShortcut("cmd+k")
             if let viewModel = timelineViewModel {
+                guard Self.shouldToggleSearchOverlayFromShortcut(
+                    isActivelyScrolling: viewModel.isActivelyScrolling,
+                    isSettledAtAbsoluteTimelineBoundary: viewModel.isSettledAtAbsoluteTimelineBoundary
+                ) else {
+                    Log.info("[TimelineShortcut] Cmd+K ignored while scroll is active", category: .ui)
+                    return true
+                }
                 let wasVisible = viewModel.isSearchOverlayVisible
-                viewModel.toggleSearchOverlay()
-                // Record search dialog open metric when opening
-                if !wasVisible {
-                    if let coordinator = coordinator {
-                        DashboardViewModel.recordSearchDialogOpen(coordinator: coordinator)
-                    }
+                let action = Self.searchOverlayShortcutAction(
+                    isSearchOverlayVisible: wasVisible,
+                    shouldRefocusSearchFieldBeforeClose: viewModel.searchViewModel.shouldRefocusSearchFieldOnEscape
+                )
+                Log.info(
+                    "[TimelineShortcut] Cmd+K action=\(String(describing: action)) wasVisible=\(wasVisible) fieldFocused=\(viewModel.searchViewModel.isSearchFieldFocused) queryEmpty=\(viewModel.searchViewModel.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)",
+                    category: .ui
+                )
+                switch action {
+                case .focusField:
+                    viewModel.searchViewModel.requestSearchFieldFocus(selectAll: true)
+                case .close:
+                    viewModel.closeSearchOverlay()
+                case .open:
+                    _ = Self.presentSearchOverlay(
+                        on: viewModel,
+                        coordinator: coordinator,
+                        recentEntriesRevealDelay: 0.3
+                    )
                 }
             }
             return true
         }
 
-        // Cmd+F to toggle filter panel
-        if event.keyCode == 3 && modifiers == [.command] { // F key with Command
-            recordShortcut("cmd+f")
+        // Option+H to hide segment block at playhead
+        if event.keyCode == 4 && modifiers == [.option] { // H key with Option
+            recordShortcut("opt+h")
+            hidePlayheadSegment(trigger: "Option+H")
+            return true
+        }
+
+        // Add Tag submenu for segment block at playhead (Cmd+T)
+        if let trigger = addTagTrigger {
+            recordShortcut("cmd+t")
+            openAddTagSubmenuAtPlayhead(trigger: trigger)
+            return true
+        }
+
+        // Add Comment composer for segment block at playhead (Option+C)
+        if addCommentTrigger != nil {
+            recordShortcut("opt+c")
+            openAddCommentComposerAtPlayhead(source: "keyboard_opt_c")
+            return true
+        }
+
+        // Option+F to toggle app filter for the current playhead frame
+        if let trigger = quickAppFilterTrigger(for: event, modifiers: modifiers) {
+            togglePlayheadAppFilter(trigger: trigger)
+            return true
+        }
+
+        // Cmd+Shift+F to toggle filter panel
+        if event.keyCode == 3 && modifiers == [.command, .shift] { // F key with Command+Shift
+            recordShortcut("cmd+shift+f")
             if let viewModel = timelineViewModel {
                 if viewModel.isFilterPanelVisible {
                     withAnimation(.easeOut(duration: 0.15)) {
@@ -1554,33 +3408,105 @@ public class TimelineWindowController: NSObject {
         }
 
         // Cmd+A to select all text on the frame
-        // Skip when a dialog with text input is active - let the text field handle it
+        // Skip when text editing owns the shortcut.
         if event.keyCode == 0 && modifiers == [.command] { // A key with Command
-            if let viewModel = timelineViewModel {
-                // Don't intercept when dialogs with text inputs are open
-                if viewModel.isSearchOverlayVisible || viewModel.isFilterPanelVisible || viewModel.isDateSearchActive {
-                    return false // Let the text field handle Cmd+A
+            let isTextFieldActive: Bool = {
+                guard let window,
+                      let firstResponder = window.firstResponder else {
+                    return false
                 }
+                return firstResponder is NSTextView || firstResponder is NSTextField
+            }()
+
+            if Self.shouldDeferCommandAToTextInput(
+                isTextFieldActive: isTextFieldActive,
+                isSearchOverlayVisible: timelineViewModel?.isSearchOverlayVisible ?? false,
+                isFilterPanelVisible: timelineViewModel?.isFilterPanelVisible ?? false,
+                isDateSearchActive: timelineViewModel?.isDateSearchActive ?? false,
+                isCommentSubmenuVisible: timelineViewModel?.showCommentSubmenu ?? false
+            ) {
+                return false // Let the text field handle Cmd+A
+            }
+
+            if let viewModel = timelineViewModel {
                 recordShortcut("cmd+a")
                 viewModel.selectAllText()
                 return true
             }
         }
 
-        // Cmd+C to copy selected text
-        if event.keyCode == 8 && modifiers == [.command] { // C key with Command
+        // Cmd+C to copy selected text, otherwise copy the active image context.
+        if event.charactersIgnoringModifiers == "c" && modifiers == [.command] {
             recordShortcut("cmd+c")
-            if let viewModel = timelineViewModel, viewModel.hasSelection {
-                viewModel.copySelectedText()
+            if let viewModel = timelineViewModel {
+                if viewModel.hasSelection {
+                    viewModel.copySelectedText()
+                } else if viewModel.isZoomRegionActive {
+                    viewModel.copyZoomedRegionImage()
+                } else {
+                    copyCurrentFrameImage()
+                }
                 return true
             }
+        }
+
+        // Cmd+S to save image
+        if event.charactersIgnoringModifiers == "s" && modifiers == [.command] {
+            recordShortcut("cmd+s")
+            saveCurrentFrameImage()
+            return true
+        }
+
+        // Cmd+Shift+L to open current browser link
+        if openLinkShortcutTrigger(for: event, modifiers: modifiers) != nil {
+            recordShortcut("cmd+shift+l")
+            if timelineViewModel?.openCurrentBrowserURL() == true {
+                hide(restorePreviousFocus: false)
+                return true
+            }
+            return false
+        }
+
+        // Cmd+L to copy current browser URL
+        if copyLinkShortcutTrigger(for: event, modifiers: modifiers) != nil {
+            recordShortcut("cmd+l")
+            if let viewModel = timelineViewModel, viewModel.copyCurrentBrowserURL() {
+                return true
+            }
+            return true
+        }
+
+        // Option+Cmd+L to copy YouTube markdown link
+        if copyYouTubeMarkdownLinkShortcutTrigger(for: event, modifiers: modifiers) != nil {
+            recordShortcut("opt+cmd+l")
+            if let viewModel = timelineViewModel, viewModel.copyCurrentYouTubeMarkdownLink() {
+                return true
+            }
+            return true
+        }
+
+        // Option+Shift+L to copy moment link
+        if copyMomentLinkShortcutTrigger(for: event, modifiers: modifiers) != nil {
+            recordShortcut("opt+shift+l")
+            _ = copyMomentLink()
+            return true
+        }
+
+        // Cmd+; to toggle more options menu
+        if event.charactersIgnoringModifiers == ";" && modifiers == [.command] {
+            recordShortcut("cmd+;")
+            if let viewModel = timelineViewModel {
+                viewModel.toggleMoreOptionsMenu()
+                return true
+            }
+            return false
         }
 
         // Cmd+H to toggle timeline controls visibility
         if event.keyCode == 4 && modifiers == [.command] { // H key with Command
             recordShortcut("cmd+h")
             if let viewModel = timelineViewModel {
-                viewModel.toggleControlsVisibility()
+                viewModel.toggleControlsVisibility(showRestoreHint: true)
                 return true
             }
         }
@@ -1618,8 +3544,127 @@ public class TimelineWindowController: NSObject {
             return false
         }
 
-        // Left arrow key - navigate to previous frame (Option = 3x speed)
-        if event.keyCode == 123 && (modifiers.isEmpty || modifiers == [.option]) { // Left arrow
+        // Cmd+Shift+Z to redo (go forward to last undone playhead position)
+        if event.keyCode == 6 && modifiers == [.command, .shift] { // Z key with Command+Shift
+            if let viewModel = timelineViewModel {
+                if viewModel.redoLastUndonePosition() {
+                    recordShortcut("cmd+shift+z")
+                    return true
+                }
+            }
+            // Don't consume the event if there's nothing to redo
+            return false
+        }
+
+        // Space bar to toggle play/pause (only when video controls are enabled)
+        if event.keyCode == 49 && modifiers.isEmpty { // Space
+            if let viewModel = timelineViewModel, viewModel.showVideoControls {
+                viewModel.togglePlayback()
+                return true
+            }
+        }
+
+        // Shift+> to increase playback speed (only when video controls are enabled)
+        if event.characters == ">" {
+            if let viewModel = timelineViewModel, viewModel.showVideoControls {
+                let speeds: [Double] = [1, 2, 4, 8]
+                if let currentIdx = speeds.firstIndex(of: viewModel.playbackSpeed), currentIdx < speeds.count - 1 {
+                    let newSpeed = speeds[currentIdx + 1]
+                    viewModel.setPlaybackSpeed(newSpeed)
+                    viewModel.showToast("Speed: \(Int(newSpeed))x")
+                }
+                return true
+            }
+        }
+
+        // Shift+< to decrease playback speed (only when video controls are enabled)
+        if event.characters == "<" {
+            if let viewModel = timelineViewModel, viewModel.showVideoControls {
+                let speeds: [Double] = [1, 2, 4, 8]
+                if let currentIdx = speeds.firstIndex(of: viewModel.playbackSpeed), currentIdx > 0 {
+                    let newSpeed = speeds[currentIdx - 1]
+                    viewModel.setPlaybackSpeed(newSpeed)
+                    viewModel.showToast("Speed: \(Int(newSpeed))x")
+                }
+                return true
+            }
+        }
+
+        // Calendar picker keyboard navigation should consume arrow/enter keys
+        // while the picker is visible so timeline scrubbing does not trigger.
+        if let viewModel = timelineViewModel,
+           viewModel.isCalendarPickerVisible,
+           modifiers.isEmpty {
+            if event.keyCode == 123 || event.keyCode == 124 || event.keyCode == 125 || event.keyCode == 126 {
+                return viewModel.handleCalendarPickerArrowKey(event.keyCode)
+            }
+            if event.keyCode == 36 || event.keyCode == 76 { // Return or Enter
+                return viewModel.handleCalendarPickerEnterKey()
+            }
+        }
+
+        // While the filter panel is open, let the panel own arrow-key navigation.
+        // This prevents left/right from scrubbing the timeline behind the panel.
+        if let viewModel = timelineViewModel,
+           viewModel.isFilterPanelVisible,
+           modifiers.isEmpty,
+           (event.keyCode == 123 || event.keyCode == 124 || event.keyCode == 125 || event.keyCode == 126) {
+            return false
+        }
+
+        // Left arrow, J, or L - navigate to previous frame (Option = 3x speed)
+        // Skip when search UI is open so overlay controls can own arrow keys.
+        if let viewModel = timelineViewModel,
+           viewModel.isSearchOverlayVisible,
+           !viewModel.searchViewModel.searchQuery.isEmpty,
+           (event.keyCode == 123 || event.keyCode == 124 || event.keyCode == 125 || event.keyCode == 126) {
+            return false
+        }
+        // Skip when a search filter dropdown is open (e.g., DateFilterPopover uses arrow keys for calendar navigation)
+        if let viewModel = timelineViewModel, viewModel.searchViewModel.isDropdownOpen, (event.keyCode == 123 || event.keyCode == 124 || event.keyCode == 125 || event.keyCode == 126) {
+            return false
+        }
+        if let viewModel = timelineViewModel,
+           let direction = Self.searchResultNavigationDirection(
+               keyCode: event.keyCode,
+               modifiers: modifiers,
+               isSearchResultHighlightVisible: viewModel.searchResultHighlightNavigationState != nil
+           ) {
+            let shortcut: String
+            switch direction {
+            case .previous:
+                shortcut = "cmd+shift+left"
+            case .next:
+                shortcut = "cmd+shift+right"
+            }
+            recordShortcut(shortcut)
+            Task { @MainActor in
+                await viewModel.navigateToAdjacentSearchResult(
+                    offset: direction == .previous ? -1 : 1,
+                    trigger: .keyboard
+                )
+            }
+            return true
+        }
+        // Cmd+Left: jump to the start of the previous consecutive timeline block
+        if event.keyCode == 123 && modifiers == [.command] {
+            Task { @MainActor [weak self] in
+                guard let self, let viewModel = self.timelineViewModel else { return }
+                if await viewModel.navigateToPreviousBlockStart() {
+                    self.recordShortcut("cmd+left")
+                    if let coordinator = self.coordinator {
+                        DashboardViewModel.recordArrowKeyNavigation(coordinator: coordinator, direction: "left")
+                    }
+                }
+            }
+            return true // Consume even at boundary to avoid system "bonk" sound
+        }
+
+        if Self.shouldNavigateTimelineBackward(
+            keyCode: event.keyCode,
+            charactersIgnoringModifiers: event.charactersIgnoringModifiers,
+            modifiers: modifiers
+        ) {
             if let viewModel = timelineViewModel {
                 let step = modifiers.contains(.option) ? 3 : 1
                 viewModel.navigateToFrame(viewModel.currentIndex - step)
@@ -1628,11 +3673,29 @@ public class TimelineWindowController: NSObject {
                     DashboardViewModel.recordArrowKeyNavigation(coordinator: coordinator, direction: "left")
                 }
             }
-            return true // Always consume arrow keys to prevent system "bonk" sound
+            return true // Always consume to prevent system "bonk" sound
         }
 
-        // Right arrow key - navigate to next frame (Option = 3x speed)
-        if event.keyCode == 124 && (modifiers.isEmpty || modifiers == [.option]) { // Right arrow
+        // Right arrow, K, or ; - navigate to next frame (Option = 3x speed)
+        // Cmd+Right: jump to the start of the next consecutive timeline block
+        if event.keyCode == 124 && modifiers == [.command] {
+            Task { @MainActor [weak self] in
+                guard let self, let viewModel = self.timelineViewModel else { return }
+                if await viewModel.navigateToNextBlockStartOrNewestFrame() {
+                    self.recordShortcut("cmd+right")
+                    if let coordinator = self.coordinator {
+                        DashboardViewModel.recordArrowKeyNavigation(coordinator: coordinator, direction: "right")
+                    }
+                }
+            }
+            return true // Consume even at boundary to avoid system "bonk" sound
+        }
+
+        if Self.shouldNavigateTimelineForward(
+            keyCode: event.keyCode,
+            charactersIgnoringModifiers: event.charactersIgnoringModifiers,
+            modifiers: modifiers
+        ) {
             if let viewModel = timelineViewModel {
                 let step = modifiers.contains(.option) ? 3 : 1
                 viewModel.navigateToFrame(viewModel.currentIndex + step)
@@ -1641,7 +3704,7 @@ public class TimelineWindowController: NSObject {
                     DashboardViewModel.recordArrowKeyNavigation(coordinator: coordinator, direction: "right")
                 }
             }
-            return true // Always consume arrow keys to prevent system "bonk" sound
+            return true // Always consume to prevent system "bonk" sound
         }
 
         // Ctrl+0 to reset frame zoom to 100%
@@ -1707,8 +3770,6 @@ public class TimelineWindowController: NSObject {
         // }
         // // Option+3 — Send objectWillChange (should fix stale tape)
         // if event.keyCode == 20 && modifiers == [.option] { // 3
-        //     timelineViewModel?.objectWillChange.send()
-        //     Log.info("[DEV-TEST] ⚡ Sent objectWillChange.send()", category: .ui)
         //     return true
         // }
         // #endif
@@ -1721,7 +3782,7 @@ public class TimelineWindowController: NSObject {
            !event.modifierFlags.contains(.control),
            event.keyCode != 53 { // Don't clear on Escape (handled above)
             // Only clear for non-navigation keys
-            let navigationKeys: Set<UInt16> = [123, 124, 125, 126] // Arrow keys
+            let navigationKeys: Set<UInt16> = [123, 124, 125, 126, 37, 38, 40, 41, 49] // Arrow keys + J, K, L, ; + Space
             if !navigationKeys.contains(event.keyCode) {
                 viewModel.clearTextSelection()
             }
@@ -1753,6 +3814,69 @@ public class TimelineWindowController: NSObject {
         return pointInWindow.y >= hitBottom && pointInWindow.y <= hitTop
     }
 
+    /// Hit region near playback controls.
+    /// Derived from the same layout metrics as TimelineTapeView to avoid tap-vs-drag conflicts.
+    private func isPointNearPlaybackControls(_ pointInWindow: CGPoint) -> Bool {
+        guard let viewModel = timelineViewModel,
+              viewModel.showVideoControls,
+              !viewModel.areControlsHidden,
+              !viewModel.isTapeHidden,
+              let window = window else {
+            return false
+        }
+
+        let scale = TimelineScaleFactor.current
+        let controlButtonSize = TimelineScaleFactor.controlButtonSize
+        let controlSpacing = TimelineScaleFactor.controlSpacing
+        let centerX = window.contentView?.bounds.midX ?? window.frame.width / 2
+        let controlsCenterY = TimelineScaleFactor.tapeBottomPadding + TimelineScaleFactor.tapeHeight + TimelineScaleFactor.controlsYOffset
+
+        // Keep this in sync with TimelineTapeView.playhead:
+        // middleSideControlsWidth = controlButtonSize * 2 + 6 + 8 + (controlButtonSize + controlSpacing)
+        let middleSideControlsWidth = (controlButtonSize * 3) + controlSpacing + 14
+        let datetimeWidth = estimatedDatetimeControlWidth(for: viewModel, scale: scale)
+        let rightControlsLeadingX = centerX + (datetimeWidth / 2) + controlSpacing
+
+        // Cover both "Go to now/refresh" and play button targets.
+        let horizontalPadding = 16 * scale
+        let minX = rightControlsLeadingX - horizontalPadding
+        let maxX = rightControlsLeadingX + middleSideControlsWidth + horizontalPadding
+
+        // Include slight overlap with tape hit area to catch low-edge play clicks.
+        let verticalPadding = 18 * scale
+        let minY = controlsCenterY - (controlButtonSize / 2) - verticalPadding
+        let maxY = controlsCenterY + (controlButtonSize / 2) + verticalPadding
+
+        return pointInWindow.x >= minX &&
+            pointInWindow.x <= maxX &&
+            pointInWindow.y >= minY &&
+            pointInWindow.y <= maxY
+    }
+
+    /// Estimate the runtime width of the datetime control so click hit-testing matches localized labels.
+    private func estimatedDatetimeControlWidth(for viewModel: SimpleTimelineViewModel, scale: CGFloat) -> CGFloat {
+        let dateFont = NSFont.systemFont(ofSize: TimelineScaleFactor.fontCaption, weight: .medium)
+        let timeFont = NSFont.monospacedSystemFont(ofSize: TimelineScaleFactor.fontMono, weight: .regular)
+        let chevronFont = NSFont.systemFont(ofSize: TimelineScaleFactor.fontTiny, weight: .bold)
+
+        let dateWidth = (viewModel.currentDateString as NSString).size(withAttributes: [.font: dateFont]).width
+        let timeWidth = (viewModel.currentTimeString as NSString).size(withAttributes: [.font: timeFont]).width
+        let chevronWidth = ("▾" as NSString).size(withAttributes: [.font: chevronFont]).width
+
+        // Match DatetimeButton horizontal spacing/padding.
+        let contentWidth = dateWidth +
+            TimelineScaleFactor.iconSpacing +
+            timeWidth +
+            TimelineScaleFactor.iconSpacing +
+            chevronWidth
+        let paddedWidth = contentWidth + (TimelineScaleFactor.paddingH * 2)
+
+        // Clamp to avoid pathological under/over-estimation.
+        let minWidth = 120 * scale
+        let maxWidth = 480 * scale
+        return min(maxWidth, max(minWidth, ceil(paddedWidth)))
+    }
+
     /// Force-end any in-progress tape drag (e.g., on window focus loss)
     private func forceEndTapeDrag() {
         guard isTapeDragging else { return }
@@ -1760,6 +3884,8 @@ public class TimelineWindowController: NSObject {
         isTapeDragging = false
         tapeDragDidExceedThreshold = false
         tapeDragVelocitySamples.removeAll()
+        tapeDragStartedNearPlaybackControls = false
+        tapeDragStartPoint = .zero
 
         if wasDragging {
             NSCursor.pop()
@@ -1771,14 +3897,50 @@ public class TimelineWindowController: NSObject {
         }
     }
 
-    private func handleScrollEvent(_ event: NSEvent) {
+    private func handleScrollEvent(_ event: NSEvent, source: String) {
         guard isVisible, let viewModel = timelineViewModel else { return }
 
-        let deltaX = event.scrollingDeltaX
-        let deltaY = event.scrollingDeltaY
+        // Dedicated overlays own wheel gestures while visible.
+        if viewModel.showCommentSubmenu {
+            return
+        }
 
-        // Use horizontal scrolling primarily, fall back to vertical
-        let delta = abs(deltaX) > abs(deltaY) ? -deltaX : -deltaY
+        if viewModel.isInLiveMode, CFAbsoluteTimeGetCurrent() < suppressLiveScrollUntil {
+            return
+        }
+
+        let orientationRaw = Self.timelineSettingsStore.string(forKey: "timelineScrollOrientation") ?? "horizontal"
+        let orientation = TimelineScrollOrientation(rawValue: orientationRaw) ?? .horizontal
+        let delta: Double
+        switch orientation {
+        case .horizontal:
+            // Default behavior: left/right swipes move timeline.
+            delta = -event.scrollingDeltaX
+        case .vertical:
+            // Optional behavior: up/down swipes move timeline.
+            delta = -event.scrollingDeltaY
+        }
+
+        // --- Scroll orientation mismatch detection ---
+        if !hasShownScrollOrientationHint {
+            let wrongAxisMag = abs(orientation == .horizontal ? event.scrollingDeltaY : event.scrollingDeltaX)
+            let rightAxisMag = abs(orientation == .horizontal ? event.scrollingDeltaX : event.scrollingDeltaY)
+
+            let now = CFAbsoluteTimeGetCurrent()
+            if now - scrollAccumStartTime > 2.0 {
+                wrongAxisScrollAccum = 0
+                rightAxisScrollAccum = 0
+                scrollAccumStartTime = now
+            }
+            wrongAxisScrollAccum += wrongAxisMag
+            rightAxisScrollAccum += rightAxisMag
+
+            if wrongAxisScrollAccum > 500,
+               rightAxisScrollAccum < 5 || wrongAxisScrollAccum > 5 * rightAxisScrollAccum {
+                hasShownScrollOrientationHint = true
+                viewModel.showScrollOrientationHint(current: orientation.rawValue)
+            }
+        }
 
         // Trackpads have precise scrolling deltas, mice do not
         let isTrackpad = event.hasPreciseScrollingDeltas
@@ -1890,34 +4052,173 @@ public class TimelineWindowController: NSObject {
     // MARK: - Keyboard Shortcut Tracking
 
     /// Record keyboard shortcut usage
+    // MARK: - Image & Link Actions (Keyboard Shortcuts)
+
+    private func copyCurrentFrameImage() {
+        guard let viewModel = timelineViewModel else { return }
+        viewModel.copyCurrentFrameImageToClipboard()
+    }
+
+    private func saveCurrentFrameImage() {
+        guard let viewModel = timelineViewModel else { return }
+        getCurrentFrameImage(viewModel: viewModel) { [weak self] image in
+            guard let image = image else { return }
+
+            let savePanel = NSSavePanel()
+            savePanel.allowedContentTypes = [.png]
+            let formatter = DateFormatter()
+            formatter.dateFormat = "yyyy-MM-dd-HHmmss"
+            let timestamp = formatter.string(from: viewModel.currentTimestamp ?? Date())
+            savePanel.nameFieldStringValue = "retrace-\(timestamp).png"
+            savePanel.level = .screenSaver + 1
+
+            savePanel.begin { response in
+                if response == .OK, let url = savePanel.url {
+                    if let tiffData = image.tiffRepresentation,
+                       let bitmap = NSBitmapImageRep(data: tiffData),
+                       let pngData = bitmap.representation(using: .png, properties: [:]) {
+                        try? pngData.write(to: url)
+                        if let coordinator = self?.coordinator {
+                            DashboardViewModel.recordImageSave(coordinator: coordinator, frameID: viewModel.currentFrame?.id.value)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @discardableResult
+    private func copyMomentLink() -> Bool {
+        guard let viewModel = timelineViewModel,
+              !viewModel.isInLiveMode,
+              let timestamp = viewModel.currentTimestamp,
+              let url = DeeplinkHandler.generateTimelineLink(timestamp: timestamp) else {
+            return false
+        }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(url.absoluteString, forType: .string)
+        viewModel.showToast("Moment Link copied")
+        if let coordinator = coordinator {
+            DashboardViewModel.recordDeeplinkCopy(coordinator: coordinator, url: url.absoluteString)
+        }
+        return true
+    }
+
+    private func getCurrentFrameImage(viewModel: SimpleTimelineViewModel, completion: @escaping (NSImage?) -> Void) {
+        if viewModel.isInLiveMode {
+            completion(viewModel.liveScreenshot)
+            return
+        }
+
+        if let image = viewModel.currentImage {
+            completion(image)
+            return
+        }
+
+        guard let videoInfo = viewModel.currentVideoInfo else {
+            completion(nil)
+            return
+        }
+
+        var actualVideoPath = videoInfo.videoPath
+        if !FileManager.default.fileExists(atPath: actualVideoPath) {
+            let pathWithExtension = actualVideoPath + ".mp4"
+            if FileManager.default.fileExists(atPath: pathWithExtension) {
+                actualVideoPath = pathWithExtension
+            } else {
+                completion(nil)
+                return
+            }
+        }
+
+        guard let url = MP4SymlinkResolver.resolveURL(for: actualVideoPath) else {
+            completion(nil)
+            return
+        }
+
+        let asset = AVURLAsset(url: url)
+        let directDecodeBytes = UIDirectFrameDecodeMemoryLedger.begin(
+            tag: UIDirectFrameDecodeMemoryLedger.timelineWindowGeneratorTag,
+            function: "ui.timeline.window_actions",
+            reason: "ui.timeline.window_frame_decode",
+            videoInfo: videoInfo
+        )
+        let imageGenerator = AVAssetImageGenerator(asset: asset)
+        imageGenerator.appliesPreferredTrackTransform = true
+        imageGenerator.requestedTimeToleranceBefore = .zero
+        imageGenerator.requestedTimeToleranceAfter = .zero
+
+        let time = videoInfo.frameTimeCMTime
+
+        imageGenerator.generateCGImagesAsynchronously(forTimes: [NSValue(time: time)]) { _, cgImage, _, _, _ in
+            DispatchQueue.main.async {
+                UIDirectFrameDecodeMemoryLedger.end(
+                    tag: UIDirectFrameDecodeMemoryLedger.timelineWindowGeneratorTag,
+                    reason: "ui.timeline.window_frame_decode",
+                    bytes: directDecodeBytes
+                )
+                if let cgImage = cgImage {
+                    let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+                    completion(nsImage)
+                } else {
+                    completion(nil)
+                }
+            }
+        }
+    }
+
     private func recordShortcut(_ shortcut: String) {
         if let coordinator = coordinator {
             DashboardViewModel.recordKeyboardShortcut(coordinator: coordinator, shortcut: shortcut)
         }
     }
 
+    private func formattedPoint(_ point: CGPoint) -> String {
+        "(\(Int(point.x)),\(Int(point.y)))"
+    }
+
     // MARK: - Session Metrics
 
-    /// Force record session metrics (called on app termination)
-    public func forceRecordSessionMetrics() {
-        guard let startTime = sessionStartTime, let coordinator = coordinator else { return }
+    /// Force-record active session metrics without blocking the main actor.
+    /// Returns true when metrics were flushed before timeout, false otherwise.
+    public func forceRecordSessionMetrics(timeoutMs: UInt64 = 350) async -> Bool {
+        guard let startTime = sessionStartTime, let coordinator = coordinator else { return true }
 
         let durationMs = Int64(Date().timeIntervalSince(startTime) * 1000)
+        let scrubDistance = sessionScrubDistance > 0 ? Int(sessionScrubDistance) : nil
 
-        // Record synchronously using a blocking task
-        let semaphore = DispatchSemaphore(value: 0)
-        Task {
-            try? await coordinator.recordMetricEvent(metricType: .timelineSessionDuration, metadata: "\(durationMs)")
+        do {
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                group.addTask {
+                    try await coordinator.recordMetricEvent(metricType: .timelineSessionDuration, metadata: "\(durationMs)")
+                    if let scrubDistance {
+                        try await coordinator.recordMetricEvent(metricType: .scrubDistance, metadata: "\(scrubDistance)")
+                    }
+                }
 
-            if sessionScrubDistance > 0 {
-                try? await coordinator.recordMetricEvent(metricType: .scrubDistance, metadata: "\(Int(sessionScrubDistance))")
+                group.addTask {
+                    try await Task.sleep(for: .nanoseconds(Int64(timeoutMs * 1_000_000)), clock: .continuous)
+                    throw SessionMetricFlushTimeout()
+                }
+
+                _ = try await group.next()
+                group.cancelAll()
             }
 
-            semaphore.signal()
+            Log.info("[TIMELINE] Session metrics flush completed during termination", category: .ui)
+            return true
+        } catch is SessionMetricFlushTimeout {
+            Log.warning("[TIMELINE] Session metrics flush timed out after \(timeoutMs)ms during termination", category: .ui)
+            return false
+        } catch {
+            Log.warning("[TIMELINE] Session metrics flush failed during termination: \(error)", category: .ui)
+            return false
         }
-        semaphore.wait()
     }
 }
+
+private struct SessionMetricFlushTimeout: Error {}
 
 // MARK: - Notifications
 
@@ -1932,8 +4233,57 @@ extension Notification.Name {
 /// Custom NSWindow subclass that can become key window even when borderless
 /// This is required for text fields to receive keyboard input properly
 class KeyableWindow: NSWindow {
+    var onEscape: (() -> Void)?
+
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if event.type == .keyDown, modifiers.isEmpty, event.keyCode == 53 {
+            onEscape?()
+            return true
+        }
+
+        return super.performKeyEquivalent(with: event)
+    }
+
+    override func cancelOperation(_ sender: Any?) {
+        if let onEscape {
+            onEscape()
+            return
+        }
+
+        super.cancelOperation(sender)
+    }
+}
+
+/// Non-activating panel variant for the live timeline so the source app keeps
+/// menu-bar ownership during launch.
+class KeyablePanel: NSPanel {
+    var onEscape: (() -> Void)?
+
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if event.type == .keyDown, modifiers.isEmpty, event.keyCode == 53 {
+            onEscape?()
+            return true
+        }
+
+        return super.performKeyEquivalent(with: event)
+    }
+
+    override func cancelOperation(_ sender: Any?) {
+        if let onEscape {
+            onEscape()
+            return
+        }
+
+        super.cancelOperation(sender)
+    }
 }
 
 /// Custom hosting view that accepts first mouse to enable hover on first interaction

@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import CryptoKit
 import Shared
 
 /// Retrace design system
@@ -8,753 +9,84 @@ public struct AppTheme {
     private init() {}
 }
 
-// MARK: - App Name Resolution
+// MARK: - Video URL Symlink Resolver
 
-/// Resolves bundle IDs to human-readable app names with caching
-public class AppNameResolver {
-    public static let shared = AppNameResolver()
+/// Resolves extensionless video paths to stable, collision-safe `.mp4` symlink URLs.
+/// Symlink file names are derived from the full normalized destination path to avoid
+/// basename collisions across different sources.
+enum MP4SymlinkResolver {
+    static func resolveURL(for videoPath: String) -> URL? {
+        if videoPath.hasSuffix(".mp4") {
+            return URL(fileURLWithPath: videoPath)
+        }
 
-    private var cache: [String: String] = [:]
-    private let lock = NSLock()
-    private let cacheFileURL: URL
-    private var diskCache: [String: String] = [:]
-    private var isDirty = false
+        let destinationPath = URL(fileURLWithPath: videoPath).standardizedFileURL.path
+        let symlinkURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("retrace_video_\(pathDigest(destinationPath)).mp4")
 
-    private init() {
-        // Use AppPaths which respects custom storage location
-        let retraceDir = URL(fileURLWithPath: AppPaths.expandedStorageRoot)
-        try? FileManager.default.createDirectory(at: retraceDir, withIntermediateDirectories: true)
-        cacheFileURL = retraceDir.appendingPathComponent("app_names.json")
-        loadFromDisk()
+        do {
+            try ensureSymlink(at: symlinkURL, destinationPath: destinationPath)
+            return symlinkURL
+        } catch {
+            return nil
+        }
     }
 
-    /// Get a human-readable name for an app bundle ID
-    public func displayName(for bundleID: String) -> String {
-        lock.lock()
-        defer { lock.unlock() }
+    private static func ensureSymlink(at symlinkURL: URL, destinationPath: String) throws {
+        let fileManager = FileManager.default
+        var lastError: Error?
 
-        // Return from memory cache if available
-        if let cached = cache[bundleID] {
-            return cached
-        }
+        // Retry a small number of times to tolerate concurrent resolvers racing to create/remove the same symlink.
+        for _ in 0..<3 {
+            do {
+                try fileManager.createSymbolicLink(
+                    atPath: symlinkURL.path,
+                    withDestinationPath: destinationPath
+                )
+                return
+            } catch {
+                lastError = error
 
-        // Return from disk cache if available
-        if let stored = diskCache[bundleID] {
-            cache[bundleID] = stored
-            return stored
-        }
+                if let existingDestination = try? fileManager.destinationOfSymbolicLink(atPath: symlinkURL.path),
+                   normalizedSymlinkDestination(existingDestination, symlinkURL: symlinkURL) == destinationPath {
+                    return
+                }
 
-        // Resolve the name
-        let name = resolveAppName(for: bundleID)
-        cache[bundleID] = name
-
-        // Save to disk cache
-        saveToDiskAsync(bundleID: bundleID, name: name)
-
-        return name
-    }
-
-    /// Resolve bundle ID to app name using multiple strategies
-    private func resolveAppName(for bundleID: String) -> String {
-        // Strategy 1: Look up the actual app name from the system
-        if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID),
-           let bundle = Bundle(url: appURL),
-           let name = bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String
-                   ?? bundle.object(forInfoDictionaryKey: "CFBundleName") as? String {
-            return name
-        }
-
-        // Strategy 2: Handle standard reverse-DNS bundle IDs (e.g., com.google.Chrome -> Chrome)
-        if bundleID.contains(".") {
-            let components = bundleID.components(separatedBy: ".")
-            if components.count >= 2,
-               let lastComponent = components.last,
-               !lastComponent.isEmpty,
-               lastComponent.first?.isLetter == true {
-                // Capitalize first letter if needed
-                return lastComponent.prefix(1).uppercased() + lastComponent.dropFirst()
-            }
-        }
-
-        // Strategy 3: Handle non-standard identifiers (e.g., "230313mzl4w4u92")
-        // Check if it looks like a random/hash identifier
-        if looksLikeRandomIdentifier(bundleID) {
-            return "Unknown App"
-        }
-
-        // Strategy 4: Clean up and return as-is for other cases
-        return cleanupName(bundleID)
-    }
-
-    /// Check if a string looks like a random/generated identifier
-    private func looksLikeRandomIdentifier(_ identifier: String) -> Bool {
-        // If it starts with a number, it's likely a random ID
-        if identifier.first?.isNumber == true {
-            return true
-        }
-
-        // If it's mostly alphanumeric with no clear word structure
-        let letterCount = identifier.filter { $0.isLetter }.count
-        let numberCount = identifier.filter { $0.isNumber }.count
-
-        // High ratio of numbers to letters suggests a random ID
-        if letterCount > 0 && Double(numberCount) / Double(letterCount) > 0.5 {
-            return true
-        }
-
-        // Very short or very long without dots suggests random
-        if !identifier.contains(".") && (identifier.count < 3 || identifier.count > 20) {
-            return true
-        }
-
-        return false
-    }
-
-    /// Clean up an identifier for display
-    private func cleanupName(_ identifier: String) -> String {
-        // Replace common separators with spaces
-        var cleaned = identifier
-            .replacingOccurrences(of: "-", with: " ")
-            .replacingOccurrences(of: "_", with: " ")
-
-        // Capitalize words
-        cleaned = cleaned.split(separator: " ")
-            .map { $0.prefix(1).uppercased() + $0.dropFirst().lowercased() }
-            .joined(separator: " ")
-
-        return cleaned.isEmpty ? "Unknown App" : cleaned
-    }
-
-    // MARK: - Installed Apps
-
-    /// Check if an app is currently installed (can be found by NSWorkspace)
-    public func isInstalled(bundleID: String) -> Bool {
-        NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) != nil
-    }
-
-    /// Get all currently installed apps from /Applications (instant, no DB query needed)
-    /// Returns array of AppInfo with bundleID and name
-    /// Also pre-warms the icon cache for instant popover display
-    public func getInstalledApps() -> [AppInfo] {
-        let startTime = CFAbsoluteTimeGetCurrent()
-        var apps: [AppInfo] = []
-        let fm = FileManager.default
-
-        let appFolders = [
-            URL(fileURLWithPath: "/Applications"),
-            URL(fileURLWithPath: "/System/Applications"),
-            fm.homeDirectoryForCurrentUser.appendingPathComponent("Applications"),
-            fm.homeDirectoryForCurrentUser.appendingPathComponent("Applications/Chrome Apps.localized")
-        ]
-
-        for folder in appFolders {
-            guard let contents = try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil) else {
-                continue
-            }
-
-            for appURL in contents where appURL.pathExtension == "app" {
-                let plistURL = appURL.appendingPathComponent("Contents/Info.plist")
-                guard let plist = NSDictionary(contentsOf: plistURL),
-                      let bundleID = plist["CFBundleIdentifier"] as? String,
-                      !bundleID.isEmpty else {
+                guard fileManager.fileExists(atPath: symlinkURL.path) else {
                     continue
                 }
 
-                // Get display name
-                let name: String
-                if let displayName = plist["CFBundleDisplayName"] as? String, !displayName.isEmpty {
-                    name = displayName
-                } else if let bundleName = plist["CFBundleName"] as? String, !bundleName.isEmpty {
-                    name = bundleName
-                } else {
-                    name = appURL.deletingPathExtension().lastPathComponent
-                }
-
-                apps.append(AppInfo(bundleID: bundleID, name: name))
-
-                // Also cache the name for later lookups
-                lock.lock()
-                cache[bundleID] = name
-                lock.unlock()
-
-                // Pre-warm icon cache using the app URL we already have
-                AppIconProvider.shared.preloadIcon(for: bundleID, appURL: appURL)
-            }
-        }
-
-        let elapsed = Int((CFAbsoluteTimeGetCurrent() - startTime) * 1000)
-        #if DEBUG
-        print("[AppNameResolver] getInstalledApps: found \(apps.count) apps in \(elapsed)ms, icon cache size: \(AppIconProvider.shared.cacheCount)")
-        #endif
-
-        return apps
-    }
-
-    /// Resolve multiple bundle IDs to AppInfo objects
-    /// - Parameter bundleIDs: Array of bundle identifiers
-    /// - Returns: Array of AppInfo with resolved names
-    public func resolveAll(bundleIDs: [String]) -> [AppInfo] {
-        return bundleIDs.map { bundleID in
-            AppInfo(bundleID: bundleID, name: displayName(for: bundleID))
-        }
-    }
-
-    // MARK: - Disk Persistence
-
-    private func loadFromDisk() {
-        guard FileManager.default.fileExists(atPath: cacheFileURL.path) else { return }
-        do {
-            let data = try Data(contentsOf: cacheFileURL)
-            diskCache = try JSONDecoder().decode([String: String].self, from: data)
-        } catch {
-            // Silently fail
-        }
-    }
-
-    private func saveToDiskAsync(bundleID: String, name: String) {
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            guard let self = self else { return }
-            self.lock.lock()
-            self.diskCache[bundleID] = name
-            self.isDirty = true
-            self.lock.unlock()
-            self.flushToDiskIfNeeded()
-        }
-    }
-
-    private func flushToDiskIfNeeded() {
-        lock.lock()
-        guard isDirty else {
-            lock.unlock()
-            return
-        }
-        let cacheToSave = diskCache
-        isDirty = false
-        lock.unlock()
-
-        do {
-            let data = try JSONEncoder().encode(cacheToSave)
-            try data.write(to: cacheFileURL, options: .atomic)
-        } catch {
-            // Silently fail
-        }
-    }
-
-    /// Clear all cached app names (both memory and disk)
-    /// Call this when app names appear stale or incorrect
-    /// - Returns: Number of entries cleared from cache
-    @discardableResult
-    public func clearCache() -> Int {
-        lock.lock()
-        let entriesCleared = cache.count + diskCache.count
-        cache.removeAll()
-        diskCache.removeAll()
-        isDirty = false
-        lock.unlock()
-
-        // Delete the disk cache file
-        try? FileManager.default.removeItem(at: cacheFileURL)
-
-        // Also clear the "other apps" cache file
-        let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
-        let otherAppsCache = cacheDir.appendingPathComponent("other_apps_cache.json")
-        try? FileManager.default.removeItem(at: otherAppsCache)
-
-        // Clear the timestamp so it will be refreshed
-        UserDefaults.standard.removeObject(forKey: "search.otherAppsCacheSavedAt")
-
-        #if DEBUG
-        print("[AppNameResolver] Cache cleared (\(entriesCleared) entries)")
-        #endif
-        return entriesCleared
-    }
-}
-
-// MARK: - App Icon Provider
-
-/// Provides app icons for bundle IDs with caching
-public class AppIconProvider {
-    public static let shared = AppIconProvider()
-
-    private var cache: [String: NSImage] = [:]
-    private let lock = NSLock()
-
-    private init() {}
-
-    /// Get the app icon for a bundle ID as an NSImage
-    public func icon(for bundleID: String) -> NSImage? {
-        lock.lock()
-        defer { lock.unlock() }
-
-        // Return from cache if available
-        if let cached = cache[bundleID] {
-            return cached
-        }
-
-        // Cache miss - need to resolve (this is slow!)
-        let startTime = CFAbsoluteTimeGetCurrent()
-
-        // Try to get the icon from the system
-        if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
-            let icon = NSWorkspace.shared.icon(forFile: appURL.path)
-            cache[bundleID] = icon
-            #if DEBUG
-            print("[AppIconProvider] CACHE MISS for \(bundleID) - resolved in \(Int((CFAbsoluteTimeGetCurrent() - startTime) * 1000))ms")
-            #endif
-            return icon
-        }
-
-        #if DEBUG
-        print("[AppIconProvider] CACHE MISS for \(bundleID) - not found, took \(Int((CFAbsoluteTimeGetCurrent() - startTime) * 1000))ms")
-        #endif
-        return nil
-    }
-
-    /// Pre-load an icon into cache when we already have the app URL
-    /// This avoids the NSWorkspace lookup when iterating through /Applications
-    public func preloadIcon(for bundleID: String, appURL: URL) {
-        lock.lock()
-        defer { lock.unlock() }
-
-        // Skip if already cached
-        guard cache[bundleID] == nil else { return }
-
-        let icon = NSWorkspace.shared.icon(forFile: appURL.path)
-        cache[bundleID] = icon
-    }
-
-    /// Debug: Get current cache size
-    public var cacheCount: Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return cache.count
-    }
-}
-
-// MARK: - Favicon Provider
-
-/// Provides website favicons by fetching directly from the website itself (no third-party APIs).
-/// PRIVACY: No browsing data is sent to any third party. Favicon requests go only to the
-/// site the user already visited. Each domain is fetched once and cached to disk.
-public class FaviconProvider {
-    public static let shared = FaviconProvider()
-
-    private var cache: [String: NSImage] = [:]
-    private var pendingRequests: Set<String> = []
-    private let lock = NSLock()
-    private let cacheFileURL: URL
-    private var diskCache: [String: Data] = [:]
-
-    private lazy var session: URLSession = {
-        let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 5
-        config.timeoutIntervalForResource = 10
-        return URLSession(configuration: config)
-    }()
-
-    private init() {
-        // Store favicon cache in AppPaths.storageRoot (respects custom location)
-        let retraceDir = URL(fileURLWithPath: AppPaths.expandedStorageRoot)
-        try? FileManager.default.createDirectory(at: retraceDir, withIntermediateDirectories: true)
-        cacheFileURL = retraceDir.appendingPathComponent("favicon_cache")
-
-        // Create favicon cache directory
-        try? FileManager.default.createDirectory(at: cacheFileURL, withIntermediateDirectories: true)
-
-        // Load existing cache from disk
-        loadFromDisk()
-    }
-
-    /// Get the favicon for a domain synchronously (returns cached image or nil)
-    public func favicon(for domain: String) -> NSImage? {
-        let normalizedDomain = normalizeDomain(domain)
-        guard !normalizedDomain.isEmpty else { return nil }
-
-        lock.lock()
-        defer { lock.unlock() }
-
-        // Return from memory cache if available
-        if let cached = cache[normalizedDomain] {
-            return cached
-        }
-
-        // Return from disk cache if available
-        if let imageData = diskCache[normalizedDomain],
-           let image = NSImage(data: imageData) {
-            cache[normalizedDomain] = image
-            return image
-        }
-
-        return nil
-    }
-
-    /// Fetch favicon asynchronously if not cached
-    public func fetchFaviconIfNeeded(for domain: String, completion: @escaping (NSImage?) -> Void) {
-        let normalizedDomain = normalizeDomain(domain)
-        guard !normalizedDomain.isEmpty else {
-            completion(nil)
-            return
-        }
-
-        lock.lock()
-
-        // Already cached in memory
-        if let cached = cache[normalizedDomain] {
-            lock.unlock()
-            completion(cached)
-            return
-        }
-
-        // Already cached on disk
-        if let imageData = diskCache[normalizedDomain],
-           let image = NSImage(data: imageData) {
-            cache[normalizedDomain] = image
-            lock.unlock()
-            completion(image)
-            return
-        }
-
-        // Already fetching
-        if pendingRequests.contains(normalizedDomain) {
-            lock.unlock()
-            completion(nil)
-            return
-        }
-
-        pendingRequests.insert(normalizedDomain)
-        lock.unlock()
-
-        // Fetch favicon directly from the website — no third-party services involved
-        fetchFaviconFromWebsite(domain: normalizedDomain, completion: completion)
-    }
-
-    /// Fetches favicon directly from the website by:
-    /// 1. Parsing the homepage HTML for <link rel="icon"> / <link rel="shortcut icon"> / <link rel="apple-touch-icon">
-    /// 2. Falling back to /favicon.ico if no <link> tag is found
-    private func fetchFaviconFromWebsite(domain: String, completion: @escaping (NSImage?) -> Void) {
-        let baseURL = "https://\(domain)"
-        guard let homepageURL = URL(string: baseURL) else {
-            finishRequest(domain: domain, completion: completion)
-            return
-        }
-
-        // Step 1: Fetch the homepage HTML and look for <link> favicon tags
-        var request = URLRequest(url: homepageURL)
-        // Only fetch the head section — we don't need the full page body
-        request.setValue("text/html", forHTTPHeaderField: "Accept")
-
-        session.dataTask(with: request) { [weak self] data, response, error in
-            guard let self = self else { return }
-
-            // Try to parse favicon URL from HTML
-            if let data = data,
-               let html = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .ascii),
-               let faviconURL = self.parseFaviconURL(from: html, baseURL: baseURL) {
-                self.downloadFaviconImage(from: faviconURL, domain: domain, completion: completion)
-                return
-            }
-
-            // Step 2: Fall back to /favicon.ico
-            let fallbackURL = "\(baseURL)/favicon.ico"
-            guard let icoURL = URL(string: fallbackURL) else {
-                self.finishRequest(domain: domain, completion: completion)
-                return
-            }
-            self.downloadFaviconImage(from: icoURL, domain: domain, completion: completion)
-        }.resume()
-    }
-
-    /// Parse HTML to find the best favicon URL from <link> tags
-    private func parseFaviconURL(from html: String, baseURL: String) -> URL? {
-        // Only scan the <head> section to avoid false matches in body content
-        let searchRange: String
-        if let headEnd = html.range(of: "</head>", options: .caseInsensitive) {
-            searchRange = String(html[html.startIndex..<headEnd.lowerBound])
-        } else {
-            // No closing head tag found — scan first 10KB as a reasonable limit
-            let limit = html.index(html.startIndex, offsetBy: min(10_000, html.count))
-            searchRange = String(html[html.startIndex..<limit])
-        }
-
-        // Match <link> tags with rel containing "icon" and extract href
-        // Priority: apple-touch-icon > icon > shortcut icon (apple-touch-icon is usually highest quality)
-        let pattern = #"<link\s[^>]*rel\s*=\s*["']([^"']*)["'][^>]*href\s*=\s*["']([^"']*)["'][^>]*/?\s*>|<link\s[^>]*href\s*=\s*["']([^"']*)["'][^>]*rel\s*=\s*["']([^"']*)["'][^>]*/?\s*>"#
-
-        guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) else {
-            return nil
-        }
-
-        let nsRange = NSRange(searchRange.startIndex..., in: searchRange)
-        let matches = regex.matches(in: searchRange, options: [], range: nsRange)
-
-        var bestHref: String?
-        var bestPriority = -1
-
-        for match in matches {
-            // Extract rel and href from either pattern variant
-            let rel: String
-            let href: String
-
-            if let relRange = Range(match.range(at: 1), in: searchRange),
-               let hrefRange = Range(match.range(at: 2), in: searchRange) {
-                rel = String(searchRange[relRange]).lowercased()
-                href = String(searchRange[hrefRange])
-            } else if let hrefRange = Range(match.range(at: 3), in: searchRange),
-                      let relRange = Range(match.range(at: 4), in: searchRange) {
-                rel = String(searchRange[relRange]).lowercased()
-                href = String(searchRange[hrefRange])
-            } else {
-                continue
-            }
-
-            guard rel.contains("icon") else { continue }
-
-            let priority: Int
-            if rel.contains("apple-touch-icon") {
-                priority = 2
-            } else if rel == "icon" {
-                priority = 1
-            } else {
-                priority = 0 // "shortcut icon" or other variants
-            }
-
-            if priority > bestPriority {
-                bestPriority = priority
-                bestHref = href
-            }
-        }
-
-        guard let href = bestHref else { return nil }
-        return resolveURL(href, baseURL: baseURL)
-    }
-
-    /// Resolve a potentially relative or protocol-relative URL
-    private func resolveURL(_ href: String, baseURL: String) -> URL? {
-        // Protocol-relative URL (e.g., "//example.com/favicon.png")
-        if href.hasPrefix("//") {
-            return URL(string: "https:\(href)")
-        }
-        // Absolute URL
-        if href.hasPrefix("http://") || href.hasPrefix("https://") {
-            return URL(string: href)
-        }
-        // Root-relative URL (e.g., "/favicon.png")
-        if href.hasPrefix("/") {
-            return URL(string: "\(baseURL)\(href)")
-        }
-        // Relative URL (e.g., "images/favicon.png")
-        return URL(string: "\(baseURL)/\(href)")
-    }
-
-    /// Download the favicon image from the resolved URL
-    private func downloadFaviconImage(from url: URL, domain: String, completion: @escaping (NSImage?) -> Void) {
-        session.dataTask(with: url) { [weak self] data, response, error in
-            guard let self = self else { return }
-
-            guard let data = data,
-                  let httpResponse = response as? HTTPURLResponse,
-                  (200...299).contains(httpResponse.statusCode),
-                  let image = NSImage(data: data) else {
-                // If this was from HTML parsing and it failed, try /favicon.ico as last resort
-                if url.path != "/favicon.ico" {
-                    let fallbackURL = "https://\(domain)/favicon.ico"
-                    if let icoURL = URL(string: fallbackURL) {
-                        self.downloadFaviconImage(from: icoURL, domain: domain, completion: completion)
-                        return
+                do {
+                    try fileManager.removeItem(at: symlinkURL)
+                } catch {
+                    lastError = error
+                    if !fileManager.fileExists(atPath: symlinkURL.path) {
+                        continue
                     }
-                }
-                self.finishRequest(domain: domain, completion: completion)
-                return
-            }
-
-            self.lock.lock()
-            self.pendingRequests.remove(domain)
-            self.cache[domain] = image
-            self.diskCache[domain] = data
-            self.lock.unlock()
-
-            self.saveToDiskAsync(domain: domain, data: data)
-            DispatchQueue.main.async { completion(image) }
-        }.resume()
-    }
-
-    /// Clean up a failed request
-    private func finishRequest(domain: String, completion: @escaping (NSImage?) -> Void) {
-        lock.lock()
-        pendingRequests.remove(domain)
-        lock.unlock()
-        DispatchQueue.main.async { completion(nil) }
-    }
-
-    /// Normalize domain name (remove protocol, www, and path)
-    private func normalizeDomain(_ domain: String) -> String {
-        var normalized = domain.lowercased()
-
-        // Remove protocol
-        if let range = normalized.range(of: "://") {
-            normalized = String(normalized[range.upperBound...])
-        }
-
-        // Remove www.
-        if normalized.hasPrefix("www.") {
-            normalized = String(normalized.dropFirst(4))
-        }
-
-        // Remove path
-        if let slashIndex = normalized.firstIndex(of: "/") {
-            normalized = String(normalized[..<slashIndex])
-        }
-
-        // Remove port
-        if let colonIndex = normalized.firstIndex(of: ":") {
-            normalized = String(normalized[..<colonIndex])
-        }
-
-        return normalized.trimmingCharacters(in: .whitespaces)
-    }
-
-    // MARK: - Disk Persistence
-
-    private func loadFromDisk() {
-        guard FileManager.default.fileExists(atPath: cacheFileURL.path) else { return }
-
-        do {
-            let contents = try FileManager.default.contentsOfDirectory(at: cacheFileURL, includingPropertiesForKeys: nil)
-            for fileURL in contents {
-                let domain = fileURL.deletingPathExtension().lastPathComponent
-                if let data = try? Data(contentsOf: fileURL) {
-                    diskCache[domain] = data
+                    break
                 }
             }
-        } catch {
-            // Silently fail - will re-fetch as needed
+        }
+
+        if let lastError {
+            throw lastError
         }
     }
 
-    private func saveToDiskAsync(domain: String, data: Data) {
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            guard let self = self else { return }
-
-            let fileURL = self.cacheFileURL.appendingPathComponent("\(domain).png")
-            try? data.write(to: fileURL, options: .atomic)
-        }
-    }
-
-    /// Clear all cached favicons
-    public func clearCache() {
-        lock.lock()
-        cache.removeAll()
-        diskCache.removeAll()
-        lock.unlock()
-
-        // Delete disk cache
-        try? FileManager.default.removeItem(at: cacheFileURL)
-        try? FileManager.default.createDirectory(at: cacheFileURL, withIntermediateDirectories: true)
-    }
-
-    /// Debug: Get current cache size
-    public var cacheCount: Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return cache.count
-    }
-}
-
-/// SwiftUI view that displays a favicon for a website domain
-public struct FaviconView: View {
-    let domain: String
-    let size: CGFloat
-    let fallbackColor: Color
-
-    @State private var favicon: NSImage? = nil
-    @State private var hasFetched: Bool = false
-
-    public init(domain: String, size: CGFloat = 16, fallbackColor: Color = .retraceSecondary) {
-        self.domain = domain
-        self.size = size
-        self.fallbackColor = fallbackColor
-    }
-
-    public var body: some View {
-        Group {
-            if let favicon = favicon {
-                Image(nsImage: favicon)
-                    .resizable()
-                    .interpolation(.high)
-                    .aspectRatio(contentMode: .fit)
-                    .clipShape(RoundedRectangle(cornerRadius: size * 0.15))
-                    .frame(width: size * 0.85, height: size * 0.85) // Scale down to match app icon visual size
-            } else {
-                // Fallback: colored circle (same as current dot indicator)
-                Circle()
-                    .fill(fallbackColor.opacity(0.5))
-                    .frame(width: size * 0.4, height: size * 0.4)
-            }
-        }
-        .frame(width: size, height: size)
-        .onAppear {
-            loadFavicon()
-        }
-    }
-
-    private func loadFavicon() {
-        // First try synchronous cache lookup
-        if let cached = FaviconProvider.shared.favicon(for: domain) {
-            self.favicon = cached
-            return
+    private static func normalizedSymlinkDestination(_ destination: String, symlinkURL: URL) -> String {
+        if destination.hasPrefix("/") {
+            return URL(fileURLWithPath: destination).standardizedFileURL.path
         }
 
-        // Then fetch asynchronously if not already fetched
-        guard !hasFetched else { return }
-        hasFetched = true
-
-        FaviconProvider.shared.fetchFaviconIfNeeded(for: domain) { image in
-            self.favicon = image
-        }
-    }
-}
-
-/// SwiftUI view that displays an app icon for a bundle ID
-public struct AppIconView: View {
-    let bundleID: String
-    let size: CGFloat
-
-    public init(bundleID: String, size: CGFloat = 32) {
-        self.bundleID = bundleID
-        self.size = size
+        return URL(
+            fileURLWithPath: destination,
+            relativeTo: symlinkURL.deletingLastPathComponent()
+        ).standardizedFileURL.path
     }
 
-    public var body: some View {
-        Group {
-            if let nsImage = AppIconProvider.shared.icon(for: bundleID) {
-                Image(nsImage: nsImage)
-                    .resizable()
-                    .interpolation(.high)
-                    .aspectRatio(contentMode: .fit)
-            } else {
-                // Fallback: colored rounded square with first letter
-                fallbackIcon
-            }
-        }
-        .frame(width: size, height: size)
-    }
-
-    private var fallbackIcon: some View {
-        let appName = AppNameResolver.shared.displayName(for: bundleID)
-        let firstLetter = appName.first.map { String($0).uppercased() } ?? "?"
-        let color = Color.segmentColor(for: bundleID)
-
-        return ZStack {
-            RoundedRectangle(cornerRadius: size * 0.22)
-                .fill(color.opacity(0.2))
-
-            RoundedRectangle(cornerRadius: size * 0.22)
-                .stroke(color.opacity(0.3), lineWidth: 1)
-
-            Text(firstLetter)
-                .font(RetraceFont.font(size: size * 0.45, weight: .semibold))
-                .foregroundColor(color)
-        }
+    private static func pathDigest(_ path: String) -> String {
+        let digest = SHA256.hash(data: Data(path.utf8))
+        return digest.prefix(16).map { String(format: "%02x", $0) }.joined()
     }
 }
 
@@ -786,6 +118,7 @@ public class AppIconColorCache {
     private let cacheFileURL: URL
     private var diskCache: [String: StoredColor] = [:]
     private var isDirty = false
+    private var pendingExtractions: Set<String> = []
 
     private init() {
         // Store in AppPaths.storageRoot (respects custom location)
@@ -803,10 +136,8 @@ public class AppIconColorCache {
     /// Get the dominant color for an app's icon, with caching
     public func color(for bundleID: String) -> Color {
         lock.lock()
-        defer { lock.unlock() }
-
-        // Return from memory cache if available
         if let cached = cache[bundleID] {
+            lock.unlock()
             return cached
         }
 
@@ -814,17 +145,31 @@ public class AppIconColorCache {
         if let stored = diskCache[bundleID] {
             let color = stored.color
             cache[bundleID] = color
+            lock.unlock()
             return color
         }
 
-        // Extract color from icon
+        // Cache miss: return deterministic fallback immediately and extract asynchronously.
+        if !pendingExtractions.contains(bundleID) {
+            pendingExtractions.insert(bundleID)
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                self?.extractAndCacheColor(for: bundleID)
+            }
+        }
+        lock.unlock()
+        return fallbackColor(for: bundleID)
+    }
+
+    private func extractAndCacheColor(for bundleID: String) {
         let color = extractDominantColor(for: bundleID)
+
+        lock.lock()
         cache[bundleID] = color
+        pendingExtractions.remove(bundleID)
+        lock.unlock()
 
-        // Save to disk cache (async to avoid blocking)
+        // Persist asynchronously to keep extraction path non-blocking.
         saveToDiskAsync(bundleID: bundleID, color: color)
-
-        return color
     }
 
     /// Extract the dominant color from an app's icon
@@ -978,6 +323,156 @@ public class AppIconColorCache {
     }
 }
 
+// MARK: - Tag Color Storage
+
+/// Persists per-tag colors selected by users in Settings.
+/// Colors are keyed by tag ID and fall back to a deterministic color when unset.
+public enum TagColorStore {
+    private static let defaults: UserDefaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
+    private static let storageKey = "tagColorsByID"
+    private static let lock = NSLock()
+    private static var cachedHexByTagID: [Int64: String] = [:]
+    private static var didLoadCache = false
+
+    public static func color(for tag: Tag) -> Color {
+        color(forTagID: tag.id, tagName: tag.name)
+    }
+
+    public static func color(forTagID tagID: TagID, tagName: String? = nil) -> Color {
+        lock.lock()
+        loadCacheIfNeededLocked()
+        let storedHex = cachedHexByTagID[tagID.value]
+        lock.unlock()
+
+        if let storedHex, let storedColor = colorFromHex(storedHex) {
+            return storedColor
+        }
+
+        return fallbackColor(forTagID: tagID, tagName: tagName)
+    }
+
+    public static func setColor(_ color: Color, for tagID: TagID) {
+        let hex = hexString(from: color)
+        var didChange = false
+
+        lock.lock()
+        loadCacheIfNeededLocked()
+
+        if cachedHexByTagID[tagID.value] != hex {
+            cachedHexByTagID[tagID.value] = hex
+            persistLocked()
+            didChange = true
+        }
+
+        lock.unlock()
+
+        if didChange {
+            NotificationCenter.default.post(name: .tagColorsDidChange, object: tagID)
+        }
+    }
+
+    public static func removeColor(for tagID: TagID) {
+        var didChange = false
+
+        lock.lock()
+        loadCacheIfNeededLocked()
+
+        if cachedHexByTagID.removeValue(forKey: tagID.value) != nil {
+            persistLocked()
+            didChange = true
+        }
+
+        lock.unlock()
+
+        if didChange {
+            NotificationCenter.default.post(name: .tagColorsDidChange, object: tagID)
+        }
+    }
+
+    public static func pruneColors(keeping validTagIDs: Set<Int64>) {
+        var didChange = false
+
+        lock.lock()
+        loadCacheIfNeededLocked()
+
+        let initialCount = cachedHexByTagID.count
+        cachedHexByTagID = cachedHexByTagID.filter { validTagIDs.contains($0.key) }
+        didChange = cachedHexByTagID.count != initialCount
+
+        if didChange {
+            persistLocked()
+        }
+
+        lock.unlock()
+
+        if didChange {
+            NotificationCenter.default.post(name: .tagColorsDidChange, object: nil)
+        }
+    }
+
+    public static func suggestedColor(for tagName: String) -> Color {
+        fallbackColor(forTagID: TagID(value: 0), tagName: tagName)
+    }
+
+    private static func loadCacheIfNeededLocked() {
+        guard !didLoadCache else { return }
+        defer { didLoadCache = true }
+
+        guard let raw = defaults.dictionary(forKey: storageKey) as? [String: String] else {
+            cachedHexByTagID = [:]
+            return
+        }
+
+        cachedHexByTagID = raw.reduce(into: [:]) { map, entry in
+            guard let id = Int64(entry.key) else { return }
+            map[id] = entry.value
+        }
+    }
+
+    private static func persistLocked() {
+        let serialized = cachedHexByTagID.reduce(into: [String: String]()) { map, entry in
+            map[String(entry.key)] = entry.value
+        }
+        defaults.set(serialized, forKey: storageKey)
+    }
+
+    private static func fallbackColor(forTagID tagID: TagID, tagName: String?) -> Color {
+        let normalizedName = (tagName ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let hashSeed = normalizedName.isEmpty ? "tag-\(tagID.value)" : "tag-\(tagID.value)-\(normalizedName)"
+        let hash = stableHash(for: hashSeed)
+        let hue = Double(hash % 360) / 360.0
+        return Color(hue: hue, saturation: 0.72, brightness: 0.88)
+    }
+
+    private static func stableHash(for input: String) -> UInt64 {
+        // FNV-1a 64-bit hash for deterministic color assignment.
+        var hash: UInt64 = 1_469_598_103_934_665_603
+        for byte in input.utf8 {
+            hash ^= UInt64(byte)
+            hash &*= 1_099_511_628_211
+        }
+        return hash
+    }
+
+    private static func colorFromHex(_ hex: String) -> Color? {
+        let cleaned = hex.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
+        guard cleaned.count == 6 else { return nil }
+        return Color(hex: cleaned)
+    }
+
+    private static func hexString(from color: Color) -> String {
+        let nsColor = NSColor(color).usingColorSpace(.sRGB) ?? NSColor.systemBlue
+
+        let red = max(0, min(255, Int((nsColor.redComponent * 255).rounded())))
+        let green = max(0, min(255, Int((nsColor.greenComponent * 255).rounded())))
+        let blue = max(0, min(255, Int((nsColor.blueComponent * 255).rounded())))
+
+        return String(format: "#%02X%02X%02X", red, green, blue)
+    }
+}
+
 // MARK: - Colors
 
 extension Color {
@@ -1004,8 +499,18 @@ extension Color {
     // Original brand blue (for cases where we always want blue)
     public static let retraceBrandBlue = Color(red: 11/255, green: 51/255, blue: 108/255)
 
-    // Submit button accent - darker blue for submit/action buttons (#0b336c)
-    public static let retraceSubmitAccent = Color(red: 11/255, green: 51/255, blue: 108/255)
+    // Submit/action button accent - slightly deeper tones for filled buttons
+    public static var retraceSubmitAccent: Color {
+        let theme = MilestoneCelebrationManager.getCurrentTheme()
+        switch theme {
+        case .blue:
+            return Color(red: 59/255, green: 130/255, blue: 246/255)
+        case .gold:
+            return Color(red: 245/255, green: 180/255, blue: 0/255)
+        case .purple:
+            return Color(red: 148/255, green: 84/255, blue: 242/255)
+        }
+    }
 
     // Card background: hsl(222, 47%, 7%)
     public static let retraceCard = Color(red: 9/255, green: 18/255, blue: 38/255)
@@ -1049,7 +554,7 @@ extension Color {
 // MARK: - Typography
 
 /// Available font styles for the app
-public enum RetraceFontStyle: String, CaseIterable, Identifiable {
+public enum RetraceFontStyle: String, CaseIterable, Identifiable, Sendable {
     case `default` = "default"
     case rounded = "rounded"
     case serif = "serif"
@@ -1088,19 +593,19 @@ public enum RetraceFont {
     private static let fontStyleKey = "retraceFontStyle"
 
     /// Shared UserDefaults store (same as Settings uses)
-    private static let settingsStore = UserDefaults(suiteName: "io.retrace.app")
+    private static let settingsStore = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
 
     /// The current font style (persisted in UserDefaults)
     public static var currentStyle: RetraceFontStyle {
         get {
-            if let rawValue = settingsStore?.string(forKey: fontStyleKey),
+            if let rawValue = settingsStore.string(forKey: fontStyleKey),
                let style = RetraceFontStyle(rawValue: rawValue) {
                 return style
             }
             return .default
         }
         set {
-            settingsStore?.set(newValue.rawValue, forKey: fontStyleKey)
+            settingsStore.set(newValue.rawValue, forKey: fontStyleKey)
             // Post notification so views can update
             DispatchQueue.main.async {
                 NotificationCenter.default.post(name: .fontStyleDidChange, object: newValue)
@@ -1443,7 +948,7 @@ public struct TimelineScaleFactor {
     private static let minScale: CGFloat = 0.85
 
     /// Maximum scale factor to prevent UI from becoming too large
-    private static let maxScale: CGFloat = 1.6
+    private static let maxScale: CGFloat = 1.35
 
     /// Thread-safe cached scale factor to prevent size changes during window lifecycle
     private static var _cachedScaleFactor: CGFloat?
@@ -1505,8 +1010,9 @@ public struct TimelineScaleFactor {
 
     // MARK: - Control Positioning (scaled)
 
-    /// Y offset for control buttons above tape
-    public static var controlsYOffset: CGFloat { -55 * current }
+    /// Y offset for control buttons above tape.
+    /// Raised by 10pt from baseline.
+    public static var controlsYOffset: CGFloat { -65 * current }
 
     /// Y offset for floating search panel
     public static var searchPanelYOffset: CGFloat { -195 * current }
@@ -1648,6 +1154,13 @@ public struct RetraceMenuStyle {
     /// Font size value (for non-SwiftUI contexts)
     public static let fontSize: CGFloat = 13
 
+    /// Font for keyboard shortcut hints shown on the right side of menu rows
+    /// Use default system design so symbol glyphs like "⌫" and "⌘" render cleanly.
+    public static let shortcutFont = Font.system(size: 14, weight: .semibold)
+
+    /// Reserved width for the right-aligned shortcut column
+    public static let shortcutColumnMinWidth: CGFloat = 38
+
     /// Font weight
     public static let fontWeight: Font.Weight = .medium
 
@@ -1686,6 +1199,27 @@ public struct RetraceMenuStyle {
     /// Same hue as brand blue but lower saturation for less visual noise
     public static let uiBlue = Color(red: 0.4, green: 0.55, blue: 0.7)
 
+    /// Base accent color for filter control strokes (buttons and fields).
+    /// Uses the lighter Retrace accent for consistent focus/hover/open outlines.
+    public static var filterStrokeAccent: Color {
+        Color.retraceAccent
+    }
+
+    /// Strong stroke color for hovered/focused/open filter controls.
+    public static var filterStrokeStrong: Color {
+        filterStrokeAccent.opacity(0.95)
+    }
+
+    /// Medium stroke color for active/selected filter controls.
+    public static var filterStrokeMedium: Color {
+        filterStrokeAccent.opacity(0.45)
+    }
+
+    /// Subtle resting stroke color for filter controls.
+    public static var filterStrokeSubtle: Color {
+        filterStrokeAccent.opacity(0.18)
+    }
+
     // MARK: - Search Field Styling (within menus)
 
     /// Search field background
@@ -1707,6 +1241,110 @@ public struct RetraceMenuStyle {
     public static let appearanceAnimation = Animation.easeOut(duration: 0.15)
 }
 
+// MARK: - Timeline Overlay Surface Families
+
+/// Fullscreen timeline overlays must use one of two families:
+/// glass black for transient HUD chrome, or matte dark gray for owned editors/dialogs.
+public enum RetraceTimelineGlassVariant {
+    case chip
+    case banner
+    case panel
+
+    var fillColor: Color {
+        switch self {
+        case .chip:
+            return Color.black.opacity(0.46)
+        case .banner:
+            return Color.black.opacity(0.56)
+        case .panel:
+            return Color.black.opacity(0.4)
+        }
+    }
+
+    var materialOpacity: Double {
+        switch self {
+        case .chip:
+            return 0.9
+        case .banner:
+            return 1.0
+        case .panel:
+            return 1.0
+        }
+    }
+
+    var borderColor: Color {
+        switch self {
+        case .chip:
+            return Color.white.opacity(0.18)
+        case .banner:
+            return Color.white.opacity(0.16)
+        case .panel:
+            return Color.white.opacity(0.15)
+        }
+    }
+
+    var shadowColor: Color {
+        Color.black.opacity(0.5)
+    }
+
+    var shadowRadius: CGFloat {
+        switch self {
+        case .chip:
+            return 12
+        case .banner:
+            return 20
+        case .panel:
+            return 20
+        }
+    }
+
+    var shadowY: CGFloat {
+        switch self {
+        case .chip:
+            return 5
+        case .banner, .panel:
+            return 10
+        }
+    }
+}
+
+public struct RetraceTimelineGlassSurface: ViewModifier {
+    let variant: RetraceTimelineGlassVariant
+    let cornerRadius: CGFloat
+    let borderColorOverride: Color?
+
+    public func body(content: Content) -> some View {
+        content
+            .background(
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .fill(.ultraThinMaterial.opacity(variant.materialOpacity))
+                    .environment(\.colorScheme, .dark)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                            .fill(variant.fillColor)
+                    )
+                    .shadow(
+                        color: variant.shadowColor,
+                        radius: variant.shadowRadius,
+                        y: variant.shadowY
+                    )
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .stroke(borderColorOverride ?? variant.borderColor, lineWidth: 1)
+            )
+    }
+}
+
+public struct RetraceMattePanelSurface: ViewModifier {
+    let cornerRadius: CGFloat
+    let addPadding: Bool
+
+    public func body(content: Content) -> some View {
+        content.retraceMenuContainer(addPadding: addPadding, cornerRadius: cornerRadius)
+    }
+}
+
 // MARK: - Reusable Menu Components
 
 /// Standardized menu button component
@@ -1714,6 +1352,7 @@ public struct RetraceMenuStyle {
 public struct RetraceMenuButton: View {
     let icon: String
     let title: String
+    var shortcut: String? = nil
     var showChevron: Bool = false
     var isDestructive: Bool = false
     var isDisabled: Bool = false
@@ -1725,6 +1364,7 @@ public struct RetraceMenuButton: View {
     public init(
         icon: String,
         title: String,
+        shortcut: String? = nil,
         showChevron: Bool = false,
         isDestructive: Bool = false,
         isDisabled: Bool = false,
@@ -1733,6 +1373,7 @@ public struct RetraceMenuButton: View {
     ) {
         self.icon = icon
         self.title = title
+        self.shortcut = shortcut
         self.showChevron = showChevron
         self.isDestructive = isDestructive
         self.isDisabled = isDisabled
@@ -1751,8 +1392,21 @@ public struct RetraceMenuButton: View {
                 Text(title)
                     .font(RetraceMenuStyle.font)
                     .foregroundColor(foregroundColor)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .layoutPriority(1)
 
-                Spacer()
+                Spacer(minLength: 0)
+
+                if let shortcut {
+                    Text(shortcut)
+                        .font(RetraceMenuStyle.shortcutFont)
+                        .foregroundColor(shortcutColor)
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .frame(minWidth: RetraceMenuStyle.shortcutColumnMinWidth, alignment: .trailing)
+                        .layoutPriority(1)
+                }
 
                 if showChevron {
                     Image(systemName: "chevron.right")
@@ -1789,19 +1443,27 @@ public struct RetraceMenuButton: View {
             return isHovering ? RetraceMenuStyle.textColor : RetraceMenuStyle.textColorMuted
         }
     }
+
+    private var shortcutColor: Color {
+        if isDisabled {
+            return RetraceMenuStyle.textColorMuted.opacity(0.4)
+        }
+        return RetraceMenuStyle.textColorMuted.opacity(isHovering ? 0.95 : 0.7)
+    }
 }
 
 /// Shared UserDefaults store for accessing settings
-private let menuContainerSettingsStore = UserDefaults(suiteName: "io.retrace.app")
+private let menuContainerSettingsStore = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
 
 /// Standardized menu container modifier
 /// Applies consistent background, border, and shadow to any menu/popover content
 /// Border color adapts based on user's color theme preference
 public struct RetraceMenuContainer: ViewModifier {
     var addPadding: Bool = true
+    var cornerRadius: CGFloat = RetraceMenuStyle.cornerRadius
 
     private var showColoredBorders: Bool {
-        menuContainerSettingsStore?.bool(forKey: "timelineColoredBorders") ?? true
+        menuContainerSettingsStore.bool(forKey: "timelineColoredBorders")
     }
 
     private var borderColor: Color {
@@ -1821,7 +1483,7 @@ public struct RetraceMenuContainer: ViewModifier {
             }
         }
         .background(
-            RoundedRectangle(cornerRadius: RetraceMenuStyle.cornerRadius)
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                 .fill(RetraceMenuStyle.backgroundColor)
                 .shadow(
                     color: RetraceMenuStyle.shadowColor,
@@ -1830,7 +1492,7 @@ public struct RetraceMenuContainer: ViewModifier {
                 )
         )
         .overlay(
-            RoundedRectangle(cornerRadius: RetraceMenuStyle.cornerRadius)
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                 .stroke(borderColor, lineWidth: RetraceMenuStyle.borderWidth)
         )
     }
@@ -1838,8 +1500,32 @@ public struct RetraceMenuContainer: ViewModifier {
 
 extension View {
     /// Apply standardized menu/popover container styling
-    public func retraceMenuContainer(addPadding: Bool = true) -> some View {
-        self.modifier(RetraceMenuContainer(addPadding: addPadding))
+    public func retraceMenuContainer(
+        addPadding: Bool = true,
+        cornerRadius: CGFloat = RetraceMenuStyle.cornerRadius
+    ) -> some View {
+        self.modifier(RetraceMenuContainer(addPadding: addPadding, cornerRadius: cornerRadius))
+    }
+
+    public func timelineGlassSurface(
+        _ variant: RetraceTimelineGlassVariant,
+        cornerRadius: CGFloat,
+        borderColor: Color? = nil
+    ) -> some View {
+        self.modifier(
+            RetraceTimelineGlassSurface(
+                variant: variant,
+                cornerRadius: cornerRadius,
+                borderColorOverride: borderColor
+            )
+        )
+    }
+
+    public func retraceMattePanel(
+        addPadding: Bool = true,
+        cornerRadius: CGFloat = RetraceMenuStyle.cornerRadius
+    ) -> some View {
+        self.modifier(RetraceMattePanelSurface(cornerRadius: cornerRadius, addPadding: addPadding))
     }
 }
 
@@ -1848,6 +1534,7 @@ public struct RetraceMenuSearchField: View {
     @Binding var text: String
     var placeholder: String
     var onSubmit: (() -> Void)? = nil
+    @FocusState private var isFocused: Bool
 
     public init(text: Binding<String>, placeholder: String = "Search...", onSubmit: (() -> Void)? = nil) {
         self._text = text
@@ -1865,6 +1552,7 @@ public struct RetraceMenuSearchField: View {
                 .textFieldStyle(.plain)
                 .font(RetraceMenuStyle.font)
                 .foregroundColor(.white)
+                .focused($isFocused)
                 .onSubmit {
                     onSubmit?()
                 }
@@ -1884,6 +1572,10 @@ public struct RetraceMenuSearchField: View {
             RoundedRectangle(cornerRadius: RetraceMenuStyle.searchFieldCornerRadius)
                 .fill(RetraceMenuStyle.searchFieldBackground)
         )
+        .contentShape(Rectangle())
+        .onTapGesture {
+            isFocused = true
+        }
     }
 }
 
@@ -1948,7 +1640,7 @@ public struct PingDotView: View {
         .onAppear {
             if isAnimating {
                 withAnimation(
-                    Animation.easeOut(duration: 1.5)
+                    Animation.easeOut(duration: 3.0)
                         .repeatForever(autoreverses: false)
                 ) {
                     isPulsing = true
@@ -1963,4 +1655,6 @@ public struct PingDotView: View {
 extension Notification.Name {
     /// Posted when the font style preference changes
     public static let fontStyleDidChange = Notification.Name("fontStyleDidChange")
+    /// Posted when user-defined tag colors are updated
+    public static let tagColorsDidChange = Notification.Name("tagColorsDidChange")
 }

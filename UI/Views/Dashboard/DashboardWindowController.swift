@@ -1,7 +1,15 @@
 import AppKit
 import SwiftUI
+import Combine
 import App
 import Shared
+
+private enum DashboardWindowSizing {
+    static let defaultWidth: CGFloat = 1000
+    static let defaultHeight: CGFloat = 700
+    static let minWidth: CGFloat = 760
+    static let minHeight: CGFloat = 700
+}
 
 /// Manages the dashboard window as an on-demand window
 /// This follows the menu bar app pattern where windows are only created when requested
@@ -16,6 +24,8 @@ public class DashboardWindowController: NSObject {
 
     private(set) var window: NSWindow?
     private var coordinator: AppCoordinator?
+    private var dashboardViewModel: DashboardViewModel?
+    private var deeplinkTask: Task<Void, Never>?
 
     /// Whether the dashboard window is currently visible
     public private(set) var isVisible = false
@@ -46,12 +56,19 @@ public class DashboardWindowController: NSObject {
         self.coordinator = coordinator
     }
 
+    nonisolated static func shouldPerformCloseSideEffects(isApplicationTerminating: Bool) -> Bool {
+        !isApplicationTerminating
+    }
+
     // MARK: - Show/Hide
 
     /// Show the dashboard window
     public func show() {
+        Log.info("[DashboardWindowController] show requested state=\(windowStateSnapshot())", category: .ui)
+
         // If window already exists and is visible, just bring it to front
         if let window = window, window.isVisible {
+            Log.info("[DashboardWindowController] show routed to bringToFront (window already visible)", category: .ui)
             bringToFront()
             return
         }
@@ -63,6 +80,7 @@ public class DashboardWindowController: NSObject {
 
         // Create window if needed
         if window == nil {
+            Log.info("[DashboardWindowController] creating dashboard window", category: .ui)
             window = createWindow(coordinator: coordinator)
         }
 
@@ -73,6 +91,7 @@ public class DashboardWindowController: NSObject {
         NSApp.activate(ignoringOtherApps: true)
 
         isVisible = true
+        Log.info("[DashboardWindowController] show completed state=\(windowStateSnapshot())", category: .ui)
 
         // Post notification
         NotificationCenter.default.post(name: .dashboardDidOpen, object: nil)
@@ -80,12 +99,16 @@ public class DashboardWindowController: NSObject {
 
     /// Hide the dashboard window
     public func hide() {
+        Log.info("[DashboardWindowController] hide requested state=\(windowStateSnapshot())", category: .ui)
         guard let window = window, isVisible else {
+            Log.info("[DashboardWindowController] hide skipped (no visible dashboard)", category: .ui)
             return
         }
 
         window.orderOut(nil)
         isVisible = false
+        Log.info("[DashboardWindowController] hide completed state=\(windowStateSnapshot())", category: .ui)
+        hideAppIfNoForegroundWindows(ignoring: window)
 
         // Post notification
         NotificationCenter.default.post(name: .dashboardDidClose, object: nil)
@@ -111,30 +134,98 @@ public class DashboardWindowController: NSObject {
 
     /// Bring dashboard window to front if visible
     public func bringToFront() {
+        Log.info("[DashboardWindowController] bringToFront requested state=\(windowStateSnapshot())", category: .ui)
         guard let window = window else { return }
 
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
         window.orderFrontRegardless()
+        Log.info("[DashboardWindowController] bringToFront completed state=\(windowStateSnapshot())", category: .ui)
+    }
+
+    /// Show the dashboard window and route to the main dashboard view.
+    public func showDashboard() {
+        show()
+        NotificationCenter.default.post(name: .openDashboard, object: nil)
+    }
+
+    /// Apply the filter before creating/showing the window, including on a cold launch.
+    /// Keeping the model in the controller prevents a lost first-window notification
+    /// and avoids starting an unfiltered storage scan before the range is applied.
+    public func openDeeplink(dateRange: DateRangeCriterion?) {
+        guard let coordinator else {
+            Log.error("[DashboardWindowController] Cannot open dashboard deeplink before configuration", category: .ui)
+            return
+        }
+        deeplinkTask?.cancel()
+        let appWasHidden = NSApp.isHidden
+        let dashboardWasVisible = isVisible
+        let viewModel = getDashboardViewModel(coordinator: coordinator)
+        UIMetricsRecorder.recordDictionary(
+            coordinator: coordinator,
+            type: .launchSurfaceReveal,
+            payload: [
+                "source": "dashboard_deeplink",
+                "action": "open_dashboard",
+                "appWasHidden": appWasHidden,
+                "dashboardWasVisible": dashboardWasVisible,
+                "isInitialized": true,
+                "hasDateRange": dateRange != nil
+            ]
+        )
+        deeplinkTask = Task { [weak self] in
+            if let dateRange {
+                await viewModel.setAppUsageDateRange(
+                    from: dateRange, source: "dashboard_deeplink", reloadStatistics: false
+                )
+            }
+            guard !Task.isCancelled, let self else { return }
+            self.showDashboard()
+            await viewModel.loadStatistics(reason: "dashboard_deeplink")
+            Log.info("[DashboardWindowController] Dashboard deeplink presented range=\(viewModel.appUsageRangeLabel)", category: .ui)
+        }
+    }
+
+    private func getDashboardViewModel(coordinator: AppCoordinator) -> DashboardViewModel {
+        if let dashboardViewModel { return dashboardViewModel }
+        let viewModel = DashboardViewModel(coordinator: coordinator)
+        dashboardViewModel = viewModel
+        return viewModel
+    }
+
+    /// Update the dashboard window title used for metadata/window-list consumers.
+    func updateWindowTitle(_ title: String) {
+        window?.title = title
     }
 
     // MARK: - Window Creation
 
     private func createWindow(coordinator: AppCoordinator) -> NSWindow {
         // Create the SwiftUI view for the dashboard content
-        let dashboardContent = DashboardContentView(coordinator: coordinator)
+        let dashboardContent = DashboardContentView(
+            coordinator: coordinator,
+            dashboardViewModel: getDashboardViewModel(coordinator: coordinator)
+        )
 
         // Create hosting controller
         let hostingController = NSHostingController(rootView: dashboardContent)
 
         // Create window
-        let window = NSWindow(contentViewController: hostingController)
+        let window = DashboardWindow(contentViewController: hostingController)
 
         // Configure window properties
-        window.title = "Retrace"
+        window.title = "Dashboard"
         window.styleMask = [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView]
-        window.setContentSize(NSSize(width: 1000, height: 700))
-        window.minSize = NSSize(width: 1000, height: 700)
+        window.setContentSize(
+            NSSize(
+                width: DashboardWindowSizing.defaultWidth,
+                height: DashboardWindowSizing.defaultHeight
+            )
+        )
+        window.minSize = NSSize(
+            width: DashboardWindowSizing.minWidth,
+            height: DashboardWindowSizing.minHeight
+        )
         window.center()
 
         // Set window level and appearance
@@ -166,19 +257,80 @@ public class DashboardWindowController: NSObject {
         show()
         NotificationCenter.default.post(name: .toggleSettings, object: nil)
     }
+
+    /// Navigate to changelog view within the dashboard
+    public func showChangelog() {
+        show()
+        NotificationCenter.default.post(
+            name: .openDashboard,
+            object: nil,
+            userInfo: ["target": "changelog"]
+        )
+    }
 }
 
 // MARK: - NSWindowDelegate
 
 extension DashboardWindowController: NSWindowDelegate {
     public func windowWillClose(_ notification: Notification) {
+        Log.info("[DashboardWindowController] windowWillClose state(before)=\(windowStateSnapshot())", category: .ui)
         isVisible = false
+        Log.info("[DashboardWindowController] windowWillClose state(after)=\(windowStateSnapshot())", category: .ui)
+
+        if !Self.shouldPerformCloseSideEffects(isApplicationTerminating: AppDelegate.isApplicationTerminating) {
+            Log.info("[DashboardWindowController] windowWillClose skipping app-hide/close-notification during termination", category: .ui)
+            return
+        }
+
+        hideAppIfNoForegroundWindows(ignoring: window)
         NotificationCenter.default.post(name: .dashboardDidClose, object: nil)
     }
 
     public func windowDidBecomeKey(_ notification: Notification) {
         // Post notification so dashboard can refresh its stats
         NotificationCenter.default.post(name: .dashboardDidBecomeKey, object: nil)
+    }
+}
+
+private extension DashboardWindowController {
+    func hideAppIfNoForegroundWindows(ignoring dashboardWindow: NSWindow?) {
+        guard Self.shouldPerformCloseSideEffects(isApplicationTerminating: AppDelegate.isApplicationTerminating) else {
+            Log.info("[DashboardWindowController] skipping app hide while application is terminating", category: .ui)
+            return
+        }
+
+        let hasOtherForegroundWindows = NSApp.windows.contains { candidate in
+            isForegroundAppWindow(candidate, ignoring: dashboardWindow)
+        }
+
+        guard !hasOtherForegroundWindows else {
+            Log.info("[DashboardWindowController] keeping app active after dashboard hide (other foreground windows visible)", category: .ui)
+            return
+        }
+
+        Log.info("[DashboardWindowController] hiding app after dashboard hide (no foreground windows visible)", category: .ui)
+        NSApp.hide(nil)
+    }
+
+    func isForegroundAppWindow(_ candidate: NSWindow, ignoring ignoredWindow: NSWindow?) -> Bool {
+        guard candidate !== ignoredWindow else { return false }
+        guard candidate.isVisible, !candidate.isMiniaturized else { return false }
+        guard candidate.alphaValue > 0.01 else { return false }
+
+        return candidate.canBecomeKey
+            || candidate.canBecomeMain
+            || candidate.isKeyWindow
+            || candidate.isMainWindow
+    }
+
+    func windowStateSnapshot() -> String {
+        let windowExists = window != nil
+        let windowVisible = window?.isVisible ?? false
+        let windowKey = window?.isKeyWindow ?? false
+        let windowMain = window?.isMainWindow ?? false
+        let windowMini = window?.isMiniaturized ?? false
+
+        return "controllerVisible=\(isVisible) windowExists=\(windowExists) windowVisible=\(windowVisible) windowKey=\(windowKey) windowMain=\(windowMain) windowMini=\(windowMini) appHidden=\(NSApp.isHidden) appActive=\(NSApp.isActive)"
     }
 }
 
@@ -198,19 +350,28 @@ struct DashboardContentView: View {
     /// Manager for milestone celebrations
     @StateObject private var milestoneCelebrationManager: MilestoneCelebrationManager
 
+    /// Dashboard view model - hoisted here so it persists across tab switches
+    @StateObject private var dashboardViewModel: DashboardViewModel
+
     @State private var selectedView: DashboardSelectedView = .dashboard
+    @State private var currentSettingsTabTitle = SettingsTab.general.rawValue
     @State private var showFeedbackSheet = false
     @State private var showOnboarding: Bool? = nil
     @State private var initialSettingsTab: SettingsTab? = nil
+    @State private var initialSettingsScrollTargetID: String? = nil
+    @State private var hasLoadedDashboard = false
+    /// Forces a SwiftUI refresh when global appearance preferences change.
+    @State private var appearanceRefreshTick = 0
 
-    init(coordinator: AppCoordinator) {
+    init(coordinator: AppCoordinator, dashboardViewModel: DashboardViewModel) {
         self.coordinator = coordinator
         self._coordinatorWrapper = StateObject(wrappedValue: AppCoordinatorWrapper(coordinator: coordinator))
         self._launchOnLoginReminderManager = StateObject(wrappedValue: LaunchOnLoginReminderManager(coordinator: coordinator))
         self._milestoneCelebrationManager = StateObject(wrappedValue: MilestoneCelebrationManager(coordinator: coordinator))
+        self._dashboardViewModel = StateObject(wrappedValue: dashboardViewModel)
     }
 
-    var body: some View {
+    private var dashboardWithAppearanceNotifications: some View {
         ZStack {
             if let showOnboarding = showOnboarding {
                 if showOnboarding {
@@ -224,28 +385,11 @@ struct DashboardContentView: View {
                     }
                 } else {
                     // Main content based on selected view
-                    Group {
-                        switch selectedView {
-                        case .dashboard:
-                            DashboardView(
-                                coordinator: coordinator,
-                                launchOnLoginReminderManager: launchOnLoginReminderManager,
-                                milestoneCelebrationManager: milestoneCelebrationManager
-                            )
+                    // Persistent background prevents titlebar flash during tab transitions
+                    Color.retraceBackground
+                        .ignoresSafeArea()
 
-                        case .settings:
-                            SettingsView(initialTab: initialSettingsTab)
-                                .environmentObject(coordinatorWrapper)
-                                .onDisappear {
-                                    // Clear the initial tab when leaving settings
-                                    initialSettingsTab = nil
-                                }
-
-                        case .monitor:
-                            SystemMonitorView(coordinator: coordinator)
-                                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        }
-                    }
+                    selectedContent
                     .transition(.opacity.combined(with: .scale(scale: 0.98)))
                     .animation(.easeInOut(duration: 0.2), value: selectedView)
                 }
@@ -255,45 +399,132 @@ struct DashboardContentView: View {
                     .ignoresSafeArea()
             }
         }
-        .frame(minWidth: 1000, minHeight: 700)
+        .frame(
+            minWidth: DashboardWindowSizing.minWidth,
+            minHeight: DashboardWindowSizing.minHeight
+        )
         .task {
             await checkOnboarding()
         }
-        .onReceive(NotificationCenter.default.publisher(for: .openDashboard)) { _ in
+        .onAppear {
+            updateDashboardWindowTitle()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openDashboard)) { notification in
+            let target = notification.userInfo?["target"] as? String
             withAnimation(.easeInOut(duration: 0.2)) {
-                selectedView = .dashboard
+                selectedView = target == "changelog" ? .changelog : .dashboard
             }
+            updateDashboardWindowTitle()
         }
         .onReceive(NotificationCenter.default.publisher(for: .dashboardShowSettings)) { _ in
             withAnimation(.easeInOut(duration: 0.2)) {
                 selectedView = .settings
             }
+            updateDashboardWindowTitle()
         }
+        .onReceive(NotificationCenter.default.publisher(for: .colorThemeDidChange)) { _ in
+            appearanceRefreshTick &+= 1
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .fontStyleDidChange)) { _ in
+            appearanceRefreshTick &+= 1
+        }
+    }
+
+    private var dashboardWithSettingsNotifications: some View {
+        dashboardWithAppearanceNotifications
         .onReceive(NotificationCenter.default.publisher(for: .toggleSettings)) { _ in
             // Toggle: if on settings go to dashboard, otherwise go to settings
-            withAnimation(.easeInOut(duration: 0.2)) {
-                selectedView = selectedView == .settings ? .dashboard : .settings
+            let targetView: DashboardSelectedView
+            switch selectedView {
+            case .settings: targetView = .dashboard
+            default: targetView = .settings
             }
+            withAnimation(.easeInOut(duration: 0.2)) {
+                selectedView = targetView
+            }
+            updateDashboardWindowTitle()
         }
         .onReceive(NotificationCenter.default.publisher(for: .openSettings)) { _ in
+            initialSettingsTab = nil
+            initialSettingsScrollTargetID = nil
             withAnimation(.easeInOut(duration: 0.2)) {
                 selectedView = .settings
             }
             DashboardWindowController.shared.show()
+            updateDashboardWindowTitle()
         }
         .onReceive(NotificationCenter.default.publisher(for: .openSettingsAppearance)) { _ in
+            initialSettingsTab = nil
+            initialSettingsScrollTargetID = nil
             withAnimation(.easeInOut(duration: 0.2)) {
                 selectedView = .settings
             }
             DashboardWindowController.shared.show()
             // General tab contains Appearance settings - it's the default tab
+            updateDashboardWindowTitle()
         }
         .onReceive(NotificationCenter.default.publisher(for: .openSettingsPower)) { _ in
             initialSettingsTab = .power
+            initialSettingsScrollTargetID = nil
+            currentSettingsTabTitle = SettingsTab.power.rawValue
             withAnimation(.easeInOut(duration: 0.2)) {
                 selectedView = .settings
             }
             DashboardWindowController.shared.show()
+            updateDashboardWindowTitle()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openSettingsTags)) { _ in
+            initialSettingsTab = .tags
+            initialSettingsScrollTargetID = nil
+            currentSettingsTabTitle = SettingsTab.tags.rawValue
+            withAnimation(.easeInOut(duration: 0.2)) {
+                selectedView = .settings
+            }
+            DashboardWindowController.shared.show()
+            updateDashboardWindowTitle()
+        }
+    }
+
+    var body: some View {
+        dashboardWithSettingsNotifications
+        .onReceive(NotificationCenter.default.publisher(for: .openSettingsPauseReminderInterval)) { _ in
+            initialSettingsTab = .capture
+            initialSettingsScrollTargetID = SettingsView.pauseReminderIntervalTargetID
+            currentSettingsTabTitle = SettingsTab.capture.rawValue
+            withAnimation(.easeInOut(duration: 0.2)) {
+                selectedView = .settings
+            }
+            DashboardWindowController.shared.show()
+            updateDashboardWindowTitle()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openSettingsPowerOCRCard)) { _ in
+            initialSettingsTab = .power
+            initialSettingsScrollTargetID = SettingsView.powerOCRCardTargetID
+            currentSettingsTabTitle = SettingsTab.power.rawValue
+            withAnimation(.easeInOut(duration: 0.2)) {
+                selectedView = .settings
+            }
+            DashboardWindowController.shared.show()
+            updateDashboardWindowTitle()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openSettingsPowerOCRPriority)) { _ in
+            initialSettingsTab = .power
+            initialSettingsScrollTargetID = SettingsView.powerOCRPriorityTargetID
+            currentSettingsTabTitle = SettingsTab.power.rawValue
+            withAnimation(.easeInOut(duration: 0.2)) {
+                selectedView = .settings
+            }
+            DashboardWindowController.shared.show()
+            updateDashboardWindowTitle()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .settingsSelectedTabDidChange)) { notification in
+            guard let tab = notification.userInfo?["tab"] as? String, !tab.isEmpty else {
+                return
+            }
+            currentSettingsTabTitle = tab
+            if selectedView == .settings {
+                updateDashboardWindowTitle()
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: .openFeedback)) { _ in
             showFeedbackSheet = true
@@ -304,10 +535,62 @@ struct DashboardContentView: View {
                 selectedView = .monitor
             }
             DashboardWindowController.shared.show()
+            updateDashboardWindowTitle()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .toggleSystemMonitor)) { _ in
+            if selectedView == .monitor,
+               DashboardWindowController.shared.isVisible,
+               let window = DashboardWindowController.shared.window,
+               (window.isKeyWindow || window.attachedSheet != nil) && NSApp.isActive {
+                // Already showing monitor and frontmost — toggle monitor off by hiding window
+                DashboardWindowController.shared.hide()
+            } else {
+                // Show system monitor
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    selectedView = .monitor
+                }
+                DashboardWindowController.shared.show()
+                updateDashboardWindowTitle()
+            }
         }
         .sheet(isPresented: $showFeedbackSheet) {
             FeedbackFormView()
                 .environmentObject(coordinatorWrapper)
+        }
+    }
+
+    @ViewBuilder
+    private var selectedContent: some View {
+        switch selectedView {
+        case .dashboard:
+            DashboardView(
+                viewModel: dashboardViewModel,
+                coordinator: coordinator,
+                launchOnLoginReminderManager: launchOnLoginReminderManager,
+                milestoneCelebrationManager: milestoneCelebrationManager,
+                debugLaunchOnboarding: triggerDebugOnboardingRelaunch,
+                hasLoadedInitialData: $hasLoadedDashboard
+            )
+
+        case .settings:
+            SettingsView(
+                initialTab: initialSettingsTab,
+                initialScrollTargetID: initialSettingsScrollTargetID
+            )
+            .environmentObject(coordinatorWrapper)
+            .onDisappear {
+                // Clear the initial tab when leaving settings
+                initialSettingsTab = nil
+                initialSettingsScrollTargetID = nil
+            }
+
+        case .changelog:
+            ChangelogView()
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+        case .monitor:
+            SystemMonitorView(coordinator: coordinator)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 
@@ -317,6 +600,37 @@ struct DashboardContentView: View {
             showOnboarding = shouldShow
         }
     }
+
+    private func triggerDebugOnboardingRelaunch() {
+        DashboardViewModel.recordDebugOnboardingRelaunchTriggered(coordinator: coordinator)
+
+        Task {
+            await coordinator.onboardingManager.resetCompletionStateForDebug()
+
+            await MainActor.run {
+                OnboardingView.resetPersistedProgressForDebug()
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    showOnboarding = true
+                }
+            }
+        }
+    }
+
+    private func updateDashboardWindowTitle() {
+        let title: String
+        switch selectedView {
+        case .dashboard:
+            title = "Dashboard"
+        case .settings:
+            title = "Settings - \(currentSettingsTabTitle)"
+        case .changelog:
+            title = "Changelog"
+        case .monitor:
+            title = "System Monitor"
+        }
+
+        DashboardWindowController.shared.updateWindowTitle(title)
+    }
 }
 
 // MARK: - Dashboard Selected View
@@ -324,7 +638,33 @@ struct DashboardContentView: View {
 enum DashboardSelectedView {
     case dashboard
     case settings
+    case changelog
     case monitor
+}
+
+/// Dashboard window that restores native maximize/restore behavior
+/// when double-clicking the title bar area.
+private final class DashboardWindow: NSWindow {
+    override func sendEvent(_ event: NSEvent) {
+        if shouldToggleZoom(for: event) {
+            zoom(nil)
+            return
+        }
+
+        super.sendEvent(event)
+    }
+
+    private func shouldToggleZoom(for event: NSEvent) -> Bool {
+        guard event.type == .leftMouseDown, event.clickCount == 2 else { return false }
+        guard styleMask.contains(.titled), styleMask.contains(.resizable) else { return false }
+
+        return isPointInTitleBar(event.locationInWindow)
+    }
+
+    private func isPointInTitleBar(_ point: NSPoint) -> Bool {
+        let titleBarMinY = contentLayoutRect.maxY
+        return point.y >= titleBarMinY
+    }
 }
 
 // MARK: - Notifications
@@ -335,4 +675,5 @@ extension Notification.Name {
     static let dashboardShowSettings = Notification.Name("dashboardShowSettings")
     static let dashboardDidBecomeKey = Notification.Name("dashboardDidBecomeKey")
     static let toggleSettings = Notification.Name("toggleSettings")
+    static let settingsSelectedTabDidChange = Notification.Name("settingsSelectedTabDidChange")
 }

@@ -4,16 +4,22 @@
 # =============================================================================
 # This script automates the release process:
 # 1. Builds the app (Release configuration)
-# 2. Creates a signed ZIP
-# 3. Generates the signature for Sparkle
-# 4. Updates the appcast.xml
-# 5. Outputs instructions for uploading
+# 2. Exports a Developer ID signed app
+# Packaging, notarization, Sparkle signing, and publication follow separately.
 #
 # Usage: ./scripts/create-release.sh [version]
 # Example: ./scripts/create-release.sh 1.0.1
 # =============================================================================
 
-set -e
+set -euo pipefail
+
+run_xcodebuild() {
+    if command -v xcbeautify > /dev/null 2>&1; then
+        xcodebuild "$@" | xcbeautify
+    else
+        xcodebuild "$@"
+    fi
+}
 
 # Configuration
 APP_NAME="Retrace"
@@ -21,6 +27,10 @@ BUNDLE_ID="io.retrace.app"
 BUILD_DIR="build/Release"
 RELEASES_DIR="releases"
 APPCAST_FILE="appcast.xml"
+XCODE_PROJECT_PATH="Retrace.xcodeproj"
+DERIVED_DATA_PATH="build/DerivedData"
+SWIFTPM_RESOLVED_SOURCE="Package.resolved"
+SWIFTPM_RESOLVED_DEST="${XCODE_PROJECT_PATH}/project.xcworkspace/xcshareddata/swiftpm/Package.resolved"
 
 # Colors for output
 RED='\033[0;31m'
@@ -29,18 +39,34 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
+sync_swiftpm_resolution() {
+    if [ ! -f "$SWIFTPM_RESOLVED_SOURCE" ]; then
+        echo -e "${RED}ERROR: Missing ${SWIFTPM_RESOLVED_SOURCE}${NC}"
+        exit 1
+    fi
+
+    mkdir -p "$(dirname "$SWIFTPM_RESOLVED_DEST")"
+    cp "$SWIFTPM_RESOLVED_SOURCE" "$SWIFTPM_RESOLVED_DEST"
+}
+
 echo -e "${BLUE}================================================${NC}"
 echo -e "${BLUE}  Retrace Release Builder${NC}"
 echo -e "${BLUE}================================================${NC}"
 echo ""
 
-# Get version from argument or prompt
-VERSION="$1"
+# Get version from argument; prompt only for interactive terminals.
+VERSION="${1:-}"
 if [ -z "$VERSION" ]; then
-    # Try to get from project.yml
-    CURRENT_VERSION=$(grep "MARKETING_VERSION" project.yml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-    echo -e "Current version in project.yml: ${YELLOW}${CURRENT_VERSION}${NC}"
-    read -p "Enter new version number (e.g., 1.0.1): " VERSION
+    if [ -t 0 ]; then
+        # Try to get from project.yml
+        CURRENT_VERSION=$(grep "MARKETING_VERSION" project.yml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+        echo -e "Current version in project.yml: ${YELLOW}${CURRENT_VERSION}${NC}"
+        read -r -p "Enter new version number (e.g., 1.0.1): " VERSION
+    else
+        echo -e "${RED}ERROR: Version number is required in non-interactive mode${NC}"
+        echo "Usage: ./scripts/create-release.sh <version>"
+        exit 2
+    fi
 fi
 
 if [ -z "$VERSION" ]; then
@@ -51,6 +77,10 @@ fi
 echo ""
 echo -e "${GREEN}Building version: ${VERSION}${NC}"
 echo ""
+
+echo -e "${YELLOW}Preflight: Running sleep API guard...${NC}"
+./scripts/check_no_nanoseconds_sleep.sh
+echo -e "${GREEN}  Sleep API guard passed${NC}"
 
 # Create releases directory
 mkdir -p "$RELEASES_DIR"
@@ -65,11 +95,41 @@ echo ""
 echo -e "${YELLOW}Step 2: Generating Xcode project...${NC}"
 if command -v xcodegen &> /dev/null; then
     xcodegen generate
+    sync_swiftpm_resolution
+    rm -rf "$DERIVED_DATA_PATH"
+    xcodebuild -resolvePackageDependencies \
+        -project "$XCODE_PROJECT_PATH" \
+        -scheme Retrace \
+        -derivedDataPath "$DERIVED_DATA_PATH" \
+        -disableAutomaticPackageResolution \
+        -onlyUsePackageVersionsFromResolvedFile
     echo "  Xcode project generated"
 else
     echo -e "${RED}  ERROR: xcodegen not found. Install with: brew install xcodegen${NC}"
     exit 1
 fi
+
+# Step 2.5: Prepare build metadata for Info.plist keys
+echo ""
+echo -e "${YELLOW}Step 2.5: Preparing build info...${NC}"
+BUILD_NUMBER=$(grep 'CURRENT_PROJECT_VERSION' project.yml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+GIT_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+GIT_COMMIT_FULL=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
+GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+BUILD_DATE=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+XCODE_BUILDINFO_ARGS=(
+    "INFOPLIST_KEY_RetraceVersion=${VERSION}"
+    "INFOPLIST_KEY_RetraceBuildNumber=${BUILD_NUMBER}"
+    "INFOPLIST_KEY_RetraceGitCommit=${GIT_COMMIT}"
+    "INFOPLIST_KEY_RetraceGitCommitFull=${GIT_COMMIT_FULL}"
+    "INFOPLIST_KEY_RetraceGitBranch=${GIT_BRANCH}"
+    "INFOPLIST_KEY_RetraceBuildDate=${BUILD_DATE}"
+    "INFOPLIST_KEY_RetraceBuildConfig=release"
+    "INFOPLIST_KEY_RetraceIsDevBuild=NO"
+    "INFOPLIST_KEY_RetraceForkName="
+)
+
+echo "  Prepared v${VERSION} build ${BUILD_NUMBER} commit ${GIT_COMMIT}"
 
 # Step 3: Archive the app
 echo ""
@@ -77,17 +137,15 @@ echo -e "${YELLOW}Step 3: Archiving...${NC}"
 ARCHIVE_PATH="build/${APP_NAME}.xcarchive"
 rm -rf "$ARCHIVE_PATH"
 
-xcodebuild -project Retrace.xcodeproj \
+run_xcodebuild -project "$XCODE_PROJECT_PATH" \
     -scheme Retrace \
     -configuration Release \
     -archivePath "$ARCHIVE_PATH" \
+    -derivedDataPath "$DERIVED_DATA_PATH" \
+    -disableAutomaticPackageResolution \
+    -onlyUsePackageVersionsFromResolvedFile \
     clean archive \
-    CODE_SIGN_IDENTITY="Developer ID Application" \
-    | xcbeautify || xcodebuild -project Retrace.xcodeproj \
-    -scheme Retrace \
-    -configuration Release \
-    -archivePath "$ARCHIVE_PATH" \
-    clean archive \
+    "${XCODE_BUILDINFO_ARGS[@]}" \
     CODE_SIGN_IDENTITY="Developer ID Application"
 
 if [ ! -d "$ARCHIVE_PATH" ]; then
@@ -122,11 +180,7 @@ EXPORT_PATH="build/Build/Products/Release"
 rm -rf "$EXPORT_PATH"
 mkdir -p "$EXPORT_PATH"
 
-xcodebuild -exportArchive \
-    -archivePath "$ARCHIVE_PATH" \
-    -exportPath "$EXPORT_PATH" \
-    -exportOptionsPlist "$EXPORT_OPTIONS_PATH" \
-    | xcbeautify || xcodebuild -exportArchive \
+run_xcodebuild -exportArchive \
     -archivePath "$ARCHIVE_PATH" \
     -exportPath "$EXPORT_PATH" \
     -exportOptionsPlist "$EXPORT_OPTIONS_PATH"

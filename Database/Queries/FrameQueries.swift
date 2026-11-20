@@ -1,11 +1,11 @@
 import Foundation
+import CoreGraphics
 import SQLCipher
 import Shared
 
 /// CRUD operations for frame table (Rewind-compatible schema)
-/// Uses: id, createdAt, imageFileName, segmentId, videoId, videoFrameIndex, isStarred, encodingStatus
-enum FrameQueries {
-
+/// Uses: id, createdAt, imageFileName, segmentId, videoId, videoFrameIndex, isStarred, encodedAt
+public enum FrameQueries {
     // MARK: - Insert
 
     /// Insert a new frame and return the auto-generated ID
@@ -14,8 +14,8 @@ enum FrameQueries {
     static func insert(db: OpaquePointer, frame: FrameReference) throws -> Int64 {
         let sql = """
             INSERT INTO frame (
-                createdAt, imageFileName, segmentId, videoId, videoFrameIndex, isStarred, encodingStatus, processingStatus, displayID, isFocused
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 4, ?, ?);
+                createdAt, imageFileName, segmentId, videoId, videoFrameIndex, isStarred, redactionReason, capture_trigger, processingStatus, displayID, isFocused
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 4, ?, ?);
             """
 
         var statement: OpaquePointer?
@@ -56,14 +56,15 @@ enum FrameQueries {
         // isStarred: 0 or 1
         sqlite3_bind_int(statement, 6, 0)
 
-        // encodingStatus: "pending", "success", "failed"
-        sqlite3_bind_text(statement, 7, frame.encodingStatus.rawValue, -1, SQLITE_TRANSIENT)
+        // redactionReason: nullable, set when frame pixels were intentionally redacted
+        bindTextOrNull(statement, 7, frame.metadata.redactionReason)
+        bindTextOrNull(statement, 8, frame.metadata.captureTrigger?.rawValue)
 
         // displayID: which physical display captured this frame
-        sqlite3_bind_int(statement, 8, Int32(frame.metadata.displayID))
+        sqlite3_bind_int64(statement, 9, Int64(frame.metadata.displayID))
 
         // isFocused: was user looking at this display (1 = yes, 0 = secondary)
-        sqlite3_bind_int(statement, 9, frame.metadata.isFocused ? 1 : 0)
+        sqlite3_bind_int(statement, 10, frame.metadata.isFocused ? 1 : 0)
 
         guard sqlite3_step(statement) == SQLITE_DONE else {
             throw DatabaseError.queryFailed(
@@ -77,10 +78,10 @@ enum FrameQueries {
 
     // MARK: - Update Video Link
 
-    /// Update frame's videoId and videoFrameIndex after video encoding
+    /// Update frame's videoId and videoFrameIndex after video encoding.
     static func updateVideoLink(db: OpaquePointer, frameId: Int64, videoId: Int64, videoFrameIndex: Int) throws {
         let sql = """
-            UPDATE frame SET videoId = ?, videoFrameIndex = ?, encodingStatus = 'success'
+            UPDATE frame SET videoId = ?, videoFrameIndex = ?
             WHERE id = ?;
             """
 
@@ -108,13 +109,782 @@ enum FrameQueries {
         }
     }
 
+    /// Persist optional metadata JSON payload for a frame.
+    static func updateMetadata(db: OpaquePointer, frameId: Int64, metadataJSON: String?) throws {
+        let sql = """
+            UPDATE frame
+            SET metadata = ?
+            WHERE id = ?;
+            """
+
+        var statement: OpaquePointer?
+        defer {
+            sqlite3_finalize(statement)
+        }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        bindTextOrNull(statement, 1, metadataJSON)
+        sqlite3_bind_int64(statement, 2, frameId)
+
+        guard sqlite3_step(statement) == SQLITE_DONE else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+    }
+
+    /// Get metadata JSON payload for a frame.
+    static func getMetadata(db: OpaquePointer, frameId: Int64) throws -> String? {
+        let sql = """
+            SELECT metadata
+            FROM frame
+            WHERE id = ?;
+            """
+
+        var statement: OpaquePointer?
+        defer {
+            sqlite3_finalize(statement)
+        }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        sqlite3_bind_int64(statement, 1, frameId)
+
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else {
+            return nil
+        }
+
+        return getTextOrNil(statement!, 0)
+    }
+
+    /// Replace resolved in-page URL rows/context for a frame.
+    static func replaceInPageURLData(
+        db: OpaquePointer,
+        frameId: Int64,
+        state: FrameInPageURLState?,
+        rows: [FrameInPageURLRow]
+    ) throws {
+        let sanitizedState = sanitizeInPageURLState(state, frameId: frameId)
+        let sanitizedRows = sanitizeInPageURLRows(rows, frameId: frameId)
+        try ensureInPageURLSchema(db: db)
+        try beginTransaction(db: db)
+        do {
+            try deleteInPageURLRows(db: db, frameId: frameId)
+            try updateInPageURLState(db: db, frameId: frameId, state: sanitizedState)
+
+            if !sanitizedRows.isEmpty {
+                try insertInPageURLRows(db: db, frameId: frameId, rows: sanitizedRows)
+            }
+
+            try commitTransaction(db: db)
+        } catch {
+            try? rollbackTransaction(db: db)
+            throw error
+        }
+    }
+
+    /// Get resolved in-page URL rows for a frame.
+    static func getInPageURLRows(db: OpaquePointer, frameId: Int64) throws -> [FrameInPageURLRow] {
+        try ensureInPageURLSchema(db: db)
+        let sql = """
+            SELECT r.ord, t.url, r.nid
+            FROM frame_in_page_url r
+            INNER JOIN in_page_url_text t
+                ON t.id = r.urlId
+            WHERE r.frameId = ?
+            ORDER BY r.ord ASC;
+            """
+
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        sqlite3_bind_int64(statement, 1, frameId)
+        var rows: [FrameInPageURLRow] = []
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
+            rows.append(
+                FrameInPageURLRow(
+                    order: Int(sqlite3_column_int64(statement, 0)),
+                    url: getTextOrNil(statement!, 1) ?? "",
+                    nodeID: Int(sqlite3_column_int64(statement, 2))
+                )
+            )
+        }
+
+        return rows
+    }
+
+    static func getInPageURLState(db: OpaquePointer, frameId: Int64) throws -> FrameInPageURLState? {
+        try ensureInPageURLSchema(db: db)
+        let sql = """
+            SELECT mousePosition, scrollPosition, videoCurrentTime
+            FROM frame
+            WHERE id = ?
+            LIMIT 1;
+            """
+
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        sqlite3_bind_int64(statement, 1, frameId)
+
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else {
+            return nil
+        }
+
+        let mousePosition = decodePoint(getTextOrNil(statement!, 0))
+        let scrollPosition = decodePoint(getTextOrNil(statement!, 1))
+        let videoCurrentTime = sqlite3_column_type(statement, 2) == SQLITE_NULL
+            ? nil
+            : sqlite3_column_double(statement, 2)
+
+        guard mousePosition != nil || scrollPosition != nil || videoCurrentTime != nil else {
+            return nil
+        }
+
+        return FrameInPageURLState(
+            mouseX: mousePosition?.x,
+            mouseY: mousePosition?.y,
+            scrollX: scrollPosition?.x,
+            scrollY: scrollPosition?.y,
+            videoCurrentTime: videoCurrentTime
+        )
+    }
+    private static func ensureInPageURLFrameColumns(db: OpaquePointer) throws {
+        if !(try hasColumn(db: db, table: "frame", column: "mousePosition")) {
+            try executeSQL(db: db, sql: "ALTER TABLE frame ADD COLUMN mousePosition TEXT;")
+        }
+        if !(try hasColumn(db: db, table: "frame", column: "scrollPosition")) {
+            try executeSQL(db: db, sql: "ALTER TABLE frame ADD COLUMN scrollPosition TEXT;")
+        }
+        if !(try hasColumn(db: db, table: "frame", column: "videoCurrentTime")) {
+            try executeSQL(db: db, sql: "ALTER TABLE frame ADD COLUMN videoCurrentTime REAL;")
+        }
+    }
+
+    static func ensureInPageURLSchema(db: OpaquePointer) throws {
+        try ensureInPageURLFrameColumns(db: db)
+
+        let usesLegacyInlineRows = try usesLegacyInPageURLRowStorage(db: db)
+        let usesSharedRowDefinitions: Bool
+        if usesLegacyInlineRows {
+            usesSharedRowDefinitions = false
+        } else {
+            usesSharedRowDefinitions = try usesSharedInPageURLRowDefinitionStorage(db: db)
+        }
+        let usesURLTextWithRects = try usesURLTextInPageURLStorageWithRects(db: db)
+
+        if usesLegacyInlineRows || usesSharedRowDefinitions || usesURLTextWithRects {
+            let managesOwnTransaction = sqlite3_get_autocommit(db) != 0
+            if managesOwnTransaction {
+                try beginTransaction(db: db)
+            }
+            do {
+                if usesLegacyInlineRows {
+                    try migrateLegacyInPageURLRowsToURLTextStorage(db: db)
+                } else if usesSharedRowDefinitions {
+                    try migrateSharedInPageURLRowsToURLTextStorage(db: db)
+                } else {
+                    try migrateURLTextInPageURLRowsToNodeOnlyStorage(db: db)
+                }
+                try dropObsoleteInPageURLArtifacts(db: db)
+                if managesOwnTransaction {
+                    try commitTransaction(db: db)
+                }
+            } catch {
+                if managesOwnTransaction {
+                    try? rollbackTransaction(db: db)
+                }
+                throw error
+            }
+        } else {
+            try createURLTextInPageURLSchema(db: db)
+            try dropObsoleteInPageURLArtifacts(db: db)
+        }
+
+        if try tableExists(db: db, table: "frame_in_page_context") {
+            try migrateLegacyInPageURLContextToFrame(db: db)
+            try executeSQL(db: db, sql: "DROP TABLE IF EXISTS frame_in_page_context;")
+        }
+    }
+
+    private static func deleteInPageURLRows(db: OpaquePointer, frameId: Int64) throws {
+        let sql = "DELETE FROM frame_in_page_url WHERE frameId = ?;"
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+        sqlite3_bind_int64(statement, 1, frameId)
+        guard sqlite3_step(statement) == SQLITE_DONE else {
+            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+    }
+
+    private struct SanitizedInPageURLRow {
+        let order: Int64
+        let url: String
+        let nodeID: Int64
+    }
+
+    private static func insertInPageURLRows(
+        db: OpaquePointer,
+        frameId: Int64,
+        rows: [SanitizedInPageURLRow]
+    ) throws {
+        let insertMappingSQL = """
+            INSERT INTO frame_in_page_url (frameId, ord, urlId, nid)
+            VALUES (?, ?, ?, ?);
+            """
+        let insertURLTextSQL = """
+            INSERT OR IGNORE INTO in_page_url_text (url)
+            VALUES (?);
+            """
+        let selectURLTextSQL = """
+            SELECT id
+            FROM in_page_url_text
+            WHERE url = ?
+            LIMIT 1;
+            """
+
+        var insertMappingStatement: OpaquePointer?
+        var insertURLTextStatement: OpaquePointer?
+        var selectURLTextStatement: OpaquePointer?
+        defer {
+            sqlite3_finalize(insertMappingStatement)
+            sqlite3_finalize(insertURLTextStatement)
+            sqlite3_finalize(selectURLTextStatement)
+        }
+
+        guard sqlite3_prepare_v2(db, insertMappingSQL, -1, &insertMappingStatement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: insertMappingSQL, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+        guard sqlite3_prepare_v2(db, insertURLTextSQL, -1, &insertURLTextStatement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: insertURLTextSQL, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+        guard sqlite3_prepare_v2(db, selectURLTextSQL, -1, &selectURLTextStatement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: selectURLTextSQL, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+
+        var urlTextIDs: [String: Int64] = [:]
+        urlTextIDs.reserveCapacity(rows.count)
+
+        for row in rows.sorted(by: { $0.order < $1.order }) {
+            let urlID = try ensureInPageURLTextID(
+                url: row.url,
+                cache: &urlTextIDs,
+                insertStatement: insertURLTextStatement,
+                selectStatement: selectURLTextStatement
+            )
+
+            sqlite3_reset(insertMappingStatement)
+            sqlite3_clear_bindings(insertMappingStatement)
+            sqlite3_bind_int64(insertMappingStatement, 1, frameId)
+            sqlite3_bind_int64(insertMappingStatement, 2, row.order)
+            sqlite3_bind_int64(insertMappingStatement, 3, urlID)
+            sqlite3_bind_int64(insertMappingStatement, 4, Int64(row.nodeID))
+
+            guard sqlite3_step(insertMappingStatement) == SQLITE_DONE else {
+                throw DatabaseError.queryFailed(query: insertMappingSQL, underlying: String(cString: sqlite3_errmsg(db)))
+            }
+        }
+    }
+
+    private static func updateInPageURLState(
+        db: OpaquePointer,
+        frameId: Int64,
+        state: FrameInPageURLState?
+    ) throws {
+        let sql = """
+            UPDATE frame
+            SET mousePosition = ?, scrollPosition = ?, videoCurrentTime = ?
+            WHERE id = ?;
+            """
+
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+
+        bindTextOrNull(statement, 1, encodePoint(x: state?.mouseX, y: state?.mouseY))
+        bindTextOrNull(statement, 2, encodePoint(x: state?.scrollX, y: state?.scrollY))
+        bindDoubleOrNull(statement, 3, state?.videoCurrentTime)
+        sqlite3_bind_int64(statement, 4, frameId)
+
+        guard sqlite3_step(statement) == SQLITE_DONE else {
+            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+    }
+
+    private static func migrateLegacyInPageURLContextToFrame(db: OpaquePointer) throws {
+        let sql = """
+            UPDATE frame
+            SET mousePosition = COALESCE(
+                    mousePosition,
+                    (
+                        SELECT CASE
+                            WHEN c.mouseX IS NOT NULL AND c.mouseY IS NOT NULL
+                                THEN CAST(c.mouseX AS TEXT) || ',' || CAST(c.mouseY AS TEXT)
+                            ELSE NULL
+                        END
+                        FROM frame_in_page_context c
+                        WHERE c.frameId = frame.id
+                    )
+                ),
+                videoCurrentTime = COALESCE(
+                    videoCurrentTime,
+                    (
+                        SELECT c.videoCurrentTime
+                        FROM frame_in_page_context c
+                        WHERE c.frameId = frame.id
+                    )
+                )
+            WHERE EXISTS (
+                SELECT 1
+                FROM frame_in_page_context c
+                WHERE c.frameId = frame.id
+            );
+            """
+        try executeSQL(db: db, sql: sql)
+    }
+
+    private static func beginTransaction(db: OpaquePointer) throws {
+        try executeSQL(db: db, sql: "BEGIN IMMEDIATE TRANSACTION;")
+    }
+
+    private static func commitTransaction(db: OpaquePointer) throws {
+        try executeSQL(db: db, sql: "COMMIT;")
+    }
+
+    private static func rollbackTransaction(db: OpaquePointer) throws {
+        try executeSQL(db: db, sql: "ROLLBACK;")
+    }
+
+    private static func usesLegacyInPageURLRowStorage(db: OpaquePointer) throws -> Bool {
+        guard try tableExists(db: db, table: "frame_in_page_url") else {
+            return false
+        }
+        return try hasColumn(db: db, table: "frame_in_page_url", column: "url")
+    }
+
+    private static func usesSharedInPageURLRowDefinitionStorage(db: OpaquePointer) throws -> Bool {
+        guard try tableExists(db: db, table: "frame_in_page_url") else {
+            return false
+        }
+        return try hasColumn(db: db, table: "frame_in_page_url", column: "rowDefId")
+    }
+
+    private static func usesURLTextInPageURLStorageWithRects(db: OpaquePointer) throws -> Bool {
+        guard try tableExists(db: db, table: "frame_in_page_url"),
+              try tableExists(db: db, table: "in_page_url_text")
+        else {
+            return false
+        }
+
+        return try hasColumn(db: db, table: "frame_in_page_url", column: "urlId")
+            && (try hasColumn(db: db, table: "frame_in_page_url", column: "nid"))
+            && (try hasColumn(db: db, table: "frame_in_page_url", column: "x1000"))
+            && (try hasColumn(db: db, table: "frame_in_page_url", column: "y1000"))
+            && (try hasColumn(db: db, table: "frame_in_page_url", column: "w1000"))
+            && (try hasColumn(db: db, table: "frame_in_page_url", column: "h1000"))
+    }
+
+    private static func usesURLTextInPageURLStorageWithoutRects(db: OpaquePointer) throws -> Bool {
+        guard try tableExists(db: db, table: "frame_in_page_url"),
+              try tableExists(db: db, table: "in_page_url_text")
+        else {
+            return false
+        }
+
+        return try hasColumn(db: db, table: "frame_in_page_url", column: "urlId")
+            && (try hasColumn(db: db, table: "frame_in_page_url", column: "nid"))
+            && !(try hasColumn(db: db, table: "frame_in_page_url", column: "x1000"))
+            && !(try hasColumn(db: db, table: "frame_in_page_url", column: "y1000"))
+            && !(try hasColumn(db: db, table: "frame_in_page_url", column: "w1000"))
+            && !(try hasColumn(db: db, table: "frame_in_page_url", column: "h1000"))
+    }
+
+    private static func createURLTextInPageURLSchema(db: OpaquePointer) throws {
+        let createURLTextTable = """
+            CREATE TABLE IF NOT EXISTS in_page_url_text (
+                id INTEGER PRIMARY KEY,
+                url TEXT NOT NULL UNIQUE
+            );
+            """
+        let createRowsTable = """
+            CREATE TABLE IF NOT EXISTS frame_in_page_url (
+                frameId INTEGER NOT NULL,
+                ord INTEGER NOT NULL,
+                urlId INTEGER NOT NULL,
+                nid INTEGER NOT NULL,
+                PRIMARY KEY (frameId, ord),
+                FOREIGN KEY (frameId) REFERENCES frame(id) ON DELETE CASCADE,
+                FOREIGN KEY (urlId) REFERENCES in_page_url_text(id)
+            );
+            """
+        let createURLIDIndex = """
+            CREATE INDEX IF NOT EXISTS idx_frame_in_page_url_urlId
+            ON frame_in_page_url(urlId);
+            """
+        let createCleanupTrigger = """
+            CREATE TRIGGER IF NOT EXISTS trg_frame_in_page_url_cleanup_text
+            AFTER DELETE ON frame_in_page_url
+            BEGIN
+                DELETE FROM in_page_url_text
+                WHERE id = OLD.urlId
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM frame_in_page_url
+                      WHERE urlId = OLD.urlId
+                  );
+            END;
+            """
+
+        try executeSQL(db: db, sql: createURLTextTable)
+        try executeSQL(db: db, sql: createRowsTable)
+        try executeSQL(db: db, sql: createURLIDIndex)
+        try executeSQL(db: db, sql: createCleanupTrigger)
+    }
+
+    private static func migrateLegacyInPageURLRowsToURLTextStorage(db: OpaquePointer) throws {
+        try executeSQL(db: db, sql: "DROP TABLE IF EXISTS frame_in_page_url_legacy;")
+        try executeSQL(db: db, sql: "DROP TRIGGER IF EXISTS trg_frame_in_page_url_cleanup_row_def;")
+        try executeSQL(db: db, sql: "DROP TRIGGER IF EXISTS trg_frame_in_page_url_cleanup_text;")
+        try executeSQL(db: db, sql: "ALTER TABLE frame_in_page_url RENAME TO frame_in_page_url_legacy;")
+        try createURLTextInPageURLSchema(db: db)
+
+        let insertURLTextsSQL = """
+            INSERT OR IGNORE INTO in_page_url_text (url)
+            SELECT DISTINCT url
+            FROM frame_in_page_url_legacy;
+            """
+        let insertRowsSQL = """
+            INSERT INTO frame_in_page_url (frameId, ord, urlId, nid)
+            SELECT
+                legacy.frameId,
+                legacy.ord,
+                texts.id,
+                legacy.nid
+            FROM frame_in_page_url_legacy legacy
+            INNER JOIN in_page_url_text texts
+                ON texts.url = legacy.url;
+            """
+
+        try executeSQL(db: db, sql: insertURLTextsSQL)
+        try executeSQL(db: db, sql: insertRowsSQL)
+        try executeSQL(db: db, sql: "DROP TABLE IF EXISTS frame_in_page_url_legacy;")
+    }
+
+    private static func migrateSharedInPageURLRowsToURLTextStorage(db: OpaquePointer) throws {
+        try executeSQL(db: db, sql: "DROP TABLE IF EXISTS frame_in_page_url_legacy;")
+        try executeSQL(db: db, sql: "DROP TABLE IF EXISTS in_page_url_row_def_legacy;")
+        try executeSQL(db: db, sql: "DROP TRIGGER IF EXISTS trg_frame_in_page_url_cleanup_row_def;")
+        try executeSQL(db: db, sql: "DROP TRIGGER IF EXISTS trg_frame_in_page_url_cleanup_text;")
+        try executeSQL(db: db, sql: "ALTER TABLE frame_in_page_url RENAME TO frame_in_page_url_legacy;")
+        try executeSQL(db: db, sql: "ALTER TABLE in_page_url_row_def RENAME TO in_page_url_row_def_legacy;")
+        try createURLTextInPageURLSchema(db: db)
+
+        let insertURLTextsSQL = """
+            INSERT OR IGNORE INTO in_page_url_text (url)
+            SELECT DISTINCT url
+            FROM in_page_url_row_def_legacy;
+            """
+        let insertRowsSQL = """
+            INSERT INTO frame_in_page_url (frameId, ord, urlId, nid)
+            SELECT
+                legacy.frameId,
+                legacy.ord,
+                texts.id,
+                legacy.nid
+            FROM frame_in_page_url_legacy legacy
+            INNER JOIN in_page_url_row_def_legacy defs
+                ON defs.id = legacy.rowDefId
+            INNER JOIN in_page_url_text texts
+                ON texts.url = defs.url;
+            """
+
+        try executeSQL(db: db, sql: insertURLTextsSQL)
+        try executeSQL(db: db, sql: insertRowsSQL)
+        try executeSQL(db: db, sql: "DROP TABLE IF EXISTS frame_in_page_url_legacy;")
+        try executeSQL(db: db, sql: "DROP TABLE IF EXISTS in_page_url_row_def_legacy;")
+    }
+
+    private static func migrateURLTextInPageURLRowsToNodeOnlyStorage(db: OpaquePointer) throws {
+        try executeSQL(db: db, sql: "DROP TABLE IF EXISTS frame_in_page_url_legacy;")
+        try executeSQL(db: db, sql: "DROP TRIGGER IF EXISTS trg_frame_in_page_url_cleanup_text;")
+        try executeSQL(db: db, sql: "ALTER TABLE frame_in_page_url RENAME TO frame_in_page_url_legacy;")
+        try createURLTextInPageURLSchema(db: db)
+
+        let insertRowsSQL = """
+            INSERT INTO frame_in_page_url (frameId, ord, urlId, nid)
+            SELECT frameId, ord, urlId, nid
+            FROM frame_in_page_url_legacy;
+            """
+
+        try executeSQL(db: db, sql: insertRowsSQL)
+        try executeSQL(db: db, sql: "DROP TABLE IF EXISTS frame_in_page_url_legacy;")
+    }
+
+    private static func dropObsoleteInPageURLArtifacts(db: OpaquePointer) throws {
+        try executeSQL(db: db, sql: "DROP TRIGGER IF EXISTS trg_frame_in_page_url_cleanup_row_def;")
+        try executeSQL(db: db, sql: "DROP INDEX IF EXISTS idx_frame_in_page_url_frameId;")
+        try executeSQL(db: db, sql: "DROP INDEX IF EXISTS idx_frame_in_page_url_rowDefId;")
+
+        let usesURLTextStorageWithRects = try usesURLTextInPageURLStorageWithRects(db: db)
+        let usesURLTextStorageWithoutRects = try usesURLTextInPageURLStorageWithoutRects(db: db)
+        if usesURLTextStorageWithRects || usesURLTextStorageWithoutRects {
+            try executeSQL(db: db, sql: "DROP TABLE IF EXISTS in_page_url_row_def;")
+        }
+    }
+
+    private static func ensureInPageURLTextID(
+        url: String,
+        cache: inout [String: Int64],
+        insertStatement: OpaquePointer?,
+        selectStatement: OpaquePointer?
+    ) throws -> Int64 {
+        if let cachedID = cache[url] {
+            return cachedID
+        }
+
+        bindTextStatement(insertStatement, text: url)
+        guard sqlite3_step(insertStatement) == SQLITE_DONE else {
+            throw DatabaseError.queryFailed(
+                query: "INSERT OR IGNORE INTO in_page_url_text",
+                underlying: String(cString: sqlite3_errmsg(sqlite3_db_handle(insertStatement)))
+            )
+        }
+
+        bindTextStatement(selectStatement, text: url)
+        guard try SQLiteReadStep.next(selectStatement) == SQLITE_ROW else {
+            throw DatabaseError.queryFailed(
+                query: "SELECT id FROM in_page_url_text",
+                underlying: "Missing shared in-page URL text row"
+            )
+        }
+
+        let urlTextID = sqlite3_column_int64(selectStatement, 0)
+        cache[url] = urlTextID
+        return urlTextID
+    }
+
+    private static func bindTextStatement(_ statement: OpaquePointer?, text: String) {
+        sqlite3_reset(statement)
+        sqlite3_clear_bindings(statement)
+        sqlite3_bind_text(statement, 1, text, -1, SQLITE_TRANSIENT)
+    }
+
+    private static func sanitizeInPageURLRows(
+        _ rows: [FrameInPageURLRow],
+        frameId: Int64
+    ) -> [SanitizedInPageURLRow] {
+        guard !rows.isEmpty else { return [] }
+
+        var sanitizedRows: [SanitizedInPageURLRow] = []
+        sanitizedRows.reserveCapacity(rows.count)
+
+        var seenOrders: Set<Int> = []
+        seenOrders.reserveCapacity(rows.count)
+
+        var emptyURLCount = 0
+        var duplicateOrderCount = 0
+
+        for row in rows.sorted(by: { $0.order < $1.order }) {
+            let trimmedURL = row.url.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmedURL.isEmpty else {
+                emptyURLCount += 1
+                continue
+            }
+
+            guard seenOrders.insert(row.order).inserted else {
+                duplicateOrderCount += 1
+                continue
+            }
+
+            sanitizedRows.append(
+                SanitizedInPageURLRow(
+                    order: Int64(row.order),
+                    url: trimmedURL,
+                    nodeID: Int64(row.nodeID)
+                )
+            )
+        }
+
+        let skippedCount = emptyURLCount + duplicateOrderCount
+        if skippedCount > 0 {
+            Log.warning(
+                "[FrameQueries] Skipped \(skippedCount) malformed in-page URL rows for frame \(frameId) (emptyURL=\(emptyURLCount), duplicateOrder=\(duplicateOrderCount))",
+                category: .database
+            )
+        }
+
+        return sanitizedRows
+    }
+
+    private static func sanitizeInPageURLState(
+        _ state: FrameInPageURLState?,
+        frameId: Int64
+    ) -> FrameInPageURLState? {
+        guard let state else { return nil }
+
+        let mousePosition = sanitizePoint(x: state.mouseX, y: state.mouseY)
+        let scrollPosition = sanitizePoint(x: state.scrollX, y: state.scrollY)
+        let videoCurrentTime = sanitizeFiniteValue(state.videoCurrentTime)
+
+        let droppedMousePosition = (state.mouseX != nil || state.mouseY != nil) && mousePosition == nil
+        let droppedScrollPosition = (state.scrollX != nil || state.scrollY != nil) && scrollPosition == nil
+        let droppedVideoCurrentTime = state.videoCurrentTime != nil && videoCurrentTime == nil
+
+        if droppedMousePosition || droppedScrollPosition || droppedVideoCurrentTime {
+            Log.warning(
+                "[FrameQueries] Dropped malformed in-page URL state for frame \(frameId) (mouse=\(droppedMousePosition), scroll=\(droppedScrollPosition), video=\(droppedVideoCurrentTime))",
+                category: .database
+            )
+        }
+
+        guard mousePosition != nil || scrollPosition != nil || videoCurrentTime != nil else {
+            return nil
+        }
+
+        return FrameInPageURLState(
+            mouseX: mousePosition?.x,
+            mouseY: mousePosition?.y,
+            scrollX: scrollPosition?.x,
+            scrollY: scrollPosition?.y,
+            videoCurrentTime: videoCurrentTime
+        )
+    }
+    private static func executeSQL(db: OpaquePointer, sql: String) throws {
+        var errorPointer: UnsafeMutablePointer<CChar>?
+        let result = sqlite3_exec(db, sql, nil, nil, &errorPointer)
+        if result != SQLITE_OK {
+            let errorMessage = errorPointer.flatMap { String(cString: $0) } ?? String(cString: sqlite3_errmsg(db))
+            sqlite3_free(errorPointer)
+            throw DatabaseError.queryFailed(query: sql, underlying: errorMessage)
+        }
+    }
+
+    private static func bindDoubleOrNull(_ statement: OpaquePointer?, _ index: Int32, _ value: Double?) {
+        if let value {
+            sqlite3_bind_double(statement, index, value)
+        } else {
+            sqlite3_bind_null(statement, index)
+        }
+    }
+
+    private static func sanitizePoint(x: Double?, y: Double?) -> (x: Double, y: Double)? {
+        guard let sanitizedX = sanitizeFiniteValue(x),
+              let sanitizedY = sanitizeFiniteValue(y) else {
+            return nil
+        }
+
+        return (sanitizedX, sanitizedY)
+    }
+
+    private static func sanitizeFiniteValue(_ value: Double?) -> Double? {
+        guard let value, value.isFinite else {
+            return nil
+        }
+
+        if value == -0 {
+            return 0
+        }
+
+        return value
+    }
+
+    private static func encodePoint(x: Double?, y: Double?) -> String? {
+        guard let x, let y else {
+            return nil
+        }
+        return "\(x),\(y)"
+    }
+
+    private static func decodePoint(_ rawValue: String?) -> (x: Double, y: Double)? {
+        guard let rawValue else {
+            return nil
+        }
+        let parts = rawValue.split(separator: ",", maxSplits: 1, omittingEmptySubsequences: false)
+        guard parts.count == 2,
+              let x = Double(parts[0]),
+              let y = Double(parts[1]) else {
+            return nil
+        }
+        return (x, y)
+    }
+
+    private static func hasColumn(db: OpaquePointer, table: String, column: String) throws -> Bool {
+        let sql = "PRAGMA table_info(\(table));"
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
+            guard let name = sqlite3_column_text(statement, 1).map({ String(cString: $0) }) else {
+                continue
+            }
+            if name == column {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    private static func tableExists(db: OpaquePointer, table: String) throws -> Bool {
+        let sql = """
+            SELECT 1
+            FROM sqlite_master
+            WHERE type = 'table' AND name = ?
+            LIMIT 1;
+            """
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+
+        sqlite3_bind_text(statement, 1, table, -1, SQLITE_TRANSIENT)
+        return try SQLiteReadStep.next(statement) == SQLITE_ROW
+    }
+
     // MARK: - Select by ID
 
     static func getByID(db: OpaquePointer, id: FrameID) throws -> FrameReference? {
         let sql = """
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.isStarred, f.encodingStatus,
-                   s.bundleID, s.windowName, s.browserUrl,
-                   f.displayID, f.isFocused
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.isStarred, f.encodedAt,
+                   f.redactionReason, f.capture_trigger, s.bundleID, s.windowName, s.browserUrl, f.mousePosition, f.displayID, f.isFocused
             FROM frame f
             LEFT JOIN segment s ON f.segmentId = s.id
             WHERE f.id = ?;
@@ -134,7 +904,7 @@ enum FrameQueries {
 
         sqlite3_bind_int64(statement, 1, id.value)
 
-        guard sqlite3_step(statement) == SQLITE_ROW else {
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else {
             return nil
         }
 
@@ -150,9 +920,8 @@ enum FrameQueries {
         limit: Int
     ) throws -> [FrameReference] {
         let sql = """
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.isStarred, f.encodingStatus,
-                   s.bundleID, s.windowName, s.browserUrl,
-                   f.displayID, f.isFocused
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.isStarred, f.encodedAt,
+                   f.redactionReason, f.capture_trigger, s.bundleID, s.windowName, s.browserUrl, f.mousePosition, f.displayID, f.isFocused
             FROM frame f
             LEFT JOIN segment s ON f.segmentId = s.id
             WHERE f.createdAt >= ? AND f.createdAt <= ?
@@ -177,7 +946,7 @@ enum FrameQueries {
         sqlite3_bind_int(statement, 3, Int32(limit))
 
         var frames: [FrameReference] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             let frame = try parseFrameRow(statement: statement!)
             frames.append(frame)
         }
@@ -193,9 +962,8 @@ enum FrameQueries {
         limit: Int
     ) throws -> [FrameReference] {
         let sql = """
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.isStarred, f.encodingStatus,
-                   s.bundleID, s.windowName, s.browserUrl,
-                   f.displayID, f.isFocused
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.isStarred, f.encodedAt,
+                   f.redactionReason, f.capture_trigger, s.bundleID, s.windowName, s.browserUrl, f.mousePosition, f.displayID, f.isFocused
             FROM frame f
             LEFT JOIN segment s ON f.segmentId = s.id
             WHERE f.createdAt < ?
@@ -219,7 +987,7 @@ enum FrameQueries {
         sqlite3_bind_int(statement, 2, Int32(limit))
 
         var frames: [FrameReference] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             let frame = try parseFrameRow(statement: statement!)
             frames.append(frame)
         }
@@ -235,9 +1003,8 @@ enum FrameQueries {
         limit: Int
     ) throws -> [FrameReference] {
         let sql = """
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.isStarred, f.encodingStatus,
-                   s.bundleID, s.windowName, s.browserUrl,
-                   f.displayID, f.isFocused
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.isStarred, f.encodedAt,
+                   f.redactionReason, f.capture_trigger, s.bundleID, s.windowName, s.browserUrl, f.mousePosition, f.displayID, f.isFocused
             FROM frame f
             LEFT JOIN segment s ON f.segmentId = s.id
             WHERE f.createdAt >= ?
@@ -261,7 +1028,7 @@ enum FrameQueries {
         sqlite3_bind_int(statement, 2, Int32(limit))
 
         var frames: [FrameReference] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             let frame = try parseFrameRow(statement: statement!)
             frames.append(frame)
         }
@@ -273,9 +1040,8 @@ enum FrameQueries {
 
     static func getMostRecent(db: OpaquePointer, limit: Int) throws -> [FrameReference] {
         let sql = """
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.isStarred, f.encodingStatus,
-                   s.bundleID, s.windowName, s.browserUrl,
-                   f.displayID, f.isFocused
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.isStarred, f.encodedAt,
+                   f.redactionReason, f.capture_trigger, s.bundleID, s.windowName, s.browserUrl, f.mousePosition, f.displayID, f.isFocused
             FROM frame f
             LEFT JOIN segment s ON f.segmentId = s.id
             ORDER BY f.createdAt DESC
@@ -297,7 +1063,7 @@ enum FrameQueries {
         sqlite3_bind_int(statement, 1, Int32(limit))
 
         var frames: [FrameReference] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             let frame = try parseFrameRow(statement: statement!)
             frames.append(frame)
         }
@@ -314,9 +1080,8 @@ enum FrameQueries {
         offset: Int
     ) throws -> [FrameReference] {
         let sql = """
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.isStarred, f.encodingStatus,
-                   s.bundleID, s.windowName, s.browserUrl,
-                   f.displayID, f.isFocused
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.isStarred, f.encodedAt,
+                   f.redactionReason, f.capture_trigger, s.bundleID, s.windowName, s.browserUrl, f.mousePosition, f.displayID, f.isFocused
             FROM frame f
             INNER JOIN segment s ON f.segmentId = s.id
             WHERE s.bundleID = ?
@@ -341,7 +1106,7 @@ enum FrameQueries {
         sqlite3_bind_int(statement, 3, Int32(offset))
 
         var frames: [FrameReference] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             let frame = try parseFrameRow(statement: statement!)
             frames.append(frame)
         }
@@ -354,9 +1119,8 @@ enum FrameQueries {
     /// Get frames that haven't been linked to a video yet (for video chunking)
     static func getFramesPendingVideoEncoding(db: OpaquePointer, limit: Int) throws -> [FrameReference] {
         let sql = """
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.isStarred, f.encodingStatus,
-                   s.bundleID, s.windowName, s.browserUrl,
-                   f.displayID, f.isFocused
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.isStarred, f.encodedAt,
+                   f.redactionReason, f.capture_trigger, s.bundleID, s.windowName, s.browserUrl, f.mousePosition, f.displayID, f.isFocused
             FROM frame f
             LEFT JOIN segment s ON f.segmentId = s.id
             WHERE f.videoId IS NULL
@@ -379,7 +1143,7 @@ enum FrameQueries {
         sqlite3_bind_int(statement, 1, Int32(limit))
 
         var frames: [FrameReference] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             let frame = try parseFrameRow(statement: statement!)
             frames.append(frame)
         }
@@ -390,62 +1154,96 @@ enum FrameQueries {
     // MARK: - Delete
 
     static func delete(db: OpaquePointer, id: FrameID) throws {
-        let sql = "DELETE FROM frame WHERE id = ?;"
+        _ = try delete(db: db, frameIDs: [id])
+    }
 
-        var statement: OpaquePointer?
-        defer {
-            sqlite3_finalize(statement)
-        }
-
-        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
-            throw DatabaseError.queryFailed(
-                query: sql,
-                underlying: String(cString: sqlite3_errmsg(db))
-            )
-        }
-
-        sqlite3_bind_int64(statement, 1, id.value)
-
-        guard sqlite3_step(statement) == SQLITE_DONE else {
-            throw DatabaseError.queryFailed(
-                query: sql,
-                underlying: String(cString: sqlite3_errmsg(db))
-            )
-        }
+    public static func delete(db: OpaquePointer, frameIDs: [FrameID]) throws -> Int {
+        try deleteFrameIDs(db: db, frameIDs: frameIDs.map(\.value))
     }
 
     static func deleteOlderThan(db: OpaquePointer, date: Date) throws -> Int {
-        let sql = "DELETE FROM frame WHERE createdAt < ?;"
-
-        var statement: OpaquePointer?
-        defer {
-            sqlite3_finalize(statement)
-        }
-
-        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
-            throw DatabaseError.queryFailed(
-                query: sql,
-                underlying: String(cString: sqlite3_errmsg(db))
-            )
-        }
-
-        sqlite3_bind_int64(statement, 1, Schema.dateToTimestamp(date))
-
-        guard sqlite3_step(statement) == SQLITE_DONE else {
-            throw DatabaseError.queryFailed(
-                query: sql,
-                underlying: String(cString: sqlite3_errmsg(db))
-            )
-        }
-
-        return Int(sqlite3_changes(db))
+        try deleteFramesMatching(
+            db: db,
+            selectionSQL: "SELECT id FROM frame WHERE createdAt < ?;",
+            bindSelection: { statement in
+                sqlite3_bind_int64(statement, 1, Schema.dateToTimestamp(date))
+            }
+        )
     }
 
     /// Delete all frames newer than (after) the specified date
     /// Used for quick delete functionality to remove recent recordings
     static func deleteNewerThan(db: OpaquePointer, date: Date) throws -> Int {
-        let sql = "DELETE FROM frame WHERE createdAt > ?;"
+        try deleteFramesMatching(
+            db: db,
+            selectionSQL: "SELECT id FROM frame WHERE createdAt > ?;",
+            bindSelection: { statement in
+                sqlite3_bind_int64(statement, 1, Schema.dateToTimestamp(date))
+            }
+        )
+    }
 
+    private static func deleteFramesMatching(
+        db: OpaquePointer,
+        selectionSQL: String,
+        bindSelection: (OpaquePointer?) -> Void
+    ) throws -> Int {
+        var selectionStatement: OpaquePointer?
+        defer {
+            sqlite3_finalize(selectionStatement)
+        }
+
+        guard sqlite3_prepare_v2(db, selectionSQL, -1, &selectionStatement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: selectionSQL,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        bindSelection(selectionStatement)
+
+        var frameIDs: [Int64] = []
+        while try SQLiteReadStep.next(selectionStatement) == SQLITE_ROW {
+            frameIDs.append(sqlite3_column_int64(selectionStatement, 0))
+        }
+
+        return try deleteFrameIDs(db: db, frameIDs: frameIDs)
+    }
+
+    private static func deleteFrameIDs(db: OpaquePointer, frameIDs: [Int64]) throws -> Int {
+        guard !frameIDs.isEmpty else {
+            return 0
+        }
+
+        let managesOwnTransaction = sqlite3_get_autocommit(db) != 0
+        if managesOwnTransaction {
+            try beginTransaction(db: db)
+        }
+
+        do {
+            let batchSize = FTSQueries.deletionBatchSize(db: db)
+            for start in stride(from: 0, to: frameIDs.count, by: batchSize) {
+                let batch = Array(frameIDs[start..<min(start + batchSize, frameIDs.count)])
+                try FTSQueries.deleteForFrames(db: db, frameIDs: batch)
+                try deleteFrameRows(db: db, frameIDs: batch)
+            }
+
+            if managesOwnTransaction {
+                try commitTransaction(db: db)
+            }
+        } catch {
+            if managesOwnTransaction {
+                try? rollbackTransaction(db: db)
+            }
+            throw error
+        }
+
+        return frameIDs.count
+    }
+
+    private static func deleteFrameRows(db: OpaquePointer, frameIDs: [Int64]) throws {
+        let placeholders = frameIDs.map { _ in "?" }.joined(separator: ",")
+        let sql = "DELETE FROM frame WHERE id IN (\(placeholders));"
         var statement: OpaquePointer?
         defer {
             sqlite3_finalize(statement)
@@ -458,7 +1256,9 @@ enum FrameQueries {
             )
         }
 
-        sqlite3_bind_int64(statement, 1, Schema.dateToTimestamp(date))
+        for (index, id) in frameIDs.enumerated() {
+            sqlite3_bind_int64(statement, Int32(index + 1), id)
+        }
 
         guard sqlite3_step(statement) == SQLITE_DONE else {
             throw DatabaseError.queryFailed(
@@ -466,19 +1266,17 @@ enum FrameQueries {
                 underlying: String(cString: sqlite3_errmsg(db))
             )
         }
-
-        return Int(sqlite3_changes(db))
     }
 
     // MARK: - Exists Check
 
-    /// Check if a frame exists with the given timestamp (to the second)
-    /// Used by recovery manager to avoid inserting duplicates
+    /// Check if a frame exists near the given timestamp (millisecond window).
+    /// Used by recovery manager to avoid inserting duplicates.
     static func existsAtTimestamp(db: OpaquePointer, timestamp: Date) throws -> Bool {
-        // Convert to seconds precision (truncate milliseconds)
-        let timestampSeconds = Int64(timestamp.timeIntervalSince1970)
-        let startMs = timestampSeconds * 1000
-        let endMs = (timestampSeconds + 1) * 1000 - 1
+        let targetMs = Schema.dateToTimestamp(timestamp)
+        let toleranceMs: Int64 = 5
+        let startMs = targetMs - toleranceMs
+        let endMs = targetMs + toleranceMs
 
         let sql = "SELECT 1 FROM frame WHERE createdAt >= ? AND createdAt <= ? LIMIT 1;"
 
@@ -497,19 +1295,25 @@ enum FrameQueries {
         sqlite3_bind_int64(statement, 1, startMs)
         sqlite3_bind_int64(statement, 2, endMs)
 
-        return sqlite3_step(statement) == SQLITE_ROW
+        return try SQLiteReadStep.next(statement) == SQLITE_ROW
     }
 
-    /// Get frame ID at the given timestamp (to the second)
-    /// Returns nil if no frame exists at that timestamp
+    /// Get frame ID near the given timestamp (millisecond window)
+    /// Returns nil if no frame exists in that window.
     /// Used by recovery manager to update existing frames instead of skipping
     static func getFrameIDAtTimestamp(db: OpaquePointer, timestamp: Date) throws -> Int64? {
-        // Convert to seconds precision (truncate milliseconds)
-        let timestampSeconds = Int64(timestamp.timeIntervalSince1970)
-        let startMs = timestampSeconds * 1000
-        let endMs = (timestampSeconds + 1) * 1000 - 1
+        let targetMs = Schema.dateToTimestamp(timestamp)
+        let toleranceMs: Int64 = 5
+        let startMs = targetMs - toleranceMs
+        let endMs = targetMs + toleranceMs
 
-        let sql = "SELECT id FROM frame WHERE createdAt >= ? AND createdAt <= ? LIMIT 1;"
+        let sql = """
+            SELECT id
+            FROM frame
+            WHERE createdAt >= ? AND createdAt <= ?
+            ORDER BY ABS(createdAt - ?) ASC, id ASC
+            LIMIT 1;
+            """
 
         var statement: OpaquePointer?
         defer {
@@ -525,8 +1329,9 @@ enum FrameQueries {
 
         sqlite3_bind_int64(statement, 1, startMs)
         sqlite3_bind_int64(statement, 2, endMs)
+        sqlite3_bind_int64(statement, 3, targetMs)
 
-        if sqlite3_step(statement) == SQLITE_ROW {
+        if try SQLiteReadStep.next(statement) == SQLITE_ROW {
             return sqlite3_column_int64(statement, 0)
         }
         return nil
@@ -549,7 +1354,7 @@ enum FrameQueries {
             )
         }
 
-        guard sqlite3_step(statement) == SQLITE_ROW else {
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else {
             return 0
         }
 
@@ -559,8 +1364,8 @@ enum FrameQueries {
     // MARK: - Helpers
 
     /// Parse a frame row from Rewind-compatible schema
-    /// Expected columns: id, createdAt, segmentId, videoId, videoFrameIndex, isStarred, encodingStatus,
-    ///                   bundleID, windowName, browserUrl (from JOIN)
+    /// Expected columns: id, createdAt, segmentId, videoId, videoFrameIndex, isStarred, encodedAt,
+    ///                   redactionReason, bundleID, windowName, browserUrl, mousePosition (from JOIN)
     private static func parseFrameRow(statement: OpaquePointer) throws -> FrameReference {
         // Column 0: id (INTEGER)
         let frameIDValue = sqlite3_column_int64(statement, 0)
@@ -584,25 +1389,30 @@ enum FrameQueries {
         // Column 5: isStarred (INTEGER - 0 or 1)
         // Currently not used in FrameReference, but stored for compatibility
 
-        // Column 6: encodingStatus (TEXT)
-        let statusString = getTextOrNil(statement, 6) ?? "pending"
-        let encodingStatus = EncodingStatus(rawValue: statusString) ?? .pending
+        // Column 6: encodedAt (INTEGER - ms since epoch, nullable)
+        let encodedAt = dateOrNil(statement, 6)
 
-        // Columns 7-9: metadata from segment JOIN (nullable)
-        let appBundleID = getTextOrNil(statement, 7)
-        let windowName = getTextOrNil(statement, 8)
-        let browserURL = getTextOrNil(statement, 9)
+        // Columns 7-12: Trigger + window metadata from frame/segment JOIN (nullable)
+        let redactionReason = getTextOrNil(statement, 7)
+        let captureTrigger = getTextOrNil(statement, 8).flatMap(FrameCaptureTrigger.init(rawValue:))
+        let appBundleID = getTextOrNil(statement, 9)
+        let windowName = getTextOrNil(statement, 10)
+        let browserURL = getTextOrNil(statement, 11)
+        let mousePosition = decodePoint(getTextOrNil(statement, 12))
 
-        // Columns 10-11: multi-display fields
-        let displayID = UInt32(sqlite3_column_int(statement, 10))
-        let isFocused = sqlite3_column_int(statement, 11) != 0
+        // Columns 13-14: multi-display fields
+        let displayID = UInt32(sqlite3_column_int(statement, 13))
+        let isFocused = sqlite3_column_int(statement, 14) != 0
 
         let metadata = FrameMetadata(
             appBundleID: appBundleID,
             appName: nil, // Not stored in Rewind schema
             windowName: windowName,
             browserURL: browserURL,
+            redactionReason: redactionReason,
+            captureTrigger: captureTrigger,
             displayID: displayID,
+            mousePosition: mousePosition.map { CGPoint(x: $0.x, y: $0.y) },
             isFocused: isFocused
         )
 
@@ -612,7 +1422,7 @@ enum FrameQueries {
             segmentID: segmentID,
             videoID: videoID,
             frameIndexInSegment: videoFrameIndex,
-            encodingStatus: encodingStatus,
+            encodedAt: encodedAt,
             metadata: metadata,
             source: .native
         )
@@ -633,12 +1443,23 @@ enum FrameQueries {
         return String(cString: text)
     }
 
+    private static func dateOrNil(_ statement: OpaquePointer, _ index: Int32) -> Date? {
+        guard sqlite3_column_type(statement, index) != SQLITE_NULL else {
+            return nil
+        }
+        return Schema.timestampToDate(sqlite3_column_int64(statement, index))
+    }
+
     // MARK: - Optimized Queries with Video Info (Rewind-inspired)
 
     /// Get frames with video info in a single JOIN query (optimized, inspired by Rewind)
-    static func getByTimeRangeWithVideoInfo(db: OpaquePointer, from startDate: Date, to endDate: Date, limit: Int) throws -> [FrameWithVideoInfo] {
-        Log.debug("[FrameQueries] getByTimeRangeWithVideoInfo: startDate=\(startDate), endDate=\(endDate), limit=\(limit)", category: .database)
-
+    static func getByTimeRangeWithVideoInfo(
+        db: OpaquePointer,
+        from startDate: Date,
+        to endDate: Date,
+        limit: Int,
+        storageRoot: String
+    ) throws -> [FrameWithVideoInfo] {
         let sql = """
             SELECT
                 f.id,
@@ -646,18 +1467,26 @@ enum FrameQueries {
                 f.segmentId,
                 f.videoId,
                 f.videoFrameIndex,
-                f.encodingStatus,
+                f.encodedAt,
                 f.processingStatus,
+                f.redactionReason,
+                f.capture_trigger,
                 s.bundleID,
                 s.windowName,
+                s.browserUrl,
+                f.mousePosition,
                 v.path,
                 v.frameRate,
                 v.width,
-                v.height
+                v.height,
+                v.processingState,
+                v.fileSize,
+                v.frameCount,
+                (SELECT MAX(fr.rewrittenAt) FROM frame fr WHERE fr.videoId = f.videoId) AS videoReencodedAt, f.displayID, f.isFocused
             FROM frame f
             LEFT JOIN segment s ON f.segmentId = s.id
             LEFT JOIN video v ON f.videoId = v.id
-            WHERE f.createdAt >= ? AND f.createdAt <= ? AND f.processingStatus != 4
+            WHERE f.createdAt >= ? AND f.createdAt <= ?
             ORDER BY f.createdAt ASC
             LIMIT ?;
             """
@@ -676,36 +1505,37 @@ enum FrameQueries {
 
         let startTimestamp = Schema.dateToTimestamp(startDate)
         let endTimestamp = Schema.dateToTimestamp(endDate)
-        Log.debug("[FrameQueries]   Binding: startTimestamp=\(startTimestamp), endTimestamp=\(endTimestamp), limit=\(limit)", category: .database)
 
         sqlite3_bind_int64(statement, 1, startTimestamp)
         sqlite3_bind_int64(statement, 2, endTimestamp)
         sqlite3_bind_int(statement, 3, Int32(limit))
 
         var results: [FrameWithVideoInfo] = []
-        var rowCount = 0
-        while sqlite3_step(statement) == SQLITE_ROW {
-            rowCount += 1
-            let frameWithVideoInfo = try parseFrameWithVideoInfoRow(statement: statement!)
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
+            let frameWithVideoInfo = try parseFrameWithVideoInfoRow(
+                statement: statement!,
+                storageRoot: storageRoot
+            )
             results.append(frameWithVideoInfo)
         }
 
-        Log.debug("[FrameQueries] ✓ Query returned \(rowCount) rows, parsed \(results.count) frames", category: .database)
         return results
     }
 
     /// Get most recent frames with video info in a single JOIN query (optimized, inspired by Rewind)
-    static func getMostRecentWithVideoInfo(db: OpaquePointer, limit: Int) throws -> [FrameWithVideoInfo] {
-        Log.debug("[FrameQueries] getMostRecentWithVideoInfo: limit=\(limit)", category: .database)
-
+    static func getMostRecentWithVideoInfo(
+        db: OpaquePointer,
+        limit: Int,
+        storageRoot: String
+    ) throws -> [FrameWithVideoInfo] {
         let sql = """
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, f.processingStatus,
-                   s.bundleID, s.windowName,
-                   v.path, v.frameRate, v.width, v.height, v.processingState
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodedAt, f.processingStatus, f.redactionReason,
+                   f.capture_trigger, s.bundleID, s.windowName, s.browserUrl, f.mousePosition,
+                   v.path, v.frameRate, v.width, v.height, v.processingState, v.fileSize, v.frameCount,
+                   (SELECT MAX(fr.rewrittenAt) FROM frame fr WHERE fr.videoId = f.videoId) AS videoReencodedAt, f.displayID, f.isFocused
             FROM (
-                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, processingStatus
+                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodedAt, processingStatus, redactionReason, capture_trigger, mousePosition, displayID, isFocused
                 FROM frame
-                WHERE processingStatus != 4
                 ORDER BY createdAt DESC
                 LIMIT ?
             ) f
@@ -729,27 +1559,33 @@ enum FrameQueries {
         sqlite3_bind_int(statement, 1, Int32(limit))
 
         var results: [FrameWithVideoInfo] = []
-        var rowCount = 0
-        while sqlite3_step(statement) == SQLITE_ROW {
-            rowCount += 1
-            let frameWithVideoInfo = try parseFrameWithVideoInfoRow(statement: statement!)
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
+            let frameWithVideoInfo = try parseFrameWithVideoInfoRow(
+                statement: statement!,
+                storageRoot: storageRoot
+            )
             results.append(frameWithVideoInfo)
         }
 
-        Log.debug("[FrameQueries] ✓ Query returned \(rowCount) rows, parsed \(results.count) frames", category: .database)
         return results
     }
 
     /// Get frames before timestamp with video info in a single JOIN query (optimized, inspired by Rewind)
-    static func getBeforeWithVideoInfo(db: OpaquePointer, timestamp: Date, limit: Int) throws -> [FrameWithVideoInfo] {
+    static func getBeforeWithVideoInfo(
+        db: OpaquePointer,
+        timestamp: Date,
+        limit: Int,
+        storageRoot: String
+    ) throws -> [FrameWithVideoInfo] {
         let sql = """
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, f.processingStatus,
-                   s.bundleID, s.windowName,
-                   v.path, v.frameRate, v.width, v.height, v.processingState
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodedAt, f.processingStatus, f.redactionReason,
+                   f.capture_trigger, s.bundleID, s.windowName, s.browserUrl, f.mousePosition,
+                   v.path, v.frameRate, v.width, v.height, v.processingState, v.fileSize, v.frameCount,
+                   (SELECT MAX(fr.rewrittenAt) FROM frame fr WHERE fr.videoId = f.videoId) AS videoReencodedAt, f.displayID, f.isFocused
             FROM (
-                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, processingStatus
+                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodedAt, processingStatus, redactionReason, capture_trigger, mousePosition, displayID, isFocused
                 FROM frame
-                WHERE createdAt < ? AND processingStatus != 4
+                WHERE createdAt < ?
                 ORDER BY createdAt DESC
                 LIMIT ?
             ) f
@@ -772,8 +1608,11 @@ enum FrameQueries {
         sqlite3_bind_int(statement, 2, Int32(limit))
 
         var results: [FrameWithVideoInfo] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
-            let frameWithVideoInfo = try parseFrameWithVideoInfoRow(statement: statement!)
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
+            let frameWithVideoInfo = try parseFrameWithVideoInfoRow(
+                statement: statement!,
+                storageRoot: storageRoot
+            )
             results.append(frameWithVideoInfo)
         }
 
@@ -781,15 +1620,21 @@ enum FrameQueries {
     }
 
     /// Get frames after timestamp with video info in a single JOIN query (optimized, inspired by Rewind)
-    static func getAfterWithVideoInfo(db: OpaquePointer, timestamp: Date, limit: Int) throws -> [FrameWithVideoInfo] {
+    static func getAfterWithVideoInfo(
+        db: OpaquePointer,
+        timestamp: Date,
+        limit: Int,
+        storageRoot: String
+    ) throws -> [FrameWithVideoInfo] {
         let sql = """
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, f.processingStatus,
-                   s.bundleID, s.windowName,
-                   v.path, v.frameRate, v.width, v.height, v.processingState
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodedAt, f.processingStatus, f.redactionReason,
+                   f.capture_trigger, s.bundleID, s.windowName, s.browserUrl, f.mousePosition,
+                   v.path, v.frameRate, v.width, v.height, v.processingState, v.fileSize, v.frameCount,
+                   (SELECT MAX(fr.rewrittenAt) FROM frame fr WHERE fr.videoId = f.videoId) AS videoReencodedAt, f.displayID, f.isFocused
             FROM (
-                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, processingStatus
+                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodedAt, processingStatus, redactionReason, capture_trigger, mousePosition, displayID, isFocused
                 FROM frame
-                WHERE createdAt >= ? AND processingStatus != 4
+                WHERE createdAt >= ?
                 ORDER BY createdAt ASC
                 LIMIT ?
             ) f
@@ -812,8 +1657,11 @@ enum FrameQueries {
         sqlite3_bind_int(statement, 2, Int32(limit))
 
         var results: [FrameWithVideoInfo] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
-            let frameWithVideoInfo = try parseFrameWithVideoInfoRow(statement: statement!)
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
+            let frameWithVideoInfo = try parseFrameWithVideoInfoRow(
+                statement: statement!,
+                storageRoot: storageRoot
+            )
             results.append(frameWithVideoInfo)
         }
 
@@ -821,11 +1669,16 @@ enum FrameQueries {
     }
 
     /// Get a single frame by ID with video info (optimized - single query with JOINs)
-    static func getByIDWithVideoInfo(db: OpaquePointer, id: FrameID) throws -> FrameWithVideoInfo? {
+    static func getByIDWithVideoInfo(
+        db: OpaquePointer,
+        id: FrameID,
+        storageRoot: String
+    ) throws -> FrameWithVideoInfo? {
         let sql = """
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, f.processingStatus,
-                   s.bundleID, s.windowName,
-                   v.path, v.frameRate, v.width, v.height, v.processingState
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodedAt, f.processingStatus, f.redactionReason,
+                   f.capture_trigger, s.bundleID, s.windowName, s.browserUrl, f.mousePosition,
+                   v.path, v.frameRate, v.width, v.height, v.processingState, v.fileSize, v.frameCount,
+                   (SELECT MAX(fr.rewrittenAt) FROM frame fr WHERE fr.videoId = f.videoId) AS videoReencodedAt, f.displayID, f.isFocused
             FROM frame f
             LEFT JOIN segment s ON f.segmentId = s.id
             LEFT JOIN video v ON f.videoId = v.id
@@ -844,17 +1697,21 @@ enum FrameQueries {
 
         sqlite3_bind_int64(statement, 1, id.value)
 
-        guard sqlite3_step(statement) == SQLITE_ROW else {
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else {
             return nil
         }
 
-        return try parseFrameWithVideoInfoRow(statement: statement!)
+        return try parseFrameWithVideoInfoRow(statement: statement!, storageRoot: storageRoot)
     }
 
     /// Parse a row from a query that JOINs frame with segment and video tables
-    /// Columns: f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, f.processingStatus,
-    ///          s.bundleID, s.windowName, v.path, v.frameRate, v.width, v.height, v.processingState
-    private static func parseFrameWithVideoInfoRow(statement: OpaquePointer) throws -> FrameWithVideoInfo {
+    /// Columns: f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodedAt, f.processingStatus,
+    ///          f.redactionReason, f.capture_trigger, s.bundleID, s.windowName, s.browserUrl, f.mousePosition,
+    ///          v.path, v.frameRate, v.width, v.height, v.processingState, v.fileSize, v.frameCount, MAX(frame.rewrittenAt for videoId)
+    private static func parseFrameWithVideoInfoRow(
+        statement: OpaquePointer,
+        storageRoot: String
+    ) throws -> FrameWithVideoInfo {
         // Parse frame data
         let id = FrameID(value: sqlite3_column_int64(statement, 0))
         let timestamp = Schema.timestampToDate(sqlite3_column_int64(statement, 1))
@@ -862,25 +1719,27 @@ enum FrameQueries {
         let videoID = VideoSegmentID(value: sqlite3_column_int64(statement, 3))
         let frameIndexInSegment = Int(sqlite3_column_int(statement, 4))
 
-        Log.debug("[FrameQueries] Parsing frame: id=\(id.value), timestamp=\(timestamp), segmentID=\(segmentID.value), videoID=\(videoID.value), frameIndex=\(frameIndexInSegment)", category: .database)
-
-        let encodingStatusText = getTextOrNil(statement, 5) ?? "pending"
-        let encodingStatus = EncodingStatus(rawValue: encodingStatusText) ?? .pending
+        let encodedAt = dateOrNil(statement, 5)
         let processingStatus = Int(sqlite3_column_int(statement, 6))
-        Log.debug("[FrameQueries]   encodingStatus=\(encodingStatus), processingStatus=\(processingStatus)", category: .database)
+        let redactionReason = getTextOrNil(statement, 7)
+        let captureTrigger = getTextOrNil(statement, 8).flatMap(FrameCaptureTrigger.init(rawValue:))
 
-        // Parse metadata from segment (columns 7-8: s.bundleID, s.windowName)
-        let appBundleID = getTextOrNil(statement, 7)
-        let windowName = getTextOrNil(statement, 8)
-        Log.debug("[FrameQueries]   metadata: bundleID=\(appBundleID ?? "nil"), windowName=\(windowName ?? "nil")", category: .database)
+        // Parse metadata from segment + frame context columns
+        let appBundleID = getTextOrNil(statement, 9)
+        let windowName = getTextOrNil(statement, 10)
+        let browserURL = getTextOrNil(statement, 11)
+        let mousePosition = decodePoint(getTextOrNil(statement, 12))
 
         let metadata = FrameMetadata(
             appBundleID: appBundleID,
             appName: nil,  // App name not stored in segment table
             windowName: windowName,
-            browserURL: nil,  // Browser URL not stored in simple segment table
-            displayID: 0,  // Display ID populated from frame table when available
-            isFocused: true  // Default to focused for backward compatibility
+            browserURL: browserURL,
+            redactionReason: redactionReason,
+            captureTrigger: captureTrigger,
+            displayID: UInt32(sqlite3_column_int(statement, 21)),
+            mousePosition: mousePosition.map { CGPoint(x: $0.x, y: $0.y) },
+            isFocused: sqlite3_column_int(statement, 22) != 0
         )
 
         let frame = FrameReference(
@@ -889,31 +1748,37 @@ enum FrameQueries {
             segmentID: segmentID,
             videoID: videoID,
             frameIndexInSegment: frameIndexInSegment,
-            encodingStatus: encodingStatus,
+            encodedAt: encodedAt,
             metadata: metadata,
             source: .native
         )
 
-        // Parse video info (columns 9-12: v.path, v.frameRate, v.width, v.height)
+        // Parse video info (columns 13-20: v.path, v.frameRate, v.width, v.height, v.processingState, v.fileSize, v.frameCount, MAX(frame.rewrittenAt for videoId))
         var videoInfo: FrameVideoInfo? = nil
-        let videoPath = getTextOrNil(statement, 9)
-        Log.debug("[FrameQueries]   videoPath=\(videoPath ?? "nil"), videoID.value=\(videoID.value)", category: .database)
+        let videoPath = getTextOrNil(statement, 13)
 
         if let videoPath = videoPath,
            videoID.value > 0 {
-            let frameRate = sqlite3_column_double(statement, 10)
-            let width = sqlite3_column_type(statement, 11) != SQLITE_NULL
-                ? Int(sqlite3_column_int(statement, 11))
+            let frameRate = sqlite3_column_double(statement, 14)
+            let width = sqlite3_column_type(statement, 15) != SQLITE_NULL
+                ? Int(sqlite3_column_int(statement, 15))
                 : nil
-            let height = sqlite3_column_type(statement, 12) != SQLITE_NULL
-                ? Int(sqlite3_column_int(statement, 12))
+            let height = sqlite3_column_type(statement, 16) != SQLITE_NULL
+                ? Int(sqlite3_column_int(statement, 16))
                 : nil
             // v.processingState: 0 = finalized/complete, 1 = still being written
-            let videoProcessingState = Int(sqlite3_column_int(statement, 13))
+            let videoProcessingState = Int(sqlite3_column_int(statement, 17))
             let isVideoFinalized = videoProcessingState == 0
+            let fileSizeBytes = sqlite3_column_type(statement, 18) != SQLITE_NULL
+                ? sqlite3_column_int64(statement, 18)
+                : nil
+            let frameCount = sqlite3_column_type(statement, 19) != SQLITE_NULL
+                ? Int(sqlite3_column_int(statement, 19))
+                : nil
+            let videoReencodedAt = sqlite3_column_type(statement, 20) != SQLITE_NULL
+                ? Schema.timestampToDate(sqlite3_column_int64(statement, 20))
+                : nil
 
-            // Convert relative path to full path (must use expandedStorageRoot to resolve ~)
-            let storageRoot = AppPaths.expandedStorageRoot
             let fullPath = (storageRoot as NSString).appendingPathComponent(videoPath)
 
             videoInfo = FrameVideoInfo(
@@ -922,9 +1787,11 @@ enum FrameQueries {
                 frameRate: frameRate,
                 width: width,
                 height: height,
-                isVideoFinalized: isVideoFinalized
+                isVideoFinalized: isVideoFinalized,
+                videoReencodedAt: videoReencodedAt,
+                fileSizeBytes: fileSizeBytes,
+                frameCount: frameCount
             )
-            Log.debug("[FrameQueries]   ✓ Created videoInfo: path=\(fullPath), frameIndex=\(frameIndexInSegment), frameRate=\(frameRate), dimensions=\(width ?? 0)x\(height ?? 0), isFinalized=\(isVideoFinalized)", category: .database)
         } else {
             Log.warning("[FrameQueries]   ⚠️ videoInfo is nil (videoPath=\(videoPath ?? "nil"), videoID=\(videoID.value))", category: .database)
         }
@@ -956,7 +1823,7 @@ enum FrameQueries {
         }
 
         var dates: [Date] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             let timestampMs = sqlite3_column_int64(statement, 0)
             let date = Schema.timestampToDate(timestampMs)
             // Normalize to start of day in local timezone
@@ -1001,7 +1868,7 @@ enum FrameQueries {
         sqlite3_bind_int64(statement, 2, endMs)
 
         var hours: [Date] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             let timestampMs = sqlite3_column_int64(statement, 0)
             let timestamp = Schema.timestampToDate(timestampMs)
             // Normalize to start of hour

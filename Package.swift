@@ -1,6 +1,5 @@
 // swift-tools-version:5.9
 import PackageDescription
-import Foundation
 
 // MARK: - Whisper.cpp Path Configuration (Bundled)
 // ⚠️ RELEASE 2 ONLY - Audio transcription dependencies
@@ -28,7 +27,9 @@ let package = Package(
         .library(name: "Search", targets: ["Search"]),
         .library(name: "Migration", targets: ["Migration"]),
         .library(name: "App", targets: ["App"]),
+        .library(name: "CrashRecoverySupport", targets: ["CrashRecoverySupport"]),
         .executable(name: "Retrace", targets: ["Retrace"]),
+        .executable(name: "RetraceCrashRecoveryHelper", targets: ["RetraceCrashRecoveryHelper"]),
         .executable(name: "TestMostRecentFrame", targets: ["TestMostRecentFrame"]),
         .executable(name: "QueryRewindApps", targets: ["QueryRewindApps"]),
     ],
@@ -39,9 +40,11 @@ let package = Package(
         // Models (*.bin, *.gguf) - downloaded at runtime on first launch
 
         // SQLCipher for reading encrypted Rewind database
-        .package(url: "https://github.com/skiptools/swift-sqlcipher.git", from: "1.0.0"),
+        .package(url: "https://github.com/skiptools/swift-sqlcipher.git", exact: "1.7.0"),
         // Sparkle for auto-updates
-        .package(url: "https://github.com/sparkle-project/Sparkle.git", from: "2.6.0")
+        .package(url: "https://github.com/sparkle-project/Sparkle.git", exact: "2.8.1"),
+        // SwiftyChrono for natural language date parsing (batmac fork with Swift 5.5+ support)
+        .package(url: "https://github.com/batmac/SwiftyChrono.git", revision: "e1bf3bde0f09112909157360b6bf39302f10ae5f")
     ],
     targets: [
         // MARK: - Shared models and protocols
@@ -71,7 +74,10 @@ let package = Package(
         ),
         .testTarget(
             name: "DatabaseTests",
-            dependencies: ["Database", "Shared"],
+            dependencies: [
+                "Database", "Shared", "Storage", "Processing", "Search",
+                .product(name: "SQLCipher", package: "swift-sqlcipher")
+            ],
             path: "Database/Tests",
             exclude: [
                 "_future"  // Release 2+ tests
@@ -123,7 +129,9 @@ let package = Package(
             name: "Processing",
             dependencies: [
                 "Shared",
-                "Database"
+                "Database",
+                "Storage",
+                "Search"
             ],
             path: "Processing",
             exclude: [
@@ -137,8 +145,12 @@ let package = Package(
         ),
         .testTarget(
             name: "ProcessingTests",
-            dependencies: ["Processing", "Shared", "Database", "Storage"],
-            path: "Processing/Tests"
+            dependencies: [
+                "Processing", "Shared", "Database", "Storage",
+                .product(name: "SQLCipher", package: "swift-sqlcipher")
+            ],
+            path: "Processing/Tests",
+            resources: [.copy("Fixtures")]
             // ⚠️ RELEASE 2 ONLY - Whisper cSettings and linkerSettings removed for Release 1
             // ⚠️ RELEASE 2 ONLY - Audio/Tests excluded for Release 1
         ),
@@ -203,10 +215,20 @@ let package = Package(
             name: "AppTests",
             dependencies: [
                 "App",
-                "Shared"
+                "Database",
+                "Shared",
+                "Storage",
+                .product(name: "SQLCipher", package: "swift-sqlcipher")
             ],
             path: "App/Tests"
             // ⚠️ RELEASE 2 ONLY - Whisper cSettings and linkerSettings removed for Release 1
+        ),
+
+        // MARK: - Crash recovery support
+        .target(
+            name: "CrashRecoverySupport",
+            dependencies: [],
+            path: "UI/CrashRecoverySupport"
         ),
 
         // MARK: - UI module
@@ -221,15 +243,33 @@ let package = Package(
                 "Processing",
                 "Search",
                 "Migration",
-                .product(name: "Sparkle", package: "Sparkle")
+                "CrashRecoverySupport",
+                .product(name: "Sparkle", package: "Sparkle"),
+                .product(name: "SwiftyChrono", package: "SwiftyChrono")
             ],
             path: "UI",
             exclude: [
+                "CrashRecoveryHelper",
+                "CrashRecoverySupport",
+                "LaunchAgents",
                 "Tests",
                 "README.md",
-                "AGENTS.md"
+                "AGENTS.md",
+                "Info.plist",
+                "Retrace.entitlements"
+            ],
+            resources: [
+                .process("Assets.xcassets")
             ]
             // ⚠️ RELEASE 2 ONLY - Whisper cSettings and linkerSettings removed for Release 1
+        ),
+        .executableTarget(
+            name: "RetraceCrashRecoveryHelper",
+            dependencies: ["CrashRecoverySupport"],
+            path: "UI/CrashRecoveryHelper",
+            sources: [
+                "main.swift"
+            ]
         ),
 
         // MARK: - Test executable for getMostRecentFrameTimestamp
@@ -253,7 +293,7 @@ let package = Package(
         ),
         .testTarget(
             name: "RetraceTests",
-            dependencies: ["Retrace", "Shared", "App"],
+            dependencies: ["Retrace", "CrashRecoverySupport", "Shared", "App", "Processing"],
             path: "UI/Tests"
             // ⚠️ RELEASE 2 ONLY - Whisper cSettings and linkerSettings removed for Release 1
         ),

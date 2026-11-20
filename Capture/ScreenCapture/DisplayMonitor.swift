@@ -91,6 +91,15 @@ actor DisplayMonitor {
             return (CGMainDisplayID(), true) // No app is fine, not a permission issue
         }
 
+        // Avoid AX frame reads for our own app; use CGWindow fallback.
+        if app.processIdentifier == ProcessInfo.processInfo.processIdentifier {
+            if let windowFrame = getWindowFrameFromWindowList(for: app.processIdentifier) {
+                let displayID = getDisplayContainingPoint(windowFrame.midX, windowFrame.midY)
+                return (displayID, true)
+            }
+            return (CGMainDisplayID(), true)
+        }
+
         // Use safe wrapper to get window frame
         if let windowFrame = PermissionMonitor.shared.safeGetWindowFrame(for: app.processIdentifier) {
             // Find which display contains the center of the window
@@ -115,6 +124,43 @@ actor DisplayMonitor {
         }
 
         return CGMainDisplayID()
+    }
+
+    /// Best-effort window frame lookup without AX APIs.
+    /// Uses front-to-back ordering from CGWindowListCopyWindowInfo.
+    private func getWindowFrameFromWindowList(for pid: pid_t) -> CGRect? {
+        guard let windowList = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements],
+            kCGNullWindowID
+        ) as? [[String: Any]] else {
+            return nil
+        }
+
+        for windowInfo in windowList {
+            guard let ownerPID = windowInfo[kCGWindowOwnerPID as String] as? pid_t,
+                  ownerPID == pid else {
+                continue
+            }
+
+            let layer = windowInfo[kCGWindowLayer as String] as? Int ?? 0
+            if layer != 0 {
+                continue
+            }
+
+            let isOnScreen = windowInfo[kCGWindowIsOnscreen as String] as? Bool ?? false
+            if !isOnScreen {
+                continue
+            }
+
+            guard let boundsDict = windowInfo[kCGWindowBounds as String] as? [String: Any],
+                  let bounds = CGRect(dictionaryRepresentation: boundsDict as CFDictionary) else {
+                continue
+            }
+
+            return bounds
+        }
+
+        return nil
     }
 
     /// Get display by ID

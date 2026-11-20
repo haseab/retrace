@@ -11,6 +11,9 @@ import SQLCipher
 /// Dependency injection container for all app services
 /// Owner: APP integration
 public actor ServiceContainer {
+    private static let rewindCutoffDateDefaultsKey = "rewindCutoffDate"
+    private static let rewindSQLCipherPassword = "soiZ58XZJhdka55hLUp18yOtTUTDXz7Diu7Z4JzuwhRwGG13N6Z9RTVU1fGiKkuF"
+    private static let rewindCipherCompatibility = 4
 
     // MARK: - Services
 
@@ -44,12 +47,14 @@ public actor ServiceContainer {
     private let searchConfig: SearchConfig
 
     private var isInitialized = false
+    private var ownedRewindConnection: DatabaseConnection?
 
     // MARK: - Initialization
 
     public init(
         databasePath: String = AppPaths.databasePath,
         storageConfig: StorageConfig = .default,
+        storageCrashReportDirectory: String = EmergencyDiagnostics.crashReportDirectory,
         captureConfig: CaptureConfig = .default,
         // ⚠️ RELEASE 2 ONLY
         // audioCaptureConfig: AudioCaptureConfig = .default,
@@ -69,11 +74,16 @@ public actor ServiceContainer {
         self.searchConfig = searchConfig
 
         // Initialize all managers
-        self.database = DatabaseManager(databasePath: databasePath)
+        self.database = DatabaseManager(
+            databasePath: databasePath,
+            storageRootPath: storageConfig.expandedStorageRootPath
+        )
         self.ftsEngine = FTSManager(databasePath: databasePath)
-        // Use the correct storage root (respects custom path setting)
-        let storageRootURL = URL(fileURLWithPath: AppPaths.expandedStorageRoot, isDirectory: true)
-        self.storage = StorageManager(storageRoot: storageRootURL)
+        let storageRootURL = URL(fileURLWithPath: storageConfig.expandedStorageRootPath, isDirectory: true)
+        self.storage = StorageManager(
+            storageRoot: storageRootURL,
+            crashReportDirectory: storageCrashReportDirectory
+        )
         self.capture = CaptureManager(config: captureConfig)
         // ⚠️ RELEASE 2 ONLY - Audio initialization commented out
         // self.audioCapture = AudioCaptureManager(config: audioCaptureConfig)
@@ -150,10 +160,15 @@ public actor ServiceContainer {
         // self.audioProcessingConfig = .default
         self.searchConfig = .default
 
-        self.database = DatabaseManager(databasePath: sharedMemoryPath)
+        self.database = DatabaseManager(
+            databasePath: sharedMemoryPath,
+            storageRootPath: StorageConfig.default.expandedStorageRootPath
+        )
         self.ftsEngine = FTSManager(databasePath: sharedMemoryPath)
-        // Use the correct storage root (respects custom path setting)
-        let storageRootURL = URL(fileURLWithPath: AppPaths.expandedStorageRoot, isDirectory: true)
+        let storageRootURL = URL(
+            fileURLWithPath: StorageConfig.default.expandedStorageRootPath,
+            isDirectory: true
+        )
         self.storage = StorageManager(storageRoot: storageRootURL)
         self.capture = CaptureManager()
         // ⚠️ RELEASE 2 ONLY
@@ -229,22 +244,35 @@ public actor ServiceContainer {
 
         // 3. Initialize storage (creates directories, loads encryption key)
         try await storage.initialize(config: storageConfig)
-        Log.info("✓ Storage initialized", category: .app)
+        if let walIssue = await storage.currentWALAvailabilityIssue() {
+            Log.error(
+                "⚠️ Storage initialized in degraded mode - startup WAL initialization failed at \(walIssue.walRootPath): \(walIssue.reason)",
+                category: .app
+            )
+        } else {
+            Log.info("✓ Storage initialized", category: .app)
+        }
 
         // DIAGNOSTIC: Log critical paths for troubleshooting database/storage mismatches
         Log.info("=== Storage Configuration ===", category: .app)
-        Log.info("Storage Root: \(AppPaths.storageRoot)", category: .app)
-        Log.info("Expanded Root: \(AppPaths.expandedStorageRoot)", category: .app)
-        Log.info("Database Path: \(AppPaths.databasePath)", category: .app)
+        Log.info("Storage Root: \(storageConfig.storageRootPath)", category: .app)
+        Log.info("Expanded Root: \(storageConfig.expandedStorageRootPath)", category: .app)
+        Log.info("Database Path: \(databasePath)", category: .app)
         let fm = FileManager.default
-        let chunksPath = "\(AppPaths.expandedStorageRoot)/chunks"
-        let dbPath = NSString(string: AppPaths.databasePath).expandingTildeInPath
-        Log.info("Database exists: \(fm.fileExists(atPath: dbPath))", category: .app)
+        let chunksPath = "\(storageConfig.expandedStorageRootPath)/chunks"
+        let dbPath = databasePath.hasPrefix("file:")
+            ? nil
+            : NSString(string: databasePath).expandingTildeInPath
+        if let dbPath {
+            Log.info("Database exists: \(fm.fileExists(atPath: dbPath))", category: .app)
+        } else {
+            Log.info("Database exists: n/a (URI database path)", category: .app)
+        }
         Log.info("Chunks folder exists: \(fm.fileExists(atPath: chunksPath))", category: .app)
 
         // SAFETY: If database exists but chunks folder is missing, clear processing queue
         // This prevents infinite retry loops from orphaned frame records
-        if fm.fileExists(atPath: dbPath) && !fm.fileExists(atPath: chunksPath) {
+        if let dbPath, fm.fileExists(atPath: dbPath), !fm.fileExists(atPath: chunksPath) {
             Log.error("⚠️ CRITICAL: Database exists but chunks folder missing!", category: .app)
             Log.warning("Clearing processing queue to prevent failures...", category: .app)
 
@@ -299,18 +327,19 @@ public actor ServiceContainer {
 
         // Create connections and config for Retrace
         let retraceConnection = SQLiteConnection(db: dbPointer)
-        let retraceConfig = DatabaseConfig.retrace
+        let retraceConfig = DatabaseConfig.retrace(storageRoot: storageConfig.expandedStorageRootPath)
         let retraceImageExtractor = HEVCStorageExtractor(storageManager: storage)
 
         let adapter = DataAdapter(
             retraceConnection: retraceConnection,
+            retraceReadConnectionPool: database.readConnectionPool,
             retraceConfig: retraceConfig,
             retraceImageExtractor: retraceImageExtractor,
             database: database
         )
 
         // Register Rewind source if user opted in
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
         let useRewindData = defaults.bool(forKey: "useRewindData")
         Log.info("Checking Rewind source during initialization: useRewindData=\(useRewindData)", category: .app)
 
@@ -353,7 +382,7 @@ public actor ServiceContainer {
             return
         }
 
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
         let useRewindData = defaults.bool(forKey: "useRewindData")
         Log.info("Checking if Rewind source should be registered: useRewindData=\(useRewindData)", category: .app)
 
@@ -386,7 +415,7 @@ public actor ServiceContainer {
         }
 
         // Save preference
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
         defaults.set(enabled, forKey: "useRewindData")
 
         if enabled {
@@ -401,8 +430,48 @@ public actor ServiceContainer {
         } else {
             // Disconnect Rewind source
             await adapter.disconnectRewind()
+            closeOwnedRewindConnection()
             Log.info("✓ Rewind source disconnected", category: .app)
         }
+    }
+
+    @discardableResult
+    public func refreshRewindCutoffDate() async -> Bool {
+        guard isInitialized else {
+            Log.warning("Cannot refresh Rewind cutoff - ServiceContainer not initialized", category: .app)
+            return false
+        }
+
+        guard let adapter = dataAdapter else {
+            Log.warning("Cannot refresh Rewind cutoff - DataAdapter not available", category: .app)
+            return false
+        }
+
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
+        guard defaults.bool(forKey: "useRewindData") else {
+            Log.info("Rewind cutoff updated in settings while Rewind data is disabled", category: .app)
+            return false
+        }
+
+        let cutoffDate = Self.rewindCutoffDate(in: defaults)
+        if await adapter.updateRewindCutoffDate(cutoffDate) {
+            Log.info("✓ Active Rewind cutoff refreshed to \(cutoffDate)", category: .app)
+            return true
+        }
+
+        await configureRewindSource(adapter: adapter)
+        let sources = await adapter.registeredSources
+        let refreshed = sources.contains(.rewind)
+        if refreshed {
+            Log.info("✓ Rewind source configured with refreshed cutoff \(cutoffDate)", category: .app)
+        } else {
+            Log.warning("Failed to refresh Rewind cutoff because Rewind source could not be configured", category: .app)
+        }
+        return refreshed
+    }
+
+    public func latestRewindFrameDate() async -> Date? {
+        Self.latestRewindFrameDate(databasePath: AppPaths.rewindDBPath)
     }
 
     /// Helper to configure Rewind source on DataAdapter
@@ -414,63 +483,165 @@ public actor ServiceContainer {
             return
         }
 
-        // Open encrypted database
-        var db: OpaquePointer?
-        guard sqlite3_open(rewindDBPath, &db) == SQLITE_OK else {
-            let errorMsg = db.map { String(cString: sqlite3_errmsg($0)) } ?? "Unknown error"
-            Log.error("[ServiceContainer] Failed to open Rewind database: \(errorMsg)", category: .app)
+        let rewindConnection: DatabaseConnection
+        do {
+            rewindConnection = try Self.makeRewindConnection(databasePath: rewindDBPath)
+        } catch {
+            Log.error("[ServiceContainer] Failed to open Rewind database: \(error)", category: .app)
             return
         }
 
-        // Set encryption key
-        let rewindPassword = "soiZ58XZJhdka55hLUp18yOtTUTDXz7Diu7Z4JzuwhRwGG13N6Z9RTVU1fGiKkuF"
-        let keySQL = "PRAGMA key = '\(rewindPassword)'"
-        var keyError: UnsafeMutablePointer<Int8>?
-        if sqlite3_exec(db, keySQL, nil, nil, &keyError) != SQLITE_OK {
-            let error = keyError.map { String(cString: $0) } ?? "Unknown error"
-            sqlite3_free(keyError)
-            Log.error("[ServiceContainer] Failed to set Rewind encryption key: \(error)", category: .app)
-            sqlite3_close(db)
-            return
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
+        let cutoffDate = Self.rewindCutoffDate(in: defaults)
+        if Self.storedRewindCutoffDate(in: defaults) != nil {
+            Log.info("[ServiceContainer] Using user-configured Rewind cutoff \(cutoffDate)", category: .app)
+        } else {
+            Log.info("[ServiceContainer] Using default Rewind cutoff \(cutoffDate)", category: .app)
         }
-
-        // Set cipher compatibility (Rewind uses SQLCipher 4)
-        var compatError: UnsafeMutablePointer<Int8>?
-        if sqlite3_exec(db, "PRAGMA cipher_compatibility = 4", nil, nil, &compatError) != SQLITE_OK {
-            let error = compatError.map { String(cString: $0) } ?? "Unknown error"
-            sqlite3_free(compatError)
-            Log.error("[ServiceContainer] Failed to set cipher compatibility: \(error)", category: .app)
-            sqlite3_close(db)
-            return
-        }
-
-        // Verify connection
-        var testStmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, "SELECT count(*) FROM sqlite_master", -1, &testStmt, nil) == SQLITE_OK,
-              sqlite3_step(testStmt) == SQLITE_ROW else {
-            sqlite3_finalize(testStmt)
-            sqlite3_close(db)
-            Log.error("[ServiceContainer] Failed to verify Rewind encryption", category: .app)
-            return
-        }
-        sqlite3_finalize(testStmt)
 
         // Create connection and config
-        let rewindConnection = SQLCipherConnection(db: db)
-        let rewindConfig = DatabaseConfig.rewind
+        ownedRewindConnection = rewindConnection
+        let rewindSearchConnectionPool = SQLiteReadConnectionPool(
+            label: "rewind_search",
+            connectionFactory: { [rewindDBPath] in
+                try Self.makeRewindConnection(databasePath: rewindDBPath)
+            }
+        )
+        let rewindConfig = DatabaseConfig.rewind(cutoffDate: cutoffDate)
         // Chunks directory is always in the same parent directory as the database
         let rewindDBDir = (rewindDBPath as NSString).deletingLastPathComponent
         let rewindChunksPath = "\(rewindDBDir)/chunks"
         let rewindImageExtractor = AVAssetExtractor(storageRoot: rewindChunksPath)
-        let cutoffDate = Date(timeIntervalSince1970: 1766217600) // Dec 20, 2025 00:00:00 UTC
 
         await adapter.configureRewind(
             connection: rewindConnection,
             config: rewindConfig,
             imageExtractor: rewindImageExtractor,
-            cutoffDate: cutoffDate
+            cutoffDate: cutoffDate,
+            searchConnectionPool: rewindSearchConnectionPool
         )
         Log.info("✓ Rewind source configured during initialization", category: .app)
+    }
+
+    private func closeOwnedRewindConnection() {
+        guard let db = ownedRewindConnection?.getConnection() else {
+            ownedRewindConnection = nil
+            return
+        }
+
+        let rc = sqlite3_close_v2(db)
+        if rc != SQLITE_OK {
+            let message = String(cString: sqlite3_errmsg(db))
+            Log.warning(
+                "[ServiceContainer] Failed to close Rewind database connection (\(rc)): \(message)",
+                category: .app
+            )
+        }
+
+        ownedRewindConnection = nil
+    }
+
+    private nonisolated static func makeRewindConnection(databasePath: String) throws -> DatabaseConnection {
+        try SQLiteReadOnlyConnectionFactory.makeRewindConnection(
+            databasePath: databasePath,
+            password: rewindSQLCipherPassword,
+            cipherCompatibility: rewindCipherCompatibility
+        )
+    }
+
+    nonisolated static func latestRewindFrameDate(databasePath: String) -> Date? {
+        let expandedPath = NSString(string: databasePath).expandingTildeInPath
+
+        guard FileManager.default.fileExists(atPath: expandedPath) else {
+            Log.info("[ServiceContainer] Rewind database not found while probing latest frame: \(expandedPath)", category: .app)
+            return nil
+        }
+
+        let connection: DatabaseConnection
+        do {
+            connection = try makeRewindConnection(databasePath: expandedPath)
+        } catch {
+            Log.error("[ServiceContainer] Failed to open Rewind database while probing latest frame", category: .app, error: error)
+            return nil
+        }
+
+        guard let db = connection.getConnection() else {
+            Log.warning("[ServiceContainer] Rewind database connection was nil while probing latest frame", category: .app)
+            return nil
+        }
+
+        var statement: OpaquePointer?
+        defer {
+            sqlite3_finalize(statement)
+            let closeResult = sqlite3_close_v2(db)
+            if closeResult != SQLITE_OK {
+                let message = String(cString: sqlite3_errmsg(db))
+                Log.warning(
+                    "[ServiceContainer] Failed to close Rewind probe connection (\(closeResult)): \(message)",
+                    category: .app
+                )
+            }
+        }
+
+        let sql = "SELECT MAX(createdAt) FROM frame;"
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            let message = String(cString: sqlite3_errmsg(db))
+            Log.warning("[ServiceContainer] Failed to prepare latest Rewind frame probe: \(message)", category: .app)
+            return nil
+        }
+
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            let message = String(cString: sqlite3_errmsg(db))
+            Log.warning("[ServiceContainer] Latest Rewind frame probe did not return a row: \(message)", category: .app)
+            return nil
+        }
+
+        guard let value = sqlite3_column_text(statement, 0) else {
+            Log.info("[ServiceContainer] Latest Rewind frame probe returned no timestamp", category: .app)
+            return nil
+        }
+
+        let latestFrameTimestamp = String(cString: value)
+        guard let date = DatabaseConfig.rewindDateFormatter.date(from: latestFrameTimestamp) else {
+            Log.warning(
+                "[ServiceContainer] Failed to parse latest Rewind frame timestamp: \(latestFrameTimestamp)",
+                category: .app
+            )
+            return nil
+        }
+
+        return date
+    }
+
+    public nonisolated static func defaultRewindCutoffDate(calendar: Calendar = .current) -> Date {
+        var components = DateComponents()
+        components.year = 2025
+        components.month = 12
+        components.day = 20
+        components.hour = 0
+        components.minute = 0
+        components.second = 0
+
+        return calendar.date(from: components) ?? Date(timeIntervalSince1970: 1_766_188_800)
+    }
+
+    public nonisolated static func storedRewindCutoffDate(in defaults: UserDefaults) -> Date? {
+        if let storedDate = defaults.object(forKey: rewindCutoffDateDefaultsKey) as? Date {
+            return storedDate
+        }
+
+        if let storedNumber = defaults.object(forKey: rewindCutoffDateDefaultsKey) as? NSNumber {
+            return Date(timeIntervalSince1970: storedNumber.doubleValue)
+        }
+
+        return nil
+    }
+
+    public nonisolated static func rewindCutoffDate(
+        in defaults: UserDefaults,
+        calendar: Calendar = .current
+    ) -> Date {
+        storedRewindCutoffDate(in: defaults) ?? defaultRewindCutoffDate(calendar: calendar)
     }
 
     /// Shutdown all services gracefully
@@ -496,10 +667,6 @@ public actor ServiceContainer {
         await processingQueue?.stopWorkers()
         Log.info("✓ Processing queue workers stopped", category: .app)
 
-        // Wait for processing queue to drain (legacy OCR queue)
-        await processing.waitForQueueDrain()
-        Log.info("✓ Processing queue drained", category: .app)
-
         // ⚠️ RELEASE 2 ONLY
         // // Audio processing will complete when stream ends
         // Log.info("✓ Audio processing drained", category: .app)
@@ -510,9 +677,9 @@ public actor ServiceContainer {
 
         // Shutdown DataAdapter (disconnects all sources)
         await dataAdapter?.shutdown()
+        closeOwnedRewindConnection()
         Log.info("✓ DataAdapter shutdown", category: .app)
 
-        // Close database connections
         try await ftsEngine.close()
         Log.info("✓ FTS engine closed", category: .app)
 
@@ -567,7 +734,7 @@ extension StorageConfig {
     public static var `default`: StorageConfig {
         // Read settings from UserDefaults (synced with Settings UI)
         // Defaults: retention = forever (0/nil), storage = unlimited (500GB max)
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
         let retentionDays = defaults.object(forKey: "retentionDays") as? Int ?? 0
         let maxStorageGB = defaults.object(forKey: "maxStorageGB") as? Double ?? 500.0
 
@@ -583,10 +750,9 @@ extension StorageConfig {
 extension CaptureConfig {
     public static var `default`: CaptureConfig {
         // Read settings from UserDefaults (synced with Settings UI)
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
         let captureIntervalSeconds = defaults.object(forKey: "captureIntervalSeconds") as? Double ?? 2.0
-        // TODO: Re-enable once private window detection is more reliable
-        // Currently disabled because detection has false positives and doesn't reliably detect incognito
+        // Private/incognito redaction toggle (AXTitle marker-based)
         let excludePrivateWindows = defaults.object(forKey: "excludePrivateWindows") as? Bool ?? false
         // excludeCursor = true means hide cursor, so showCursor = !excludeCursor
         let excludeCursor = defaults.object(forKey: "excludeCursor") as? Bool ?? false
@@ -596,6 +762,8 @@ extension CaptureConfig {
         let deleteDuplicateFrames = defaults.object(forKey: "deleteDuplicateFrames") as? Bool ?? true
         // Deduplication threshold - how similar frames must be to be considered duplicates
         let deduplicationThreshold = defaults.object(forKey: "deduplicationThreshold") as? Double ?? CaptureConfig.defaultDeduplicationThreshold
+        let keepFramesOnMouseMovement = defaults.object(forKey: "keepFramesOnMouseMovement") as? Bool ?? true
+        let enableCustomPatternWindowRedaction = defaults.object(forKey: "enableCustomPatternWindowRedaction") as? Bool ?? true
 
         // Parse excluded apps from settings (stored as JSON array of ExcludedAppInfo)
         var excludedBundleIDs: Set<String> = ["com.apple.loginwindow"] // Always exclude login screen
@@ -613,8 +781,16 @@ extension CaptureConfig {
             }
         }
 
+        let redactWindowTitlePatterns = enableCustomPatternWindowRedaction
+            ? parseRedactionPatterns(defaults.string(forKey: "redactWindowTitlePatterns"))
+            : []
+        let redactBrowserURLPatterns = enableCustomPatternWindowRedaction
+            ? parseRedactionPatterns(defaults.string(forKey: "redactBrowserURLPatterns"))
+            : []
+
         // Capture on window change - instantly capture when switching apps/windows
         let captureOnWindowChange = defaults.object(forKey: "captureOnWindowChange") as? Bool ?? true
+        let captureOnMouseClick = defaults.object(forKey: "captureOnMouseClick") as? Bool ?? false
 
         // Multi-display recording - opt-in via settings
         let recordAllDisplays = defaults.object(forKey: "recordAllDisplays") as? Bool ?? false
@@ -623,20 +799,32 @@ extension CaptureConfig {
             captureIntervalSeconds: captureIntervalSeconds,
             adaptiveCaptureEnabled: deleteDuplicateFrames, // Controlled by "Delete duplicate frames" setting
             deduplicationThreshold: deduplicationThreshold, // Controlled by "Similarity threshold" slider in settings
+            keepFramesOnMouseMovement: keepFramesOnMouseMovement,
             maxResolution: .uhd4K,
             excludedAppBundleIDs: excludedBundleIDs,
             excludePrivateWindows: excludePrivateWindows,
             showCursor: showCursor,
+            redactWindowTitlePatterns: redactWindowTitlePatterns,
+            redactBrowserURLPatterns: redactBrowserURLPatterns,
             captureOnWindowChange: captureOnWindowChange,
-            recordAllDisplays: recordAllDisplays
+            recordAllDisplays: recordAllDisplays,
+            captureOnMouseClick: captureOnMouseClick
         )
+    }
+
+    private static func parseRedactionPatterns(_ raw: String?) -> [String] {
+        guard let raw, !raw.isEmpty else { return [] }
+        return raw
+            .split(whereSeparator: { $0 == "," || $0 == "\n" })
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
     }
 }
 
 extension ProcessingConfig {
     public static var `default`: ProcessingConfig {
         ProcessingConfig(
-            accessibilityEnabled: false,  // Disabled - reads live screen, not video frames
+            accessibilityEnabled: true,  // Correct OCR using saved capture-time references only
             ocrAccuracyLevel: .accurate,
             recognitionLanguages: ["en-US"],
             minimumConfidence: 0.5
@@ -685,4 +873,5 @@ extension SearchConfig {
 
 enum ServiceError: Error {
     case databaseNotReady
+    case initializationFailed(String)
 }

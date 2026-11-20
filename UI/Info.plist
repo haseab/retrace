@@ -14,6 +14,24 @@
     <string>$(MARKETING_VERSION)</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
+    <key>RetraceVersion</key>
+    <string>$(MARKETING_VERSION)</string>
+    <key>RetraceBuildNumber</key>
+    <string>$(CURRENT_PROJECT_VERSION)</string>
+    <key>RetraceGitCommit</key>
+    <string>$(INFOPLIST_KEY_RetraceGitCommit)</string>
+    <key>RetraceGitCommitFull</key>
+    <string>$(INFOPLIST_KEY_RetraceGitCommitFull)</string>
+    <key>RetraceGitBranch</key>
+    <string>$(INFOPLIST_KEY_RetraceGitBranch)</string>
+    <key>RetraceBuildDate</key>
+    <string>$(INFOPLIST_KEY_RetraceBuildDate)</string>
+    <key>RetraceBuildConfig</key>
+    <string>$(INFOPLIST_KEY_RetraceBuildConfig)</string>
+    <key>RetraceIsDevBuild</key>
+    <string>$(INFOPLIST_KEY_RetraceIsDevBuild)</string>
+    <key>RetraceForkName</key>
+    <string>$(INFOPLIST_KEY_RetraceForkName)</string>
     <key>CFBundleExecutable</key>
     <string>Retrace</string>
 
@@ -52,7 +70,7 @@
 
     <!-- Privacy - Accessibility Usage Description -->
     <key>NSAppleEventsUsageDescription</key>
-    <string>Retrace needs accessibility permission to extract text from applications. All data stays local and encrypted on your Mac.</string>
+    <string>Retrace needs Automation permission to extract the browser url. If you're getting this notice, you're likely using an application that doesn't support url extraction via accessibility APIs, so URL Extraction needs to be done via Apple Script. All data stays local and encrypted on your Mac.</string>
 
     <!-- Required Entitlements -->
     <key>com.apple.security.device.screen-recording</key>
@@ -60,10 +78,10 @@
     <key>com.apple.security.automation.apple-events</key>
     <true/>
 
-    <!-- LSUIElement: Run as menu bar app (no dock icon) -->
-    <!-- Set to false if you want the app in the Dock -->
+    <!-- Default to regular app so Dock icon is discoverable -->
+    <!-- Users can hide Dock presence at runtime via Settings (activation policy) -->
     <key>LSUIElement</key>
-    <true/>
+    <false/>
 
     <!-- Support for Dark Mode -->
     <key>NSRequiresAquaSystemAppearance</key>
@@ -89,6 +107,10 @@
     <!-- Allow users to opt into automatic updates -->
     <key>SUAllowsAutomaticUpdates</key>
     <true/>
+
+    <!-- Default to not automatically downloading/installing updates -->
+    <key>SUAutomaticallyUpdate</key>
+    <false/>
 
     <!-- Show release notes in update dialog -->
     <key>SUShowReleaseNotes</key>

@@ -2,27 +2,35 @@
 
 You are responsible for the **Storage** module of Retrace. Your job is to implement file storage operations including video segment writing, encryption/decryption, and disk space management.
 
-**v0.5 Status**: ✅ HEVC encoding working with VideoToolbox hardware acceleration. **Not yet optimized** - currently using ~50-70GB/month vs target of ~15-20GB/month. **Apple Silicon required** for hardware HEVC encoding. No audio segment storage in v0.5.
+**Status**: ✅ HEVC encoding with VideoToolbox hardware acceleration and per-frame lossless LZFSE recovery journals. Legacy raw WAL records remain readable. **Apple Silicon required** for hardware HEVC encoding. No audio segment storage yet.
 
 ## Your Directory
 
 ```
 Storage/
+├── GeneratorCachePolicy.swift   # Shared idle/LRU eviction policy for AVAsset generator caches
 ├── StorageManager.swift         # Main StorageProtocol implementation
+├── ImageExtractor.swift         # Frame extraction and AVAsset generator caches
+├── IncrementalSegmentWriter.swift # WAL-first recording and video finalization
 ├── SegmentWriterImpl.swift      # SegmentWriter implementation
-├── Encryption/
-│   ├── EncryptionManager.swift  # AES-256-GCM encryption
-│   └── KeychainHelper.swift     # Keychain key storage
+├── StorageModuleError.swift     # Storage-local errors
 ├── FileManager/
+│   ├── TemporaryVideoLink.swift # Scoped AVAssetReader links removed on success/error
 │   ├── DirectoryManager.swift   # Directory structure management
 │   └── StorageHealthMonitor.swift # Disk space + I/O + volume health monitoring
 ├── VideoEncoder/
 │   ├── HEVCEncoder.swift        # VideoToolbox HEVC encoding
 │   └── FrameConverter.swift     # Pixel format conversion
+├── WAL/
+│   ├── WALManager.swift         # Versioned lossless/raw records, checksums, random reads, decoded byte limits
+│   └── RecoveryManager.swift    # Crash recovery and durable video-prefix reuse
 └── Tests/
+    ├── EncoderFileInspectionTests.swift # Lookup reuse, failure handling and real graphics/file regression checks
+    ├── DirectoryManagerTests.swift
+    ├── TemporaryVideoLinkTests.swift # Real file/link lifecycle regression
     ├── StorageManagerTests.swift
-    ├── EncryptionTests.swift
-    └── HEVCEncoderTests.swift
+    ├── HEVCEncoderTests.swift
+    └── TestLogger.swift
 ```
 
 ## Protocols You Must Implement
@@ -44,21 +52,24 @@ Location: `AppPaths.storageRoot` (default: `~/Library/Application Support/Retrac
 
 ```
 {storageRoot}/
-├── config.json                    # App configuration
 ├── retrace.db                     # SQLite database (owned by DATABASE)
-├── segments/
-│   ├── 2024/
-│   │   ├── 01/
-│   │   │   ├── 15/
-│   │   │   │   ├── segment_abc123.hevc.enc  # Encrypted video
-│   │   │   │   └── segment_def456.hevc.enc
-│   │   │   └── 16/
-│   │   │       └── ...
-│   │   └── 02/
-│   │       └── ...
-│   └── ...
-└── temp/                          # Temporary files during encoding
+├── chunks/YYYYMM/DD/{videoID}      # HEVC MP4 video files
+├── wal/active_segment_{videoID}/
+│   ├── frames.bin                 # Independently compressed image records
+│   ├── frame_id_map.bin           # Database frame ID -> record offset
+│   └── metadata.json              # Periodic screenshot metadata checkpoints and immediate durable video frontier
+└── temp/                          # Temporary files
 ```
+
+### WAL format and memory rules
+
+- New records begin with `RTRCWAL2`, a UInt32 codec (0 = raw fallback, 1 = LZFSE), a UInt32 decoded size, and a 32-byte SHA-256 pixel digest. The existing 36-byte frame header, metadata strings, and stored payload follow. Integers use little-endian encoding.
+- Records are independent. Index scans skip payloads, while OCR/recovery decode one frame at a time. Loss of `metadata.json` must not prevent format detection or recovery.
+- Preserve legacy raw record support, exact row stride/padding, and frame-ID offset mappings. Never silently fall back to a different frame index when an ID mapping is missing.
+- Isolate metadata rebuild failures per session. Retain/quarantine unsupported or corrupt journals without deleting their bytes or blocking healthy recovery and recording startup.
+- Compression runs serially on the WAL actor with a 64 KiB output scratch buffer. Incompressible images use a checksummed raw fallback without writing an intermediate raw copy.
+- Validate decoded sizes against dimensions and the 256 MiB per-frame bound before allocating. Eager reads must enforce the decoded byte budget (512 MiB maximum), regardless of compressed file size.
+- Aggregate compression statistics once per finalized segment; do not add per-frame metrics/log writes.
 
 ## Key Implementation Details
 
@@ -270,15 +281,19 @@ func readFrame(segmentID: SegmentID, frameIndex: Int) async throws -> Data {
 
     let cgImage = try generator.copyCGImage(at: time, actualTime: nil)
 
-    // Convert to Data (JPEG for efficiency)
-    let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
-    guard let tiffData = nsImage.tiffRepresentation,
-          let bitmap = NSBitmapImageRep(data: tiffData),
-          let jpegData = bitmap.representation(using: .jpeg, properties: [.compressionFactor: 0.8]) else {
-        throw StorageError.fileReadFailed(path: path.path, underlying: "Failed to convert frame")
+    // Encode directly to JPEG; no intermediate TIFF/AppKit bitmap conversion.
+    let data = NSMutableData()
+    guard let destination = CGImageDestinationCreateWithData(
+        data as CFMutableData, "public.jpeg" as CFString, 1, nil
+    ) else {
+        throw StorageError.fileReadFailed(path: path.path, underlying: "Failed to create JPEG encoder")
     }
-
-    return jpegData
+    CGImageDestinationAddImage(destination, cgImage,
+        [kCGImageDestinationLossyCompressionQuality: 0.8] as CFDictionary)
+    guard CGImageDestinationFinalize(destination) else {
+        throw StorageError.fileReadFailed(path: path.path, underlying: "Failed to finalize JPEG")
+    }
+    return data as Data
 }
 ```
 
@@ -339,3 +354,25 @@ throw StorageError.insufficientDiskSpace
 6. Write tests for encoding and encryption
 
 Start with the HEVC encoder since that's the core complexity, then add encryption on top.
+
+## Permanent keyword redaction
+
+`SegmentRedactionTarget.mode` is captured from stored node metadata, not current settings. Permanent targets overwrite the whole patch with opaque black and require no secret; scramble targets retain the existing keyed permutation. Invalid rectangles or patch extraction failures abort the atomic rewrite. Mixed plans require a secret if any target uses scrambling. Recovery keeps the existing write/swap/commit cleanup contract.
+
+### Screenshot metadata checkpoints
+
+- Frame count/dimensions are reconstructible from `frames.bin`; checkpoint them at most once per 30 seconds during append instead of rewriting `metadata.json` for each screenshot.
+- Durable video frontier updates still persist immediately. Merge them into later session-copy checkpoints so the persisted frontier never regresses.
+- Recovery reconciles even structurally valid stale metadata against the complete WAL record prefix, preserving its durable frontier. Missing metadata remains recoverable. Checkpoint state is cleared with all other session caches.
+
+- Maintain an eight-entry LRU of WAL writer handles and extend offsets incrementally within an active session, but force validation scans for recovery. Close handles on session removal/reset and failed appends, including seek failures. Failed appends invalidate both offset caches; truncate a partial record only if the initial seek returned a valid offset.
+- Local video readers use TemporaryVideoLink through a defer covering every return/error; cached AVAssetImageGenerator links remain alive until generator eviction.
+
+### Encoder output inspection
+
+Keep the pre-append existence check for recovery before writing the next frame. After append, `outputFileSizeIfPresent` performs one attributes lookup for both missing-file detection and fragment size/frontier tracking. Missing paths trigger immediate recreation; empty existing files are not missing. Other metadata I/O failures propagate without treating the file as deleted or recreating the writer. Fragment thresholds and durable-frontier accounting remain unchanged.
+
+
+### JPEG frame extraction
+
+`ImageExtractor` implementations and `StorageManager` encode CGImage frames directly with ImageIO at quality 0.8. Do not reintroduce an NSImage/TIFF/NSBitmapImageRep round trip. JPEG conversion telemetry uses the `storage.videoDecoding.jpegEncoding` tag and a one-frame-plus-output-headroom proxy; this is an estimate, not measured allocation or a memory limit. Existing frame reading and real video/redaction regressions exercise decoded JPEGs. The paired encoder comparison used the same native decoded frames as both inputs and verified identical JPEG bytes for the sampled recordings.

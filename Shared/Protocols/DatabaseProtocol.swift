@@ -21,6 +21,10 @@ public protocol DatabaseProtocol: Actor {
 
     /// Insert a new frame reference and return the auto-generated ID
     func insertFrame(_ frame: FrameReference) async throws -> Int64
+    func insertFrame(_ frame: FrameReference, accessibilitySnapshot: AccessibilitySnapshot?) async throws -> Int64
+
+    /// Saved capture-time geometry for OCR; nil for older/imported frames.
+    func getFrameOCRRegions(frameID: Int64) async throws -> [CGRect]?
 
     /// Get a frame by ID
     func getFrame(id: FrameID) async throws -> FrameReference?
@@ -42,6 +46,9 @@ public protocol DatabaseProtocol: Actor {
     /// Delete frames older than a date
     func deleteFrames(olderThan date: Date) async throws -> Int
 
+    /// Delete a single frame by ID
+    func deleteFrame(id: FrameID) async throws
+
     /// Get total frame count
     func getFrameCount() async throws -> Int
 
@@ -54,8 +61,16 @@ public protocol DatabaseProtocol: Actor {
     /// Update frame's videoId and videoFrameIndex after video encoding
     func updateFrameVideoLink(frameID: FrameID, videoID: VideoSegmentID, frameIndex: Int) async throws
 
+    /// Persist optional per-frame metadata JSON payload.
+    func updateFrameMetadata(frameID: FrameID, metadataJSON: String?) async throws
+
+    /// Read per-frame metadata JSON payload.
+    func getFrameMetadata(frameID: FrameID) async throws -> String?
+
     /// Get processing status for multiple frames in a single query
-    /// Returns dictionary of frameID -> processingStatus (0=pending, 1=processing, 2=completed, 3=failed, 4=not yet readable)
+    /// Returns dictionary of frameID -> processingStatus
+    /// 0=pending, 1=processing, 2=completed, 3=failed, 4=not yet readable,
+    /// 5=rewrite pending, 6=rewrite processing, 7=rewrite completed, 8=rewrite failed
     func getFrameProcessingStatuses(frameIDs: [Int64]) async throws -> [Int64: Int]
 
     /// Mark frame as readable from video file (processingStatus 4 -> 0)
@@ -65,7 +80,9 @@ public protocol DatabaseProtocol: Actor {
     /// Update frame's processing status
     /// - Parameters:
     ///   - frameID: The frame ID to update
-    ///   - status: The new processing status (0=pending, 1=processing, 2=completed, 3=failed, 4=not yet readable)
+    ///   - status: The new processing status
+    ///     0=pending, 1=processing, 2=completed, 3=failed, 4=not yet readable,
+    ///     5=rewrite pending, 6=rewrite processing, 7=rewrite completed, 8=rewrite failed
     func updateFrameProcessingStatus(frameID: Int64, status: Int) async throws
 
     // MARK: - Video Segment Operations (Video Files)
@@ -75,6 +92,9 @@ public protocol DatabaseProtocol: Actor {
 
     /// Get video segment by ID
     func getVideoSegment(id: VideoSegmentID) async throws -> VideoSegment?
+
+    /// Find a video segment by the final path component of its relative path.
+    func findVideoSegment(relativePathStem: String) async throws -> VideoSegment?
 
     /// Get video segment containing a specific timestamp
     func getVideoSegment(containingTimestamp date: Date) async throws -> VideoSegment?
@@ -361,13 +381,18 @@ public struct OCRNode: Sendable, Equatable, Identifiable {
     /// Used for multi-window text separation
     public let windowIndex: Int?
 
+    /// Whether this node's on-screen pixels were redacted/scrambled.
+    /// Derived from whether a protected OCR payload exists for the node.
+    public let isRedacted: Bool
+
     public init(
         id: Int64? = nil,
         nodeOrder: Int,
         textOffset: Int,
         textLength: Int,
         bounds: CGRect,
-        windowIndex: Int? = nil
+        windowIndex: Int? = nil,
+        isRedacted: Bool = false
     ) {
         self.id = id
         self.nodeOrder = nodeOrder
@@ -375,6 +400,7 @@ public struct OCRNode: Sendable, Equatable, Identifiable {
         self.textLength = textLength
         self.bounds = bounds
         self.windowIndex = windowIndex
+        self.isRedacted = isRedacted
     }
 
     /// X coordinate in pixels
@@ -408,7 +434,11 @@ public struct OCRNode: Sendable, Equatable, Identifiable {
 /// OCR Node with normalized coordinates (0.0-1.0) and text content
 /// Used for text selection UI layer - compatible with both Rewind and Retrace data
 public struct OCRNodeWithText: Identifiable, Equatable, Sendable {
-    public let id: Int  // nodeOrder from database
+    /// Primary key for stored OCR nodes.
+    /// Live OCR uses a transient in-memory identifier.
+    public let id: Int
+    /// Reading order within the frame.
+    public let nodeOrder: Int
     /// The frame ID this node belongs to (for debugging frame offset issues)
     public let frameId: Int64
     /// Normalized X coordinate (0.0-1.0)
@@ -421,14 +451,59 @@ public struct OCRNodeWithText: Identifiable, Equatable, Sendable {
     public let height: CGFloat
     /// The text content of this node
     public let text: String
+    /// Stored protected OCR text for redacted nodes, read from node.encryptedText.
+    public let encryptedText: String?
+    /// Whether this node was redacted in storage.
+    public let isRedacted: Bool
 
-    public init(id: Int, frameId: Int64, x: CGFloat, y: CGFloat, width: CGFloat, height: CGFloat, text: String) {
+    public init(
+        id: Int,
+        nodeOrder: Int? = nil,
+        frameId: Int64,
+        x: CGFloat,
+        y: CGFloat,
+        width: CGFloat,
+        height: CGFloat,
+        text: String,
+        encryptedText: String? = nil,
+        isRedacted: Bool = false
+    ) {
         self.id = id
+        self.nodeOrder = nodeOrder ?? id
         self.frameId = frameId
         self.x = x
         self.y = y
         self.width = width
         self.height = height
         self.text = text
+        self.encryptedText = encryptedText
+        self.isRedacted = isRedacted
+    }
+
+    public var isPermanentlyRedacted: Bool {
+        isRedacted && PhraseRedactionMode(storedText: encryptedText) == .permanent
+    }
+
+    public func replacingText(_ text: String) -> OCRNodeWithText {
+        OCRNodeWithText(
+            id: id,
+            nodeOrder: nodeOrder,
+            frameId: frameId,
+            x: x,
+            y: y,
+            width: width,
+            height: height,
+            text: text,
+            encryptedText: encryptedText,
+            isRedacted: isRedacted
+        )
+    }
+}
+
+// Compatibility for alternate data sources which do not record native screenshots.
+public extension DatabaseProtocol {
+    func getFrameOCRRegions(frameID: Int64) async throws -> [CGRect]? { nil }
+    func insertFrame(_ frame: FrameReference, accessibilitySnapshot: AccessibilitySnapshot?) async throws -> Int64 {
+        try await insertFrame(frame)
     }
 }

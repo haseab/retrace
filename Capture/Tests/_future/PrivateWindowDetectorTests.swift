@@ -1,6 +1,7 @@
 import XCTest
 @testable import Capture
 import Shared
+import CoreGraphics
 
 // ╔══════════════════════════════════════════════════════════════════════════════╗
 // ║                    PRIVATE WINDOW DETECTOR TESTS                             ║
@@ -77,6 +78,20 @@ final class PrivateWindowDetectorTests: XCTestCase {
                 "Should detect Firefox private browsing with title: \(title)"
             )
         }
+    }
+
+    func testFirefoxWindowInfoUsesPrivateRedactionDetection() {
+        let privateWindow: [String: Any] = [
+            kCGWindowOwnerName as String: "Firefox",
+            kCGWindowName as String: "Ranking Natalie Reynolds Viral Moments - YouTube — Private Browsing",
+        ]
+        XCTAssertTrue(PrivateWindowDetector.isPrivateWindow(windowInfo: privateWindow))
+
+        let normalWindow: [String: Any] = [
+            kCGWindowOwnerName as String: "Firefox",
+            kCGWindowName as String: "Ranking Natalie Reynolds Viral Moments - YouTube",
+        ]
+        XCTAssertFalse(PrivateWindowDetector.isPrivateWindow(windowInfo: normalWindow))
     }
 
     func testDoesNotDetectNormalWindows() {

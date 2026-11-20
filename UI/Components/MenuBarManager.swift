@@ -6,6 +6,7 @@ import Dispatch
 
 /// Manages the macOS menu bar icon and status menu
 public class MenuBarManager: ObservableObject {
+    typealias PrimaryAction = (title: String, imageSystemName: String)
 
     // MARK: - Shared Instance
 
@@ -15,9 +16,14 @@ public class MenuBarManager: ObservableObject {
     // MARK: - Properties
 
     private var statusItem: NSStatusItem?
+    private var statusMenu: NSMenu?
+    private var lastStatusMenuOpenEventTimestamp: TimeInterval = 0
+    private var localStatusClickMonitor: Any?
     private let coordinator: AppCoordinator
     private let onboardingManager: OnboardingManager
     private var refreshTimer: DispatchSourceTimer?
+    private var autoResumeCountdownTimer: Timer?
+    private weak var autoResumeStatusItem: NSMenuItem?
 
     @Published public var isRecording = false
 
@@ -31,11 +37,134 @@ public class MenuBarManager: ObservableObject {
     private var timelineShortcut: ShortcutConfig = .defaultTimeline
     private var dashboardShortcut: ShortcutConfig = .defaultDashboard
     private var recordingShortcut: ShortcutConfig = .defaultRecording
+    private var systemMonitorShortcut: ShortcutConfig = .defaultSystemMonitor
+    private var commentShortcut: ShortcutConfig = .defaultCommentCapture
 
     /// Timer for icon fill animation
     private var iconAnimationTimer: Timer?
     /// Current fill progress for icon animation (0.0 to 1.0)
     private var iconFillProgress: CGFloat = 0.0
+    private var hasPendingCapturePulse = false
+    /// References used to keep the recording toggle pinned to the row's trailing edge.
+    private weak var recordingToggleContainerView: NSView?
+    private weak var recordingToggleControl: RecordingToggleSwitch?
+    /// True when capture was paused via pause controls (not plain keyboard toggle off).
+    private var isPausedByUser = false
+    /// Pending task that resumes capture after a timed pause.
+    private var scheduledResumeTask: Task<Void, Never>?
+    /// Target wall clock time for timed resume (nil means paused indefinitely / no timed pause active).
+    private var scheduledResumeDate: Date?
+    private var conferenceConsentMenuState: ConferenceConsentMenuState?
+    private var faceBlurConsentWindowController: NSWindowController?
+
+    private enum RecordingStatusIconStyle {
+        case off
+        case recording
+        case paused
+    }
+
+    public var isPausedState: Bool {
+        !isRecording && isPausedByUser
+    }
+
+    public var timedPauseRemainingSeconds: Int? {
+        guard isPausedState, let scheduledResumeDate else { return nil }
+        return max(0, Int(ceil(scheduledResumeDate.timeIntervalSinceNow)))
+    }
+
+    public var ghostAppDebugSummary: String {
+        let hasButton = statusItem?.button != nil
+        let isVisible = statusItem?.isVisible ?? false
+        return "menuBarEnabled=\(isMenuBarIconEnabled) hasStatusItem=\(statusItem != nil) hasButton=\(hasButton) isVisible=\(isVisible)"
+    }
+
+    struct CaptureFeedbackEventDecision: Equatable {
+        let shouldAnimateImmediately: Bool
+        let shouldQueueReplay: Bool
+    }
+
+    enum CaptureFeedbackAnimationCompletion: Equatable {
+        case restoreCurrentIcon
+        case replayQueuedPulse
+    }
+
+    static func captureFeedbackEventDecision(
+        isRunning: Bool,
+        settingEnabled: Bool,
+        shouldHideRecordingIndicator: Bool,
+        isAnimationInFlight: Bool
+    ) -> CaptureFeedbackEventDecision {
+        guard settingEnabled, isRunning, !shouldHideRecordingIndicator else {
+            return CaptureFeedbackEventDecision(
+                shouldAnimateImmediately: false,
+                shouldQueueReplay: false
+            )
+        }
+
+        if isAnimationInFlight {
+            return CaptureFeedbackEventDecision(
+                shouldAnimateImmediately: false,
+                shouldQueueReplay: true
+            )
+        }
+
+        return CaptureFeedbackEventDecision(
+            shouldAnimateImmediately: true,
+            shouldQueueReplay: false
+        )
+    }
+
+    static func shouldReplayQueuedCapturePulse(
+        hasQueuedReplay: Bool,
+        isRunning: Bool,
+        settingEnabled: Bool,
+        shouldHideRecordingIndicator: Bool
+    ) -> Bool {
+        hasQueuedReplay && isRunning && settingEnabled && !shouldHideRecordingIndicator
+    }
+
+    static func captureFeedbackAnimationCompletion(
+        hasQueuedReplay: Bool,
+        isRunning: Bool,
+        settingEnabled: Bool,
+        shouldHideRecordingIndicator: Bool
+    ) -> CaptureFeedbackAnimationCompletion {
+        shouldReplayQueuedCapturePulse(
+            hasQueuedReplay: hasQueuedReplay,
+            isRunning: isRunning,
+            settingEnabled: settingEnabled,
+            shouldHideRecordingIndicator: shouldHideRecordingIndicator
+        ) ? .replayQueuedPulse : .restoreCurrentIcon
+    }
+
+    @MainActor
+    static func makeFaceBlurConsentPanel(contentRect: NSRect) -> KeyablePanel {
+        let panel = KeyablePanel(
+            contentRect: contentRect,
+            styleMask: [.borderless, .nonactivatingPanel, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        panel.isFloatingPanel = true
+        panel.level = .modalPanel
+        panel.animationBehavior = .utilityWindow
+        panel.titleVisibility = .hidden
+        panel.titlebarAppearsTransparent = true
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.ignoresMouseEvents = false
+        panel.acceptsMouseMovedEvents = true
+        panel.becomesKeyOnlyIfNeeded = false
+        panel.isMovableByWindowBackground = false
+        panel.hidesOnDeactivate = false
+        panel.isReleasedWhenClosed = false
+        panel.isExcludedFromWindowsMenu = true
+        panel.sharingType = .readOnly
+        panel.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary, .ignoresCycle]
+        panel.tabbingMode = .disallowed
+        return panel
+    }
 
     // MARK: - Initialization
 
@@ -49,13 +178,24 @@ public class MenuBarManager: ObservableObject {
 
     public func setup() {
         // Don't create status item if menu bar icon is disabled
-        guard isMenuBarIconEnabled else { return }
+        guard isMenuBarIconEnabled else {
+            Log.debug("[MenuBarLifecycle] setup skipped: menu bar icon disabled", category: .ui)
+            Log.info("[GhostAppCheck] MenuBarManager.setup skipped \(ghostAppDebugSummary)", category: .ui)
+            return
+        }
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        Log.debug("[MenuBarLifecycle] status item created", category: .ui)
+        Log.info("[GhostAppCheck] MenuBarManager.setup created status item \(ghostAppDebugSummary)", category: .ui)
 
         if statusItem?.button != nil {
             // Start with icon showing current recording state
-            updateIcon(recording: isRecording)
+            updateIconForCurrentState()
+            configureStatusButtonClicks()
+            setupStatusClickMonitors()
+        } else {
+            Log.error("[MenuBarLifecycle] status item button missing after creation", category: .ui)
+            Log.error("[GhostAppCheck] MenuBarManager.setup missing status item button \(ghostAppDebugSummary)", category: .ui)
         }
 
         // Load shortcuts then setup menu and hotkeys
@@ -63,6 +203,7 @@ public class MenuBarManager: ObservableObject {
             await loadShortcuts()
             setupMenu()
             setupTimelineNotifications()
+            configureWindowControllers()
 
             // Only setup global hotkeys if onboarding is past the permissions step (step 3)
             // This prevents HotkeyManager from calling AXIsProcessTrusted() before user grants permission
@@ -80,6 +221,9 @@ public class MenuBarManager: ObservableObject {
 
     /// Setup timer to auto-refresh recording status
     private func setupAutoRefresh() {
+        refreshTimer?.cancel()
+        refreshTimer = nil
+
         // Sync recording status every 2 seconds with leeway for power efficiency
         let timer = DispatchSource.makeTimerSource(queue: .main)
         timer.schedule(deadline: .now(), repeating: 2.0, leeway: .milliseconds(500))
@@ -91,6 +235,15 @@ public class MenuBarManager: ObservableObject {
 
         // Setup periodic diagnostics logging (every 5 minutes)
         setupDiagnosticsLogging()
+    }
+
+    private static func menuBarCaptureFeedbackEnabled(
+        defaults: UserDefaults = settingsStore
+    ) -> Bool {
+        guard defaults.object(forKey: menuBarCaptureFeedbackDefaultsKey) != nil else {
+            return SettingsDefaults.showMenuBarCaptureFeedback
+        }
+        return defaults.bool(forKey: menuBarCaptureFeedbackDefaultsKey)
     }
 
     /// Setup periodic logging of UI responsiveness diagnostics
@@ -130,16 +283,39 @@ public class MenuBarManager: ObservableObject {
         timelineShortcut = await onboardingManager.timelineShortcut
         dashboardShortcut = await onboardingManager.dashboardShortcut
         recordingShortcut = await onboardingManager.recordingShortcut
-        Log.info("[MenuBarManager] Loaded shortcuts - Timeline: \(timelineShortcut.displayString), Dashboard: \(dashboardShortcut.displayString), Recording: \(recordingShortcut.displayString)", category: .ui)
+        systemMonitorShortcut = await onboardingManager.systemMonitorShortcut
+        commentShortcut = await onboardingManager.commentShortcut
+        Log.info(
+            "[MenuBarManager] Loaded shortcuts - Timeline: \(timelineShortcut.displayString), Dashboard: \(dashboardShortcut.displayString), Recording: \(recordingShortcut.displayString), Monitor: \(systemMonitorShortcut.displayString), Comment: \(commentShortcut.displayString)",
+            category: .ui
+        )
+    }
+
+    @MainActor
+    private func reloadShortcutsMainActor() async {
+        await loadShortcuts()
+        setupGlobalHotkey()
+        setupMenu()
     }
 
     /// Reload shortcuts from storage and re-register hotkeys (called from Settings)
     public func reloadShortcuts() {
         Task { @MainActor in
-            await loadShortcuts()
-            setupGlobalHotkey()
-            setupMenu()
+            await reloadShortcutsMainActor()
         }
+    }
+
+    /// Reload shortcuts immediately on the main actor for flows that need the
+    /// hotkeys active before dismissing or advancing their UI.
+    @MainActor
+    public func reloadShortcutsNow() async {
+        await reloadShortcutsMainActor()
+    }
+
+    @MainActor
+    private func configureWindowControllers() {
+        TimelineWindowController.shared.configure(coordinator: coordinator)
+        StandaloneCommentComposerWindowController.shared.configure(coordinator: coordinator)
     }
 
     /// Setup notifications for timeline open/close
@@ -159,6 +335,72 @@ public class MenuBarManager: ObservableObject {
         ) { [weak self] _ in
             self?.restoreRecordingIndicator()
         }
+
+        NotificationCenter.default.addObserver(
+            forName: CaptureObservedNotification.didObserve,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            self?.handleCaptureObservedNotification(notification)
+        }
+
+        NotificationCenter.default.addObserver(
+            forName: ConferenceConsentStateNotification.didChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            self?.conferenceConsentMenuState = ConferenceConsentMenuState.from(
+                notificationUserInfo: notification.userInfo
+            )
+        }
+    }
+
+    private func handleCaptureObservedNotification(_ notification: Notification) {
+        guard statusItem?.button != nil else { return }
+
+        let status = coordinator.statusHolder.status
+        let isCaptureFeedbackActive = status.isRunning || isRecording
+        let decision = Self.captureFeedbackEventDecision(
+            isRunning: isCaptureFeedbackActive,
+            settingEnabled: Self.menuBarCaptureFeedbackEnabled(),
+            shouldHideRecordingIndicator: shouldHideRecordingIndicator,
+            isAnimationInFlight: iconAnimationTimer != nil
+        )
+
+        if decision.shouldQueueReplay {
+            hasPendingCapturePulse = true
+            if let trigger = notification.userInfo?["trigger"] as? String {
+                Log.debug("[MenuBarCaptureFeedback] Queued replay trigger=\(trigger)", category: .ui)
+            }
+            return
+        }
+
+        guard decision.shouldAnimateImmediately else { return }
+        if let trigger = notification.userInfo?["trigger"] as? String {
+            Log.debug("[MenuBarCaptureFeedback] Pulse trigger=\(trigger)", category: .ui)
+        }
+        animateCapturePulseWithCommonMode()
+    }
+
+    private func completeIconAnimation() {
+        iconAnimationTimer = nil
+        let completion = Self.captureFeedbackAnimationCompletion(
+            hasQueuedReplay: hasPendingCapturePulse,
+            isRunning: coordinator.statusHolder.status.isRunning || isRecording,
+            settingEnabled: Self.menuBarCaptureFeedbackEnabled(),
+            shouldHideRecordingIndicator: shouldHideRecordingIndicator
+        )
+        hasPendingCapturePulse = false
+
+        switch completion {
+        case .restoreCurrentIcon:
+            updateIconForCurrentState()
+        case .replayQueuedPulse:
+            Log.debug("[MenuBarCaptureFeedback] Replaying queued pulse", category: .ui)
+            DispatchQueue.main.async { [weak self] in
+                self?.animateCapturePulseWithCommonMode()
+            }
+        }
     }
 
     /// Setup global hotkeys for timeline and dashboard
@@ -171,7 +413,8 @@ public class MenuBarManager: ObservableObject {
         if !timelineShortcut.key.isEmpty {
             HotkeyManager.shared.registerHotkey(
                 key: timelineShortcut.key,
-                modifiers: timelineShortcut.modifiers.nsModifiers
+                modifiers: timelineShortcut.modifiers.nsModifiers,
+                allowsCarbonFallback: true
             ) { [weak self] in
                 self?.toggleTimelineOverlay()
             }
@@ -181,7 +424,8 @@ public class MenuBarManager: ObservableObject {
         if !dashboardShortcut.key.isEmpty {
             HotkeyManager.shared.registerHotkey(
                 key: dashboardShortcut.key,
-                modifiers: dashboardShortcut.modifiers.nsModifiers
+                modifiers: dashboardShortcut.modifiers.nsModifiers,
+                allowsCarbonFallback: true
             ) { [weak self] in
                 self?.toggleDashboard()
             }
@@ -197,9 +441,24 @@ public class MenuBarManager: ObservableObject {
             }
         }
 
-        // Also configure the timeline window controller
-        Task { @MainActor in
-            TimelineWindowController.shared.configure(coordinator: coordinator)
+        // Register system monitor global hotkey (skip if cleared)
+        if !systemMonitorShortcut.key.isEmpty {
+            HotkeyManager.shared.registerHotkey(
+                key: systemMonitorShortcut.key,
+                modifiers: systemMonitorShortcut.modifiers.nsModifiers
+            ) { [weak self] in
+                self?.toggleSystemMonitor()
+            }
+        }
+
+        // Register quick-comment global hotkey (skip if cleared)
+        if !commentShortcut.key.isEmpty {
+            HotkeyManager.shared.registerHotkey(
+                key: commentShortcut.key,
+                modifiers: commentShortcut.modifiers.nsModifiers
+            ) { [weak self] in
+                self?.openCommentComposerFromHotkey()
+            }
         }
     }
 
@@ -207,6 +466,43 @@ public class MenuBarManager: ObservableObject {
     private func toggleTimelineOverlay() {
         Task { @MainActor in
             TimelineWindowController.shared.toggle()
+        }
+    }
+
+    private func keyboardShortcutMetricIdentifier(for shortcut: ShortcutConfig) -> String {
+        var parts: [String] = []
+        let modifiers = shortcut.modifiers
+        if modifiers.contains(.control) { parts.append("ctrl") }
+        if modifiers.contains(.option) { parts.append("opt") }
+        if modifiers.contains(.shift) { parts.append("shift") }
+        if modifiers.contains(.command) { parts.append("cmd") }
+
+        let normalizedKey = shortcut.key.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        parts.append(normalizedKey == "space" ? "space" : normalizedKey)
+        return parts.joined(separator: "+")
+    }
+
+    /// Open the standalone quick-comment composer at the current moment.
+    private func openCommentComposerFromHotkey() {
+        Task { @MainActor in
+            let source = "global_hotkey_comment"
+            DashboardViewModel.recordKeyboardShortcut(
+                coordinator: coordinator,
+                shortcut: keyboardShortcutMetricIdentifier(for: commentShortcut)
+            )
+            let didHideTimeline = await TimelineWindowController.shared.hideAndWait(
+                restorePreviousFocus: false
+            )
+            guard didHideTimeline else {
+                Log.warning(
+                    "[QuickComment] Aborting hotkey open because timeline did not finish hiding",
+                    category: .ui
+                )
+                return
+            }
+            StandaloneCommentComposerWindowController.shared.openCommentComposerAtCurrentMoment(
+                source: source
+            )
         }
     }
 
@@ -219,8 +515,12 @@ public class MenuBarManager: ObservableObject {
     private func toggleRecording() {
         Task { @MainActor in
             do {
-                let currentlyRecording = await coordinator.getStatus().isRunning
+                let currentlyRecording = coordinator.statusHolder.status.isRunning
                 let shouldRecord = !currentlyRecording
+
+                // Keyboard shortcut remains a plain toggle and clears any timed pause intent.
+                clearScheduledResume()
+                isPausedByUser = false
 
                 // Update state and animate icon
                 isRecording = shouldRecord
@@ -229,6 +529,10 @@ public class MenuBarManager: ObservableObject {
                 if shouldRecord {
                     Log.debug("[MenuBar] Hotkey toggle ON - Starting pipeline...", category: .ui)
                     try await coordinator.startPipeline()
+                    DashboardViewModel.recordRecordingStartedFromMenu(
+                        coordinator: coordinator,
+                        source: "menu_hotkey"
+                    )
                 } else {
                     Log.debug("[MenuBar] Hotkey toggle OFF - Stopping pipeline...", category: .ui)
                     try await coordinator.stopPipeline()
@@ -236,7 +540,7 @@ public class MenuBarManager: ObservableObject {
             } catch {
                 Log.error("[MenuBar] Failed to toggle recording via hotkey: \(error)", category: .ui)
                 // Revert on error
-                let actualState = await coordinator.getStatus().isRunning
+                let actualState = coordinator.statusHolder.status.isRunning
                 isRecording = actualState
                 updateIcon(recording: actualState)
             }
@@ -246,22 +550,41 @@ public class MenuBarManager: ObservableObject {
     /// Hide recording indicator (called when timeline opens)
     private func hideRecordingIndicator() {
         shouldHideRecordingIndicator = true
+        hasPendingCapturePulse = false
         updateIcon(recording: false)
     }
 
     /// Restore recording indicator (called when timeline closes)
     private func restoreRecordingIndicator() {
         shouldHideRecordingIndicator = false
-        updateIcon(recording: isRecording)
+        updateIconForCurrentState()
+    }
+
+    private func currentIconStyle() -> RecordingStatusIconStyle {
+        if shouldHideRecordingIndicator {
+            return .off
+        }
+        if isRecording {
+            return .recording
+        }
+        return isPausedByUser ? .paused : .off
+    }
+
+    private func updateIconForCurrentState() {
+        updateIcon(style: currentIconStyle())
+    }
+
+    /// Update the menu bar icon to show recording status (no animation)
+    private func updateIcon(style: RecordingStatusIconStyle) {
+        guard let button = statusItem?.button else { return }
+        let image = createStatusIcon(style: style)
+        button.image = image
+        button.image?.isTemplate = true
     }
 
     /// Update the menu bar icon to show recording status (no animation)
     private func updateIcon(recording: Bool) {
-        guard let button = statusItem?.button else { return }
-
-        let image = createStatusIcon(filled: recording)
-        button.image = image
-        button.image?.isTemplate = true
+        updateIcon(style: recording ? .recording : .off)
     }
 
     /// Animate the menu bar icon with a "press" effect when recording state changes
@@ -269,6 +592,7 @@ public class MenuBarManager: ObservableObject {
     private func animateIconFill(toRecording: Bool) {
         // Cancel any existing animation
         iconAnimationTimer?.invalidate()
+        iconAnimationTimer = nil
 
         let frameRate: TimeInterval = 1.0 / 60.0
         let pressDuration: TimeInterval = 0.10   // Press down (100ms)
@@ -297,7 +621,7 @@ public class MenuBarManager: ObservableObject {
                 let scale = 1.0 - ((1.0 - minScale) * easedProgress)
 
                 if let button = self.statusItem?.button {
-                    let image = self.createStatusIcon(filled: startFilled, scale: scale)
+                    let image = self.createStatusIcon(style: startFilled ? .recording : .off, scale: scale)
                     button.image = image
                     button.image?.isTemplate = true
                 }
@@ -315,7 +639,7 @@ public class MenuBarManager: ObservableObject {
                 let scale = minScale + ((1.0 - minScale) * easedProgress)
 
                 if let button = self.statusItem?.button {
-                    let image = self.createStatusIcon(filled: toRecording, scale: scale)
+                    let image = self.createStatusIcon(style: toRecording ? .recording : .off, scale: scale)
                     button.image = image
                     button.image?.isTemplate = true
                 }
@@ -324,15 +648,88 @@ public class MenuBarManager: ObservableObject {
                     timer.invalidate()
                     // Ensure final state is correct
                     self.iconFillProgress = toRecording ? 1.0 : 0.0
+                    self.completeIconAnimation()
                 }
             }
         }
     }
 
+    private func animateCapturePulseWithCommonMode() {
+        guard statusItem?.button != nil else { return }
+        guard iconAnimationTimer == nil else { return }
+
+        let frameRate: TimeInterval = 1.0 / 60.0
+        let contractDuration: TimeInterval = 0.14
+        let releaseDuration: TimeInterval = 0.28
+        let contractFrames = max(1, Int(contractDuration / frameRate))
+        let releaseFrames = max(1, Int(releaseDuration / frameRate))
+        let minimumVerticalScale: CGFloat = 0.22
+        var currentFrame = 0
+        var phase = 0
+
+        let timer = Timer(timeInterval: frameRate, repeats: true) { [weak self] timer in
+            guard let self else {
+                timer.invalidate()
+                return
+            }
+
+            currentFrame += 1
+            let verticalScale: CGFloat
+
+            if phase == 0 {
+                let progress = CGFloat(currentFrame) / CGFloat(contractFrames)
+                let easedProgress = progress * progress
+                verticalScale = 1.0 - ((1.0 - minimumVerticalScale) * easedProgress)
+            } else {
+                let progress = CGFloat(currentFrame) / CGFloat(releaseFrames)
+                let easedProgress = 1.0 - pow(1.0 - progress, 3)
+                verticalScale = minimumVerticalScale + ((1.0 - minimumVerticalScale) * easedProgress)
+            }
+
+            if let button = self.statusItem?.button {
+                let image = self.createStatusIcon(
+                    style: .recording,
+                    horizontalScale: 1.0,
+                    verticalScale: verticalScale
+                )
+                button.image = image
+                button.image?.isTemplate = true
+            }
+
+            let didFinishPhase = (phase == 0 && currentFrame >= contractFrames)
+                || (phase == 1 && currentFrame >= releaseFrames)
+            guard didFinishPhase else { return }
+
+            if phase == 0 {
+                phase = 1
+                currentFrame = 0
+                return
+            }
+
+            timer.invalidate()
+            self.completeIconAnimation()
+        }
+
+        RunLoop.main.add(timer, forMode: .common)
+        iconAnimationTimer = timer
+    }
+
     /// Create a custom status icon with two triangles (Retrace logo)
-    /// Left triangle: Points left, filled or outlined based on state, with optional scale
+    /// Left triangle: Points left, supports recording/off/paused visual states, with optional scale
     /// Right triangle: Points right, always outlined
-    private func createStatusIcon(filled: Bool, scale: CGFloat = 1.0) -> NSImage {
+    private func createStatusIcon(style: RecordingStatusIconStyle, scale: CGFloat = 1.0) -> NSImage {
+        createStatusIcon(
+            style: style,
+            horizontalScale: scale,
+            verticalScale: scale
+        )
+    }
+
+    private func createStatusIcon(
+        style: RecordingStatusIconStyle,
+        horizontalScale: CGFloat,
+        verticalScale: CGFloat
+    ) -> NSImage {
         let size = NSSize(width: 22, height: 16)
         let image = NSImage(size: size)
 
@@ -345,8 +742,8 @@ public class MenuBarManager: ObservableObject {
         let gap: CGFloat = 3.0 // Gap between triangles
 
         // Apply scale to left triangle dimensions
-        let triangleHeight = baseTriangleHeight * scale
-        let triangleWidth = baseTriangleWidth * scale
+        let triangleHeight = baseTriangleHeight * max(0.0, verticalScale)
+        let triangleWidth = baseTriangleWidth * max(0.0, horizontalScale)
 
         // Left triangle - Points left ◁ (recording indicator)
         // Center the scaled triangle at the same position
@@ -360,12 +757,13 @@ public class MenuBarManager: ObservableObject {
         leftTriangle.line(to: NSPoint(x: leftBase, y: verticalCenter + triangleHeight / 2))
         leftTriangle.close()
 
-        if filled {
+        switch style {
+        case .recording:
             // Filled when recording (no border)
             NSColor.white.setFill()
             leftTriangle.fill()
-        } else {
-            // Outlined when not recording
+        case .paused, .off:
+            // Outlined when paused or fully off.
             NSColor.white.setStroke()
             leftTriangle.lineWidth = 1.2
             leftTriangle.stroke()
@@ -393,16 +791,37 @@ public class MenuBarManager: ObservableObject {
         let containerWidth: CGFloat = 235
         let containerView = NSView(frame: NSRect(x: 0, y: 0, width: containerWidth, height: 30))
 
+        // Icon
+        let iconSize: CGFloat = 16
+        let iconView = NSImageView(frame: NSRect(x: 17, y: 7, width: iconSize, height: iconSize))
+        if let iconImage = NSImage(systemSymbolName: "record.circle", accessibilityDescription: nil) {
+            let config = NSImage.SymbolConfiguration(pointSize: 13, weight: .regular)
+            iconView.image = iconImage.withSymbolConfiguration(config)
+            iconView.contentTintColor = .secondaryLabelColor
+        }
+        containerView.addSubview(iconView)
+
         // Label
         let label = NSTextField(labelWithString: "Recording")
-        label.frame = NSRect(x: 14, y: 5, width: 100, height: 20)
+        label.frame = NSRect(x: 40, y: 5, width: 70, height: 20)
         label.font = NSFont.systemFont(ofSize: 13)
         label.textColor = .labelColor
         containerView.addSubview(label)
 
+        // Keyboard shortcut hint
+        if !recordingShortcut.key.isEmpty {
+            let shortcutLabel = NSTextField(labelWithString: recordingShortcut.displayString)
+            shortcutLabel.font = NSFont.systemFont(ofSize: 13)
+            shortcutLabel.textColor = .tertiaryLabelColor
+            shortcutLabel.sizeToFit()
+            let shortcutX = 40 + 70 + 2  // After the "Recording" label
+            shortcutLabel.frame = NSRect(x: CGFloat(shortcutX), y: 5, width: shortcutLabel.frame.width, height: shortcutLabel.frame.height + 3)
+            containerView.addSubview(shortcutLabel)
+        }
+
         // Custom toggle switch view - positioned on the far right
         let toggleWidth: CGFloat = 40
-        let rightPadding: CGFloat = 8
+        let rightPadding: CGFloat = 2
         let toggleView = RecordingToggleSwitch(
             frame: NSRect(x: containerWidth - toggleWidth - rightPadding, y: 5, width: toggleWidth, height: 20),
             isOn: isRecording,
@@ -412,7 +831,28 @@ public class MenuBarManager: ObservableObject {
         toggleView.action = #selector(recordingToggleChanged(_:))
         containerView.addSubview(toggleView)
 
+        recordingToggleContainerView = containerView
+        recordingToggleControl = toggleView
+
         return containerView
+    }
+
+    /// Expands the custom recording row to match menu width and pins the toggle to the trailing edge.
+    private func alignRecordingToggleToTrailingEdge(in menu: NSMenu) {
+        guard let container = recordingToggleContainerView,
+              let toggle = recordingToggleControl else { return }
+
+        let targetWidth = max(container.frame.width, menu.size.width - 8)
+        guard targetWidth > 0 else { return }
+
+        var containerFrame = container.frame
+        containerFrame.size.width = targetWidth
+        container.frame = containerFrame
+
+        var toggleFrame = toggle.frame
+        let trailingPadding: CGFloat = 2
+        toggleFrame.origin.x = targetWidth - toggleFrame.width - trailingPadding
+        toggle.frame = toggleFrame
     }
 
     /// Handle recording toggle switch change
@@ -420,9 +860,13 @@ public class MenuBarManager: ObservableObject {
         guard let toggle = sender as? RecordingToggleSwitch else { return }
         let shouldRecord = toggle.state == .on
 
+        clearScheduledResume()
+        isPausedByUser = false
+
         // Update state and animate icon (using common run loop mode to work while menu is open)
         isRecording = shouldRecord
         animateIconFillWithCommonMode(toRecording: shouldRecord)
+        refreshOpenRecordingControlsIfNeeded()
 
         // Then perform the actual operation in the background
         Task { @MainActor in
@@ -430,6 +874,10 @@ public class MenuBarManager: ObservableObject {
                 if shouldRecord {
                     Log.debug("[MenuBar] Toggle ON - Starting pipeline...", category: .ui)
                     try await coordinator.startPipeline()
+                    DashboardViewModel.recordRecordingStartedFromMenu(
+                        coordinator: coordinator,
+                        source: "menu_toggle"
+                    )
                 } else {
                     Log.debug("[MenuBar] Toggle OFF - Stopping pipeline...", category: .ui)
                     try await coordinator.stopPipeline()
@@ -437,10 +885,11 @@ public class MenuBarManager: ObservableObject {
             } catch {
                 Log.error("[MenuBar] Failed to toggle recording: \(error)", category: .ui)
                 // Revert on error
-                let actualState = await coordinator.getStatus().isRunning
+                let actualState = coordinator.statusHolder.status.isRunning
                 toggle.isOn = actualState
                 isRecording = actualState
                 updateIcon(recording: actualState)
+                refreshOpenRecordingControlsIfNeeded()
             }
         }
     }
@@ -448,6 +897,7 @@ public class MenuBarManager: ObservableObject {
     /// Animate icon using common run loop mode (works while menu is open)
     private func animateIconFillWithCommonMode(toRecording: Bool) {
         iconAnimationTimer?.invalidate()
+        iconAnimationTimer = nil
 
         let frameRate: TimeInterval = 1.0 / 60.0
         let pressDuration: TimeInterval = 0.10   // Press down (100ms)
@@ -477,7 +927,7 @@ public class MenuBarManager: ObservableObject {
                 let scale = 1.0 - ((1.0 - minScale) * easedProgress)
 
                 if let button = self.statusItem?.button {
-                    let image = self.createStatusIcon(filled: startFilled, scale: scale)
+                    let image = self.createStatusIcon(style: startFilled ? .recording : .off, scale: scale)
                     button.image = image
                     button.image?.isTemplate = true
                 }
@@ -494,7 +944,7 @@ public class MenuBarManager: ObservableObject {
                 let scale = minScale + ((1.0 - minScale) * easedProgress)
 
                 if let button = self.statusItem?.button {
-                    let image = self.createStatusIcon(filled: toRecording, scale: scale)
+                    let image = self.createStatusIcon(style: toRecording ? .recording : .off, scale: scale)
                     button.image = image
                     button.image?.isTemplate = true
                 }
@@ -502,6 +952,7 @@ public class MenuBarManager: ObservableObject {
                 if currentFrame >= releaseFrames {
                     timer.invalidate()
                     self.iconFillProgress = toRecording ? 1.0 : 0.0
+                    self.completeIconAnimation()
                 }
             }
         }
@@ -511,54 +962,312 @@ public class MenuBarManager: ObservableObject {
         iconAnimationTimer = timer
     }
 
+    public func pauseRecording(for duration: TimeInterval?, source: String = "pause_menu") async {
+        clearScheduledResume()
+        let wasRecording = coordinator.statusHolder.status.isRunning
+        let isTimedPause = (duration ?? 0) > 0
+        if wasRecording {
+            // Timed pauses are treated as paused state; "Turn Off" is normal off state.
+            isPausedByUser = isTimedPause
+        }
+
+        do {
+            if wasRecording {
+                Log.debug("[MenuBar] Pausing capture pipeline...", category: .ui)
+                // Timed pause should come back ON after app relaunch; explicit "Turn Off" should persist OFF.
+                try await coordinator.stopPipeline(persistState: !isTimedPause)
+
+                if isTimedPause, let duration {
+                    await MainActor.run {
+                        DashboardViewModel.recordRecordingPauseSelected(
+                            coordinator: coordinator,
+                            source: source,
+                            durationSeconds: Int(duration)
+                        )
+                    }
+                } else {
+                    await MainActor.run {
+                        DashboardViewModel.recordRecordingTurnedOff(
+                            coordinator: coordinator,
+                            source: source
+                        )
+                    }
+                }
+            }
+
+            if wasRecording, isTimedPause, let duration {
+                scheduleTimedResume(after: duration)
+            }
+        } catch {
+            Log.error("[MenuBar] Failed to pause recording: \(error)", category: .ui)
+        }
+
+        syncWithCoordinator()
+        updateIconForCurrentState()
+    }
+
+    public func startRecordingNow(source: String = "status_menu_start") async {
+        clearScheduledResume()
+        isPausedByUser = false
+        do {
+            try await coordinator.startPipeline()
+            await MainActor.run {
+                DashboardViewModel.recordRecordingStartedFromMenu(
+                    coordinator: coordinator,
+                    source: source
+                )
+            }
+        } catch {
+            Log.error("[MenuBar] Failed to start recording: \(error)", category: .ui)
+        }
+        syncWithCoordinator()
+    }
+
+    private func clearScheduledResume(refreshMenu: Bool = true) {
+        scheduledResumeTask?.cancel()
+        scheduledResumeTask = nil
+
+        if scheduledResumeDate != nil {
+            scheduledResumeDate = nil
+            if refreshMenu {
+                setupMenu()
+            }
+        }
+    }
+
+    public func cancelScheduledResume() {
+        clearScheduledResume()
+    }
+
+    private func scheduleTimedResume(after duration: TimeInterval) {
+        guard duration > 0 else { return }
+
+        let targetDate = Date().addingTimeInterval(duration)
+        scheduledResumeDate = targetDate
+        setupMenu()
+
+        scheduledResumeTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: .seconds(duration), clock: .continuous)
+            } catch {
+                return
+            }
+
+            guard let self else { return }
+            guard self.scheduledResumeDate == targetDate else { return }
+
+            self.scheduledResumeDate = nil
+            self.scheduledResumeTask = nil
+
+            do {
+                Log.info("[MenuBar] Timed pause ended - resuming capture", category: .ui)
+                try await self.coordinator.startPipeline()
+                DashboardViewModel.recordRecordingAutoResumed(
+                    coordinator: self.coordinator,
+                    source: "timed_pause",
+                    pausedDurationSeconds: Int(duration)
+                )
+            } catch {
+                Log.error("[MenuBar] Failed to auto-resume after timed pause: \(error)", category: .ui)
+            }
+
+            self.syncWithCoordinator()
+            self.setupMenu()
+        }
+    }
+
+    private func autoResumeSubtitle() -> String? {
+        guard let remainingSeconds = timedPauseRemainingSeconds else { return nil }
+        let hours = remainingSeconds / 3600
+        let minutes = (remainingSeconds % 3600) / 60
+        let seconds = remainingSeconds % 60
+
+        if hours > 0 {
+            return String(format: "Resumes in %d:%02d:%02d", hours, minutes, seconds)
+        }
+        return String(format: "Resumes in %02d:%02d", minutes, seconds)
+    }
+
+    private func makeRecordingControlItems() -> [NSMenuItem] {
+        autoResumeStatusItem = nil
+
+        let recordingToggleItem = NSMenuItem()
+        recordingToggleItem.view = createRecordingToggleView()
+        var items: [NSMenuItem] = [recordingToggleItem]
+
+        if isRecording {
+            let pauseFor5Item = NSMenuItem(title: "Pause for 5 Minutes", action: #selector(pauseFor5Minutes), keyEquivalent: "")
+            pauseFor5Item.image = NSImage(systemSymbolName: "timer", accessibilityDescription: nil)
+            pauseFor5Item.target = self
+            items.append(pauseFor5Item)
+
+            let pauseFor30Item = NSMenuItem(title: "Pause for 30 Minutes", action: #selector(pauseFor30Minutes), keyEquivalent: "")
+            pauseFor30Item.image = NSImage(systemSymbolName: "timer", accessibilityDescription: nil)
+            pauseFor30Item.target = self
+            items.append(pauseFor30Item)
+
+            let pauseFor60Item = NSMenuItem(title: "Pause for 60 Minutes", action: #selector(pauseFor60Minutes), keyEquivalent: "")
+            pauseFor60Item.image = NSImage(systemSymbolName: "timer", accessibilityDescription: nil)
+            pauseFor60Item.target = self
+            items.append(pauseFor60Item)
+        } else if let subtitle = autoResumeSubtitle() {
+            let resumeStatusItem = NSMenuItem(title: subtitle, action: nil, keyEquivalent: "")
+            resumeStatusItem.isEnabled = false
+            resumeStatusItem.image = NSImage(systemSymbolName: "timer", accessibilityDescription: nil)
+            autoResumeStatusItem = resumeStatusItem
+            items.append(resumeStatusItem)
+        }
+
+        return items
+    }
+
+    private func addRecordingControls(to menu: NSMenu) {
+        for item in makeRecordingControlItems() {
+            menu.addItem(item)
+        }
+    }
+
+    private func visibleConferenceConsentState() -> ConferenceConsentMenuState? {
+        guard let state = conferenceConsentMenuState,
+              state.isVisible() else { return nil }
+        return state
+    }
+
+    private func activeConferenceConsentState() -> ConferenceConsentMenuState? {
+        guard let state = visibleConferenceConsentState() else { return nil }
+        guard state.canDisableFaceBlur else { return nil }
+        return state
+    }
+
+    static func conferenceConsentMenuItemTitle(
+        for state: ConferenceConsentMenuState,
+        truncatedTitleLimit: Int = 30
+    ) -> String {
+        guard state.isBlurBypassedForConsent else {
+            return state.canDisableFaceBlur ? "Disable Face Blurring This Call" : "Face Blurring Enabled"
+        }
+
+        let trimmedTitle = state.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedTitle.isEmpty else {
+            return "Blurring is disabled for this call"
+        }
+
+        let truncatedTitle = truncatedConferenceConsentCallTitle(
+            trimmedTitle,
+            limit: truncatedTitleLimit
+        )
+        return "Blurring is disabled for '\(truncatedTitle)'"
+    }
+
+    static func truncatedConferenceConsentCallTitle(
+        _ title: String,
+        limit: Int
+    ) -> String {
+        guard limit > 1, title.count > limit else {
+            return title
+        }
+
+        return String(title.prefix(max(1, limit - 1))) + "…"
+    }
+
+    /// Refresh only the recording-controls section while status menu is open.
+    /// This keeps the menu visible and updates pause rows immediately after toggle changes.
+    private func refreshOpenRecordingControlsIfNeeded() {
+        guard let menu = statusItem?.menu else { return }
+
+        let separatorIndices = menu.items.enumerated().compactMap { idx, item in
+            item.isSeparatorItem ? idx : nil
+        }
+        guard separatorIndices.count >= 2 else { return }
+
+        let firstSeparator = separatorIndices[0]
+        let secondSeparator = separatorIndices[1]
+        let insertionIndex = firstSeparator + 1
+
+        if secondSeparator > insertionIndex {
+            for _ in insertionIndex..<secondSeparator {
+                menu.removeItem(at: insertionIndex)
+            }
+        }
+
+        let refreshedItems = makeRecordingControlItems()
+        for (offset, item) in refreshedItems.enumerated() {
+            menu.insertItem(item, at: insertionIndex + offset)
+        }
+
+        alignRecordingToggleToTrailingEdge(in: menu)
+
+        if autoResumeStatusItem != nil {
+            startAutoResumeCountdownUpdates()
+        } else {
+            stopAutoResumeCountdownUpdates()
+        }
+    }
+
     private func setupMenu() {
         let menu = NSMenu()
-
-        // Status
-        let statusMenuItem = NSMenuItem(
-            title: isRecording ? "Recording..." : "Paused",
-            action: nil,
-            keyEquivalent: ""
+        let visibleDashboardContent = LaunchMenuRouting.visibleDashboardContent()
+        let primaryActions = Self.primaryActions(
+            isDashboardFrontAndCenter: visibleDashboardContent == .dashboard,
+            isSystemMonitorFrontAndCenter: visibleDashboardContent == .monitor
         )
-        statusMenuItem.isEnabled = false
-        menu.addItem(statusMenuItem)
-
-        menu.addItem(NSMenuItem.separator())
 
         // Open Timeline
         let timelineItem = NSMenuItem(
-            title: "Open Timeline",
+            title: primaryActions.timeline.title,
             action: #selector(openTimeline),
             keyEquivalent: timelineShortcut.menuKeyEquivalent
         )
         timelineItem.keyEquivalentModifierMask = timelineShortcut.modifiers.nsModifiers
+        timelineItem.image = NSImage(systemSymbolName: primaryActions.timeline.imageSystemName, accessibilityDescription: nil)
         menu.addItem(timelineItem)
+
+        // Search Screen History
+        let searchItem = NSMenuItem(
+            title: primaryActions.search.title,
+            action: #selector(openSearch),
+            keyEquivalent: ""
+        )
+        searchItem.image = NSImage(systemSymbolName: primaryActions.search.imageSystemName, accessibilityDescription: nil)
+        menu.addItem(searchItem)
 
         // Open Dashboard
         let dashboardItem = NSMenuItem(
-            title: "Dashboard",
-            action: #selector(openDashboard),
+            title: primaryActions.dashboard.title,
+            action: visibleDashboardContent == .dashboard ? #selector(hideDashboardFromMenu) : #selector(openDashboard),
             keyEquivalent: dashboardShortcut.menuKeyEquivalent
         )
         dashboardItem.keyEquivalentModifierMask = dashboardShortcut.modifiers.nsModifiers
+        dashboardItem.image = NSImage(systemSymbolName: primaryActions.dashboard.imageSystemName, accessibilityDescription: nil)
         menu.addItem(dashboardItem)
 
         // System Monitor
         let monitorItem = NSMenuItem(
-            title: "System Monitor",
-            action: #selector(openSystemMonitor),
-            keyEquivalent: ""
+            title: primaryActions.monitor.title,
+            action: visibleDashboardContent == .monitor ? #selector(hideSystemMonitorFromMenu) : #selector(openSystemMonitor),
+            keyEquivalent: systemMonitorShortcut.key.isEmpty ? "" : systemMonitorShortcut.menuKeyEquivalent
         )
-        monitorItem.image = NSImage(systemSymbolName: "waveform.path.ecg", accessibilityDescription: nil)
+        if !systemMonitorShortcut.key.isEmpty {
+            monitorItem.keyEquivalentModifierMask = systemMonitorShortcut.modifiers.nsModifiers
+        }
+        monitorItem.image = NSImage(systemSymbolName: primaryActions.monitor.imageSystemName, accessibilityDescription: nil)
         menu.addItem(monitorItem)
 
         menu.addItem(NSMenuItem.separator())
 
-        // Recording toggle with switch
-        let recordingItem = NSMenuItem()
-        let recordingView = createRecordingToggleView()
-        recordingItem.view = recordingView
-        menu.addItem(recordingItem)
+        // Recording controls
+        addRecordingControls(to: menu)
+
+        if let conferenceConsentState = visibleConferenceConsentState() {
+            let consentItem = NSMenuItem(
+                title: Self.conferenceConsentMenuItemTitle(for: conferenceConsentState),
+                action: conferenceConsentState.canDisableFaceBlur ? #selector(disableFaceBlurThisCall) : nil,
+                keyEquivalent: ""
+            )
+            consentItem.image = NSImage(systemSymbolName: "person.crop.circle.badge.checkmark", accessibilityDescription: nil)
+            consentItem.isEnabled = conferenceConsentState.canDisableFaceBlur
+            menu.addItem(consentItem)
+        }
 
         menu.addItem(NSMenuItem.separator())
 
@@ -569,15 +1278,59 @@ public class MenuBarManager: ObservableObject {
             keyEquivalent: ","
         )
         settingsItem.keyEquivalentModifierMask = .command
+        settingsItem.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: nil)
         menu.addItem(settingsItem)
 
-        // Report an Issue / Get Help
+        // Check for updates
+        let checkForUpdatesItem = NSMenuItem(
+            title: UpdaterManager.shared.isCheckingForUpdates ? "Checking..." : "Check for Updates...",
+            action: #selector(checkForUpdatesFromMenu),
+            keyEquivalent: ""
+        )
+        checkForUpdatesItem.image = NSImage(systemSymbolName: "arrow.down.circle", accessibilityDescription: nil)
+        checkForUpdatesItem.isEnabled = !UpdaterManager.shared.isCheckingForUpdates && UpdaterManager.shared.canCheckForUpdates
+        menu.addItem(checkForUpdatesItem)
+
+        // Changelog
+        let changelogItem = NSMenuItem(
+            title: "Changelog",
+            action: #selector(openChangelog),
+            keyEquivalent: ""
+        )
+        changelogItem.image = NSImage(systemSymbolName: "text.book.closed", accessibilityDescription: nil)
+        menu.addItem(changelogItem)
+
+        // Get Help
         let feedbackItem = NSMenuItem(
-            title: "Report an Issue...",
+            title: "Get Help...",
             action: #selector(openFeedback),
             keyEquivalent: ""
         )
+        feedbackItem.image = NSImage(systemSymbolName: "exclamationmark.bubble", accessibilityDescription: nil)
         menu.addItem(feedbackItem)
+
+        menu.addItem(NSMenuItem.separator())
+
+        // Version — clickable to open commit on GitHub (if available)
+        let versionItem = NSMenuItem(
+            title: "Retrace \(BuildInfo.displayVersion)",
+            action: BuildInfo.commitURL != nil ? #selector(openCommitURL) : nil,
+            keyEquivalent: ""
+        )
+        versionItem.isEnabled = BuildInfo.commitURL != nil
+        menu.addItem(versionItem)
+
+        // Branch on its own line for dev builds (keeps menu width reasonable)
+        if let branch = BuildInfo.displayBranch {
+            let branchItem = NSMenuItem()
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 11),
+                .foregroundColor: NSColor.secondaryLabelColor
+            ]
+            branchItem.attributedTitle = NSAttributedString(string: "  \(branch)", attributes: attrs)
+            branchItem.isEnabled = false
+            menu.addItem(branchItem)
+        }
 
         menu.addItem(NSMenuItem.separator())
 
@@ -595,7 +1348,175 @@ public class MenuBarManager: ObservableObject {
             item.target = self
         }
 
-        statusItem?.menu = menu
+        statusMenu = menu
+    }
+
+    /// Ensure both left-click and right-click open the status menu.
+    private func configureStatusButtonClicks() {
+        guard let button = statusItem?.button else {
+            Log.error("[MenuBarLifecycle] cannot configure clicks: status button missing", category: .ui)
+            return
+        }
+        button.target = self
+        button.action = #selector(handleStatusButtonClick(_:))
+        button.sendAction(on: [.leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp, .otherMouseDown, .otherMouseUp])
+        Log.debug("[MenuBarLifecycle] click handlers configured for left/right/other mouse down+up", category: .ui)
+    }
+
+    /// Adds a local monitor so right-click is still detected if NSStatusBarButton action dispatch misses it.
+    private func setupStatusClickMonitors() {
+        teardownStatusClickMonitors()
+
+        localStatusClickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.rightMouseDown, .rightMouseUp, .otherMouseDown, .otherMouseUp]) { [weak self] event in
+            self?.handleMonitoredStatusClick(event)
+            return event
+        }
+
+        Log.debug("[MenuBarLifecycle] installed local secondary-click monitor", category: .ui)
+    }
+
+    private func teardownStatusClickMonitors() {
+        if let localStatusClickMonitor {
+            NSEvent.removeMonitor(localStatusClickMonitor)
+            self.localStatusClickMonitor = nil
+        }
+    }
+
+    /// Handle right/secondary click events from local monitor and open status menu if click lands on the menu bar button.
+    private func handleMonitoredStatusClick(_ event: NSEvent) {
+        guard Self.shouldOpenStatusMenu(for: event.type) else { return }
+        guard let button = statusItem?.button else { return }
+        guard isEventOnStatusButton(event, button: button) else { return }
+        guard shouldOpenMenu(forEventTimestamp: event.timestamp) else { return }
+
+        Log.debug(
+            "[MenuBarLifecycle] local monitor captured secondary click type=\(String(describing: event.type)) button=\(event.buttonNumber) ts=\(event.timestamp)",
+            category: .ui
+        )
+
+        DispatchQueue.main.async { [weak self, weak button] in
+            guard let self, let button else { return }
+            self.showStatusMenu(from: button)
+        }
+    }
+
+    /// Converts a local event location and checks whether it intersects the status bar button.
+    private func isEventOnStatusButton(_ event: NSEvent, button: NSStatusBarButton) -> Bool {
+        guard let window = button.window else { return false }
+
+        let pointInWindow: NSPoint
+        if event.window === window {
+            pointInWindow = event.locationInWindow
+        } else {
+            pointInWindow = window.convertPoint(fromScreen: event.locationInWindow)
+        }
+
+        let pointInButton = button.convert(pointInWindow, from: nil)
+        return button.bounds.contains(pointInButton)
+    }
+
+    /// De-duplicates down/up or monitor/action double-fires.
+    private func shouldOpenMenu(forEventTimestamp eventTimestamp: TimeInterval?) -> Bool {
+        guard let eventTimestamp else { return true }
+
+        let delta = eventTimestamp - lastStatusMenuOpenEventTimestamp
+        if delta >= 0, delta < 0.20 {
+            Log.debug("[MenuBarLifecycle] duplicate click event ignored delta=\(String(format: "%.4f", delta))s", category: .ui)
+            return false
+        }
+
+        lastStatusMenuOpenEventTimestamp = eventTimestamp
+        return true
+    }
+
+    /// Determines whether the current event should trigger opening the menu.
+    static func shouldOpenStatusMenu(for eventType: NSEvent.EventType?) -> Bool {
+        switch eventType {
+        case .leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp, .otherMouseDown, .otherMouseUp:
+            return true
+        case nil:
+            // Fallback to open menu when currentEvent is unavailable.
+            return true
+        default:
+            return false
+        }
+    }
+
+    @objc private func handleStatusButtonClick(_ sender: NSStatusBarButton) {
+        let event = NSApp.currentEvent
+        let eventType = String(describing: event?.type)
+        let buttonNumber = event.map { String($0.buttonNumber) } ?? "nil"
+        let clickCount = event.map { String($0.clickCount) } ?? "nil"
+        let eventTimestamp = event?.timestamp
+        let isControlClick = event?.modifierFlags.contains(.control) == true
+
+        Log.debug(
+            "[MenuBarLifecycle] status button click received type=\(eventType) button=\(buttonNumber) clicks=\(clickCount) controlClick=\(isControlClick) ts=\(eventTimestamp.map { String($0) } ?? "nil")",
+            category: .ui
+        )
+
+        guard Self.shouldOpenStatusMenu(for: event?.type) else {
+            Log.debug("[MenuBarLifecycle] click ignored by event gate", category: .ui)
+            return
+        }
+
+        guard shouldOpenMenu(forEventTimestamp: eventTimestamp) else { return }
+
+        showStatusMenu(from: sender)
+    }
+
+    private func showStatusMenu(from button: NSStatusBarButton) {
+        setupMenu()
+        guard let menu = statusMenu, let statusItem else {
+            Log.error("[MenuBarLifecycle] popup aborted: status menu is nil", category: .ui)
+            return
+        }
+        alignRecordingToggleToTrailingEdge(in: menu)
+        startAutoResumeCountdownUpdates()
+
+        Log.debug(
+            "[MenuBarLifecycle] opening status menu items=\(menu.items.count) via status-item attachment",
+            category: .ui
+        )
+
+        // Present as a real status-item menu so it stays visually attached to the menu bar.
+        statusItem.menu = menu
+        button.performClick(nil)
+        statusItem.menu = nil
+        stopAutoResumeCountdownUpdates()
+
+        Log.debug("[MenuBarLifecycle] status menu closed", category: .ui)
+    }
+
+    private func startAutoResumeCountdownUpdates() {
+        autoResumeCountdownTimer?.invalidate()
+        autoResumeCountdownTimer = nil
+        guard autoResumeStatusItem != nil else { return }
+
+        autoResumeCountdownTimer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+            guard let self else { return }
+
+            guard let item = self.autoResumeStatusItem else {
+                self.stopAutoResumeCountdownUpdates()
+                return
+            }
+
+            if let subtitle = self.autoResumeSubtitle() {
+                item.title = subtitle
+            } else {
+                self.stopAutoResumeCountdownUpdates()
+            }
+        }
+
+        if let timer = autoResumeCountdownTimer {
+            RunLoop.main.add(timer, forMode: .common)
+        }
+    }
+
+    private func stopAutoResumeCountdownUpdates() {
+        autoResumeCountdownTimer?.invalidate()
+        autoResumeCountdownTimer = nil
+        autoResumeStatusItem = nil
     }
 
     // MARK: - Actions
@@ -605,20 +1526,251 @@ public class MenuBarManager: ObservableObject {
         toggleTimelineOverlay()
     }
 
-    @objc private func openSearch() {
-        // Open timeline with search focused
-        Task { @MainActor in
-            TimelineWindowController.shared.show()
+    @objc private func disableFaceBlurThisCall() {
+        guard let state = activeConferenceConsentState(), let consentSessionID = state.consentSessionID else {
+            Log.warning("[FaceBlurConsentUI] Menu action invoked without an active conference consent state", category: .ui)
+            return
         }
-        // The search panel will auto-show when timeline opens
+
+        Log.info(
+            "[FaceBlurConsentUI] Presenting consent dialog",
+            category: .ui
+        )
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            UIMetricsRecorder.recordDictionary(
+                coordinator: coordinator, type: .conferencePrivacy,
+                payload: ["action": "consent_dialog", "outcome": "opened", "source": "menu_bar"]
+            )
+            presentFaceBlurConsentDialog(callTitle: state.title) { [weak self] didConfirm in
+                Log.info(
+                    "[FaceBlurConsentUI] Consent dialog decision confirmed=\(didConfirm)",
+                    category: .ui
+                )
+                guard let self else { return }
+                UIMetricsRecorder.recordDictionary(
+                    coordinator: coordinator, type: .conferencePrivacy,
+                    payload: [
+                        "action": "consent_dialog", "outcome": didConfirm ? "confirmed" : "cancelled",
+                        "source": "menu_bar"
+                    ]
+                )
+                guard didConfirm else { return }
+
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    let didApply = await coordinator.disableFaceBlurForConferenceCall(callID: consentSessionID)
+                    if didApply {
+                        conferenceConsentMenuState = ConferenceConsentMenuState(
+                            callID: state.callID,
+                            title: state.title,
+                            lastObservedAt: Date(),
+                            isBlurBypassedForConsent: true,
+                            consentSessionID: consentSessionID
+                        )
+                        setupMenu()
+                        return
+                    }
+
+                    let failureAlert = NSAlert()
+                    failureAlert.alertStyle = .informational
+                    failureAlert.messageText = "Couldn’t Disable Face Blur"
+                    failureAlert.informativeText = "Retrace could not apply the per-call consent override. Try again while the call is active."
+                    failureAlert.addButton(withTitle: "OK")
+                    failureAlert.runModal()
+                }
+            }
+        }
+    }
+
+    @MainActor
+    private func preferredConsentDialogOrigin(panelSize: CGSize) -> NSPoint? {
+        let mouseLocation = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first { NSMouseInRect(mouseLocation, $0.frame, false) }
+            ?? NSScreen.main
+        guard let screen else { return nil }
+
+        let visible = screen.visibleFrame
+        return NSPoint(
+            x: visible.midX - panelSize.width / 2,
+            y: visible.midY - panelSize.height / 2
+        )
+    }
+
+    @MainActor
+    private func presentFaceBlurConsentDialog(
+        callTitle: String,
+        onDecision: @escaping (Bool) -> Void
+    ) {
+        faceBlurConsentWindowController?.close()
+        faceBlurConsentWindowController = nil
+
+        let panelSize = CGSize(width: 420, height: 284)
+        let panel = Self.makeFaceBlurConsentPanel(
+            contentRect: NSRect(origin: .zero, size: panelSize)
+        )
+
+        let controller = NSWindowController(window: panel)
+        faceBlurConsentWindowController = controller
+
+        let closePanel: (Bool) -> Void = { [weak self] didConfirm in
+            self?.faceBlurConsentWindowController?.close()
+            self?.faceBlurConsentWindowController = nil
+            onDecision(didConfirm)
+        }
+
+        let rootView = FaceBlurConsentDialogView(
+            callTitle: callTitle,
+            onConfirm: {
+                closePanel(true)
+            },
+            onCancel: {
+                closePanel(false)
+            }
+        )
+        panel.onEscape = {
+            closePanel(false)
+        }
+        let hostingController = NSHostingController(rootView: rootView)
+        hostingController.view.wantsLayer = true
+        hostingController.view.layer?.backgroundColor = NSColor.clear.cgColor
+        if #available(macOS 10.15, *) {
+            hostingController.view.layer?.cornerCurve = .continuous
+        }
+        hostingController.view.layer?.cornerRadius = 28
+        hostingController.view.layer?.masksToBounds = true
+        panel.contentViewController = hostingController
+        applyFaceBlurConsentWindowMask(to: panel)
+        panel.setContentSize(panelSize)
+        logFaceBlurConsentPanelState(panel, reason: "before_positioning")
+
+        if let origin = preferredConsentDialogOrigin(panelSize: panelSize) {
+            panel.setFrameOrigin(origin)
+            Log.info(
+                "[FaceBlurConsentUI] Showing consent dialog at origin=\(origin)",
+                category: .ui
+            )
+        } else {
+            panel.center()
+            Log.info(
+                "[FaceBlurConsentUI] Showing consent dialog centered on screen",
+                category: .ui
+            )
+        }
+
+        controller.window = panel
+        panel.makeKeyAndOrderFront(nil)
+        panel.orderFrontRegardless()
+        logFaceBlurConsentPanelState(panel, reason: "after_order_front")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self, weak panel] in
+            guard let self, let panel else { return }
+            self.logFaceBlurConsentPanelState(panel, reason: "after_50ms")
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self, weak panel] in
+            guard let self, let panel else { return }
+            self.logFaceBlurConsentPanelState(panel, reason: "after_250ms")
+        }
+    }
+
+    @MainActor
+    private func applyFaceBlurConsentWindowMask(to window: NSWindow) {
+        guard let contentView = window.contentView else { return }
+        contentView.wantsLayer = true
+        contentView.layer?.backgroundColor = NSColor.clear.cgColor
+        if #available(macOS 10.15, *) {
+            contentView.layer?.cornerCurve = .continuous
+        }
+        contentView.layer?.cornerRadius = 28
+        contentView.layer?.masksToBounds = true
+    }
+
+    @MainActor
+    private func logFaceBlurConsentPanelState(_ panel: NSPanel, reason: String) {
+        let screenDescription: String
+        if let screen = panel.screen {
+            screenDescription = "frame=\(screen.frame) visible=\(screen.visibleFrame)"
+        } else {
+            screenDescription = "nil"
+        }
+        let occlusionVisible = panel.occlusionState.contains(.visible)
+        Log.info(
+            "[FaceBlurConsentUI] PanelState reason=\(reason) windowNumber=\(panel.windowNumber) visible=\(panel.isVisible) key=\(panel.isKeyWindow) main=\(panel.isMainWindow) mini=\(panel.isMiniaturized) alpha=\(String(format: "%.2f", panel.alphaValue)) level=\(panel.level.rawValue) occlusionVisible=\(occlusionVisible) frame=\(panel.frame) screen=\(screenDescription) appActive=\(NSApp.isActive)",
+            category: .ui
+        )
+    }
+
+    @objc private func openSearch() {
+        // Open the timeline search overlay without resetting existing search state.
+        Task { @MainActor in
+            LaunchMenuRouting.showSearch(source: "menu_bar_menu")
+        }
     }
 
     @objc private func openDashboard() {
-        NotificationCenter.default.post(name: .toggleDashboard, object: nil)
+        Task { @MainActor in
+            LaunchMenuRouting.showDashboard()
+        }
+    }
+
+    @objc private func hideDashboardFromMenu() {
+        Task { @MainActor in
+            DashboardWindowController.shared.hide()
+        }
+    }
+
+    @objc private func openChangelog() {
+        Task { @MainActor in
+            LaunchMenuRouting.showChangelog()
+        }
     }
 
     @objc private func openSystemMonitor() {
-        NotificationCenter.default.post(name: .openSystemMonitor, object: nil)
+        Task { @MainActor in
+            LaunchMenuRouting.showSystemMonitor()
+        }
+    }
+
+    @objc private func hideSystemMonitorFromMenu() {
+        Task { @MainActor in
+            LaunchMenuRouting.toggleSystemMonitor()
+        }
+    }
+
+    @objc private func startRecordingFromMenu() {
+        Task { @MainActor in
+            await startRecordingNow()
+        }
+    }
+
+    @objc private func pauseFor5Minutes() {
+        applyPauseSelection(duration: 5 * 60)
+    }
+
+    @objc private func pauseFor30Minutes() {
+        applyPauseSelection(duration: 30 * 60)
+    }
+
+    @objc private func pauseFor60Minutes() {
+        applyPauseSelection(duration: 60 * 60)
+    }
+
+    @objc private func turnOffRecording() {
+        applyPauseSelection(duration: nil)
+    }
+
+    /// Toggle system monitor from global hotkey - hides timeline if open, then toggles monitor view
+    private func toggleSystemMonitor() {
+        Task { @MainActor in
+            if TimelineWindowController.shared.isVisible {
+                TimelineWindowController.shared.hideToShowDashboard()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                    LaunchMenuRouting.toggleSystemMonitor()
+                }
+            } else {
+                LaunchMenuRouting.toggleSystemMonitor()
+            }
+        }
     }
 
     /// Sync recording status with coordinator
@@ -626,8 +1778,16 @@ public class MenuBarManager: ObservableObject {
     public func syncWithCoordinator() {
         // Read status directly from thread-safe holder - no actor hop needed
         let status = coordinator.statusHolder.status
+        if status.isRunning {
+            isPausedByUser = false
+            if scheduledResumeDate != nil {
+                clearScheduledResume(refreshMenu: false)
+            }
+        }
         if isRecording != status.isRunning {
             updateRecordingStatus(status.isRunning)
+        } else {
+            updateIconForCurrentState()
         }
     }
 
@@ -636,11 +1796,53 @@ public class MenuBarManager: ObservableObject {
     }
 
     @objc private func openFeedback() {
+        Task { @MainActor in
+            DashboardViewModel.recordHelpOpened(coordinator: coordinator, source: "menu_bar_menu")
+        }
         NotificationCenter.default.post(name: .openFeedback, object: nil)
+    }
+
+    @objc private func checkForUpdatesFromMenu() {
+        UpdaterManager.shared.checkForUpdates()
+    }
+
+    @objc private func openCommitURL() {
+        if let url = BuildInfo.commitURL {
+            NSWorkspace.shared.open(url)
+        }
     }
 
     @objc private func quit() {
         NSApplication.shared.terminate(nil)
+    }
+
+    private func applyPauseSelection(duration: TimeInterval?) {
+        Task { @MainActor in
+            await pauseRecording(for: duration)
+        }
+    }
+
+    static func primaryActions(
+        isDashboardFrontAndCenter: Bool,
+        isSystemMonitorFrontAndCenter: Bool
+    ) -> (
+        timeline: PrimaryAction,
+        search: PrimaryAction,
+        dashboard: PrimaryAction,
+        monitor: PrimaryAction
+    ) {
+        (
+            timeline: (title: "Open Timeline", imageSystemName: "clock.arrow.circlepath"),
+            search: (title: "Search Screen History", imageSystemName: "magnifyingglass"),
+            dashboard: (
+                title: isDashboardFrontAndCenter ? "Hide Dashboard" : "Open Dashboard",
+                imageSystemName: "rectangle.3.group"
+            ),
+            monitor: (
+                title: isSystemMonitorFrontAndCenter ? "Hide System Monitor" : "Open System Monitor",
+                imageSystemName: "waveform.path.ecg"
+            )
+        )
     }
 
     // MARK: - Update
@@ -648,13 +1850,18 @@ public class MenuBarManager: ObservableObject {
     public func updateRecordingStatus(_ recording: Bool) {
         let wasRecording = isRecording
         isRecording = recording
+        if recording {
+            isPausedByUser = false
+        } else {
+            hasPendingCapturePulse = false
+        }
         setupMenu()
 
-        // Animate the icon fill if the state actually changed
-        if wasRecording != recording {
+        // Animate only for true start/stop transitions; paused uses hatched static icon.
+        if wasRecording != recording && !(wasRecording && !recording && isPausedByUser) {
             animateIconFill(toRecording: recording)
         } else {
-            updateIcon(recording: recording)
+            updateIconForCurrentState()
         }
     }
 
@@ -662,8 +1869,11 @@ public class MenuBarManager: ObservableObject {
     public func show() {
         isMenuBarIconEnabled = true
         DispatchQueue.main.async {
+            Log.info("[GhostAppCheck] MenuBarManager.show requested \(self.ghostAppDebugSummary)", category: .ui)
             if self.statusItem == nil {
                 self.setup()
+            } else {
+                Log.info("[GhostAppCheck] MenuBarManager.show reused existing status item \(self.ghostAppDebugSummary)", category: .ui)
             }
         }
     }
@@ -672,10 +1882,14 @@ public class MenuBarManager: ObservableObject {
     public func hide() {
         isMenuBarIconEnabled = false
         DispatchQueue.main.async {
+            Log.info("[GhostAppCheck] MenuBarManager.hide requested \(self.ghostAppDebugSummary)", category: .ui)
+            self.hasPendingCapturePulse = false
+            self.teardownStatusClickMonitors()
             if let item = self.statusItem {
                 NSStatusBar.system.removeStatusItem(item)
                 self.statusItem = nil
             }
+            Log.info("[GhostAppCheck] MenuBarManager.hide completed \(self.ghostAppDebugSummary)", category: .ui)
         }
     }
 
@@ -684,6 +1898,168 @@ public class MenuBarManager: ObservableObject {
     deinit {
         refreshTimer?.cancel()
         iconAnimationTimer?.invalidate()
+        autoResumeCountdownTimer?.invalidate()
+        scheduledResumeTask?.cancel()
+        teardownStatusClickMonitors()
+    }
+}
+
+private struct FaceBlurConsentDialogView: View {
+    let callTitle: String
+    let onConfirm: () -> Void
+    let onCancel: () -> Void
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            RoundedRectangle(cornerRadius: 28, style: .continuous)
+                .fill(
+                    LinearGradient(
+                        colors: [
+                            Color(red: 0.10, green: 0.17, blue: 0.30).opacity(0.96),
+                            Color(red: 0.08, green: 0.12, blue: 0.22).opacity(0.94)
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 28, style: .continuous)
+                        .stroke(Color.white.opacity(0.18), lineWidth: 1)
+                )
+                .shadow(color: Color.black.opacity(0.35), radius: 24, x: 0, y: 16)
+
+            VStack(alignment: .leading, spacing: 18) {
+                ZStack(alignment: .topLeading) {
+                    FaceBlurConsentWindowDragHandle()
+
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack(spacing: 7) {
+                            Image(systemName: "checkmark.shield")
+                                .font(.system(size: 10, weight: .bold))
+                            Text("Consent Required")
+                                .font(.system(size: 11, weight: .semibold))
+                        }
+                        .foregroundStyle(Color.white.opacity(0.74))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(
+                            Capsule(style: .continuous)
+                                .fill(Color.white.opacity(0.08))
+                                .overlay(
+                                    Capsule(style: .continuous)
+                                        .stroke(Color.white.opacity(0.12), lineWidth: 1)
+                                )
+                        )
+
+                        HStack(alignment: .center, spacing: 12) {
+                            ZStack {
+                                Circle()
+                                    .fill(Color(red: 0.95, green: 0.29, blue: 0.33).opacity(0.20))
+                                    .frame(width: 38, height: 38)
+                                Image(systemName: "person.2.slash.fill")
+                                    .font(.system(size: 17, weight: .semibold))
+                                    .foregroundStyle(Color(red: 0.99, green: 0.42, blue: 0.45))
+                            }
+
+                            Text("Disable Face Blurring This Call?")
+                                .font(.system(size: 19, weight: .bold))
+                                .foregroundStyle(.white)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, minHeight: 76, alignment: .topLeading)
+
+                Text("Only continue if you obtained consent from everyone in this call to record without face blurring.")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(Color.white.opacity(0.92))
+                    .lineSpacing(1.2)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Text(callTitle)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(Color.white.opacity(0.85))
+                    .lineLimit(2)
+
+                HStack(spacing: 12) {
+                    Button("Cancel", action: onCancel)
+                        .buttonStyle(FaceBlurConsentSecondaryButtonStyle())
+                        .keyboardShortcut(.cancelAction)
+
+                    Button("I got consent", action: onConfirm)
+                        .buttonStyle(FaceBlurConsentPrimaryButtonStyle())
+                        .keyboardShortcut(.defaultAction)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .padding(.horizontal, 22)
+            .padding(.top, 18)
+            .padding(.bottom, 20)
+        }
+        .frame(width: 420, height: 284)
+    }
+}
+
+private struct FaceBlurConsentWindowDragHandle: NSViewRepresentable {
+    func makeNSView(context: Context) -> FaceBlurConsentWindowDragHandleView {
+        FaceBlurConsentWindowDragHandleView()
+    }
+
+    func updateNSView(_ nsView: FaceBlurConsentWindowDragHandleView, context: Context) {}
+}
+
+private final class FaceBlurConsentWindowDragHandleView: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        self
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        window?.performDrag(with: event)
+    }
+}
+
+private struct FaceBlurConsentPrimaryButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 14, weight: .semibold))
+            .foregroundStyle(.white)
+            .frame(maxWidth: .infinity)
+            .frame(height: 34)
+            .background(
+                RoundedRectangle(cornerRadius: 11, style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            colors: [
+                                Color(red: 0.95, green: 0.29, blue: 0.33),
+                                Color(red: 0.84, green: 0.18, blue: 0.23)
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+            )
+            .opacity(configuration.isPressed ? 0.86 : 1)
+            .scaleEffect(configuration.isPressed ? 0.99 : 1)
+    }
+}
+
+private struct FaceBlurConsentSecondaryButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 14, weight: .semibold))
+            .foregroundStyle(Color.white.opacity(0.95))
+            .frame(maxWidth: .infinity)
+            .frame(height: 34)
+            .background(
+                RoundedRectangle(cornerRadius: 11, style: .continuous)
+                    .fill(Color.white.opacity(0.10))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 11, style: .continuous)
+                            .stroke(Color.white.opacity(0.18), lineWidth: 1)
+                    )
+            )
+            .opacity(configuration.isPressed ? 0.85 : 1)
+            .scaleEffect(configuration.isPressed ? 0.99 : 1)
     }
 }
 
@@ -794,6 +2170,11 @@ private class RecordingToggleSwitch: NSView {
         blendedColor.setFill()
         trackPath.fill()
 
+        // Draw white border around track
+        NSColor.white.withAlphaComponent(0.5).setStroke()
+        trackPath.lineWidth = 1.0
+        trackPath.stroke()
+
         // Draw knob (circle) - position based on knobProgress
         let offX = trackRect.minX + knobPadding
         let onX = trackRect.maxX - knobDiameter - knobPadding
@@ -812,7 +2193,8 @@ private class RecordingToggleSwitch: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
-        isOn.toggle()
+        let nextState = !isOn
+        isOn = nextState
 
         // Send action
         if let target = target, let action = action {
@@ -840,7 +2222,13 @@ extension Notification.Name {
     static let openSettings = Notification.Name("openSettings")
     static let openSettingsAppearance = Notification.Name("openSettingsAppearance")
     static let openSettingsPower = Notification.Name("openSettingsPower")
+    static let openSettingsTags = Notification.Name("openSettingsTags")
+    static let openSettingsPauseReminderInterval = Notification.Name("openSettingsPauseReminderInterval")
+    static let openSettingsPowerOCRCard = Notification.Name("openSettingsPowerOCRCard")
+    static let openSettingsPowerOCRPriority = Notification.Name("openSettingsPowerOCRPriority")
+    static let openSettingsTimelineScrollOrientation = Notification.Name("openSettingsTimelineScrollOrientation")
     static let openFeedback = Notification.Name("openFeedback")
     static let openSystemMonitor = Notification.Name("openSystemMonitor")
+    static let toggleSystemMonitor = Notification.Name("toggleSystemMonitor")
     static let dataSourceDidChange = Notification.Name("dataSourceDidChange")
 }

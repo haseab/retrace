@@ -6,8 +6,20 @@ import Processing
 /// System monitor view showing background task status
 public struct SystemMonitorView: View {
     @StateObject private var viewModel: SystemMonitorViewModel
+    private let coordinator: AppCoordinator
+    @StateObject private var scrollLatch = HoverLatchedScrollMonitor<ScrollTarget>(
+        hoverPriority: [.cpu, .memory],
+        defaultTarget: .outer
+    )
+
+    private enum ScrollTarget {
+        case outer
+        case cpu
+        case memory
+    }
 
     public init(coordinator: AppCoordinator) {
+        self.coordinator = coordinator
         _viewModel = StateObject(wrappedValue: SystemMonitorViewModel(coordinator: coordinator))
     }
 
@@ -16,41 +28,57 @@ public struct SystemMonitorView: View {
     private let monitorMaxWidth: CGFloat = 1100
 
     public var body: some View {
-        ZStack {
-            // Background matching dashboard - extends under titlebar
-            backgroundView
-                .ignoresSafeArea()
+        GeometryReader { geometry in
+            let isCompactLayout = geometry.size.width < dashboardCompactLayoutThreshold
 
-            VStack(spacing: 0) {
-                // Header
-                header
-                    .frame(maxWidth: monitorMaxWidth)
-                    .frame(maxWidth: .infinity)
-                    .padding(.horizontal, 32)
-                    .padding(.top, 28)
-                    .padding(.bottom, 24)
+            ZStack {
+                // Background matching dashboard - extends under titlebar
+                backgroundView
+                    .ignoresSafeArea()
 
-                // Main content
-                ScrollView(showsIndicators: false) {
-                    VStack(alignment: .leading, spacing: 16) {
-                        // OCR Processing Section
-                        ocrProcessingSection
+                VStack(spacing: 0) {
+                    // Header
+                    header
+                        .frame(maxWidth: monitorMaxWidth)
+                        .frame(maxWidth: .infinity)
+                        .padding(.horizontal, 32)
+                        .padding(.top, 16)
+                        .padding(.bottom, 12)
 
-                        // Future sections placeholder
-                        // - Data Transfers
-                        // - Migrations
+                    // Main content
+                    ScrollView(showsIndicators: false) {
+                        VStack(alignment: .leading, spacing: 20) {
+                            processingPipelinesSection(isCompactLayout: isCompactLayout)
+
+                            processResourceSummarySection(isCompactLayout: isCompactLayout)
+
+                            // Future sections placeholder
+                            // - Data Transfers
+                            // - Migrations
+                        }
+                        .frame(maxWidth: monitorMaxWidth)
+                        .frame(maxWidth: .infinity)
+                        .padding(.horizontal, 32)
+                        .padding(.bottom, 32)
                     }
-                    .frame(maxWidth: monitorMaxWidth)
-                    .frame(maxWidth: .infinity)
-                    .padding(.horizontal, 32)
-                    .padding(.bottom, 32)
+                    .scrollDisabled(isOuterScrollDisabled)
                 }
             }
         }
         .task {
-            await viewModel.startMonitoring()
+            viewModel.startMonitoring()
+        }
+        .onAppear {
+            installScrollMonitorIfNeeded()
+            ProcessCPUMonitor.shared.setConsumerVisible(.systemMonitor, isVisible: true)
+            DashboardViewModel.recordSystemMonitorOpened(
+                coordinator: coordinator,
+                source: "dashboard_window"
+            )
         }
         .onDisappear {
+            removeScrollMonitor()
+            ProcessCPUMonitor.shared.setConsumerVisible(.systemMonitor, isVisible: false)
             viewModel.stopMonitoring()
         }
         .background(
@@ -98,6 +126,7 @@ public struct SystemMonitorView: View {
     // MARK: - Header
 
     @State private var isHoveringBack = false
+    @State private var isHoveringHelp = false
     @State private var isHoveringSettings = false
     @State private var settingsRotation: Double = 0
 
@@ -144,7 +173,7 @@ public struct SystemMonitorView: View {
 
             Spacer()
 
-            // Right side: Live indicator + Settings button
+            // Right side: Live indicator + Help + Settings button
             HStack(spacing: 12) {
                 // Live indicator
                 HStack(spacing: 6) {
@@ -163,12 +192,49 @@ public struct SystemMonitorView: View {
                         .foregroundColor(.retraceSecondary)
                 }
 
+                Button(action: {
+                    DashboardViewModel.recordHelpOpened(
+                        coordinator: coordinator,
+                        source: "system_monitor_header"
+                    )
+                    NotificationCenter.default.post(name: .openFeedback, object: nil)
+                }) {
+                    Image(systemName: "questionmark.circle")
+                        .font(.retraceCalloutMedium)
+                        .foregroundColor(.retraceSecondary)
+                        .padding(10)
+                        .background(Color.white.opacity(0.05))
+                        .cornerRadius(8)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8)
+                                .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                        )
+                }
+                .buttonStyle(.plain)
+                .contentShape(Rectangle())
+                .keyboardShortcut("h", modifiers: [.command, .shift])
+                .help("Help")
+                .scaleEffect(isHoveringHelp ? 1.03 : 1.0)
+                .animation(.easeOut(duration: 0.12), value: isHoveringHelp)
+                .onHover { hovering in
+                    isHoveringHelp = hovering
+                    if hovering {
+                        NSCursor.pointingHand.push()
+                    } else {
+                        NSCursor.pop()
+                    }
+                }
+
                 // Settings button
                 Button(action: {
                     withAnimation(.easeInOut(duration: 0.3)) {
                         settingsRotation += 90
                     }
-                    NotificationCenter.default.post(name: .openSettings, object: nil)
+                    DashboardViewModel.recordSystemMonitorSettingsOpened(
+                        coordinator: coordinator,
+                        source: "monitor_header_settings"
+                    )
+                    NotificationCenter.default.post(name: .openSettingsPower, object: nil)
                 }) {
                     Image(systemName: "gearshape")
                         .font(.retraceCalloutMedium)
@@ -185,6 +251,7 @@ public struct SystemMonitorView: View {
                 }
                 .buttonStyle(.plain)
                 .contentShape(Rectangle())
+                .help("Settings")
                 .onHover { hovering in
                     isHoveringSettings = hovering
                     if hovering {
@@ -200,160 +267,549 @@ public struct SystemMonitorView: View {
     // MARK: - OCR Processing Section
 
     private var ocrProcessingSection: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            // Section header
-            HStack {
-                Image(systemName: "text.viewfinder")
-                    .font(.retraceCallout)
-                    .foregroundColor(.retraceSecondary)
-                Text("OCR Processing")
-                    .font(.retraceCalloutBold)
-                    .foregroundColor(.retracePrimary)
-
-                Spacer()
-
-                // Status badge
-                statusBadge
-            }
-
-            // Content card
-            VStack(spacing: 0) {
-                // Chart area
-                VStack(alignment: .leading, spacing: 12) {
-                    HStack(spacing: 6) {
-                        Text("Frames processed")
-                            .font(.retraceCaption)
-                            .foregroundColor(.retraceSecondary)
-                        Text("·")
-                            .font(.retraceCaption2)
-                            .foregroundColor(.retraceSecondary.opacity(0.5))
-                        Text("Last 30 min")
-                            .font(.retraceCaption2)
-                            .foregroundColor(.retraceSecondary.opacity(0.7))
-                        Spacer()
-                    }
-
-                    ProcessingBarChart(
-                        dataPoints: viewModel.processingHistory,
-                        pendingCount: viewModel.pendingCount,
-                        processingCount: viewModel.processingCount,
-                        hoveredIndex: $viewModel.hoveredBarIndex
-                    )
-                    .frame(height: 140)
-                }
-                .padding(16)
-
+        activityMonitorCard(
+            model: ocrMonitorCardModel,
+            hoveredIndex: $viewModel.hoveredOCRBarIndex
+        ) {
+            if viewModel.isPausedForBattery {
                 Divider()
                     .background(Color.white.opacity(0.06))
 
-                // Stats row - horizontal layout with dots between
-                HStack(spacing: 16) {
-                    // Processed (left) - blue
-                    HStack(spacing: 4) {
-                        Text("\(viewModel.processedLast30Min)")
-                            .font(.system(size: 14, weight: .semibold, design: .rounded))
-                            .foregroundColor(.retraceAccent)
-                        // Show "in the last 30 minutes" only when idle (no pending/processing)
-                        if viewModel.processingCount == 0 && viewModel.pendingCount == 0 {
-                            Text("processed in the last 30 minutes")
-                                .font(.retraceCaption2)
-                                .foregroundColor(.retraceSecondary.opacity(0.7))
-                        } else {
-                            Text("processed")
-                                .font(.retraceCaption2)
-                                .foregroundColor(.retraceSecondary.opacity(0.7))
-                        }
+                HStack(spacing: 8) {
+                    Image(systemName: "bolt.slash.fill")
+                        .font(.retraceCaption)
+                        .foregroundColor(.orange)
+                    Text("Processing paused by power settings — adjust them in ")
+                        .font(.retraceCaption2)
+                        .foregroundColor(.retraceSecondary)
+                    + Text("Settings")
+                        .font(.retraceCaption2)
+                        .foregroundColor(.retraceAccent)
+                    Spacer()
+                }
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    DashboardViewModel.recordSystemMonitorOpenPowerOCRCard(
+                        coordinator: coordinator,
+                        source: "monitor_paused_warning"
+                    )
+                    NotificationCenter.default.post(name: .openSettingsPowerOCRCard, object: nil)
+                }
+                .padding(12)
+                .background(Color.orange.opacity(0.05))
+            }
+
+            if !viewModel.ocrEnabled {
+                Divider()
+                    .background(Color.white.opacity(0.06))
+
+                HStack(alignment: .center, spacing: 12) {
+                    ZStack {
+                        Circle()
+                            .fill(Color.retraceAccent.opacity(0.28))
+                            .frame(width: 28, height: 28)
+                        Image(systemName: "eye.slash.fill")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundColor(.white)
                     }
 
-                    if viewModel.processingCount > 0 {
-                        Circle()
-                            .fill(Color.retraceSecondary.opacity(0.3))
-                            .frame(width: 3, height: 3)
-
-                        // Processing (status 1) - green
-                        HStack(spacing: 4) {
-                            Text("\(viewModel.processingCount)")
-                                .font(.system(size: 14, weight: .semibold, design: .rounded))
-                                .foregroundColor(.green)
-                            Text("processing")
-                                .font(.retraceCaption2)
-                                .foregroundColor(.retraceSecondary.opacity(0.7))
-                        }
-                    }
-
-                    if viewModel.pendingCount > 0 {
-                        Circle()
-                            .fill(Color.retraceSecondary.opacity(0.3))
-                            .frame(width: 3, height: 3)
-
-                        // Pending (status 0) - orange
-                        HStack(spacing: 4) {
-                            Text("\(viewModel.pendingCount)")
-                                .font(.system(size: 14, weight: .semibold, design: .rounded))
-                                .foregroundColor(.orange)
-                            Text("pending")
-                                .font(.retraceCaption2)
-                                .foregroundColor(.retraceSecondary.opacity(0.7))
-                        }
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("OCR is paused")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundColor(.white.opacity(0.95))
+                        Text("New frames are still captured, but text won’t be searchable until OCR resumes.")
+                            .font(.retraceCaption2)
+                            .foregroundColor(.white.opacity(0.78))
                     }
 
                     Spacer()
 
-                    // ETA (right side)
-                    if viewModel.queueDepth > 0 {
+                    HStack(spacing: 4) {
+                        Text("Open Power Settings")
+                        Image(systemName: "arrow.up.right")
+                            .font(.system(size: 9, weight: .semibold))
+                    }
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(.white.opacity(0.95))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(Color.retraceAccent.opacity(0.30))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(Color.retraceAccent.opacity(0.55), lineWidth: 1)
+                    )
+                    .cornerRadius(8)
+                }
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    DashboardViewModel.recordSystemMonitorOpenPowerOCRCard(
+                        coordinator: coordinator,
+                        source: "monitor_ocr_disabled_warning"
+                    )
+                    NotificationCenter.default.post(name: .openSettingsPowerOCRCard, object: nil)
+                }
+                .padding(14)
+                .background(
+                    RoundedRectangle(cornerRadius: 10)
+                        .fill(
+                            LinearGradient(
+                                colors: [
+                                    Color.retraceAccent.opacity(0.22),
+                                    Color.retraceAccent.opacity(0.10)
+                                ],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 10)
+                                .stroke(Color.retraceAccent.opacity(0.35), lineWidth: 1)
+                        )
+                )
+                .padding(.horizontal, 8)
+                .padding(.vertical, 8)
+            }
+
+            if viewModel.shouldShowPerformanceNudge {
+                Divider()
+                    .background(Color.white.opacity(0.06))
+
+                HStack(alignment: .center, spacing: 12) {
+                    ZStack {
+                        Circle()
+                            .fill(Color.orange.opacity(0.25))
+                            .frame(width: 30, height: 30)
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 12, weight: .bold))
+                            .foregroundColor(.orange)
+                    }
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Large OCR Backlog Detected")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundColor(.white.opacity(0.96))
+                        Text("\(viewModel.ocrQueueDepth) frames queued. Go to System Settings to increase your OCR Priority.")
+                            .font(.retraceCaption2)
+                            .foregroundColor(.white.opacity(0.82))
+                    }
+
+                    Spacer()
+
+                    HStack(spacing: 4) {
+                        Text("Go to System Settings")
+                        Image(systemName: "arrow.up.right")
+                            .font(.system(size: 9, weight: .semibold))
+                    }
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(.white.opacity(0.95))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(Color.retraceAccent.opacity(0.3))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(Color.retraceAccent.opacity(0.6), lineWidth: 1)
+                    )
+                    .cornerRadius(8)
+                }
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    DashboardViewModel.recordSystemMonitorOpenPowerOCRPriority(
+                        coordinator: coordinator,
+                        source: "monitor_backlog_nudge"
+                    )
+                    NotificationCenter.default.post(name: .openSettingsPowerOCRPriority, object: nil)
+                }
+                .padding(14)
+                .background(
+                    RoundedRectangle(cornerRadius: 10)
+                        .fill(
+                            LinearGradient(
+                                colors: [
+                                    Color.orange.opacity(0.24),
+                                    Color.orange.opacity(0.12)
+                                ],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 10)
+                                .stroke(Color.orange.opacity(0.42), lineWidth: 1)
+                        )
+                )
+                .padding(.horizontal, 8)
+                .padding(.vertical, 8)
+            }
+        }
+    }
+
+    private var videoRewritingSection: some View {
+        activityMonitorCard(
+            model: videoRewritingCardModel,
+            hoveredIndex: $viewModel.hoveredRewriteBarIndex
+        ) {
+            EmptyView()
+        }
+    }
+
+    private var frameEncodingSection: some View {
+        activityMonitorCard(
+            model: encodingCardModel,
+            hoveredIndex: $viewModel.hoveredEncodingBarIndex
+        ) {
+            EmptyView()
+        }
+    }
+
+    private var ocrMonitorCardModel: ActivityMonitorCardModel {
+        ActivityMonitorCardModel(
+            icon: "text.viewfinder",
+            title: "OCR Processing (Extracting Screenshot Text)",
+            statusText: viewModel.ocrStatusBadgeText,
+            statusColor: viewModel.ocrStatusColor,
+            metricTitle: "Frames processed",
+            history: viewModel.ocrProcessingHistory,
+            completedLast30Minutes: viewModel.ocrProcessedLast30Min,
+            completedLabel: "processed",
+            activeCount: viewModel.ocrProcessingCount,
+            activeLabel: "processing",
+            pendingCount: viewModel.ocrPendingCount,
+            pendingLabel: "pending",
+            queueDepth: viewModel.ocrQueueDepth,
+            etaText: viewModel.ocrEtaText,
+            etaSuffixText: viewModel.ocrEtaSuffixText,
+            backlogAxisLabel: "backlog",
+            historyWindowMinutes: viewModel.ocrHistoryWindowMinutes,
+            maxVisibleBacklogBars: 10
+        )
+    }
+
+    private var encodingCardModel: ActivityMonitorCardModel {
+        ActivityMonitorCardModel(
+            icon: "video",
+            title: "Frame Encoding (Compression)",
+            statusText: viewModel.encodingBufferStatusBadgeText,
+            statusColor: viewModel.encodingBufferStatusColor,
+            metricTitle: "Frames encoded",
+            history: viewModel.encodingHistory,
+            completedLast30Minutes: viewModel.encodedLast30Min,
+            completedLabel: "encoded",
+            activeCount: nil,
+            activeLabel: nil,
+            pendingCount: viewModel.encodedPendingCount,
+            pendingLabel: "buffered",
+            queueDepth: viewModel.encodedQueueDepth,
+            etaText: viewModel.encodingEtaText,
+            etaSuffixText: viewModel.encodingEtaSuffixText,
+            backlogAxisLabel: "buffer",
+            historyWindowMinutes: viewModel.encodingHistoryWindowMinutes,
+            maxVisibleBacklogBars: 3
+        )
+    }
+
+    private var videoRewritingCardModel: ActivityMonitorCardModel {
+        ActivityMonitorCardModel(
+            icon: "film.stack",
+            title: "Video Rewriting (Redaction)",
+            statusText: viewModel.rewriteStatusBadgeText,
+            statusColor: viewModel.rewriteStatusColor,
+            metricTitle: "Frames rewritten",
+            history: viewModel.rewriteHistory,
+            completedLast30Minutes: viewModel.rewrittenLast30Min,
+            completedLabel: "rewritten",
+            activeCount: viewModel.rewriteProcessingCount,
+            activeLabel: "rewriting",
+            pendingCount: viewModel.rewritePendingCount,
+            pendingLabel: "queued",
+            queueDepth: viewModel.rewriteQueueDepth,
+            etaText: viewModel.rewriteEtaText,
+            etaSuffixText: viewModel.rewriteEtaSuffixText,
+            backlogAxisLabel: "queue",
+            historyWindowMinutes: viewModel.rewriteHistoryWindowMinutes,
+            maxVisibleBacklogBars: 3
+        )
+    }
+
+    private func activityMonitorCard<Footer: View>(
+        model: ActivityMonitorCardModel,
+        hoveredIndex: Binding<Int?>,
+        @ViewBuilder footer: () -> Footer
+    ) -> some View {
+        VStack(spacing: 0) {
+            HStack {
+                Image(systemName: model.icon)
+                    .font(.retraceCallout)
+                    .foregroundColor(.retraceSecondary)
+                Text(model.title)
+                    .font(.retraceCalloutBold)
+                    .foregroundColor(.retracePrimary)
+
+                Spacer()
+                statusBadge(text: model.statusText, color: model.statusColor)
+            }
+            .padding(.horizontal, 20)
+                .padding(.vertical, 8)
+
+            Divider()
+                .background(Color.white.opacity(0.06))
+
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 6) {
+                    Text(model.metricTitle)
+                        .font(.retraceCaption)
+                        .foregroundColor(.retraceSecondary)
+                    Text("·")
+                        .font(.retraceCaption2)
+                        .foregroundColor(.retraceSecondary.opacity(0.5))
+                    Text("Last \(model.historyWindowMinutes) min")
+                        .font(.retraceCaption2)
+                        .foregroundColor(.retraceSecondary.opacity(0.7))
+                    Spacer()
+                }
+
+                ActivityBarChart(
+                    dataPoints: model.history,
+                    pendingCount: model.pendingCount,
+                    processingCount: model.activeCount ?? 0,
+                    completedTint: model.completedTint,
+                    activeTint: model.activeTint,
+                    pendingTint: model.pendingTint,
+                    backlogLabel: model.backlogAxisLabel,
+                    maxVisibleBacklogBars: model.maxVisibleBacklogBars,
+                    hoveredIndex: hoveredIndex
+                )
+                .frame(height: 88)
+            }
+            .padding(.vertical, 8)
+            .padding(.horizontal, 20)
+
+            Divider()
+                .background(Color.white.opacity(0.06))
+
+            HStack(spacing: 10) {
+                HStack(spacing: 4) {
+                    Text("\(model.completedLast30Minutes)")
+                        .font(.system(size: 14, weight: .semibold, design: .rounded))
+                        .foregroundColor(model.completedTint)
+                    if model.isIdle {
+                        Text("\(model.completedLabel) in the last \(model.historyWindowMinutes) minutes")
+                            .font(.retraceCaption2)
+                            .foregroundColor(.retraceSecondary.opacity(0.7))
+                    } else {
+                        Text(model.completedLabel)
+                            .font(.retraceCaption2)
+                            .foregroundColor(.retraceSecondary.opacity(0.7))
+                    }
+                }
+
+                if let activeCount = model.activeCount,
+                   activeCount > 0,
+                   let activeLabel = model.activeLabel {
+                    Circle()
+                        .fill(Color.retraceSecondary.opacity(0.3))
+                        .frame(width: 3, height: 3)
+
+                    HStack(spacing: 4) {
+                        Text("\(activeCount)")
+                            .font(.system(size: 14, weight: .semibold, design: .rounded))
+                            .foregroundColor(model.activeTint)
+                        Text(activeLabel)
+                            .font(.retraceCaption2)
+                            .foregroundColor(.retraceSecondary.opacity(0.7))
+                    }
+                }
+
+                if model.pendingCount > 0 {
+                    HStack(spacing: 10) {
+                        Circle()
+                            .fill(Color.retraceSecondary.opacity(0.3))
+                            .frame(width: 3, height: 3)
+
                         HStack(spacing: 4) {
-                            Text(viewModel.etaText)
+                            Text("\(model.pendingCount)")
                                 .font(.system(size: 14, weight: .semibold, design: .rounded))
-                                .foregroundColor(.retracePrimary)
-                            Text(viewModel.isPausedForBattery ? "worth of processing" : "remaining")
+                                .foregroundColor(model.pendingTint)
+                            Text(model.pendingLabel)
                                 .font(.retraceCaption2)
                                 .foregroundColor(.retraceSecondary.opacity(0.7))
                         }
                     }
+                    .transition(.asymmetric(
+                        insertion: .move(edge: .trailing).combined(with: .opacity),
+                        removal: .opacity
+                    ))
                 }
-                .padding(.vertical, 12)
-                .padding(.horizontal, 16)
 
-                // Paused warning
-                if viewModel.isPausedForBattery {
-                    Divider()
-                        .background(Color.white.opacity(0.06))
+                Spacer()
 
-                    HStack(spacing: 8) {
-                        Image(systemName: "bolt.slash.fill")
-                            .font(.retraceCaption)
-                            .foregroundColor(.orange)
-                        Text("Processing paused — connect to power to resume or ")
+                if model.queueDepth > 0,
+                   let etaText = model.etaText,
+                   let etaSuffixText = model.etaSuffixText {
+                    HStack(spacing: 4) {
+                        Text(etaText)
+                            .font(.system(size: 14, weight: .semibold, design: .rounded))
+                            .foregroundColor(.retracePrimary)
+                        Text(etaSuffixText)
                             .font(.retraceCaption2)
-                            .foregroundColor(.retraceSecondary)
-                        + Text("change this in Settings")
-                            .font(.retraceCaption2)
-                            .foregroundColor(.retraceAccent)
-                        Spacer()
+                            .foregroundColor(.retraceSecondary.opacity(0.7))
                     }
-                    .contentShape(Rectangle())
-                    .onTapGesture {
-                        NotificationCenter.default.post(name: .openSettingsPower, object: nil)
-                    }
-                    .padding(12)
-                    .background(Color.orange.opacity(0.05))
+                    .transition(.opacity.combined(with: .move(edge: .trailing)))
                 }
             }
-            .background(Color.white.opacity(0.02))
-            .cornerRadius(12)
-            .overlay(
-                RoundedRectangle(cornerRadius: 12)
-                    .stroke(Color.white.opacity(0.06), lineWidth: 1)
-            )
+            .padding(.vertical, 8)
+            .padding(.horizontal, 16)
+            .animation(.spring(response: 0.28, dampingFraction: 0.84), value: model.pendingCount > 0)
+            .animation(.spring(response: 0.28, dampingFraction: 0.84), value: model.queueDepth > 0)
+
+            footer()
         }
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(Color.white.opacity(0.02))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.white.opacity(0.06), lineWidth: 1)
+        )
     }
 
-    private var statusBadge: some View {
+    private func processResourceSummarySection(isCompactLayout: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 10) {
+                Image(systemName: "gauge.with.needle")
+                    .font(.retraceHeadline)
+                    .foregroundColor(.retraceSecondary)
+
+                Text("Process Resource Logs (last 12h)")
+                    .font(.retraceHeadline)
+                    .foregroundColor(.retracePrimary)
+
+                Spacer()
+
+                Button("Restart Baseline") {
+                    ProcessCPUMonitor.shared.resetSampler()
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(.retraceSecondary.opacity(0.9))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(Color.white.opacity(0.06))
+                .cornerRadius(6)
+                .help("Clear CPU/memory sampler history and restart baseline collection")
+            }
+            .padding(.horizontal, 12)
+            .padding(.top, 12)
+            .padding(.bottom, 10)
+
+            Divider()
+                .background(Color.white.opacity(0.06))
+
+            Group {
+                if isCompactLayout {
+                    VStack(alignment: .leading, spacing: 12) {
+                        processCPUSummarySection
+                            .frame(maxWidth: .infinity, alignment: .topLeading)
+                        processMemorySummarySection
+                            .frame(maxWidth: .infinity, alignment: .topLeading)
+                    }
+                } else {
+                    HStack(alignment: .top, spacing: 12) {
+                        processCPUSummarySection
+                            .frame(maxWidth: .infinity, alignment: .topLeading)
+                        processMemorySummarySection
+                            .frame(maxWidth: .infinity, alignment: .topLeading)
+                    }
+                }
+            }
+            .padding(12)
+        }
+        .background(Color.white.opacity(0.02))
+        .cornerRadius(12)
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.white.opacity(0.06), lineWidth: 1)
+        )
+    }
+
+    private func processingPipelinesSection(isCompactLayout: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 10) {
+                Image(systemName: "arrow.triangle.branch")
+                    .font(.retraceHeadline)
+                    .foregroundColor(.retraceSecondary)
+
+                Text("Processing Pipelines")
+                    .font(.retraceHeadline)
+                    .foregroundColor(.retracePrimary)
+
+                Spacer()
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 14)
+            .padding(.bottom, 12)
+
+            Divider()
+                .background(Color.white.opacity(0.06))
+
+            VStack(alignment: .leading, spacing: 20) {
+                if isCompactLayout {
+                    frameEncodingSection
+                    videoRewritingSection
+                } else {
+                    HStack(alignment: .top, spacing: 18) {
+                        frameEncodingSection
+                            .frame(maxWidth: .infinity, alignment: .top)
+                        videoRewritingSection
+                            .frame(maxWidth: .infinity, alignment: .top)
+                    }
+                }
+
+                ocrProcessingSection
+            }
+            .padding(16)
+        }
+        .background(Color.white.opacity(0.02))
+        .cornerRadius(12)
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.white.opacity(0.06), lineWidth: 1)
+        )
+    }
+
+    private var processCPUSummarySection: some View {
+        ProcessCPUSummaryCard(
+            onRowsHoverChanged: { hovering in
+                scrollLatch.updateHoveredTarget(.cpu, isHovering: hovering)
+            },
+            isRowsScrollEnabled: isCPUScrollEnabled,
+            showsOCRBacklogAttribution: viewModel.shouldShowOCRBacklogAttribution
+        )
+    }
+
+    private var processMemorySummarySection: some View {
+        ProcessMemorySummaryCard(
+            onRowsHoverChanged: { hovering in
+                scrollLatch.updateHoveredTarget(.memory, isHovering: hovering)
+            },
+            onRetraceRowToggle: { expanded in
+                DashboardViewModel.recordSystemMonitorMemoryLogToggle(
+                    coordinator: coordinator,
+                    source: "monitor_memory_log_retrace_row",
+                    expanded: expanded
+                )
+            },
+            isRowsScrollEnabled: isMemoryScrollEnabled,
+            showsOCRBacklogAttribution: viewModel.shouldShowOCRBacklogAttribution
+        )
+    }
+
+    private func statusBadge(text: String, color: Color) -> some View {
         HStack(spacing: 4) {
             Circle()
-                .fill(viewModel.statusColor)
+                .fill(color)
                 .frame(width: 6, height: 6)
-            Text(viewModel.statusBadgeText)
+            Text(text)
                 .font(.retraceCaption2)
                 .foregroundColor(.retraceSecondary)
         }
@@ -363,180 +819,315 @@ public struct SystemMonitorView: View {
         .cornerRadius(6)
     }
 
-    private func formatNumber(_ number: Int) -> String {
-        if number >= 1_000_000 {
-            return String(format: "%.1fM", Double(number) / 1_000_000)
-        } else if number >= 1_000 {
-            return String(format: "%.1fK", Double(number) / 1_000)
+    private var isOuterScrollDisabled: Bool {
+        switch scrollLatch.latchedTarget {
+        case .cpu, .memory:
+            return true
+        case .outer, .none:
+            return false
         }
-        return "\(number)"
+    }
+
+    private var isCPUScrollEnabled: Bool {
+        switch scrollLatch.latchedTarget {
+        case .outer, .memory:
+            return false
+        case .cpu, .none:
+            return true
+        }
+    }
+
+    private var isMemoryScrollEnabled: Bool {
+        switch scrollLatch.latchedTarget {
+        case .outer, .cpu:
+            return false
+        case .memory, .none:
+            return true
+        }
+    }
+
+    private func installScrollMonitorIfNeeded() {
+        scrollLatch.installMonitorIfNeeded { event in
+            event.window?.title == "System Monitor"
+        }
+    }
+
+    private func removeScrollMonitor() {
+        scrollLatch.removeMonitor()
+    }
+}
+
+private struct ActivityMonitorCardModel {
+    let icon: String
+    let title: String
+    let statusText: String
+    let statusColor: Color
+    let metricTitle: String
+    let history: [ProcessingDataPoint]
+    let completedLast30Minutes: Int
+    let completedLabel: String
+    let activeCount: Int?
+    let activeLabel: String?
+    let pendingCount: Int
+    let pendingLabel: String
+    let queueDepth: Int
+    let etaText: String?
+    let etaSuffixText: String?
+    let completedTint: Color = .retraceAccent
+    let activeTint: Color = .green
+    let pendingTint: Color = .orange
+    let backlogAxisLabel: String
+    let historyWindowMinutes: Int
+    let maxVisibleBacklogBars: Int
+
+    var isIdle: Bool {
+        queueDepth == 0
     }
 }
 
 // MARK: - Processing Bar Chart
 
-struct ProcessingBarChart: View {
+struct ActivityBarChart: View {
+    struct LayoutMetrics {
+        let chartHeight: CGFloat
+        let chartWidth: CGFloat
+        let barWidth: CGFloat
+        let backlogWidth: CGFloat
+        let separatorWidth: CGFloat
+        let totalBacklogBarCount: Int
+        let visibleBacklogBarCount: Int
+    }
+
     let dataPoints: [ProcessingDataPoint]
     let pendingCount: Int
     let processingCount: Int
+    let completedTint: Color
+    let activeTint: Color
+    let pendingTint: Color
+    let backlogLabel: String
+    let maxVisibleBacklogBars: Int
     @Binding var hoveredIndex: Int?
 
     // Backlog hover state
     @State private var isHoveringBacklog = false
 
-    // Cap for each backlog bar
+    // Cap for each backlog bar and maximum number of visible backlog bars.
     private let backlogBarCap = 100
+    private let standardTooltipEstimatedHeight: CGFloat = 56
+    private let liveTooltipEstimatedHeight: CGFloat = 76
+    private let tooltipGapAboveBar: CGFloat = 8
+    private let tooltipTopOverflowAllowance: CGFloat = 14
+    private let tooltipBubbleWidth: CGFloat = 60
+    private let tooltipHorizontalOverflowAllowance: CGFloat = 20
+    private let tooltipPointerInset: CGFloat = 14
+    private let backlogTransitionAnimation = Animation.spring(response: 0.28, dampingFraction: 0.84)
 
     var body: some View {
         GeometryReader { geometry in
-            let totalWidth = geometry.size.width
             let xAxisHeight: CGFloat = 1  // x-axis line
             let labelPadding: CGFloat = 4  // space between axis and labels
             let labelHeight: CGFloat = 12  // actual label height
-            let bottomAreaHeight = xAxisHeight + labelPadding + labelHeight
-            let chartHeight = geometry.size.height - bottomAreaHeight
-
-            // Reserve space for backlog section if there's pending work
-            let hasBacklog = pendingCount > 0
-            // Calculate number of backlog bars needed (each bar shows up to 150)
-            let backlogBarCount = hasBacklog ? max(1, Int(ceil(Double(pendingCount) / Double(backlogBarCap)))) : 0
-            let singleBarWidth: CGFloat = 28
             let backlogSpacing: CGFloat = 2
-            let backlogWidth: CGFloat = hasBacklog ? CGFloat(backlogBarCount) * singleBarWidth + CGFloat(max(0, backlogBarCount - 1)) * backlogSpacing + 12 : 0
-            let separatorWidth: CGFloat = hasBacklog ? 12 : 0
-            let chartWidth = totalWidth - backlogWidth - separatorWidth
-
             let spacing: CGFloat = 1
-            let barWidth = max(3, (chartWidth - CGFloat(dataPoints.count - 1) * spacing) / CGFloat(dataPoints.count))
+            let singleBarWidth: CGFloat = 28
+            let metrics = Self.layoutMetrics(
+                totalWidth: geometry.size.width,
+                totalHeight: geometry.size.height,
+                dataPointCount: dataPoints.count,
+                pendingCount: pendingCount,
+                backlogBarCap: backlogBarCap,
+                maxVisibleBacklogBars: maxVisibleBacklogBars,
+                xAxisHeight: xAxisHeight,
+                labelPadding: labelPadding,
+                labelHeight: labelHeight,
+                singleBarWidth: singleBarWidth,
+                backlogSpacing: backlogSpacing,
+                spacing: spacing
+            )
+            let chartHeight = metrics.chartHeight
+            let chartWidth = metrics.chartWidth
+            let barWidth = metrics.barWidth
+            let backlogWidth = metrics.backlogWidth
+            let separatorWidth = metrics.separatorWidth
+            let totalBacklogBarCount = metrics.totalBacklogBarCount
+            let visibleBacklogBarCount = metrics.visibleBacklogBarCount
+            let hasBacklog = totalBacklogBarCount > 0
 
             // For live bar: total = processed this minute + currently processing
             let lastIndex = dataPoints.count - 1
             let liveProcessedCount = dataPoints.last?.count ?? 0
             let liveTotalForScaling = liveProcessedCount + processingCount
 
-            // Scale based on max of historical data, live total, or backlog cap (150)
-            // Backlog bars are capped at 150, so use that for scaling
+            // Scale based on the observed chart data, then round up to a "nice" axis value.
             let historicalMax = dataPoints.map(\.count).max() ?? 1
-            let maxValue = max(historicalMax, liveTotalForScaling, backlogBarCap, 1)
+            let maxValue = Self.yAxisUpperBound(
+                historicalMax: historicalMax,
+                liveTotal: liveTotalForScaling,
+                pendingCount: pendingCount,
+                backlogBarCap: backlogBarCap
+            )
 
             VStack(spacing: 0) {
                 HStack(alignment: .bottom, spacing: 0) {
                     // Main chart area
-                    VStack {
-                        Spacer()
-                        HStack(alignment: .bottom, spacing: spacing) {
-                            ForEach(Array(dataPoints.enumerated()), id: \.offset) { index, point in
-                                let isHovered = hoveredIndex == index
-                                let isLive = index == lastIndex
+                    HStack(alignment: .bottom, spacing: spacing) {
+                        ForEach(Array(dataPoints.enumerated()), id: \.offset) { index, point in
+                            let isHovered = hoveredIndex == index
+                            let isLive = index == lastIndex
 
-                                if isLive {
-                                    // Live bar: blue (processed) + green (processing) stacked
-                                    liveBarView(
-                                        processedCount: point.count,
-                                        processingCount: processingCount,
-                                        maxValue: maxValue,
-                                        barWidth: barWidth,
-                                        height: chartHeight,
-                                        isHovered: isHovered,
-                                        index: index
-                                    )
-                                } else {
-                                    // Historical bar (blue)
-                                    let normalizedHeight = CGFloat(point.count) / CGFloat(maxValue)
-                                    let barHeight = chartHeight * normalizedHeight
+                            if isLive {
+                                // Live bar: blue (processed) + green (processing) stacked
+                                liveBarView(
+                                    processedCount: point.count,
+                                    processingCount: processingCount,
+                                    maxValue: maxValue,
+                                    barWidth: barWidth,
+                                    height: chartHeight,
+                                    isHovered: isHovered
+                                )
+                            } else {
+                                // Historical bar (blue)
+                                let normalizedHeight = CGFloat(point.count) / CGFloat(maxValue)
+                                let barHeight = chartHeight * normalizedHeight
 
-                                    UnevenRoundedRectangle(
-                                        topLeadingRadius: 2,
-                                        bottomLeadingRadius: 0,
-                                        bottomTrailingRadius: 0,
-                                        topTrailingRadius: 2
-                                    )
-                                    .fill(Color.retraceAccent.opacity(isHovered ? 0.9 : 0.6))
-                                    .frame(width: barWidth, height: max(barHeight, point.count > 0 ? 3 : 1))
-                                    .animation(.easeOut(duration: 0.15), value: isHovered)
-                                    .contentShape(Rectangle().size(width: barWidth, height: chartHeight))
-                                    .onHover { hovering in
-                                        hoveredIndex = hovering ? index : nil
-                                    }
-                                }
+                                UnevenRoundedRectangle(
+                                    topLeadingRadius: 2,
+                                    bottomLeadingRadius: 0,
+                                    bottomTrailingRadius: 0,
+                                    topTrailingRadius: 2
+                                )
+                                .fill(completedTint.opacity(isHovered ? 0.9 : 0.6))
+                                .frame(width: barWidth, height: max(barHeight, point.count > 0 ? 3 : 1))
+                                .animation(.easeOut(duration: 0.15), value: isHovered)
                             }
                         }
                     }
-                    .frame(width: chartWidth, height: chartHeight)
+                    .frame(width: chartWidth, height: chartHeight, alignment: .bottom)
+                    .contentShape(Rectangle())
+                    .onContinuousHover { phase in
+                        switch phase {
+                        case .active(let location):
+                            hoveredIndex = Self.hoveredDataIndex(
+                                at: location.x,
+                                dataPointCount: dataPoints.count,
+                                barWidth: barWidth,
+                                spacing: spacing
+                            )
+                        case .ended:
+                            hoveredIndex = nil
+                        }
+                    }
                     .overlay(alignment: .top) {
                         // Tooltip for main chart (index >= 0 excludes backlog hover which uses -1)
                         if let index = hoveredIndex, index >= 0, index < dataPoints.count {
                             let point = dataPoints[index]
                             let isLive = index == lastIndex
                             let xPosition = CGFloat(index) * (barWidth + spacing) + barWidth / 2
+                            let tooltipCenterX = Self.clampedTooltipCenterX(
+                                anchorX: xPosition,
+                                containerWidth: chartWidth,
+                                tooltipWidth: tooltipBubbleWidth,
+                                horizontalOverflowAllowance: tooltipHorizontalOverflowAllowance
+                            )
+                            let yPosition = mainTooltipYOffset(
+                                for: point,
+                                isLive: isLive,
+                                maxValue: maxValue,
+                                chartHeight: chartHeight
+                            )
 
-                            tooltipView(for: point, isLive: isLive)
-                                .offset(x: clampTooltipOffset(xPosition, in: chartWidth), y: 0)
-                                .transition(.opacity)
-                                .animation(.easeOut(duration: 0.1), value: hoveredIndex)
+                            tooltipView(
+                                for: point,
+                                isLive: isLive,
+                                pointerOffset: Self.tooltipPointerOffset(
+                                    bubbleCenterX: tooltipCenterX,
+                                    anchorX: xPosition,
+                                    tooltipWidth: tooltipBubbleWidth,
+                                    pointerInset: tooltipPointerInset
+                                )
+                            )
+                                .offset(x: tooltipCenterX - (chartWidth / 2), y: yPosition)
+                                .transition(.opacity.combined(with: .scale(scale: 0.95, anchor: .bottom)))
+                                .animation(.spring(response: 0.18, dampingFraction: 0.86), value: hoveredIndex)
                         }
                     }
 
                     // Separator and backlog section
                     if hasBacklog {
-                        // Dotted vertical line separator
-                        Path { path in
-                            let dashHeight: CGFloat = 4
-                            let gapHeight: CGFloat = 3
-                            var y: CGFloat = 0
-                            while y < chartHeight {
-                                path.move(to: CGPoint(x: separatorWidth / 2, y: y))
-                                path.addLine(to: CGPoint(x: separatorWidth / 2, y: min(y + dashHeight, chartHeight)))
-                                y += dashHeight + gapHeight
+                        HStack(alignment: .bottom, spacing: 0) {
+                            // Dotted vertical line separator
+                            Path { path in
+                                let dashHeight: CGFloat = 4
+                                let gapHeight: CGFloat = 3
+                                var y: CGFloat = 0
+                                while y < chartHeight {
+                                    path.move(to: CGPoint(x: separatorWidth / 2, y: y))
+                                    path.addLine(to: CGPoint(x: separatorWidth / 2, y: min(y + dashHeight, chartHeight)))
+                                    y += dashHeight + gapHeight
+                                }
                             }
-                        }
-                        .stroke(Color.retraceSecondary.opacity(0.3), lineWidth: 1)
-                        .frame(width: separatorWidth, height: chartHeight)
+                            .stroke(Color.retraceSecondary.opacity(0.3), lineWidth: 1)
+                            .frame(width: separatorWidth, height: chartHeight)
 
-                        // Backlog bars (orange) - multiple bars if count exceeds cap
-                        backlogBarsView(
-                            pendingCount: pendingCount,
-                            maxValue: maxValue,
-                            barCount: backlogBarCount,
-                            singleBarWidth: singleBarWidth,
-                            spacing: backlogSpacing,
-                            totalWidth: backlogWidth,
-                            height: chartHeight
-                        )
+                            // Backlog bars (orange) - multiple bars if count exceeds cap
+                            backlogBarsView(
+                                pendingCount: pendingCount,
+                                maxValue: maxValue,
+                                visibleBarCount: visibleBacklogBarCount,
+                                totalBarCount: totalBacklogBarCount,
+                                singleBarWidth: singleBarWidth,
+                                spacing: backlogSpacing,
+                                totalWidth: backlogWidth,
+                                height: chartHeight
+                            )
+                        }
+                        .transition(.asymmetric(
+                            insertion: .move(edge: .trailing).combined(with: .opacity),
+                            removal: .opacity.combined(with: .scale(scale: 0.96, anchor: .trailing))
+                        ))
                     }
                 }
                 .frame(height: chartHeight)
+                .animation(backlogTransitionAnimation, value: hasBacklog)
+                .animation(backlogTransitionAnimation, value: visibleBacklogBarCount)
 
                 // X-axis line (spans full width including backlog)
                 Rectangle()
                     .fill(Color.retraceSecondary.opacity(0.2))
-                    .frame(height: -1)
+                    .frame(height: xAxisHeight)
 
                 // X-axis labels
                 HStack(spacing: 0) {
                     // Main chart labels
                     HStack {
-                        Text("-30m")
+                        Text("-\(max(dataPoints.count, 1))m")
                         Spacer()
                         Text("now")
                     }
                     .frame(width: chartWidth)
 
                     if hasBacklog {
-                        // Separator space
-                        Spacer()
-                            .frame(width: separatorWidth)
+                        HStack(spacing: 0) {
+                            // Separator space
+                            Spacer()
+                                .frame(width: separatorWidth)
 
-                        // Backlog label
-                        Text("backlog")
-                            .foregroundColor(.orange.opacity(0.7))
-                            .frame(width: backlogWidth)
+                            // Backlog label
+                            Text(backlogLabel)
+                                .foregroundColor(pendingTint.opacity(0.7))
+                                .frame(width: backlogWidth)
+                        }
+                        .transition(.asymmetric(
+                            insertion: .move(edge: .trailing).combined(with: .opacity),
+                            removal: .opacity
+                        ))
                     }
                 }
                 .font(.system(size: 9, weight: .medium))
                 .foregroundColor(.retraceSecondary.opacity(0.5))
                 .padding(.top, labelPadding)
                 .frame(height: labelPadding + labelHeight)
+                .animation(backlogTransitionAnimation, value: hasBacklog)
             }
         }
     }
@@ -549,44 +1140,42 @@ struct ProcessingBarChart: View {
         maxValue: Int,
         barWidth: CGFloat,
         height: CGFloat,
-        isHovered: Bool,
-        index: Int
+        isHovered: Bool
     ) -> some View {
         let processedNormalized = CGFloat(processedCount) / CGFloat(maxValue)
         let processingNormalized = CGFloat(processingCount) / CGFloat(maxValue)
         let processedHeight = height * processedNormalized
         let processingHeight = height * processingNormalized
 
-        return VStack(spacing: 0) {
-            // Processing portion (green) - on top
-            if processingCount > 0 {
-                UnevenRoundedRectangle(
-                    topLeadingRadius: 2,
-                    bottomLeadingRadius: 0,
-                    bottomTrailingRadius: 0,
-                    topTrailingRadius: 2
-                )
-                .fill(Color.green.opacity(isHovered ? 1.0 : 0.8))
-                .frame(width: barWidth, height: max(processingHeight, 3))
-            }
+        return ZStack(alignment: .bottom) {
+            VStack(spacing: 0) {
+                // Processing portion (green) - on top
+                if processingCount > 0 {
+                    UnevenRoundedRectangle(
+                        topLeadingRadius: 2,
+                        bottomLeadingRadius: 0,
+                        bottomTrailingRadius: 0,
+                        topTrailingRadius: 2
+                    )
+                    .fill(activeTint.opacity(isHovered ? 1.0 : 0.8))
+                    .frame(width: barWidth, height: max(processingHeight, 3))
+                }
 
-            // Processed portion (blue) - on bottom
-            if processedCount > 0 || processingCount == 0 {
-                UnevenRoundedRectangle(
-                    topLeadingRadius: processingCount > 0 ? 0 : 2,
-                    bottomLeadingRadius: 0,
-                    bottomTrailingRadius: 0,
-                    topTrailingRadius: processingCount > 0 ? 0 : 2
-                )
-                .fill(Color.retraceAccent.opacity(isHovered ? 0.9 : 0.6))
-                .frame(width: barWidth, height: max(processedHeight, processedCount > 0 ? 3 : 1))
+                // Processed portion (blue) - on bottom
+                if processedCount > 0 || processingCount == 0 {
+                    UnevenRoundedRectangle(
+                        topLeadingRadius: processingCount > 0 ? 0 : 2,
+                        bottomLeadingRadius: 0,
+                        bottomTrailingRadius: 0,
+                        topTrailingRadius: processingCount > 0 ? 0 : 2
+                    )
+                    .fill(completedTint.opacity(isHovered ? 0.9 : 0.6))
+                    .frame(width: barWidth, height: max(processedHeight, processedCount > 0 ? 3 : 1))
+                }
             }
         }
+        .frame(width: barWidth, height: height, alignment: .bottom)
         .animation(.easeOut(duration: 0.15), value: isHovered)
-        .contentShape(Rectangle().size(width: barWidth, height: height))
-        .onHover { hovering in
-            hoveredIndex = hovering ? index : nil
-        }
     }
 
     // MARK: - Backlog Bars (orange pending, multiple bars for overflow)
@@ -594,19 +1183,21 @@ struct ProcessingBarChart: View {
     private func backlogBarsView(
         pendingCount: Int,
         maxValue: Int,
-        barCount: Int,
+        visibleBarCount: Int,
+        totalBarCount: Int,
         singleBarWidth: CGFloat,
         spacing: CGFloat,
         totalWidth: CGFloat,
         height: CGFloat
     ) -> some View {
-        HStack(alignment: .bottom, spacing: spacing) {
-            ForEach(0..<barCount, id: \.self) { barIndex in
-                // FIFO: rightmost bars drain first, so we fill from right to left
-                // barIndex 0 = leftmost bar (last to drain), barIndex N-1 = rightmost bar (first to drain)
-                // Reverse the index for calculation: rightmost bar shows remainder, leftmost bars are full
-                let reverseIndex = barCount - 1 - barIndex
-                let previousBarsTotal = reverseIndex * backlogBarCap
+        let newestBarIndex = totalBarCount - 1
+
+        return HStack(alignment: .bottom, spacing: spacing) {
+            ForEach(0..<visibleBarCount, id: \.self) { visibleBarIndex in
+                // Show only the most recent N backlog bars when total bar count exceeds UI cap.
+                // Bars are rendered left -> right, with newest chunk first so leftmost drains first.
+                let actualBarIndex = newestBarIndex - visibleBarIndex
+                let previousBarsTotal = actualBarIndex * backlogBarCap
                 let remainingForThisBar = pendingCount - previousBarsTotal
                 let thisBarCount = min(max(remainingForThisBar, 0), backlogBarCap)
 
@@ -620,7 +1211,7 @@ struct ProcessingBarChart: View {
                     bottomTrailingRadius: 0,
                     topTrailingRadius: 3
                 )
-                .fill(Color.orange.opacity(isHoveringBacklog ? 0.8 : 0.5))
+                .fill(pendingTint.opacity(isHoveringBacklog ? 0.8 : 0.5))
                 .frame(width: singleBarWidth, height: max(barHeight, 6))
             }
         }
@@ -630,58 +1221,330 @@ struct ProcessingBarChart: View {
             isHoveringBacklog = hovering
             hoveredIndex = hovering ? -1 : nil // Use -1 for backlog
         }
+        .animation(backlogTransitionAnimation, value: visibleBarCount)
+        .animation(backlogTransitionAnimation, value: pendingCount > 0)
         .overlay(alignment: .top) {
             if isHoveringBacklog {
                 backlogTooltipView(pendingCount: pendingCount)
-                    .offset(y: 4)
+                    .offset(y: backlogTooltipYOffset(pendingCount: pendingCount, maxValue: maxValue, chartHeight: height))
+                    .transition(.opacity.combined(with: .scale(scale: 0.95, anchor: .bottom)))
+                    .animation(.spring(response: 0.18, dampingFraction: 0.86), value: isHoveringBacklog)
             }
         }
     }
 
     // MARK: - Tooltips
 
-    private func tooltipView(for point: ProcessingDataPoint, isLive: Bool) -> some View {
-        HStack(spacing: 4) {
-            Text("\(point.count)")
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundColor(.retraceAccent)
-            if isLive && processingCount > 0 {
-                Text("+\(processingCount)")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundColor(.green)
-            }
-            if isLive {
-                Text("now")
-                    .font(.system(size: 8, weight: .medium))
-                    .foregroundColor(.retraceSecondary)
+    private func tooltipView(
+        for point: ProcessingDataPoint,
+        isLive: Bool,
+        pointerOffset: CGFloat
+    ) -> some View {
+        let shouldStackMetrics = isLive && processingCount > 0
+
+        return floatingTooltip(pointerOffset: pointerOffset, width: tooltipBubbleWidth) {
+            VStack(spacing: 5) {
+                Text(isLive ? "LIVE NOW" : point.minute.formatted(date: .omitted, time: .shortened))
+                    .font(.system(size: 9, weight: .semibold, design: .rounded))
+                    .tracking(0.45)
+                    .foregroundColor(.white.opacity(0.72))
+
+                VStack(spacing: shouldStackMetrics ? 4 : 0) {
+                    tooltipMetricChip(
+                        text: "\(point.count)",
+                        tint: completedTint
+                    )
+                    if isLive && processingCount > 0 {
+                        tooltipMetricChip(
+                            text: "+\(processingCount)",
+                            tint: activeTint
+                        )
+                    }
+                }
             }
         }
-        .padding(.horizontal, 6)
-        .padding(.vertical, 3)
-        .background(
-            RoundedRectangle(cornerRadius: 4)
-                .fill(Color.black.opacity(0.85))
-        )
     }
 
     private func backlogTooltipView(pendingCount: Int) -> some View {
-        Text("\(pendingCount)")
-            .font(.system(size: 10, weight: .semibold))
-            .foregroundColor(.orange)
-            .padding(.horizontal, 6)
+        VStack(spacing: 0) {
+            Text("\(pendingCount)")
+                .font(.system(size: 11, weight: .bold, design: .rounded))
+                .foregroundColor(pendingTint)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(
+                    Capsule(style: .continuous)
+                        .fill(pendingTint.opacity(0.18))
+                )
+                .overlay(
+                    Capsule(style: .continuous)
+                        .stroke(pendingTint.opacity(0.35), lineWidth: 1)
+                )
+                .padding(.horizontal, 6)
+                .padding(.top, 5)
+                .padding(.bottom, 6)
+                .background(
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .fill(
+                            LinearGradient(
+                                colors: [
+                                    Color(red: 0.15, green: 0.18, blue: 0.24).opacity(0.98),
+                                    Color(red: 0.08, green: 0.10, blue: 0.15).opacity(0.98)
+                                ],
+                                startPoint: .top,
+                                endPoint: .bottom
+                            )
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                .stroke(Color.white.opacity(0.15), lineWidth: 1)
+                        )
+                        .shadow(color: Color.black.opacity(0.34), radius: 10, x: 0, y: 6)
+                )
+
+            TooltipPointer()
+                .fill(Color(red: 0.08, green: 0.10, blue: 0.15).opacity(0.98))
+                .frame(width: 10, height: 6)
+                .overlay(
+                    TooltipPointer()
+                        .stroke(Color.white.opacity(0.14), lineWidth: 0.8)
+                )
+                .offset(y: -1)
+        }
+    }
+
+    @ViewBuilder
+    private func floatingTooltip<Content: View>(
+        pointerOffset: CGFloat = 0,
+        width: CGFloat,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(spacing: 0) {
+            content()
+                .frame(maxWidth: .infinity)
+                .padding(.horizontal, 10)
+                .padding(.top, 7)
+                .padding(.bottom, 8)
+                .background(
+                    RoundedRectangle(cornerRadius: 11, style: .continuous)
+                        .fill(
+                            LinearGradient(
+                                colors: [
+                                    Color(red: 0.15, green: 0.18, blue: 0.24).opacity(0.98),
+                                    Color(red: 0.08, green: 0.10, blue: 0.15).opacity(0.98)
+                                ],
+                                startPoint: .top,
+                                endPoint: .bottom
+                            )
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                                .stroke(Color.white.opacity(0.15), lineWidth: 1)
+                        )
+                        .shadow(color: Color.black.opacity(0.34), radius: 14, x: 0, y: 8)
+                )
+                .frame(width: width)
+
+            TooltipPointer()
+                .fill(Color(red: 0.08, green: 0.10, blue: 0.15).opacity(0.98))
+                .frame(width: 12, height: 7)
+                .overlay(
+                    TooltipPointer()
+                        .stroke(Color.white.opacity(0.14), lineWidth: 0.8)
+                )
+                .offset(x: pointerOffset, y: -1)
+        }
+        .frame(width: width)
+    }
+
+    private func tooltipMetricChip(text: String, tint: Color) -> some View {
+        Text(text)
+            .font(.system(size: 11, weight: .bold, design: .rounded))
+            .foregroundColor(tint)
+            .padding(.horizontal, 8)
             .padding(.vertical, 3)
             .background(
-                RoundedRectangle(cornerRadius: 4)
-                    .fill(Color.black.opacity(0.85))
+                Capsule(style: .continuous)
+                    .fill(tint.opacity(0.18))
+            )
+            .overlay(
+                Capsule(style: .continuous)
+                    .stroke(tint.opacity(0.35), lineWidth: 1)
             )
     }
 
-    private func clampTooltipOffset(_ x: CGFloat, in width: CGFloat) -> CGFloat {
-        let center = width / 2
-        let offset = x - center
-        let tooltipHalfWidth: CGFloat = 30
-        let maxOffset = (width / 2) - tooltipHalfWidth
-        return min(max(offset, -maxOffset), maxOffset)
+    private func mainTooltipYOffset(
+        for point: ProcessingDataPoint,
+        isLive: Bool,
+        maxValue: Int,
+        chartHeight: CGFloat
+    ) -> CGFloat {
+        let barHeight = mainBarVisualHeight(for: point, isLive: isLive, maxValue: maxValue, chartHeight: chartHeight)
+        let barTopY = chartHeight - barHeight
+        let tooltipEstimatedHeight = isLive && processingCount > 0
+            ? liveTooltipEstimatedHeight
+            : standardTooltipEstimatedHeight
+        let desiredY = barTopY - tooltipEstimatedHeight - tooltipGapAboveBar
+        return max(-tooltipTopOverflowAllowance, desiredY)
+    }
+
+    private func backlogTooltipYOffset(
+        pendingCount: Int,
+        maxValue: Int,
+        chartHeight: CGFloat
+    ) -> CGFloat {
+        let normalizedHeight = CGFloat(min(max(pendingCount, 0), backlogBarCap)) / CGFloat(max(maxValue, 1))
+        let barHeight = max(chartHeight * normalizedHeight, 6)
+        let barTopY = chartHeight - barHeight
+        let desiredY = barTopY - standardTooltipEstimatedHeight - tooltipGapAboveBar
+        return max(-tooltipTopOverflowAllowance, desiredY)
+    }
+
+    private func mainBarVisualHeight(
+        for point: ProcessingDataPoint,
+        isLive: Bool,
+        maxValue: Int,
+        chartHeight: CGFloat
+    ) -> CGFloat {
+        if isLive {
+            let processedNormalized = CGFloat(point.count) / CGFloat(max(maxValue, 1))
+            let processingNormalized = CGFloat(processingCount) / CGFloat(max(maxValue, 1))
+            let processedHeight = chartHeight * processedNormalized
+            let processingHeight = chartHeight * processingNormalized
+
+            let visibleProcessingHeight = processingCount > 0 ? max(processingHeight, 3) : 0
+            let visibleProcessedHeight = (point.count > 0 || processingCount == 0) ? max(processedHeight, point.count > 0 ? 3 : 1) : 0
+            return max(visibleProcessingHeight + visibleProcessedHeight, 1)
+        }
+
+        let normalizedHeight = CGFloat(point.count) / CGFloat(max(maxValue, 1))
+        let barHeight = chartHeight * normalizedHeight
+        return max(barHeight, point.count > 0 ? 3 : 1)
+    }
+
+    static func hoveredDataIndex(
+        at x: CGFloat,
+        dataPointCount: Int,
+        barWidth: CGFloat,
+        spacing: CGFloat
+    ) -> Int? {
+        guard dataPointCount > 0 else { return nil }
+
+        let stride = barWidth + spacing
+        guard stride > 0 else { return 0 }
+
+        let index = Int(floor((max(0, x) + (spacing / 2)) / stride))
+        return min(max(index, 0), dataPointCount - 1)
+    }
+
+    static func layoutMetrics(
+        totalWidth: CGFloat,
+        totalHeight: CGFloat,
+        dataPointCount: Int,
+        pendingCount: Int,
+        backlogBarCap: Int,
+        maxVisibleBacklogBars: Int,
+        xAxisHeight: CGFloat,
+        labelPadding: CGFloat,
+        labelHeight: CGFloat,
+        singleBarWidth: CGFloat,
+        backlogSpacing: CGFloat,
+        spacing: CGFloat
+    ) -> LayoutMetrics {
+        let clampedTotalWidth = max(totalWidth, 0)
+        let clampedTotalHeight = max(totalHeight, 0)
+        let bottomAreaHeight = xAxisHeight + labelPadding + labelHeight
+        // Clamp chart dimensions so transient window/layout states never feed
+        // negative or non-finite frame sizes back into SwiftUI.
+        let chartHeight = max(clampedTotalHeight - bottomAreaHeight, 0)
+
+        let hasBacklog = pendingCount > 0
+        let totalBacklogBarCount = hasBacklog ? max(1, Int(ceil(Double(pendingCount) / Double(backlogBarCap)))) : 0
+        let visibleBacklogBarCount = min(totalBacklogBarCount, maxVisibleBacklogBars)
+        let separatorWidth: CGFloat = hasBacklog ? 12 : 0
+        let backlogWidth: CGFloat = hasBacklog
+            ? CGFloat(visibleBacklogBarCount) * singleBarWidth
+                + CGFloat(max(0, visibleBacklogBarCount - 1)) * backlogSpacing
+                + 12
+            : 0
+        let chartWidth = max(clampedTotalWidth - backlogWidth - separatorWidth, 0)
+        let safeDataPointCount = max(dataPointCount, 1)
+        let spacingWidth = CGFloat(max(dataPointCount - 1, 0)) * spacing
+        let barWidth = max(3, max(chartWidth - spacingWidth, 0) / CGFloat(safeDataPointCount))
+
+        return LayoutMetrics(
+            chartHeight: chartHeight,
+            chartWidth: chartWidth,
+            barWidth: barWidth,
+            backlogWidth: backlogWidth,
+            separatorWidth: separatorWidth,
+            totalBacklogBarCount: totalBacklogBarCount,
+            visibleBacklogBarCount: visibleBacklogBarCount
+        )
+    }
+
+    static func yAxisUpperBound(
+        historicalMax: Int,
+        liveTotal: Int,
+        pendingCount: Int,
+        backlogBarCap: Int
+    ) -> Int {
+        let visibleBacklogMax = min(max(pendingCount, 0), max(backlogBarCap, 1))
+        let rawMax = max(historicalMax, liveTotal, visibleBacklogMax, 1)
+
+        guard rawMax > 1 else { return 1 }
+
+        let magnitude = pow(10.0, floor(log10(Double(rawMax))))
+        let normalized = Double(rawMax) / magnitude
+        let niceMultiplier: Double
+
+        switch normalized {
+        case ...1:
+            niceMultiplier = 1
+        case ...2:
+            niceMultiplier = 2
+        case ...3:
+            niceMultiplier = 3
+        case ...5:
+            niceMultiplier = 5
+        default:
+            niceMultiplier = 10
+        }
+
+        return Int(niceMultiplier * magnitude)
+    }
+
+    static func clampedTooltipCenterX(
+        anchorX: CGFloat,
+        containerWidth: CGFloat,
+        tooltipWidth: CGFloat,
+        horizontalOverflowAllowance: CGFloat
+    ) -> CGFloat {
+        let halfWidth = tooltipWidth / 2
+        let minCenter = halfWidth - horizontalOverflowAllowance
+        let maxCenter = max(minCenter, containerWidth - halfWidth + horizontalOverflowAllowance)
+        return min(max(anchorX, minCenter), maxCenter)
+    }
+
+    static func tooltipPointerOffset(
+        bubbleCenterX: CGFloat,
+        anchorX: CGFloat,
+        tooltipWidth: CGFloat,
+        pointerInset: CGFloat
+    ) -> CGFloat {
+        let maxPointerOffset = max(0, (tooltipWidth / 2) - pointerInset)
+        return min(max(anchorX - bubbleCenterX, -maxPointerOffset), maxPointerOffset)
+    }
+}
+
+private struct TooltipPointer: Shape {
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        path.move(to: CGPoint(x: rect.midX, y: rect.maxY))
+        path.addLine(to: CGPoint(x: rect.minX, y: rect.minY))
+        path.addLine(to: CGPoint(x: rect.maxX, y: rect.minY))
+        path.closeSubpath()
+        return path
     }
 }
 
@@ -700,101 +1563,263 @@ struct ProcessingDataPoint: Identifiable {
     }
 }
 
+/// Shared rolling history state for a pipeline card.
+/// Supports both delayed historical bucket snapshots and live cumulative-total deltas.
+private struct ActivityPipelineHistory {
+    let windowMinutes: Int
+    var history: [ProcessingDataPoint]
+
+    private var minuteCounts: [Int: Int] = [:]
+    private var previousTotal = 0
+
+    init(windowMinutes: Int, now: Date = Date()) {
+        self.windowMinutes = windowMinutes
+
+        let nowKey = Self.minuteKey(for: now)
+        self.history = (0..<windowMinutes).reversed().map { minutesAgo in
+            let key = nowKey - minutesAgo
+            return ProcessingDataPoint(minute: Self.date(fromMinuteKey: key), count: 0)
+        }
+    }
+
+    var completedInWindow: Int {
+        history.reduce(0) { $0 + $1.count }
+    }
+
+    mutating func mergeHistoricalCounts(_ counts: [Int: Int], now: Date = Date()) {
+        let nowKey = Self.minuteKey(for: now)
+        for (minuteOffset, count) in counts where minuteOffset >= 0 && minuteOffset < windowMinutes {
+            let minuteKey = nowKey - minuteOffset
+            if minuteOffset == 0 {
+                // Historical fetches can arrive after live observations have already recorded
+                // current-minute progress. Keep the higher count so the bar never moves backward.
+                minuteCounts[minuteKey] = max(minuteCounts[minuteKey] ?? 0, count)
+            } else {
+                minuteCounts[minuteKey] = count
+            }
+        }
+        rebuildHistory(nowKey: nowKey)
+    }
+
+    mutating func recordObservedTotal(_ total: Int, now: Date = Date()) {
+        let newlyCompleted = total - previousTotal
+        if previousTotal > 0 && newlyCompleted > 0 {
+            let currentKey = Self.minuteKey(for: now)
+            minuteCounts[currentKey, default: 0] += newlyCompleted
+        }
+        previousTotal = total
+        rebuildHistory(nowKey: Self.minuteKey(for: now))
+    }
+
+    private mutating func rebuildHistory(nowKey: Int) {
+        history = (0..<windowMinutes).reversed().map { minutesAgo in
+            let key = nowKey - minutesAgo
+            return ProcessingDataPoint(
+                minute: Self.date(fromMinuteKey: key),
+                count: minuteCounts[key] ?? 0
+            )
+        }
+
+        let cutoffKey = nowKey - (windowMinutes + 1)
+        minuteCounts = minuteCounts.filter { $0.key > cutoffKey }
+    }
+
+    private static func minuteKey(for date: Date) -> Int {
+        Int(date.timeIntervalSince1970 / 60)
+    }
+
+    private static func date(fromMinuteKey key: Int) -> Date {
+        Date(timeIntervalSince1970: Double(key) * 60)
+    }
+}
+
 // MARK: - ViewModel
+
+protocol SystemMonitorDataProviding: AnyObject {
+    func getQueueStatistics() async -> QueueStatistics?
+    func getFramesProcessedPerMinute(lastMinutes: Int) async throws -> [Int: Int]
+    func getFramesEncodedPerMinute(lastMinutes: Int) async throws -> [Int: Int]
+    func getFramesRewrittenPerMinute(lastMinutes: Int) async throws -> [Int: Int]
+    func getEncodingStatistics() async -> (
+        queueDepth: Int,
+        pendingCount: Int
+    )?
+    func getCurrentPowerState() -> (source: PowerStateMonitor.PowerSource, isPaused: Bool)
+    var isSystemMonitorRecordingActive: Bool { get }
+}
+
+extension AppCoordinator: SystemMonitorDataProviding {
+    nonisolated var isSystemMonitorRecordingActive: Bool {
+        statusHolder.status.isRunning
+    }
+}
 
 @MainActor
 class SystemMonitorViewModel: ObservableObject {
+    #if DEBUG
+    private enum DebugDefaultsKey {
+        static let ocrPendingCount = "debugSystemMonitorPendingCount"
+        static let ocrProcessingCount = "debugSystemMonitorProcessingCount"
+        static let ocrQueueDepth = "debugSystemMonitorQueueDepth"
+    }
+    #endif
+
     // Queue stats
-    @Published var queueDepth: Int = 0
-    @Published var pendingCount: Int = 0       // Frames waiting (status 0)
-    @Published var processingCount: Int = 0    // Frames being processed (status 1)
-    @Published var totalProcessed: Int = 0
+    @Published var ocrQueueDepth: Int = 0
+    @Published var ocrPendingCount: Int = 0
+    @Published var ocrProcessingCount: Int = 0
+    @Published var encodedQueueDepth: Int = 0
+    @Published var encodedPendingCount: Int = 0
+    @Published var rewriteQueueDepth: Int = 0
+    @Published var rewritePendingCount: Int = 0
+    @Published var rewriteProcessingCount: Int = 0
+    @Published var ocrTotalProcessed: Int = 0
+    @Published var totalRewritten: Int = 0
     @Published var ocrEnabled: Bool = true
     @Published var isPausedForBattery: Bool = false
     @Published var powerSource: PowerStateMonitor.PowerSource = .unknown
+    @Published var ocrProcessingLevel: Int = 3
+    @Published var pauseOnBatterySetting: Bool = false
+    @Published var pauseOnLowPowerModeSetting: Bool = false
+    @Published var isRecordingActive: Bool = false
 
     // Chart data
-    @Published var processingHistory: [ProcessingDataPoint] = []
-    @Published var hoveredBarIndex: Int? = nil
+    @Published private var ocrHistoryState = ActivityPipelineHistory(windowMinutes: 30)
+    @Published private var encodingHistoryState = ActivityPipelineHistory(windowMinutes: 15)
+    @Published private var rewriteHistoryState = ActivityPipelineHistory(windowMinutes: 15)
+    @Published var hoveredOCRBarIndex: Int? = nil
+    @Published var hoveredEncodingBarIndex: Int? = nil
+    @Published var hoveredRewriteBarIndex: Int? = nil
 
     // Animation
     @Published var pulseScale: CGFloat = 1.0
     @Published var pulseOpacity: Double = 1.0
 
-    private let coordinator: AppCoordinator
+    private let dataProvider: any SystemMonitorDataProviding
     private var monitoringTask: Task<Void, Never>?
+    private var historicalLoadTask: Task<Void, Never>?
+    private var pulseAnimationTask: Task<Void, Never>?
 
-    // Track frames processed per minute using minute key (minutes since epoch)
-    // Using Int key instead of Date to avoid timezone/rounding issues at minute boundaries
-    private var minuteProcessingCounts: [Int: Int] = [:]
-    private var previousTotalProcessed: Int = 0
+    private var ocrQueueDepthSamples: [(timestamp: Date, depth: Int)] = []
+    private let backlogNudgeThreshold = 100
+    private let queueDepthSampleWindowSeconds: TimeInterval = 45
+    private let minimumQueueTrendWindowSeconds: TimeInterval = 12
+    private let queueDepthGrowthEpsilonPerMinute: Double = 0.5
 
-    init(coordinator: AppCoordinator) {
-        self.coordinator = coordinator
-        initializeHistory()
+    convenience init(coordinator: AppCoordinator) {
+        self.init(dataProvider: coordinator)
     }
 
-    /// Convert a Date to a minute key (minutes since epoch)
-    private func minuteKey(for date: Date) -> Int {
-        Int(date.timeIntervalSince1970 / 60)
+    init(dataProvider: any SystemMonitorDataProviding) {
+        self.dataProvider = dataProvider
     }
 
-    /// Convert a minute key back to a Date (start of that minute)
-    private func date(fromMinuteKey key: Int) -> Date {
-        Date(timeIntervalSince1970: Double(key) * 60)
+    var ocrHistoryWindowMinutes: Int { ocrHistoryState.windowMinutes }
+    var encodingHistoryWindowMinutes: Int { encodingHistoryState.windowMinutes }
+    var rewriteHistoryWindowMinutes: Int { rewriteHistoryState.windowMinutes }
+
+    var ocrProcessingHistory: [ProcessingDataPoint] { ocrHistoryState.history }
+    var encodingHistory: [ProcessingDataPoint] { encodingHistoryState.history }
+    var rewriteHistory: [ProcessingDataPoint] { rewriteHistoryState.history }
+
+    /// Total frames processed in the current OCR history window (sum of history)
+    var ocrProcessedLast30Min: Int {
+        ocrHistoryState.completedInWindow
     }
 
-    private func initializeHistory() {
-        // Create 30 empty data points (one per minute)
-        let nowKey = minuteKey(for: Date())
-        processingHistory = (0..<30).reversed().map { minutesAgo in
-            let key = nowKey - minutesAgo
-            return ProcessingDataPoint(minute: date(fromMinuteKey: key), count: 0)
-        }
+    var rewrittenLast30Min: Int {
+        rewriteHistoryState.completedInWindow
     }
 
-    /// Total frames processed in the last 30 minutes (sum of history)
-    var processedLast30Min: Int {
-        processingHistory.reduce(0) { $0 + $1.count }
+    var encodedLast30Min: Int {
+        encodingHistoryState.completedInWindow
     }
 
-    var statusColor: Color {
+    var ocrStatusColor: Color {
         if !ocrEnabled {
             return .gray
         } else if isPausedForBattery {
             return .orange
-        } else if queueDepth > 0 {
+        } else if ocrQueueDepth > 0 {
             return .retraceAccent
         } else {
             return .retraceAccent
         }
     }
 
-    var statusBadgeText: String {
+    var ocrStatusBadgeText: String {
         if !ocrEnabled {
             return "Disabled"
         } else if isPausedForBattery {
             return "Paused"
-        } else if queueDepth > 0 {
+        } else if ocrQueueDepth > 0 {
             return "Processing"
         } else {
             return "Idle"
         }
     }
 
-    var etaText: String {
-        guard queueDepth > 0 else { return "—" }
+    var rewriteStatusColor: Color {
+        rewriteProcessingCount > 0 ? .green : .gray
+    }
 
-        // Calculate average processing rate from recent history
-        let recentProcessed = processingHistory.suffix(5).reduce(0) { $0 + $1.count }
-        let minutesOfData = min(5, processingHistory.count)
+    var rewriteStatusBadgeText: String {
+        rewriteProcessingCount > 0 ? "Rewriting" : "Idle"
+    }
 
-        guard recentProcessed > 0, minutesOfData > 0 else {
-            return "..."
+    var encodingBufferStatusColor: Color {
+        encodedQueueDepth > 0 ? .retraceAccent : .gray
+    }
+
+    var encodingBufferStatusBadgeText: String {
+        encodedQueueDepth > 0 ? "Encoding" : "Idle"
+    }
+
+    private func recentCompletionRateFramesPerMinute(for history: [ProcessingDataPoint]) -> Double? {
+        let recentProcessed = history.suffix(5).reduce(0) { $0 + $1.count }
+        let minutesOfData = min(5, history.count)
+        guard recentProcessed > 0, minutesOfData > 0 else { return nil }
+        return Double(recentProcessed) / Double(minutesOfData)
+    }
+
+    private var recentQueueDepthChangePerMinute: Double? {
+        Self.queueDepthChangePerMinute(
+            samples: ocrQueueDepthSamples,
+            minimumObservationWindow: minimumQueueTrendWindowSeconds
+        )
+    }
+
+    private var effectiveOCRDrainRateFramesPerMinute: Double? {
+        guard let processingRate = recentCompletionRateFramesPerMinute(for: ocrProcessingHistory) else { return nil }
+        guard isRecordingActive else {
+            return processingRate
         }
 
-        let framesPerMinute = Double(recentProcessed) / Double(minutesOfData)
-        let minutesRemaining = Double(queueDepth) / framesPerMinute
+        // When recording is active, infer net drain from actual queue behavior instead of
+        // configured capture interval. Dedup/app filters can make theoretical capture rate wrong.
+        if let queueDepthChange = recentQueueDepthChangePerMinute {
+            return -queueDepthChange
+        }
+
+        // Not enough queue-depth samples yet; fall back to processing rate temporarily.
+        return processingRate
+    }
+
+    var isBacklogGrowingAtCurrentRates: Bool {
+        guard ocrQueueDepth > 0,
+              isRecordingActive,
+              let queueDepthChange = recentQueueDepthChangePerMinute else {
+            return false
+        }
+        return queueDepthChange > queueDepthGrowthEpsilonPerMinute
+    }
+
+    private func etaText(queueDepth: Int, drainRate: Double?) -> String {
+        guard queueDepth > 0 else { return "—" }
+        guard let drainRate else { return "..." }
+        guard drainRate > 0 else { return "∞" }
+
+        let minutesRemaining = Double(queueDepth) / drainRate
 
         if minutesRemaining < 1 {
             return "<1m"
@@ -807,34 +1832,93 @@ class SystemMonitorViewModel: ObservableObject {
         }
     }
 
-    func startMonitoring() async {
-        // Start pulse animation
+    var ocrEtaText: String {
+        etaText(queueDepth: ocrQueueDepth, drainRate: effectiveOCRDrainRateFramesPerMinute)
+    }
+
+    var encodingEtaText: String {
+        etaText(
+            queueDepth: encodedQueueDepth,
+            drainRate: recentCompletionRateFramesPerMinute(for: encodingHistory)
+        )
+    }
+
+    var ocrEtaSuffixText: String {
+        if isPausedForBattery || !ocrEnabled {
+            return "processing time"
+        }
+        if isBacklogGrowingAtCurrentRates {
+            return "backlog growing"
+        }
+        return "remaining"
+    }
+
+    var encodingEtaSuffixText: String {
+        "remaining"
+    }
+
+    var rewriteEtaText: String {
+        etaText(
+            queueDepth: rewriteQueueDepth,
+            drainRate: recentCompletionRateFramesPerMinute(for: rewriteHistory)
+        )
+    }
+
+    var rewriteEtaSuffixText: String {
+        "remaining"
+    }
+
+    var shouldShowPerformanceNudge: Bool {
+        ocrEnabled &&
+        !isPausedForBattery &&
+        ocrQueueDepth >= backlogNudgeThreshold &&
+        ocrProcessingLevel == 3 &&
+        !pauseOnBatterySetting &&
+        !pauseOnLowPowerModeSetting
+    }
+
+    var shouldShowOCRBacklogAttribution: Bool {
+        ocrEnabled &&
+        !isPausedForBattery &&
+        ocrProcessingCount > 0
+    }
+
+    func startMonitoring() {
         startPulseAnimation()
 
-        // Load historical data on first load
-        await loadHistoricalData()
+        monitoringTask?.cancel()
+        historicalLoadTask?.cancel()
 
         monitoringTask = Task {
             while !Task.isCancelled {
                 await updateStats()
-                try? await Task.sleep(nanoseconds: 1_000_000_000) // 1 second
+                try? await Task.sleep(for: .seconds(1), clock: .continuous)
             }
+        }
+
+        historicalLoadTask = Task {
+            await loadHistoricalData()
         }
     }
 
     func stopMonitoring() {
         monitoringTask?.cancel()
+        historicalLoadTask?.cancel()
+        pulseAnimationTask?.cancel()
         monitoringTask = nil
+        historicalLoadTask = nil
+        pulseAnimationTask = nil
     }
 
     private func startPulseAnimation() {
-        Task { @MainActor in
+        pulseAnimationTask?.cancel()
+        pulseAnimationTask = Task { @MainActor in
             while !Task.isCancelled {
                 withAnimation(.easeOut(duration: 1.0)) {
                     pulseScale = 1.6
                     pulseOpacity = 0
                 }
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                try? await Task.sleep(for: .seconds(1), clock: .continuous)
                 pulseScale = 1.0
                 pulseOpacity = 1.0
             }
@@ -842,65 +1926,112 @@ class SystemMonitorViewModel: ObservableObject {
     }
 
     private func loadHistoricalData() async {
-        // Query frames processed in last 30 minutes from database
-        // Group by minute offset
-        if let historicalCounts = try? await coordinator.getFramesProcessedPerMinute(lastMinutes: 30) {
-            let nowKey = minuteKey(for: Date())
+        if let historicalCounts = try? await dataProvider.getFramesProcessedPerMinute(
+            lastMinutes: ocrHistoryWindowMinutes
+        ), !Task.isCancelled {
+            ocrHistoryState.mergeHistoricalCounts(historicalCounts)
+        }
 
-            for (minuteOffset, count) in historicalCounts {
-                let key = nowKey - minuteOffset
-                minuteProcessingCounts[key] = count
-            }
-            updateProcessingHistory()
+        if let rewriteCounts = try? await dataProvider.getFramesRewrittenPerMinute(
+            lastMinutes: rewriteHistoryWindowMinutes
+        ), !Task.isCancelled {
+            rewriteHistoryState.mergeHistoricalCounts(rewriteCounts)
         }
     }
 
     private func updateStats() async {
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
+
         // Get queue statistics
-        if let stats = await coordinator.getQueueStatistics() {
-            queueDepth = stats.queueDepth
-            pendingCount = stats.pendingCount
-            processingCount = stats.processingCount
+        if let stats = await dataProvider.getQueueStatistics() {
+            ocrQueueDepth = stats.ocrQueueDepth
+            ocrPendingCount = stats.ocrPendingCount
+            ocrProcessingCount = stats.ocrProcessingCount
+            rewriteQueueDepth = stats.rewriteQueueDepth
+            rewritePendingCount = stats.rewritePendingCount
+            rewriteProcessingCount = stats.rewriteProcessingCount
 
-            // Calculate frames processed since last update
-            let newlyProcessed = stats.totalProcessed - previousTotalProcessed
-            if previousTotalProcessed > 0 && newlyProcessed > 0 {
-                // Add to current minute's count using stable minute key
-                let currentKey = minuteKey(for: Date())
-                minuteProcessingCounts[currentKey, default: 0] += newlyProcessed
-            }
-            previousTotalProcessed = stats.totalProcessed
-            totalProcessed = stats.totalProcessed
+            ocrTotalProcessed = stats.totalProcessed
+            totalRewritten = stats.totalRewritten
 
-            updateProcessingHistory()
+            ocrHistoryState.recordObservedTotal(stats.totalProcessed)
+            rewriteHistoryState.recordObservedTotal(stats.totalRewritten)
         }
 
+        if let encodingStats = await dataProvider.getEncodingStatistics() {
+            encodedQueueDepth = encodingStats.queueDepth
+            encodedPendingCount = encodingStats.pendingCount
+        }
+
+        if let encodedCounts = try? await dataProvider.getFramesEncodedPerMinute(
+            lastMinutes: encodingHistoryWindowMinutes
+        ), !Task.isCancelled {
+            encodingHistoryState.mergeHistoricalCounts(encodedCounts)
+        }
+
+        #if DEBUG
+        applyDebugQueueOverrides(defaults: defaults)
+        #endif
+        recordQueueDepthSample(ocrQueueDepth)
+
         // Get power state
-        let powerState = coordinator.getCurrentPowerState()
+        let powerState = dataProvider.getCurrentPowerState()
         powerSource = powerState.source
         isPausedForBattery = powerState.isPaused
 
-        // Get OCR enabled state
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
-        ocrEnabled = defaults.object(forKey: "ocrEnabled") as? Bool ?? true
+        // Get OCR power settings snapshot from defaults to keep the nudge logic aligned
+        // with the power configuration shown in Settings.
+        let powerSettings = OCRPowerSettingsSnapshot.fromDefaults(defaults)
+        ocrEnabled = powerSettings.ocrEnabled
+        isRecordingActive = dataProvider.isSystemMonitorRecordingActive
+        ocrProcessingLevel = min(max(powerSettings.processingLevel, 1), 5)
+        pauseOnBatterySetting = powerSettings.pauseOnBattery
+        pauseOnLowPowerModeSetting = powerSettings.pauseOnLowPowerMode
     }
 
-    private func updateProcessingHistory() {
-        let nowKey = minuteKey(for: Date())
+    #if DEBUG
+    private func applyDebugQueueOverrides(defaults: UserDefaults) {
+        let pendingOverride = (defaults.object(forKey: DebugDefaultsKey.ocrPendingCount) as? NSNumber)?.intValue
+        let processingOverride = (defaults.object(forKey: DebugDefaultsKey.ocrProcessingCount) as? NSNumber)?.intValue
+        let queueDepthOverride = (defaults.object(forKey: DebugDefaultsKey.ocrQueueDepth) as? NSNumber)?.intValue
 
-        // Build new history with current minute counts
-        var newHistory: [ProcessingDataPoint] = []
-
-        for minutesAgo in (0..<30).reversed() {
-            let key = nowKey - minutesAgo
-            let count = minuteProcessingCounts[key] ?? 0
-            newHistory.append(ProcessingDataPoint(minute: date(fromMinuteKey: key), count: count))
+        if let pendingOverride {
+            ocrPendingCount = max(pendingOverride, 0)
         }
 
-        processingHistory = newHistory
+        if let processingOverride {
+            ocrProcessingCount = max(processingOverride, 0)
+        }
 
-        // Clean up old entries (older than 31 minutes)
-        let cutoffKey = nowKey - 31
-        minuteProcessingCounts = minuteProcessingCounts.filter { $0.key > cutoffKey }
+        if let queueDepthOverride {
+            ocrQueueDepth = max(queueDepthOverride, 0)
+        } else if pendingOverride != nil || processingOverride != nil {
+            ocrQueueDepth = max(ocrPendingCount + ocrProcessingCount, 0)
+        }
+    }
+    #endif
+
+    private func recordQueueDepthSample(_ depth: Int, at timestamp: Date = Date()) {
+        ocrQueueDepthSamples.append((timestamp: timestamp, depth: max(depth, 0)))
+        let cutoff = timestamp.addingTimeInterval(-queueDepthSampleWindowSeconds)
+        ocrQueueDepthSamples.removeAll { $0.timestamp < cutoff }
+    }
+
+    static func queueDepthChangePerMinute(
+        samples: [(timestamp: Date, depth: Int)],
+        minimumObservationWindow: TimeInterval = 12
+    ) -> Double? {
+        guard let oldestSample = samples.first,
+              let newestSample = samples.last else {
+            return nil
+        }
+
+        let elapsedSeconds = newestSample.timestamp.timeIntervalSince(oldestSample.timestamp)
+        guard elapsedSeconds >= minimumObservationWindow else {
+            return nil
+        }
+
+        let depthDelta = Double(newestSample.depth - oldestSample.depth)
+        return depthDelta / (elapsedSeconds / 60.0)
     }
 }

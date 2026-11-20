@@ -21,7 +21,7 @@ public class PauseReminderWindowController: NSObject, ObservableObject {
 
     // Window dimensions
     private let windowWidth: CGFloat = 220
-    private let windowHeight: CGFloat = 160
+    private let windowHeight: CGFloat = 188
     private let topMargin: CGFloat = 40      // Below menu bar
     private let rightMargin: CGFloat = 16
 
@@ -59,14 +59,24 @@ public class PauseReminderWindowController: NSObject, ObservableObject {
     private func showWindow() {
         guard pauseReminderManager != nil else { return }
 
+        let appWasHidden = NSApp.isHidden
+        if appWasHidden {
+            NSApp.unhideWithoutActivation()
+        }
+
         // If window already exists, just show it
         if let existingWindow = window {
-            existingWindow.orderFront(nil)
+            existingWindow.orderFrontRegardless()
+            Log.info(
+                "[PauseReminderWindowController] Reusing reminder panel appWasHidden=\(appWasHidden)",
+                category: .ui
+            )
             return
         }
 
         // Create the SwiftUI content
         let contentView = PauseReminderView(
+            title: pauseReminderManager?.reminderTitle ?? "Retrace is paused.",
             onResumeCapturing: { [weak self] in
                 Task { @MainActor in
                     await self?.pauseReminderManager?.resumeCapturing()
@@ -75,15 +85,22 @@ public class PauseReminderWindowController: NSObject, ObservableObject {
             onRemindMeLater: { [weak self] in
                 self?.pauseReminderManager?.remindLater()
             },
+            onEditIntervalInSettings: { [weak self] in
+                self?.pauseReminderManager?.dismissReminder()
+                DashboardWindowController.shared.show()
+                DispatchQueue.main.async {
+                    NotificationCenter.default.post(name: .openSettingsPauseReminderInterval, object: nil)
+                }
+            },
             onDismiss: { [weak self] in
                 self?.pauseReminderManager?.remindLater()
             }
         )
 
         // Create the window
-        let window = NSWindow(
+        let window = PauseReminderPanel(
             contentRect: NSRect(x: 0, y: 0, width: windowWidth, height: windowHeight),
-            styleMask: [.borderless],
+            styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
@@ -93,7 +110,8 @@ public class PauseReminderWindowController: NSObject, ObservableObject {
         window.level = .floating  // Float above other windows but below screen saver
         window.hasShadow = false  // We handle shadows in SwiftUI
         window.isMovableByWindowBackground = false
-        window.collectionBehavior = [.canJoinAllSpaces, .stationary]
+        window.hidesOnDeactivate = false
+        window.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary, .stationary]
 
         // Set the SwiftUI content
         window.contentView = NSHostingView(rootView: contentView)
@@ -103,7 +121,7 @@ public class PauseReminderWindowController: NSObject, ObservableObject {
 
         // Show the window with animation
         window.alphaValue = 0
-        window.orderFront(nil)
+        window.orderFrontRegardless()
 
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.3
@@ -112,7 +130,10 @@ public class PauseReminderWindowController: NSObject, ObservableObject {
         }
 
         self.window = window
-        Log.debug("[PauseReminderWindowController] Window shown", category: .ui)
+        Log.info(
+            "[PauseReminderWindowController] Reminder panel shown appWasHidden=\(appWasHidden)",
+            category: .ui
+        )
     }
 
     /// Hide the pause reminder window
@@ -127,6 +148,7 @@ public class PauseReminderWindowController: NSObject, ObservableObject {
             Task { @MainActor [weak self] in
                 window.orderOut(nil)
                 self?.window = nil
+                Log.info("[GhostAppCheck] pause reminder hidden appHidden=\(NSApp.isHidden) appActive=\(NSApp.isActive)", category: .ui)
             }
         })
 
@@ -152,4 +174,13 @@ public class PauseReminderWindowController: NSObject, ObservableObject {
     public var manager: PauseReminderManager? {
         pauseReminderManager
     }
+
+    /// Whether the pause reminder window is currently visible.
+    public var isVisible: Bool {
+        window?.isVisible == true
+    }
+}
+
+private final class PauseReminderPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
 }

@@ -69,27 +69,11 @@ let config = ProcessingConfig(
 await manager.updateConfig(config)
 ```
 
-### Background Queue
-
-```swift
-await manager.queueFrame(frame) { result in
-    switch result {
-    case .success(let text):
-        print("Extracted: \(text.fullText)")
-    case .failure(let error):
-        print("Error: \(error)")
-    }
-}
-
-await manager.waitForQueueDrain()
-```
-
 ## Key Features
 
 - **Vision OCR**: Fast or accurate text recognition with multiple language support
 - **Accessibility API**: Extract text from macOS UI elements with app context
 - **Smart Merging**: Jaccard similarity-based deduplication
-- **Queue Management**: Actor-based thread-safe background processing
 - **Performance**: <500ms OCR, <50ms AX extraction on Apple Silicon
 
 ## Integration

@@ -33,6 +33,8 @@ public actor FTSManager: FTSProtocol {
             let errorMsg = db.map { String(cString: sqlite3_errmsg($0)) } ?? "Unknown error"
             throw DatabaseError.connectionFailed(underlying: errorMsg)
         }
+
+        SQLiteRuntimeDiagnostics.log(label: "FTSManager/open", db: db)
     }
 
     /// Close the database connection
@@ -75,9 +77,14 @@ public actor FTSManager: FTSProtocol {
         }
 
         guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            let errorMessage = String(cString: sqlite3_errmsg(db))
+            Log.error(
+                "[FTSManager] Failed to prepare search statement: \(errorMessage). Runtime: \(SQLiteRuntimeDiagnostics.summary(db: db))",
+                category: .database
+            )
             throw DatabaseError.queryFailed(
                 query: sql,
-                underlying: String(cString: sqlite3_errmsg(db))
+                underlying: errorMessage
             )
         }
 
@@ -124,6 +131,20 @@ public actor FTSManager: FTSProtocol {
             }
         }
 
+        if let windowNameFilter = filters.windowNameFilter?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !windowNameFilter.isEmpty {
+            let windowPattern = "%\(windowNameFilter)%"
+            sqlite3_bind_text(statement, bindIndex, windowPattern, -1, SQLITE_TRANSIENT)
+            bindIndex += 1
+        }
+
+        if let browserUrlFilter = filters.browserUrlFilter?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !browserUrlFilter.isEmpty {
+            let browserPattern = "%\(browserUrlFilter)%"
+            sqlite3_bind_text(statement, bindIndex, browserPattern, -1, SQLITE_TRANSIENT)
+            bindIndex += 1
+        }
+
         // Bind limit and offset
         sqlite3_bind_int(statement, bindIndex, Int32(limit))
         bindIndex += 1
@@ -132,7 +153,7 @@ public actor FTSManager: FTSProtocol {
         // Execute and collect results
         var matches: [FTSMatch] = []
         while sqlite3_step(statement) == SQLITE_ROW {
-            let match = try parseSearchResult(statement: statement!)
+            let match = parseSearchResult(statement: statement!)
             matches.append(match)
         }
 
@@ -153,9 +174,14 @@ public actor FTSManager: FTSProtocol {
         }
 
         guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            let errorMessage = String(cString: sqlite3_errmsg(db))
+            Log.error(
+                "[FTSManager] Failed to prepare count statement: \(errorMessage). Runtime: \(SQLiteRuntimeDiagnostics.summary(db: db))",
+                category: .database
+            )
             throw DatabaseError.queryFailed(
                 query: sql,
-                underlying: String(cString: sqlite3_errmsg(db))
+                underlying: errorMessage
             )
         }
 
@@ -194,6 +220,20 @@ public actor FTSManager: FTSProtocol {
                 sqlite3_bind_text(statement, bindIndex, appPattern, -1, SQLITE_TRANSIENT)
                 bindIndex += 1
             }
+        }
+
+        if let windowNameFilter = filters.windowNameFilter?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !windowNameFilter.isEmpty {
+            let windowPattern = "%\(windowNameFilter)%"
+            sqlite3_bind_text(statement, bindIndex, windowPattern, -1, SQLITE_TRANSIENT)
+            bindIndex += 1
+        }
+
+        if let browserUrlFilter = filters.browserUrlFilter?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !browserUrlFilter.isEmpty {
+            let browserPattern = "%\(browserUrlFilter)%"
+            sqlite3_bind_text(statement, bindIndex, browserPattern, -1, SQLITE_TRANSIENT)
+            bindIndex += 1
         }
 
         guard sqlite3_step(statement) == SQLITE_ROW else {
@@ -249,11 +289,15 @@ public actor FTSManager: FTSProtocol {
         var sql = """
             SELECT
                 searchRanking.rowid, ds.frameId, f.createdAt, s.bundleID, s.windowName,
-                snippet(searchRanking, 0, '<mark>', '</mark>', '...', 32) as snippet,
                 bm25(searchRanking) as rank,
-                f.videoId, f.videoFrameIndex
+                f.videoId, f.videoFrameIndex,
+                snippet(searchRanking, -1, '<mark>', '</mark>', '...', 16) AS snippet
             FROM searchRanking
-            JOIN doc_segment ds ON searchRanking.rowid = ds.docid
+            JOIN (
+                SELECT frameId, MAX(docid) AS docid
+                FROM doc_segment
+                GROUP BY frameId
+            ) ds ON searchRanking.rowid = ds.docid
             JOIN frame f ON ds.frameId = f.id
             JOIN segment s ON f.segmentId = s.id
             WHERE searchRanking MATCH ?
@@ -279,6 +323,14 @@ public actor FTSManager: FTSProtocol {
             sql += " AND (\(placeholders))"
         }
 
+        if filters.windowNameFilter?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
+            sql += " AND s.windowName LIKE ?"
+        }
+
+        if filters.browserUrlFilter?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
+            sql += " AND s.browserUrl LIKE ?"
+        }
+
         sql += " ORDER BY rank LIMIT ? OFFSET ?"
 
         return sql
@@ -289,7 +341,11 @@ public actor FTSManager: FTSProtocol {
         var sql = """
             SELECT COUNT(*)
             FROM searchRanking
-            JOIN doc_segment ds ON searchRanking.rowid = ds.docid
+            JOIN (
+                SELECT frameId, MAX(docid) AS docid
+                FROM doc_segment
+                GROUP BY frameId
+            ) ds ON searchRanking.rowid = ds.docid
             JOIN frame f ON ds.frameId = f.id
             JOIN segment s ON f.segmentId = s.id
             WHERE searchRanking MATCH ?
@@ -313,12 +369,20 @@ public actor FTSManager: FTSProtocol {
             sql += " AND (\(placeholders))"
         }
 
+        if filters.windowNameFilter?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
+            sql += " AND s.windowName LIKE ?"
+        }
+
+        if filters.browserUrlFilter?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
+            sql += " AND s.browserUrl LIKE ?"
+        }
+
         return sql
     }
 
-    private func parseSearchResult(statement: OpaquePointer) throws -> FTSMatch {
+    private func parseSearchResult(statement: OpaquePointer) -> FTSMatch {
         // Column order from query:
-        // searchRanking.rowid, ds.frameId, f.createdAt, s.bundleID, s.windowName, snippet, rank, f.videoId, f.videoFrameIndex
+        // searchRanking.rowid, ds.frameId, f.createdAt, s.bundleID, s.windowName, rank, f.videoId, f.videoFrameIndex, snippet
 
         // Column 0: document id (searchRanking.rowid)
         let documentID = sqlite3_column_int64(statement, 0)
@@ -343,21 +407,18 @@ public actor FTSManager: FTSProtocol {
             windowName = String(cString: windowNameText)
         }
 
-        // Column 5: snippet
-        guard let snippetText = sqlite3_column_text(statement, 5) else {
-            throw DatabaseError.queryFailed(query: "parseSearchResult", underlying: "Missing snippet")
-        }
-        let snippet = String(cString: snippetText)
+        // Column 5: rank (BM25 score - negative, lower is better)
+        let rank = sqlite3_column_double(statement, 5)
 
-        // Column 6: rank (BM25 score - negative, lower is better)
-        let rank = sqlite3_column_double(statement, 6)
-
-        // Column 7: videoId (INTEGER from frame.videoId)
-        let videoIDValue = sqlite3_column_int64(statement, 7)
+        // Column 6: videoId (INTEGER from frame.videoId)
+        let videoIDValue = sqlite3_column_int64(statement, 6)
         let videoID = VideoSegmentID(value: videoIDValue)
 
-        // Column 8: videoFrameIndex (INTEGER from frame.videoFrameIndex)
-        let frameIndex = Int(sqlite3_column_int(statement, 8))
+        // Column 7: videoFrameIndex (INTEGER from frame.videoFrameIndex)
+        let frameIndex = Int(sqlite3_column_int(statement, 7))
+
+        // Column 8: snippet generated by SQLite FTS from the already-sanitized indexed text.
+        let snippet = sqlite3_column_text(statement, 8).map { String(cString: $0) } ?? ""
 
         Log.debug("[FTSManager] Parsed FTS result: frameID=\(frameID.value), videoID=\(videoIDValue), frameIndex=\(frameIndex), snippet='\(snippet.prefix(50))...'", category: .database)
 

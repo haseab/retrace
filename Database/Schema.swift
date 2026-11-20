@@ -75,6 +75,7 @@ enum Schema {
         static let videoFileState = "videoFileState"
         static let frameProcessing = "frame_processing"
         static let purge = "purge"
+        static let dbStorageSnapshot = "db_storage_snapshot"
 
         // Meta
         static let schemaMigrations = "schema_migrations"
@@ -217,7 +218,7 @@ extension Schema {
     ///   - INTEGER videoId (FK video.id ON DELETE SET NULL)
     ///   - INTEGER videoFrameIndex
     ///   - INTEGER isStarred NOT NULL DEFAULT 0
-    ///   - TEXT encodingStatus
+    ///   - INTEGER encodedAt (ms, nullable)
     ///
     /// node: OCR text bounding boxes
     ///   - INTEGER id (PK, auto-increment)
@@ -230,6 +231,7 @@ extension Schema {
     ///   - REAL width NOT NULL (normalized 0.0-1.0)
     ///   - REAL height NOT NULL (normalized 0.0-1.0)
     ///   - INTEGER windowIndex
+    ///   - TEXT encryptedText
     ///
     /// video: Video metadata
     ///   - INTEGER id (PK, auto-increment)
@@ -260,8 +262,8 @@ extension Schema {
     ///
     /// searchRanking_content: FTS external content table
     ///   - INTEGER id (PK, auto-increment)
-    ///   - TEXT c0 (main OCR text, 100-1000+ chars per frame)
-    ///   - TEXT c1 (dual purpose: UI chrome text ~40-50 chars OR overflow OCR 500+ chars)
+    ///   - TEXT c0 (masked OCR text used for FTS and node offsets)
+    ///   - TEXT c1 (masked chrome text)
     ///   - TEXT c2 (window/app title, can be NULL)
     ///
     /// searchRanking: FTS5 virtual table (external content)
@@ -312,11 +314,12 @@ extension Schema {
     ///   - TEXT path NOT NULL
     ///   - TEXT fileType NOT NULL
     ///
-    /// INDEXES (21 total, Rewind-compatible naming):
+    /// INDEXES (selected, Rewind-compatible naming):
     /// - segment: index_segment_on_appid, index_segment_on_endtime, index_segment_on_starttime,
     ///            index_segment_on_windowname (partial), index_segment_on_browserurl (partial)
-    /// - frame: index_frame_on_createdat, index_frame_on_encodingstatus_createdat,
-    ///          index_frame_on_isstarred_createdat, index_frame_on_segmentid_createdat, index_frame_on_videoid
+    /// - frame: index_frame_on_createdat,
+    ///          index_frame_on_isstarred_createdat, index_frame_on_segmentid_createdat, index_frame_on_videoid,
+    ///          idx_frame_encoded_at
     /// - node: index_node_on_frameid, index_node_on_windowindex (partial)
     /// - transcript_word: index_transcript_word_on_segmentid_fulltextoffset
     /// - event: index_event_on_calendarseriesid, index_event_on_status

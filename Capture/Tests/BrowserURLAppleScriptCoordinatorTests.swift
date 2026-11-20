@@ -1,0 +1,571 @@
+import XCTest
+@testable import Capture
+
+final class BrowserURLAppleScriptCoordinatorTests: XCTestCase {
+    func testMissingAutomationTargetIsRejectedWithoutRequestingPermission() {
+        XCTAssertFalse(BrowserURLExtractor.hasAutomationAuthorization(bundleID: "io.retrace.tests.nonexistent-browser"))
+    }
+
+    @MainActor
+    func testStrictAppleScriptWindowSelectionUsesUniqueMatchingTab() throws {
+        let cases = [
+            (#"return selectWindowURL({"News", "Weekly sync"}, {"https://example.com", "https://meet.google.com/abc-defg-hij"}, "Weekly sync")"#, "https://meet.google.com/abc-defg-hij"),
+            (#"return selectWindowURL({"Weekly sync", "Weekly sync"}, {"https://one.example", "https://two.example"}, "Weekly sync")"#, "__STRICT_TITLE_MISMATCH__"),
+            (#"return selectWindowURL({"Weekly sync", "Weekly sync"}, {"", "https://other.example"}, "Weekly sync")"#, "__STRICT_TITLE_MISMATCH__"),
+            (#"return selectWindowURL({"News"}, {"https://example.com"}, "Weekly sync")"#, "__STRICT_TITLE_MISMATCH__"),
+            (#"return selectWindowURL({missing value, "Weekly sync"}, {missing value, "https://meet.google.com/abc-defg-hij"}, "weekly sync")"#, "https://meet.google.com/abc-defg-hij")
+        ]
+        for (invocation, expected) in cases {
+            let script = try XCTUnwrap(NSAppleScript(source: BrowserURLExtractor.strictWindowURLSelectionHandler + "\n" + invocation))
+            var error: NSDictionary?
+            let result = script.executeAndReturnError(&error)
+            XCTAssertNil(error)
+            XCTAssertEqual(result.stringValue, expected)
+        }
+    }
+
+    func testStrictWindowSelectionRejectsMissingAndAmbiguousTitles() {
+        XCTAssertEqual(BrowserURLExtractor.matchingWindowIndex(
+            titles: ["News", "Meet - abc-defg-hij"], requestedTitle: "Meet - abc-defg-hij"
+        ), 1)
+        XCTAssertNil(BrowserURLExtractor.matchingWindowIndex(titles: ["News"], requestedTitle: "Weekly sync"))
+        XCTAssertNil(BrowserURLExtractor.matchingWindowIndex(titles: ["Meet", "Meet"], requestedTitle: "Meet"))
+        XCTAssertNil(BrowserURLExtractor.matchingWindowIndex(titles: ["News"], requestedTitle: nil))
+        XCTAssertEqual(BrowserURLExtractor.matchingWindowIndex(titles: ["Weekly sync - Safari"], requestedTitle: "Weekly sync"), 0)
+        XCTAssertNil(BrowserURLExtractor.matchingWindowIndex(titles: ["Weekly sync", "Weekly sync - Safari"], requestedTitle: "Weekly sync"))
+    }
+
+    actor RunnerProbe {
+        private var callCount = 0
+        private var observedTimeouts: [TimeInterval] = []
+        private var observedBootstrapFlags: [Bool] = []
+
+        private var shouldBlock = false
+        private var isReleased = false
+        private var blockContinuation: CheckedContinuation<Void, Never>?
+
+        func enableBlocking() {
+            shouldBlock = true
+            isReleased = false
+            blockContinuation = nil
+        }
+
+        func releaseBlocking() {
+            isReleased = true
+            blockContinuation?.resume()
+            blockContinuation = nil
+        }
+
+        func recordCall(timeoutSeconds: TimeInterval, isBootstrapTimeout: Bool) {
+            callCount += 1
+            observedTimeouts.append(timeoutSeconds)
+            observedBootstrapFlags.append(isBootstrapTimeout)
+        }
+
+        func waitIfBlockingEnabled() async {
+            guard shouldBlock, !isReleased else { return }
+            await withCheckedContinuation { continuation in
+                blockContinuation = continuation
+            }
+        }
+
+        func waitForCallCount(atLeast minimum: Int) async {
+            while callCount < minimum {
+                try? await Task.sleep(for: .milliseconds(5), clock: .continuous)
+            }
+        }
+
+        func snapshot() -> (callCount: Int, timeouts: [TimeInterval], bootstrapFlags: [Bool]) {
+            return (callCount, observedTimeouts, observedBootstrapFlags)
+        }
+    }
+
+    func testTimeoutEntersCooldownAndSkipsImmediateRelaunch() async {
+        let probe = RunnerProbe()
+        let coordinator = BrowserURLAppleScriptCoordinator(
+            timeoutBaseBackoffSeconds: 5.0,
+            runner: { _, _, _, timeoutSeconds, isBootstrapTimeout, _ in
+                await probe.recordCall(timeoutSeconds: timeoutSeconds, isBootstrapTimeout: isBootstrapTimeout)
+                return BrowserURLAppleScriptResult(didTimeOut: true)
+            }
+        )
+
+        let first = await coordinator.execute(
+            source: "tell application \"Arc\" to return \"\"",
+            browserBundleID: "company.thebrowser.Browser",
+            pid: 123
+        )
+        XCTAssertTrue(first.didTimeOut)
+
+        let second = await coordinator.execute(
+            source: "tell application \"Arc\" to return \"\"",
+            browserBundleID: "company.thebrowser.Browser",
+            pid: 123
+        )
+        XCTAssertTrue(second.skippedByCooldown)
+
+        let snapshot = await probe.snapshot()
+        XCTAssertEqual(snapshot.callCount, 1)
+    }
+
+    func testPermissionDeniedEntersCooldownAndSkipsImmediateRelaunch() async {
+        let probe = RunnerProbe()
+        let coordinator = BrowserURLAppleScriptCoordinator(
+            deniedBaseBackoffSeconds: 20.0,
+            runner: { _, _, _, timeoutSeconds, isBootstrapTimeout, _ in
+                await probe.recordCall(timeoutSeconds: timeoutSeconds, isBootstrapTimeout: isBootstrapTimeout)
+                return BrowserURLAppleScriptResult(
+                    permissionDenied: true,
+                    completedWithoutTimeout: true
+                )
+            }
+        )
+
+        let first = await coordinator.execute(
+            source: "tell application \"Arc\" to return \"\"",
+            browserBundleID: "company.thebrowser.Browser",
+            pid: 321
+        )
+        XCTAssertTrue(first.permissionDenied)
+
+        let second = await coordinator.execute(
+            source: "tell application \"Arc\" to return \"\"",
+            browserBundleID: "company.thebrowser.Browser",
+            pid: 321
+        )
+        XCTAssertTrue(second.skippedByCooldown)
+
+        let snapshot = await probe.snapshot()
+        XCTAssertEqual(snapshot.callCount, 1)
+    }
+
+    func testBootstrapTimeoutTransitionsToNormalAfterNonTimeoutCompletion() async {
+        let probe = RunnerProbe()
+        let coordinator = BrowserURLAppleScriptCoordinator(
+            bootstrapTimeoutSeconds: 11.0,
+            normalTimeoutSeconds: 3.0,
+            runner: { _, _, _, timeoutSeconds, isBootstrapTimeout, _ in
+                await probe.recordCall(timeoutSeconds: timeoutSeconds, isBootstrapTimeout: isBootstrapTimeout)
+                return BrowserURLAppleScriptResult(completedWithoutTimeout: true)
+            }
+        )
+
+        _ = await coordinator.execute(
+            source: "tell application \"Arc\" to return \"\"",
+            browserBundleID: "company.thebrowser.Browser",
+            pid: 555
+        )
+        _ = await coordinator.execute(
+            source: "tell application \"Arc\" to return \"\"",
+            browserBundleID: "company.thebrowser.Browser",
+            pid: 555
+        )
+
+        let snapshot = await probe.snapshot()
+        XCTAssertEqual(snapshot.callCount, 2)
+        XCTAssertEqual(snapshot.bootstrapFlags, [true, false])
+        XCTAssertEqual(snapshot.timeouts.count, 2)
+        XCTAssertEqual(snapshot.timeouts[0], 11.0, accuracy: 0.0001)
+        XCTAssertEqual(snapshot.timeouts[1], 3.0, accuracy: 0.0001)
+    }
+
+    func testInFlightCallsJoinSingleRunnerTask() async {
+        let probe = RunnerProbe()
+        await probe.enableBlocking()
+
+        let coordinator = BrowserURLAppleScriptCoordinator(
+            runner: { _, _, _, timeoutSeconds, isBootstrapTimeout, _ in
+                await probe.recordCall(timeoutSeconds: timeoutSeconds, isBootstrapTimeout: isBootstrapTimeout)
+                await probe.waitIfBlockingEnabled()
+                return BrowserURLAppleScriptResult(
+                    output: "https://example.com",
+                    completedWithoutTimeout: true
+                )
+            }
+        )
+
+        async let first = coordinator.execute(
+            source: "tell application \"Arc\" to return \"https://example.com\"",
+            browserBundleID: "company.thebrowser.Browser",
+            pid: 777
+        )
+
+        await probe.waitForCallCount(atLeast: 1)
+
+        async let second = coordinator.execute(
+            source: "tell application \"Arc\" to return \"https://example.com\"",
+            browserBundleID: "company.thebrowser.Browser",
+            pid: 777
+        )
+
+        await probe.releaseBlocking()
+
+        let firstResult = await first
+        let secondResult = await second
+
+        XCTAssertEqual(firstResult.output, "https://example.com")
+        XCTAssertEqual(secondResult.output, "https://example.com")
+
+        let snapshot = await probe.snapshot()
+        XCTAssertEqual(snapshot.callCount, 1)
+    }
+
+    func testSyntaxErrorEntersCooldownAndSkipsImmediateRelaunch() async {
+        let probe = RunnerProbe()
+        let coordinator = BrowserURLAppleScriptCoordinator(
+            syntaxBaseBackoffSeconds: 20.0,
+            runner: { _, _, _, timeoutSeconds, isBootstrapTimeout, _ in
+                await probe.recordCall(timeoutSeconds: timeoutSeconds, isBootstrapTimeout: isBootstrapTimeout)
+                return BrowserURLAppleScriptResult(
+                    completedWithoutTimeout: true,
+                    scriptSyntaxError: true,
+                    failureCode: -2741
+                )
+            }
+        )
+
+        let first = await coordinator.execute(
+            source: "tell application id \"com.google.Chrome.app.fake\" to return \"\"",
+            browserBundleID: "com.google.Chrome.app.fake",
+            pid: 888,
+            scriptLabel: "syntax-test-1"
+        )
+        XCTAssertTrue(first.scriptSyntaxError)
+        XCTAssertEqual(first.failureCode, -2741)
+
+        let second = await coordinator.execute(
+            source: "tell application id \"com.google.Chrome.app.fake\" to return \"\"",
+            browserBundleID: "com.google.Chrome.app.fake",
+            pid: 888,
+            scriptLabel: "syntax-test-2"
+        )
+        XCTAssertTrue(second.skippedByCooldown)
+
+        let snapshot = await probe.snapshot()
+        XCTAssertEqual(snapshot.callCount, 1)
+    }
+
+    func testCacheTTLOverrideKeepsCachedResultBeyondDefaultTTL() async {
+        let probe = RunnerProbe()
+        let coordinator = BrowserURLAppleScriptCoordinator(
+            cacheTTLSeconds: 0.02,
+            runner: { _, _, _, timeoutSeconds, isBootstrapTimeout, _ in
+                await probe.recordCall(timeoutSeconds: timeoutSeconds, isBootstrapTimeout: isBootstrapTimeout)
+                return BrowserURLAppleScriptResult(
+                    output: "https://example.com/ttl-test",
+                    completedWithoutTimeout: true
+                )
+            }
+        )
+
+        let first = await coordinator.execute(
+            source: "tell application \"Arc\" to return \"https://example.com/ttl-test\"",
+            browserBundleID: "company.thebrowser.Browser",
+            pid: 990,
+            scriptLabel: "ttl-override-1",
+            cacheTTLOverrideSeconds: 0.2
+        )
+        XCTAssertEqual(first.output, "https://example.com/ttl-test")
+        XCTAssertFalse(first.returnedFromCache)
+
+        try? await Task.sleep(for: .milliseconds(80), clock: .continuous)
+
+        let second = await coordinator.execute(
+            source: "tell application \"Arc\" to return \"https://example.com/ttl-test\"",
+            browserBundleID: "company.thebrowser.Browser",
+            pid: 990,
+            scriptLabel: "ttl-override-2",
+            cacheTTLOverrideSeconds: 0.2
+        )
+        XCTAssertEqual(second.output, "https://example.com/ttl-test")
+        XCTAssertTrue(second.returnedFromCache)
+
+        let snapshot = await probe.snapshot()
+        XCTAssertEqual(snapshot.callCount, 1)
+    }
+
+    func testCacheTTLOverrideSurvivesCleanupBeyondDefaultTTL() async {
+        let probe = RunnerProbe()
+        let coordinator = BrowserURLAppleScriptCoordinator(
+            cacheTTLSeconds: 0.02,
+            runner: { _, _, _, timeoutSeconds, isBootstrapTimeout, _ in
+                await probe.recordCall(timeoutSeconds: timeoutSeconds, isBootstrapTimeout: isBootstrapTimeout)
+                return BrowserURLAppleScriptResult(
+                    output: "https://example.com/ttl-prune-test",
+                    completedWithoutTimeout: true
+                )
+            }
+        )
+
+        let first = await coordinator.execute(
+            source: "tell application \"Arc\" to return \"https://example.com/ttl-prune-test\"",
+            browserBundleID: "company.thebrowser.Browser",
+            pid: 1990,
+            scriptLabel: "ttl-prune-1",
+            cacheTTLOverrideSeconds: 0.2
+        )
+        XCTAssertEqual(first.output, "https://example.com/ttl-prune-test")
+        XCTAssertFalse(first.returnedFromCache)
+
+        try? await Task.sleep(for: .milliseconds(80), clock: .continuous)
+
+        let second = await coordinator.execute(
+            source: "tell application \"Arc\" to return \"https://example.com/ttl-prune-test\"",
+            browserBundleID: "company.thebrowser.Browser",
+            pid: 1990,
+            scriptLabel: "ttl-prune-2",
+            cacheTTLOverrideSeconds: 0.2
+        )
+        XCTAssertEqual(second.output, "https://example.com/ttl-prune-test")
+        XCTAssertTrue(second.returnedFromCache)
+
+        let snapshot = await probe.snapshot()
+        XCTAssertEqual(snapshot.callCount, 1)
+    }
+
+    func testWindowCacheKeySeparatesCacheEntriesForSameBundleAndPID() async {
+        let probe = RunnerProbe()
+        let coordinator = BrowserURLAppleScriptCoordinator(
+            cacheTTLSeconds: 60.0,
+            runner: { _, _, _, timeoutSeconds, isBootstrapTimeout, _ in
+                await probe.recordCall(timeoutSeconds: timeoutSeconds, isBootstrapTimeout: isBootstrapTimeout)
+                return BrowserURLAppleScriptResult(
+                    output: "https://example.com/window-sensitive",
+                    completedWithoutTimeout: true
+                )
+            }
+        )
+
+        let first = await coordinator.execute(
+            source: "tell application \"Arc\" to return \"https://example.com/window-sensitive\"",
+            browserBundleID: "company.thebrowser.Browser",
+            pid: 991,
+            windowCacheKey: "Window A",
+            scriptLabel: "window-key-a"
+        )
+        XCTAssertEqual(first.output, "https://example.com/window-sensitive")
+        XCTAssertFalse(first.returnedFromCache)
+
+        let second = await coordinator.execute(
+            source: "tell application \"Arc\" to return \"https://example.com/window-sensitive\"",
+            browserBundleID: "company.thebrowser.Browser",
+            pid: 991,
+            windowCacheKey: "Window B",
+            scriptLabel: "window-key-b"
+        )
+        XCTAssertEqual(second.output, "https://example.com/window-sensitive")
+        XCTAssertFalse(second.returnedFromCache)
+
+        let snapshot = await probe.snapshot()
+        XCTAssertEqual(snapshot.callCount, 2)
+    }
+
+    func testExpiredCacheEntryRerunsAfterTTL() async {
+        let probe = RunnerProbe()
+        let coordinator = BrowserURLAppleScriptCoordinator(
+            cacheTTLSeconds: 0.02,
+            runner: { _, _, _, timeoutSeconds, isBootstrapTimeout, _ in
+                await probe.recordCall(timeoutSeconds: timeoutSeconds, isBootstrapTimeout: isBootstrapTimeout)
+                return BrowserURLAppleScriptResult(
+                    output: "https://example.com/ttl-expiry",
+                    completedWithoutTimeout: true
+                )
+            }
+        )
+
+        let first = await coordinator.execute(
+            source: "tell application \"Arc\" to return \"https://example.com/ttl-expiry\"",
+            browserBundleID: "company.thebrowser.Browser",
+            pid: 1001
+        )
+        XCTAssertFalse(first.returnedFromCache)
+
+        try? await Task.sleep(for: .milliseconds(40), clock: .continuous)
+
+        let second = await coordinator.execute(
+            source: "tell application \"Arc\" to return \"https://example.com/ttl-expiry\"",
+            browserBundleID: "company.thebrowser.Browser",
+            pid: 1001
+        )
+        XCTAssertFalse(second.returnedFromCache)
+
+        let snapshot = await probe.snapshot()
+        XCTAssertEqual(snapshot.callCount, 2)
+    }
+
+    func testExpiredCooldownAllowsRetry() async {
+        let probe = RunnerProbe()
+        actor TimeoutState {
+            private var attempt = 0
+
+            func nextResult() -> BrowserURLAppleScriptResult {
+                attempt += 1
+                if attempt == 1 {
+                    return BrowserURLAppleScriptResult(didTimeOut: true)
+                }
+                return BrowserURLAppleScriptResult(
+                    output: "https://example.com/retry",
+                    completedWithoutTimeout: true
+                )
+            }
+        }
+        let state = TimeoutState()
+        let coordinator = BrowserURLAppleScriptCoordinator(
+            timeoutBaseBackoffSeconds: 0.02,
+            runner: { _, _, _, timeoutSeconds, isBootstrapTimeout, _ in
+                await probe.recordCall(timeoutSeconds: timeoutSeconds, isBootstrapTimeout: isBootstrapTimeout)
+                return await state.nextResult()
+            }
+        )
+
+        let first = await coordinator.execute(
+            source: "tell application \"Arc\" to return \"https://example.com/retry\"",
+            browserBundleID: "company.thebrowser.Browser",
+            pid: 2001
+        )
+        XCTAssertTrue(first.didTimeOut)
+
+        let immediateRetry = await coordinator.execute(
+            source: "tell application \"Arc\" to return \"https://example.com/retry\"",
+            browserBundleID: "company.thebrowser.Browser",
+            pid: 2001
+        )
+        XCTAssertTrue(immediateRetry.skippedByCooldown)
+
+        try? await Task.sleep(for: .milliseconds(40), clock: .continuous)
+
+        let retried = await coordinator.execute(
+            source: "tell application \"Arc\" to return \"https://example.com/retry\"",
+            browserBundleID: "company.thebrowser.Browser",
+            pid: 2001
+        )
+        XCTAssertEqual(retried.output, "https://example.com/retry")
+        XCTAssertFalse(retried.skippedByCooldown)
+
+        let snapshot = await probe.snapshot()
+        XCTAssertEqual(snapshot.callCount, 2)
+    }
+
+    func testIsBrowserRecognizesChromiumAppShims() {
+        XCTAssertTrue(BrowserURLExtractor.isBrowser("com.google.Chrome.app.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"))
+        XCTAssertTrue(BrowserURLExtractor.isBrowser("com.microsoft.edgemac.app.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"))
+        XCTAssertTrue(BrowserURLExtractor.isBrowser("com.brave.Browser.app.cccccccccccccccccccccccccccccccc"))
+        XCTAssertTrue(BrowserURLExtractor.isBrowser("org.chromium.Chromium.app.dddddddddddddddddddddddddddddddd"))
+        XCTAssertTrue(BrowserURLExtractor.isBrowser("ai.perplexity.comet.app.eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"))
+        XCTAssertTrue(BrowserURLExtractor.isBrowser("company.thebrowser.dia.app.ffffffffffffffffffffffffffffffff"))
+        XCTAssertTrue(BrowserURLExtractor.isBrowser("com.sigmaos.sigmaos.macos.app.gggggggggggggggggggggggggggggggg"))
+    }
+
+    func testIsBrowserRecognizesDiaBundleIDs() {
+        XCTAssertTrue(BrowserURLExtractor.isBrowser("company.thebrowser.dia"))
+    }
+
+    func testIsBrowserRecognizesInstalledCometSigmaOSAndFirefoxBundleIDs() {
+        XCTAssertTrue(BrowserURLExtractor.isBrowser("ai.perplexity.comet"))
+        XCTAssertTrue(BrowserURLExtractor.isBrowser("com.sigmaos.sigmaos.macos"))
+        XCTAssertTrue(BrowserURLExtractor.isBrowser("org.mozilla.firefox"))
+        XCTAssertTrue(BrowserURLExtractor.isBrowser("org.mozilla.firefoxbeta"))
+        XCTAssertTrue(BrowserURLExtractor.isBrowser("org.mozilla.firefoxdeveloperedition"))
+        XCTAssertTrue(BrowserURLExtractor.isBrowser("org.mozilla.nightly"))
+    }
+
+    func testGetURLReturnsNilForFirefoxFamily() async {
+        let firefoxBundleIDs = [
+            "org.mozilla.firefox",
+            "org.mozilla.firefoxbeta",
+            "org.mozilla.firefoxdeveloperedition",
+            "org.mozilla.nightly",
+        ]
+
+        for bundleID in firefoxBundleIDs {
+            let url = await BrowserURLExtractor.getURL(bundleID: bundleID, pid: 0, windowCacheKey: "Firefox")
+            XCTAssertNil(url, "Expected URL extraction to be disabled for \(bundleID)")
+        }
+    }
+
+    func testIsBrowserRejectsSafariWebApps() {
+        XCTAssertFalse(BrowserURLExtractor.isBrowser("com.apple.Safari.WebApp.0E0342B7-F35F-420B-951B-F2CDB1400D12"))
+    }
+
+    func testIsBrowserRejectsNonBrowserBundleID() {
+        XCTAssertFalse(BrowserURLExtractor.isBrowser("com.example.notabrowser"))
+        XCTAssertFalse(BrowserURLExtractor.isBrowser("com.google.Chromeapp.fake"))
+    }
+
+    func testNormalizedAXURLValueAcceptsStringAndURLInstances() {
+        XCTAssertEqual(
+            BrowserURLExtractor.normalizedAXURLValue(from: "  https://example.com/string  "),
+            "https://example.com/string"
+        )
+        XCTAssertEqual(
+            BrowserURLExtractor.normalizedAXURLValue(from: URL(string: "https://example.com/url")!),
+            "https://example.com/url"
+        )
+        XCTAssertEqual(
+            BrowserURLExtractor.normalizedAXURLValue(from: NSURL(string: "https://example.com/nsurl")!),
+            "https://example.com/nsurl"
+        )
+    }
+
+    func testNormalizedAXURLValueRejectsEmptyAndUnsupportedValues() {
+        XCTAssertNil(BrowserURLExtractor.normalizedAXURLValue(from: "   "))
+        XCTAssertNil(BrowserURLExtractor.normalizedAXURLValue(from: 42))
+    }
+
+    func testSanitizedBrowserURLCandidateRejectsChromiumInternalPages() {
+        XCTAssertNil(
+            BrowserURLExtractor.sanitizedBrowserURLCandidate(
+                "chrome-extension://mpognobbkildjkofajifpdfhcoklimli/window.html",
+                for: "com.vivaldi.Vivaldi"
+            )
+        )
+        XCTAssertNil(
+            BrowserURLExtractor.sanitizedBrowserURLCandidate(
+                "chrome://settings",
+                for: "com.google.Chrome"
+            )
+        )
+        XCTAssertNil(
+            BrowserURLExtractor.sanitizedBrowserURLCandidate(
+                "vivaldi://settings",
+                for: "com.vivaldi.Vivaldi"
+            )
+        )
+        XCTAssertEqual(
+            BrowserURLExtractor.sanitizedBrowserURLCandidate(
+                "https://www.youtube.com/watch?v=abc123",
+                for: "com.vivaldi.Vivaldi"
+            ),
+            "https://www.youtube.com/watch?v=abc123"
+        )
+    }
+
+    func testNormalizedWindowTitleForWindowMatchCollapsesWhitespace() {
+        XCTAssertEqual(
+            BrowserURLExtractor.normalizedWindowTitleForWindowMatch("  Meet   -   abc-defg-hij \n "),
+            "Meet - abc-defg-hij"
+        )
+        XCTAssertNil(BrowserURLExtractor.normalizedWindowTitleForWindowMatch("   "))
+    }
+
+    func testChromiumWindowTitleMatchesRequestedWindowAllowsBrowserSuffixForm() {
+        XCTAssertTrue(
+            BrowserURLExtractor.chromiumWindowTitleMatchesRequestedWindow(
+                windowTitle: "Daily Standup",
+                requestedWindowCacheKey: "Google Meet - Daily Standup"
+            )
+        )
+        XCTAssertTrue(
+            BrowserURLExtractor.chromiumWindowTitleMatchesRequestedWindow(
+                windowTitle: "Meet - abc-defg-hij",
+                requestedWindowCacheKey: "Meet - abc-defg-hij"
+            )
+        )
+        XCTAssertFalse(
+            BrowserURLExtractor.chromiumWindowTitleMatchesRequestedWindow(
+                windowTitle: "Meet - abc-defg-hij",
+                requestedWindowCacheKey: "Meet - xyz-qrst-uvw"
+            )
+        )
+    }
+}

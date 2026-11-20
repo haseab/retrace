@@ -18,6 +18,8 @@ import Shared
 // ╚══════════════════════════════════════════════════════════════════════════════╝
 
 final class OCRPipelineTests: XCTestCase {
+    private static let screenshotFixtureSkipMessage =
+        "Integration-only test. Set TEST_SCREENSHOT_PATH to a directory of .jpeg screenshots to run it."
 
     // MARK: - Properties
 
@@ -26,35 +28,51 @@ final class OCRPipelineTests: XCTestCase {
     var storage: StorageManager!
     var processing: ProcessingManager!
     var search: SearchManager!
+    var testRoot: URL!
 
     /// Path to test screenshots (set via TEST_SCREENSHOT_PATH env var)
-    var screenshotPath: String {
-        ProcessInfo.processInfo.environment["TEST_SCREENSHOT_PATH"] ?? NSString(string: "~/ScreenMemoryData/screenshots").expandingTildeInPath
+    var screenshotPath: String? {
+        let path = ProcessInfo.processInfo.environment["TEST_SCREENSHOT_PATH"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let path, !path.isEmpty else {
+            return nil
+        }
+        return path
     }
 
-    /// Database path for this test (uses AppPaths which respects custom location)
+    /// Database path for this test (isolated temp location)
     var testDatabasePath: String {
-        NSString(string: AppPaths.databasePath).expandingTildeInPath
+        testRoot.appendingPathComponent("retrace-test.db").path
     }
 
-    /// Storage root for video segments (uses AppPaths which respects custom location)
+    /// Storage root for video segments (isolated temp location)
     var storageRoot: URL {
-        URL(fileURLWithPath: AppPaths.expandedStorageRoot)
+        testRoot.appendingPathComponent("storage", isDirectory: true)
     }
 
     // MARK: - Setup/Teardown
 
     override func setUp() async throws {
+        guard screenshotPath != nil else {
+            throw XCTSkip(Self.screenshotFixtureSkipMessage)
+        }
+
         print("\n" + String(repeating: "═", count: 70))
         print("  OCR PIPELINE TEST - Processing Real Screenshots")
         print(String(repeating: "═", count: 70))
 
-        // Create directories if needed
-        try FileManager.default.createDirectory(atPath: AppPaths.expandedStorageRoot, withIntermediateDirectories: true)
+        testRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RetraceOCRPipelineTests_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: testRoot, withIntermediateDirectories: true)
+
+        // Create isolated storage directory for this test run
         try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
 
-        // Initialize managers with real database path
-        database = DatabaseManager(databasePath: testDatabasePath)
+        // Initialize managers with isolated test database path
+        database = DatabaseManager(
+            databasePath: testDatabasePath,
+            storageRootPath: storageRoot.path
+        )
         ftsManager = FTSManager(databasePath: testDatabasePath)
         storage = StorageManager(storageRoot: storageRoot)
         processing = ProcessingManager(config: .default)
@@ -83,13 +101,21 @@ final class OCRPipelineTests: XCTestCase {
     }
 
     override func tearDown() async throws {
-        try await ftsManager.close()
-        try await database.close()
+        if ftsManager != nil {
+            try await ftsManager.close()
+        }
+        if database != nil {
+            try await database.close()
+        }
         database = nil
         ftsManager = nil
         storage = nil
         processing = nil
         search = nil
+        if testRoot != nil {
+            try? FileManager.default.removeItem(at: testRoot)
+        }
+        testRoot = nil
 
         print("\n✓ Test cleanup complete")
         print(String(repeating: "═", count: 70) + "\n")
@@ -99,6 +125,10 @@ final class OCRPipelineTests: XCTestCase {
 
     /// Process all screenshots through the full pipeline
     func testProcessScreenshotsThroughFullPipeline() async throws {
+        guard let screenshotPath else {
+            throw XCTSkip(Self.screenshotFixtureSkipMessage)
+        }
+
         // STEP 1: Discover all screenshot files
         print("\n📁 Scanning for screenshots...")
         let files = try FileManager.default.contentsOfDirectory(atPath: screenshotPath)

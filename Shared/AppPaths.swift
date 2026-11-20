@@ -4,10 +4,20 @@ import Foundation
 /// Single source of truth for all path constants used across the app
 public enum AppPaths {
 
+    /// Only the persistent bundled development identity uses the separate namespace.
+    public static let isDevelopment = Bundle.main.bundleIdentifier == "io.retrace.app.dev"
+    public static let settingsSuiteName = isDevelopment ? "io.retrace.app.dev" : "io.retrace.app"
+    public static let applicationSupportName = isDevelopment ? "Retrace Dev" : "Retrace"
+    public static let cacheDirectory: URL = {
+        let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        return isDevelopment ? base.appendingPathComponent(settingsSuiteName, isDirectory: true) : base
+    }()
+
     // MARK: - Base Paths
 
     /// Default root storage path for all app data (tilde expanded)
-    public static let defaultStorageRoot = NSString(string: "~/Library/Application Support/Retrace").expandingTildeInPath
+    public static let defaultStorageRoot = NSString(string: "~/Library/Application Support/\(applicationSupportName)").expandingTildeInPath
 
     /// Default Rewind/MemoryVault storage root path (tilde expanded)
     public static let defaultRewindStorageRoot = NSString(string: "~/Library/Application Support/com.memoryvault.MemoryVault").expandingTildeInPath
@@ -17,7 +27,7 @@ public enum AppPaths {
 
     /// Root storage path for all app data (respects custom location if set)
     public static var storageRoot: String {
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
         return defaults.string(forKey: "customRetraceDBLocation") ?? defaultStorageRoot
     }
 
@@ -34,12 +44,24 @@ public enum AppPaths {
     }
 
     /// Rewind/MemoryVault storage root (respects custom location if set)
-    /// Derived from customRewindDBLocation by getting its parent directory
+    /// `customRewindDBLocation` stores a folder path. Legacy file-path values are normalized.
     public static var rewindStorageRoot: String {
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
-        if let customDBPath = defaults.string(forKey: "customRewindDBLocation") {
-            // Custom DB path is like "/path/to/db-enc.sqlite3", storage root is the parent directory
-            return (customDBPath as NSString).deletingLastPathComponent
+        let defaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
+        if let customLocation = defaults.string(forKey: "customRewindDBLocation") {
+            let normalized = NSString(string: customLocation).expandingTildeInPath
+            let fileManager = FileManager.default
+            var isDirectory: ObjCBool = false
+            if fileManager.fileExists(atPath: normalized, isDirectory: &isDirectory), !isDirectory.boolValue {
+                // Backward compatibility for older file-based setting values.
+                return (normalized as NSString).deletingLastPathComponent
+            }
+
+            let lastComponent = (normalized as NSString).lastPathComponent.lowercased()
+            if lastComponent.hasSuffix(".sqlite3") || lastComponent.hasSuffix(".db") {
+                // Handle legacy values that point to a DB file that is no longer present.
+                return (normalized as NSString).deletingLastPathComponent
+            }
+            return normalized
         }
         return defaultRewindStorageRoot
     }
@@ -49,12 +71,8 @@ public enum AppPaths {
         NSString(string: rewindStorageRoot).expandingTildeInPath
     }
 
-    /// Rewind database path (respects custom location if set)
+    /// Rewind database path (db-enc.sqlite3 under rewindStorageRoot)
     public static var rewindDBPath: String {
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
-        if let customPath = defaults.string(forKey: "customRewindDBLocation") {
-            return customPath
-        }
         return "\(rewindStorageRoot)/db-enc.sqlite3"
     }
 
@@ -82,7 +100,7 @@ public enum AppPaths {
     // MARK: - Keychain
 
     /// Keychain service identifier for database encryption
-    public static let keychainService = "com.retrace.database"
+    public static let keychainService = isDevelopment ? "com.retrace.database.dev" : "com.retrace.database"
 
     /// Keychain account for SQLCipher key
     public static let keychainAccount = "sqlcipher-key"
@@ -90,5 +108,5 @@ public enum AppPaths {
     // MARK: - Logging
 
     /// Log subsystem identifier
-    public static let logSubsystem = "io.retrace.app"
+    public static let logSubsystem = settingsSuiteName
 }

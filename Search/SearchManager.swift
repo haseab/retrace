@@ -65,8 +65,8 @@ public actor SearchManager: SearchProtocol {
         let parsed = try queryParser.parse(rawQuery: query.text)
 
         // Build FTS query
-        let ftsQuery = parsed.toFTSQuery()
-        Log.debug("[SearchManager] Raw query: '\(query.text)' → FTS query: '\(ftsQuery)' | terms: \(parsed.searchTerms) | phrases: \(parsed.phrases)", category: .search)
+        let searchableColumnsFTSQuery = Self.buildScopedFTSQuery(for: parsed)
+        Log.debug("[SearchManager] Raw query: '\(query.text)' → FTS query: '\(searchableColumnsFTSQuery)' | terms: \(parsed.searchTerms) | phrases: \(parsed.phrases) | excluded: \(parsed.excludedTerms)", category: .search)
 
         // Build filters
         var filters = query.filters
@@ -74,28 +74,39 @@ public actor SearchManager: SearchProtocol {
             filters = SearchFilters(
                 startDate: filters.startDate ?? parsed.dateRange.start,
                 endDate: filters.endDate ?? parsed.dateRange.end,
+                dateRanges: filters.dateRanges,
                 appBundleIDs: [appFilter],
-                excludedAppBundleIDs: filters.excludedAppBundleIDs
+                excludedAppBundleIDs: filters.excludedAppBundleIDs,
+                selectedTagIds: filters.selectedTagIds,
+                excludedTagIds: filters.excludedTagIds,
+                hiddenFilter: filters.hiddenFilter,
+                commentFilter: filters.commentFilter,
+                windowNameFilter: filters.windowNameFilter,
+                browserUrlFilter: filters.browserUrlFilter
             )
         } else if parsed.dateRange.start != nil || parsed.dateRange.end != nil {
             filters = SearchFilters(
                 startDate: filters.startDate ?? parsed.dateRange.start,
                 endDate: filters.endDate ?? parsed.dateRange.end,
+                dateRanges: filters.dateRanges,
                 appBundleIDs: filters.appBundleIDs,
-                excludedAppBundleIDs: filters.excludedAppBundleIDs
+                excludedAppBundleIDs: filters.excludedAppBundleIDs,
+                selectedTagIds: filters.selectedTagIds,
+                excludedTagIds: filters.excludedTagIds,
+                hiddenFilter: filters.hiddenFilter,
+                commentFilter: filters.commentFilter,
+                windowNameFilter: filters.windowNameFilter,
+                browserUrlFilter: filters.browserUrlFilter
             )
         }
 
         // Execute FTS search
         let ftsMatches = try await ftsEngine.search(
-            query: ftsQuery,
+            query: searchableColumnsFTSQuery,
             filters: filters,
             limit: query.limit,
             offset: query.offset
         )
-
-        // Get total count for pagination
-        let totalCount = try await ftsEngine.getMatchCount(query: ftsQuery, filters: filters)
 
         // Convert FTS matches to SearchResults
         var results: [SearchResult] = []
@@ -144,7 +155,6 @@ public actor SearchManager: SearchProtocol {
         return SearchResults(
             query: query,
             results: filteredResults,
-            totalCount: totalCount,
             searchTimeMs: searchTimeMs
         )
     }
@@ -160,7 +170,7 @@ public actor SearchManager: SearchProtocol {
 
         // Use prefix search to find matching terms
         // Search for "prefix*" to get documents containing words starting with prefix
-        let prefixQuery = "\(prefix)*"
+        let prefixQuery = scopeToSearchableColumns("\(prefix)*")
 
         do {
             let results = try await ftsEngine.search(
@@ -278,5 +288,48 @@ public actor SearchManager: SearchProtocol {
         // BM25 returns negative values (more negative = better match)
         // Normalize to 0-1 range: higher score for more negative BM25
         return -bm25Rank / (1.0 + abs(bm25Rank))
+    }
+
+    /// Scope a plain FTS query to OCR columns only (`text` + `otherText`), excluding `title`.
+    /// This is used for include-only helper queries (e.g. suggestions).
+    private func scopeToSearchableColumns(_ query: String) -> String {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return query }
+        return "((text:(\(trimmed))) OR (otherText:(\(trimmed))))"
+    }
+
+    /// Build an FTS query that searches OCR columns and applies exclusions globally.
+    /// Example: `haseab -wave` becomes:
+    /// `((text:(haseab*)) OR (otherText:(haseab*))) NOT ((text:(wave)) OR (otherText:(wave)))`
+    static func buildScopedFTSQuery(for parsed: ParsedQuery) -> String {
+        let includeQuery = buildIncludeFTSQuery(for: parsed)
+        let trimmedInclude = includeQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedInclude.isEmpty else { return includeQuery }
+
+        var query = "((text:(\(trimmedInclude))) OR (otherText:(\(trimmedInclude))))"
+        for excluded in parsed.excludedTerms {
+            let escaped = QueryTokenizer.sanitizeFTSTerm(excluded)
+            let excludedToken = excluded.contains(where: \.isWhitespace) ? "\"\(escaped)\"" : escaped
+            let excludedScope = "((text:(\(excludedToken))) OR (otherText:(\(excludedToken))))"
+            query = "(\(query) NOT \(excludedScope))"
+        }
+
+        return query
+    }
+
+    private static func buildIncludeFTSQuery(for parsed: ParsedQuery) -> String {
+        var parts: [String] = []
+
+        for term in parsed.searchTerms {
+            let escaped = QueryTokenizer.sanitizeFTSTerm(term)
+            parts.append("\(escaped)*")
+        }
+
+        for phrase in parsed.phrases {
+            let escaped = QueryTokenizer.sanitizeFTSTerm(phrase)
+            parts.append("\"\(escaped)\"")
+        }
+
+        return parts.joined(separator: " ")
     }
 }

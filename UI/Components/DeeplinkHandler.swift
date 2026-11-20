@@ -3,8 +3,10 @@ import SwiftUI
 import Shared
 
 /// Handles deeplink URL routing for Retrace
-/// Supports: retrace://search?q={query}&timestamp={unix_ms}&app={bundle_id}
-///           retrace://timeline?timestamp={unix_ms}
+/// Supports: retrace://search?q={query}&t={unix_ms}&app={bundle_id}
+///           retrace://timeline?t={unix_ms}
+///           retrace://dashboard?start={unix_ms_or_ISO8601}&end={unix_ms_or_ISO8601}
+///           (legacy timestamp key `timestamp` is also accepted)
 @MainActor
 public class DeeplinkHandler: ObservableObject {
 
@@ -15,54 +17,119 @@ public class DeeplinkHandler: ObservableObject {
     // MARK: - URL Handling
 
     public func handle(_ url: URL) {
+        guard let route = Self.route(for: url) else { return }
+        activeRoute = route
+
+        switch route {
+        case let .search(query, timestamp, appBundleID):
+            Log.info("[DeeplinkHandler] Navigating to search: query=\(query ?? "nil"), timestamp=\(String(describing: timestamp)), app=\(appBundleID ?? "nil")", category: .ui)
+        case let .timeline(timestamp):
+            Log.info("[DeeplinkHandler] Navigating to timeline: timestamp=\(String(describing: timestamp))", category: .ui)
+        case let .dashboard(dateRange):
+            Log.info("[DeeplinkHandler] Navigating to dashboard: range=\(String(describing: dateRange))", category: .ui)
+        }
+    }
+
+    /// Parse a deeplink URL into a route, accepting both `t` and `timestamp`.
+    public static func route(for url: URL, calendar: Calendar = .current) -> DeeplinkRoute? {
         guard url.scheme == "retrace" else {
             Log.warning("[DeeplinkHandler] Invalid scheme: \(url.scheme ?? "none")", category: .ui)
-            return
+            return nil
         }
 
         guard let host = url.host else {
             Log.warning("[DeeplinkHandler] No host in URL: \(url)", category: .ui)
-            return
+            return nil
         }
 
         let queryParams = url.queryParameters
 
         switch host.lowercased() {
         case "search":
-            handleSearchRoute(queryParams: queryParams)
+            let query = queryParams["q"].flatMap { $0.trimmedOrNil }
+            let timestamp = parseTimestamp(queryParams: queryParams)
+            let appBundleID = queryParams["app"].flatMap { $0.trimmedOrNil }
+            return .search(query: query, timestamp: timestamp, appBundleID: appBundleID)
 
         case "timeline":
-            handleTimelineRoute(queryParams: queryParams)
+            let timestamp = parseTimestamp(queryParams: queryParams)
+            return .timeline(timestamp: timestamp)
+
+        case "dashboard":
+            let boundItems = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.filter {
+                $0.name == "start" || $0.name == "end"
+            } ?? []
+            guard !boundItems.isEmpty else {
+                return .dashboard(dateRange: nil)
+            }
+            guard boundItems.count == 2,
+                  let rawStart = queryParams["start"]?.trimmedOrNil,
+                  let rawEnd = queryParams["end"]?.trimmedOrNil,
+                  let start = parseDashboardDate(rawStart, isEnd: false, calendar: calendar),
+                  let end = parseDashboardDate(rawEnd, isEnd: true, calendar: calendar),
+                  start <= end else {
+                Log.warning("[DeeplinkHandler] Dashboard requires valid start/end datetimes in ascending order", category: .ui)
+                return nil
+            }
+            let daySpan = (calendar.dateComponents(
+                [.day],
+                from: calendar.startOfDay(for: start),
+                to: calendar.startOfDay(for: end)
+            ).day ?? 0) + 1
+            guard daySpan <= DashboardViewModel.maxAppUsageRangeDays else {
+                Log.warning("[DeeplinkHandler] Dashboard range exceeds 31 days", category: .ui)
+                return nil
+            }
+            return .dashboard(dateRange: DateRangeCriterion(start: start, end: end))
 
         default:
             Log.warning("[DeeplinkHandler] Unknown route: \(host)", category: .ui)
+            return nil
         }
     }
 
-    // MARK: - Route Handlers
+    private static func parseDashboardDate(_ text: String, isEnd: Bool, calendar: Calendar) -> Date? {
+        if let milliseconds = Int64(text) {
+            // Bound dates to years 1...9999 before calendar arithmetic or formatting.
+            guard (-62_135_596_800_000...253_402_300_799_999).contains(milliseconds) else { return nil }
+            return Date(timeIntervalSince1970: Double(milliseconds) / 1000)
+        }
 
-    private func handleSearchRoute(queryParams: [String: String]) {
-        let query = queryParams["q"]
-        let timestamp = queryParams["t"].flatMap { Int64($0) }.map { Date(timeIntervalSince1970: TimeInterval($0 / 1000)) }
-        let appBundleID = queryParams["app"]
+        if text.range(of: #"^\d{4}-\d{2}-\d{2}$"#, options: .regularExpression) != nil {
+            let formatter = DateFormatter()
+            formatter.calendar = calendar
+            formatter.timeZone = calendar.timeZone
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.dateFormat = "yyyy-MM-dd"
+            formatter.isLenient = false
+            guard let date = formatter.date(from: text), formatter.string(from: date) == text else { return nil }
+            return isEnd ? DateRangeInputParser(calendar: calendar).endOfDay(date) : calendar.startOfDay(for: date)
+        }
 
-        let route = DeeplinkRoute.search(
-            query: query,
-            timestamp: timestamp,
-            appBundleID: appBundleID
-        )
-
-        activeRoute = route
-        Log.info("[DeeplinkHandler] Navigating to search: query=\(query ?? "nil"), timestamp=\(String(describing: timestamp)), app=\(appBundleID ?? "nil")", category: .ui)
+        // External apps must supply a timezone for exact datetimes.
+        guard text.range(of: #"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"#, options: .regularExpression) != nil else {
+            return nil
+        }
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = text.contains(".")
+            ? [.withInternetDateTime, .withFractionalSeconds]
+            : [.withInternetDateTime]
+        return formatter.date(from: text)
     }
 
-    private func handleTimelineRoute(queryParams: [String: String]) {
-        let timestamp = queryParams["t"].flatMap { Int64($0) }.map { Date(timeIntervalSince1970: TimeInterval($0 / 1000)) }
+    private static func parseTimestamp(queryParams: [String: String]) -> Date? {
+        let canonicalTimestamp = queryParams["t"].flatMap { $0.trimmedOrNil }
+        let legacyTimestamp = queryParams["timestamp"].flatMap { $0.trimmedOrNil }
+        guard let rawTimestamp = canonicalTimestamp ?? legacyTimestamp else {
+            return nil
+        }
 
-        let route = DeeplinkRoute.timeline(timestamp: timestamp)
+        guard let unixMs = Int64(rawTimestamp) else {
+            Log.warning("[DeeplinkHandler] Invalid timestamp value: \(rawTimestamp)", category: .ui)
+            return nil
+        }
 
-        activeRoute = route
-        Log.info("[DeeplinkHandler] Navigating to timeline: timestamp=\(String(describing: timestamp))", category: .ui)
+        return Date(timeIntervalSince1970: TimeInterval(unixMs) / 1000.0)
     }
 
     // MARK: - URL Generation
@@ -106,6 +173,25 @@ public class DeeplinkHandler: ObservableObject {
         return components.url
     }
 
+    public static func generateDashboardLink(start: Date? = nil, end: Date? = nil) -> URL? {
+        var components = URLComponents()
+        components.scheme = "retrace"
+        components.host = "dashboard"
+        if start != nil || end != nil {
+            guard let start, let end else { return nil }
+            let bounds = [start.timeIntervalSince1970 * 1000, end.timeIntervalSince1970 * 1000]
+            guard bounds.allSatisfy({ $0.isFinite && (-62_135_596_800_000...253_402_300_799_999).contains($0) }) else {
+                return nil
+            }
+            components.queryItems = [
+                URLQueryItem(name: "start", value: String(Int64(bounds[0].rounded()))),
+                URLQueryItem(name: "end", value: String(Int64(bounds[1].rounded())))
+            ]
+        }
+        guard let url = components.url, route(for: url) != nil else { return nil }
+        return url
+    }
+
     // MARK: - Reset
 
     public func clearActiveRoute() {
@@ -118,6 +204,7 @@ public class DeeplinkHandler: ObservableObject {
 public enum DeeplinkRoute: Equatable {
     case search(query: String?, timestamp: Date?, appBundleID: String?)
     case timeline(timestamp: Date?)
+    case dashboard(dateRange: DateRangeCriterion?)
 
     public static func == (lhs: DeeplinkRoute, rhs: DeeplinkRoute) -> Bool {
         switch (lhs, rhs) {
@@ -125,6 +212,8 @@ public enum DeeplinkRoute: Equatable {
             return q1 == q2 && t1 == t2 && a1 == a2
         case let (.timeline(t1), .timeline(t2)):
             return t1 == t2
+        case let (.dashboard(range1), .dashboard(range2)):
+            return range1 == range2
         default:
             return false
         }
@@ -145,5 +234,12 @@ extension URL {
             params[item.name] = item.value
         }
         return params
+    }
+}
+
+private extension String {
+    var trimmedOrNil: String? {
+        let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 }

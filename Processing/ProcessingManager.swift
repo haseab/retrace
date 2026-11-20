@@ -1,20 +1,20 @@
 import Foundation
 import Shared
 
-/// Debug logger that writes to /tmp/retrace_debug.log
-private func debugLog(_ message: String) {
-    let logLine = "[\(Log.timestamp())] [ProcessingManager] \(message)\n"
-    let logPath = "/tmp/retrace_debug.log"
+private struct BuildExtractedTextOutput {
+    let extractedText: ExtractedText
+    let attributedResidualBytes: Int64
+    let outputPayloadBytes: Int64
+}
 
-    if let handle = FileHandle(forWritingAtPath: logPath) {
-        handle.seekToEndOfFile()
-        if let data = logLine.data(using: .utf8) {
-            handle.write(data)
-        }
-        handle.closeFile()
-    } else {
-        FileManager.default.createFile(atPath: logPath, contents: logLine.data(using: .utf8))
-    }
+private enum OCRExtractionMode: Equatable {
+    case fullFrame
+    case regionBased
+}
+
+private struct OCRExtractionOutput {
+    let regions: [TextRegion]
+    let mode: OCRExtractionMode
 }
 
 // MARK: - ProcessingManager
@@ -22,6 +22,10 @@ private func debugLog(_ message: String) {
 /// Main actor implementing ProcessingProtocol
 /// Coordinates OCR, Accessibility API, and text merging
 public actor ProcessingManager: ProcessingProtocol {
+    private static let memoryLedgerPreviousFrameTag = "processing.ocr.previousFrame"
+    private static let memoryLedgerRegionCacheTag = "processing.ocr.fullFrameRegionCache"
+    private static let memoryLedgerTileGridTag = "processing.ocr.fullFrameTileGrid"
+    private static let memoryLedgerSummaryIntervalSeconds: TimeInterval = 30
 
     // MARK: - Dependencies
 
@@ -33,18 +37,13 @@ public actor ProcessingManager: ProcessingProtocol {
 
     private var config: ProcessingConfig
 
-    // Processing queue
-    private var processingQueue: [(CapturedFrame, (Result<ExtractedText, ProcessingError>) -> Void)] = []
-    private var isProcessing = false
-
     // Region-based OCR state
     private var fullFrameCache: FullFrameOCRCache?
     private var previousFrame: CapturedFrame?
+    private var extractingFrame = false
+    private var extractionWaiters: [CheckedContinuation<Void, Never>] = []
     private var useRegionBasedOCR: Bool = true
 
-    // Serialization for region-based OCR (prevents concurrent cache access)
-    private var extractionQueue: [CheckedContinuation<Void, Never>] = []
-    private var isExtractingText: Bool = false
 
     // Region OCR statistics
     private var totalEnergySavings: Double = 0
@@ -71,66 +70,97 @@ public actor ProcessingManager: ProcessingProtocol {
         self.config = config
     }
 
-    /// Helper to resume next queued extraction or clear the flag
-    private func finishExtraction() {
-        debugLog("finishExtraction, queue size=\(extractionQueue.count)")
-        if !extractionQueue.isEmpty {
-            let next = extractionQueue.removeFirst()
-            next.resume()
-        } else {
-            isExtractingText = false
-        }
-    }
 
     public func extractText(from frame: CapturedFrame) async throws -> ExtractedText {
+        // Actor methods reenter across OCR awaits. Keep the previous pixels and OCR cache
+        // in one ordered frame transaction while requests within a frame can run concurrently.
+        await beginFrameExtraction()
+        defer { endFrameExtraction() }
+        try Task.checkCancellation()
+        let instrumentation = await ProcessingExtractRequestInstrumentation.begin()
         let startTime = Date()
-        debugLog("extractText START frame=\(frame.width)x\(frame.height), isExtractingText=\(isExtractingText)")
-
-        // Serialize extraction calls to prevent race conditions with region-based OCR cache
-        if isExtractingText {
-            debugLog("Waiting in queue...")
-            await withCheckedContinuation { continuation in
-                extractionQueue.append(continuation)
-            }
-            debugLog("Resumed from queue")
-        }
-        isExtractingText = true
-
-        debugLog("extractText RUNNING frame=\(frame.width)x\(frame.height)")
-
         do {
-            let result = try await extractTextInternal(from: frame, startTime: startTime)
-            finishExtraction()
-            return result
+            let ocrExtraction = try await extractOCRRegions(
+                from: frame,
+                instrumentation: instrumentation
+            )
+            let windowRegions = frame.metadata.ocrRegions.map {
+                WindowOCRPlanner.pixelRegions($0, width: frame.width, height: frame.height) ?? []
+            }
+            let orderedOCRRegions = OCRReadingOrder.ordered(ocrExtraction.regions, windows: windowRegions)
+            let ocrRegions: [TextRegion]
+            if config.accessibilityEnabled, let snapshot = frame.accessibilitySnapshot {
+                ocrRegions = await AccessibilityOCRCorrector.correct(
+                    orderedOCRRegions, snapshot: snapshot,
+                    recognitionLanguages: config.recognitionLanguages,
+                    windowRegions: windowRegions
+                )
+            } else {
+                ocrRegions = orderedOCRRegions
+            }
+            let ocrStage = await instrumentation.recordOCRStage(
+                ocrRegions: ocrRegions,
+                schedulesReturnResidualProbes: ocrExtraction.mode == .fullFrame
+            )
+
+            let buildOutput = try await buildExtractedText(
+                timestamp: frame.timestamp,
+                frameHeight: frame.height,
+                metadata: frame.metadata,
+                ocrRegions: ocrRegions,
+                startTime: startTime,
+                instrumentation: instrumentation
+            )
+            await instrumentation.recordExtractCompletion(
+                ocrStage: ocrStage,
+                attributedResidualBytes: buildOutput.attributedResidualBytes,
+                outputPayloadBytes: buildOutput.outputPayloadBytes
+            )
+
+            await instrumentation.finish()
+            return buildOutput.extractedText
         } catch {
-            finishExtraction()
+            await instrumentation.finish()
             throw error
         }
     }
 
-    private func extractTextInternal(from frame: CapturedFrame, startTime: Date) async throws -> ExtractedText {
+    private func beginFrameExtraction() async {
+        if !extractingFrame { extractingFrame = true; return }
+        await withCheckedContinuation { extractionWaiters.append($0) }
+    }
 
+    private func endFrameExtraction() {
+        if extractionWaiters.isEmpty { extractingFrame = false }
+        else { extractionWaiters.removeFirst().resume() }
+    }
+
+    private func extractOCRRegions(
+        from frame: CapturedFrame,
+        instrumentation: ProcessingExtractRequestInstrumentation
+    ) async throws -> OCRExtractionOutput {
         // Ensure full-frame cache is initialized for region-based OCR
         if fullFrameCache == nil {
-            debugLog("Creating new FullFrameOCRCache")
             fullFrameCache = FullFrameOCRCache()
         }
 
         // Perform OCR (region-based or full-frame)
-        let ocrRegions: [TextRegion]
+        let ocrOutput: OCRExtractionOutput
 
         if useRegionBasedOCR, let cache = fullFrameCache {
             // Use region-based OCR for energy efficiency
             // Tiles are used for CHANGE DETECTION only, not for OCR bounding boxes
-            debugLog("Starting region-based OCR, hasPreviousFrame=\(previousFrame != nil)")
             let result = try await ocr.recognizeTextRegionBased(
                 frame: frame,
                 previousFrame: previousFrame,
                 cache: cache,
-                config: config
+                config: config,
+                extractInstrumentation: instrumentation
             )
-            ocrRegions = result.regions
-            debugLog("Region OCR complete: \(result.stats.tilesOCRed)/\(result.stats.totalTiles) tiles, \(result.regions.count) regions")
+            ocrOutput = OCRExtractionOutput(
+                regions: result.regions,
+                mode: .regionBased
+            )
 
             // Track energy savings
             regionOCRFrameCount += 1
@@ -142,26 +172,42 @@ public actor ProcessingManager: ProcessingProtocol {
             }
         } else {
             // Fallback to full-frame OCR
-            debugLog("Starting full-frame OCR")
-            ocrRegions = try await ocr.recognizeText(
+            let regions = try await ocr.recognizeText(
                 imageData: frame.imageData,
                 width: frame.width,
                 height: frame.height,
                 bytesPerRow: frame.bytesPerRow,
-                config: config
+                config: config,
+                extractInstrumentation: instrumentation
             )
-            debugLog("Full-frame OCR complete: \(ocrRegions.count) regions")
+            ocrOutput = OCRExtractionOutput(
+                regions: regions,
+                mode: .fullFrame
+            )
         }
 
         // Store frame for next comparison (region-based OCR)
         previousFrame = frame
+        await updateMemoryLedger()
+        return ocrOutput
+    }
+
+    private func buildExtractedText(
+        timestamp: Date,
+        frameHeight: Int,
+        metadata frameMetadata: FrameMetadata,
+        ocrRegions: [TextRegion],
+        startTime: Date,
+        instrumentation: ProcessingExtractRequestInstrumentation
+    ) async throws -> BuildExtractedTextOutput {
+        let buildStage = await instrumentation.beginBuildStage()
 
         // Separate UI chrome from main content
         // Chrome = top 5% (menu bar/status bar) + bottom 5% (dock)
         // Coordinates are now in pixel space with Y flipped (0 = top)
-        let frameHeight = CGFloat(frame.height)
-        let topChromeThreshold = frameHeight * 0.05    // Top 5%
-        let bottomChromeThreshold = frameHeight * 0.95 // Bottom 5%
+        let normalizedFrameHeight = max(CGFloat(frameHeight), 1)
+        let topChromeThreshold = normalizedFrameHeight * 0.05    // Top 5%
+        let bottomChromeThreshold = normalizedFrameHeight * 0.95 // Bottom 5%
 
         var mainRegions: [TextRegion] = []
         var chromeRegions: [TextRegion] = []
@@ -180,69 +226,24 @@ public actor ProcessingManager: ProcessingProtocol {
                 mainRegions.append(region)
             }
         }
-
-        // Extract accessibility text (if enabled and permitted)
-        var axResult: AccessibilityResult? = nil
-        var axText: String? = nil
-        if config.accessibilityEnabled {
-            let hasPermission = await accessibility.hasPermission()
-            if hasPermission {
-                do {
-                    axResult = try await accessibility.getFocusedAppText()
-                    axText = axResult?.textElements.map(\.text).joined(separator: " ")
-                } catch {
-                    Log.debug("[ProcessingManager] Accessibility text extraction failed (non-critical): \(error.localizedDescription)", category: .processing)
-                    axResult = nil
-                }
-            }
-        }
-
-        // Build OCR text from main regions only (chrome text stored separately)
-        let ocrText = mainRegions.map(\.text).joined(separator: " ")
+        // AX corrections have already been applied to the OCR regions. Never query
+        // the current foreground app for a historical frame or append AX-only text.
+        let fullText = mainRegions.map(\.text).joined(separator: " ")
         let chromeText = chromeRegions.map(\.text).joined(separator: " ")
-
-        // Merge OCR and accessibility text
-        let fullText = merger.mergeText(ocrText: ocrText, accessibilityText: axText)
-
-        // Merge accessibility metadata with existing metadata
-        // Preserve browserURL from capture phase if accessibility doesn't provide one
-        var metadata = frame.metadata
-        if let axResult = axResult {
-            metadata = FrameMetadata(
-                appBundleID: axResult.appInfo.bundleID,
-                appName: axResult.appInfo.name,
-                windowName: axResult.appInfo.windowName,
-                browserURL: axResult.appInfo.browserURL ?? frame.metadata.browserURL,
-                displayID: frame.metadata.displayID
-            )
-        }
-
-        // Extract browser URL from OCR if not already available from Accessibility API
-        // This handles browsers that don't expose URL via AX API (Firefox, Opera, Vivaldi, etc.)
-        // Only searches chrome text (top 5% - address bar area)
-        if metadata.browserURL == nil {
-            if let extractedURL = URLExtractor.extractURL(chromeText: chromeText) {
-                metadata = FrameMetadata(
-                    appBundleID: metadata.appBundleID,
-                    appName: metadata.appName,
-                    windowName: metadata.windowName,
-                    browserURL: extractedURL,
-                    displayID: metadata.displayID
-                )
-            }
-        }
+        let metadata = frameMetadata
 
         // Create ExtractedText with separated main/chrome regions
         // Note: CapturedFrame doesn't have an ID yet (assigned by database on insert)
         let extractedText = ExtractedText(
             frameID: FrameID(value: 0), // Placeholder - will be updated by caller after DB insert
-            timestamp: frame.timestamp,
+            timestamp: timestamp,
             regions: mainRegions,        // Main content regions (c0)
             chromeRegions: chromeRegions, // UI chrome regions (c1)
             fullText: fullText,          // Main content text
             chromeText: chromeText,      // UI chrome text
             metadata: metadata
         )
+        let outputPayloadBytes = buildStage.recordOutputPayload(extractedText)
 
         // Update statistics
         let ocrTime = Date().timeIntervalSince(startTime) * 1000  // Convert to ms
@@ -250,8 +251,15 @@ public actor ProcessingManager: ProcessingProtocol {
         totalOCRTimeMs += ocrTime
         totalTextLength += extractedText.wordCount
 
-        debugLog("extractTextInternal COMPLETE")
-        return extractedText
+        let buildResidualBytes = await buildStage.recordBuildResidual(
+            outputPayloadBytes: outputPayloadBytes
+        )
+
+        return BuildExtractedTextOutput(
+            extractedText: extractedText,
+            attributedResidualBytes: buildResidualBytes,
+            outputPayloadBytes: outputPayloadBytes
+        )
     }
 
     public func extractTextViaOCR(from frame: CapturedFrame) async throws -> [TextRegion] {
@@ -285,30 +293,6 @@ public actor ProcessingManager: ProcessingProtocol {
                 bounds: .zero,  // AX doesn't provide spatial info
                 confidence: 1.0  // AX text is always accurate
             )
-        }
-    }
-
-    // MARK: - Processing Queue
-
-    public func queueFrame(
-        _ frame: CapturedFrame,
-        completion: @escaping @Sendable (Result<ExtractedText, ProcessingError>) -> Void
-    ) async {
-        processingQueue.append((frame, completion))
-
-        // Start processing if not already running
-        if !isProcessing {
-            await processQueue()
-        }
-    }
-
-    public var queuedFrameCount: Int {
-        return processingQueue.count
-    }
-
-    public func waitForQueueDrain() async {
-        while !processingQueue.isEmpty || isProcessing {
-            try? await Task.sleep(nanoseconds: 100_000_000)  // 100ms
         }
     }
 
@@ -348,14 +332,14 @@ public actor ProcessingManager: ProcessingProtocol {
     /// Enable or disable region-based OCR
     /// When enabled, only changed regions are OCR'd for energy efficiency
     /// Tiles are used for change detection only - bounding boxes remain paragraph-level
-    public func setRegionBasedOCR(enabled: Bool) {
+    public func setRegionBasedOCR(enabled: Bool) async {
+        await beginFrameExtraction()
+        defer { endFrameExtraction() }
         useRegionBasedOCR = enabled
         if !enabled {
-            // Clear cache and previous frame when disabled
-            Task {
-                await fullFrameCache?.invalidateAll()
-            }
+            await fullFrameCache?.invalidateAll()
             previousFrame = nil
+            await updateMemoryLedger()
         }
     }
 
@@ -366,33 +350,49 @@ public actor ProcessingManager: ProcessingProtocol {
 
     /// Invalidate the OCR cache (useful when significant UI changes occur)
     public func invalidateTileCache() async {
+        await beginFrameExtraction()
+        defer { endFrameExtraction() }
         await fullFrameCache?.invalidateAll()
         previousFrame = nil
+        await updateMemoryLedger()
     }
 
-    // MARK: - Private Methods
+    private func updateMemoryLedger() async {
+        let previousFrameBytes = Int64(previousFrame?.imageData.count ?? 0)
+        let cacheEstimate = await fullFrameCache?.memoryEstimate()
 
-    private func processQueue() async {
-        isProcessing = true
-
-        while !processingQueue.isEmpty {
-            let (frame, completion) = processingQueue.removeFirst()
-
-            do {
-                let text = try await extractText(from: frame)
-                completion(.success(text))
-            } catch let error as ProcessingError {
-                errorCount += 1
-                Log.error("[ProcessingManager] Queue processing failed for frame: \(error)", category: .processing)
-                completion(.failure(error))
-            } catch {
-                errorCount += 1
-                Log.error("[ProcessingManager] Queue processing failed for frame: \(error.localizedDescription)", category: .processing, error: error)
-                completion(.failure(.ocrFailed(underlying: error.localizedDescription)))
-            }
-        }
-
-        isProcessing = false
+        MemoryLedger.set(
+            tag: Self.memoryLedgerPreviousFrameTag,
+            bytes: previousFrameBytes,
+            count: previousFrame == nil ? 0 : 1,
+            unit: "frames",
+            function: "processing.ocr",
+            kind: "previous-frame",
+            note: "estimated"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerRegionCacheTag,
+            bytes: cacheEstimate?.regionBytes ?? 0,
+            count: cacheEstimate?.regionCount ?? 0,
+            unit: "regions",
+            function: "processing.ocr",
+            kind: "region-cache",
+            note: "estimated"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerTileGridTag,
+            bytes: cacheEstimate?.tileGridBytes ?? 0,
+            count: cacheEstimate?.tileCount ?? 0,
+            unit: "tiles",
+            function: "processing.ocr",
+            kind: "tile-grid-cache",
+            note: "estimated"
+        )
+        MemoryLedger.emitSummary(
+            reason: "processing.ocr.functional_memory",
+            category: .processing,
+            minIntervalSeconds: Self.memoryLedgerSummaryIntervalSeconds
+        )
     }
 }
 

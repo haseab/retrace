@@ -3,34 +3,8 @@ import Shared
 import App
 import AppKit
 
-/// Debug logging to file
-private func debugLog(_ message: String) {
-    let line = "[\(Log.timestamp())] \(message)\n"
-    let path = "/tmp/retrace_debug.log"
-    if let data = line.data(using: .utf8) {
-        if FileManager.default.fileExists(atPath: path) {
-            if let handle = FileHandle(forWritingAtPath: path) {
-                handle.seekToEndOfFile()
-                handle.write(data)
-                handle.closeFile()
-            }
-        } else {
-            FileManager.default.createFile(atPath: path, contents: data)
-        }
-    }
-}
-
-// MARK: - Focus Effect Disabled Modifier (macOS 13.0+ compatible)
-
-/// Modifier that hides the focus ring, with availability check for macOS 14.0+
-private struct FocusEffectDisabledModifier: ViewModifier {
-    func body(content: Content) -> some View {
-        if #available(macOS 14.0, *) {
-            content.focusEffectDisabled()
-        } else {
-            content
-        }
-    }
+private enum SpotlightFilterChipMetrics {
+    static let dropdownYOffset: CGFloat = 44
 }
 
 /// Filter bar for search overlay - displays filter chips below the search field
@@ -44,67 +18,68 @@ public struct SearchFilterBar: View {
     @State private var showDatePopover = false
     @State private var showTagsDropdown = false
     @State private var showVisibilityDropdown = false
-    @State private var showSortDropdown = false
+    @State private var showCommentDropdown = false
+    @State private var showAdvancedDropdown = false
+    @State private var showSearchOrderDropdown = false
+    @State private var datePopoverFocusRequestID: UUID?
+    @State private var isClearFiltersHovered = false
     @State private var tabKeyMonitor: Any?
 
-    /// Filter indices for Tab navigation: 1=Apps, 2=Date, 3=Tags, 4=Visibility, 0=back to search
-    private let filterCount = 4
+    /// Filter indices for Tab navigation: 1=Order, 2=Apps, 3=Date, 4=Tags, 5=Visibility, 6=Comments, 7=Advanced, 0=back to search
+    private let filterCount = 7
 
     // MARK: - Body
 
-    private func logToFile(_ message: String) {
-        let logMessage = "[\(Log.timestamp())] \(message)\n"
-        if let data = logMessage.data(using: .utf8) {
-            let logPath = "/tmp/retrace_debug.log"
-            if !FileManager.default.fileExists(atPath: logPath) {
-                FileManager.default.createFile(atPath: logPath, contents: nil)
-            }
-            if let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: logPath)) {
-                handle.seekToEndOfFile()
-                handle.write(data)
-                handle.closeFile()
-            }
-        }
-    }
-
     public var body: some View {
-        let _ = logToFile("[SearchFilterBar] Rendering, showAppsDropdown=\(showAppsDropdown), showDatePopover=\(showDatePopover), showTagsDropdown=\(showTagsDropdown), showVisibilityDropdown=\(showVisibilityDropdown)")
-        HStack(spacing: 10) {
-            // Search mode tabs (Relevant / All)
-            SearchModeTabs(viewModel: viewModel)
-
-            // Sort order dropdown (only visible in "All" mode)
-            if viewModel.searchMode == .all {
-                SortOrderChip(
-                    currentOrder: viewModel.sortOrder,
-                    action: {
+        HStack(spacing: 8) {
+            SearchOrderChip(
+                selection: SearchOrderOption.from(
+                    mode: viewModel.searchMode,
+                    sortOrder: viewModel.sortOrder
+                ),
+                isOpen: showSearchOrderDropdown,
+                action: {
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        showSearchOrderDropdown.toggle()
+                        showAppsDropdown = false
+                        showDatePopover = false
+                        showTagsDropdown = false
+                        showVisibilityDropdown = false
+                        showCommentDropdown = false
+                        showAdvancedDropdown = false
+                    }
+                }
+            )
+            .dropdownOverlay(
+                isPresented: $showSearchOrderDropdown,
+                yOffset: SpotlightFilterChipMetrics.dropdownYOffset,
+                dismissOnOutsideClick: false
+            ) {
+                SearchOrderPopover(
+                    selection: SearchOrderOption.from(
+                        mode: viewModel.searchMode,
+                        sortOrder: viewModel.sortOrder
+                    ),
+                    onSelect: { option in
+                        switch option {
+                        case .relevance:
+                            viewModel.setSearchModeAndSort(mode: .relevant, sortOrder: nil)
+                        case .newest:
+                            viewModel.setSearchModeAndSort(mode: .all, sortOrder: .newestFirst)
+                        case .oldest:
+                            viewModel.setSearchModeAndSort(mode: .all, sortOrder: .oldestFirst)
+                        }
+                    },
+                    onDismiss: {
                         withAnimation(.easeOut(duration: 0.15)) {
-                            showSortDropdown.toggle()
-                            showAppsDropdown = false
-                            showDatePopover = false
-                            showTagsDropdown = false
-                            showVisibilityDropdown = false
+                            showSearchOrderDropdown = false
                         }
                     }
                 )
-                .dropdownOverlay(isPresented: $showSortDropdown, yOffset: 56) {
-                    SortOrderPopover(
-                        currentOrder: viewModel.sortOrder,
-                        onSelect: { order in
-                            viewModel.setSearchSortOrder(order)
-                        },
-                        onDismiss: {
-                            withAnimation(.easeOut(duration: 0.15)) {
-                                showSortDropdown = false
-                            }
-                        }
-                    )
-                }
-                .transition(.opacity.combined(with: .scale(scale: 0.95)))
             }
 
             Divider()
-                .frame(height: 28)
+                .frame(height: 21)
                 .background(Color.white.opacity(0.2))
 
             // Apps filter (multi-select) - shows app icons when selected
@@ -112,18 +87,23 @@ public struct SearchFilterBar: View {
                 selectedApps: viewModel.selectedAppFilters,
                 filterMode: viewModel.appFilterMode,
                 isActive: viewModel.selectedAppFilters != nil && !viewModel.selectedAppFilters!.isEmpty,
+                isOpen: showAppsDropdown,
                 action: {
-                    logToFile("[SearchFilterBar] Apps chip CLICKED! showAppsDropdown was \(showAppsDropdown), toggling...")
                     withAnimation(.easeOut(duration: 0.15)) {
                         showAppsDropdown.toggle()
                         showDatePopover = false
                         showTagsDropdown = false
                         showVisibilityDropdown = false
+                        showCommentDropdown = false
+                        showAdvancedDropdown = false
                     }
-                    logToFile("[SearchFilterBar] Apps chip after toggle: showAppsDropdown=\(showAppsDropdown)")
                 }
             )
-            .dropdownOverlay(isPresented: $showAppsDropdown, yOffset: 56) {
+            .dropdownOverlay(
+                isPresented: $showAppsDropdown,
+                yOffset: SpotlightFilterChipMetrics.dropdownYOffset,
+                dismissOnOutsideClick: false
+            ) {
                 AppsFilterPopover(
                     apps: viewModel.installedApps.map { ($0.bundleID, $0.name) },
                     otherApps: viewModel.otherApps.map { ($0.bundleID, $0.name) },
@@ -148,22 +128,59 @@ public struct SearchFilterBar: View {
             FilterChip(
                 icon: "calendar",
                 label: dateFilterLabel,
-                isActive: viewModel.startDate != nil || viewModel.endDate != nil,
+                isActive: !viewModel.effectiveDateRanges.isEmpty,
+                isOpen: showDatePopover,
                 showChevron: true
             ) {
-                logToFile("[SearchFilterBar] Date chip CLICKED! showDatePopover was \(showDatePopover), toggling...")
                 withAnimation(.easeOut(duration: 0.15)) {
-                    showDatePopover.toggle()
+                    let willOpen = !showDatePopover
+                    if willOpen {
+                        datePopoverFocusRequestID = UUID()
+                    }
+                    showDatePopover = willOpen
                     showAppsDropdown = false
                     showTagsDropdown = false
                     showVisibilityDropdown = false
+                    showCommentDropdown = false
+                    showAdvancedDropdown = false
                 }
-                logToFile("[SearchFilterBar] Date chip after toggle: showDatePopover=\(showDatePopover)")
             }
-            .dropdownOverlay(isPresented: $showDatePopover, yOffset: 56) {
-                DateFilterPopover(
-                    viewModel: viewModel,
-                    isPresented: $showDatePopover
+            .dropdownOverlay(
+                isPresented: $showDatePopover,
+                yOffset: SpotlightFilterChipMetrics.dropdownYOffset,
+                dismissOnOutsideClick: false
+            ) {
+                DateRangeFilterPopover(
+                    dateRanges: viewModel.effectiveDateRanges,
+                    onApply: { ranges in
+                        viewModel.setDateRanges(ranges)
+                    },
+                    onClear: {
+                        viewModel.setDateRanges([])
+                    },
+                    width: 300,
+                    enableKeyboardNavigation: true,
+                    onMoveToNextFilter: {
+                        // Tab order: Order -> Apps -> Date -> Tags -> Visibility -> Comments -> Advanced.
+                        // Enter from Date input should advance to Tags, matching Tab behavior.
+                        viewModel.openFilterSignal = (4, UUID())
+                    },
+                    onCalendarEditingChange: { isEditing in
+                        viewModel.isDatePopoverHandlingKeys = isEditing
+                    },
+                    onQuickPresetShortcut: { preset in
+                        viewModel.recordKeyboardShortcut("search.date_range.\(preset.rawValue)")
+                    },
+                    onClearShortcut: {
+                        viewModel.recordKeyboardShortcut("search.date_range.clear")
+                    },
+                    focusPrimaryInputRequestID: datePopoverFocusRequestID,
+                    onDismiss: {
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            showDatePopover = false
+                        }
+                        viewModel.isDatePopoverHandlingKeys = false
+                    }
                 )
             }
 
@@ -173,18 +190,23 @@ public struct SearchFilterBar: View {
                 availableTags: viewModel.availableTags,
                 filterMode: viewModel.tagFilterMode,
                 isActive: viewModel.selectedTags != nil && !viewModel.selectedTags!.isEmpty,
+                isOpen: showTagsDropdown,
                 action: {
-                    logToFile("[SearchFilterBar] Tags chip CLICKED! showTagsDropdown was \(showTagsDropdown), toggling...")
                     withAnimation(.easeOut(duration: 0.15)) {
                         showTagsDropdown.toggle()
                         showAppsDropdown = false
                         showDatePopover = false
                         showVisibilityDropdown = false
+                        showCommentDropdown = false
+                        showAdvancedDropdown = false
                     }
-                    logToFile("[SearchFilterBar] Tags chip after toggle: showTagsDropdown=\(showTagsDropdown)")
                 }
             )
-            .dropdownOverlay(isPresented: $showTagsDropdown, yOffset: 56) {
+            .dropdownOverlay(
+                isPresented: $showTagsDropdown,
+                yOffset: SpotlightFilterChipMetrics.dropdownYOffset,
+                dismissOnOutsideClick: false
+            ) {
                 TagsFilterPopover(
                     tags: viewModel.availableTags,
                     selectedTags: viewModel.selectedTags,
@@ -208,18 +230,23 @@ public struct SearchFilterBar: View {
             VisibilityFilterChip(
                 currentFilter: viewModel.hiddenFilter,
                 isActive: viewModel.hiddenFilter != .hide,
+                isOpen: showVisibilityDropdown,
                 action: {
-                    logToFile("[SearchFilterBar] Visibility chip CLICKED! showVisibilityDropdown was \(showVisibilityDropdown), toggling...")
                     withAnimation(.easeOut(duration: 0.15)) {
                         showVisibilityDropdown.toggle()
                         showAppsDropdown = false
                         showDatePopover = false
                         showTagsDropdown = false
+                        showCommentDropdown = false
+                        showAdvancedDropdown = false
                     }
-                    logToFile("[SearchFilterBar] Visibility chip after toggle: showVisibilityDropdown=\(showVisibilityDropdown)")
                 }
             )
-            .dropdownOverlay(isPresented: $showVisibilityDropdown, yOffset: 56) {
+            .dropdownOverlay(
+                isPresented: $showVisibilityDropdown,
+                yOffset: SpotlightFilterChipMetrics.dropdownYOffset,
+                dismissOnOutsideClick: false
+            ) {
                 VisibilityFilterPopover(
                     currentFilter: viewModel.hiddenFilter,
                     onSelect: { filter in
@@ -229,7 +256,84 @@ public struct SearchFilterBar: View {
                         withAnimation(.easeOut(duration: 0.15)) {
                             showVisibilityDropdown = false
                         }
+                    },
+                    onKeyboardSelect: {
+                        // Keep Enter behavior aligned with Tab order:
+                        // Visibility -> Comments.
+                        viewModel.openFilterSignal = (6, UUID())
                     }
+                )
+            }
+
+            // Comment presence filter
+            CommentFilterChip(
+                currentFilter: viewModel.commentFilter,
+                isActive: viewModel.commentFilter != .allFrames,
+                isOpen: showCommentDropdown,
+                action: {
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        showCommentDropdown.toggle()
+                        showAppsDropdown = false
+                        showDatePopover = false
+                        showTagsDropdown = false
+                        showVisibilityDropdown = false
+                        showAdvancedDropdown = false
+                    }
+                }
+            )
+            .dropdownOverlay(
+                isPresented: $showCommentDropdown,
+                yOffset: SpotlightFilterChipMetrics.dropdownYOffset,
+                dismissOnOutsideClick: false
+            ) {
+                CommentFilterPopover(
+                    currentFilter: viewModel.commentFilter,
+                    onSelect: { filter in
+                        viewModel.setCommentFilter(filter)
+                    },
+                    onDismiss: {
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            showCommentDropdown = false
+                        }
+                    },
+                    onKeyboardSelect: {
+                        // Keep Enter behavior aligned with Tab order:
+                        // Comments -> Advanced.
+                        viewModel.openFilterSignal = (7, UUID())
+                    }
+                )
+            }
+
+            // Advanced metadata filters (window name + browser URL)
+            FilterChip(
+                icon: "slider.horizontal.3",
+                label: "Advanced",
+                isActive: hasActiveAdvancedFilters,
+                isOpen: showAdvancedDropdown,
+                showChevron: true
+            ) {
+                withAnimation(.easeOut(duration: 0.15)) {
+                    showAdvancedDropdown.toggle()
+                    showAppsDropdown = false
+                    showDatePopover = false
+                    showTagsDropdown = false
+                    showVisibilityDropdown = false
+                    showCommentDropdown = false
+                }
+            }
+            .dropdownOverlay(
+                isPresented: $showAdvancedDropdown,
+                yOffset: SpotlightFilterChipMetrics.dropdownYOffset,
+                dismissOnOutsideClick: false
+            ) {
+                AdvancedSearchFilterPopover(
+                    windowNameIncludeTerms: $viewModel.windowNameTerms,
+                    windowNameExcludeTerms: $viewModel.windowNameExcludedTerms,
+                    windowNameFilterMode: $viewModel.windowNameFilterMode,
+                    browserUrlIncludeTerms: $viewModel.browserUrlTerms,
+                    browserUrlExcludeTerms: $viewModel.browserUrlExcludedTerms,
+                    browserUrlFilterMode: $viewModel.browserUrlFilterMode,
+                    excludedSearchTerms: $viewModel.excludedSearchTerms
                 )
             }
 
@@ -246,69 +350,108 @@ public struct SearchFilterBar: View {
                         viewModel.submitSearch()
                     }
                 }) {
-                    HStack(spacing: 4) {
+                    HStack(spacing: 3) {
                         Image(systemName: "xmark")
-                            .font(.retraceTinyBold)
+                            .font(.system(size: 9, weight: .semibold))
                         Text("Clear")
-                            .font(.retraceCaption2Medium)
+                            .font(.system(size: 9, weight: .semibold))
                     }
                     .foregroundColor(.white.opacity(0.6))
                 }
                 .buttonStyle(.plain)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(Color.white.opacity(0.1))
-                .cornerRadius(6)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 3)
+                .background(
+                    RoundedRectangle(cornerRadius: 5)
+                        .fill(Color.white.opacity(0.1))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 5)
+                        .stroke(
+                            isClearFiltersHovered ? RetraceMenuStyle.filterStrokeStrong : Color.clear,
+                            lineWidth: 1.2
+                        )
+                )
+                .onHover { hovering in
+                    withAnimation(.easeOut(duration: 0.1)) {
+                        isClearFiltersHovered = hovering
+                    }
+                }
             }
         }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 12)
+        .padding(.horizontal, 15)
+        // Shift chips slightly upward: more top inset, less bottom inset.
+        .padding(.top, 10)
+        .padding(.bottom, 4)
         .task {
             // Delay loading until after animation completes to avoid choppy animation
-            try? await Task.sleep(nanoseconds: 200_000_000) // 200ms
+            try? await Task.sleep(for: .nanoseconds(Int64(200_000_000)), clock: .continuous) // 200ms
             await viewModel.loadAvailableTags()
         }
         .onChange(of: showAppsDropdown) { isOpen in
-            debugLog("[SearchFilterBar] showAppsDropdown changed to: \(isOpen)")
-            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showSortDropdown
-            debugLog("[SearchFilterBar] isDropdownOpen now: \(viewModel.isDropdownOpen)")
+            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showCommentDropdown || showAdvancedDropdown || showSearchOrderDropdown
             // Lazy load apps only when dropdown is opened
             if isOpen {
+                syncOpenFilterIndex(2)
                 Task {
                     await viewModel.loadAvailableApps()
                 }
             }
         }
         .onChange(of: showDatePopover) { isOpen in
-            debugLog("[SearchFilterBar] showDatePopover changed to: \(isOpen)")
-            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showSortDropdown
+            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showCommentDropdown || showAdvancedDropdown || showSearchOrderDropdown
+            if !isOpen {
+                viewModel.isDatePopoverHandlingKeys = false
+                datePopoverFocusRequestID = nil
+            }
+            if isOpen {
+                syncOpenFilterIndex(3)
+            }
         }
         .onChange(of: showTagsDropdown) { isOpen in
-            debugLog("[SearchFilterBar] showTagsDropdown changed to: \(isOpen)")
-            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showSortDropdown
+            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showCommentDropdown || showAdvancedDropdown || showSearchOrderDropdown
+            if isOpen {
+                syncOpenFilterIndex(4)
+            }
         }
         .onChange(of: showVisibilityDropdown) { isOpen in
-            debugLog("[SearchFilterBar] showVisibilityDropdown changed to: \(isOpen)")
-            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showSortDropdown
+            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showCommentDropdown || showAdvancedDropdown || showSearchOrderDropdown
+            if isOpen {
+                syncOpenFilterIndex(5)
+            }
         }
-        .onChange(of: showSortDropdown) { isOpen in
-            debugLog("[SearchFilterBar] showSortDropdown changed to: \(isOpen)")
-            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showSortDropdown
+        .onChange(of: showCommentDropdown) { isOpen in
+            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showCommentDropdown || showAdvancedDropdown || showSearchOrderDropdown
+            if isOpen {
+                syncOpenFilterIndex(6)
+            }
+        }
+        .onChange(of: showAdvancedDropdown) { isOpen in
+            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showCommentDropdown || showAdvancedDropdown || showSearchOrderDropdown
+            if isOpen {
+                syncOpenFilterIndex(7)
+            }
+        }
+        .onChange(of: showSearchOrderDropdown) { isOpen in
+            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showCommentDropdown || showAdvancedDropdown || showSearchOrderDropdown
+            if isOpen {
+                syncOpenFilterIndex(1)
+            }
         }
         .onChange(of: viewModel.closeDropdownsSignal) { newValue in
-            debugLog("[SearchFilterBar] closeDropdownsSignal received: \(newValue)")
             // Close all dropdowns when signal is received (from Escape key in parent)
             withAnimation(.easeOut(duration: 0.15)) {
                 showAppsDropdown = false
                 showDatePopover = false
                 showTagsDropdown = false
                 showVisibilityDropdown = false
-                showSortDropdown = false
+                showCommentDropdown = false
+                showAdvancedDropdown = false
+                showSearchOrderDropdown = false
             }
         }
         .onChange(of: viewModel.openFilterSignal.id) { _ in
             let filterIndex = viewModel.openFilterSignal.index
-            debugLog("[SearchFilterBar] openFilterSignal received: index=\(filterIndex)")
             openFilterAtIndex(filterIndex)
         }
         .onAppear {
@@ -329,22 +472,31 @@ public struct SearchFilterBar: View {
             showDatePopover = false
             showTagsDropdown = false
             showVisibilityDropdown = false
-            showSortDropdown = false
+            showCommentDropdown = false
+            showAdvancedDropdown = false
+            showSearchOrderDropdown = false
 
             // Open the requested one
             switch index {
             case 1:
+                showSearchOrderDropdown = true
+            case 2:
                 showAppsDropdown = true
                 // Lazy load apps when opening via Tab
                 Task {
                     await viewModel.loadAvailableApps()
                 }
-            case 2:
-                showDatePopover = true
             case 3:
-                showTagsDropdown = true
+                datePopoverFocusRequestID = UUID()
+                showDatePopover = true
             case 4:
+                showTagsDropdown = true
+            case 5:
                 showVisibilityDropdown = true
+            case 6:
+                showCommentDropdown = true
+            case 7:
+                showAdvancedDropdown = true
             default:
                 // Index 0 means focus search field - parent will handle via onChange
                 break
@@ -352,12 +504,22 @@ public struct SearchFilterBar: View {
         }
     }
 
+    private func syncOpenFilterIndex(_ index: Int) {
+        let currentID = viewModel.openFilterSignal.id
+        if viewModel.openFilterSignal.index != index {
+            viewModel.openFilterSignal = (index, currentID)
+        }
+    }
+
     /// Get the current open filter index (0 if none open)
     private func currentOpenFilterIndex() -> Int {
-        if showAppsDropdown { return 1 }
-        if showDatePopover { return 2 }
-        if showTagsDropdown { return 3 }
-        if showVisibilityDropdown { return 4 }
+        if showSearchOrderDropdown { return 1 }
+        if showAppsDropdown { return 2 }
+        if showDatePopover { return 3 }
+        if showTagsDropdown { return 4 }
+        if showVisibilityDropdown { return 5 }
+        if showCommentDropdown { return 6 }
+        if showAdvancedDropdown { return 7 }
         return 0
     }
 
@@ -376,20 +538,19 @@ public struct SearchFilterBar: View {
             let isShiftHeld = event.modifierFlags.contains(.shift)
 
             // Determine current filter by checking the signal's last index
-            // Filter indices: 0=Search, 1=Apps, 2=Date, 3=Tags, 4=Visibility
+            // Filter indices: 0=Search, 1=Order, 2=Apps, 3=Date, 4=Tags, 5=Visibility, 6=Comments, 7=Advanced
             let lastSignal = vm.openFilterSignal.index
             let currentIndex = lastSignal > 0 ? lastSignal : 1  // Start from 1 if coming from search
 
-            debugLog("[SearchFilterBar] Tab pressed in dropdown, lastSignal=\(lastSignal), cycling from \(currentIndex), shift=\(isShiftHeld)")
 
             // Calculate next index based on direction
             let nextIndex: Int
             if isShiftHeld {
-                // Shift+Tab: go backward (cycle: 0 -> 4 -> 3 -> 2 -> 1 -> 0)
-                nextIndex = currentIndex <= 0 ? 4 : currentIndex - 1
+                // Shift+Tab: go backward (cycle: 0 -> 7 -> ... -> 1 -> 0)
+                nextIndex = currentIndex <= 0 ? filterCount : currentIndex - 1
             } else {
-                // Tab: go forward (cycle: 1 -> 2 -> 3 -> 4 -> 0 -> 1)
-                nextIndex = currentIndex >= 4 ? 0 : currentIndex + 1
+                // Tab: go forward (cycle: 1 -> 2 -> ... -> 7 -> 0 -> 1)
+                nextIndex = currentIndex >= filterCount ? 0 : currentIndex + 1
             }
 
             // Signal the change - the onChange handler will open the appropriate dropdown
@@ -410,20 +571,33 @@ public struct SearchFilterBar: View {
     // MARK: - Computed Properties
 
     private var dateFilterLabel: String {
-        if let start = viewModel.startDate, let end = viewModel.endDate {
+        let ranges = viewModel.effectiveDateRanges
+        if ranges.count > 1 {
+            return "\(ranges.count) date ranges"
+        }
+
+        if let start = ranges.first?.start, let end = ranges.first?.end {
             let formatter = DateFormatter()
             formatter.dateFormat = "MMM d"
             return "\(formatter.string(from: start)) - \(formatter.string(from: end))"
-        } else if let start = viewModel.startDate {
+        } else if let start = ranges.first?.start {
             let formatter = DateFormatter()
             formatter.dateFormat = "MMM d"
             return "From \(formatter.string(from: start))"
-        } else if let end = viewModel.endDate {
+        } else if let end = ranges.first?.end {
             let formatter = DateFormatter()
             formatter.dateFormat = "MMM d"
             return "Until \(formatter.string(from: end))"
         }
         return "Date"
+    }
+
+    private var hasActiveAdvancedFilters: Bool {
+        !viewModel.windowNameTerms.isEmpty ||
+        !viewModel.windowNameExcludedTerms.isEmpty ||
+        !viewModel.browserUrlTerms.isEmpty ||
+        !viewModel.browserUrlExcludedTerms.isEmpty ||
+        !viewModel.excludedSearchTerms.isEmpty
     }
 }
 
@@ -433,54 +607,46 @@ private struct FilterChip: View {
     let icon: String
     let label: String
     let isActive: Bool
+    let isOpen: Bool
     let showChevron: Bool
     let action: () -> Void
 
     @State private var isHovered = false
 
-    private func logToFile(_ message: String) {
-        let logMessage = "[\(Log.timestamp())] \(message)\n"
-        if let data = logMessage.data(using: .utf8) {
-            let logPath = "/tmp/retrace_debug.log"
-            if !FileManager.default.fileExists(atPath: logPath) {
-                FileManager.default.createFile(atPath: logPath, contents: nil)
-            }
-            if let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: logPath)) {
-                handle.seekToEndOfFile()
-                handle.write(data)
-                handle.closeFile()
-            }
-        }
-    }
-
     var body: some View {
         Button(action: {
-            logToFile("[FilterChip] Button action triggered for: \(label)")
             action()
         }) {
-            HStack(spacing: 6) {
+            HStack(spacing: 4.5) {
                 Image(systemName: icon)
-                    .font(.system(size: 14))
+                    .font(.system(size: 11))
 
                 Text(label)
-                    .font(.retraceCalloutMedium)
+                    .font(.system(size: 11, weight: .medium))
                     .lineLimit(1)
 
                 if showChevron {
                     Image(systemName: "chevron.down")
-                        .font(.retraceCaption2)
+                        .font(.system(size: 9, weight: .semibold))
                 }
             }
             .foregroundColor(isActive ? .white : .white.opacity(0.7))
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
+            .padding(.horizontal, 10.5)
+            .padding(.vertical, 7.5)
             .background(
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(isActive ? Color.white.opacity(0.2) : Color.white.opacity(isHovered ? 0.15 : 0.1))
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(isActive ? Color.white.opacity(0.2) : Color.white.opacity((isHovered || isOpen) ? 0.15 : 0.1))
             )
             .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(isActive ? Color.white.opacity(0.3) : Color.clear, lineWidth: 1)
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(
+                        isOpen
+                            ? RetraceMenuStyle.filterStrokeStrong
+                            : (isActive
+                                ? RetraceMenuStyle.filterStrokeMedium
+                                : (isHovered ? Color.white.opacity(0.65) : Color.clear)),
+                        lineWidth: (isOpen || isHovered) ? 1.2 : 1
+                    )
             )
         }
         .buttonStyle(.plain)
@@ -498,12 +664,14 @@ private struct AppsFilterChip: View {
     let selectedApps: Set<String>?
     let filterMode: AppFilterMode
     let isActive: Bool
+    let isOpen: Bool
     let action: () -> Void
 
+    @StateObject private var appMetadata = AppMetadataCache.shared
     @State private var isHovered = false
 
     private let maxVisibleIcons = 5
-    private let iconSize: CGFloat = 20
+    private let iconSize: CGFloat = 13
 
     private var sortedApps: [String] {
         guard let apps = selectedApps else { return [] }
@@ -514,31 +682,16 @@ private struct AppsFilterChip: View {
         filterMode == .exclude && isActive
     }
 
-    private func logToFile(_ message: String) {
-        let logMessage = "[\(Log.timestamp())] \(message)\n"
-        if let data = logMessage.data(using: .utf8) {
-            let logPath = "/tmp/retrace_debug.log"
-            if !FileManager.default.fileExists(atPath: logPath) {
-                FileManager.default.createFile(atPath: logPath, contents: nil)
-            }
-            if let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: logPath)) {
-                handle.seekToEndOfFile()
-                handle.write(data)
-                handle.closeFile()
-            }
-        }
-    }
-
     var body: some View {
         Button(action: {
-            logToFile("[AppsFilterChip] Button action triggered!")
             action()
         }) {
-            HStack(spacing: 6) {
+            HStack(spacing: 4.5) {
                 // Show exclude indicator
                 if isExcludeMode {
                     Image(systemName: "minus.circle.fill")
-                        .font(.system(size: 12))
+                        .font(.system(size: 9))
+                        .frame(width: iconSize, height: iconSize)
                         .foregroundColor(.orange)
                         .transition(.scale.combined(with: .opacity))
                 }
@@ -552,13 +705,13 @@ private struct AppsFilterChip: View {
                         .transition(.scale.combined(with: .opacity))
 
                     Text(appName(for: bundleID))
-                        .font(.retraceCaptionMedium)
+                        .font(.system(size: 10.5, weight: .medium))
                         .lineLimit(1)
                         .strikethrough(isExcludeMode, color: .orange)
                         .transition(.opacity)
                 } else if sortedApps.count > 1 {
                     // Multiple apps: show icons
-                    HStack(spacing: -4) {
+                    HStack(spacing: -3) {
                         ForEach(Array(sortedApps.prefix(maxVisibleIcons)), id: \.self) { bundleID in
                             appIcon(for: bundleID)
                                 .frame(width: iconSize, height: iconSize)
@@ -578,27 +731,36 @@ private struct AppsFilterChip: View {
                 } else {
                     // Default state - no apps selected
                     Image(systemName: "square.grid.2x2.fill")
-                        .font(.system(size: 14))
+                        .font(.system(size: 11))
+                        .frame(width: iconSize, height: iconSize)
                         .transition(.scale.combined(with: .opacity))
                     Text("Apps")
-                        .font(.retraceCalloutMedium)
+                        .font(.system(size: 11, weight: .medium))
                         .transition(.opacity)
                 }
 
                 Image(systemName: "chevron.down")
-                    .font(.retraceCaption2)
+                    .font(.system(size: 9, weight: .semibold))
             }
+            .frame(height: iconSize)
             .animation(.spring(response: 0.3, dampingFraction: 0.7), value: sortedApps)
             .foregroundColor(isActive ? .white : .white.opacity(0.7))
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
+            .padding(.horizontal, 10.5)
+            .padding(.vertical, 7.5)
             .background(
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(isActive ? Color.white.opacity(0.2) : Color.white.opacity(isHovered ? 0.15 : 0.1))
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(isActive ? Color.white.opacity(0.2) : Color.white.opacity((isHovered || isOpen) ? 0.15 : 0.1))
             )
             .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(isActive ? Color.white.opacity(0.3) : Color.clear, lineWidth: 1)
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(
+                        isOpen
+                            ? RetraceMenuStyle.filterStrokeStrong
+                            : (isActive
+                                ? RetraceMenuStyle.filterStrokeMedium
+                                : (isHovered ? Color.white.opacity(0.65) : Color.clear)),
+                        lineWidth: (isOpen || isHovered) ? 1.2 : 1
+                    )
             )
         }
         .buttonStyle(.plain)
@@ -607,519 +769,63 @@ private struct AppsFilterChip: View {
                 isHovered = hovering
             }
         }
+        .onAppear {
+            appMetadata.prefetch(bundleIDs: sortedApps)
+        }
+        .onChange(of: sortedApps) { bundleIDs in
+            appMetadata.prefetch(bundleIDs: bundleIDs)
+        }
     }
 
-    @ViewBuilder
     private func appIcon(for bundleID: String) -> some View {
-        if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
-            Image(nsImage: NSWorkspace.shared.icon(forFile: appURL.path))
-                .resizable()
-                .aspectRatio(contentMode: .fit)
-        } else {
-            Image(systemName: "app.fill")
-                .resizable()
-                .aspectRatio(contentMode: .fit)
-                .foregroundColor(.white.opacity(0.6))
-        }
+        AppIconView(bundleID: bundleID, size: iconSize)
     }
 
     private func appName(for bundleID: String) -> String {
-        if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
-            return FileManager.default.displayName(atPath: appURL.path)
-        }
-        // Fallback: extract last component of bundle ID
-        return bundleID.components(separatedBy: ".").last ?? bundleID
+        appMetadata.name(for: bundleID) ?? fallbackName(for: bundleID)
+    }
+
+    private func fallbackName(for bundleID: String) -> String {
+        bundleID.components(separatedBy: ".").last ?? bundleID
     }
 }
 
-// MARK: - Date Filter Popover
+// MARK: - Search Order Dropdown
 
-private struct DateFilterPopover: View {
-    @ObservedObject var viewModel: SearchViewModel
-    @Binding var isPresented: Bool
+private enum SearchOrderOption: CaseIterable {
+    case relevance
+    case newest
+    case oldest
 
-    @State private var startDate: Date = Date()
-    @State private var endDate: Date = Date()
-    @State private var editingDate: EditingDate? = nil
-    @State private var displayedMonth: Date = Date()
-
-    /// Focus state to capture focus when popover appears - allows main search field to "steal" focus and dismiss
-    @FocusState private var isFocused: Bool
-
-    private let calendar = Calendar.current
-    private let weekdaySymbols = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"]
-
-    private enum EditingDate {
-        case start
-        case end
-    }
-
-    var body: some View {
-        VStack(spacing: 0) {
-            // Header
-            HStack {
-                Text("Date Range")
-                    .font(.retraceCalloutBold)
-                    .foregroundColor(.primary)
-
-                Spacer()
-
-                if viewModel.startDate != nil || viewModel.endDate != nil {
-                    Button("Clear") {
-                        viewModel.setDateRange(start: nil, end: nil)
-                        isPresented = false
-                    }
-                    .buttonStyle(.plain)
-                    .font(.retraceCaption2Medium)
-                    .foregroundColor(.white.opacity(0.6))
-                }
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 12)
-
-            Divider()
-                .background(Color.white.opacity(0.1))
-
-            // Date selection rows
-            VStack(spacing: 8) {
-                dateRow(label: "Start", date: startDate, isEditing: editingDate == .start) {
-                    withAnimation(.easeOut(duration: 0.15)) {
-                        editingDate = editingDate == .start ? nil : .start
-                        displayedMonth = startDate
-                    }
-                }
-                dateRow(label: "End", date: endDate, isEditing: editingDate == .end) {
-                    withAnimation(.easeOut(duration: 0.15)) {
-                        editingDate = editingDate == .end ? nil : .end
-                        displayedMonth = endDate
-                    }
-                }
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 12)
-
-            // Inline calendar (shown when editing)
-            if editingDate != nil {
-                Divider()
-                    .background(Color.white.opacity(0.1))
-
-                inlineCalendar
-                    .padding(12)
-                    .contentShape(Rectangle())
-                    .onTapGesture { } // Prevent tap from bubbling up
-            }
-
-            Divider()
-                .background(Color.white.opacity(0.1))
-
-            // Quick presets (horizontal chips)
-            HStack(spacing: 6) {
-                presetChip("All", preset: .anytime)
-                presetChip("Today", preset: .today)
-                presetChip("7d", preset: .lastWeek)
-                presetChip("30d", preset: .lastMonth)
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 10)
-
-            Divider()
-                .background(Color.white.opacity(0.1))
-
-            // Apply button
-            Button(action: applyCustomRange) {
-                Text("Apply")
-                    .font(.retraceCaptionBold)
-                    .foregroundColor(.white)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 10)
-                    .background(Color.retraceSubmitAccent)
-                    .cornerRadius(6)
-            }
-            .buttonStyle(.plain)
-            .padding(12)
-        }
-        .frame(width: 280)
-        .background(Color(nsColor: .windowBackgroundColor))
-        .focusable()
-        .focused($isFocused)
-        .modifier(FocusEffectDisabledModifier())
-        .onAppear {
-            initializeDates()
-            // Capture focus when popover appears
-            // This allows clicking elsewhere (like main search field) to dismiss by stealing focus
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                isFocused = true
-            }
-        }
-        .onChange(of: isFocused) { focused in
-            // Dismiss when focus is lost (e.g., clicking on main search field)
-            if !focused {
-                isPresented = false
-            }
-        }
-        .onExitCommand {
-            if editingDate != nil {
-                withAnimation(.easeOut(duration: 0.15)) {
-                    editingDate = nil
-                }
-            }
-        }
-        .contentShape(Rectangle())
-        .onTapGesture {
-            // Collapse calendar when tapping outside of it
-            if editingDate != nil {
-                withAnimation(.easeOut(duration: 0.15)) {
-                    editingDate = nil
-                }
-            }
+    var icon: String {
+        switch self {
+        case .relevance: return "arrow.up.arrow.down"
+        case .newest: return "arrow.down"
+        case .oldest: return "arrow.up"
         }
     }
 
-    // MARK: - Date Row
-
-    private func dateRow(label: String, date: Date, isEditing: Bool, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            HStack(spacing: 10) {
-                Image(systemName: "calendar")
-                    .font(.system(size: 14))
-                    .foregroundColor(isEditing ? .accentColor : .secondary)
-                    .frame(width: 20)
-
-                Text(label)
-                    .font(.retraceCalloutMedium)
-                    .foregroundColor(.secondary)
-                    .frame(width: 36, alignment: .leading)
-
-                Spacer()
-
-                Text(formatDate(date))
-                    .font(.retraceCalloutMedium)
-                    .foregroundColor(isEditing ? .accentColor : .primary)
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 10)
-            .background(
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(isEditing ? Color.accentColor.opacity(0.1) : Color.white.opacity(0.05))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(isEditing ? Color.accentColor.opacity(0.5) : Color.clear, lineWidth: 1)
-            )
-        }
-        .buttonStyle(.plain)
-        .onHover { h in
-            if h { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+    var title: String {
+        switch self {
+        case .relevance: return "Relevance"
+        case .newest: return "Newest"
+        case .oldest: return "Oldest"
         }
     }
 
-    // MARK: - Inline Calendar
-
-    private var inlineCalendar: some View {
-        VStack(spacing: 8) {
-            // Month navigation
-            HStack {
-                Button(action: { changeMonth(by: -1) }) {
-                    Image(systemName: "chevron.left")
-                        .font(.retraceCaption2Bold)
-                        .foregroundColor(.white.opacity(0.6))
-                        .frame(width: 24, height: 24)
-                        .background(Color.white.opacity(0.08))
-                        .clipShape(Circle())
-                }
-                .buttonStyle(.plain)
-                .onHover { h in if h { NSCursor.pointingHand.push() } else { NSCursor.pop() } }
-
-                Spacer()
-
-                Text(monthYearString)
-                    .font(.retraceCaptionMedium)
-                    .foregroundColor(.white.opacity(0.8))
-
-                Spacer()
-
-                Button(action: { changeMonth(by: 1) }) {
-                    Image(systemName: "chevron.right")
-                        .font(.retraceCaption2Bold)
-                        .foregroundColor(.white.opacity(0.6))
-                        .frame(width: 24, height: 24)
-                        .background(Color.white.opacity(0.08))
-                        .clipShape(Circle())
-                }
-                .buttonStyle(.plain)
-                .onHover { h in if h { NSCursor.pointingHand.push() } else { NSCursor.pop() } }
-            }
-
-            // Weekday headers
-            HStack(spacing: 0) {
-                ForEach(weekdaySymbols, id: \.self) { day in
-                    Text(day)
-                        .font(.retraceTinyMedium)
-                        .foregroundColor(.white.opacity(0.4))
-                        .frame(maxWidth: .infinity)
-                }
-            }
-
-            // Calendar grid
-            let days = daysInMonth()
-            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 2), count: 7), spacing: 2) {
-                ForEach(days.indices, id: \.self) { index in
-                    dayCell(for: days[index])
-                }
-            }
+    var subtitle: String {
+        switch self {
+        case .relevance: return "Best semantic match"
+        case .newest: return "Most recent results first"
+        case .oldest: return "Oldest results first"
         }
     }
 
-    // MARK: - Day Cell
-
-    private func dayCell(for day: Date?) -> some View {
-        Group {
-            if let day = day {
-                let isToday = calendar.isDateInToday(day)
-                let isSelected = isDateSelected(day)
-                let isCurrentMonth = calendar.isDate(day, equalTo: displayedMonth, toGranularity: .month)
-                let isFuture = day > Date()
-
-                Button(action: {
-                    selectDay(day)
-                }) {
-                    Text("\(calendar.component(.day, from: day))")
-                        .font(isToday ? .retraceCaptionBold : .retraceCaption)
-                        .foregroundColor(
-                            isFuture
-                                ? .white.opacity(0.2)
-                                : (isSelected ? .white : .white.opacity(isCurrentMonth ? 0.8 : 0.3))
-                        )
-                        .frame(width: 30, height: 30)
-                        .background(
-                            ZStack {
-                                if isSelected {
-                                    Circle()
-                                        .fill(Color.accentColor)
-                                } else if isToday {
-                                    Circle()
-                                        .stroke(Color.accentColor, lineWidth: 1)
-                                }
-                            }
-                        )
-                }
-                .buttonStyle(.plain)
-                .disabled(isFuture)
-                .onHover { h in
-                    if !isFuture {
-                        if h { NSCursor.pointingHand.push() } else { NSCursor.pop() }
-                    }
-                }
-            } else {
-                Color.clear
-                    .frame(width: 30, height: 30)
-            }
+    static func from(mode: SearchMode, sortOrder: SearchSortOrder) -> SearchOrderOption {
+        if mode == .relevant {
+            return .relevance
         }
-    }
-
-    // MARK: - Preset Chip
-
-    private func presetChip(_ label: String, preset: DatePreset) -> some View {
-        Button(action: {
-            applyPreset(preset)
-        }) {
-            Text(label)
-                .font(.retraceCaption2Medium)
-                .foregroundColor(.white.opacity(0.8))
-                .padding(.horizontal, 10)
-                .padding(.vertical, 6)
-                .background(
-                    RoundedRectangle(cornerRadius: 6)
-                        .fill(Color.white.opacity(0.1))
-                )
-        }
-        .buttonStyle(.plain)
-        .onHover { isHovered in
-            if isHovered { NSCursor.pointingHand.push() } else { NSCursor.pop() }
-        }
-    }
-
-    // MARK: - Helpers
-
-    private func formatDate(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "MMM d, yyyy"
-        return formatter.string(from: date)
-    }
-
-    private var monthYearString: String {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "MMMM yyyy"
-        return formatter.string(from: displayedMonth)
-    }
-
-    private func changeMonth(by value: Int) {
-        if let newMonth = calendar.date(byAdding: .month, value: value, to: displayedMonth) {
-            withAnimation(.easeInOut(duration: 0.15)) {
-                displayedMonth = newMonth
-            }
-        }
-    }
-
-    private func daysInMonth() -> [Date?] {
-        var days: [Date?] = []
-
-        guard let monthInterval = calendar.dateInterval(of: .month, for: displayedMonth),
-              let monthFirstWeek = calendar.dateInterval(of: .weekOfMonth, for: monthInterval.start) else {
-            return days
-        }
-
-        var currentDate = monthFirstWeek.start
-
-        for _ in 0..<42 {
-            days.append(currentDate)
-            currentDate = calendar.date(byAdding: .day, value: 1, to: currentDate) ?? currentDate
-        }
-
-        return days
-    }
-
-    private func isDateSelected(_ day: Date) -> Bool {
-        switch editingDate {
-        case .start:
-            return calendar.isDate(day, inSameDayAs: startDate)
-        case .end:
-            return calendar.isDate(day, inSameDayAs: endDate)
-        case .none:
-            return false
-        }
-    }
-
-    private func selectDay(_ day: Date) {
-        switch editingDate {
-        case .start:
-            startDate = day
-            if startDate > endDate {
-                endDate = startDate
-            }
-        case .end:
-            endDate = day
-            if endDate < startDate {
-                startDate = endDate
-            }
-        case .none:
-            break
-        }
-    }
-
-    private func initializeDates() {
-        let now = Date()
-        let weekAgo = calendar.date(byAdding: .day, value: -7, to: now) ?? now
-
-        startDate = viewModel.startDate ?? weekAgo
-        endDate = viewModel.endDate ?? now
-        displayedMonth = endDate
-    }
-
-    private func applyCustomRange() {
-        let start = calendar.startOfDay(for: startDate)
-        let end = calendar.date(bySettingHour: 23, minute: 59, second: 59, of: endDate) ?? endDate
-
-        viewModel.setDateRange(start: start, end: end)
-        isPresented = false
-    }
-
-    private func applyPreset(_ preset: DatePreset) {
-        let now = Date()
-
-        switch preset {
-        case .anytime:
-            viewModel.setDateRange(start: nil, end: nil)
-        case .today:
-            let start = calendar.startOfDay(for: now)
-            let end = calendar.date(bySettingHour: 23, minute: 59, second: 59, of: now)
-            viewModel.setDateRange(start: start, end: end)
-        case .yesterday:
-            if let yesterday = calendar.date(byAdding: .day, value: -1, to: now) {
-                let start = calendar.startOfDay(for: yesterday)
-                let end = calendar.date(bySettingHour: 23, minute: 59, second: 59, of: yesterday)
-                viewModel.setDateRange(start: start, end: end)
-            }
-        case .lastWeek:
-            if let weekAgo = calendar.date(byAdding: .day, value: -7, to: now) {
-                let start = calendar.startOfDay(for: weekAgo)
-                viewModel.setDateRange(start: start, end: now)
-            }
-        case .lastMonth:
-            if let monthAgo = calendar.date(byAdding: .month, value: -1, to: now) {
-                let start = calendar.startOfDay(for: monthAgo)
-                viewModel.setDateRange(start: start, end: now)
-            }
-        }
-
-        isPresented = false
-    }
-}
-
-// MARK: - Date Preset Enum
-
-private enum DatePreset {
-    case anytime
-    case today
-    case yesterday
-    case lastWeek
-    case lastMonth
-}
-
-// MARK: - Search Mode Tabs
-
-private struct SearchModeTabs: View {
-    @ObservedObject var viewModel: SearchViewModel
-
-    var body: some View {
-        HStack(spacing: 4) {
-            SearchModeTab(
-                label: "Relevant",
-                isSelected: viewModel.searchMode == .relevant
-            ) {
-                viewModel.setSearchMode(.relevant)
-            }
-
-            SearchModeTab(
-                label: "All",
-                isSelected: viewModel.searchMode == .all
-            ) {
-                viewModel.setSearchMode(.all)
-            }
-        }
-        .padding(3)
-        .background(
-            RoundedRectangle(cornerRadius: 8)
-                .fill(Color.white.opacity(0.08))
-        )
-    }
-}
-
-private struct SearchModeTab: View {
-    let label: String
-    let isSelected: Bool
-    let action: () -> Void
-
-    @State private var isHovered = false
-
-    var body: some View {
-        Button(action: action) {
-            Text(label)
-                .font(isSelected ? .retraceCalloutBold : .retraceCalloutMedium)
-                .foregroundColor(isSelected ? .white : .white.opacity(0.6))
-                .padding(.horizontal, 14)
-                .padding(.vertical, 8)
-                .background(
-                    RoundedRectangle(cornerRadius: 6)
-                        .fill(isSelected ? Color.white.opacity(0.2) : (isHovered ? Color.white.opacity(0.1) : Color.clear))
-                )
-        }
-        .buttonStyle(.plain)
-        .onHover { hovering in
-            withAnimation(.easeOut(duration: 0.1)) {
-                isHovered = hovering
-            }
-        }
+        return sortOrder == .oldestFirst ? .oldest : .newest
     }
 }
 
@@ -1130,6 +836,7 @@ private struct TagsFilterChip: View {
     let availableTags: [Tag]
     let filterMode: TagFilterMode
     let isActive: Bool
+    let isOpen: Bool
     let action: () -> Void
 
     @State private var isHovered = false
@@ -1153,56 +860,47 @@ private struct TagsFilterChip: View {
         }
     }
 
-    private func logToFile(_ message: String) {
-        let logMessage = "[\(Log.timestamp())] \(message)\n"
-        if let data = logMessage.data(using: .utf8) {
-            let logPath = "/tmp/retrace_debug.log"
-            if !FileManager.default.fileExists(atPath: logPath) {
-                FileManager.default.createFile(atPath: logPath, contents: nil)
-            }
-            if let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: logPath)) {
-                handle.seekToEndOfFile()
-                handle.write(data)
-                handle.closeFile()
-            }
-        }
-    }
-
     var body: some View {
         Button(action: {
-            logToFile("[TagsFilterChip] Button action triggered!")
             action()
         }) {
-            HStack(spacing: 6) {
+            HStack(spacing: 4.5) {
                 // Show exclude indicator
                 if isExcludeMode {
                     Image(systemName: "minus.circle.fill")
-                        .font(.system(size: 12))
+                        .font(.system(size: 9))
                         .foregroundColor(.orange)
                         .transition(.scale.combined(with: .opacity))
                 }
 
                 Image(systemName: isActive ? "tag.fill" : "tag")
-                    .font(.system(size: 14))
+                    .font(.system(size: 11))
 
                 Text(label)
-                    .font(.retraceCalloutMedium)
+                    .font(.system(size: 11, weight: .medium))
                     .lineLimit(1)
                     .strikethrough(isExcludeMode, color: .orange)
 
                 Image(systemName: "chevron.down")
-                    .font(.retraceCaption2)
+                    .font(.system(size: 9, weight: .semibold))
             }
             .foregroundColor(isActive ? .white : .white.opacity(0.7))
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
+            .padding(.horizontal, 10.5)
+            .padding(.vertical, 7.5)
             .background(
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(isActive ? Color.white.opacity(0.2) : Color.white.opacity(isHovered ? 0.15 : 0.1))
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(isActive ? Color.white.opacity(0.2) : Color.white.opacity((isHovered || isOpen) ? 0.15 : 0.1))
             )
             .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(isActive ? Color.white.opacity(0.3) : Color.clear, lineWidth: 1)
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(
+                        isOpen
+                            ? RetraceMenuStyle.filterStrokeStrong
+                            : (isActive
+                                ? RetraceMenuStyle.filterStrokeMedium
+                                : (isHovered ? Color.white.opacity(0.65) : Color.clear)),
+                        lineWidth: (isOpen || isHovered) ? 1.2 : 1
+                    )
             )
         }
         .buttonStyle(.plain)
@@ -1219,6 +917,7 @@ private struct TagsFilterChip: View {
 private struct VisibilityFilterChip: View {
     let currentFilter: HiddenFilter
     let isActive: Bool
+    let isOpen: Bool
     let action: () -> Void
 
     @State private var isHovered = false
@@ -1239,47 +938,38 @@ private struct VisibilityFilterChip: View {
         }
     }
 
-    private func logToFile(_ message: String) {
-        let logMessage = "[\(Log.timestamp())] \(message)\n"
-        if let data = logMessage.data(using: .utf8) {
-            let logPath = "/tmp/retrace_debug.log"
-            if !FileManager.default.fileExists(atPath: logPath) {
-                FileManager.default.createFile(atPath: logPath, contents: nil)
-            }
-            if let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: logPath)) {
-                handle.seekToEndOfFile()
-                handle.write(data)
-                handle.closeFile()
-            }
-        }
-    }
-
     var body: some View {
         Button(action: {
-            logToFile("[VisibilityFilterChip] Button action triggered!")
             action()
         }) {
-            HStack(spacing: 6) {
+            HStack(spacing: 4.5) {
                 Image(systemName: icon)
-                    .font(.system(size: 14))
+                    .font(.system(size: 11))
 
                 Text(label)
-                    .font(.retraceCalloutMedium)
+                    .font(.system(size: 11, weight: .medium))
                     .lineLimit(1)
 
                 Image(systemName: "chevron.down")
-                    .font(.retraceCaption2)
+                    .font(.system(size: 9, weight: .semibold))
             }
             .foregroundColor(isActive ? .white : .white.opacity(0.7))
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
+            .padding(.horizontal, 10.5)
+            .padding(.vertical, 7.5)
             .background(
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(isActive ? Color.white.opacity(0.2) : Color.white.opacity(isHovered ? 0.15 : 0.1))
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(isActive ? Color.white.opacity(0.2) : Color.white.opacity((isHovered || isOpen) ? 0.15 : 0.1))
             )
             .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(isActive ? Color.white.opacity(0.3) : Color.clear, lineWidth: 1)
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(
+                        isOpen
+                            ? RetraceMenuStyle.filterStrokeStrong
+                            : (isActive
+                                ? RetraceMenuStyle.filterStrokeMedium
+                                : (isHovered ? Color.white.opacity(0.65) : Color.clear)),
+                        lineWidth: (isOpen || isHovered) ? 1.2 : 1
+                    )
             )
         }
         .buttonStyle(.plain)
@@ -1291,47 +981,64 @@ private struct VisibilityFilterChip: View {
     }
 }
 
-// MARK: - Sort Order Chip
+// MARK: - Comment Filter Chip
 
-private struct SortOrderChip: View {
-    let currentOrder: SearchSortOrder
+private struct CommentFilterChip: View {
+    let currentFilter: CommentFilter
+    let isActive: Bool
+    let isOpen: Bool
     let action: () -> Void
 
     @State private var isHovered = false
 
     private var icon: String {
-        switch currentOrder {
-        case .newestFirst: return "arrow.down"
-        case .oldestFirst: return "arrow.up"
+        switch currentFilter {
+        case .allFrames: return "text.bubble"
+        case .commentsOnly: return "text.bubble.fill"
+        case .noComments: return "text.bubble.slash"
         }
     }
 
     private var label: String {
-        switch currentOrder {
-        case .newestFirst: return "Newest"
-        case .oldestFirst: return "Oldest"
+        switch currentFilter {
+        case .allFrames: return "All"
+        case .commentsOnly: return "Comments"
+        case .noComments: return "No Comments"
         }
     }
 
     var body: some View {
-        Button(action: action) {
-            HStack(spacing: 6) {
+        Button(action: {
+            action()
+        }) {
+            HStack(spacing: 4.5) {
                 Image(systemName: icon)
-                    .font(.system(size: 14))
+                    .font(.system(size: 11))
 
                 Text(label)
-                    .font(.retraceCalloutMedium)
+                    .font(.system(size: 11, weight: .medium))
                     .lineLimit(1)
 
                 Image(systemName: "chevron.down")
-                    .font(.retraceCaption2)
+                    .font(.system(size: 9, weight: .semibold))
             }
-            .foregroundColor(.white.opacity(0.7))
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
+            .foregroundColor(isActive ? .white : .white.opacity(0.7))
+            .padding(.horizontal, 10.5)
+            .padding(.vertical, 7.5)
             .background(
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(Color.white.opacity(isHovered ? 0.15 : 0.1))
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(isActive ? Color.white.opacity(0.2) : Color.white.opacity((isHovered || isOpen) ? 0.15 : 0.1))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(
+                        isOpen
+                            ? RetraceMenuStyle.filterStrokeStrong
+                            : (isActive
+                                ? RetraceMenuStyle.filterStrokeMedium
+                                : (isHovered ? Color.white.opacity(0.65) : Color.clear)),
+                        lineWidth: (isOpen || isHovered) ? 1.2 : 1
+                    )
             )
         }
         .buttonStyle(.plain)
@@ -1343,17 +1050,63 @@ private struct SortOrderChip: View {
     }
 }
 
-// MARK: - Sort Order Popover
+private struct SearchOrderChip: View {
+    let selection: SearchOrderOption
+    let isOpen: Bool
+    let action: () -> Void
 
-private struct SortOrderPopover: View {
-    let currentOrder: SearchSortOrder
-    let onSelect: (SearchSortOrder) -> Void
+    @State private var isHovered = false
+
+    var body: some View {
+        let isHighlighted = isHovered || isOpen
+
+        Button(action: action) {
+            HStack(spacing: 4.5) {
+                Image(systemName: selection.icon)
+                    .font(.system(size: 11))
+
+                Text(selection.title)
+                    .font(.system(size: 11, weight: .medium))
+                    .lineLimit(1)
+
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 9, weight: .semibold))
+            }
+            .foregroundColor(.white)
+            .padding(.horizontal, 10.5)
+            .padding(.vertical, 7.5)
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(Color.white.opacity(isHighlighted ? 0.22 : 0.2))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(
+                        isOpen
+                            ? RetraceMenuStyle.filterStrokeStrong
+                            : (isHovered ? Color.white.opacity(0.65) : RetraceMenuStyle.filterStrokeMedium),
+                        lineWidth: 1.2
+                    )
+            )
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            withAnimation(.easeOut(duration: 0.1)) {
+                isHovered = hovering
+            }
+        }
+    }
+}
+
+private struct SearchOrderPopover: View {
+    let selection: SearchOrderOption
+    let onSelect: (SearchOrderOption) -> Void
     var onDismiss: (() -> Void)?
 
     @FocusState private var isFocused: Bool
     @State private var highlightedIndex: Int = 0
 
-    private let options: [SearchSortOrder] = [.newestFirst, .oldestFirst]
+    private let options: [SearchOrderOption] = [.newest, .oldest, .relevance]
 
     private func selectHighlightedItem() {
         guard highlightedIndex >= 0, highlightedIndex < options.count else { return }
@@ -1368,41 +1121,31 @@ private struct SortOrderPopover: View {
     var body: some View {
         FilterPopoverContainer(width: 200) {
             VStack(spacing: 0) {
-                // Newest First option (default)
-                FilterRow(
-                    systemIcon: "arrow.down",
-                    title: "Newest First",
-                    subtitle: "Most recent results first",
-                    isSelected: currentOrder == .newestFirst,
-                    isKeyboardHighlighted: highlightedIndex == 0
-                ) {
-                    onSelect(.newestFirst)
-                    onDismiss?()
-                }
-                .id(0)
+                ForEach(Array(options.enumerated()), id: \.offset) { index, option in
+                    if index > 0 {
+                        Divider()
+                            .padding(.vertical, 4)
+                    }
 
-                Divider()
-                    .padding(.vertical, 4)
-
-                // Oldest First option
-                FilterRow(
-                    systemIcon: "arrow.up",
-                    title: "Oldest First",
-                    subtitle: "Oldest results first",
-                    isSelected: currentOrder == .oldestFirst,
-                    isKeyboardHighlighted: highlightedIndex == 1
-                ) {
-                    onSelect(.oldestFirst)
-                    onDismiss?()
+                    FilterRow(
+                        systemIcon: option.icon,
+                        title: option.title,
+                        subtitle: option.subtitle,
+                        isSelected: selection == option,
+                        isKeyboardHighlighted: highlightedIndex == index
+                    ) {
+                        onSelect(option)
+                        onDismiss?()
+                    }
+                    .id(index)
                 }
-                .id(1)
             }
             .padding(.vertical, 8)
         }
         .focused($isFocused)
         .onAppear {
             // Set initial highlight to current selection
-            highlightedIndex = options.firstIndex(of: currentOrder) ?? 0
+            highlightedIndex = options.firstIndex(of: selection) ?? 0
             isFocused = true
         }
         .keyboardNavigation(
@@ -1412,4 +1155,3 @@ private struct SortOrderPopover: View {
         )
     }
 }
-

@@ -86,6 +86,7 @@ struct V1_InitialSchema: Migration {
                 isStarred       INTEGER NOT NULL DEFAULT 0,
                 encodingStatus  TEXT,
                 processingStatus INTEGER DEFAULT 0, -- See note above: insert uses 4, not this default
+                capture_trigger TEXT,
                 FOREIGN KEY (segmentId) REFERENCES segment(id) ON DELETE CASCADE,
                 FOREIGN KEY (videoId) REFERENCES video(id) ON DELETE SET NULL
             );

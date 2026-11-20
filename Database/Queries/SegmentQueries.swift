@@ -210,7 +210,7 @@ enum SegmentQueries {
         sqlite3_bind_int(statement, 1, Int32(width))
         sqlite3_bind_int(statement, 2, Int32(height))
 
-        guard sqlite3_step(statement) == SQLITE_ROW else {
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else {
             return nil
         }
 
@@ -301,7 +301,7 @@ enum SegmentQueries {
         }
 
         var results: [UnfinalisedVideo] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             let id = sqlite3_column_int64(statement, 0)
             guard let pathText = sqlite3_column_text(statement, 1) else { continue }
             let path = String(cString: pathText)
@@ -327,7 +327,7 @@ enum SegmentQueries {
 
     static func getByID(db: OpaquePointer, id: VideoSegmentID) throws -> VideoSegment? {
         let sql = """
-            SELECT id, height, width, path, fileSize, frameRate
+            SELECT id, height, width, path, fileSize, frameCount, frameRate
             FROM video
             WHERE id = ?;
             """
@@ -346,7 +346,43 @@ enum SegmentQueries {
 
         sqlite3_bind_int64(statement, 1, id.value)
 
-        guard sqlite3_step(statement) == SQLITE_ROW else {
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else {
+            return nil
+        }
+
+        return try parseVideoRow(statement: statement!)
+    }
+
+    static func findByRelativePathStem(db: OpaquePointer, stem: String) throws -> VideoSegment? {
+        let sql = """
+            SELECT id, height, width, path, fileSize, frameCount, frameRate
+            FROM video
+            WHERE path = ?
+               OR path = ?
+               OR path GLOB ?
+               OR path GLOB ?
+            ORDER BY CASE WHEN processingState = 1 THEN 0 ELSE 1 END, id DESC
+            LIMIT 1;
+            """
+
+        var statement: OpaquePointer?
+        defer {
+            sqlite3_finalize(statement)
+        }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        sqlite3_bind_text(statement, 1, stem, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(statement, 2, "\(stem).mp4", -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(statement, 3, "*/\(stem)", -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(statement, 4, "*/\(stem).mp4", -1, SQLITE_TRANSIENT)
+
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else {
             return nil
         }
 
@@ -359,7 +395,7 @@ enum SegmentQueries {
     static func getByTimestamp(db: OpaquePointer, timestamp: Date) throws -> VideoSegment? {
         // Query through frames to find the video
         let sql = """
-            SELECT DISTINCT v.id, v.height, v.width, v.path, v.fileSize, v.frameRate
+            SELECT DISTINCT v.id, v.height, v.width, v.path, v.fileSize, v.frameCount, v.frameRate
             FROM video v
             INNER JOIN frame f ON f.videoId = v.id
             WHERE f.createdAt = ?
@@ -381,7 +417,7 @@ enum SegmentQueries {
         let timestampMs = Schema.dateToTimestamp(timestamp)
         sqlite3_bind_int64(statement, 1, timestampMs)
 
-        guard sqlite3_step(statement) == SQLITE_ROW else {
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else {
             return nil
         }
 
@@ -397,7 +433,7 @@ enum SegmentQueries {
         to endDate: Date
     ) throws -> [VideoSegment] {
         let sql = """
-            SELECT DISTINCT v.id, v.height, v.width, v.path, v.fileSize, v.frameRate
+            SELECT DISTINCT v.id, v.height, v.width, v.path, v.fileSize, v.frameCount, v.frameRate
             FROM video v
             INNER JOIN frame f ON f.videoId = v.id
             WHERE f.createdAt >= ? AND f.createdAt <= ?
@@ -420,7 +456,7 @@ enum SegmentQueries {
         sqlite3_bind_int64(statement, 2, Schema.dateToTimestamp(endDate))
 
         var segments: [VideoSegment] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             let segment = try parseVideoRow(statement: statement!)
             segments.append(segment)
         }
@@ -429,6 +465,35 @@ enum SegmentQueries {
     }
 
     // MARK: - Delete
+
+    /// Atomic guard against retention deleting a still-referenced or active video.
+    /// An already absent row is success so a journal can retry its file removal.
+    static func deleteUnreferenced(db: OpaquePointer, id: VideoSegmentID) throws -> Bool {
+        let sql = """
+            DELETE FROM video WHERE id = ? AND processingState = 0
+            AND NOT EXISTS (SELECT 1 FROM frame WHERE videoId = video.id);
+            """
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+        sqlite3_bind_int64(statement, 1, id.value)
+        guard sqlite3_step(statement) == SQLITE_DONE else {
+            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+        var check: OpaquePointer?
+        defer { sqlite3_finalize(check) }
+        guard sqlite3_prepare_v2(db, "SELECT 1 FROM video WHERE id = ?", -1, &check, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: "retention video existence", underlying: String(cString: sqlite3_errmsg(db)))
+        }
+        sqlite3_bind_int64(check, 1, id.value)
+        let result = sqlite3_step(check)
+        guard result == SQLITE_ROW || result == SQLITE_DONE else {
+            throw DatabaseError.queryFailed(query: "retention video existence", underlying: String(cString: sqlite3_errmsg(db)))
+        }
+        return result == SQLITE_DONE
+    }
 
     static func delete(db: OpaquePointer, id: VideoSegmentID) throws {
         let sql = "DELETE FROM video WHERE id = ?;"
@@ -472,7 +537,7 @@ enum SegmentQueries {
             )
         }
 
-        guard sqlite3_step(statement) == SQLITE_ROW else {
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else {
             return 0
         }
 
@@ -494,7 +559,7 @@ enum SegmentQueries {
             )
         }
 
-        guard sqlite3_step(statement) == SQLITE_ROW else {
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else {
             return 0
         }
 
@@ -504,7 +569,7 @@ enum SegmentQueries {
     // MARK: - Helpers
 
     /// Parse a video row from the video table
-    /// Expected columns: id, height, width, path, fileSize, frameRate
+    /// Expected columns: id, height, width, path, fileSize, frameCount, frameRate
     private static func parseVideoRow(statement: OpaquePointer) throws -> VideoSegment {
         // Column 0: id (INTEGER)
         let videoId = sqlite3_column_int64(statement, 0)
@@ -525,15 +590,16 @@ enum SegmentQueries {
         // Column 4: fileSize (nullable)
         let fileSizeBytes = sqlite3_column_int64(statement, 4)
 
-        // Column 5: frameRate
-        let frameRate = sqlite3_column_double(statement, 5)
+        // Column 5: frameCount
+        let frameCount = Int(sqlite3_column_int(statement, 5))
 
-        // Note: The video table doesn't have startTime/endTime/frameCount
-        // Those need to be queried from the frames table if needed
-        // For now, use placeholder values (will be computed from frames when needed)
+        // Column 6: frameRate (currently unused by VideoSegment)
+        _ = sqlite3_column_double(statement, 6)
+
+        // Note: The video table doesn't have startTime/endTime.
+        // Those need to be queried from the frames table if needed.
         let startTime = Date(timeIntervalSince1970: 0)
         let endTime = Date(timeIntervalSince1970: 0)
-        let frameCount = 150 // Standard 150 frames per video (5 seconds @ 30 FPS)
 
         return VideoSegment(
             id: id,

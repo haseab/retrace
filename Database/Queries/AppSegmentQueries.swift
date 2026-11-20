@@ -1,5 +1,5 @@
 import Foundation
-import SQLite3
+import SQLCipher
 import Shared
 
 // MARK: - App Segment Queries
@@ -86,14 +86,29 @@ enum AppSegmentQueries {
         }
     }
 
-    /// Update browserURL if currently null
-    /// Used to backfill URLs extracted from OCR after capture
-    static func updateBrowserURL(db: OpaquePointer, id: Int64, browserURL: String) throws {
-        let sql = """
-            UPDATE segment
-            SET browserUrl = ?
-            WHERE id = ? AND browserUrl IS NULL
-            """
+    /// Update segment browserURL.
+    /// - Parameter onlyIfNull: When true, updates only if browserUrl is NULL.
+    ///   When false, also allows correcting an existing value if it differs.
+    static func updateBrowserURL(
+        db: OpaquePointer,
+        id: Int64,
+        browserURL: String,
+        onlyIfNull: Bool = true
+    ) throws {
+        var sql: String
+        if onlyIfNull {
+            sql = """
+                UPDATE segment
+                SET browserUrl = ?
+                WHERE id = ? AND browserUrl IS NULL
+                """
+        } else {
+            sql = """
+                UPDATE segment
+                SET browserUrl = ?
+                WHERE id = ? AND (browserUrl IS NULL OR browserUrl != ?)
+                """
+        }
 
         var statement: OpaquePointer?
         defer {
@@ -109,6 +124,9 @@ enum AppSegmentQueries {
 
         sqlite3_bind_text(statement, 1, browserURL, -1, SQLITE_TRANSIENT)
         sqlite3_bind_int64(statement, 2, id)
+        if !onlyIfNull {
+            sqlite3_bind_text(statement, 3, browserURL, -1, SQLITE_TRANSIENT)
+        }
 
         guard sqlite3_step(statement) == SQLITE_DONE else {
             throw DatabaseError.queryFailed(
@@ -141,7 +159,7 @@ enum AppSegmentQueries {
 
         sqlite3_bind_int64(statement, 1, id)
 
-        guard sqlite3_step(statement) == SQLITE_ROW else {
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else {
             return nil
         }
 
@@ -172,7 +190,7 @@ enum AppSegmentQueries {
         sqlite3_bind_int64(statement, 2, Schema.dateToTimestamp(startDate))
 
         var results: [Segment] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             results.append(try parseSegment(statement: statement!))
         }
         return results
@@ -200,7 +218,7 @@ enum AppSegmentQueries {
 
         sqlite3_bind_int(statement, 1, Int32(limit))
 
-        guard sqlite3_step(statement) == SQLITE_ROW else {
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else {
             return nil
         }
 
@@ -232,7 +250,7 @@ enum AppSegmentQueries {
         sqlite3_bind_int(statement, 2, Int32(limit))
 
         var results: [Segment] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             results.append(try parseSegment(statement: statement!))
         }
         return results
@@ -275,7 +293,7 @@ enum AppSegmentQueries {
         sqlite3_bind_int(statement, 5, Int32(offset))
 
         var results: [Segment] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             results.append(try parseSegment(statement: statement!))
         }
         return results
@@ -294,7 +312,7 @@ enum AppSegmentQueries {
     ) throws -> [Segment] {
         let isBrowser = browserBundleIDs.contains(bundleID)
 
-        let sql: String
+        var sql: String
         if isBrowser {
             // For browsers: match domain in browserUrl using LIKE (faster than CASE expression)
             // Matches patterns like "https://domain.com/..." or "https://domain.com"
@@ -353,7 +371,7 @@ enum AppSegmentQueries {
         }
 
         var results: [Segment] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             results.append(try parseSegment(statement: statement!))
         }
         return results
@@ -399,7 +417,7 @@ enum AppSegmentQueries {
         sqlite3_bind_int64(statement, 1, maxGapMs)
         sqlite3_bind_int64(statement, 2, maxGapMs)
 
-        guard sqlite3_step(statement) == SQLITE_ROW else {
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else {
             return 0
         }
 
@@ -448,7 +466,7 @@ enum AppSegmentQueries {
         sqlite3_bind_int64(statement, 2, maxGapMs)
         sqlite3_bind_int64(statement, 3, maxGapMs)
 
-        guard sqlite3_step(statement) == SQLITE_ROW else {
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else {
             return 0
         }
 
@@ -472,7 +490,7 @@ enum AppSegmentQueries {
             )
         }
 
-        guard sqlite3_step(statement) == SQLITE_ROW else {
+        guard try SQLiteReadStep.next(statement) == SQLITE_ROW else {
             return 0
         }
 
@@ -524,7 +542,7 @@ enum AppSegmentQueries {
         sqlite3_bind_int64(statement, 2, Schema.dateToTimestamp(endDate))
 
         var results: [(bundleID: String, duration: TimeInterval, sessionCount: Int)] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             let bundleID = String(cString: sqlite3_column_text(statement, 0))
             let durationMs = sqlite3_column_int64(statement, 1)
             let sessionCount = Int(sqlite3_column_int(statement, 2))
@@ -552,6 +570,8 @@ enum AppSegmentQueries {
         from startDate: Date,
         to endDate: Date
     ) throws -> [(bundleID: String, duration: TimeInterval, uniqueItemCount: Int)] {
+        let traceID = String(UUID().uuidString.prefix(8))
+        let totalStartedAt = CFAbsoluteTimeGetCurrent()
         let maxGapMs: Int64 = 120_000  // 2 minutes
 
         // Browser bundle IDs as SQL list for CASE expression
@@ -564,7 +584,7 @@ enum AppSegmentQueries {
         // 5. Count unique windows (or domains for browsers) per bundleID
         let sql = """
             WITH frames_with_app AS (
-                SELECT s.bundleID, f.segmentId, f.createdAt
+                SELECT s.bundleID, s.id as segmentId, f.createdAt
                 FROM frame f
                 JOIN segment s ON f.segmentId = s.id
                 WHERE f.createdAt >= ? AND f.createdAt <= ? AND f.isFocused = 1
@@ -572,6 +592,7 @@ enum AppSegmentQueries {
             frame_gaps AS (
                 SELECT
                     LAG(bundleID) OVER (ORDER BY createdAt) as prev_bundleID,
+                    LAG(segmentId) OVER (ORDER BY createdAt) as prev_segmentId,
                     createdAt - LAG(createdAt) OVER (ORDER BY createdAt) as gap_ms
                 FROM frames_with_app
             ),
@@ -602,6 +623,11 @@ enum AppSegmentQueries {
                     END) as unique_count
                 FROM frames_with_app fwa
                 JOIN segment s ON fwa.segmentId = s.id
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM segment_tag st
+                    JOIN tag t ON st.tagId = t.id
+                    WHERE st.segmentId = s.id AND t.name = 'hidden'
+                )
                 GROUP BY fwa.bundleID
             )
             SELECT
@@ -615,49 +641,114 @@ enum AppSegmentQueries {
             FROM frame_gaps fg
             LEFT JOIN unique_items ui ON fg.prev_bundleID = ui.bundleID
             WHERE fg.prev_bundleID IS NOT NULL
+                AND NOT EXISTS (
+                    SELECT 1 FROM segment_tag st
+                    JOIN tag t ON st.tagId = t.id
+                    WHERE st.segmentId = fg.prev_segmentId AND t.name = 'hidden'
+                )
             GROUP BY fg.prev_bundleID
             """
 
+        let prepareStartedAt = CFAbsoluteTimeGetCurrent()
         var statement: OpaquePointer?
         defer { sqlite3_finalize(statement) }
 
         guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            let elapsedMs = (CFAbsoluteTimeGetCurrent() - totalStartedAt) * 1000
+            Log.error(
+                "[DASHBOARD-SQL][\(traceID)] getAppUsageStats PREPARE FAIL after \(String(format: "%.1f", elapsedMs))ms",
+                category: .database
+            )
             throw DatabaseError.queryFailed(
                 query: sql,
                 underlying: String(cString: sqlite3_errmsg(db))
             )
         }
+        let prepareElapsedMs = (CFAbsoluteTimeGetCurrent() - prepareStartedAt) * 1000
+        Log.recordLatency(
+            "dashboard.sql.get_app_usage_stats.prepare_ms",
+            valueMs: prepareElapsedMs,
+            category: .database,
+            summaryEvery: 10,
+            warningThresholdMs: 150,
+            criticalThresholdMs: 600
+        )
 
         sqlite3_bind_int64(statement, 1, Schema.dateToTimestamp(startDate))
         sqlite3_bind_int64(statement, 2, Schema.dateToTimestamp(endDate))
         sqlite3_bind_int64(statement, 3, maxGapMs)
         sqlite3_bind_int64(statement, 4, maxGapMs)
 
+        let executeStartedAt = CFAbsoluteTimeGetCurrent()
         var results: [(bundleID: String, duration: TimeInterval, uniqueItemCount: Int)] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        var totalDurationMs: Int64 = 0
+        var stepResult = try SQLiteReadStep.next(statement)
+        while stepResult == SQLITE_ROW {
             let bundleID = String(cString: sqlite3_column_text(statement, 0))
             let durationMs = sqlite3_column_int64(statement, 1)
             let uniqueCount = Int(sqlite3_column_int(statement, 2))
+            totalDurationMs += durationMs
 
             results.append((
                 bundleID: bundleID,
                 duration: TimeInterval(durationMs) / 1000.0,
                 uniqueItemCount: uniqueCount
             ))
+
+            stepResult = try SQLiteReadStep.next(statement)
         }
+
+        guard stepResult == SQLITE_DONE else {
+            let executeElapsedMs = (CFAbsoluteTimeGetCurrent() - executeStartedAt) * 1000
+            let totalElapsedMs = (CFAbsoluteTimeGetCurrent() - totalStartedAt) * 1000
+            Log.error(
+                "[DASHBOARD-SQL][\(traceID)] getAppUsageStats EXECUTE FAIL rows=\(results.count) stepCode=\(stepResult) execute=\(String(format: "%.1f", executeElapsedMs))ms total=\(String(format: "%.1f", totalElapsedMs))ms",
+                category: .database
+            )
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        let executeElapsedMs = (CFAbsoluteTimeGetCurrent() - executeStartedAt) * 1000
+        Log.recordLatency(
+            "dashboard.sql.get_app_usage_stats.execute_ms",
+            valueMs: executeElapsedMs,
+            category: .database,
+            summaryEvery: 10,
+            warningThresholdMs: 800,
+            criticalThresholdMs: 2500
+        )
+
+        let totalElapsedMs = (CFAbsoluteTimeGetCurrent() - totalStartedAt) * 1000
+        Log.recordLatency(
+            "dashboard.sql.get_app_usage_stats.total_ms",
+            valueMs: totalElapsedMs,
+            category: .database,
+            summaryEvery: 10,
+            warningThresholdMs: 800,
+            criticalThresholdMs: 2500
+        )
+        let completionMessage = "[DASHBOARD-SQL][\(traceID)] getAppUsageStats END rows=\(results.count) totalDurationSec=\(Int(totalDurationMs / 1000)) prepare=\(String(format: "%.1f", prepareElapsedMs))ms execute=\(String(format: "%.1f", executeElapsedMs))ms total=\(String(format: "%.1f", totalElapsedMs))ms"
+        if totalElapsedMs >= 2500 {
+            Log.warning(completionMessage, category: .database)
+        }
+
         return results
     }
 
     /// Get window usage aggregated by windowName for a specific app
-    /// For browsers, aggregates by domain extracted from browserUrl instead
+    /// For browsers, aggregates by domain extracted from browserUrl and includes tab counts per domain
     /// Uses frame-based calculation with 2-minute idle cap (same as getAppUsageStats)
     /// Returns windows sorted by duration descending
     static func getWindowUsageForApp(
         db: OpaquePointer,
         bundleID: String,
         from startDate: Date,
-        to endDate: Date
-    ) throws -> [(windowName: String?, isWebsite: Bool, duration: TimeInterval)] {
+        to endDate: Date,
+        limit: Int? = nil
+    ) throws -> [(windowName: String?, isWebsite: Bool, duration: TimeInterval, tabCount: Int?, totalCount: Int, totalDuration: TimeInterval)] {
         let isBrowser = browserBundleIDs.contains(bundleID)
         let maxGapMs: Int64 = 120_000  // 2 minutes
 
@@ -667,10 +758,10 @@ enum AppSegmentQueries {
         // 3. Attribute each gap to the PREVIOUS frame's app and window
         // 4. Filter to only include gaps where prev_bundleID matches the target
         // 5. Cap gaps at 2 minutes and sum per window/domain
-        let sql: String
+        var sql: String
         if isBrowser {
             // For browsers: show websites (from browserUrl) first, then windowName fallback entries
-            // Uses UNION to combine website entries and window-only entries, sorted by type then duration
+            // Includes tab count per website (count of tab rows under each domain)
             sql = """
                 WITH all_frames AS (
                     SELECT
@@ -678,6 +769,7 @@ enum AppSegmentQueries {
                         s.bundleID,
                         s.id as segmentId,
                         s.windowName,
+                        s.browserUrl,
                         CASE
                             WHEN s.browserUrl IS NOT NULL AND s.browserUrl != '' THEN
                                 CASE
@@ -705,6 +797,7 @@ enum AppSegmentQueries {
                         LAG(bundleID) OVER (ORDER BY createdAt) as prev_bundleID,
                         LAG(segmentId) OVER (ORDER BY createdAt) as prev_segmentId,
                         LAG(windowName) OVER (ORDER BY createdAt) as prev_windowName,
+                        LAG(browserUrl) OVER (ORDER BY createdAt) as prev_browserUrl,
                         LAG(domain) OVER (ORDER BY createdAt) as prev_domain,
                         createdAt - LAG(createdAt) OVER (ORDER BY createdAt) as gap_ms
                     FROM all_frames
@@ -751,13 +844,61 @@ enum AppSegmentQueries {
                         )
                     GROUP BY prev_windowName
                     HAVING duration_ms >= 1000
-                )
-                SELECT item_name, is_website, duration_ms
-                FROM (
-                    SELECT * FROM website_usage
+                ),
+                -- Domain + tab aggregates to derive tab counts per website
+                domain_tab_usage AS (
+                    SELECT
+                        prev_domain as domain,
+                        prev_windowName as tab_name,
+                        prev_browserUrl as tab_url,
+                        SUM(CASE
+                            WHEN gap_ms IS NULL THEN 0
+                            WHEN gap_ms > ? THEN ?
+                            ELSE gap_ms
+                        END) as duration_ms
+                    FROM frame_gaps
+                    WHERE prev_bundleID = ?
+                        AND prev_domain IS NOT NULL
+                        AND prev_windowName IS NOT NULL
+                        AND NOT EXISTS (
+                            SELECT 1 FROM segment_tag st
+                            JOIN tag t ON st.tagId = t.id
+                            WHERE st.segmentId = prev_segmentId AND t.name = 'hidden'
+                        )
+                    GROUP BY prev_domain, prev_windowName, prev_browserUrl
+                    HAVING duration_ms >= 1000
+                ),
+                website_tab_counts AS (
+                    SELECT
+                        domain,
+                        COUNT(*) as tab_count
+                    FROM domain_tab_usage
+                    GROUP BY domain
+                ),
+                combined_usage AS (
+                    SELECT
+                        wu.item_name as item_name,
+                        wu.is_website as is_website,
+                        wu.duration_ms as duration_ms,
+                        COALESCE(wtc.tab_count, 0) as tab_count
+                    FROM website_usage wu
+                    LEFT JOIN website_tab_counts wtc ON wtc.domain = wu.item_name
                     UNION ALL
-                    SELECT * FROM window_usage
+                    SELECT
+                        item_name,
+                        is_website,
+                        duration_ms,
+                        NULL as tab_count
+                    FROM window_usage
                 )
+                SELECT
+                    item_name,
+                    is_website,
+                    duration_ms,
+                    tab_count,
+                    COUNT(*) OVER () as total_count,
+                    SUM(duration_ms) OVER () as total_duration_ms
+                FROM combined_usage
                 ORDER BY is_website DESC, duration_ms DESC
                 """
         } else {
@@ -780,27 +921,42 @@ enum AppSegmentQueries {
                         LAG(item_name) OVER (ORDER BY createdAt) as prev_item,
                         createdAt - LAG(createdAt) OVER (ORDER BY createdAt) as gap_ms
                     FROM all_frames
+                ),
+                combined_usage AS (
+                    SELECT
+                        prev_item as item_name,
+                        0 as is_website,
+                        SUM(CASE
+                            WHEN gap_ms IS NULL THEN 0
+                            WHEN gap_ms > ? THEN ?
+                            ELSE gap_ms
+                        END) as duration_ms,
+                        NULL as tab_count
+                    FROM frame_gaps
+                    WHERE prev_bundleID = ?
+                        AND prev_item IS NOT NULL
+                        AND NOT EXISTS (
+                            SELECT 1 FROM segment_tag st
+                            JOIN tag t ON st.tagId = t.id
+                            WHERE st.segmentId = prev_segmentId AND t.name = 'hidden'
+                        )
+                    GROUP BY prev_item
+                    HAVING duration_ms >= 1000
                 )
                 SELECT
-                    prev_item as item_name,
-                    0 as is_website,
-                    SUM(CASE
-                        WHEN gap_ms IS NULL THEN 0
-                        WHEN gap_ms > ? THEN ?
-                        ELSE gap_ms
-                    END) as duration_ms
-                FROM frame_gaps
-                WHERE prev_bundleID = ?
-                    AND prev_item IS NOT NULL
-                    AND NOT EXISTS (
-                        SELECT 1 FROM segment_tag st
-                        JOIN tag t ON st.tagId = t.id
-                        WHERE st.segmentId = prev_segmentId AND t.name = 'hidden'
-                    )
-                GROUP BY prev_item
-                HAVING duration_ms >= 1000
+                    item_name,
+                    is_website,
+                    duration_ms,
+                    tab_count,
+                    COUNT(*) OVER () as total_count,
+                    SUM(duration_ms) OVER () as total_duration_ms
+                FROM combined_usage
                 ORDER BY duration_ms DESC
                 """
+        }
+
+        if let limit {
+            sql += "\nLIMIT \(limit)"
         }
 
         var statement: OpaquePointer?
@@ -817,17 +973,20 @@ enum AppSegmentQueries {
         sqlite3_bind_int64(statement, 2, Schema.dateToTimestamp(endDate))
         sqlite3_bind_int64(statement, 3, maxGapMs)
         sqlite3_bind_int64(statement, 4, maxGapMs)
-        sqlite3_bind_text(statement, 5, (bundleID as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(statement, 5, (bundleID as NSString).utf8String, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
 
-        // For browser query, we have additional parameters for the window fallback subquery
+        // For browser query, we have additional parameters for window fallback and tab-count CTEs.
         if isBrowser {
             sqlite3_bind_int64(statement, 6, maxGapMs)
             sqlite3_bind_int64(statement, 7, maxGapMs)
-            sqlite3_bind_text(statement, 8, (bundleID as NSString).utf8String, -1, nil)
+            sqlite3_bind_text(statement, 8, (bundleID as NSString).utf8String, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+            sqlite3_bind_int64(statement, 9, maxGapMs)
+            sqlite3_bind_int64(statement, 10, maxGapMs)
+            sqlite3_bind_text(statement, 11, (bundleID as NSString).utf8String, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
         }
 
-        var results: [(windowName: String?, isWebsite: Bool, duration: TimeInterval)] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        var results: [(windowName: String?, isWebsite: Bool, duration: TimeInterval, tabCount: Int?, totalCount: Int, totalDuration: TimeInterval)] = []
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             let windowName: String?
             if sqlite3_column_type(statement, 0) == SQLITE_NULL {
                 windowName = nil
@@ -836,11 +995,22 @@ enum AppSegmentQueries {
             }
             let isWebsite = sqlite3_column_int(statement, 1) == 1
             let durationMs = sqlite3_column_int64(statement, 2)
+            let tabCount: Int?
+            if sqlite3_column_type(statement, 3) == SQLITE_NULL {
+                tabCount = nil
+            } else {
+                tabCount = Int(sqlite3_column_int(statement, 3))
+            }
+            let totalCount = Int(sqlite3_column_int(statement, 4))
+            let totalDurationMs = sqlite3_column_int64(statement, 5)
 
             results.append((
                 windowName: windowName,
                 isWebsite: isWebsite,
-                duration: TimeInterval(durationMs) / 1000.0
+                duration: TimeInterval(durationMs) / 1000.0,
+                tabCount: tabCount,
+                totalCount: totalCount,
+                totalDuration: TimeInterval(totalDurationMs) / 1000.0
             ))
         }
         return results
@@ -914,10 +1084,10 @@ enum AppSegmentQueries {
         sqlite3_bind_int64(statement, 2, Schema.dateToTimestamp(endDate))
         sqlite3_bind_int64(statement, 3, maxGapMs)
         sqlite3_bind_int64(statement, 4, maxGapMs)
-        sqlite3_bind_text(statement, 5, (bundleID as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(statement, 5, (bundleID as NSString).utf8String, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
 
         var results: [(windowName: String?, browserUrl: String?, duration: TimeInterval)] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             let windowName: String?
             if sqlite3_column_type(statement, 0) == SQLITE_NULL {
                 windowName = nil
@@ -1029,11 +1199,11 @@ enum AppSegmentQueries {
         sqlite3_bind_int64(statement, 2, Schema.dateToTimestamp(endDate))
         sqlite3_bind_int64(statement, 3, maxGapMs)
         sqlite3_bind_int64(statement, 4, maxGapMs)
-        sqlite3_bind_text(statement, 5, (bundleID as NSString).utf8String, -1, nil)
-        sqlite3_bind_text(statement, 6, (domain as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(statement, 5, (bundleID as NSString).utf8String, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        sqlite3_bind_text(statement, 6, (domain as NSString).utf8String, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
 
         var results: [(windowName: String?, browserUrl: String?, duration: TimeInterval)] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
             let windowName: String?
             if sqlite3_column_type(statement, 0) == SQLITE_NULL {
                 windowName = nil
@@ -1065,18 +1235,14 @@ enum AppSegmentQueries {
         from startDate: Date,
         to endDate: Date
     ) throws -> [(date: Date, value: Int64)] {
-        // Get local timezone offset in milliseconds
-        let tzOffsetMs = Int64(TimeZone.current.secondsFromGMT()) * 1000
-
-        // Group segments by local day by adding timezone offset before grouping
         let sql = """
             SELECT
-                ((startDate + ?) / 86400000) * 86400000 - ? as day,
+                date(startDate / 1000.0, 'unixepoch', 'localtime') as local_day,
                 SUM(endDate - startDate) as total_duration_ms
             FROM segment
             WHERE startDate >= ? AND startDate <= ?
-            GROUP BY ((startDate + ?) / 86400000)
-            ORDER BY day ASC
+            GROUP BY local_day
+            ORDER BY local_day ASC
             """
 
         var statement: OpaquePointer?
@@ -1089,20 +1255,18 @@ enum AppSegmentQueries {
             )
         }
 
-        sqlite3_bind_int64(statement, 1, tzOffsetMs)
-        sqlite3_bind_int64(statement, 2, tzOffsetMs)
-        sqlite3_bind_int64(statement, 3, Schema.dateToTimestamp(startDate))
-        sqlite3_bind_int64(statement, 4, Schema.dateToTimestamp(endDate))
-        sqlite3_bind_int64(statement, 5, tzOffsetMs)
+        sqlite3_bind_int64(statement, 1, Schema.dateToTimestamp(startDate))
+        sqlite3_bind_int64(statement, 2, Schema.dateToTimestamp(endDate))
 
         var results: [(date: Date, value: Int64)] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
-            let dayTimestamp = sqlite3_column_int64(statement, 0)
+        while try SQLiteReadStep.next(statement) == SQLITE_ROW {
+            guard let localDay = parseLocalDay(sqlite3_column_text(statement, 0)) else {
+                continue
+            }
             let durationMs = sqlite3_column_int64(statement, 1)
-            let date = Date(timeIntervalSince1970: Double(dayTimestamp) / 1000)
             // Convert milliseconds to tenths of hours for graph display (allows 1 decimal place)
             let tenthsOfHours = durationMs / (1000 * 60 * 6)
-            results.append((date: date, value: tenthsOfHours))
+            results.append((date: localDay, value: tenthsOfHours))
         }
 
         return results
@@ -1117,23 +1281,23 @@ enum AppSegmentQueries {
         from startDate: Date,
         to endDate: Date
     ) throws -> [(date: Date, value: Int64)] {
-        // Get local timezone offset in milliseconds
-        let tzOffsetMs = Int64(TimeZone.current.secondsFromGMT()) * 1000
+        let traceID = String(UUID().uuidString.prefix(8))
+        let totalStartedAt = CFAbsoluteTimeGetCurrent()
         let maxGapMs: Int64 = 120_000  // 2 minutes - gaps larger than this are considered idle
 
         // Calculate screen time from frame gaps, grouped by local day
-        // Uses LAG to get previous frame time, then caps gaps at 5 minutes
+        // Uses LAG to get previous frame time, then caps gaps at 2 minutes
         let sql = """
             WITH frame_gaps AS (
                 SELECT
                     createdAt,
-                    ((createdAt + ?) / 86400000) as local_day,
+                    date(createdAt / 1000.0, 'unixepoch', 'localtime') as local_day,
                     createdAt - LAG(createdAt) OVER (ORDER BY createdAt) as gap_ms
                 FROM frame
                 WHERE createdAt >= ? AND createdAt <= ? AND isFocused = 1
             )
             SELECT
-                (local_day * 86400000) - ? as day,
+                local_day,
                 SUM(CASE
                     WHEN gap_ms IS NULL THEN 0
                     WHEN gap_ms > ? THEN ?
@@ -1141,36 +1305,111 @@ enum AppSegmentQueries {
                 END) as total_duration_ms
             FROM frame_gaps
             GROUP BY local_day
-            ORDER BY day ASC
+            ORDER BY local_day ASC
             """
 
+        let prepareStartedAt = CFAbsoluteTimeGetCurrent()
         var statement: OpaquePointer?
         defer { sqlite3_finalize(statement) }
 
         guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            let elapsedMs = (CFAbsoluteTimeGetCurrent() - totalStartedAt) * 1000
+            Log.error(
+                "[DASHBOARD-SQL][\(traceID)] getDailyScreenTime PREPARE FAIL after \(String(format: "%.1f", elapsedMs))ms",
+                category: .database
+            )
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+        let prepareElapsedMs = (CFAbsoluteTimeGetCurrent() - prepareStartedAt) * 1000
+        Log.recordLatency(
+            "dashboard.sql.get_daily_screen_time.prepare_ms",
+            valueMs: prepareElapsedMs,
+            category: .database,
+            summaryEvery: 10,
+            warningThresholdMs: 150,
+            criticalThresholdMs: 600
+        )
+
+        sqlite3_bind_int64(statement, 1, Schema.dateToTimestamp(startDate))
+        sqlite3_bind_int64(statement, 2, Schema.dateToTimestamp(endDate))
+        sqlite3_bind_int64(statement, 3, maxGapMs)
+        sqlite3_bind_int64(statement, 4, maxGapMs)
+
+        let executeStartedAt = CFAbsoluteTimeGetCurrent()
+        var results: [(date: Date, value: Int64)] = []
+        var totalDurationMs: Int64 = 0
+        var stepResult = try SQLiteReadStep.next(statement)
+        while stepResult == SQLITE_ROW {
+            guard let localDay = parseLocalDay(sqlite3_column_text(statement, 0)) else {
+                stepResult = try SQLiteReadStep.next(statement)
+                continue
+            }
+            let durationMs = sqlite3_column_int64(statement, 1)
+            totalDurationMs += durationMs
+            // Return raw milliseconds - conversion happens in UI layer to preserve precision
+            results.append((date: localDay, value: durationMs))
+
+            stepResult = try SQLiteReadStep.next(statement)
+        }
+
+        guard stepResult == SQLITE_DONE else {
+            let executeElapsedMs = (CFAbsoluteTimeGetCurrent() - executeStartedAt) * 1000
+            let totalElapsedMs = (CFAbsoluteTimeGetCurrent() - totalStartedAt) * 1000
+            Log.error(
+                "[DASHBOARD-SQL][\(traceID)] getDailyScreenTime EXECUTE FAIL rows=\(results.count) stepCode=\(stepResult) execute=\(String(format: "%.1f", executeElapsedMs))ms total=\(String(format: "%.1f", totalElapsedMs))ms",
+                category: .database
+            )
             throw DatabaseError.queryFailed(
                 query: sql,
                 underlying: String(cString: sqlite3_errmsg(db))
             )
         }
 
-        sqlite3_bind_int64(statement, 1, tzOffsetMs)
-        sqlite3_bind_int64(statement, 2, Schema.dateToTimestamp(startDate))
-        sqlite3_bind_int64(statement, 3, Schema.dateToTimestamp(endDate))
-        sqlite3_bind_int64(statement, 4, tzOffsetMs)
-        sqlite3_bind_int64(statement, 5, maxGapMs)
-        sqlite3_bind_int64(statement, 6, maxGapMs)
+        let executeElapsedMs = (CFAbsoluteTimeGetCurrent() - executeStartedAt) * 1000
+        Log.recordLatency(
+            "dashboard.sql.get_daily_screen_time.execute_ms",
+            valueMs: executeElapsedMs,
+            category: .database,
+            summaryEvery: 10,
+            warningThresholdMs: 1200,
+            criticalThresholdMs: 5000
+        )
 
-        var results: [(date: Date, value: Int64)] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
-            let dayTimestamp = sqlite3_column_int64(statement, 0)
-            let durationMs = sqlite3_column_int64(statement, 1)
-            let date = Date(timeIntervalSince1970: Double(dayTimestamp) / 1000)
-            // Return raw milliseconds - conversion happens in UI layer to preserve precision
-            results.append((date: date, value: durationMs))
+        let totalElapsedMs = (CFAbsoluteTimeGetCurrent() - totalStartedAt) * 1000
+        Log.recordLatency(
+            "dashboard.sql.get_daily_screen_time.total_ms",
+            valueMs: totalElapsedMs,
+            category: .database,
+            summaryEvery: 10,
+            warningThresholdMs: 1200,
+            criticalThresholdMs: 5000
+        )
+        let completionMessage = "[DASHBOARD-SQL][\(traceID)] getDailyScreenTime END rows=\(results.count) totalDurationSec=\(Int(totalDurationMs / 1000)) prepare=\(String(format: "%.1f", prepareElapsedMs))ms execute=\(String(format: "%.1f", executeElapsedMs))ms total=\(String(format: "%.1f", totalElapsedMs))ms"
+        if totalElapsedMs >= 5000 {
+            Log.warning(completionMessage, category: .database)
         }
 
         return results
+    }
+
+    private static func parseLocalDay(_ localDayText: UnsafePointer<UInt8>?) -> Date? {
+        guard let localDayText else { return nil }
+
+        let components = String(cString: localDayText).split(separator: "-")
+        guard components.count == 3,
+              let year = Int(components[0]),
+              let month = Int(components[1]),
+              let day = Int(components[2]) else {
+            return nil
+        }
+
+        var calendar = Calendar.current
+        calendar.timeZone = .current
+
+        return calendar.date(from: DateComponents(year: year, month: month, day: day))
     }
 
     // MARK: - Delete

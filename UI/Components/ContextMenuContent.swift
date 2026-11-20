@@ -10,21 +10,37 @@ import App
 struct ContextMenuContent: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel
     @Binding var showMenu: Bool
+    var highlightControlsVisibilityRow: Bool = false
     @EnvironmentObject var coordinatorWrapper: AppCoordinatorWrapper
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
-            ContextMenuRow(title: "Copy Moment Link", icon: "link") {
+            ContextMenuRow(
+                title: "Copy Moment Link",
+                icon: "link",
+                shortcut: "⌥⇧L",
+                isDisabled: viewModel.isInLiveMode
+            ) {
                 showMenu = false
                 copyMomentLink()
             }
 
-            ContextMenuRow(title: "Copy Image", icon: "doc.on.doc") {
+            ContextMenuRow(
+                title: "Copy URL Link",
+                icon: "link",
+                shortcut: "⌘L",
+                isDisabled: viewModel.isInLiveMode || !hasCurrentBrowserURL
+            ) {
+                showMenu = false
+                copyURLLink()
+            }
+
+            ContextMenuRow(title: "Copy Image", icon: "doc.on.doc", shortcut: "⌘C") {
                 showMenu = false
                 copyImageToClipboard()
             }
 
-            ContextMenuRow(title: "Save Image", icon: "square.and.arrow.down") {
+            ContextMenuRow(title: "Save Image", icon: "square.and.arrow.down", shortcut: "⌘S") {
                 showMenu = false
                 saveImage()
             }
@@ -33,7 +49,12 @@ struct ContextMenuContent: View {
                 .background(Color.white.opacity(0.1))
                 .padding(.vertical, 4)
 
-            ContextMenuRow(title: viewModel.areControlsHidden ? "Show Controls" : "Hide Controls", icon: viewModel.areControlsHidden ? "menubar.arrow.up.rectangle" : "menubar.arrow.down.rectangle", shortcut: "⌘H") {
+            ContextMenuRow(
+                title: viewModel.areControlsHidden ? "Show Controls" : "Hide Controls",
+                icon: viewModel.areControlsHidden ? "menubar.arrow.up.rectangle" : "menubar.arrow.down.rectangle",
+                shortcut: "⌘H",
+                showGuideRing: highlightControlsVisibilityRow
+            ) {
                 showMenu = false
                 viewModel.toggleControlsVisibility()
             }
@@ -43,9 +64,14 @@ struct ContextMenuContent: View {
                 openDashboard()
             }
 
-            ContextMenuRow(title: "System Monitor", icon: "waveform.path.ecg") {
+            ContextMenuRow(title: "System Monitor", icon: "waveform.path.ecg", shortcut: "⌘⇧M") {
                 showMenu = false
                 openSystemMonitor()
+            }
+
+            ContextMenuRow(title: "Get Help", icon: "exclamationmark.bubble", shortcut: "⌘⇧H") {
+                showMenu = false
+                openFeedback()
             }
 
             ContextMenuRow(title: "Settings", icon: "gear", shortcut: "⌘,") {
@@ -57,7 +83,16 @@ struct ContextMenuContent: View {
 
     // MARK: - Actions
 
+    private var hasCurrentBrowserURL: Bool {
+        guard let urlString = viewModel.currentFrame?.metadata.browserURL,
+              !urlString.isEmpty else {
+            return false
+        }
+        return URL(string: urlString) != nil
+    }
+
     private func copyMomentLink() {
+        guard !viewModel.isInLiveMode else { return }
         guard let timestamp = viewModel.currentTimestamp else { return }
 
         if let url = DeeplinkHandler.generateTimelineLink(timestamp: timestamp) {
@@ -67,6 +102,10 @@ struct ContextMenuContent: View {
             // Record deeplink copy metric with the URL
             DashboardViewModel.recordDeeplinkCopy(coordinator: coordinatorWrapper.coordinator, url: url.absoluteString)
         }
+    }
+
+    private func copyURLLink() {
+        _ = viewModel.copyCurrentBrowserURL()
     }
 
     private func saveImage() {
@@ -95,16 +134,7 @@ struct ContextMenuContent: View {
     }
 
     private func copyImageToClipboard() {
-        let coordinator = coordinatorWrapper.coordinator
-        let frameID = viewModel.currentFrame?.id.value
-        getCurrentFrameImage { image in
-            guard let image = image else { return }
-            let pasteboard = NSPasteboard.general
-            pasteboard.clearContents()
-            pasteboard.writeObjects([image])
-            // Record image copy metric with frame ID
-            DashboardViewModel.recordImageCopy(coordinator: coordinator, frameID: frameID)
-        }
+        viewModel.copyCurrentFrameImageToClipboard()
     }
 
     private func openDashboard() {
@@ -130,7 +160,19 @@ struct ContextMenuContent: View {
         }
     }
 
+    private func openFeedback() {
+        TimelineWindowController.shared.hideToShowDashboard()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+            NotificationCenter.default.post(name: .openFeedback, object: nil)
+        }
+    }
+
     private func getCurrentFrameImage(completion: @escaping (NSImage?) -> Void) {
+        if viewModel.isInLiveMode {
+            completion(viewModel.liveScreenshot)
+            return
+        }
+
         if let image = viewModel.currentImage {
             completion(image)
             return
@@ -152,26 +194,18 @@ struct ContextMenuContent: View {
             }
         }
 
-        let url: URL
-        if actualVideoPath.hasSuffix(".mp4") {
-            url = URL(fileURLWithPath: actualVideoPath)
-        } else {
-            let tempDir = FileManager.default.temporaryDirectory
-            let fileName = (actualVideoPath as NSString).lastPathComponent
-            let symlinkPath = tempDir.appendingPathComponent("\(fileName).mp4").path
-
-            if !FileManager.default.fileExists(atPath: symlinkPath) {
-                do {
-                    try FileManager.default.createSymbolicLink(atPath: symlinkPath, withDestinationPath: actualVideoPath)
-                } catch {
-                    completion(nil)
-                    return
-                }
-            }
-            url = URL(fileURLWithPath: symlinkPath)
+        guard let url = MP4SymlinkResolver.resolveURL(for: actualVideoPath) else {
+            completion(nil)
+            return
         }
 
         let asset = AVURLAsset(url: url)
+        let directDecodeBytes = UIDirectFrameDecodeMemoryLedger.begin(
+            tag: UIDirectFrameDecodeMemoryLedger.contextMenuGeneratorTag,
+            function: "ui.context_menu",
+            reason: "ui.context_menu.frame_decode",
+            videoInfo: videoInfo
+        )
         let imageGenerator = AVAssetImageGenerator(asset: asset)
         imageGenerator.appliesPreferredTrackTransform = true
         imageGenerator.requestedTimeToleranceBefore = .zero
@@ -181,6 +215,11 @@ struct ContextMenuContent: View {
 
         imageGenerator.generateCGImagesAsynchronously(forTimes: [NSValue(time: time)]) { _, cgImage, _, _, _ in
             DispatchQueue.main.async {
+                UIDirectFrameDecodeMemoryLedger.end(
+                    tag: UIDirectFrameDecodeMemoryLedger.contextMenuGeneratorTag,
+                    reason: "ui.context_menu.frame_decode",
+                    bytes: directDecodeBytes
+                )
                 if let cgImage = cgImage {
                     let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
                     completion(nsImage)
@@ -205,44 +244,98 @@ struct ContextMenuRow: View {
     let title: String
     let icon: String
     var shortcut: String? = nil
+    var showGuideRing: Bool = false
+    var isDisabled: Bool = false
     let action: () -> Void
 
     @State private var isHovering = false
+    @State private var guidePulse = false
 
     var body: some View {
         Button(action: action) {
             HStack(spacing: RetraceMenuStyle.iconTextSpacing) {
                 Image(systemName: icon)
                     .font(.system(size: RetraceMenuStyle.iconSize, weight: RetraceMenuStyle.fontWeight))
-                    .foregroundColor(isHovering ? RetraceMenuStyle.textColor : RetraceMenuStyle.textColorMuted)
+                    .foregroundColor(foregroundColor)
                     .frame(width: RetraceMenuStyle.iconFrameWidth)
 
                 Text(title)
                     .font(RetraceMenuStyle.font)
-                    .foregroundColor(isHovering ? RetraceMenuStyle.textColor : RetraceMenuStyle.textColorMuted)
+                    .foregroundColor(foregroundColor)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
 
                 Spacer()
 
                 if let shortcut = shortcut {
                     Text(shortcut)
-                        .font(.system(size: 11))
-                        .foregroundColor(.white.opacity(0.4))
+                        .font(RetraceMenuStyle.shortcutFont)
+                        .foregroundColor(shortcutColor)
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .frame(minWidth: RetraceMenuStyle.shortcutColumnMinWidth, alignment: .trailing)
+                        .layoutPriority(1)
                 }
             }
             .padding(.horizontal, RetraceMenuStyle.itemPaddingH)
             .padding(.vertical, RetraceMenuStyle.itemPaddingV)
             .background(
-                RoundedRectangle(cornerRadius: RetraceMenuStyle.itemCornerRadius)
-                    .fill(isHovering ? RetraceMenuStyle.itemHoverColor : Color.clear)
+                ZStack {
+                    RoundedRectangle(cornerRadius: RetraceMenuStyle.itemCornerRadius)
+                        .fill(isHovering && !isDisabled ? RetraceMenuStyle.itemHoverColor : Color.clear)
+
+                    if showGuideRing {
+                        RoundedRectangle(cornerRadius: RetraceMenuStyle.itemCornerRadius)
+                            .stroke(Color.retraceAccent, lineWidth: guidePulse ? 2.6 : 2.0)
+                            .opacity(guidePulse ? 0.95 : 0.7)
+                            .shadow(
+                                color: Color.retraceAccent.opacity(guidePulse ? 0.45 : 0.25),
+                                radius: guidePulse ? 8 : 5
+                            )
+                            .animation(.easeInOut(duration: 0.85).repeatForever(autoreverses: true), value: guidePulse)
+                    }
+                }
             )
         }
         .buttonStyle(.plain)
+        .disabled(isDisabled)
+        .onAppear {
+            if showGuideRing {
+                guidePulse = true
+            }
+        }
+        .onChange(of: showGuideRing) { isEnabled in
+            if isEnabled {
+                guidePulse = true
+            } else {
+                guidePulse = false
+            }
+        }
         .onHover { hovering in
             withAnimation(.easeOut(duration: RetraceMenuStyle.hoverAnimationDuration)) {
                 isHovering = hovering
             }
-            if hovering { NSCursor.pointingHand.push() }
-            else { NSCursor.pop() }
+            if hovering {
+                if !isDisabled {
+                    NSCursor.pointingHand.push()
+                }
+            } else if !isDisabled {
+                NSCursor.pop()
+            }
         }
+    }
+
+    private var foregroundColor: Color {
+        if isDisabled {
+            return RetraceMenuStyle.textColorMuted.opacity(0.5)
+        }
+        return isHovering ? RetraceMenuStyle.textColor : RetraceMenuStyle.textColorMuted
+    }
+
+    private var shortcutColor: Color {
+        if isDisabled {
+            return RetraceMenuStyle.textColorMuted.opacity(0.4)
+        }
+        return .white.opacity(0.4)
     }
 }
