@@ -691,12 +691,21 @@ public enum AccessibilityOCRCorrector {
         }
         let a = index(source), b = index(target)
         var found = Set<Anchor>()
+        var extended: [Int: [Range<Int>]] = [:]
         for (key, i) in a where i >= 0 {
             guard let j = b[key], j >= 0 else { continue }
+            // Every seed inside the same exact run and source/target diagonal
+            // extends to the same maximal anchor. Reuse that run instead of
+            // scanning a long matching paragraph once for each seed.
+            let diagonal = j - i
+            if extended[diagonal, default: []].contains(where: {
+                $0.lowerBound <= i && i + seed <= $0.upperBound
+            }) { continue }
             var left = 0, length = seed
             while i - left > 0, j - left > 0, source[i - left - 1] == target[j - left - 1] { left += 1 }
             while i + length < source.count, j + length < target.count, source[i + length] == target[j + length] { length += 1 }
             found.insert(Anchor(source: i - left, target: j - left, length: length + left))
+            extended[diagonal, default: []].append((i - left)..<(i + length))
             if found.count > 256 { budget.incomplete = true; return [] }
         }
         let anchors = found.sorted {
