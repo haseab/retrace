@@ -768,7 +768,7 @@ Focus on getting the timeline + search working first before polishing dashboard/
 - The method selection emits `phrase_level_redaction_mode_updated` with `{mode, source}`; never include keyword contents.
 - Permanent-node tooltips are noninteractive and say “Permanently redacted”; reveal and clipboard paths must never recover their removed text or pixels.
 - Feedback log readers accept only the privacy-safe logger format and strip its format marker before normal grouping. All legacy file lines, including error and grouped channels, are excluded.
-- While keyword protection is enabled, timeline/search disk previews are bypassed. Completed rewrites invalidate preview images without resetting timeline filters or search queries.
+- Timeline still previews remain available while keyword protection is enabled so unencoded frames can display their captured image. These temporary stills may precede OCR redaction. Search disk previews remain bypassed while keyword protection is enabled. Completed rewrites invalidate preview images without resetting timeline filters or search queries.
 
 - Visible search cards reload thumbnails with a generation-keyed task after rewrite invalidation; keep card identity stable.
 
@@ -776,7 +776,7 @@ Focus on getting the timeline + search working first before polishing dashboard/
 
 ## Preview cache I/O and budgets
 
-Timeline index touches do not rescan sizes. JPEG NSCache entries have compressed-byte costs (64 MiB cost limit). Search LRU costs use decoded representation estimates (32 MiB, 60 entries); no CGImage decode is forced for accounting. Cache disk operations go through the shared FIFO utility worker; a brief admission lock only bounds pending memory. Coalesce thumbnail trim scans (burst debounce, 60-second minimum interval), batch deletions, and prune by request-time cutoff so new files survive delayed cleanup. Invalidation epochs and main-actor generations prevent stale completions from restoring cleared previews. Search keys use render identity and a persisted revision, with highlighted geometry kept distinct. Changing the rendering algorithm must advance the key format version. Keyword privacy bypasses and redaction purge paths remain mandatory.
+Timeline index touches do not rescan sizes. JPEG NSCache entries have compressed-byte costs (64 MiB cost limit). Search LRU costs use decoded representation estimates (32 MiB, 60 entries); no CGImage decode is forced for accounting. Cache disk operations go through the shared FIFO utility worker; a brief admission lock only bounds pending memory. Coalesce thumbnail trim scans (burst debounce, 60-second minimum interval), batch deletions, and prune by request-time cutoff so new files survive delayed cleanup. Invalidation epochs and main-actor generations prevent stale completions from restoring cleared previews. Search keys use render identity and a persisted revision, with highlighted geometry kept distinct. Changing the rendering algorithm must advance the key format version. The search keyword privacy bypass and redaction purge paths remain mandatory; timeline still caching must remain available while video encodes.
 
 ### Captured link policy
 
