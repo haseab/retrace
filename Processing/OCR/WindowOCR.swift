@@ -47,6 +47,62 @@ enum WindowOCRPlanner {
     }
 }
 
+enum OCRReadingOrder {
+    /// Order existing nodes without rebuilding them, so text assembly and node
+    /// offsets share the same sequence while identities and rectangles survive.
+    static func ordered(_ regions: [TextRegion], windows: [CGRect]? = nil) -> [TextRegion] {
+        guard regions.count > 1 else { return regions }
+        guard let windows, windows.count <= 16 else {
+            return indices(Array(regions.indices), bounds: { regions[$0].bounds }).map { regions[$0] }
+        }
+        var result: [Int] = [], owned = Set<Int>()
+        for index in windows.indices {
+            let group = regions.indices.filter { WindowOCRPlanner.owns(regions[$0].bounds, at: index, in: windows) }
+            result += indices(group, bounds: { regions[$0].bounds })
+            owned.formUnion(group)
+        }
+        // Ordering is not an exclusion filter. Keep unmatched legacy/cached
+        // nodes exactly once; the capture/OCR planners own pixel eligibility.
+        result += indices(regions.indices.filter { !owned.contains($0) }, bounds: { regions[$0].bounds })
+        return result.map { regions[$0] }
+    }
+
+    /// Use vertical centers with half a smaller line-height tolerance, then X.
+    /// A row's first box stays fixed so a chain of offsets cannot merge lines.
+    static func indices(_ indices: [Int], bounds: (Int) -> CGRect) -> [Int] {
+        let boxes = Dictionary(uniqueKeysWithValues: indices.map { ($0, bounds($0)) })
+        let valid = indices.filter { index in
+            let box = boxes[index]!
+            return [box.minX, box.minY, box.width, box.height].allSatisfy(\.isFinite)
+                && box.width > 0 && box.height > 0
+        }
+        let sorted = valid.sorted {
+            let a = boxes[$0]!, b = boxes[$1]!
+            if a.midY != b.midY { return a.midY < b.midY }
+            if a.minX != b.minX { return a.minX < b.minX }
+            return $0 < $1
+        }
+        var rows: [[Int]] = []
+        for index in sorted {
+            let box = boxes[index]!
+            if let first = rows.last?.first, let row = boxes[first],
+               abs(row.midY - box.midY) <= min(row.height, box.height) * 0.5 {
+                rows[rows.count - 1].append(index)
+            } else {
+                rows.append([index])
+            }
+        }
+        let ordered = rows.flatMap { row in
+            row.sorted {
+                let a = boxes[$0]!, b = boxes[$1]!
+                return a.minX == b.minX ? $0 < $1 : a.minX < b.minX
+            }
+        }
+        let seen = Set(valid)
+        return ordered + indices.filter { !seen.contains($0) }
+    }
+}
+
 /// Global bound across OCR workers, not just within one frame. No blocking semaphores.
 private actor WindowOCRLimiter {
     static let shared = WindowOCRLimiter()
@@ -170,7 +226,7 @@ extension VisionOCR {
                         do { try VNImageRequestHandler(cgImage: crop, options: [:]).perform([request]) }
                         catch { throw ProcessingError.ocrFailed(underlying: error.localizedDescription) }
                         try Task.checkCancellation()
-                        return (request.results ?? []).compactMap { observation -> TextRegion? in
+                        let recognized = (request.results ?? []).compactMap { observation -> TextRegion? in
                             guard let candidate = observation.topCandidates(1).first,
                                   candidate.confidence >= config.minimumConfidence,
                                   !candidate.string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
@@ -181,10 +237,8 @@ extension VisionOCR {
                             guard !masks.contains(where: { !$0.intersection(mapped).isEmpty }) else { return nil }
                             return TextRegion(frameID: .init(value: 0), text: candidate.string,
                                 bounds: mapped, confidence: Double(candidate.confidence))
-                        }.sorted {
-                            if $0.bounds.minY == $1.bounds.minY { return $0.bounds.minX < $1.bounds.minX }
-                            return $0.bounds.minY < $1.bounds.minY
                         }
+                        return OCRReadingOrder.ordered(recognized)
                     }
                     await MemoryLedger.remove(tag: tag)
                     return result

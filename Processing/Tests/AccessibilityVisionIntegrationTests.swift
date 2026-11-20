@@ -22,9 +22,11 @@ final class AccessibilityVisionIntegrationTests: XCTestCase {
             return true
         }
         XCTAssertTrue(rendered)
-        let raw = try await VisionOCR().recognizeText(imageData: pixels, width: width, height: height, bytesPerRow: stride, config: .default)
-        XCTAssertFalse(raw.isEmpty)
-        let metadata = FrameMetadata(appBundleID: "com.apple.TextEdit", appName: "TextEdit", windowName: "Saved fixture")
+        let metadata = FrameMetadata(appBundleID: "com.apple.TextEdit", appName: "TextEdit", windowName: "Saved fixture",
+            ocrRegions: [CGRect(x: 0, y: 0, width: 1, height: 1)])
+        let baselineFrame = CapturedFrame(imageData: pixels, width: width, height: height, bytesPerRow: stride, metadata: metadata)
+        let baseline = try await ProcessingManager().extractText(from: baselineFrame)
+        XCTAssertFalse((baseline.regions + baseline.chromeRegions).isEmpty)
         let snapshot = AccessibilitySnapshot(capturedAt: Date(), elements: [
             .init(text: document.string + " AXONLY_MUST_NOT_BE_APPENDED", bounds: CGRect(x: 0, y: 0, width: width, height: height), precise: false)
         ])
@@ -34,8 +36,8 @@ final class AccessibilityVisionIntegrationTests: XCTestCase {
         XCTAssertFalse(result.fullText.contains("AXONLY_MUST_NOT_BE_APPENDED"))
         XCTAssertFalse(result.chromeText.contains("AXONLY_MUST_NOT_BE_APPENDED"))
         XCTAssertEqual(result.metadata, metadata)
-        let originalBounds = Set(raw.map(\.bounds))
-        XCTAssertTrue((result.regions + result.chromeRegions).allSatisfy { originalBounds.contains($0.bounds) })
+        XCTAssertEqual((result.regions + result.chromeRegions).map(\.bounds),
+            (baseline.regions + baseline.chromeRegions).map(\.bounds))
     }
     func testDecomposedAccessibilityAccentDoesNotDowngradeCorrectVisionText() async throws {
         let reference = "Please review the cafe\u{301} menu before confirming your reservation."
@@ -60,21 +62,27 @@ final class AccessibilityVisionIntegrationTests: XCTestCase {
         let snapshot = AccessibilitySnapshot(capturedAt: Date(), elements: [
             .init(text: reference, bounds: CGRect(x: 0, y: 0, width: width, height: height), precise: false)
         ])
-        let corrected = raw.map { AccessibilityOCRCorrector.correct($0, snapshot: snapshot) }
+        let corrected = await AccessibilityOCRCorrector.correct(raw, snapshot: snapshot)
         XCTAssertEqual(corrected.map(\.text), raw.map(\.text))
         XCTAssertEqual(corrected.map(\.bounds), raw.map(\.bounds))
     }
 
-    func testRecordedAccentCorrectionDoesNotIntroduceSQLiteOffsetDrift() {
+    func testRecordedAccentCorrectionDoesNotIntroduceSQLiteOffsetDrift() async {
         // Actual Vision output from the bundled Dev capture, before AX correction.
         let bounds = CGRect(x: 1045, y: 703, width: 395, height: 19)
         let region = TextRegion(frameID: .init(value: 37),
                                 text: "Please review the cafe menu before contirming your reservation.", bounds: bounds)
         let reference = "Please review the cafe\u{301} menu before confirming your reservation."
+        let before = TextRegion(frameID: .init(value: 37),
+            text: "Renée Müller discussed the façade with José García at 14:35.", bounds: bounds.offsetBy(dx: 0, dy: -35))
+        let after = TextRegion(frameID: .init(value: 37),
+            text: "Naïve comparisons must preserve the résumé and its accents.", bounds: bounds.offsetBy(dx: 0, dy: 35))
         let snapshot = AccessibilitySnapshot(capturedAt: Date(), elements: [
-            .init(text: reference, bounds: bounds, precise: false)
+            .init(text: before.text + " " + reference + " " + after.text,
+                  bounds: CGRect(x: 1000, y: 650, width: 600, height: 120), precise: false)
         ])
-        let corrected = AccessibilityOCRCorrector.correct(region, snapshot: snapshot)
+        let results = await AccessibilityOCRCorrector.correct([before, region, after], snapshot: snapshot)
+        let corrected = results[1]
         XCTAssertEqual(Array(corrected.text.utf8), Array(reference.precomposedStringWithCanonicalMapping.utf8))
         // SQLite counts Unicode scalars; existing node offsets use Swift characters.
         // A decomposed Latin accent must not add a scalar and shift later nodes.

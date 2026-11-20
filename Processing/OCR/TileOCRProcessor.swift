@@ -18,7 +18,7 @@ public final class TileOCRProcessor: Sendable {
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .accurate
         request.recognitionLanguages = recognitionLanguages
-        request.usesLanguageCorrection = true
+        request.usesLanguageCorrection = false
         return request
     }
 
