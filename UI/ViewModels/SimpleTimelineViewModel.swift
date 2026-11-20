@@ -1598,7 +1598,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             let trimmed = screen.localizedName.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { return nil }
 
-            // For built-in displays, prefer the user's computer name (e.g., "haseab's MacBook Pro")
+            // For built-in displays, prefer the user's configured computer name.
             if CGDisplayIsBuiltin(CGDirectDisplayID(displayID)) != 0 {
                 return computerDisplayName() ?? trimmed
             }
