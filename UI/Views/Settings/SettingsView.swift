@@ -103,6 +103,7 @@ public struct SettingsView: View {
     @State var isProgrammaticWindowChangeCaptureToggleChange = false
     @State var lastObservedStorageEstimateRange: StorageEstimateRange?
     @State var storageEstimateDeltaDirection: StorageEstimateDeltaDirection?
+    @AppStorage("recordAllDisplays", store: settingsStore) var recordAllDisplays: Bool = false
 
     // MARK: Storage Settings
     @AppStorage("retentionDays", store: settingsStore) var retentionDays: Int = SettingsDefaults.retentionDays
@@ -306,6 +307,7 @@ public struct SettingsView: View {
     // Danger zone confirmation states
     @State var showingResetConfirmation = false
     @State var showingDeleteConfirmation = false
+    @State var showingRecordAllDisplaysPowerWarning = false
 
     // Database schema display
     @State var showingDatabaseSchema = false

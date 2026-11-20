@@ -177,6 +177,10 @@ public actor CaptureManager: CaptureProtocol {
         let windowChangeSignature: WindowChangeSignature?
     }
 
+    private var multiDisplayBackends: [UInt32: CGWindowListCapture] = [:]
+    private var deduplicationByDisplay: [UInt32: (CaptureFrameCandidate?, CapturedFrame?, CGPoint?)] = [:]
+    private var focusedDisplayID: UInt32 = 0
+
     private let cgWindowListCapture: any ScreenCaptureBackend
     private let displayMonitor: any CaptureDisplayMonitoring
     private let displaySwitchMonitor: any CaptureDisplaySwitchMonitoring
@@ -193,7 +197,8 @@ public actor CaptureManager: CaptureProtocol {
     private var lastKeptMousePosition: CGPoint?
     private var _isCapturing = false
 
-    private var dedupedFrameContinuation: AsyncStream<CapturedFrame>.Continuation?
+    private var frameChannel: BoundedFrameChannel?
+    private var captureGeneration: UInt64 = 0
     private var _frameStream: AsyncStream<CapturedFrame>?
 
     private var stats = CaptureStatistics(
@@ -220,6 +225,7 @@ public actor CaptureManager: CaptureProtocol {
     private var isCaptureExecutionInFlight = false
     private var pipelinePerformance = CapturePerformanceDiagnostics(pipeline: true)
     private static let dedupedFrameBufferLimit = 8
+    private static let dedupedFrameByteLimit = 64 * 1024 * 1024
     private static let memoryLedgerCurrentFrameTag = "capture.stream.currentFrame"
     private static let memoryLedgerLastKeptFrameTag = "capture.dedup.lastKeptFrame"
     private static let memoryLedgerSummaryIntervalSeconds: TimeInterval = 5
@@ -286,11 +292,11 @@ public actor CaptureManager: CaptureProtocol {
 
         self.currentConfig = config
 
-        let (dedupedStream, dedupedContinuation) = AsyncStream<CapturedFrame>.makeStream(
-            bufferingPolicy: .bufferingNewest(Self.dedupedFrameBufferLimit)
-        )
-        self.dedupedFrameContinuation = dedupedContinuation
-        self._frameStream = dedupedStream
+        captureGeneration &+= 1
+        await frameChannel?.finish()
+        let channel = BoundedFrameChannel(frameLimit: Self.dedupedFrameBufferLimit, byteLimit: Self.dedupedFrameByteLimit)
+        frameChannel = channel
+        _frameStream = channel.stream
 
         let activeDisplayID = await displayMonitor.getActiveDisplayID()
         currentCaptureDisplayID = activeDisplayID
@@ -320,6 +326,12 @@ public actor CaptureManager: CaptureProtocol {
         guard _isCapturing else { return }
 
         _isCapturing = false
+        captureGeneration &+= 1
+        // Release a producer waiting for storage before stopping the backends.
+        let channel = frameChannel
+        frameChannel = nil
+        _frameStream = nil
+        await channel?.finish()
 
         scheduledCaptureTask?.cancel()
         scheduledCaptureTask = nil
@@ -333,12 +345,11 @@ public actor CaptureManager: CaptureProtocol {
         await mouseClickMonitor.stopMonitoring()
         await cgWindowListCapture.setOnConferenceFramePrivacyEvent(nil)
         try await cgWindowListCapture.stopCapture()
+        for backend in multiDisplayBackends.values { try await backend.stopCapture() }
+        multiDisplayBackends.removeAll()
+        deduplicationByDisplay.removeAll()
         let reports = pipelinePerformance.flush(at: CapturePerformanceFrame.now())
         pipelinePerformance.emit(reports)
-
-        dedupedFrameContinuation?.finish()
-        dedupedFrameContinuation = nil
-        _frameStream = nil
 
         lastKeptCandidate = nil
         lastKeptFrame = nil
@@ -362,11 +373,10 @@ public actor CaptureManager: CaptureProtocol {
             return stream
         }
 
-        let (stream, continuation) = AsyncStream<CapturedFrame>.makeStream(
-            bufferingPolicy: .bufferingNewest(Self.dedupedFrameBufferLimit)
-        )
-        self.dedupedFrameContinuation = continuation
-        self._frameStream = stream
+        let channel = BoundedFrameChannel(frameLimit: Self.dedupedFrameBufferLimit, byteLimit: Self.dedupedFrameByteLimit)
+        frameChannel = channel
+        let stream = channel.stream
+        _frameStream = stream
         return stream
     }
 
@@ -386,6 +396,7 @@ public actor CaptureManager: CaptureProtocol {
 
         if _isCapturing {
             try await cgWindowListCapture.updateConfig(config)
+            for backend in multiDisplayBackends.values { try await backend.updateConfig(config) }
             await configureMouseClickMonitoring(enabled: config.captureOnMouseClick)
             cancelDisabledPendingRequestIfNeeded()
             scheduleNextIntervalCapture(from: lastActualCaptureTime ?? now())
@@ -403,7 +414,12 @@ public actor CaptureManager: CaptureProtocol {
     }
 
     public func disableFaceBlurForConferenceCall(callID: String) async -> Bool {
-        await cgWindowListCapture.disableFaceBlurForConferenceCall(callID: callID)
+        var changed = await cgWindowListCapture.disableFaceBlurForConferenceCall(callID: callID)
+        for backend in multiDisplayBackends.values {
+            let updated = await backend.disableFaceBlurForConferenceCall(callID: callID)
+            changed = changed || updated
+        }
+        return changed
     }
 
     public func setOnConferenceFramePrivacyEvent(
@@ -679,7 +695,7 @@ public actor CaptureManager: CaptureProtocol {
         scheduledCaptureTask?.cancel()
         scheduledCaptureTask = nil
 
-        guard let capture = pendingCapture else { return }
+        guard let capture = pendingCapture, !isCaptureExecutionInFlight else { return }
 
         scheduledCaptureTask = Task { [weak self] in
             guard let self else { return }
@@ -697,6 +713,7 @@ public actor CaptureManager: CaptureProtocol {
         guard let capture = pendingCapture else { return }
         guard !isCaptureExecutionInFlight else { return }
 
+        let generation = captureGeneration
         let performance = CapturePerformanceFrame()
         let performanceStart = CapturePerformanceFrame.now()
         performance.record(.queueDelay, milliseconds: max(0, now().timeIntervalSince(capture.fireTime) * 1000))
@@ -715,9 +732,9 @@ public actor CaptureManager: CaptureProtocol {
         scheduledCaptureTask = nil
         isCaptureExecutionInFlight = true
         defer {
-            isCaptureExecutionInFlight = false
-            if _isCapturing {
-                reschedulePendingCaptureTask()
+            if captureGeneration == generation {
+                isCaptureExecutionInFlight = false
+                if _isCapturing { reschedulePendingCaptureTask() }
             }
         }
 
@@ -725,15 +742,66 @@ public actor CaptureManager: CaptureProtocol {
             await syncCaptureDisplayIfNeeded()
         }
 
-        let captureAttemptStartedAt = now()
-        let displayID = await displayIDForCapture(trigger: capture.trigger)
-        currentCaptureDisplayID = displayID
+        let activeDisplayID = await displayIDForCapture(trigger: capture.trigger)
+        currentCaptureDisplayID = activeDisplayID
+        focusedDisplayID = activeDisplayID
+        let batchTimestamp = currentConfig.recordAllDisplays ? now() : nil
+        let displays = currentConfig.recordAllDisplays
+            ? (try? await displayMonitor.getAvailableDisplays().map(\.id)) ?? [activeDisplayID]
+            : [activeDisplayID]
+        let disconnected = Set(multiDisplayBackends.keys).subtracting(displays)
+        for id in disconnected {
+            if let backend = multiDisplayBackends.removeValue(forKey: id) { try? await backend.stopCapture() }
+            deduplicationByDisplay.removeValue(forKey: id)
+        }
+        for displayID in displays {
+            guard _isCapturing, captureGeneration == generation else { break }
+            let backend: any ScreenCaptureBackend
+            if currentConfig.recordAllDisplays {
+                if let existing = multiDisplayBackends[displayID] { backend = existing }
+                else {
+                    let created = CGWindowListCapture()
+                    do {
+                        try await created.startCapture(config: currentConfig, displayID: displayID)
+                        await created.setOnConferenceFramePrivacyEvent { [weak self] event in
+                            await self?.onConferenceFramePrivacyEvent?(event)
+                        }
+                        multiDisplayBackends[displayID] = created
+                        backend = created
+                    } catch {
+                        Log.error("Failed to start display capture: \(error)", category: .capture)
+                        continue
+                    }
+                }
+            } else { backend = cgWindowListCapture }
+            let state = deduplicationByDisplay[displayID]
+            lastKeptCandidate = state?.0
+            lastKeptFrame = state?.1
+            lastKeptMousePosition = state?.2
+            await executeCapture(capture, displayID: displayID, backend: backend,
+                                 batchTimestamp: batchTimestamp, performance: performance)
+            guard _isCapturing, captureGeneration == generation else { return }
+            deduplicationByDisplay[displayID] = (lastKeptCandidate, lastKeptFrame, lastKeptMousePosition)
+        }
+        if capture.trigger == .windowChange {
+            await syncCaptureDisplayIfNeeded()
+            scheduleDisplaySyncCheck()
+        }
+    }
 
-        let candidate = await cgWindowListCapture.captureCandidate(displayID: displayID)
+    private func executeCapture(
+        _ capture: PendingCapture, displayID: UInt32, backend: any ScreenCaptureBackend,
+        batchTimestamp: Date?, performance: CapturePerformanceFrame
+    ) async {
+        let generation = captureGeneration
+        let captureAttemptStartedAt = now()
+
+        let candidate = await backend.captureCandidate(displayID: displayID)
+        guard _isCapturing, captureGeneration == generation else { return }
         let captureAttemptCompletedAt = now()
         if let candidate {
             lastActualCaptureTime = captureAttemptCompletedAt
-            if let windowChangeEvent = capture.windowChangeEvent {
+            if displayID == focusedDisplayID, let windowChangeEvent = capture.windowChangeEvent {
                 let shouldDropFrame = shouldDropWindowChangeCapture(
                     event: windowChangeEvent,
                     capturedMetadata: candidate.metadata
@@ -769,7 +837,13 @@ public actor CaptureManager: CaptureProtocol {
             performance.record(.materialize, since: pixelStart)
             if let frame {
                 let handlingStart = CapturePerformanceFrame.now()
-                let kept = await handleCapturedFrame(frame, trigger: capture.trigger)
+                let synchronizedFrame = CapturedFrame(
+                    timestamp: batchTimestamp ?? frame.timestamp, imageData: frame.imageData,
+                    width: frame.width, height: frame.height, bytesPerRow: frame.bytesPerRow,
+                    metadata: frame.metadata, accessibilitySnapshot: frame.accessibilitySnapshot
+                )
+                let kept = await handleCapturedFrame(synchronizedFrame, trigger: capture.trigger)
+                guard _isCapturing, captureGeneration == generation else { return }
                 performance.record(.deduplication, since: handlingStart)
                 performance.increment(kept ? .kept : .deduplicated)
                 if kept {
@@ -785,10 +859,6 @@ public actor CaptureManager: CaptureProtocol {
             scheduleNextIntervalCapture(from: max(captureAttemptStartedAt, captureAttemptCompletedAt))
         }
 
-        if capture.trigger == .windowChange {
-            await syncCaptureDisplayIfNeeded()
-            scheduleDisplaySyncCheck()
-        }
     }
 
     private func displayIDForCapture(trigger: CaptureTrigger) async -> UInt32 {
@@ -946,11 +1016,14 @@ public actor CaptureManager: CaptureProtocol {
             let shouldKeep = keepBySimilarity || keepByMouseMovement
 
             if shouldKeep {
+                guard let channel = frameChannel else { return false }
+                let enrichedFrame = await enrichFrameMetadata(frame, trigger: trigger)
+                guard _isCapturing, frameChannel === channel,
+                      await channel.send(enrichedFrame),
+                      _isCapturing, frameChannel === channel else { return false }
                 retained = true
                 lastKeptFrame = frame
                 lastKeptMousePosition = currentMousePosition
-                let enrichedFrame = await enrichFrameMetadata(frame, trigger: trigger)
-                dedupedFrameContinuation?.yield(enrichedFrame)
 
                 stats = CaptureStatistics(
                     totalFramesCaptured: totalFrames,
@@ -1003,8 +1076,11 @@ public actor CaptureManager: CaptureProtocol {
                 )
             }
         } else {
+            guard let channel = frameChannel else { return false }
             let enrichedFrame = await enrichFrameMetadata(frame, trigger: trigger)
-            dedupedFrameContinuation?.yield(enrichedFrame)
+            guard _isCapturing, frameChannel === channel,
+                  await channel.send(enrichedFrame),
+                  _isCapturing, frameChannel === channel else { return false }
 
             stats = CaptureStatistics(
                 totalFramesCaptured: totalFrames,
@@ -1170,7 +1246,9 @@ public actor CaptureManager: CaptureProtocol {
             guard let capturedBundleID = frame.metadata.appBundleID else { return true }
             return BrowserURLExtractor.isBrowser(capturedBundleID) || capturedBundleID == "com.apple.finder"
         }()
-        let frontmostMetadata = await appInfoProvider.getFrontmostAppInfo(
+        let frontmostMetadata = currentConfig.recordAllDisplays && frame.metadata.displayID != focusedDisplayID
+            ? frame.metadata
+            : await appInfoProvider.getFrontmostAppInfo(
             includeBrowserURL: shouldLookupBrowserURL,
             preferredDisplayID: preferredDisplayID
         )
@@ -1187,8 +1265,10 @@ public actor CaptureManager: CaptureProtocol {
                 browserURL: frame.metadata.browserURL ?? frontmostMetadata.browserURL,
                 redactionReason: redactionReason,
                 captureTrigger: captureTrigger,
-                displayID: preservedDisplayID,
-                ocrRegions: frame.metadata.ocrRegions
+                displayID: stableDisplayID(forRuntimeDisplayID: preservedDisplayID),
+                mousePosition: Self.mousePositionWithinCapturedFrame(frame),
+                ocrRegions: frame.metadata.ocrRegions,
+                isFocused: !currentConfig.recordAllDisplays || preservedDisplayID == focusedDisplayID
             )
         } else {
             enrichedMetadata = FrameMetadata(
@@ -1198,8 +1278,10 @@ public actor CaptureManager: CaptureProtocol {
                 browserURL: nil,
                 redactionReason: redactionReason,
                 captureTrigger: captureTrigger,
-                displayID: preservedDisplayID,
-                ocrRegions: frame.metadata.ocrRegions
+                displayID: stableDisplayID(forRuntimeDisplayID: preservedDisplayID),
+                mousePosition: Self.mousePositionWithinCapturedFrame(frame),
+                ocrRegions: frame.metadata.ocrRegions,
+                isFocused: !currentConfig.recordAllDisplays || preservedDisplayID == focusedDisplayID
             )
         }
 
@@ -1315,4 +1397,11 @@ extension MouseClickMonitor: CaptureMouseClickMonitoring {}
 
 public extension Notification.Name {
     static let activeDisplayDidChange = Notification.Name("activeDisplayDidChange")
+}
+
+extension CaptureManager {
+    private func stableDisplayID(forRuntimeDisplayID runtimeDisplayID: UInt32) -> UInt32 {
+        DisplayIdentityRegistry.shared.displayID(for: runtimeDisplayID)
+    }
+
 }

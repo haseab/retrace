@@ -137,6 +137,15 @@ extension SettingsView {
                     .background(Color.white.opacity(0.1))
 
                 ModernToggleRow(
+                    title: "Record all displays",
+                    subtitle: "Record every connected display. This increases power and storage use.",
+                    isOn: $recordAllDisplays
+                )
+                .onChange(of: recordAllDisplays) { enabled in
+                    updateRecordAllDisplaysSetting(enabled: enabled)
+                }
+
+                ModernToggleRow(
                     title: "Capture on mouse click",
                     subtitle: hasListenEventAccess
                         ? "Capture shortly after a left click so the frame matches the post-click window metadata."

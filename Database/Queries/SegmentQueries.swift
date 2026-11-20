@@ -9,13 +9,13 @@ enum SegmentQueries {
     // MARK: - Insert
 
     /// Insert a new video segment and return the auto-generated ID
-    static func insert(db: OpaquePointer, segment: VideoSegment) throws -> Int64 {
+    static func insert(db: OpaquePointer, segment: VideoSegment, displayID: UInt32 = 0) throws -> Int64 {
         // Note: path field in Rewind is just the relative path (e.g., "202505/31/d0tva3el9vhg5fjg178g")
         // We use relativePath for the same purpose
         let sql = """
             INSERT INTO video (
-                height, width, path, fileSize, frameRate, processingState
-            ) VALUES (?, ?, ?, ?, ?, ?);
+                height, width, path, fileSize, frameRate, processingState, displayID
+            ) VALUES (?, ?, ?, ?, ?, ?, ?);
             """
 
         var statement: OpaquePointer?
@@ -39,6 +39,8 @@ enum SegmentQueries {
         sqlite3_bind_double(statement, 5, 30.0)
         // processingState: 1 = in progress (still being written to), 0 = completed
         sqlite3_bind_int(statement, 6, 1)
+        // displayID: which physical display this video is from
+        sqlite3_bind_int(statement, 7, Int32(displayID))
 
         guard sqlite3_step(statement) == SQLITE_DONE else {
             throw DatabaseError.queryFailed(
@@ -187,7 +189,7 @@ enum SegmentQueries {
     /// Used to resume writing to an existing video when a frame with matching resolution comes in
     static func getUnfinalisedByResolution(db: OpaquePointer, width: Int, height: Int) throws -> UnfinalisedVideo? {
         let sql = """
-            SELECT id, path, frameCount
+            SELECT id, path, frameCount, displayID
             FROM video
             WHERE width = ? AND height = ? AND processingState = 1
             LIMIT 1;
@@ -218,13 +220,62 @@ enum SegmentQueries {
         }
         let path = String(cString: pathText)
         let frameCount = Int(sqlite3_column_int(statement, 2))
+        let displayID = UInt32(sqlite3_column_int(statement, 3))
 
         return UnfinalisedVideo(
             id: id,
             relativePath: path,
             frameCount: frameCount,
             width: width,
-            height: height
+            height: height,
+            displayID: displayID
+        )
+    }
+
+    /// Get an unfinalised video matching the given display ID and resolution
+    /// Used in multi-display mode to prevent resuming the wrong display's video
+    static func getUnfinalisedByDisplayAndResolution(db: OpaquePointer, displayID: UInt32, width: Int, height: Int) throws -> UnfinalisedVideo? {
+        let sql = """
+            SELECT id, path, frameCount
+            FROM video
+            WHERE displayID = ? AND width = ? AND height = ? AND processingState = 1
+            LIMIT 1;
+            """
+
+        var statement: OpaquePointer?
+        defer {
+            sqlite3_finalize(statement)
+        }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        sqlite3_bind_int(statement, 1, Int32(displayID))
+        sqlite3_bind_int(statement, 2, Int32(width))
+        sqlite3_bind_int(statement, 3, Int32(height))
+
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            return nil
+        }
+
+        let id = sqlite3_column_int64(statement, 0)
+        guard let pathText = sqlite3_column_text(statement, 1) else {
+            return nil
+        }
+        let path = String(cString: pathText)
+        let frameCount = Int(sqlite3_column_int(statement, 2))
+
+        return UnfinalisedVideo(
+            id: id,
+            relativePath: path,
+            frameCount: frameCount,
+            width: width,
+            height: height,
+            displayID: displayID
         )
     }
 
@@ -232,7 +283,7 @@ enum SegmentQueries {
     /// processingState = 1 means video is still being written to
     static func getAllUnfinalised(db: OpaquePointer) throws -> [UnfinalisedVideo] {
         let sql = """
-            SELECT id, path, frameCount, width, height
+            SELECT id, path, frameCount, width, height, displayID
             FROM video
             WHERE processingState = 1;
             """
@@ -257,13 +308,15 @@ enum SegmentQueries {
             let frameCount = Int(sqlite3_column_int(statement, 2))
             let width = Int(sqlite3_column_int(statement, 3))
             let height = Int(sqlite3_column_int(statement, 4))
+            let displayID = UInt32(sqlite3_column_int(statement, 5))
 
             results.append(UnfinalisedVideo(
                 id: id,
                 relativePath: path,
                 frameCount: frameCount,
                 width: width,
-                height: height
+                height: height,
+                displayID: displayID
             ))
         }
 

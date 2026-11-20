@@ -113,4 +113,3 @@ public struct ConferenceFramePrivacyEvent: Sendable, Equatable {
         self.isPreferredMenuCandidate = isPreferredMenuCandidate
     }
 }
-

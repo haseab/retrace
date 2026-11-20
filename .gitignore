@@ -118,4 +118,5 @@ scripts/release.sh
 
 # Release artifacts
 releases/
+.build_codex_check/
 local/

@@ -16,6 +16,8 @@ UI/
 │   ├── SafariInPageURLToggle.imageset/ # Safari screenshot: enable Allow JavaScript from Apple Events
 │   └── SafariInPageURLAllow.imageset/  # Safari screenshot: confirmation dialog with Allow button
 ├── Views/
+│   ├── FullscreenTimeline/
+│   │   └── PIPThumbnailView.swift      # Secondary-display thumbnail swap UI
 │   ├── Timeline/
 │   │   ├── TimelineView.swift           # Main timeline scrubber
 │   │   ├── TimelineBar.swift            # Horizontal scrollable bar

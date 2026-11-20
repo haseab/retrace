@@ -90,8 +90,8 @@ public class MilestoneCelebrationManager: ObservableObject {
                 return """
                 You've just hit 10 hours of captured screen time - that's awesome! I'm glad you're finding Retrace useful.
 
-                I'm excited for you to see how Retrace will help in small unexpected ways. 
-                
+                I'm excited for you to see how Retrace will help in small unexpected ways.
+
                 Just remember: Anytime you're finding yourself wanting to search for something, Retrace will likely be useful!
                 """
 

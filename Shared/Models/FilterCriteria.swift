@@ -118,6 +118,11 @@ public struct FilterCriteria: Codable, Equatable, Sendable {
     /// Date range end (nil = no end limit)
     public var endDate: Date?
 
+    /// Filter to a specific display ID (nil = all displays)
+    public var displayID: UInt32?
+
+    /// Filter to focused frames only (nil/false = no focus predicate)
+    public var focusedOnly: Bool?
     /// Multi-range date filter. When non-empty, this takes precedence over `startDate`/`endDate`.
     public var dateRanges: [DateRangeCriterion]?
 
@@ -133,6 +138,8 @@ public struct FilterCriteria: Codable, Equatable, Sendable {
         browserUrlFilter: String? = nil,
         startDate: Date? = nil,
         endDate: Date? = nil,
+        displayID: UInt32? = nil,
+        focusedOnly: Bool? = nil,
         dateRanges: [DateRangeCriterion]? = nil
     ) {
         self.selectedApps = selectedApps
@@ -146,6 +153,8 @@ public struct FilterCriteria: Codable, Equatable, Sendable {
         self.browserUrlFilter = browserUrlFilter
         self.startDate = startDate
         self.endDate = endDate
+        self.displayID = displayID
+        self.focusedOnly = focusedOnly
         self.dateRanges = Self.sanitizedDateRanges(dateRanges)
     }
 
@@ -170,7 +179,9 @@ public struct FilterCriteria: Codable, Equatable, Sendable {
         (selectedTags != nil && !selectedTags!.isEmpty) ||
         (windowNameFilter != nil && !windowNameFilter!.isEmpty) ||
         (browserUrlFilter != nil && !browserUrlFilter!.isEmpty) ||
-        !effectiveDateRanges.isEmpty
+        !effectiveDateRanges.isEmpty ||
+        displayID != nil ||
+        focusedOnly == true
     }
 
     /// Returns true if any advanced filter is active
@@ -190,6 +201,8 @@ public struct FilterCriteria: Codable, Equatable, Sendable {
         if windowNameFilter != nil && !windowNameFilter!.isEmpty { count += 1 }
         if browserUrlFilter != nil && !browserUrlFilter!.isEmpty { count += 1 }
         if !effectiveDateRanges.isEmpty { count += 1 }
+        if displayID != nil { count += 1 }
+        if focusedOnly == true { count += 1 }
         return count
     }
 

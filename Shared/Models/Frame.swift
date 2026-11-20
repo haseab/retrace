@@ -56,6 +56,9 @@ public struct FrameMetadata: Codable, Sendable, Equatable {
     /// Display ID that was captured
     public let displayID: UInt32
 
+    /// Whether this frame was captured from the focused (active) display
+    /// true = user was looking at this display, false = secondary display
+    public let isFocused: Bool
     /// Mouse position in frame pixel coordinates (top-left origin), when captured.
     public let mousePosition: CGPoint?
 
@@ -73,7 +76,8 @@ public struct FrameMetadata: Codable, Sendable, Equatable {
         captureTrigger: FrameCaptureTrigger? = nil,
         displayID: UInt32 = 0,
         mousePosition: CGPoint? = nil,
-        ocrRegions: [CGRect]? = nil
+        ocrRegions: [CGRect]? = nil,
+        isFocused: Bool = true
     ) {
         self.appBundleID = appBundleID
         self.appName = appName
@@ -82,8 +86,30 @@ public struct FrameMetadata: Codable, Sendable, Equatable {
         self.redactionReason = redactionReason
         self.captureTrigger = captureTrigger
         self.displayID = displayID
+        self.isFocused = isFocused
         self.mousePosition = mousePosition
         self.ocrRegions = ocrRegions
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case appBundleID, appName, windowName, browserURL, redactionReason, captureTrigger
+        case displayID, mousePosition, ocrRegions, isFocused
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            appBundleID: try values.decodeIfPresent(String.self, forKey: .appBundleID),
+            appName: try values.decodeIfPresent(String.self, forKey: .appName),
+            windowName: try values.decodeIfPresent(String.self, forKey: .windowName),
+            browserURL: try values.decodeIfPresent(String.self, forKey: .browserURL),
+            redactionReason: try values.decodeIfPresent(String.self, forKey: .redactionReason),
+            captureTrigger: try values.decodeIfPresent(FrameCaptureTrigger.self, forKey: .captureTrigger),
+            displayID: try values.decodeIfPresent(UInt32.self, forKey: .displayID) ?? 0,
+            mousePosition: try values.decodeIfPresent(CGPoint.self, forKey: .mousePosition),
+            ocrRegions: try values.decodeIfPresent([CGRect].self, forKey: .ocrRegions),
+            isFocused: try values.decodeIfPresent(Bool.self, forKey: .isFocused) ?? true
+        )
     }
 
     public static let empty = FrameMetadata()
@@ -439,16 +465,25 @@ public struct UnfinalisedVideo: Sendable, Equatable {
     /// Video height in pixels
     public let height: Int
 
-    /// Resolution string for use as dictionary key
+    /// Display ID that produced this video (for multi-display support)
+    public let displayID: UInt32
+
+    /// Writer key combining displayID and resolution for unique video writer lookup
+    public var writerKey: String {
+        "\(displayID)_\(width)x\(height)"
+    }
+
+    /// Legacy resolution-only key (for backward compatibility)
     public var resolutionKey: String {
         "\(width)x\(height)"
     }
 
-    public init(id: Int64, relativePath: String, frameCount: Int, width: Int, height: Int) {
+    public init(id: Int64, relativePath: String, frameCount: Int, width: Int, height: Int, displayID: UInt32 = 0) {
         self.id = id
         self.relativePath = relativePath
         self.frameCount = frameCount
         self.width = width
         self.height = height
+        self.displayID = displayID
     }
 }

@@ -5,6 +5,22 @@ import Shared
 import App
 import UniformTypeIdentifiers
 
+/// Debug logging to file.
+private func debugLog(_ message: String) {
+    let line = "[\(Log.timestamp())] \(message)\n"
+    let path = "/tmp/retrace_debug.log"
+    if let data = line.data(using: .utf8) {
+        if FileManager.default.fileExists(atPath: path) {
+            if let handle = FileHandle(forWritingAtPath: path) {
+                handle.seekToEndOfFile()
+                handle.write(data)
+                handle.closeFile()
+            }
+        } else {
+            FileManager.default.createFile(atPath: path, contents: data)
+        }
+    }
+}
 private let timelineSettingsStore: UserDefaults = UserDefaults(suiteName: AppPaths.settingsSuiteName) ?? .standard
 
 /// Redesigned fullscreen timeline view with scrolling tape and fixed playhead
@@ -19,6 +35,28 @@ public struct SimpleTimelineView: View {
     @State private var appearanceRefreshTick = 0
     /// Tracks whether the live screenshot has been displayed, allowing AVPlayer to pre-mount underneath
     @State private var liveScreenshotHasAppeared = false
+    /// Persistent offset for draggable secondary display stack
+    @State private var displayStackOffset: CGSize = .zero
+    /// Active drag translation while moving secondary display stack
+    @GestureState private var displayStackDragOffset: CGSize = .zero
+    /// Hover state for the floating display stack panel.
+    @State private var isDisplayStackHovering = false
+    /// Whether the floating display stack is collapsed to header-only mode.
+    @State private var isDisplayStackMinimized = false
+    /// IDs currently allowed to run role transitions (old + new primary display).
+    @State private var roleAnimatingDisplayIDs: Set<UInt32> = []
+    /// Last primary display ID for animation debug logs.
+    @State private var previousPrimaryDisplayIDForDebug: UInt32 = 0
+    /// Last known geometry for each display card in the floating stack.
+    @State private var previousDisplayCardFramesForDebug: [UInt32: CGRect] = [:]
+    /// Monotonic counter to correlate geometry events with a specific switch interaction.
+    @State private var displayAnimationSessionID: Int = 0
+    /// Currently active display-role animation session.
+    @State private var activeDisplayAnimationSessionID: Int = 0
+    /// Display role transition duration (intentionally slow for animation debugging).
+    private let displayRoleAnimationDuration: Double = 0.231
+    /// Keep participant gating active long enough for the role transition to complete.
+    private let displayRoleAnimationGateDuration: Double = 0.3
     /// Keep comment submenu mounted during fade-out so dismissal is visibly animated.
     @State private var isCommentSubmenuMounted = false
     @State private var commentSubmenuVisibility: Double = 0
@@ -60,6 +98,13 @@ public struct SimpleTimelineView: View {
             let actualFrameRect = calculateActualDisplayedFrameRectForView(
                 containerSize: geometry.size
             )
+            let displayPreviewItems = resolvedDisplayPreviewItems()
+            let displayCardsBottomPadding: CGFloat = 10
+            let displayStackLayout = displayStackLayout(
+                containerSize: geometry.size,
+                items: displayPreviewItems,
+                bottomPadding: displayCardsBottomPadding
+            )
             let shouldShowSearchHighlightControlsHint = shouldShowSearchHighlightControlsHint(
                 containerSize: geometry.size,
                 actualFrameRect: actualFrameRect
@@ -72,6 +117,177 @@ public struct SimpleTimelineView: View {
                 frameDisplay
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
 
+                // Floating display switcher/pin panel (shows all displays)
+                if displayPreviewItems.count > 1 && !viewModel.isInLiveMode {
+                    VStack(spacing: isDisplayStackMinimized ? 0 : 10) {
+                        HStack(spacing: 8) {
+                            Image(systemName: "line.3.horizontal")
+                                .font(.caption2.weight(.semibold))
+                                .foregroundColor(.white.opacity(isDisplayStackHovering ? 0.96 : 0.8))
+                            Text("Displays")
+                                .font(.caption2.weight(.semibold))
+                                .foregroundColor(.white.opacity(isDisplayStackHovering ? 0.98 : 0.85))
+                            Spacer(minLength: 0)
+                            Button(action: {
+                                withAnimation(.easeInOut(duration: 0.18)) {
+                                    isDisplayStackMinimized.toggle()
+                                }
+                            }) {
+                                Image(systemName: isDisplayStackMinimized ? "chevron.down" : "chevron.up")
+                                    .font(.caption2.weight(.bold))
+                                    .foregroundColor(.white.opacity(0.92))
+                                    .frame(width: 18, height: 18)
+                                    .background(
+                                        Circle()
+                                            .fill(Color.white.opacity(isDisplayStackHovering ? 0.16 : 0.1))
+                                    )
+                            }
+                            .buttonStyle(.plain)
+                            .help(isDisplayStackMinimized ? "Expand displays" : "Minimize displays")
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 6)
+                        .background(Color.white.opacity(isDisplayStackHovering ? 0.24 : 0.08))
+                        .clipShape(Capsule())
+                        .overlay(
+                            Capsule()
+                                .stroke(Color.white.opacity(isDisplayStackHovering ? 0.26 : 0.12), lineWidth: 0.8)
+                        )
+                        .animation(.easeOut(duration: 0.16), value: isDisplayStackHovering)
+                        .contentShape(Rectangle())
+                        .gesture(
+                            DragGesture(minimumDistance: 0, coordinateSpace: .global)
+                                .updating($displayStackDragOffset) { value, state, _ in
+                                    state = value.translation
+                                }
+                                .onEnded { value in
+                                    displayStackOffset.width += value.translation.width
+                                    displayStackOffset.height += value.translation.height
+                                }
+                        )
+
+                        if !isDisplayStackMinimized {
+                            ScrollView(.vertical, showsIndicators: false) {
+                                VStack(spacing: 8) {
+                                ForEach(displayPreviewItems, id: \.displayID) { display in
+                                    let shouldRoleAnimate = roleAnimatingDisplayIDs.contains(display.displayID)
+                                    let isCurrentDisplay = display.presentationMode == .listRow
+                                    let targetHeight = isCurrentDisplay
+                                        ? displayStackLayout.currentDisplayCardHeight
+                                        : displayStackLayout.thumbnailHeight
+
+                                    ZStack {
+                                        PIPThumbnailView(
+                                            displayLabel: viewModel.displayLabel(for: display.displayID),
+                                            videoInfo: display.videoInfo,
+                                            isCurrentDisplay: display.isCurrentDisplay,
+                                            isPinnedDisplay: display.isPinnedDisplay,
+                                            onPrimaryAction: {
+                                                handleDisplayPrimaryAction(display)
+                                            }
+                                        )
+                                        .opacity(isCurrentDisplay ? 0 : 1)
+                                        .allowsHitTesting(!isCurrentDisplay)
+
+                                        CurrentDisplayRowView(
+                                            displayLabel: viewModel.displayLabel(for: display.displayID),
+                                            isPinnedDisplay: display.isPinnedDisplay,
+                                            onPrimaryAction: {
+                                                handleDisplayPrimaryAction(display)
+                                            }
+                                        )
+                                        .opacity(isCurrentDisplay ? 1 : 0)
+                                        .allowsHitTesting(isCurrentDisplay)
+                                    }
+                                    .frame(maxWidth: .infinity)
+                                    .frame(height: targetHeight)
+                                    .clipped()
+                                    .animation(
+                                        .easeInOut(duration: displayRoleAnimationDuration),
+                                        value: isCurrentDisplay
+                                    )
+                                    .transition(
+                                        shouldRoleAnimate
+                                        ? .opacity.animation(.easeInOut(duration: displayRoleAnimationDuration))
+                                        : .identity
+                                    )
+                                    .modifier(
+                                        DisplayRoleAnimationDebugProbe(
+                                            displayID: display.displayID,
+                                            mode: isCurrentDisplay ? "listRow" : "thumbnail",
+                                            shouldRoleAnimate: shouldRoleAnimate,
+                                            isPinnedDisplay: display.isPinnedDisplay,
+                                            targetHeight: targetHeight
+                                        )
+                                    )
+                                    .background(
+                                        GeometryReader { proxy in
+                                            Color.clear.preference(
+                                                key: DisplayCardFramePreferenceKey.self,
+                                                value: [display.displayID: proxy.frame(in: .global)]
+                                            )
+                                        }
+                                    )
+                                }
+                            }
+                                .animation(
+                                    roleAnimatingDisplayIDs.isEmpty
+                                        ? nil
+                                        : .easeInOut(duration: displayRoleAnimationDuration),
+                                    value: activeDisplayAnimationSessionID
+                                )
+                                .padding(.bottom, displayCardsBottomPadding)
+                                .onPreferenceChange(DisplayCardFramePreferenceKey.self) { newFrames in
+                                    logDisplayCardGeometryChanges(
+                                        newFrames: newFrames,
+                                        items: displayPreviewItems
+                                    )
+                                }
+                            }
+                            .frame(maxHeight: displayStackLayout.visibleCardsHeight)
+                            .transition(.opacity.combined(with: .move(edge: .top)))
+                        }
+                    }
+                    .frame(width: displayStackLayout.panelWidth)
+                    .padding(10)
+                    .background(
+                        RoundedRectangle(cornerRadius: 14)
+                            .fill(Color.black.opacity(0.8))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 14)
+                            .stroke(Color.white.opacity(0.12), lineWidth: 1)
+                    )
+                    .shadow(color: .black.opacity(0.45), radius: 12, x: 0, y: 4)
+                    .onHover { hovering in
+                        withAnimation(.easeOut(duration: 0.16)) {
+                            isDisplayStackHovering = hovering
+                        }
+                        viewModel.isDisplayStackHovering = hovering
+                        if hovering {
+                            NSCursor.pointingHand.push()
+                        } else {
+                            NSCursor.pop()
+                        }
+                    }
+                    .onDisappear {
+                        viewModel.isDisplayStackHovering = false
+                        if !previousDisplayCardFramesForDebug.isEmpty {
+                            debugLog("[DisplayAnim] display stack disappeared; clearing tracked card frames")
+                            previousDisplayCardFramesForDebug.removeAll()
+                        }
+                    }
+                    .padding(.top, 100)
+                    .padding(.trailing, 50)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                    .offset(
+                        x: displayStackOffset.width + displayStackDragOffset.width,
+                        y: displayStackOffset.height + displayStackDragOffset.height
+                    )
+                    .allowsHitTesting(!viewModel.areControlsHidden)
+                    .opacity(viewModel.areControlsHidden ? 0.5 : 1)
+                }
                 // Search-result highlights should sit above the frame, but below timeline controls/tape.
                 searchHighlightOverlay(containerSize: geometry.size, actualFrameRect: actualFrameRect)
 
@@ -230,6 +446,20 @@ public struct SimpleTimelineView: View {
                     .animation(.spring(response: 0.3, dampingFraction: 0.8), value: viewModel.isPeeking)
                 }
 
+                // Global timeline HUD toast (top center)
+                if let message = viewModel.timelineHUDToastMessage {
+                    VStack {
+                        Spacer()
+                        TimelineHUDToastBanner(message: message)
+                            .opacity(viewModel.showTimelineHUDToast ? 1 : 0)
+                        Spacer()
+                            .allowsHitTesting(false)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+                    .padding(.spacingL)
+                    .animation(.easeInOut(duration: 0.45), value: viewModel.showTimelineHUDToast)
+                }
+
                 // Persistent redaction reason banner (top center)
                 if let redactionContext = currentRedactionContext {
                     VStack {
@@ -319,6 +549,17 @@ public struct SimpleTimelineView: View {
                 ocrDebugOverlay(containerSize: geometry.size, actualFrameRect: actualFrameRect)
 
                 topHintOverlay(shouldRenderSearchHighlightControlsHint: shouldRenderSearchHighlightControlsHint)
+
+                // Persistent pinned-display banner (top center)
+                if viewModel.isPrimaryDisplayPinned, viewModel.primaryDisplayID != 0 {
+                    VStack {
+                        PinnedDisplayBanner(displayLabel: viewModel.primaryDisplayLabel)
+                            .fixedSize()
+                            .padding(.top, 22)
+                            .transition(.opacity)
+                        Spacer()
+                    }
+                }
 
                 // Filter panel (floating, anchored to filter button position)
                 if viewModel.isFilterPanelVisible {
@@ -474,6 +715,7 @@ public struct SimpleTimelineView: View {
                     frameCount: viewModel.frames.count
                 ) {
                     hasInitialized = true
+                    previousPrimaryDisplayIDForDebug = viewModel.primaryDisplayID
                     Task {
                         await viewModel.loadMostRecentFrame()
                     }
@@ -487,6 +729,40 @@ public struct SimpleTimelineView: View {
                 viewModel.handleTimelineOpened()
                 // Start periodic refresh of processing statuses
                 viewModel.startPeriodicStatusRefresh()
+            }
+            .onChange(of: viewModel.primaryDisplayID) { newPrimaryDisplayID in
+                let oldPrimaryDisplayID = previousPrimaryDisplayIDForDebug
+                previousPrimaryDisplayIDForDebug = newPrimaryDisplayID
+
+                logDisplayAnimationDebug(
+                    "primaryDisplayID changed \(oldPrimaryDisplayID) -> \(newPrimaryDisplayID), roleParticipants=\(roleAnimatingDisplayIDs.sorted())"
+                )
+
+                // If no role animation is already in progress (i.e. this wasn't triggered
+                // by handleDisplayPrimaryAction), start one so scrubbing gets the same
+                // fade+height card transitions.
+                if roleAnimatingDisplayIDs.isEmpty,
+                   oldPrimaryDisplayID != 0,
+                   newPrimaryDisplayID != 0,
+                   oldPrimaryDisplayID != newPrimaryDisplayID {
+                    displayAnimationSessionID += 1
+                    let sessionID = displayAnimationSessionID
+                    activeDisplayAnimationSessionID = sessionID
+                    var participants = Set<UInt32>()
+                    participants.insert(oldPrimaryDisplayID)
+                    participants.insert(newPrimaryDisplayID)
+                    roleAnimatingDisplayIDs = participants
+
+                    DispatchQueue.main.asyncAfter(deadline: .now() + displayRoleAnimationGateDuration) {
+                        if activeDisplayAnimationSessionID == sessionID,
+                           roleAnimatingDisplayIDs == participants {
+                            roleAnimatingDisplayIDs.removeAll()
+                        }
+                    }
+                }
+            }
+            .onChange(of: roleAnimatingDisplayIDs) { newParticipants in
+                logDisplayAnimationDebug("roleParticipants now=\(newParticipants.sorted())")
             }
             .onDisappear {
                 // Stop periodic refresh when timeline is closed
@@ -544,6 +820,43 @@ public struct SimpleTimelineView: View {
             // Note: Keyboard shortcuts (Cmd+F, Option+F, Cmd+Shift+F, Escape) are handled by TimelineWindowController
             // at the window level for more reliable event handling
         }
+    }
+
+    private struct DisplayStackLayout {
+        let panelWidth: CGFloat
+        let visibleCardsHeight: CGFloat
+        let thumbnailHeight: CGFloat
+        let currentDisplayCardHeight: CGFloat
+    }
+
+    private func displayStackLayout(
+        containerSize: CGSize,
+        items: [DisplayPreviewItem],
+        bottomPadding: CGFloat
+    ) -> DisplayStackLayout {
+        let panelWidth = max(220, containerSize.width * 0.16)
+        let thumbnailWidth = panelWidth - 20
+        let thumbnailHeight = thumbnailWidth * (10.0 / 16.0)
+        // Keep this in sync with CurrentDisplayRowView's larger stacked card.
+        let currentDisplayCardHeight: CGFloat = 96
+        let verticalSlack: CGFloat = 18
+        let thumbnailCount = items.filter { $0.presentationMode == .thumbnail }.count
+        let currentCardCount = items.count - thumbnailCount
+        let contentHeight =
+            (CGFloat(thumbnailCount) * thumbnailHeight) +
+            (CGFloat(currentCardCount) * currentDisplayCardHeight) +
+            (CGFloat(max(0, items.count - 1)) * 8) +
+            bottomPadding
+
+        // For small stacks (1 current + 1 secondary), allow a taller panel so both cards fit.
+        let maxHeightFraction: CGFloat = items.count <= 2 ? 0.72 : 0.52
+        let visibleCardsHeight = min(contentHeight + verticalSlack, containerSize.height * maxHeightFraction)
+        return DisplayStackLayout(
+            panelWidth: panelWidth,
+            visibleCardsHeight: visibleCardsHeight,
+            thumbnailHeight: thumbnailHeight,
+            currentDisplayCardHeight: currentDisplayCardHeight
+        )
     }
 
     private var isAwaitingLiveScreenshot: Bool {
@@ -869,7 +1182,7 @@ public struct SimpleTimelineView: View {
                     .font(.retraceCaption)
                     .foregroundColor(.white.opacity(0.3))
             }
-        } else if let videoInfo = viewModel.currentVideoInfo {
+        } else if let videoInfo = viewModel.displayedPrimaryVideoInfo {
             let isDecodedVideoInteractable =
                 viewModel.currentFrameMediaDisplayMode == .decodedVideo &&
                 viewModel.currentFrameStillDisplayMode == .none
@@ -1279,12 +1592,223 @@ public struct SimpleTimelineView: View {
 
     // MARK: - Helper Methods
 
+    /// Display preview model for the floating display panel.
+    private struct DisplayPreviewItem {
+        enum PresentationMode {
+            case listRow
+            case thumbnail
+        }
+
+        let displayID: UInt32
+        let videoInfo: FrameVideoInfo?
+        let isCurrentDisplay: Bool
+        let isPinnedDisplay: Bool
+        let presentationMode: PresentationMode
+    }
+
+    /// Build display previews for displays active at the current timeline position.
+    private func resolvedDisplayPreviewItems() -> [DisplayPreviewItem] {
+        // Drive panel visibility from the current timestamp snapshot:
+        // primary display + currently resolved secondary displays.
+        // `availableDisplayIDs` spans the loaded window and can include stale displays.
+        var displayIDSet = Set(
+            ([viewModel.primaryDisplayID] + viewModel.secondaryDisplayFrames.map(\.displayID))
+                .filter { $0 != 0 }
+        )
+        // Keep role-participating displays mounted during the transition window
+        // so cards don't get removed/reinserted mid-swap.
+        displayIDSet.formUnion(roleAnimatingDisplayIDs.filter { $0 != 0 })
+        // Bridge the one-frame gap before .onChange sets roleAnimatingDisplayIDs:
+        // previousPrimaryDisplayIDForDebug still holds the old primary at this point.
+        if previousPrimaryDisplayIDForDebug != 0,
+           previousPrimaryDisplayIDForDebug != viewModel.primaryDisplayID {
+            displayIDSet.insert(previousPrimaryDisplayIDForDebug)
+        }
+        let orderedDisplayIDs = Array(displayIDSet).sorted()
+        let secondaryFramesByDisplay = Dictionary(uniqueKeysWithValues: viewModel.secondaryDisplayFrames.map { ($0.displayID, $0.videoInfo) })
+
+        return orderedDisplayIDs.map { displayID in
+            let isCurrentDisplay = displayID == viewModel.primaryDisplayID
+            let previewVideoInfo: FrameVideoInfo? = isCurrentDisplay
+                ? viewModel.displayedPrimaryVideoInfo
+                : (secondaryFramesByDisplay[displayID] ?? nil)
+            return DisplayPreviewItem(
+                displayID: displayID,
+                videoInfo: previewVideoInfo,
+                isCurrentDisplay: isCurrentDisplay,
+                isPinnedDisplay: isCurrentDisplay && viewModel.isPrimaryDisplayPinned,
+                presentationMode: isCurrentDisplay ? .listRow : .thumbnail
+            )
+        }
+    }
+
+    private func handleDisplayPrimaryAction(_ display: DisplayPreviewItem) {
+        displayAnimationSessionID += 1
+        let sessionID = displayAnimationSessionID
+        activeDisplayAnimationSessionID = sessionID
+        let oldPrimaryDisplayID = viewModel.primaryDisplayID
+        var participants = Set<UInt32>()
+        if viewModel.primaryDisplayID != 0 {
+            participants.insert(viewModel.primaryDisplayID)
+        }
+        if !display.isPinnedDisplay && display.displayID != 0 {
+            participants.insert(display.displayID)
+        }
+
+        logDisplayAnimationDebug(
+            "[session=\(sessionID)] action start target=\(display.displayID), wasPinned=\(display.isPinnedDisplay), oldPrimary=\(oldPrimaryDisplayID), participants=\(participants.sorted()), transition=fade+height"
+        )
+        roleAnimatingDisplayIDs = participants
+        let animationParticipants = participants
+
+        if display.isPinnedDisplay {
+            viewModel.unpinPrimaryDisplay()
+        } else {
+            viewModel.swapToDisplay(
+                display.displayID,
+                preferredVideoInfo: display.videoInfo
+            )
+        }
+        logDisplayAnimationDebug("[session=\(sessionID)] action applied, newPrimary=\(viewModel.primaryDisplayID)")
+
+        // Keep transition eligibility open only for the current swap.
+        DispatchQueue.main.asyncAfter(deadline: .now() + displayRoleAnimationGateDuration) {
+            if activeDisplayAnimationSessionID == sessionID &&
+               roleAnimatingDisplayIDs == animationParticipants {
+                roleAnimatingDisplayIDs.removeAll()
+                logDisplayAnimationDebug("[session=\(sessionID)] participants cleared for swap ending at primary=\(viewModel.primaryDisplayID)")
+            }
+        }
+    }
+
+    private func logDisplayAnimationDebug(_ message: String) {
+        let line = "[DisplayAnim] \(message)"
+        Log.info(line, category: .ui)
+        debugLog(line)
+    }
+
+    private func logDisplayCardGeometryChanges(
+        newFrames: [UInt32: CGRect],
+        items: [DisplayPreviewItem]
+    ) {
+        let modeByDisplayID: [UInt32: String] = Dictionary(
+            uniqueKeysWithValues: items.map { item in
+                (
+                    item.displayID,
+                    item.presentationMode == .listRow ? "listRow" : "thumbnail"
+                )
+            }
+        )
+
+        for displayID in newFrames.keys.sorted() {
+            guard let newRect = newFrames[displayID] else { continue }
+            let mode = modeByDisplayID[displayID] ?? "unknown"
+
+            if let oldRect = previousDisplayCardFramesForDebug[displayID] {
+                if rectsApproximatelyEqual(oldRect, newRect) {
+                    continue
+                }
+
+                let motionSummary = describeGeometryMotion(from: oldRect, to: newRect)
+                let transition: String
+                if roleAnimatingDisplayIDs.contains(displayID) {
+                    transition = "fade+height"
+                } else if !roleAnimatingDisplayIDs.isEmpty {
+                    transition = "reflow"
+                } else {
+                    transition = "layout-static"
+                }
+                debugLog(
+                    "[DisplayAnim][session=\(displayAnimationSessionID)] card=\(displayID) mode=\(mode) frame=\(formatRect(oldRect))->\(formatRect(newRect)) motion=\(motionSummary) transition=\(transition)"
+                )
+            } else {
+                debugLog(
+                    "[DisplayAnim][session=\(displayAnimationSessionID)] card=\(displayID) mode=\(mode) appeared frame=\(formatRect(newRect)) transition=\(roleAnimatingDisplayIDs.contains(displayID) ? "fade+height" : "none")"
+                )
+            }
+        }
+
+        let removedDisplayIDs = Set(previousDisplayCardFramesForDebug.keys).subtracting(newFrames.keys)
+        for displayID in removedDisplayIDs.sorted() {
+            debugLog("[DisplayAnim][session=\(displayAnimationSessionID)] card=\(displayID) removed from display stack")
+        }
+
+        previousDisplayCardFramesForDebug = newFrames
+    }
+
+    private func rectsApproximatelyEqual(_ lhs: CGRect, _ rhs: CGRect, epsilon: CGFloat = 0.5) -> Bool {
+        abs(lhs.minX - rhs.minX) < epsilon &&
+        abs(lhs.minY - rhs.minY) < epsilon &&
+        abs(lhs.width - rhs.width) < epsilon &&
+        abs(lhs.height - rhs.height) < epsilon
+    }
+
+    private func describeGeometryMotion(from oldRect: CGRect, to newRect: CGRect) -> String {
+        let dx = newRect.midX - oldRect.midX
+        let dy = newRect.midY - oldRect.midY
+        let dw = newRect.width - oldRect.width
+        let dh = newRect.height - oldRect.height
+
+        let translated = abs(dx) > 0.5 || abs(dy) > 0.5
+        let resized = abs(dw) > 0.5 || abs(dh) > 0.5
+
+        if translated && resized {
+            return "translate(dx=\(formatNumber(dx)), dy=\(formatNumber(dy))); resize(dw=\(formatNumber(dw)), dh=\(formatNumber(dh)))"
+        }
+        if translated {
+            return "translate(dx=\(formatNumber(dx)), dy=\(formatNumber(dy)))"
+        }
+        if resized {
+            return "resize(dw=\(formatNumber(dw)), dh=\(formatNumber(dh)))"
+        }
+        return "fade-only (no geometry delta)"
+    }
+
+    private func formatRect(_ rect: CGRect) -> String {
+        "x=\(formatNumber(rect.minX)),y=\(formatNumber(rect.minY)),w=\(formatNumber(rect.width)),h=\(formatNumber(rect.height))"
+    }
+
+    private func formatNumber(_ value: CGFloat) -> String {
+        String(format: "%.1f", value)
+    }
+
+    private func displayRoleExpandTransition(
+        for displayID: UInt32,
+        in items: [DisplayPreviewItem]
+    ) -> AnyTransition {
+        .displayRoleExpand(anchor: displayRoleAnchor(for: displayID, in: items))
+    }
+
+    private func displayRoleCompressTransition(
+        for displayID: UInt32,
+        in items: [DisplayPreviewItem]
+    ) -> AnyTransition {
+        .displayRoleCompress(anchor: displayRoleAnchor(for: displayID, in: items))
+    }
+
+    /// Per-card anchor keeps stack movement glued to physical bounds:
+    /// - top card rolls from ceiling (top anchor)
+    /// - bottom card rolls from floor (bottom anchor)
+    /// - true middle cards (between top and bottom) animate around center
+    private func displayRoleAnchor(
+        for displayID: UInt32,
+        in items: [DisplayPreviewItem]
+    ) -> UnitPoint {
+        guard let index = items.firstIndex(where: { $0.displayID == displayID }) else {
+            return .center
+        }
+
+        if index == 0 { return .top }
+        if index == items.count - 1 { return .bottom }
+        return .center
+    }
+
     /// Calculate the actual displayed frame rect within the container for the main view
     private func calculateActualDisplayedFrameRectForView(containerSize: CGSize) -> CGRect {
         // Get the actual frame dimensions from videoInfo (database)
         // Don't use NSImage.size as that requires extracting the frame from video first
         let frameSize: CGSize
-        if let videoInfo = viewModel.currentVideoInfo,
+        if let videoInfo = viewModel.displayedPrimaryVideoInfo,
            let width = videoInfo.width,
            let height = videoInfo.height {
             frameSize = CGSize(width: width, height: height)
@@ -1346,6 +1870,79 @@ public struct SimpleTimelineView: View {
         .timelineGlassSurface(.banner, cornerRadius: 16, borderColor: accentColor.opacity(0.35))
         .padding(.horizontal, 24)
         .allowsHitTesting(false)
+    }
+}
+
+private extension AnyTransition {
+    private static let collapsedReveal: CGFloat = 0.04
+
+    static func displayRoleExpand(anchor: UnitPoint) -> AnyTransition {
+        .modifier(
+            active: VerticalScaleTransitionModifier(scaleY: collapsedReveal, anchor: anchor),
+            identity: VerticalScaleTransitionModifier(scaleY: 1.0, anchor: anchor)
+        )
+    }
+
+    static func displayRoleCompress(anchor: UnitPoint) -> AnyTransition {
+        .modifier(
+            active: VerticalScaleTransitionModifier(scaleY: collapsedReveal, anchor: anchor),
+            identity: VerticalScaleTransitionModifier(scaleY: 1.0, anchor: anchor)
+        )
+    }
+}
+
+private struct VerticalScaleTransitionModifier: ViewModifier {
+    let scaleY: CGFloat
+    let anchor: UnitPoint
+
+    func body(content: Content) -> some View {
+        content
+            .scaleEffect(x: 1, y: scaleY, anchor: anchor)
+            .clipped()
+    }
+}
+
+private struct DisplayCardFramePreferenceKey: PreferenceKey {
+    static var defaultValue: [UInt32: CGRect] = [:]
+
+    static func reduce(value: inout [UInt32: CGRect], nextValue: () -> [UInt32: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
+    }
+}
+
+/// Lightweight per-card probe for display stack role animation debugging.
+private struct DisplayRoleAnimationDebugProbe: ViewModifier {
+    let displayID: UInt32
+    let mode: String
+    let shouldRoleAnimate: Bool
+    let isPinnedDisplay: Bool
+    let targetHeight: CGFloat
+
+    func body(content: Content) -> some View {
+        content
+            .onAppear {
+                debugLog(
+                    "[DisplayAnim] card=\(displayID) mode=\(mode) appeared pinned=\(isPinnedDisplay) targetHeight=\(String(format: "%.1f", targetHeight)) transition=\(shouldRoleAnimate ? "fade+height" : "none")"
+                )
+            }
+            .onDisappear {
+                debugLog("[DisplayAnim] card=\(displayID) mode=\(mode) disappeared")
+            }
+            .onChange(of: mode) { newMode in
+                let intendedTransition = shouldRoleAnimate ? "fade+height" : "none"
+                debugLog("[DisplayAnim] card=\(displayID) mode changed -> \(newMode) intendedTransition=\(intendedTransition)")
+            }
+            .onChange(of: shouldRoleAnimate) { newValue in
+                debugLog("[DisplayAnim] card=\(displayID) mode=\(mode) shouldRoleAnimate=\(newValue)")
+            }
+            .onChange(of: isPinnedDisplay) { newValue in
+                debugLog("[DisplayAnim] card=\(displayID) mode=\(mode) pinned=\(newValue)")
+            }
+            .onChange(of: targetHeight) { newValue in
+                debugLog(
+                    "[DisplayAnim] card=\(displayID) mode=\(mode) targetHeight changed -> \(String(format: "%.1f", newValue))"
+                )
+            }
     }
 }
 
@@ -1485,6 +2082,172 @@ struct VideoSeekDebugContext {
             .prefix(limit)
             .sorted()
         return nearest.map(String.init).joined(separator: ",")
+    }
+}
+
+private struct TimelineHUDToastBanner: View {
+    let message: String
+
+    var body: some View {
+        HStack(spacing: 0) {
+            Text(message)
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundColor(.white.opacity(0.95))
+        }
+        .padding(.horizontal, 15)
+        .padding(.vertical, 10)
+        .background(
+            Capsule()
+                .fill(Color.black.opacity(0.58))
+                .overlay(
+                    Capsule()
+                        .stroke(Color.white.opacity(0.2), lineWidth: 0.8)
+                )
+        )
+        .shadow(color: .black.opacity(0.3), radius: 6, x: 0, y: 2)
+    }
+}
+
+private struct CurrentDisplayRowView: View {
+    let displayLabel: String
+    let isPinnedDisplay: Bool
+    let onPrimaryAction: () -> Void
+
+    @State private var isRowHovering = false
+    @State private var isPinButtonHovering = false
+    @State private var isPinnedBadgeHovering = false
+
+    private var primaryActionLabel: String {
+        isPinnedDisplay ? "Unpin" : "Pin"
+    }
+
+    private var primaryActionIcon: String {
+        isPinnedDisplay ? "pin.slash.fill" : "pin.fill"
+    }
+
+    private func handlePrimaryAction() {
+        // Clicking pin/unpin should immediately restore normal card content
+        // instead of waiting for a new hover event.
+        isRowHovering = false
+        isPinButtonHovering = false
+        onPrimaryAction()
+    }
+
+    var body: some View {
+        ZStack {
+            VStack(spacing: 8) {
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(Color.black.opacity(0.48))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6)
+                            .stroke(Color.white.opacity(0.24), lineWidth: 0.8)
+                    )
+                    .overlay(
+                        Image(systemName: "display")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundColor(.white.opacity(0.72))
+                    )
+                    .frame(width: 66, height: 40)
+
+                Text(displayLabel)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(.white.opacity(0.95))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: .infinity)
+
+                Label("Current", systemImage: "eye.fill")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(.white.opacity(0.95))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(
+                        Capsule()
+                            .fill(Color.black.opacity(0.45))
+                            .overlay(
+                                Capsule()
+                                    .stroke(Color.white.opacity(0.2), lineWidth: 0.7)
+                            )
+                    )
+                    .transition(.opacity)
+            }
+            .opacity((isRowHovering && !isPinnedDisplay) ? 0 : 1)
+
+            if isRowHovering {
+                if !isPinnedDisplay {
+                DisplayPinActionButton(
+                    label: primaryActionLabel,
+                    systemImage: primaryActionIcon,
+                    isHovering: isPinButtonHovering,
+                    action: handlePrimaryAction
+                )
+                .onHover { hovering in
+                    isPinButtonHovering = hovering
+                }
+                .transition(.opacity)
+                }
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 12)
+        .frame(maxWidth: .infinity, minHeight: 96)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color.white.opacity(0.08))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(Color.white.opacity(0.15), lineWidth: 0.8)
+                )
+        )
+        .overlay(alignment: .topTrailing) {
+            if isPinnedDisplay {
+                Button(action: handlePrimaryAction) {
+                    Image(systemName: "pin.fill")
+                        .font(.system(size: 18, weight: .bold))
+                        .foregroundColor(.white.opacity(0.95))
+                        .padding(9)
+                        .background(
+                            Circle()
+                                .fill(Color.black.opacity(isPinnedBadgeHovering ? 0.62 : 0.45))
+                                .overlay(
+                                    Circle()
+                                        .stroke(Color.white.opacity(isPinnedBadgeHovering ? 0.3 : 0.2), lineWidth: 0.8)
+                                )
+                        )
+                        .scaleEffect(isPinnedBadgeHovering ? 1.08 : 1.0)
+                        .shadow(
+                            color: .black.opacity(isPinnedBadgeHovering ? 0.45 : 0.28),
+                            radius: isPinnedBadgeHovering ? 10 : 5,
+                            x: 0,
+                            y: isPinnedBadgeHovering ? 6 : 3
+                        )
+                        .offset(y: isPinnedBadgeHovering ? -2 : 0)
+                        .padding(8)
+                }
+                .buttonStyle(.plain)
+                .onHover { hovering in
+                    withAnimation(.easeOut(duration: 0.14)) {
+                        isPinnedBadgeHovering = hovering
+                    }
+                    if hovering {
+                        NSCursor.pointingHand.push()
+                    } else {
+                        NSCursor.pop()
+                    }
+                }
+                .help("Unpin display")
+            }
+        }
+        .contentShape(Rectangle())
+        .onHover { hovering in
+            withAnimation(.easeOut(duration: 0.16)) {
+                isRowHovering = hovering && !isPinnedDisplay
+                if !hovering {
+                    isPinButtonHovering = false
+                }
+            }
+        }
     }
 }
 
@@ -2426,7 +3189,7 @@ struct FrameWithURLOverlay<Content: View>: View {
                 width: liveImage.representations.first?.pixelsWide ?? Int(liveImage.size.width),
                 height: liveImage.representations.first?.pixelsHigh ?? Int(liveImage.size.height)
             )
-        } else if let videoInfo = viewModel.currentVideoInfo,
+        } else if let videoInfo = viewModel.displayedPrimaryVideoInfo,
            let width = videoInfo.width,
            let height = videoInfo.height {
             frameSize = CGSize(width: width, height: height)
@@ -6180,7 +6943,7 @@ struct DebugFrameIDBadge: View {
     }
 
     private var videoReencodeText: String {
-        guard let videoInfo = viewModel.currentVideoInfo else {
+        guard let videoInfo = viewModel.displayedPrimaryVideoInfo else {
             return "n/a"
         }
 
@@ -6188,7 +6951,7 @@ struct DebugFrameIDBadge: View {
     }
 
     private var videoReencodeColor: Color {
-        guard let videoInfo = viewModel.currentVideoInfo else {
+        guard let videoInfo = viewModel.displayedPrimaryVideoInfo else {
             return .blue.opacity(0.8)
         }
 
@@ -6196,7 +6959,7 @@ struct DebugFrameIDBadge: View {
     }
 
     private var bitrateText: String {
-        guard let videoInfo = viewModel.currentVideoInfo,
+        guard let videoInfo = viewModel.displayedPrimaryVideoInfo,
               let bitsPerSecond = videoInfo.averageBitrateBitsPerSecond,
               bitsPerSecond.isFinite,
               bitsPerSecond > 0 else {
@@ -6211,7 +6974,7 @@ struct DebugFrameIDBadge: View {
     }
 
     private var kibPerFrameText: String {
-        guard let videoInfo = viewModel.currentVideoInfo,
+        guard let videoInfo = viewModel.displayedPrimaryVideoInfo,
               let kibPerFrame = videoInfo.kibibytesPerFrame,
               kibPerFrame.isFinite,
               kibPerFrame > 0 else {
@@ -6256,7 +7019,7 @@ struct DebugFrameIDBadge: View {
                         .foregroundColor(viewModel.currentFrameHasInMemoryJPEGCache ? .green.opacity(0.85) : .white.opacity(0.7))
 
                     // Debug: Show video frame index being requested
-                    if let videoInfo = viewModel.currentVideoInfo {
+                    if let videoInfo = viewModel.displayedPrimaryVideoInfo {
                         Text("VidIdx: \(videoInfo.frameIndex)")
                             .font(.retraceMonoSmall)
                             .foregroundColor(.orange.opacity(0.8))
@@ -6669,7 +7432,7 @@ struct DeveloperActionsMenu: View {
 
             // Open Video File button - opens in QuickTime at the current frame's timestamp
             Button(action: {
-                guard let videoInfo = viewModel.currentVideoInfo else { return }
+                guard let videoInfo = viewModel.displayedPrimaryVideoInfo else { return }
                 let originalPath = videoInfo.videoPath
                 let timeInSeconds = videoInfo.timeInSeconds
 
@@ -6714,7 +7477,7 @@ struct DeveloperActionsMenu: View {
             }) {
                 Label("Open Video File", systemImage: "play.rectangle")
             }
-            .disabled(viewModel.currentVideoInfo == nil)
+            .disabled(viewModel.displayedPrimaryVideoInfo == nil)
 
         } label: {
             HStack(spacing: 4) {
@@ -6875,6 +7638,38 @@ struct TextSelectionHintBanner: View {
                 KeyboardBadge(symbol: "⊹ Drag")
             }
         }
+    }
+}
+
+/// Persistent banner shown while a display is pinned in the stack.
+struct PinnedDisplayBanner: View {
+    let displayLabel: String
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "pin.fill")
+                .font(.retraceHeadline)
+                .foregroundColor(.white.opacity(0.9))
+
+            Text("Pinned Display:")
+                .font(.retraceCaption)
+                .foregroundColor(.white.opacity(0.7))
+
+            Text(displayLabel)
+                .font(.retraceCaptionMedium)
+                .foregroundColor(.white.opacity(0.92))
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color(white: 0.2).opacity(0.95))
+                .shadow(color: .black.opacity(0.3), radius: 10, y: 4)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color.white.opacity(0.15), lineWidth: 1)
+        )
     }
 }
 

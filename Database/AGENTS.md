@@ -34,13 +34,14 @@ Database/
 │   ├── V17_FrameCaptureTrigger.swift
 │   ├── V18_DailyMetricsRecencyIndex.swift
 │   ├── V19_FrameEncodedAt.swift
-│   └── V20_PartialProcessingStatusIndex.swift # Exclude OCR-completed frames from status index
-├── Queries/                  # Includes FrameOCRRegionQueries.swift for bounded capture-time geometry
+│   ├── V20_PartialProcessingStatusIndex.swift # Exclude OCR-completed frames from status index
+│   └── V21_MultiDisplaySupport.swift # Display metadata and frame focus
+├── Queries/                  # Includes DisplayQueries.swift and FrameOCRRegionQueries.swift
 │   ├── FrameQueries.swift     # Frame CRUD operations
 │   ├── SegmentQueries.swift   # Segment CRUD operations
 │   ├── DailyMetricsQueries.swift # Metric events and local-day counts, with optional exact timestamp bounds
 │   └── DocumentQueries.swift  # Document/FTS operations
-└── Tests/                    # Includes FrameOCRRegionTests.swift lifecycle coverage
+└── Tests/                    # Includes FrameOCRRegionTests.swift lifecycle, display round-trip, and V20-to-V21 upgrade coverage
     ├── AsyncQueuePipelineTests.swift
     ├── RetentionVideoDeletionTests.swift # Real migrated SQLite retention guards and injected failure
     ├── DatabaseManagerTests.swift

@@ -379,10 +379,28 @@ enum AppSegmentQueries {
 
     // MARK: - Statistics
 
-    /// Get total captured duration in seconds (sum of all segment durations)
+    /// Get total captured duration in seconds from focused-frame gaps (caps long idle gaps).
     static func getTotalCapturedDuration(db: OpaquePointer) throws -> TimeInterval {
-        // endDate and startDate are stored as milliseconds since epoch
-        let sql = "SELECT COALESCE(SUM(endDate - startDate), 0) FROM segment;"
+        let maxGapMs: Int64 = 120_000  // 2 minutes
+        let sql = """
+            WITH focused_frames AS (
+                SELECT
+                    createdAt,
+                    LAG(createdAt) OVER (ORDER BY createdAt) as prev_createdAt
+                FROM frame
+                WHERE isFocused = 1
+            ),
+            frame_gaps AS (
+                SELECT
+                    CASE
+                        WHEN prev_createdAt IS NULL THEN 0
+                        WHEN createdAt - prev_createdAt > ? THEN ?
+                        ELSE createdAt - prev_createdAt
+                    END as gap_ms
+                FROM focused_frames
+            )
+            SELECT COALESCE(SUM(gap_ms), 0) FROM frame_gaps;
+            """
 
         var statement: OpaquePointer?
         defer {
@@ -395,6 +413,9 @@ enum AppSegmentQueries {
                 underlying: String(cString: sqlite3_errmsg(db))
             )
         }
+
+        sqlite3_bind_int64(statement, 1, maxGapMs)
+        sqlite3_bind_int64(statement, 2, maxGapMs)
 
         guard try SQLiteReadStep.next(statement) == SQLITE_ROW else {
             return 0
@@ -405,10 +426,28 @@ enum AppSegmentQueries {
         return TimeInterval(milliseconds) / 1000.0
     }
 
-    /// Get total captured duration in seconds for segments starting after a given date
+    /// Get captured duration in seconds after a given date from focused-frame gaps.
     static func getCapturedDurationAfter(db: OpaquePointer, date: Date) throws -> TimeInterval {
-        // endDate and startDate are stored as milliseconds since epoch
-        let sql = "SELECT COALESCE(SUM(endDate - startDate), 0) FROM segment WHERE startDate > ?;"
+        let maxGapMs: Int64 = 120_000  // 2 minutes
+        let sql = """
+            WITH focused_frames AS (
+                SELECT
+                    createdAt,
+                    LAG(createdAt) OVER (ORDER BY createdAt) as prev_createdAt
+                FROM frame
+                WHERE isFocused = 1 AND createdAt > ?
+            ),
+            frame_gaps AS (
+                SELECT
+                    CASE
+                        WHEN prev_createdAt IS NULL THEN 0
+                        WHEN createdAt - prev_createdAt > ? THEN ?
+                        ELSE createdAt - prev_createdAt
+                    END as gap_ms
+                FROM focused_frames
+            )
+            SELECT COALESCE(SUM(gap_ms), 0) FROM frame_gaps;
+            """
 
         var statement: OpaquePointer?
         defer {
@@ -422,8 +461,10 @@ enum AppSegmentQueries {
             )
         }
 
-        // Bind date as milliseconds
+        // Bind date and gap cap as milliseconds.
         sqlite3_bind_int64(statement, 1, Schema.dateToTimestamp(date))
+        sqlite3_bind_int64(statement, 2, maxGapMs)
+        sqlite3_bind_int64(statement, 3, maxGapMs)
 
         guard try SQLiteReadStep.next(statement) == SQLITE_ROW else {
             return 0
@@ -522,6 +563,7 @@ enum AppSegmentQueries {
     /// Calculates actual screen time from frame gaps, attributing each gap to the PREVIOUS frame's app
     /// (the app you were using during that time period)
     /// Gaps > 2 minutes are capped (considered idle time)
+    /// Uses focused frames only (isFocused = 1) so multi-display passive screens don't inflate usage.
     /// For browsers, counts unique domains; for other apps, counts unique windowNames
     static func getAppUsageStats(
         db: OpaquePointer,
@@ -545,7 +587,7 @@ enum AppSegmentQueries {
                 SELECT s.bundleID, s.id as segmentId, f.createdAt
                 FROM frame f
                 JOIN segment s ON f.segmentId = s.id
-                WHERE f.createdAt >= ? AND f.createdAt <= ?
+                WHERE f.createdAt >= ? AND f.createdAt <= ? AND f.isFocused = 1
             ),
             frame_gaps AS (
                 SELECT
@@ -556,37 +598,37 @@ enum AppSegmentQueries {
             ),
             unique_items AS (
                 SELECT
-                    bundleID,
+                    fwa.bundleID,
                     COUNT(DISTINCT CASE
-                        WHEN bundleID IN (\(browserList)) THEN
+                        WHEN fwa.bundleID IN (\(browserList)) THEN
                             CASE
-                                WHEN browserUrl IS NOT NULL AND browserUrl != '' THEN
+                                WHEN s.browserUrl IS NOT NULL AND s.browserUrl != '' THEN
                                     CASE
-                                        WHEN INSTR(browserUrl, '://') > 0 THEN
+                                        WHEN INSTR(s.browserUrl, '://') > 0 THEN
                                             CASE
-                                                WHEN INSTR(SUBSTR(browserUrl, INSTR(browserUrl, '://') + 3), '/') > 0 THEN
+                                                WHEN INSTR(SUBSTR(s.browserUrl, INSTR(s.browserUrl, '://') + 3), '/') > 0 THEN
                                                     SUBSTR(
-                                                        browserUrl,
-                                                        INSTR(browserUrl, '://') + 3,
-                                                        INSTR(SUBSTR(browserUrl, INSTR(browserUrl, '://') + 3), '/') - 1
+                                                        s.browserUrl,
+                                                        INSTR(s.browserUrl, '://') + 3,
+                                                        INSTR(SUBSTR(s.browserUrl, INSTR(s.browserUrl, '://') + 3), '/') - 1
                                                     )
                                                 ELSE
-                                                    SUBSTR(browserUrl, INSTR(browserUrl, '://') + 3)
+                                                    SUBSTR(s.browserUrl, INSTR(s.browserUrl, '://') + 3)
                                             END
-                                        ELSE browserUrl
+                                        ELSE s.browserUrl
                                     END
-                                ELSE windowName
+                                ELSE s.windowName
                             END
-                        ELSE windowName
+                        ELSE s.windowName
                     END) as unique_count
-                FROM segment s
-                WHERE startDate >= ? AND startDate <= ?
-                    AND NOT EXISTS (
-                        SELECT 1 FROM segment_tag st
-                        JOIN tag t ON st.tagId = t.id
-                        WHERE st.segmentId = s.id AND t.name = 'hidden'
-                    )
-                GROUP BY bundleID
+                FROM frames_with_app fwa
+                JOIN segment s ON fwa.segmentId = s.id
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM segment_tag st
+                    JOIN tag t ON st.tagId = t.id
+                    WHERE st.segmentId = s.id AND t.name = 'hidden'
+                )
+                GROUP BY fwa.bundleID
             )
             SELECT
                 fg.prev_bundleID as bundleID,
@@ -634,10 +676,8 @@ enum AppSegmentQueries {
 
         sqlite3_bind_int64(statement, 1, Schema.dateToTimestamp(startDate))
         sqlite3_bind_int64(statement, 2, Schema.dateToTimestamp(endDate))
-        sqlite3_bind_int64(statement, 3, Schema.dateToTimestamp(startDate))
-        sqlite3_bind_int64(statement, 4, Schema.dateToTimestamp(endDate))
-        sqlite3_bind_int64(statement, 5, maxGapMs)
-        sqlite3_bind_int64(statement, 6, maxGapMs)
+        sqlite3_bind_int64(statement, 3, maxGapMs)
+        sqlite3_bind_int64(statement, 4, maxGapMs)
 
         let executeStartedAt = CFAbsoluteTimeGetCurrent()
         var results: [(bundleID: String, duration: TimeInterval, uniqueItemCount: Int)] = []
@@ -1233,7 +1273,8 @@ enum AppSegmentQueries {
     }
 
     /// Get daily screen time totals for a date range (for 7-day graphs)
-    /// Calculates actual screen time from frame gaps, capping gaps > 2 minutes as idle
+    /// Calculates actual screen time from focused-frame gaps (isFocused = 1),
+    /// capping gaps > 2 minutes as idle
     /// Returns array of (date, tenthsOfHours) tuples sorted by date ascending, grouped by local timezone
     static func getDailyScreenTime(
         db: OpaquePointer,
@@ -1253,7 +1294,7 @@ enum AppSegmentQueries {
                     date(createdAt / 1000.0, 'unixepoch', 'localtime') as local_day,
                     createdAt - LAG(createdAt) OVER (ORDER BY createdAt) as gap_ms
                 FROM frame
-                WHERE createdAt >= ? AND createdAt <= ?
+                WHERE createdAt >= ? AND createdAt <= ? AND isFocused = 1
             )
             SELECT
                 local_day,

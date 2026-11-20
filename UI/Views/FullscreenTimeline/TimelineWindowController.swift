@@ -2814,7 +2814,7 @@ extension TimelineWindowController {
                     (viewModel.isSearchOverlayVisible &&
                      (viewModel.searchViewModel.isDropdownOpen || viewModel.searchViewModel.isSearchOverlayExpanded)) ||
                     viewModel.isFilterDropdownOpen ||
-                    viewModel.showTagSubmenu) {
+                    (viewModel.showTagSubmenu || viewModel.isDisplayStackHovering)) {
                     return // Let SwiftUI handle it
                 }
                 self.handleScrollEvent(event, source: "GLOBAL")
@@ -3033,7 +3033,7 @@ extension TimelineWindowController {
                         return event
                     }
                     // Timeline context-menu tag submenu is also scrollable.
-                    if viewModel.showTagSubmenu {
+                    if viewModel.showTagSubmenu || viewModel.isDisplayStackHovering {
                         return event
                     }
                     // The recent-entry popover should own wheel events while open.
