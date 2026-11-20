@@ -197,7 +197,8 @@ public actor CaptureManager: CaptureProtocol {
     private var lastKeptMousePosition: CGPoint?
     private var _isCapturing = false
 
-    private var dedupedFrameContinuation: AsyncStream<CapturedFrame>.Continuation?
+    private var frameChannel: BoundedFrameChannel?
+    private var captureGeneration: UInt64 = 0
     private var _frameStream: AsyncStream<CapturedFrame>?
 
     private var stats = CaptureStatistics(
@@ -224,6 +225,7 @@ public actor CaptureManager: CaptureProtocol {
     private var isCaptureExecutionInFlight = false
     private var pipelinePerformance = CapturePerformanceDiagnostics(pipeline: true)
     private static let dedupedFrameBufferLimit = 8
+    private static let dedupedFrameByteLimit = 64 * 1024 * 1024
     private static let memoryLedgerCurrentFrameTag = "capture.stream.currentFrame"
     private static let memoryLedgerLastKeptFrameTag = "capture.dedup.lastKeptFrame"
     private static let memoryLedgerSummaryIntervalSeconds: TimeInterval = 5
@@ -290,11 +292,11 @@ public actor CaptureManager: CaptureProtocol {
 
         self.currentConfig = config
 
-        let (dedupedStream, dedupedContinuation) = AsyncStream<CapturedFrame>.makeStream(
-            bufferingPolicy: .bufferingNewest(Self.dedupedFrameBufferLimit)
-        )
-        self.dedupedFrameContinuation = dedupedContinuation
-        self._frameStream = dedupedStream
+        captureGeneration &+= 1
+        await frameChannel?.finish()
+        let channel = BoundedFrameChannel(frameLimit: Self.dedupedFrameBufferLimit, byteLimit: Self.dedupedFrameByteLimit)
+        frameChannel = channel
+        _frameStream = channel.stream
 
         let activeDisplayID = await displayMonitor.getActiveDisplayID()
         currentCaptureDisplayID = activeDisplayID
@@ -324,6 +326,12 @@ public actor CaptureManager: CaptureProtocol {
         guard _isCapturing else { return }
 
         _isCapturing = false
+        captureGeneration &+= 1
+        // Release a producer waiting for storage before stopping the backends.
+        let channel = frameChannel
+        frameChannel = nil
+        _frameStream = nil
+        await channel?.finish()
 
         scheduledCaptureTask?.cancel()
         scheduledCaptureTask = nil
@@ -342,10 +350,6 @@ public actor CaptureManager: CaptureProtocol {
         deduplicationByDisplay.removeAll()
         let reports = pipelinePerformance.flush(at: CapturePerformanceFrame.now())
         pipelinePerformance.emit(reports)
-
-        dedupedFrameContinuation?.finish()
-        dedupedFrameContinuation = nil
-        _frameStream = nil
 
         lastKeptCandidate = nil
         lastKeptFrame = nil
@@ -369,11 +373,10 @@ public actor CaptureManager: CaptureProtocol {
             return stream
         }
 
-        let (stream, continuation) = AsyncStream<CapturedFrame>.makeStream(
-            bufferingPolicy: .bufferingNewest(Self.dedupedFrameBufferLimit)
-        )
-        self.dedupedFrameContinuation = continuation
-        self._frameStream = stream
+        let channel = BoundedFrameChannel(frameLimit: Self.dedupedFrameBufferLimit, byteLimit: Self.dedupedFrameByteLimit)
+        frameChannel = channel
+        let stream = channel.stream
+        _frameStream = stream
         return stream
     }
 
@@ -692,7 +695,7 @@ public actor CaptureManager: CaptureProtocol {
         scheduledCaptureTask?.cancel()
         scheduledCaptureTask = nil
 
-        guard let capture = pendingCapture else { return }
+        guard let capture = pendingCapture, !isCaptureExecutionInFlight else { return }
 
         scheduledCaptureTask = Task { [weak self] in
             guard let self else { return }
@@ -710,6 +713,7 @@ public actor CaptureManager: CaptureProtocol {
         guard let capture = pendingCapture else { return }
         guard !isCaptureExecutionInFlight else { return }
 
+        let generation = captureGeneration
         let performance = CapturePerformanceFrame()
         let performanceStart = CapturePerformanceFrame.now()
         performance.record(.queueDelay, milliseconds: max(0, now().timeIntervalSince(capture.fireTime) * 1000))
@@ -728,9 +732,9 @@ public actor CaptureManager: CaptureProtocol {
         scheduledCaptureTask = nil
         isCaptureExecutionInFlight = true
         defer {
-            isCaptureExecutionInFlight = false
-            if _isCapturing {
-                reschedulePendingCaptureTask()
+            if captureGeneration == generation {
+                isCaptureExecutionInFlight = false
+                if _isCapturing { reschedulePendingCaptureTask() }
             }
         }
 
@@ -751,7 +755,7 @@ public actor CaptureManager: CaptureProtocol {
             deduplicationByDisplay.removeValue(forKey: id)
         }
         for displayID in displays {
-            guard _isCapturing else { break }
+            guard _isCapturing, captureGeneration == generation else { break }
             let backend: any ScreenCaptureBackend
             if currentConfig.recordAllDisplays {
                 if let existing = multiDisplayBackends[displayID] { backend = existing }
@@ -776,6 +780,7 @@ public actor CaptureManager: CaptureProtocol {
             lastKeptMousePosition = state?.2
             await executeCapture(capture, displayID: displayID, backend: backend,
                                  batchTimestamp: batchTimestamp, performance: performance)
+            guard _isCapturing, captureGeneration == generation else { return }
             deduplicationByDisplay[displayID] = (lastKeptCandidate, lastKeptFrame, lastKeptMousePosition)
         }
         if capture.trigger == .windowChange {
@@ -788,9 +793,11 @@ public actor CaptureManager: CaptureProtocol {
         _ capture: PendingCapture, displayID: UInt32, backend: any ScreenCaptureBackend,
         batchTimestamp: Date?, performance: CapturePerformanceFrame
     ) async {
+        let generation = captureGeneration
         let captureAttemptStartedAt = now()
 
         let candidate = await backend.captureCandidate(displayID: displayID)
+        guard _isCapturing, captureGeneration == generation else { return }
         let captureAttemptCompletedAt = now()
         if let candidate {
             lastActualCaptureTime = captureAttemptCompletedAt
@@ -836,6 +843,7 @@ public actor CaptureManager: CaptureProtocol {
                     metadata: frame.metadata, accessibilitySnapshot: frame.accessibilitySnapshot
                 )
                 let kept = await handleCapturedFrame(synchronizedFrame, trigger: capture.trigger)
+                guard _isCapturing, captureGeneration == generation else { return }
                 performance.record(.deduplication, since: handlingStart)
                 performance.increment(kept ? .kept : .deduplicated)
                 if kept {
@@ -1008,11 +1016,14 @@ public actor CaptureManager: CaptureProtocol {
             let shouldKeep = keepBySimilarity || keepByMouseMovement
 
             if shouldKeep {
+                guard let channel = frameChannel else { return false }
+                let enrichedFrame = await enrichFrameMetadata(frame, trigger: trigger)
+                guard _isCapturing, frameChannel === channel,
+                      await channel.send(enrichedFrame),
+                      _isCapturing, frameChannel === channel else { return false }
                 retained = true
                 lastKeptFrame = frame
                 lastKeptMousePosition = currentMousePosition
-                let enrichedFrame = await enrichFrameMetadata(frame, trigger: trigger)
-                dedupedFrameContinuation?.yield(enrichedFrame)
 
                 stats = CaptureStatistics(
                     totalFramesCaptured: totalFrames,
@@ -1065,8 +1076,11 @@ public actor CaptureManager: CaptureProtocol {
                 )
             }
         } else {
+            guard let channel = frameChannel else { return false }
             let enrichedFrame = await enrichFrameMetadata(frame, trigger: trigger)
-            dedupedFrameContinuation?.yield(enrichedFrame)
+            guard _isCapturing, frameChannel === channel,
+                  await channel.send(enrichedFrame),
+                  _isCapturing, frameChannel === channel else { return false }
 
             stats = CaptureStatistics(
                 totalFramesCaptured: totalFrames,

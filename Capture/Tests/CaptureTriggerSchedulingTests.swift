@@ -738,6 +738,58 @@ final class CaptureTriggerSchedulingTests: XCTestCase {
         try await manager.stopCapture()
     }
 
+    func testFullQueuePausesCaptureUntilConsumerPullsAndStopReleasesProducer() async throws {
+        let backend = FakeScreenCaptureBackend(frames: (0..<24).map {
+            makeFrame(displayID: 13, pixelValue: UInt8($0), timestamp: Date(timeIntervalSince1970: Double($0)))
+        })
+        let manager = makeManager(backend: backend,
+            displayMonitor: FakeDisplayMonitor(activeDisplayID: 13, hasPermission: true),
+            displaySwitchMonitor: FakeDisplaySwitchMonitor(),
+            mouseClickMonitor: FakeMouseClickMonitor(startResult: true))
+        let config = testConfig(captureIntervalSeconds: 0.04, captureOnWindowChange: false, captureOnMouseClick: false,
+                                adaptiveCaptureEnabled: false)
+        try await manager.startCapture(config: config)
+        let watchdog = Task {
+            do { try await Task.sleep(for: .seconds(10), clock: .continuous) }
+            catch { return }
+            try? await manager.stopCapture()
+        }
+        defer { watchdog.cancel() }
+        let stream = await manager.frameStream
+        let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while await backend.captureCount() < 9, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(5), clock: .continuous)
+        }
+        try await Task.sleep(for: .milliseconds(50), clock: .continuous)
+        let blockedCount = await backend.captureCount()
+        guard blockedCount == 9 else {
+            try await manager.stopCapture()
+            return XCTFail("Expected eight queued frames and one suspended capture; got \(blockedCount) captures")
+        }
+        var iterator = stream.makeAsyncIterator()
+        for sequence in 0..<12 {
+            let frame = await iterator.next()
+            XCTAssertEqual(frame?.timestamp, Date(timeIntervalSince1970: Double(sequence)))
+        }
+        // Fill the queue again and stop with no consumer pulling. This must wake
+        // the producer instead of holding shutdown hostage to storage progress.
+        let secondDeadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while await backend.captureCount() < 21, ContinuousClock.now < secondDeadline {
+            try await Task.sleep(for: .milliseconds(5), clock: .continuous)
+        }
+        let secondBlockedCount = await backend.captureCount()
+        XCTAssertEqual(secondBlockedCount, 21)
+        try await manager.stopCapture()
+        let finished = await iterator.next()
+        XCTAssertNil(finished)
+        // An old suspended producer must not contaminate a restarted stream.
+        try await manager.startCapture(config: config)
+        var restartedIterator = await manager.frameStream.makeAsyncIterator()
+        let restarted = await restartedIterator.next()
+        XCTAssertEqual(restarted?.timestamp, Date(timeIntervalSince1970: 21))
+        try await manager.stopCapture()
+    }
+
     private func makeManager(
         backend: FakeScreenCaptureBackend,
         displayMonitor: FakeDisplayMonitor,
@@ -773,11 +825,12 @@ final class CaptureTriggerSchedulingTests: XCTestCase {
     private func testConfig(
         captureIntervalSeconds: Double = 1.0,
         captureOnWindowChange: Bool = true,
-        captureOnMouseClick: Bool = true
+        captureOnMouseClick: Bool = true,
+        adaptiveCaptureEnabled: Bool = true
     ) -> CaptureConfig {
         CaptureConfig(
             captureIntervalSeconds: captureIntervalSeconds,
-            adaptiveCaptureEnabled: true,
+            adaptiveCaptureEnabled: adaptiveCaptureEnabled,
             deduplicationThreshold: CaptureConfig.defaultDeduplicationThreshold,
             keepFramesOnMouseMovement: false,
             maxResolution: .hd1080,

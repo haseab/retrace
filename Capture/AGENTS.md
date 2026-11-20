@@ -9,6 +9,7 @@ You are responsible for the **Capture** module of Retrace. Your job is to implem
 ```
 Capture/
 ├── CaptureManager.swift           # Main CaptureProtocol implementation
+├── BoundedFrameChannel.swift      # Awaited capture handoff, count and pixel-byte budgets
 ├── ScreenCapture/
 │   ├── CaptureFrameCandidate.swift # Defer BGRA materialization for exact native duplicates
 │   ├── CGWindowListCapture.swift  # Legacy CGWindowList API wrapper
@@ -482,3 +483,11 @@ Automatic browser URL AppleScripts preflight Apple Events authorization without 
 `Metadata/WindowOCRGeometry.swift` selects at most 16 meaningfully visible layer-zero application windows in front-to-back order. Each entry is the full clipped window bounds in normalized top-left screenshot coordinates; entries may overlap. Fully covered windows, exposed slivers below 1% of the window area, tiny windows and non-normal system/status-item layers do not create OCR jobs. No background fragments are appended. Screen-sized surfaces owned by background accessory/system processes are ignored as crops and occluders; the captured primary application and Retrace itself remain eligible, including with a hidden Dock icon. This ownership check caches each PID once per frame and never overrides privacy exclusions. Excluded windows consume visible area but are never selected; capture's privacy-masked screenshot remains the only pixel source. Processing masks preceding windows inside each lower crop, preserving one Vision request per selected window. Geometry over budget falls back to legacy OCR.
 
 The privacy array helper still avoids extra lookups. The OCR feature separately takes one best-effort on-screen geometry snapshot immediately after image acquisition, before slow AX/face work; it must never replace the fresh bounds used by privacy masking. The window list and screenshot are separate Window Server calls, so fast motion can race them. Only already privacy-filtered screenshot pixels are passed to OCR; no individual window image is captured.
+
+## Capture backpressure
+
+- The capture-to-storage channel queues at most eight frames and 64 MiB of pixel data. Screenshots larger than the byte budget use direct consumer handoff. The sole capture producer may retain one additional screenshot while suspended; the consumer and per-display dedup/native-image caches have separate memory costs.
+- Await channel sends inside the existing single capture batch. Never create a Task per screenshot or accumulate blocked producers. Pending triggers coalesce into one request while capture waits.
+- The AsyncStream adapter uses unfolding/pull semantics, with no second prefetch buffer. Deduplication state and captured outcomes advance only after channel admission succeeds.
+- Stop/consumer cancellation releases queued frames and suspended continuations. Session generations prevent an old resumed capture from mutating a restarted session.
+- Run `swift test --filter 'BoundedFrameChannelTests|testFullQueuePausesCapture'` for screenshot FIFO, byte limits, oversized handoff, cancellation, capture pause/resume and stop/restart checks.
