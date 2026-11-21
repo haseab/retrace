@@ -6,6 +6,21 @@ import App
 @testable import Retrace
 
 final class TimelineCoordinatorVisibilityDecisionTests: XCTestCase {
+    func testOldHideCleanupCannotSupersedeReopenedTimeline() {
+        XCTAssertFalse(TimelineWindowController.shouldFinishHideTransitionCleanup(
+            requestGeneration: 3, currentGeneration: 4, presentationState: .visible
+        ))
+        XCTAssertFalse(TimelineWindowController.shouldFinishHideTransitionCleanup(
+            requestGeneration: 3, currentGeneration: 5, presentationState: .hidden
+        ))
+        XCTAssertFalse(TimelineWindowController.shouldFinishHideTransitionCleanup(
+            requestGeneration: 3, currentGeneration: 3, presentationState: .visible
+        ))
+        XCTAssertTrue(TimelineWindowController.shouldFinishHideTransitionCleanup(
+            requestGeneration: 3, currentGeneration: 3, presentationState: .hidden
+        ))
+    }
+
     func testRejectsStaleVisibleUpdateAfterHideAdvancesGeneration() {
         XCTAssertFalse(
             TimelineWindowController.shouldApplyDeferredCoordinatorTimelineVisible(

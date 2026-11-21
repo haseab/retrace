@@ -809,6 +809,8 @@ public actor AppCoordinator {
     // Timeline visibility tracking - pause capture when timeline is open
     private var isTimelineVisible = false
     private var timelineVisibilityGeneration: UInt64 = 0
+    // Reject captures delivered after close if their pixels were acquired before close.
+    private var lastTimelineHiddenAt: Date?
 
     // Signal to flush pending frames to the OCR queue
     private var shouldFlushPendingFrames = false
@@ -996,7 +998,11 @@ public actor AppCoordinator {
             timelineVisibilityGeneration &+= 1
         }
 
+        if isTimelineVisible && !visible {
+            lastTimelineHiddenAt = Date()
+        }
         isTimelineVisible = visible
+        Log.debug("[TimelineVisibility] capture suppression visible=\(visible) generation=\(timelineVisibilityGeneration)", category: .app)
         // When timeline becomes visible, signal to flush any buffered frames to OCR queue
         if visible {
             shouldFlushPendingFrames = true
@@ -1012,6 +1018,16 @@ public actor AppCoordinator {
     ) -> Bool {
         guard let incomingGeneration else { return true }
         return incomingGeneration > currentGeneration
+    }
+
+    nonisolated static func shouldSuppressTimelineCapture(
+        capturedAt: Date,
+        isTimelineVisible: Bool,
+        lastTimelineHiddenAt: Date?
+    ) -> Bool {
+        if isTimelineVisible { return true }
+        guard let lastTimelineHiddenAt else { return false }
+        return capturedAt <= lastTimelineHiddenAt
     }
 
     public func setTimelineScrubbing(_ scrubbing: Bool) async {
@@ -2072,8 +2088,13 @@ public actor AppCoordinator {
                 continue
             }
 
-            // Skip frames when timeline is visible (don't record while user is viewing timeline)
-            if isTimelineVisible {
+            // Delivery can lag capture (privacy checks, deduplication, stream buffering).
+            // Never save timeline pixels just because the overlay closed before delivery.
+            if Self.shouldSuppressTimelineCapture(
+                capturedAt: frame.timestamp,
+                isTimelineVisible: isTimelineVisible,
+                lastTimelineHiddenAt: lastTimelineHiddenAt
+            ) {
                 // Check if we need to flush pending frames before pausing
                 if shouldFlushPendingFrames {
                     shouldFlushPendingFrames = false

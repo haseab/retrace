@@ -353,6 +353,14 @@ public class TimelineWindowController: NSObject {
         return !isTimelineVisibleToClients || !hasVisibleTimelineWindow
     }
 
+    nonisolated static func shouldFinishHideTransitionCleanup(
+        requestGeneration: UInt64,
+        currentGeneration: UInt64,
+        presentationState: PresentationState
+    ) -> Bool {
+        requestGeneration == currentGeneration && presentationState == .hidden
+    }
+
     nonisolated static func reconciledPresentationState(
         currentState: PresentationState,
         windowExists: Bool,
@@ -736,6 +744,7 @@ public class TimelineWindowController: NSObject {
         if reconciledState == .visible {
             Self.setEmergencyTimelineVisible(true)
             startObservingApplicationActivation()
+            scheduleCoordinatorTimelineVisible(true)
         } else if reconciledState == .hidden {
             Self.setEmergencyTimelineVisible(false)
             stopObservingApplicationActivation()
@@ -837,14 +846,14 @@ public class TimelineWindowController: NSObject {
         )
 
         prepareForHiddenStateTransition(reason: "external-dismissal.\(reason)")
-        applyHiddenState(
+        let generation = applyHiddenState(
             restorePreviousFocus: restorePreviousFocus,
             hideRequestedAt: nil,
             reason: "external-dismissal.\(reason)"
         )
         Task { @MainActor [weak self] in
             guard let self else { return }
-            await self.finishHideTransitionCleanup()
+            await self.finishHideTransitionCleanup(generation: generation)
         }
     }
 
@@ -949,7 +958,7 @@ public class TimelineWindowController: NSObject {
         restorePreviousFocus: Bool,
         hideRequestedAt: CFAbsoluteTime?,
         reason _: String
-    ) {
+    ) -> UInt64 {
         let wasHidingToShowDashboard = isHidingToShowDashboard
         isHiding = false
 
@@ -968,6 +977,8 @@ public class TimelineWindowController: NSObject {
             window.orderOut(nil)
         }
         presentationState = .hidden
+        // Reserve the hide's ordering before deferred cleanup can race a reopen.
+        let generation = advanceCoordinatorTimelineVisibilityGeneration()
         Self.setEmergencyTimelineVisible(false)
         lastHiddenAt = Date()
         suppressLiveScrollUntil = 0
@@ -989,16 +1000,34 @@ public class TimelineWindowController: NSObject {
             wasHidingToShowDashboard: wasHidingToShowDashboard,
             hideRequestedAt: hideRequestedAt
         )
+        return generation
     }
 
-    private func finishHideTransitionCleanup() async {
+    private func finishHideTransitionCleanup(generation: UInt64) async {
+        guard Self.shouldFinishHideTransitionCleanup(
+            requestGeneration: generation,
+            currentGeneration: coordinatorTimelineVisibilityGeneration,
+            presentationState: presentationState
+        ) else { return }
         // Mark timeline hidden before post-hide refresh so frame reads can use relaxed timing.
-        let generation = advanceCoordinatorTimelineVisibilityGeneration()
         await setCoordinatorTimelineVisibleIfCurrent(false, generation: generation)
+
+        // The actor hop can yield to show(); never tear down that newer session.
+        guard Self.shouldFinishHideTransitionCleanup(
+            requestGeneration: generation,
+            currentGeneration: coordinatorTimelineVisibilityGeneration,
+            presentationState: presentationState
+        ) else { return }
 
         hideCompletionCoordinator.resumeAll(hidden: true)
 
         await compactHiddenPresentationState()
+
+        guard Self.shouldFinishHideTransitionCleanup(
+            requestGeneration: generation,
+            currentGeneration: coordinatorTimelineVisibilityGeneration,
+            presentationState: presentationState
+        ) else { return }
 
         onClose?()
         TimelineScaleFactor.resetCache()
@@ -1350,6 +1379,7 @@ public class TimelineWindowController: NSObject {
             Self.setEmergencyTimelineVisible(true)
             hideCompletionCoordinator.resumeAll(hidden: false)
             startObservingApplicationActivation()
+            scheduleCoordinatorTimelineVisible(true)
             return
         }
 
@@ -1694,6 +1724,8 @@ public class TimelineWindowController: NSObject {
 
             NSApp.activate(ignoringOtherApps: true)
             self.window?.makeKey()
+            // A live open may initially have been rejected while the app was hidden.
+            self.scheduleCoordinatorTimelineVisible(true)
         }
     }
 
@@ -1705,6 +1737,7 @@ public class TimelineWindowController: NSObject {
         isHiding = true
         presentationState = .hiding
         prepareForHiddenStateTransition(reason: "hide")
+        let visibilityGenerationAtHide = coordinatorTimelineVisibilityGeneration
 
         // Don't save position on hide - window stays in memory
         // Position is only saved on app termination (see savePositionForTermination)
@@ -1722,13 +1755,14 @@ public class TimelineWindowController: NSObject {
             window.animator().alphaValue = 0
         }, completionHandler: { [weak self] in
             Task { @MainActor [weak self] in
-                guard let self else { return }
-                self.applyHiddenState(
+                guard let self, self.isHiding,
+                      self.coordinatorTimelineVisibilityGeneration == visibilityGenerationAtHide else { return }
+                let generation = self.applyHiddenState(
                     restorePreviousFocus: restorePreviousFocus,
                     hideRequestedAt: hideRequestStartedAt,
                     reason: "hide"
                 )
-                await self.finishHideTransitionCleanup()
+                await self.finishHideTransitionCleanup(generation: generation)
             }
         })
 
