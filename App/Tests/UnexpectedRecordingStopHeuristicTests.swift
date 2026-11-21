@@ -1,7 +1,42 @@
 import XCTest
+import Foundation
 @testable import App
 
 final class UnexpectedRecordingStopHeuristicTests: XCTestCase {
+    func testTimelineCaptureRejectsDelayedFramesAfterTimelineCloses() {
+        let closedAt = Date(timeIntervalSince1970: 1_000)
+        // Capture delivery can finish after close (title stability alone waits 650ms).
+        XCTAssertTrue(AppCoordinator.shouldSuppressTimelineCapture(
+            capturedAt: closedAt.addingTimeInterval(-0.5),
+            isTimelineVisible: false,
+            lastTimelineHiddenAt: closedAt
+        ))
+        XCTAssertTrue(AppCoordinator.shouldSuppressTimelineCapture(
+            capturedAt: closedAt,
+            isTimelineVisible: false,
+            lastTimelineHiddenAt: closedAt
+        ))
+        XCTAssertFalse(AppCoordinator.shouldSuppressTimelineCapture(
+            capturedAt: closedAt.addingTimeInterval(0.5),
+            isTimelineVisible: false,
+            lastTimelineHiddenAt: closedAt
+        ))
+    }
+
+    func testTimelineCapturePausesWhileVisibleAndAllowsFramesBeforeFirstOpen() {
+        let capturedAt = Date(timeIntervalSince1970: 1_000)
+        XCTAssertTrue(AppCoordinator.shouldSuppressTimelineCapture(
+            capturedAt: capturedAt,
+            isTimelineVisible: true,
+            lastTimelineHiddenAt: nil
+        ))
+        XCTAssertFalse(AppCoordinator.shouldSuppressTimelineCapture(
+            capturedAt: capturedAt,
+            isTimelineVisible: false,
+            lastTimelineHiddenAt: nil
+        ))
+    }
+
     func testUnexpectedCaptureTerminationRequiresRecordingToStillBeMarkedRunning() {
         XCTAssertTrue(
             AppCoordinator.shouldTreatCaptureTerminationAsUnexpected(
