@@ -4,6 +4,28 @@ import Shared
 @testable import Capture
 
 final class ConferenceSessionPrivacyPolicyTests: XCTestCase {
+    func testMeetTitleWithAudioIndicatorProtectsFacesWithoutAMatchingURL() {
+        // Chrome can decorate the native window title while URL discovery is
+        // unavailable or returns a different page. Keep title protection usable.
+        for url in [nil, "https://example.com/"] as [String?] {
+            let match = ConferenceSessionPrivacyPolicy.match(
+                appBundleID: "com.google.Chrome",
+                browserURL: url,
+                windowName: "Meet - abc-defg-hij 🔊"
+            )
+            XCTAssertEqual(match?.kind, .googleMeet)
+            XCTAssertEqual(match?.matchedBy, "window_title_meet_code")
+        }
+    }
+
+    func testMeetTitleDoesNotAcceptArbitraryTrailingText() {
+        for title in ["Meet - abc-defg-hij notes", "Meet - abc-defg-hijk 🔊"] {
+            XCTAssertNil(ConferenceSessionPrivacyPolicy.match(
+                appBundleID: "com.google.Chrome", browserURL: nil, windowName: title
+            ))
+        }
+    }
+
     func testConsentSurvivesBackgroundWindowVisibilityChangesButNotCallEnd() throws {
         let callWindow = CGWindowListCapture.VisibleWindowContext(
             windowID: 20, ownerPID: 123, appBundleID: "us.zoom.xos",

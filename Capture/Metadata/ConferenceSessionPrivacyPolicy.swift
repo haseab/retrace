@@ -685,7 +685,13 @@ enum ConferenceSessionPrivacyPolicy {
             return false
         }
 
-        let suffix = String(normalizedWindowName.dropFirst("meet - ".count))
+        // Chrome appends this audio indicator to active Meet window titles.
+        // Keep the meeting-code validation strict after removing that decoration.
+        let audioIndicator = " 🔊"
+        let title = normalizedWindowName.hasSuffix(audioIndicator)
+            ? String(normalizedWindowName.dropLast(audioIndicator.count))
+            : normalizedWindowName
+        let suffix = String(title.dropFirst("meet - ".count))
         let parts = suffix.split(separator: "-")
         guard parts.count == 3 else {
             return false
