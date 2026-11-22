@@ -434,7 +434,6 @@ extension SettingsView {
         deduplicationThreshold = SettingsDefaults.deduplicationThreshold
         deleteDuplicateFrames = SettingsDefaults.deleteDuplicateFrames
         keepFramesOnMouseMovement = SettingsDefaults.keepFramesOnMouseMovement
-        recordAllDisplays = false
         captureOnWindowChange = SettingsDefaults.captureOnWindowChange
         isProgrammaticWindowChangeCaptureToggleChange = false
         captureOnMouseClick = SettingsDefaults.captureOnMouseClick
@@ -456,7 +455,6 @@ extension SettingsView {
                         deduplicationThreshold: SettingsDefaults.deduplicationThreshold,
                         keepFramesOnMouseMovement: SettingsDefaults.keepFramesOnMouseMovement,
                         captureOnWindowChange: SettingsDefaults.captureOnWindowChange,
-                        recordAllDisplays: false,
                         captureOnMouseClick: SettingsDefaults.captureOnMouseClick
                     )
                 }
@@ -536,6 +534,8 @@ extension SettingsView {
 
     /// Reset all Advanced settings to defaults
     func resetAdvancedSettings() {
+        recordAllDisplays = false
+        updateRecordAllDisplaysSetting(enabled: false)
         showFrameIDs = SettingsDefaults.showFrameIDs
         enableFrameIDSearch = SettingsDefaults.enableFrameIDSearch
         showVideoControls = SettingsDefaults.showVideoControls

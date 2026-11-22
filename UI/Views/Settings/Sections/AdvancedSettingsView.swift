@@ -14,6 +14,7 @@ import UniformTypeIdentifiers
 extension SettingsView {
     var advancedSettings: some View {
         VStack(alignment: .leading, spacing: 20) {
+            multiMonitorRecordingCard
             cacheCard
             timelineCard
             developerCard
@@ -22,6 +23,20 @@ extension SettingsView {
     }
 
     // MARK: - Advanced Cards (extracted for search)
+
+    @ViewBuilder
+    var multiMonitorRecordingCard: some View {
+        ModernSettingsCard(title: "Multi-Monitor Recording", icon: "display.2") {
+            ModernToggleRow(
+                title: "Record multiple monitors simultaneously",
+                subtitle: "Capture every connected monitor at the same time. This increases power and storage use.",
+                isOn: $recordAllDisplays
+            )
+            .onChange(of: recordAllDisplays) { enabled in
+                updateRecordAllDisplaysSetting(enabled: enabled)
+            }
+        }
+    }
 
     @ViewBuilder
     var cacheCard: some View {
