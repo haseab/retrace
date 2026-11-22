@@ -489,5 +489,8 @@ The privacy array helper still avoids extra lookups. The OCR feature separately 
 - The capture-to-storage channel queues at most eight frames and 64 MiB of pixel data. Screenshots larger than the byte budget use direct consumer handoff. The sole capture producer may retain one additional screenshot while suspended; the consumer and per-display dedup/native-image caches have separate memory costs.
 - Await channel sends inside the existing single capture batch. Never create a Task per screenshot or accumulate blocked producers. Pending triggers coalesce into one request while capture waits.
 - The AsyncStream adapter uses unfolding/pull semantics, with no second prefetch buffer. Deduplication state and captured outcomes advance only after channel admission succeeds.
-- Stop/consumer cancellation releases queued frames and suspended continuations. Session generations prevent an old resumed capture from mutating a restarted session.
+- Production capture awaits capture-time WAL persistence before channel admission. Normal coordinator stop waits for the in-flight admission and drains the channel; emergency/consumer cancellation aborts it. Aborted receipt-bearing frames remain recoverable from WAL. Session generations prevent an old resumed capture from mutating a restarted session.
 - Run `swift test --filter 'BoundedFrameChannelTests|testFullQueuePausesCapture'` for screenshot FIFO, byte limits, oversized handoff, cancellation, capture pause/resume and stop/restart checks.
+
+- Periodic scheduling occurs once after the complete display batch, including empty discovery and backend failures. Never make the next retry depend on successfully capturing a display.
+- The coordinator installs the persistence handler before starting capture. Journal failures stop capture instead of falling back to unjournaled delivery. Standalone capture tests can omit the handler.

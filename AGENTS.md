@@ -117,6 +117,7 @@ retrace/
 │   ├── AGENTS.md
 │   ├── StorageManager.swift
 │   ├── ImageExtractor.swift     # Extract frames from video files
+│   ├── CaptureWALJournal.swift   # Capture-time persistence before queued encoding
 │   ├── IncrementalSegmentWriter.swift
 │   ├── SegmentWriterImpl.swift
 │   ├── FileManager/             # File system utilities, including scoped TemporaryVideoLink
@@ -180,6 +181,7 @@ retrace/
 │       ├── ServiceContainerRewindCutoffTests.swift # Rewind cutoff defaults and latest-frame probe coverage
 │       ├── TestLogger.swift
 │       ├── TimelineStillDiskWriterTests.swift
+│       ├── CaptureJournalPipelineTests.swift # WAL-before-encoding and real recovery coverage
 │       ├── RecordingDatabaseFailureTests.swift # Real recording pipeline with an injected metadata insert failure
 │       └── UnexpectedRecordingStopHeuristicTests.swift # Unexpected-stop watchdog heuristic coverage
 │

@@ -47,6 +47,24 @@ final class BoundedFrameChannelTests: XCTestCase {
         XCTAssertNil(end)
     }
 
+    func testGracefulFinishDrainsQueuedAndWaitingFrames() async throws {
+        let frames = try (0..<2).map(screenshot)
+        let channel = BoundedFrameChannel(frameLimit: 1, byteLimit: frames[0].imageData.count)
+        _ = await channel.send(frames[0])
+        let producer = Task { await channel.send(frames[1]) }
+        await waitForBlockedSend(channel)
+        await channel.finish()
+        var iterator = channel.stream.makeAsyncIterator()
+        for expected in frames {
+            let actual = await iterator.next()
+            XCTAssertEqual(actual?.timestamp, expected.timestamp)
+        }
+        let admitted = await producer.value
+        XCTAssertTrue(admitted)
+        let end = await iterator.next()
+        XCTAssertNil(end)
+    }
+
     func testByteBudgetAppliesBeforeFrameCountLimit() async throws {
         let frame = try screenshot(1)
         let channel = BoundedFrameChannel(frameLimit: 8, byteLimit: frame.imageData.count)
@@ -57,7 +75,7 @@ final class BoundedFrameChannelTests: XCTestCase {
         let count = await channel.bufferedFrameCount
         XCTAssertEqual(bytes, frame.imageData.count)
         XCTAssertEqual(count, 1)
-        await channel.finish()
+        await channel.abort()
         let admitted = await producer.value
         XCTAssertFalse(admitted)
     }

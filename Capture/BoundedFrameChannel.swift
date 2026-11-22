@@ -24,7 +24,7 @@ actor BoundedFrameChannel {
 
     nonisolated var stream: AsyncStream<CapturedFrame> {
         AsyncStream(unfolding: { await self.next() }, onCancel: {
-            Task { await self.finish() }
+            Task { await self.abort() }
         })
     }
 
@@ -60,8 +60,8 @@ actor BoundedFrameChannel {
     }
 
     private func next() async -> CapturedFrame? {
-        guard !finished, !Task.isCancelled else {
-            finish()
+        guard !Task.isCancelled else {
+            abort()
             return nil
         }
         if !frames.isEmpty {
@@ -81,14 +81,14 @@ actor BoundedFrameChannel {
             sender.continuation.resume(returning: true)
             return sender.frame
         }
-        guard receiver == nil else { return nil }
+        guard !finished, receiver == nil else { return nil }
         return await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
                 receiver = continuation
-                if Task.isCancelled { finish() }
+                if Task.isCancelled { abort() }
             }
         } onCancel: {
-            Task { await self.finish() }
+            Task { await self.abort() }
         }
     }
 
@@ -107,10 +107,19 @@ actor BoundedFrameChannel {
         sender.continuation.resume(returning: false)
     }
 
-    /// Stop/cancellation releases queued images and wakes both sides. Deliberate
-    /// recording shutdown is distinct from steady-state overload: it never waits
-    /// indefinitely for a stalled storage consumer to drain the queue.
+    /// Normal producer completion keeps accepted work available to the consumer.
     func finish() {
+        finished = true
+        if frames.isEmpty && sender == nil {
+            let receiver = self.receiver
+            self.receiver = nil
+            receiver?.resume(returning: nil)
+        }
+    }
+
+    /// Emergency/consumer cancellation wakes both sides without draining. Pixels
+    /// admitted through production ingress already have recovery WAL records.
+    func abort() {
         finished = true
         frames.removeAll(keepingCapacity: false)
         bufferedBytes = 0

@@ -56,6 +56,21 @@ public actor IncrementalSegmentWriter: SegmentWriter {
         }
     }
 
+    public func persistFrameToWAL(_ frame: CapturedFrame) async throws -> Int {
+        guard !cancelled else {
+            throw StorageError.fileWriteFailed(path: fileURL.path, underlying: "Writer cancelled")
+        }
+        let writeStart = CFAbsoluteTimeGetCurrent()
+        if walSession == nil { walSession = try await walManager.createSession(videoID: segmentID) }
+        var session = walSession!
+        try await walManager.appendFrame(frame, to: &session)
+        // Keep the complete record visible to recovery even if flushing fails.
+        walSession = session
+        try await walManager.synchronizeSession(videoID: segmentID)
+        StorageHealthMonitor.shared.recordWriteLatency((CFAbsoluteTimeGetCurrent() - writeStart) * 1000)
+        return session.metadata.frameCount - 1
+    }
+
     public func appendFrame(_ frame: CapturedFrame) async throws {
         guard !cancelled else {
             throw StorageError.fileWriteFailed(path: fileURL.path, underlying: "Writer cancelled")
@@ -63,24 +78,16 @@ public actor IncrementalSegmentWriter: SegmentWriter {
 
         Log.verbose("[IncrementalWriter] appendFrame called: segmentID=\(segmentID.value), frameCount=\(frameCount), size=\(frame.width)x\(frame.height)", category: .storage)
 
-        // Track I/O latency for storage health monitoring
-        let writeStart = CFAbsoluteTimeGetCurrent()
-
-        // STEP 1: Persist a lossless WAL record before video encoding
-        // This is the critical durability guarantee - frames are safe even if app crashes
-        if walSession == nil {
-            let session = try await walManager.createSession(videoID: segmentID)
-            walSession = session
+        // Capture ingress has already journaled receipt-bearing frames. Reuse
+        // that record, rather than appending the same screenshot a second time.
+        if let receipt = frame.journalReceipt {
+            guard receipt.segmentID == segmentID, receipt.frameIndex == frameCount,
+                  let session = walSession, session.metadata.frameCount > frameCount else {
+                throw StorageError.fileWriteFailed(path: fileURL.path, underlying: "Journal/encoder frame order mismatch")
+            }
+        } else {
+            _ = try await persistFrameToWAL(frame)
         }
-
-        var session = walSession!
-        try await walManager.appendFrame(frame, to: &session)
-        walSession = session
-
-        // Record write latency for health monitoring
-        let walLatencyMs = (CFAbsoluteTimeGetCurrent() - writeStart) * 1000
-        StorageHealthMonitor.shared.recordWriteLatency(walLatencyMs)
-
         // STEP 2: Initialize encoder on first frame
         if !encoderInitialized {
             frameWidth = frame.width
@@ -135,8 +142,8 @@ public actor IncrementalSegmentWriter: SegmentWriter {
             try await encoder.finalize()
         }
 
-        // Clean up WAL - video is now complete and playable
-        if let session = walSession {
+        // Release the journal only after the entire persisted tail is encoded.
+        if let session = walSession, session.metadata.frameCount == frameCount {
             try await walManager.finalizeSession(session)
         }
 

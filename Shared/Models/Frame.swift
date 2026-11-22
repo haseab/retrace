@@ -117,8 +117,20 @@ public struct FrameMetadata: Codable, Sendable, Equatable {
 
 // MARK: - Captured Frame
 
-/// A captured frame with raw image data - used during capture pipeline
-/// Note: ID is assigned by database on insert (AUTOINCREMENT)
+/// Identifies a capture-time WAL record and the writer that will encode it.
+public struct CapturedFrameJournalReceipt: Sendable {
+    public let writer: any SegmentWriter
+    public let segmentID: VideoSegmentID
+    public let frameIndex: Int
+
+    public init(writer: any SegmentWriter, segmentID: VideoSegmentID, frameIndex: Int) {
+        self.writer = writer
+        self.segmentID = segmentID
+        self.frameIndex = frameIndex
+    }
+}
+
+/// A captured frame with raw pixels; database identity is assigned on insertion.
 public struct CapturedFrame: Sendable {
     public let timestamp: Date
     public let imageData: Data  // Raw pixel data or compressed image
@@ -127,6 +139,7 @@ public struct CapturedFrame: Sendable {
     public let bytesPerRow: Int
     public let metadata: FrameMetadata
     public let accessibilitySnapshot: AccessibilitySnapshot?
+    public let journalReceipt: CapturedFrameJournalReceipt?
 
     public init(
         timestamp: Date = Date(),
@@ -135,7 +148,8 @@ public struct CapturedFrame: Sendable {
         height: Int,
         bytesPerRow: Int,
         metadata: FrameMetadata = .empty,
-        accessibilitySnapshot: AccessibilitySnapshot? = nil
+        accessibilitySnapshot: AccessibilitySnapshot? = nil,
+        journalReceipt: CapturedFrameJournalReceipt? = nil
     ) {
         self.timestamp = timestamp
         self.imageData = imageData
@@ -144,6 +158,7 @@ public struct CapturedFrame: Sendable {
         self.bytesPerRow = bytesPerRow
         self.metadata = metadata
         self.accessibilitySnapshot = accessibilitySnapshot
+        self.journalReceipt = journalReceipt
     }
 }
 

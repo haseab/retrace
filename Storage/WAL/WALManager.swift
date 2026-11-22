@@ -284,6 +284,15 @@ public actor WALManager {
         }
     }
 
+    /// Complete capture admission only after the journal bytes have been flushed.
+    public func synchronizeSession(videoID: VideoSegmentID) throws {
+        guard let handle = appendHandles[videoID.value] else {
+            throw StorageError.walUnavailable(reason: "Missing active journal writer")
+        }
+        do { try handle.synchronize() }
+        catch { throw makeStorageWriteError(path: "WAL", error: error, fallback: "Failed to synchronize captured frame") }
+    }
+
     /// Persist the readable frontier of the fragmented MP4 so recovery can
     /// trust the flushed prefix even if generic timestamp validation fails later.
     public func updateDurableVideoState(

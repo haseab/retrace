@@ -790,6 +790,99 @@ final class CaptureTriggerSchedulingTests: XCTestCase {
         try await manager.stopCapture()
     }
 
+    func testEmptyDisplayDiscoveryKeepsPeriodicRetriesAlive() async throws {
+        let backend = FakeScreenCaptureBackend(frames: [])
+        let monitor = FakeDisplayMonitor(activeDisplayID: 13, hasPermission: true, emptyDisplayList: true)
+        let manager = makeManager(backend: backend, displayMonitor: monitor,
+            displaySwitchMonitor: FakeDisplaySwitchMonitor(), mouseClickMonitor: FakeMouseClickMonitor(startResult: true))
+        let config = testConfig(captureIntervalSeconds: 0.04, captureOnWindowChange: false, captureOnMouseClick: false)
+            .updating(recordAllDisplays: true)
+        try await manager.startCapture(config: config)
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while await monitor.discoveryCount() < 3, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(5), clock: .continuous)
+        }
+        let attempts = await monitor.discoveryCount()
+        try await manager.stopCapture()
+        XCTAssertGreaterThanOrEqual(attempts, 3)
+    }
+
+    func testGracefulStopWaitsForPersistenceAndDrainsTheInFlightScreenshot() async throws {
+        let backend = FakeScreenCaptureBackend(frames: [makeFrame(displayID: 13, pixelValue: 10)])
+        let manager = makeManager(backend: backend,
+            displayMonitor: FakeDisplayMonitor(activeDisplayID: 13, hasPermission: true),
+            displaySwitchMonitor: FakeDisplaySwitchMonitor(), mouseClickMonitor: FakeMouseClickMonitor(startResult: true))
+        let gate = AsyncGate()
+        let persistenceStarted = FrameCollector()
+        await manager.setFramePersistenceHandler { frame in
+            await persistenceStarted.append(frame)
+            await gate.wait()
+            return frame
+        }
+        try await manager.startCapture(config: testConfig(captureIntervalSeconds: 0.04,
+            captureOnWindowChange: false, captureOnMouseClick: false))
+        let stream = await manager.frameStream
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while await persistenceStarted.count() == 0, ContinuousClock.now < deadline { await Task.yield() }
+        let count = await persistenceStarted.count()
+        XCTAssertEqual(count, 1)
+        let stop = Task { try await manager.stopCapture(drain: true) }
+        while await manager.isCapturing { await Task.yield() }
+        await gate.open()
+        try await stop.value
+        var iterator = stream.makeAsyncIterator()
+        let frame = await iterator.next()
+        XCTAssertNotNil(frame)
+        let end = await iterator.next()
+        XCTAssertNil(end)
+    }
+
+    func testPersistenceFailureDoesNotAdmitAnUnjournaledScreenshot() async throws {
+        let backend = FakeScreenCaptureBackend(frames: [makeFrame(displayID: 13, pixelValue: 10)])
+        let manager = makeManager(backend: backend,
+            displayMonitor: FakeDisplayMonitor(activeDisplayID: 13, hasPermission: true),
+            displaySwitchMonitor: FakeDisplaySwitchMonitor(), mouseClickMonitor: FakeMouseClickMonitor(startResult: true))
+        await manager.setFramePersistenceHandler { _ in throw StorageError.insufficientDiskSpace }
+        try await manager.startCapture(config: testConfig(captureIntervalSeconds: 0.04,
+            captureOnWindowChange: false, captureOnMouseClick: false))
+        var iterator = await manager.frameStream.makeAsyncIterator()
+        let frame = await iterator.next()
+        XCTAssertNil(frame)
+        let running = await manager.isCapturing
+        XCTAssertFalse(running)
+    }
+
+    func testEmergencyAbortReleasesAFullQueueDuringNormalDrain() async throws {
+        let backend = FakeScreenCaptureBackend(frames: (0..<12).map {
+            makeFrame(displayID: 13, pixelValue: UInt8($0))
+        })
+        let manager = makeManager(backend: backend,
+            displayMonitor: FakeDisplayMonitor(activeDisplayID: 13, hasPermission: true),
+            displaySwitchMonitor: FakeDisplaySwitchMonitor(), mouseClickMonitor: FakeMouseClickMonitor(startResult: true))
+        try await manager.startCapture(config: testConfig(captureIntervalSeconds: 0.04,
+            captureOnWindowChange: false, captureOnMouseClick: false, adaptiveCaptureEnabled: false))
+        let stream = await manager.frameStream
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while await backend.captureCount() < 9, ContinuousClock.now < deadline { await Task.yield() }
+        let count = await backend.captureCount()
+        XCTAssertEqual(count, 9)
+        let drain = Task { try await manager.stopCapture(drain: true) }
+        while await manager.isCapturing { await Task.yield() }
+        let watchdog = Task {
+            do { try await Task.sleep(for: .seconds(3), clock: .continuous) }
+            catch { return }
+            XCTFail("Emergency abort did not release the draining producer")
+            var fallback = stream.makeAsyncIterator()
+            _ = await fallback.next()
+        }
+        defer { watchdog.cancel() }
+        try await manager.stopCapture() // explicit emergency/abort path
+        try await drain.value
+        var iterator = stream.makeAsyncIterator()
+        let end = await iterator.next()
+        XCTAssertNil(end)
+    }
+
     private func makeManager(
         backend: FakeScreenCaptureBackend,
         displayMonitor: FakeDisplayMonitor,
@@ -1011,14 +1104,20 @@ private actor FakeScreenCaptureBackend: ScreenCaptureBackend {
 private actor FakeDisplayMonitor: CaptureDisplayMonitoring {
     private let activeDisplayID: UInt32
     private let hasPermission: Bool
+    private let emptyDisplayList: Bool
+    private var discoveries = 0
+    func discoveryCount() -> Int { discoveries }
 
-    init(activeDisplayID: UInt32, hasPermission: Bool) {
+    init(activeDisplayID: UInt32, hasPermission: Bool, emptyDisplayList: Bool = false) {
         self.activeDisplayID = activeDisplayID
         self.hasPermission = hasPermission
+        self.emptyDisplayList = emptyDisplayList
     }
 
     func getAvailableDisplays() async throws -> [DisplayInfo] {
-        [
+        discoveries += 1
+        if emptyDisplayList { return [] }
+        return [
             DisplayInfo(
                 id: activeDisplayID,
                 width: 100,

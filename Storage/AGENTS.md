@@ -12,6 +12,7 @@ Storage/
 ├── StorageManager.swift         # Main StorageProtocol implementation
 ├── ImageExtractor.swift         # Frame extraction and AVAsset generator caches
 ├── IncrementalSegmentWriter.swift # WAL-first recording and video finalization
+├── CaptureWALJournal.swift       # Capture-time journal admission and shared writer receipts
 ├── SegmentWriterImpl.swift      # SegmentWriter implementation
 ├── StorageModuleError.swift     # Storage-local errors
 ├── FileManager/
@@ -376,3 +377,7 @@ Keep the pre-append existence check for recovery before writing the next frame. 
 ### JPEG frame extraction
 
 `ImageExtractor` implementations and `StorageManager` encode CGImage frames directly with ImageIO at quality 0.8. Do not reintroduce an NSImage/TIFF/NSBitmapImageRep round trip. JPEG conversion telemetry uses the `storage.videoDecoding.jpegEncoding` tag and a one-frame-plus-output-headroom proxy; this is an estimate, not measured allocation or a memory limit. Existing frame reading and real video/redaction regressions exercise decoded JPEGs. The paired encoder comparison used the same native decoded frames as both inputs and verified identical JPEG bytes for the sampled recordings.
+
+### Capture-time journal admission
+
+`CaptureWALJournal` serially persists privacy-filtered screenshots and synchronizes each record before returning a receipt to capture. Receipt-bearing frames use the same incremental writer and WAL index during encoding; never append their pixels twice. Rotate capture journals at the per-segment frame limit or dimension changes. Keep a WAL whenever its journaled count exceeds the encoded prefix, including interrupted finalization. Normal shutdown drains the delivery stream before finalizing writers and closing database/storage services. `CaptureWALJournalTests` and `App/Tests/CaptureJournalPipelineTests.swift` cover pre-encoding recovery and real encoding/database delivery.

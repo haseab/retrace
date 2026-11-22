@@ -219,6 +219,13 @@ public actor CaptureManager: CaptureProtocol {
     private var latestWindowChangeEvent: WindowChangeEvent?
     private var deferredDisplaySyncTask: Task<Void, Never>?
     private var scheduledCaptureTask: Task<Void, Never>?
+    private var activeCaptureTask: Task<Void, Never>?
+    private var isDrainingCapture = false
+    private var framePersistenceHandler: (@Sendable (CapturedFrame) async throws -> CapturedFrame?)?
+
+    public func setFramePersistenceHandler(_ handler: (@Sendable (CapturedFrame) async throws -> CapturedFrame?)?) {
+        framePersistenceHandler = handler
+    }
     private var pendingCapture: PendingCapture?
     private var lastActualCaptureTime: Date?
     private var currentCaptureDisplayID: UInt32?
@@ -284,6 +291,9 @@ public actor CaptureManager: CaptureProtocol {
 
     public func startCapture(config: CaptureConfig) async throws {
         guard !_isCapturing else { return }
+        guard !isDrainingCapture else {
+            throw CaptureError.invalidConfiguration(reason: "Capture is still stopping")
+        }
         try validateCaptureConfiguration(config)
 
         guard await hasPermission() else {
@@ -293,7 +303,7 @@ public actor CaptureManager: CaptureProtocol {
         self.currentConfig = config
 
         captureGeneration &+= 1
-        await frameChannel?.finish()
+        await frameChannel?.abort()
         let channel = BoundedFrameChannel(frameLimit: Self.dedupedFrameBufferLimit, byteLimit: Self.dedupedFrameByteLimit)
         frameChannel = channel
         _frameStream = channel.stream
@@ -323,23 +333,42 @@ public actor CaptureManager: CaptureProtocol {
     }
 
     public func stopCapture() async throws {
-        guard _isCapturing else { return }
+        try await stopCapture(drain: false)
+    }
 
+    /// Normal coordinator shutdown drains persisted work; interruption uses abort.
+    public func stopCapture(drain: Bool) async throws {
+        guard _isCapturing else {
+            if isDrainingCapture, !drain {
+                captureGeneration &+= 1
+                await frameChannel?.abort()
+            }
+            return
+        }
         _isCapturing = false
-        captureGeneration &+= 1
-        // Release a producer waiting for storage before stopping the backends.
-        let channel = frameChannel
-        frameChannel = nil
-        _frameStream = nil
-        await channel?.finish()
-
+        isDrainingCapture = drain
+        defer { isDrainingCapture = false }
         scheduledCaptureTask?.cancel()
         scheduledCaptureTask = nil
+        pendingCapture = nil
+        let channel = frameChannel
+        if drain {
+            // The consumer remains alive while the in-flight screenshot finishes
+            // journaling/admission. No new screenshot starts during this wait.
+            await activeCaptureTask?.value
+            await channel?.finish()
+        } else {
+            captureGeneration &+= 1
+            await channel?.abort()
+        }
+        if drain { captureGeneration &+= 1 }
+        activeCaptureTask = nil
+        frameChannel = nil
+        _frameStream = nil
         isWindowChangeEvaluationInFlight = false
         latestWindowChangeEvent = nil
         deferredDisplaySyncTask?.cancel()
         deferredDisplaySyncTask = nil
-        pendingCapture = nil
 
         await displaySwitchMonitor.stopMonitoring()
         await mouseClickMonitor.stopMonitoring()
@@ -729,12 +758,19 @@ public actor CaptureManager: CaptureProtocol {
         }
 
         pendingCapture = nil
+        activeCaptureTask = scheduledCaptureTask
         scheduledCaptureTask = nil
         isCaptureExecutionInFlight = true
         defer {
             if captureGeneration == generation {
                 isCaptureExecutionInFlight = false
-                if _isCapturing { reschedulePendingCaptureTask() }
+                activeCaptureTask = nil
+                if _isCapturing {
+                    // Schedule once per batch, including empty discovery and
+                    // batches where every display/backend fails.
+                    scheduleNextIntervalCapture(from: now())
+                    reschedulePendingCaptureTask()
+                }
             }
         }
 
@@ -794,7 +830,6 @@ public actor CaptureManager: CaptureProtocol {
         batchTimestamp: Date?, performance: CapturePerformanceFrame
     ) async {
         let generation = captureGeneration
-        let captureAttemptStartedAt = now()
 
         let candidate = await backend.captureCandidate(displayID: displayID)
         guard _isCapturing, captureGeneration == generation else { return }
@@ -808,7 +843,6 @@ public actor CaptureManager: CaptureProtocol {
                 )
                 if shouldDropFrame {
                     performance.increment(.dropped)
-                    scheduleNextIntervalCapture(from: captureAttemptCompletedAt)
                     if capture.trigger == .windowChange {
                         await syncCaptureDisplayIfNeeded()
                         scheduleDisplaySyncCheck()
@@ -853,10 +887,8 @@ public actor CaptureManager: CaptureProtocol {
             } else {
                 performance.increment(.dropped)
             }
-            scheduleNextIntervalCapture(from: captureAttemptCompletedAt)
         } else {
             performance.increment(.dropped)
-            scheduleNextIntervalCapture(from: max(captureAttemptStartedAt, captureAttemptCompletedAt))
         }
 
     }
@@ -986,6 +1018,16 @@ public actor CaptureManager: CaptureProtocol {
         onAccessibilityPermissionWarning?()
     }
 
+    private func persistCapturedFrame(_ frame: CapturedFrame) async -> CapturedFrame? {
+        guard let handler = framePersistenceHandler else { return frame } // standalone capture/test consumers
+        do { return try await handler(frame) }
+        catch {
+            Log.error("Capture journal write failed; stopping capture", category: .capture, error: error)
+            try? await stopCapture()
+            return nil
+        }
+    }
+
     private func handleCapturedFrame(
         _ frame: CapturedFrame,
         trigger: CaptureTrigger
@@ -1018,9 +1060,10 @@ public actor CaptureManager: CaptureProtocol {
             if shouldKeep {
                 guard let channel = frameChannel else { return false }
                 let enrichedFrame = await enrichFrameMetadata(frame, trigger: trigger)
-                guard _isCapturing, frameChannel === channel,
-                      await channel.send(enrichedFrame),
-                      _isCapturing, frameChannel === channel else { return false }
+                guard let persistedFrame = await persistCapturedFrame(enrichedFrame),
+                      (_isCapturing || isDrainingCapture), frameChannel === channel,
+                      await channel.send(persistedFrame),
+                      (_isCapturing || isDrainingCapture), frameChannel === channel else { return false }
                 retained = true
                 lastKeptFrame = frame
                 lastKeptMousePosition = currentMousePosition
@@ -1078,9 +1121,10 @@ public actor CaptureManager: CaptureProtocol {
         } else {
             guard let channel = frameChannel else { return false }
             let enrichedFrame = await enrichFrameMetadata(frame, trigger: trigger)
-            guard _isCapturing, frameChannel === channel,
-                  await channel.send(enrichedFrame),
-                  _isCapturing, frameChannel === channel else { return false }
+            guard let persistedFrame = await persistCapturedFrame(enrichedFrame),
+                  (_isCapturing || isDrainingCapture), frameChannel === channel,
+                  await channel.send(persistedFrame),
+                  (_isCapturing || isDrainingCapture), frameChannel === channel else { return false }
 
             stats = CaptureStatistics(
                 totalFramesCaptured: totalFrames,

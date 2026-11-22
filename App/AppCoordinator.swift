@@ -848,6 +848,7 @@ public actor AppCoordinator {
     // Signal to flush pending frames to the OCR queue
     private var shouldFlushPendingFrames = false
     private var pendingVideoWriterRotationReason: String?
+    private var captureWALJournal: CaptureWALJournal?
 
     // Permission monitoring - stops recording gracefully if permissions are revoked
     private var permissionMonitorSetup = false
@@ -989,7 +990,12 @@ public actor AppCoordinator {
         )
 
         if isRunning {
-            pendingVideoWriterRotationReason = "video_quality_update"
+            if let journal = captureWALJournal {
+                await journal.rotate()
+                pendingVideoWriterRotationReason = nil
+            } else {
+                pendingVideoWriterRotationReason = "video_quality_update"
+            }
             Log.info(
                 "[AppCoordinator] Video quality updated to \(clampedQuality); active video writers will rotate on the next frame",
                 category: .app
@@ -1521,6 +1527,14 @@ public actor AppCoordinator {
             await self.updateConferenceConsentMenuState(with: event)
         }
 
+        // Persist privacy-filtered pixels before capture's delivery queue. The
+        // same writer/record is reused by the encoding consumer.
+        let journal = CaptureWALJournal(storage: services.storage)
+        captureWALJournal = journal
+        await services.capture.setFramePersistenceHandler { [weak self, journal] frame in
+            guard let self, await self.shouldJournalCapturedFrame(frame) else { return nil }
+            return try await journal.persist(frame)
+        }
         // Start screen capture
         try await services.capture.startCapture(config: await services.capture.getConfig())
 
@@ -1579,16 +1593,23 @@ public actor AppCoordinator {
 
         Log.info("Stopping capture pipeline...", category: .app)
 
-        await suspendPipelineInfrastructure()
+        let drainingTask = captureTask
+        // Mark intentional stop before ending the stream, so a fast drain cannot
+        // be misclassified as an unexpected capture failure.
+        finalizePipelineStopped(persistState: persistState, clearCaptureTask: false, cancelCaptureTask: false)
 
-        // Stop screen capture
-        try await services.capture.stopCapture()
+        // Stop producing, finish the current WAL admission, then drain accepted
+        // frames through encoding/metadata/finalization before closing services.
+        try await services.capture.stopCapture(drain: true)
+        await services.capture.setFramePersistenceHandler(nil)
+        captureWALJournal = nil
+        await suspendPipelineInfrastructure()
 
         // ⚠️ RELEASE 2 ONLY
         // // Stop audio capture
         // try await services.audioCapture.stopCapture()
 
-        finalizePipelineStopped(persistState: persistState, clearCaptureTask: true)
+        await drainingTask?.value
 
         Log.info("Capture pipeline stopped successfully", category: .app)
     }
@@ -1606,9 +1627,10 @@ public actor AppCoordinator {
 
     private func finalizePipelineStopped(
         persistState: Bool,
-        clearCaptureTask: Bool
+        clearCaptureTask: Bool,
+        cancelCaptureTask: Bool = true
     ) {
-        captureTask?.cancel()
+        if cancelCaptureTask { captureTask?.cancel() }
         if clearCaptureTask {
             captureTask = nil
         }
@@ -2191,6 +2213,10 @@ public actor AppCoordinator {
         var displayID: UInt32
     }
 
+    private func shouldJournalCapturedFrame(_ frame: CapturedFrame) -> Bool {
+        !isTimelineVisible && frame.metadata.appBundleID != "com.apple.loginwindow"
+    }
+
     /// Main pipeline: Capture → Storage → Processing → Database → Search
     /// Uses Rewind-style multi-resolution video writing. Injected streams let regression
     /// tests exercise the real writer/database path without capture permissions, shared
@@ -2245,10 +2271,12 @@ public actor AppCoordinator {
                 break
             }
 
-            await rotateActiveVideoWritersIfNeeded(&writersByResolution)
+            if frame.journalReceipt == nil {
+                await rotateActiveVideoWritersIfNeeded(&writersByResolution)
+            }
 
             // Skip frames entirely when loginwindow is frontmost (lock screen, login, etc.)
-            if frame.metadata.appBundleID == "com.apple.loginwindow" {
+            if frame.journalReceipt == nil, frame.metadata.appBundleID == "com.apple.loginwindow" {
                 continue
             }
 
@@ -2271,7 +2299,7 @@ public actor AppCoordinator {
                         }
                     }
                 }
-                continue
+                if frame.journalReceipt == nil { continue }
             }
 
             do {
@@ -2280,7 +2308,19 @@ public actor AppCoordinator {
                 let resolutionKey = "\(displayID)_\(frame.width)x\(frame.height)"
                 var writerState: VideoWriterState
 
-                if var existingState = writersByResolution[resolutionKey] {
+                if let receipt = frame.journalReceipt {
+                    if let existing = writersByResolution[resolutionKey],
+                       await existing.writer.segmentID == receipt.segmentID {
+                        writerState = existing
+                    } else {
+                        if var previous = writersByResolution.removeValue(forKey: resolutionKey) {
+                            try await finalizeWriter(&previous, processingQueue: await services.processingQueue)
+                        }
+                        writerState = try await createNewWriterState(width: frame.width, height: frame.height,
+                            displayID: displayID, journalReceipt: receipt)
+                        writersByResolution[resolutionKey] = writerState
+                    }
+                } else if var existingState = writersByResolution[resolutionKey] {
                     if existingState.frameCount >= maxFramesPerSegment {
                         try await finalizeWriter(&existingState, processingQueue: await services.processingQueue)
                         writersByResolution.removeValue(forKey: resolutionKey)
@@ -2431,6 +2471,11 @@ public actor AppCoordinator {
 
                 // Add frame to the pending buffer
                 writerState.pendingFrames.append(bufferedFrame)
+                if isTimelineVisible, frame.journalReceipt != nil {
+                    // This frame was captured before timeline opened. Its WAL
+                    // is readable now, even if the video fragment is not yet.
+                    try await processingQueue.enqueue(frameID: frameID)
+                }
 
                 // Check if first fragment has been written (makes video readable at all)
                 if !writerState.isReadable {
@@ -2932,8 +2977,11 @@ public actor AppCoordinator {
         return outputData as Data
     }
 
-    private func createNewWriterState(width: Int, height: Int, displayID: UInt32 = 0) async throws -> VideoWriterState {
-        let writer = try await services.storage.createSegmentWriter()
+    private func createNewWriterState(width: Int, height: Int, displayID: UInt32 = 0,
+                                      journalReceipt: CapturedFrameJournalReceipt? = nil) async throws -> VideoWriterState {
+        let writer: any SegmentWriter
+        if let receipt = journalReceipt { writer = receipt.writer }
+        else { writer = try await services.storage.createSegmentWriter() }
         let relativePath = await writer.relativePath
 
         let placeholderSegment = VideoSegment(
