@@ -2264,7 +2264,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Whether multi-display recording is enabled (read from settings)
     private var isMultiDisplayEnabled: Bool {
-        UserDefaults(suiteName: "io.retrace.app")?.bool(forKey: "recordAllDisplays") ?? false
+        UserDefaults(suiteName: AppPaths.settingsSuiteName)?.bool(forKey: "recordAllDisplays") ?? false
     }
 
     /// Last observed multi-display setting value. Used to detect runtime flips while timeline is cached.
@@ -3824,7 +3824,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     public init(coordinator: AppCoordinator) {
         self.coordinator = coordinator
-        self.lastKnownMultiDisplayEnabled = UserDefaults(suiteName: "io.retrace.app")?.bool(forKey: "recordAllDisplays") ?? false
+        self.lastKnownMultiDisplayEnabled = UserDefaults(suiteName: AppPaths.settingsSuiteName)?.bool(forKey: "recordAllDisplays") ?? false
         self.diskFrameBufferDirectoryURL = Self.defaultDiskFrameBufferDirectoryURL()
 
         // Restore search overlay visibility from last session
