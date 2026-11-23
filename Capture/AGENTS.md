@@ -494,3 +494,5 @@ The privacy array helper still avoids extra lookups. The OCR feature separately 
 
 - Periodic scheduling occurs once after the complete display batch, including empty discovery and backend failures. Never make the next retry depend on successfully capturing a display.
 - The coordinator installs the persistence handler before starting capture. Journal failures stop capture instead of falling back to unjournaled delivery. Standalone capture tests can omit the handler.
+
+- With simultaneous multi-monitor recording enabled, primary window metadata comes from the first eligible on-screen application window on each captured display in front-to-back order, independent of global app focus. Single-display mode retains foreground-app selection. Keep desktop, hidden, transparent, overlay, and Computer Use window exclusions; an empty display must not borrow app metadata from a neighbour.

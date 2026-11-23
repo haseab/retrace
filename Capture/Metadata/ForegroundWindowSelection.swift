@@ -10,11 +10,11 @@ enum ForegroundWindowSelection {
         _ windowInfo: [String: Any],
         foregroundPID: pid_t?,
         bundleID: String?,
-        displayBounds: CGRect? = nil
+        displayBounds: CGRect? = nil,
+        requireForegroundApp: Bool = true
     ) -> Bool {
-        guard let foregroundPID,
-              let ownerPID = windowInfo[kCGWindowOwnerPID as String] as? pid_t,
-              ownerPID == foregroundPID,
+        guard let ownerPID = windowInfo[kCGWindowOwnerPID as String] as? pid_t,
+              !requireForegroundApp || foregroundPID == ownerPID,
               !isComputerUse(bundleID: bundleID),
               (windowInfo[kCGWindowLayer as String] as? Int ?? 0) == 0,
               (windowInfo[kCGWindowAlpha as String] as? Double ?? 0) > 0,
