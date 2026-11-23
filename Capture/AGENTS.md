@@ -13,7 +13,7 @@ Capture/
 │   ├── CaptureFrameCandidate.swift # Defer BGRA materialization for exact native duplicates
 │   ├── CGWindowListCapture.swift  # Legacy CGWindowList API wrapper
 │   ├── CapturePerformanceDiagnostics.swift # Bounded production stage timings, slow events, and process snapshots
-│   ├── ExcludedWindowMasker.swift # Full-bounds masking; failure returns no screenshot
+│   ├── ExcludedWindowMasker.swift # Exposed-region masking; failure returns no screenshot
 │   ├── PrivateWindowDetector.swift # Private-window accessibility heuristics
 │   ├── ConferenceFaceBlurProcessor.swift # Vision face detection + irreversible conference-call face blur
 │   ├── DisplayMonitor.swift       # Track available displays
@@ -471,7 +471,7 @@ The implementation is complete. Focus on understanding the existing code rather 
 
 ### Capture window-list reuse
 
-Exclusion classification collects normal on-screen, non-transparent window IDs from its all-window snapshot, in window-server order, and removes excluded IDs before array capture. The successful array path does not fetch a second window list. Do not reuse old bounds for masking: privacy/AX checks can suspend while windows move. Forced masking, known-broken arrays, empty included arrays, and array failure must fetch fresh on-screen geometry and drop the frame if unavailable. No snapshot is cached across captures. Existing full-bounds masking and masking-failure behavior remain unchanged.
+Exclusion classification collects normal on-screen, non-transparent window IDs from its all-window snapshot, in window-server order, and removes excluded IDs before array capture. The successful array path does not fetch a second window list. Do not reuse old bounds for masking: privacy/AX checks can suspend while windows move. Forced masking, known-broken arrays, empty included arrays, and array failure must fetch fresh on-screen geometry and drop the frame if unavailable. No snapshot is cached across captures. Masking subtracts preceding on-screen layer-zero windows with alpha >= 1 from excluded bounds. Fully covered excluded windows produce no masks or redacted metadata; exposed fragments retain edge coverage and rendering failures still drop the frame. Window-level alpha cannot prove per-pixel opacity; this restores the prior geometric visibility policy.
 
 Capture-time AX: `Metadata/AccessibilitySnapshotCollector.swift` reads the matched primary window immediately after screenshot capture, before face processing. The AX window is selected by unique bounds/title match across the app’s bounded window list, rather than assuming its focused window is the captured window. Title matching removes the known owner application suffix (for example, " - Google Chrome") and normalizes whitespace/case while preserving document identity. Ambiguous matches are rejected. Snapshot bounds are screenshot pixels; window identity/geometry is rechecked. Secure, hidden, offscreen, and excluded primary-window content is skipped. Rectangle overlaps alone do not establish opacity: overlapping text regions must match opaque pixels in the actual captured frame and a window-only image. Missing/misaligned images or exhausted verification budgets reject those regions. Verification allows only a two-level per-channel rendering tolerance, checks every pixel, and is bounded to two million region pixels plus a best-effort 50 ms loop. AX runs on the capture actor, with a short messaging timeout and bounded best-effort work. `CaptureFrameCandidate` and metadata enrichment preserve the snapshot.
 
