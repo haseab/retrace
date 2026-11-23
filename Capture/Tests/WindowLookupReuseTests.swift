@@ -89,6 +89,90 @@ final class WindowLookupReuseTests: XCTestCase {
         XCTAssertNotEqual(originalPixels, protectedPixels)
     }
 
+    func testCoveredExcludedWindowDoesNotAlterForegroundPixels() async throws {
+        let image = try makeImage()
+        let bounds = CGDisplayBounds(CGMainDisplayID())
+        let result = await CGWindowListCapture().captureWithFiltering(
+            displayID: CGMainDisplayID(), excludedWindowIDs: [99], includedWindowIDs: [10], forceMasking: true,
+            copyOnScreenWindows: { [self.window(10, bounds: bounds), self.window(99, bounds: bounds)] },
+            captureDisplay: { _ in image }
+        )
+        let frame = try XCTUnwrap(result)
+        XCTAssertTrue(frame.visibleExcludedWindowIDs.isEmpty)
+        XCTAssertEqual(try BGRAImageUtilities.makeData(from: frame.image),
+                       try BGRAImageUtilities.makeData(from: image))
+    }
+
+    func testPartiallyCoveredExcludedWindowMasksOnlyExposedPixels() async throws {
+        let image = try makeImage()
+        let bounds = CGDisplayBounds(CGMainDisplayID())
+        let foreground = CGRect(x: bounds.minX, y: bounds.minY, width: bounds.width / 2, height: bounds.height)
+        let result = await CGWindowListCapture().captureWithFiltering(
+            displayID: CGMainDisplayID(), excludedWindowIDs: [99], includedWindowIDs: [10], forceMasking: true,
+            copyOnScreenWindows: { [self.window(10, bounds: foreground), self.window(99, bounds: bounds)] },
+            captureDisplay: { _ in image }
+        )
+        let frame = try XCTUnwrap(result)
+        XCTAssertEqual(frame.visibleExcludedWindowIDs, [99])
+        let original = try BGRAImageUtilities.makeData(from: image)
+        let masked = try BGRAImageUtilities.makeData(from: frame.image)
+        for row in 0..<64 {
+            let start = row * 256
+            XCTAssertEqual(masked[start..<(start + 128)], original[start..<(start + 128)])
+        }
+        XCTAssertNotEqual(masked, original, "Exposed protected content must still be blurred")
+    }
+
+    func testTransparentOrOffscreenWindowDoesNotHideExcludedContent() async throws {
+        let image = try makeImage()
+        let bounds = CGDisplayBounds(CGMainDisplayID())
+        for (alpha, onScreen) in [(0.0, true), (0.5, true), (1.0, false)] {
+            let result = await CGWindowListCapture().captureWithFiltering(
+                displayID: CGMainDisplayID(), excludedWindowIDs: [99], includedWindowIDs: [10], forceMasking: true,
+                copyOnScreenWindows: {
+                    [self.window(10, bounds: bounds, alpha: alpha, onScreen: onScreen), self.window(99, bounds: bounds)]
+                }, captureDisplay: { _ in image }
+            )
+            XCTAssertEqual(try XCTUnwrap(result).visibleExcludedWindowIDs, [99])
+        }
+    }
+
+    func testMultipleForegroundWindowsTogetherCoverExcludedWindow() async throws {
+        let image = try makeImage()
+        let bounds = CGDisplayBounds(CGMainDisplayID())
+        let left = CGRect(x: bounds.minX, y: bounds.minY, width: bounds.width / 2, height: bounds.height)
+        let right = CGRect(x: bounds.midX, y: bounds.minY, width: bounds.width / 2, height: bounds.height)
+        let result = await CGWindowListCapture().captureWithFiltering(
+            displayID: CGMainDisplayID(), excludedWindowIDs: [99], includedWindowIDs: [10, 20], forceMasking: true,
+            copyOnScreenWindows: {
+                [self.window(10, bounds: left), self.window(20, bounds: right), self.window(99, bounds: bounds)]
+            }, captureDisplay: { _ in image }
+        )
+        let frame = try XCTUnwrap(result)
+        XCTAssertTrue(frame.visibleExcludedWindowIDs.isEmpty)
+        XCTAssertEqual(try BGRAImageUtilities.makeData(from: frame.image),
+                       try BGRAImageUtilities.makeData(from: image))
+    }
+
+    func testWindowBehindExcludedWindowCannotSuppressItsMask() async throws {
+        let image = try makeImage()
+        let bounds = CGDisplayBounds(CGMainDisplayID())
+        let result = await CGWindowListCapture().captureWithFiltering(
+            displayID: CGMainDisplayID(), excludedWindowIDs: [99], includedWindowIDs: [10], forceMasking: true,
+            copyOnScreenWindows: { [self.window(99, bounds: bounds), self.window(10, bounds: bounds)] },
+            captureDisplay: { _ in image }
+        )
+        let frame = try XCTUnwrap(result)
+        XCTAssertEqual(frame.visibleExcludedWindowIDs, [99])
+        XCTAssertNotEqual(try BGRAImageUtilities.makeData(from: frame.image),
+                          try BGRAImageUtilities.makeData(from: image))
+    }
+
+    private func window(_ id: CGWindowID, bounds: CGRect, alpha: Double = 1, onScreen: Bool = true) -> [String: Any] {
+        [kCGWindowNumber as String: id, kCGWindowBounds as String: bounds.dictionaryRepresentation,
+         kCGWindowLayer as String: 0, kCGWindowAlpha as String: alpha, kCGWindowIsOnscreen as String: onScreen]
+    }
+
     private func makeImage() throws -> CGImage {
         let context = try XCTUnwrap(CGContext(data: nil, width: 64, height: 64, bitsPerComponent: 8, bytesPerRow: 256,
             space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))

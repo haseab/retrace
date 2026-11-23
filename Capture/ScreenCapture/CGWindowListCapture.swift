@@ -2053,24 +2053,44 @@ public actor CGWindowListCapture {
         let displayBounds = CGDisplayBounds(displayID)
         let scale = CGFloat(fullScreenImage.width) / displayBounds.width
 
-        // Build ordered list of window bounds (front to back, as returned by CGWindowListCopyWindowInfo)
-        // Windows earlier in the list are in front of windows later in the list
-        // Mask the complete excluded-window bounds, even beneath overlapping windows:
-        // windows in front may be translucent, so subtracting them can expose protected pixels.
+        // Window Server orders windows front to back. Restore the exposed-area
+        // calculation: a covered excluded window must not blur the app above it.
+        // Explicitly transparent windows cannot establish coverage.
+        var coveringBounds: [CGRect] = []
         var visibleExcludedRegions: [(windowID: CGWindowID, rect: CGRect)] = []
         for info in windowList {
             guard let id = info[kCGWindowNumber as String] as? CGWindowID,
-                  excludedWindowIDs.contains(id) else { continue }
+                  (info[kCGWindowIsOnscreen as String] as? Bool) != false else { continue }
+            let alpha = info[kCGWindowAlpha as String] as? Double ?? 1
+            guard alpha > 0 else { continue }
+            let isExcluded = excludedWindowIDs.contains(id)
+            let layer = info[kCGWindowLayer as String] as? Int ?? 0
+            guard isExcluded || (layer == 0 && alpha >= 1) else { continue }
             guard let dictionary = info[kCGWindowBounds as String] as? [String: Any],
                   let bounds = CGRect(dictionaryRepresentation: dictionary as CFDictionary),
                   bounds.minX.isFinite, bounds.minY.isFinite, bounds.width.isFinite, bounds.height.isFinite,
-                  bounds.width > 0, bounds.height > 0 else { return nil }
-            let visible = bounds.intersection(displayBounds)
-            guard !visible.isNull, !visible.isEmpty else { continue }
-            visibleExcludedRegions.append((id, CGRect(
-                x: (visible.minX - displayBounds.minX) * scale,
-                y: (visible.minY - displayBounds.minY) * scale,
-                width: visible.width * scale, height: visible.height * scale)))
+                  bounds.width > 0, bounds.height > 0 else {
+                if isExcluded { return nil }
+                continue
+            }
+            let clipped = bounds.intersection(displayBounds)
+            guard !clipped.isNull, !clipped.isEmpty else { continue }
+            if isExcluded {
+                var exposed = [clipped]
+                for covering in coveringBounds {
+                    exposed = subtractRect(covering, from: exposed)
+                    // Bound fragmentation without returning an unprotected image.
+                    guard exposed.count <= 256 else { return nil }
+                    if exposed.isEmpty { break }
+                }
+                for rect in exposed {
+                    visibleExcludedRegions.append((id, CGRect(
+                        x: (rect.minX - displayBounds.minX) * scale,
+                        y: (rect.minY - displayBounds.minY) * scale,
+                        width: rect.width * scale, height: rect.height * scale)))
+                }
+            }
+            if layer == 0 && alpha >= 1 { coveringBounds.append(clipped) }
         }
 
         // If no visible regions to mask, return the full capture
