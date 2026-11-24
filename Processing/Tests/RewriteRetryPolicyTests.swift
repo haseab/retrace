@@ -626,9 +626,21 @@ final class RewriteRetryPolicyTests: XCTestCase {
 
         try await waitForRewriteAttemptCount(2, in: blockingStorage)
 
-        let statuses = try await database.getFrameProcessingStatuses(
-            frameIDs: [firstFrameID.value, secondFrameID.value]
-        )
+        // Attempt count is advanced at rewrite entry, before database finalization.
+        // Observe the durable result rather than racing that in-flight update.
+        let database = try XCTUnwrap(self.database)
+        let statuses = try await withTestTimeout("deferred rewrite database completion") {
+            while !Task.isCancelled {
+                let statuses = try await database.getFrameProcessingStatuses(
+                    frameIDs: [firstFrameID.value, secondFrameID.value]
+                )
+                if statuses[secondFrameID.value] == FrameProcessingStatus.rewriteCompleted.rawValue {
+                    return statuses
+                }
+                try await Task.sleep(for: .milliseconds(5), clock: .continuous)
+            }
+            throw CancellationError()
+        }
         XCTAssertEqual(statuses[firstFrameID.value], FrameProcessingStatus.rewriteCompleted.rawValue)
         XCTAssertEqual(statuses[secondFrameID.value], FrameProcessingStatus.rewriteCompleted.rawValue)
     }
