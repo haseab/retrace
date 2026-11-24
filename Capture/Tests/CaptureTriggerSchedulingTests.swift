@@ -790,6 +790,45 @@ final class CaptureTriggerSchedulingTests: XCTestCase {
         try await manager.stopCapture()
     }
 
+    func testDisplayRetirementEventFollowsAcceptedScreenshotEvenWhenNoNewFrameArrives() async throws {
+        let backend = FakeScreenCaptureBackend(frames: [makeFrame(displayID: 13, pixelValue: 10)])
+        let monitor = FakeDisplayMonitor(activeDisplayID: 13, hasPermission: true)
+        let manager = makeManager(backend: backend, displayMonitor: monitor,
+            displaySwitchMonitor: FakeDisplaySwitchMonitor(), mouseClickMonitor: FakeMouseClickMonitor(startResult: true))
+        let retired = expectation(description: "Capture reconciles an empty display set")
+        await manager.setDisplayJournalRetirementHandler { displays in
+            if displays.isEmpty { retired.fulfill() }
+        }
+        let config = testConfig(captureIntervalSeconds: 0.04, captureOnWindowChange: false, captureOnMouseClick: false)
+        try await manager.startCapture(config: config)
+        let watchdog = Task {
+            do { try await Task.sleep(for: .seconds(5), clock: .continuous) }
+            catch { return }
+            try? await manager.stopCapture()
+        }
+        defer { watchdog.cancel() }
+        var iterator = await manager.eventStream.makeAsyncIterator()
+        guard case .retainDisplays(let connected) = await iterator.next() else {
+            try await manager.stopCapture()
+            return XCTFail("Expected display lifecycle before first frame")
+        }
+        guard case .frame(let accepted) = await iterator.next() else {
+            try await manager.stopCapture()
+            return XCTFail("Expected accepted screenshot")
+        }
+        XCTAssertEqual(connected, [accepted.metadata.displayID])
+        await monitor.setEmptyDisplayList(true)
+        // Empty discovery uses no real screen backend and produces no new pixels.
+        try await manager.updateConfig(config.updating(recordAllDisplays: true))
+        guard case .retainDisplays(let remaining) = await iterator.next() else {
+            try await manager.stopCapture()
+            return XCTFail("Disconnect must wake an idle pipeline")
+        }
+        XCTAssertTrue(remaining.isEmpty)
+        await fulfillment(of: [retired], timeout: 2)
+        try await manager.stopCapture()
+    }
+
     func testEmptyDisplayDiscoveryKeepsPeriodicRetriesAlive() async throws {
         let backend = FakeScreenCaptureBackend(frames: [])
         let monitor = FakeDisplayMonitor(activeDisplayID: 13, hasPermission: true, emptyDisplayList: true)
@@ -1104,7 +1143,8 @@ private actor FakeScreenCaptureBackend: ScreenCaptureBackend {
 private actor FakeDisplayMonitor: CaptureDisplayMonitoring {
     private let activeDisplayID: UInt32
     private let hasPermission: Bool
-    private let emptyDisplayList: Bool
+    private var emptyDisplayList: Bool
+    func setEmptyDisplayList(_ empty: Bool) { emptyDisplayList = empty }
     private var discoveries = 0
     func discoveryCount() -> Int { discoveries }
 

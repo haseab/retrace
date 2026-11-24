@@ -7,11 +7,11 @@ import Shared
 actor BoundedFrameChannel {
     private let frameLimit: Int
     private let byteLimit: Int
-    private var frames: [CapturedFrame] = []
+    private var frames: [CaptureStreamEvent] = []
     private(set) var bufferedBytes = 0
     private var finished = false
-    private var receiver: CheckedContinuation<CapturedFrame?, Never>?
-    private var sender: (id: UUID, frame: CapturedFrame, continuation: CheckedContinuation<Bool, Never>)?
+    private var receiver: CheckedContinuation<CaptureStreamEvent?, Never>?
+    private var sender: (id: UUID, frame: CaptureStreamEvent, continuation: CheckedContinuation<Bool, Never>)?
 
     init(frameLimit: Int, byteLimit: Int) {
         precondition(frameLimit > 0 && byteLimit > 0)
@@ -23,12 +23,27 @@ actor BoundedFrameChannel {
     var isWaitingToSend: Bool { sender != nil }
 
     nonisolated var stream: AsyncStream<CapturedFrame> {
+        AsyncStream(unfolding: {
+            while let event = await self.next() {
+                if case .frame(let frame) = event { return frame }
+            }
+            return nil
+        }, onCancel: {
+            Task { await self.abort() }
+        })
+    }
+
+    nonisolated var eventStream: AsyncStream<CaptureStreamEvent> {
         AsyncStream(unfolding: { await self.next() }, onCancel: {
             Task { await self.abort() }
         })
     }
 
     func send(_ frame: CapturedFrame) async -> Bool {
+        await send(.frame(frame))
+    }
+
+    func send(_ frame: CaptureStreamEvent) async -> Bool {
         guard !finished, !Task.isCancelled else { return false }
         guard sender == nil else {
             // A violated producer contract must not turn into an unbounded list
@@ -59,14 +74,14 @@ actor BoundedFrameChannel {
         }
     }
 
-    private func next() async -> CapturedFrame? {
+    private func next() async -> CaptureStreamEvent? {
         guard !Task.isCancelled else {
             abort()
             return nil
         }
         if !frames.isEmpty {
             let frame = frames.removeFirst()
-            bufferedBytes -= frame.imageData.count
+            bufferedBytes -= frame.pixelByteCount
             if let sender, canBuffer(sender.frame) {
                 self.sender = nil
                 append(sender.frame)
@@ -92,13 +107,13 @@ actor BoundedFrameChannel {
         }
     }
 
-    private func canBuffer(_ frame: CapturedFrame) -> Bool {
-        frames.count < frameLimit && frame.imageData.count <= byteLimit - bufferedBytes
+    private func canBuffer(_ frame: CaptureStreamEvent) -> Bool {
+        frames.count < frameLimit && frame.pixelByteCount <= byteLimit - bufferedBytes
     }
 
-    private func append(_ frame: CapturedFrame) {
+    private func append(_ frame: CaptureStreamEvent) {
         frames.append(frame)
-        bufferedBytes += frame.imageData.count
+        bufferedBytes += frame.pixelByteCount
     }
 
     private func cancelSend(_ id: UUID) {

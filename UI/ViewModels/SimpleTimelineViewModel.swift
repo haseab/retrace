@@ -3867,6 +3867,20 @@ public class SimpleTimelineViewModel: ObservableObject {
             }
         }
 
+        NotificationCenter.default.publisher(for: FrameDeletionNotification.didDelete)
+            .sink { [weak self] notification in
+                // The coordinator publishes on MainActor after the DB transaction.
+                MainActor.assumeIsolated {
+                    guard let self,
+                          let source = notification.object as? AppCoordinator,
+                          source === self.coordinator,
+                          let ids = notification.userInfo?[FrameDeletionNotification.frameIDsKey] as? Set<FrameID>
+                    else { return }
+                    self.invalidatePersistedDeletions(ids)
+                }
+            }
+            .store(in: &cancellables)
+
         // Listen for data source changes (e.g., Rewind data toggled)
         Log.debug("[SimpleTimelineViewModel] Setting up dataSourceDidChange observer", category: .ui)
         NotificationCenter.default.addObserver(
@@ -3885,6 +3899,33 @@ public class SimpleTimelineViewModel: ObservableObject {
         setupSearchOverlayPersistence()
         initializeDiskFrameBuffer()
         startDiskFrameBufferMemoryReporting()
+    }
+
+    private func invalidatePersistedDeletions(_ ids: Set<FrameID>) {
+        let anchorID = currentTapeFrame?.frame.id
+        let removed = frames.filter { ids.contains($0.frame.id) }
+        invalidatePinnedPrimaryFrame()
+        clearPIPDisplayFrameCache()
+        cancelCacheExpansion(reason: "frames deleted")
+        cancelBoundaryLoadTasks(reason: "frames deleted")
+        cancelBlockBoundaryLookup(reason: "frames deleted")
+        unavailableFrameDiskLookupTask?.cancel()
+        unavailableFrameDiskLookupTask = nil
+        diskFrameBufferGeneration &+= 1
+        diskFrameBufferEpoch.invalidate()
+        diskFrameBufferEntryEpochs.invalidateAll()
+        diskFrameBufferIndex.removeAll()
+        inMemoryJPEGFrameCache.removeAllObjects()
+        hotWindowRange = nil
+        frames.removeAll { ids.contains($0.frame.id) }
+        currentIndex = anchorID.flatMap { id in frames.firstIndex { $0.frame.id == id } }
+            ?? min(currentIndex, max(0, frames.count - 1))
+        selectedFrameIndex = nil
+        forceVideoReload = true
+        refreshAppBlockSnapshotImmediately(reason: "frames deleted")
+        schedulePIPUpdate()
+        loadImageIfNeeded()
+        scheduleWindowRefillAfterOptimisticDelete(removedFrames: removed, reason: "frames deleted")
     }
 
     /// Persist search overlay visibility state across app launches

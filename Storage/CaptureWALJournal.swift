@@ -19,6 +19,14 @@ public actor CaptureWALJournal {
         current.removeAll()
     }
 
+    /// Remove ingress ownership only. The consumer owns finalization after all
+    /// receipts ahead of the retirement event have been processed.
+    public func retireDisconnectedDisplays(keeping displayIDs: Set<UInt32>) {
+        for displayID in Array(current.keys) where !displayIDs.contains(displayID) {
+            current.removeValue(forKey: displayID)
+        }
+    }
+
     public func persist(_ frame: CapturedFrame) async throws -> CapturedFrame {
         let generation = self.generation
         let displayID = frame.metadata.displayID

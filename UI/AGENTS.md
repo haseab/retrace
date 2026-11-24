@@ -801,3 +801,9 @@ Navigation, a new live screenshot, and closing the timeline invalidate pending r
 `timeline.manual_ocr.total_ms`.
 
 Manual scans recheck saved protection before publishing, wait for native privacy processing when enabled, and are invalidated by redaction-completion notifications. Fresh OCR outlines use the same zoom and pan transform as the frame.
+
+Persisted native deletion intent broadcasts `FrameDeletionNotification.didDelete` on
+MainActor, scoped to the coordinator. Open timelines remove affected union-tape frames,
+invalidate pinned/PIP and image/overlay work, and refill without resetting filters.
+Invalidate generations before reloading so stale asynchronous results cannot restore
+removed content. This notification precedes potentially deferred video rewrites.

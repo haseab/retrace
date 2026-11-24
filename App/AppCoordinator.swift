@@ -1535,6 +1535,9 @@ public actor AppCoordinator {
             guard let self, await self.shouldJournalCapturedFrame(frame) else { return nil }
             return try await journal.persist(frame)
         }
+        await services.capture.setDisplayJournalRetirementHandler { [journal] displays in
+            await journal.retireDisconnectedDisplays(keeping: displays)
+        }
         // Start screen capture
         try await services.capture.startCapture(config: await services.capture.getConfig())
 
@@ -1602,6 +1605,7 @@ public actor AppCoordinator {
         // frames through encoding/metadata/finalization before closing services.
         try await services.capture.stopCapture(drain: true)
         await services.capture.setFramePersistenceHandler(nil)
+        await services.capture.setDisplayJournalRetirementHandler(nil)
         captureWALJournal = nil
         await suspendPipelineInfrastructure()
 
@@ -2223,6 +2227,7 @@ public actor AppCoordinator {
     /// preview-cache writes, or persisted stop notifications.
     func runPipeline(
         frameStream suppliedFrameStream: AsyncStream<CapturedFrame>? = nil,
+        eventStream suppliedEventStream: AsyncStream<CaptureStreamEvent>? = nil,
         cacheCapturedStills: Bool = true,
         reportUnexpectedStops: Bool = true
     ) async {
@@ -2231,9 +2236,13 @@ public actor AppCoordinator {
         defer { isPipelineLoopActive = false }
         Log.info("Pipeline processing started", category: .app)
 
-        let frameStream: AsyncStream<CapturedFrame>
-        if let suppliedFrameStream { frameStream = suppliedFrameStream }
-        else { frameStream = await services.capture.frameStream }
+        let eventStream: AsyncStream<CaptureStreamEvent>
+        if let suppliedEventStream { eventStream = suppliedEventStream }
+        else if let suppliedFrameStream {
+            // The unfolding adapter preserves backpressure without a pump task.
+            let iterator = CaptureFrameStreamIterator(stream: suppliedFrameStream)
+            eventStream = AsyncStream(unfolding: { await iterator.next() })
+        } else { eventStream = await services.capture.eventStream }
         var writersByResolution: [String: VideoWriterState] = [:]
         var pendingUnexpectedStop: PendingUnexpectedRecordingStop?
         var lastPipelineMemoryLogAt = Date.distantPast
@@ -2263,7 +2272,28 @@ public actor AppCoordinator {
             )
         }
 
-        for await frame in frameStream {
+        for await event in eventStream {
+            if Task.isCancelled { break }
+            if case .retainDisplays(let displays) = event {
+                for key in Array(writersByResolution.keys) {
+                    guard var state = writersByResolution[key],
+                          !displays.contains(state.displayID) else { continue }
+                    do {
+                        try await finalizeWriter(&state, processingQueue: await services.processingQueue)
+                    } catch {
+                        totalErrors += 1
+                        statusHolder.incrementErrors()
+                        Log.error("Failed to close disconnected display writer", category: .app, error: error)
+                        // Finalization may already have finished encoding and
+                        // removed its WAL before the database update failed.
+                        // Cancellation deletes that video; preserve both files
+                        // here for recovery instead of discarding durable pixels.
+                    }
+                    writersByResolution.removeValue(forKey: key)
+                }
+                continue
+            }
+            guard case .frame(let frame) = event else { continue }
             Log.verbose("[Pipeline] Received frame from stream: \(frame.width)x\(frame.height), app=\(frame.metadata.appName)", category: .app)
 
             if Task.isCancelled {
@@ -2306,6 +2336,13 @@ public actor AppCoordinator {
                 // Key by displayID + resolution to prevent two same-resolution displays from sharing a video file
                 let displayID = frame.metadata.displayID
                 let resolutionKey = "\(displayID)_\(frame.width)x\(frame.height)"
+                // A display has one resolution at a time. FIFO ordering ensures
+                // all receipts for its previous resolution have already drained.
+                for key in Array(writersByResolution.keys) where key != resolutionKey {
+                    guard var previous = writersByResolution[key], previous.displayID == displayID else { continue }
+                    try await finalizeWriter(&previous, processingQueue: await services.processingQueue)
+                    writersByResolution.removeValue(forKey: key)
+                }
                 var writerState: VideoWriterState
 
                 if let receipt = frame.journalReceipt {
@@ -2829,6 +2866,12 @@ public actor AppCoordinator {
         guard result.affectedFrameCount > 0 else { return .empty }
 
         removeTimelineDiskCacheStills(frameIDs: result.affectedFrameIDs)
+        // Publish persisted deletion intent before waiting for video rewrites.
+        // Queued deletions are already excluded by database display lookups.
+        await MainActor.run {
+            NotificationCenter.default.post(name: FrameDeletionNotification.didDelete, object: self,
+                userInfo: [FrameDeletionNotification.frameIDsKey: Set(result.affectedFrameIDs.map { FrameID(value: $0) })])
+        }
 
         let scheduledFrameIDs = Set(result.scheduledJobs.map(\.frameID))
         var queuedScheduledFrameIDs = Set<Int64>()
@@ -6458,5 +6501,16 @@ private final class MigrationProgressDelegate: MigrationDelegate, @unchecked Sen
 
     func migrationDidFail(error: Error) {
         Log.error("[Migration] Failed", category: .app, error: error)
+    }
+}
+
+// Only the unfolding stream consumer calls next; no producer/prefetch task
+// accesses this iterator. AsyncStream requires the unfolding closure to be Sendable.
+private final class CaptureFrameStreamIterator: @unchecked Sendable {
+    private var iterator: AsyncStream<CapturedFrame>.Iterator
+    init(stream: AsyncStream<CapturedFrame>) { iterator = stream.makeAsyncIterator() }
+    func next() async -> CaptureStreamEvent? {
+        guard let frame = await iterator.next() else { return nil }
+        return .frame(frame)
     }
 }

@@ -226,6 +226,22 @@ public actor CaptureManager: CaptureProtocol {
     public func setFramePersistenceHandler(_ handler: (@Sendable (CapturedFrame) async throws -> CapturedFrame?)?) {
         framePersistenceHandler = handler
     }
+    private var journalDisplayIDs: Set<UInt32>?
+    private var displayJournalRetirementHandler: (@Sendable (Set<UInt32>) async -> Void)?
+
+    public func setDisplayJournalRetirementHandler(
+        _ handler: (@Sendable (Set<UInt32>) async -> Void)?
+    ) {
+        displayJournalRetirementHandler = handler
+        journalDisplayIDs = nil
+    }
+
+    /// Use either this stream or frameStream, never both.
+    public var eventStream: AsyncStream<CaptureStreamEvent> {
+        if frameChannel == nil { _ = frameStream }
+        return frameChannel!.eventStream
+    }
+
     private var pendingCapture: PendingCapture?
     private var lastActualCaptureTime: Date?
     private var currentCaptureDisplayID: UInt32?
@@ -306,6 +322,7 @@ public actor CaptureManager: CaptureProtocol {
         await frameChannel?.abort()
         let channel = BoundedFrameChannel(frameLimit: Self.dedupedFrameBufferLimit, byteLimit: Self.dedupedFrameByteLimit)
         frameChannel = channel
+        journalDisplayIDs = nil
         _frameStream = channel.stream
 
         let activeDisplayID = await displayMonitor.getActiveDisplayID()
@@ -785,6 +802,17 @@ public actor CaptureManager: CaptureProtocol {
         let displays = currentConfig.recordAllDisplays
             ? (try? await displayMonitor.getAvailableDisplays().map(\.id)) ?? [activeDisplayID]
             : [activeDisplayID]
+        if let handler = displayJournalRetirementHandler, let channel = frameChannel {
+            let stableIDs = Set(displays.map { stableDisplayID(forRuntimeDisplayID: $0) })
+            if journalDisplayIDs != stableIDs {
+                await handler(stableIDs)
+                guard _isCapturing, captureGeneration == generation,
+                      await channel.send(.retainDisplays(stableIDs)),
+                      _isCapturing, captureGeneration == generation else { return }
+                journalDisplayIDs = stableIDs
+            }
+            guard _isCapturing, captureGeneration == generation else { return }
+        }
         let disconnected = Set(multiDisplayBackends.keys).subtracting(displays)
         for id in disconnected {
             if let backend = multiDisplayBackends.removeValue(forKey: id) { try? await backend.stopCapture() }

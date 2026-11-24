@@ -127,4 +127,24 @@ final class BoundedFrameChannelTests: XCTestCase {
         let admitted = await channel.send(try screenshot(1))
         XCTAssertFalse(admitted)
     }
+
+    func testLifecycleEventUsesSameBoundedFIFOAndWakesIdleConsumer() async throws {
+        let frame = try screenshot(1)
+        let channel = BoundedFrameChannel(frameLimit: 1, byteLimit: frame.imageData.count)
+        _ = await channel.send(frame)
+        let producer = Task { await channel.send(.retainDisplays([7])) }
+        await waitForBlockedSend(channel)
+        var iterator = channel.eventStream.makeAsyncIterator()
+        guard case .frame(let received) = await iterator.next() else { return XCTFail("Expected queued screenshot") }
+        XCTAssertEqual(received.imageData, frame.imageData)
+        let sent = await producer.value
+        XCTAssertTrue(sent)
+        guard case .retainDisplays(let displays) = await iterator.next() else { return XCTFail("Expected lifecycle event") }
+        XCTAssertEqual(displays, [7])
+        let consumer = Task { await iterator.next() }
+        _ = await channel.send(.retainDisplays([]))
+        guard case .retainDisplays(let empty) = await consumer.value else { return XCTFail("Idle consumer must wake") }
+        XCTAssertTrue(empty.isEmpty)
+        await channel.finish()
+    }
 }

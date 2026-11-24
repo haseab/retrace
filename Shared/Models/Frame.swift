@@ -502,3 +502,20 @@ public struct UnfinalisedVideo: Sendable, Equatable {
         self.displayID = displayID
     }
 }
+
+/// Lifecycle changes share the screenshot queue so earlier accepted frames drain
+/// before their journal writer is finalized. This stream has one consumer.
+public enum CaptureStreamEvent: Sendable {
+    case frame(CapturedFrame)
+    case retainDisplays(Set<UInt32>)
+
+    public var pixelByteCount: Int {
+        if case .frame(let frame) = self { return frame.imageData.count }
+        return 0
+    }
+}
+
+public enum FrameDeletionNotification {
+    public static let didDelete = Notification.Name("NativeFramesDidDelete")
+    public static let frameIDsKey = "frameIDs"
+}

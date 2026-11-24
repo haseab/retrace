@@ -496,3 +496,12 @@ The privacy array helper still avoids extra lookups. The OCR feature separately 
 - The coordinator installs the persistence handler before starting capture. Journal failures stop capture instead of falling back to unjournaled delivery. Standalone capture tests can omit the handler.
 
 - With simultaneous multi-monitor recording enabled, primary window metadata comes from the first eligible on-screen application window on each captured display in front-to-back order, independent of global app focus. Single-display mode retains foreground-app selection. Keep desktop, hidden, transparent, overlay, and Computer Use window exclusions; an empty display must not borrow app metadata from a neighbour.
+
+### Display writer lifecycle
+
+The coordinator consumes `CaptureManager.eventStream` instead of simultaneously consuming
+`frameStream`. Display-set changes share the bounded FIFO with screenshots, after all
+previously accepted receipts. Retire journal ownership before publishing that change;
+finalize encoding only on the consumer side. Empty display discovery must still publish
+an empty set, without waiting for a subsequent screenshot. Lifecycle events count toward
+the queue item limit and never spawn additional producers.
