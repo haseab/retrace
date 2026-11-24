@@ -266,7 +266,10 @@ public actor RecoveryManager {
                 "[Recovery] WAL session \(frontier.session.videoID.value) has no recoverable WAL frames, but existing video contains \(preservedVideoFrameCount) reusable readable frames; preserved the durable video data and quarantined WAL residue",
                 category: .storage
             )
-        } else if frontier.session.metadata.frameCount > 0 {
+        } else {
+            // Checkpoints can still report zero after capture-time appends.
+            // With no readable video or recoverable WAL pixels, the matching
+            // placeholder must not survive to orphan-video finalization.
             _ = try await discardUnfinalisedDatabaseVideoIfPresent(
                 for: frontier.session,
                 reason: "No recoverable WAL frames found in WAL session"

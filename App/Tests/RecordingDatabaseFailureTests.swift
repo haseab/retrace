@@ -22,18 +22,6 @@ final class RecordingDatabaseFailureTests: XCTestCase {
         do {
             let connection = await database.getConnection()
             let db = try XCTUnwrap(connection)
-            // Fail exactly the first frame insert without rolling back the successful video append.
-            let setup = """
-                CREATE TABLE injected_failure(attempts INTEGER);
-                INSERT INTO injected_failure VALUES(0);
-                CREATE TRIGGER fail_first_frame BEFORE INSERT ON frame
-                WHEN (SELECT attempts FROM injected_failure)=0
-                BEGIN
-                    UPDATE injected_failure SET attempts=1;
-                    SELECT RAISE(FAIL,'injected frame metadata failure');
-                END;
-                """
-            XCTAssertEqual(sqlite3_exec(db, setup, nil, nil, nil), SQLITE_OK)
             let frame = try screenshotFrame()
             let stream = AsyncStream<CapturedFrame> { continuation in
                 for index in 0..<3 {
@@ -45,7 +33,21 @@ final class RecordingDatabaseFailureTests: XCTestCase {
                 continuation.finish()
             }
             let coordinator = AppCoordinator(services: services)
+            // Keep the one-shot failure outside the database transaction. A
+            // trigger counter rolls back with the failed native insert and
+            // accidentally fails every frame rather than only the first one.
+            let failure = FrameInsertFailureGate()
+            sqlite3_set_authorizer(db, { context, action, table, _, _, _ in
+                guard action == SQLITE_INSERT, let table, String(cString: table) == "frame",
+                      let context else { return SQLITE_OK }
+                let failure = Unmanaged<FrameInsertFailureGate>.fromOpaque(context).takeUnretainedValue()
+                guard !failure.didFail else { return SQLITE_OK }
+                failure.didFail = true
+                return SQLITE_DENY
+            }, Unmanaged.passUnretained(failure).toOpaque())
             await coordinator.runPipeline(frameStream: stream, cacheCapturedStills: false, reportUnexpectedStops: false)
+            sqlite3_set_authorizer(db, nil, nil)
+            XCTAssertTrue(failure.didFail)
             let frames = try await database.getFrames(from: frame.timestamp.addingTimeInterval(-1), to: frame.timestamp.addingTimeInterval(5), limit: 10)
             XCTAssertEqual(frames.count, 2)
             XCTAssertEqual(frames.map(\.frameIndexInSegment).sorted(), [1, 2])
@@ -77,4 +79,8 @@ final class RecordingDatabaseFailureTests: XCTestCase {
         return CapturedFrame(timestamp: Date(timeIntervalSince1970: 1_775_300_000), imageData: data, width: width, height: height,
                              bytesPerRow: stride, metadata: FrameMetadata(appBundleID: "com.example.recording-regression", appName: "Recording regression"))
     }
+}
+
+private final class FrameInsertFailureGate {
+    var didFail = false
 }

@@ -91,12 +91,13 @@ final class TimelineHeadlessPrerenderStateTests: XCTestCase {
             return []
         }
         let data = try makeJPEGData(makeSolidImage(size: NSSize(width: 32, height: 32), color: .white))
+        let expectedPixelWidth = try XCTUnwrap(NSBitmapImageRep(data: data)).pixelsWide
         viewModel.test_foregroundFrameLoadHooks.loadFrameData = { frame in
             XCTAssertEqual(frame.frame.source, .rewind)
             return data
         }
         viewModel.test_dragStartStillOCRHooks.recognizeTextFromCGImage = { image in
-            XCTAssertEqual(image.width, 32)
+            XCTAssertEqual(image.width, expectedPixelWidth)
             return [TextRegion(frameID: FrameID(value: 0), text: "Imported text", bounds: CGRect(x: 0, y: 0, width: 1, height: 1))]
         }
         viewModel.isPlaying = true

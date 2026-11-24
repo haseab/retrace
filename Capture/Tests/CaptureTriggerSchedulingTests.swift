@@ -186,7 +186,7 @@ final class CaptureTriggerSchedulingTests: XCTestCase {
         )
 
         try await manager.startCapture(
-            config: testConfig(captureIntervalSeconds: 0.05)
+            config: testConfig(captureIntervalSeconds: 1.0)
         )
         let stream = await manager.frameStream
         let streamTask = collectFrames(from: stream, into: collector)
@@ -195,20 +195,24 @@ final class CaptureTriggerSchedulingTests: XCTestCase {
             Task { try? await manager.stopCapture() }
         }
 
-        try await sleep(milliseconds: 40)
+        // Leave ample scheduling headroom instead of racing 10 ms timer gaps.
+        try await sleep(milliseconds: 500)
         await mouseClickMonitor.emitMouseUp()
-
-        try await sleep(milliseconds: 25)
-        let firstCaptureCount = await backend.captureCount()
-        let firstCollectedFrameCount = await collector.count()
-        XCTAssertEqual(firstCaptureCount, 1)
-        XCTAssertEqual(firstCollectedFrameCount, 1)
-
-        try await sleep(milliseconds: 70)
+        try await waitForOutcome { await collector.count() == 1 }
+        let first = await collector.lastFrame()
+        XCTAssertEqual(first?.metadata.captureTrigger, .mouse)
+        try await waitForOutcome { await collector.count() == 2 }
+        let second = await collector.lastFrame()
+        XCTAssertEqual(second?.metadata.captureTrigger, .interval)
+        let receptions = await collector.receptionTimes()
+        XCTAssertEqual(receptions.count, 2)
+        if receptions.count == 2 {
+            // A stale original timer would fire about half a second after the
+            // click. The reset timer must wait the full configured interval.
+            XCTAssertGreaterThanOrEqual(receptions[0].duration(to: receptions[1]), .milliseconds(850))
+        }
         let finalCaptureCount = await backend.captureCount()
-        let finalCollectedFrameCount = await collector.count()
         XCTAssertEqual(finalCaptureCount, 2)
-        XCTAssertEqual(finalCollectedFrameCount, 2)
     }
 
     func testMouseClickWithinRefractoryIsDroppedInsteadOfBuffered() async throws {
@@ -286,7 +290,7 @@ final class CaptureTriggerSchedulingTests: XCTestCase {
         }
 
         await displaySwitchMonitor.emitWindowChange()
-        try await sleep(milliseconds: 80)
+        try await waitForOutcome { await collector.count() == 1 }
 
         let captureCount = await backend.captureCount()
         let collectedFrameCount = await collector.count()
@@ -327,7 +331,7 @@ final class CaptureTriggerSchedulingTests: XCTestCase {
         await mouseClickMonitor.setStartResult(true)
         await manager.retryMouseClickMonitoringIfNeeded()
         await mouseClickMonitor.emitMouseUp()
-        try await sleep(milliseconds: 80)
+        try await waitForOutcome { await collector.count() == 1 }
 
         let captureCountAfterRetry = await backend.captureCount()
         let collectedFrameCountAfterRetry = await collector.count()
@@ -366,9 +370,11 @@ final class CaptureTriggerSchedulingTests: XCTestCase {
         }
 
         await mouseClickMonitor.emitMouseUp()
-        try await sleep(milliseconds: 20)
+        try await waitForOutcome { await triggerRecorder.contains(outcome: .captured) }
+        // Distinct clicks must be outside the configured refractory interval.
+        try await sleep(milliseconds: 25)
         await mouseClickMonitor.emitMouseUp()
-        try await sleep(milliseconds: 30)
+        try await waitForOutcome { await triggerRecorder.contains(outcome: .deduped) }
 
         let collectedFrameCount = await collector.count()
         let hasCapturedOutcome = await triggerRecorder.contains(outcome: .captured)
@@ -398,7 +404,7 @@ final class CaptureTriggerSchedulingTests: XCTestCase {
         }
 
         await mouseClickMonitor.emitMouseUp()
-        try await sleep(milliseconds: 80)
+        try await waitForOutcome { await backend.captureCount() == 1 }
 
         let captureDisplayIDs = await backend.captureDisplayIDs()
         XCTAssertEqual(captureDisplayIDs, [22])
@@ -1012,6 +1018,15 @@ final class CaptureTriggerSchedulingTests: XCTestCase {
         }
     }
 
+    private func waitForOutcome(_ condition: () async -> Bool, file: StaticString = #filePath, line: UInt = #line) async throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while !(await condition()), ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(5), clock: .continuous)
+        }
+        let completed = await condition()
+        XCTAssertTrue(completed, "Expected capture outcome before deadline", file: file, line: line)
+    }
+
     private func sleep(milliseconds: Int) async throws {
         try await Task.sleep(for: .milliseconds(milliseconds), clock: .continuous)
     }
@@ -1312,10 +1327,14 @@ private actor BlockingSequencedFakeAppInfoProvider: CaptureAppInfoProviding {
 
 private actor FrameCollector {
     private var frames: [CapturedFrame] = []
+    private var receptions: [ContinuousClock.Instant] = []
 
     func append(_ frame: CapturedFrame) {
         frames.append(frame)
+        receptions.append(.now)
     }
+
+    func receptionTimes() -> [ContinuousClock.Instant] { receptions }
 
     func count() -> Int {
         frames.count
