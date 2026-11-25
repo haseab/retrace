@@ -130,6 +130,12 @@ enum DashboardWindowGrouping {
         let windows: [WindowUsageData]
         let duration: TimeInterval
         let percentage: Double
+        let isExpandable: Bool
+
+        var summary: WindowUsageData {
+            WindowUsageData(windowName: title, isWebsite: false, duration: duration,
+                            percentage: percentage, tabCount: windows.count)
+        }
     }
 
     static func prefix(_ title: String) -> String {
@@ -147,7 +153,9 @@ enum DashboardWindowGrouping {
         return grouped.map { title, windows in
             Group(title: title, windows: windows,
                   duration: windows.reduce(0) { $0 + $1.duration },
-                  percentage: windows.reduce(0) { $0 + $1.percentage })
+                  percentage: windows.reduce(0) { $0 + $1.percentage },
+                  isExpandable: windows.count > 1 || title != DashboardWindowTitleFormatter.displayTitle(
+                    for: windows[0].displayName, appBundleID: appBundleID))
         }.sorted {
             $0.duration == $1.duration ? $0.title < $1.title : $0.duration > $1.duration
         }
@@ -167,10 +175,7 @@ struct AppUsageListView: View {
 
     var onGroupingAction: ((String, Bool) -> Void)? = nil
 
-    @AppStorage("dashboardGroupWindowsByHyphen") private var groupWindowsByHyphen = false
     @State private var prefixGroups: [String: [DashboardWindowGrouping.Group]] = [:]
-    @State private var expandedPrefix: String? = nil
-    @State private var prefixWindowCounts: [String: Int] = [:]
     @State private var hoveredAppIndex: Int? = nil
     @State private var hoveredWindowKey: String? = nil
     @State private var displayedCount: Int = 20
@@ -220,13 +225,6 @@ struct AppUsageListView: View {
             // Inner shadow scroll affordance
             ScrollAffordance(height: 40, color: scrollAffordanceColor)
         }
-        .onChange(of: groupWindowsByHyphen) { enabled in
-            expandedPrefix = nil
-            onGroupingAction?("mode_changed", enabled)
-            if enabled, let app = apps.first(where: { $0.appBundleID == expandedAppBundleID }), !app.isBrowser {
-                loadWindowData(for: app, desiredVisibleCount: initialWindowCount)
-            }
-        }
     }
 
     // MARK: - Window Rows Section
@@ -255,16 +253,7 @@ struct AppUsageListView: View {
         let isLoadingMore = isLoading && !windows.isEmpty
 
         VStack(spacing: 4) {
-            if !isBrowser {
-                Toggle("Group by title prefix ( - )", isOn: $groupWindowsByHyphen)
-                    .toggleStyle(.checkbox)
-                    .font(layoutSize.windowNameFont)
-                    .foregroundColor(.retraceSecondary)
-                    .padding(.leading, layoutSize.windowRowIndent)
-                    .padding(.vertical, 6)
-                    .help("Combine windows with the same title before the first spaced hyphen.")
-            }
-            if isLoading && (windows.isEmpty || (groupWindowsByHyphen && !isBrowser)) {
+            if isLoading && (windows.isEmpty || !isBrowser) {
                 HStack {
                     Spacer()
                     SpinnerView(size: 14, lineWidth: 2, color: .retraceSecondary)
@@ -281,7 +270,7 @@ struct AppUsageListView: View {
                 }
                 .padding(.vertical, 8)
                 .padding(.leading, layoutSize.windowRowIndent)
-            } else if groupWindowsByHyphen && !isBrowser {
+            } else if !isBrowser {
                 prefixRows(for: app, layoutSize: layoutSize)
             } else {
                 ForEach(Array(displayedWindows.enumerated()), id: \.element.id) { index, window in
@@ -343,64 +332,32 @@ struct AppUsageListView: View {
         let count = displayedWindowCounts[app.appBundleID] ?? initialWindowCount
         let color = Color.segmentColor(for: app.appBundleID)
         return VStack(spacing: 4) {
-            ForEach(groups.prefix(count)) { group in
+            ForEach(Array(groups.prefix(count).enumerated()), id: \.element.id) { index, group in
+                let groupKey = "\(app.appBundleID)_prefix_\(group.id)"
                 VStack(spacing: 0) {
-                    Button {
-                        let expanding = expandedPrefix != group.id
-                        expandedPrefix = expanding ? group.id : nil
-                        onGroupingAction?(expanding ? "expanded" : "collapsed", true)
-                    } label: {
-                        HStack(spacing: 10) {
-                            Image(systemName: expandedPrefix == group.id ? "chevron.down" : "chevron.right")
-                                .frame(width: 12)
-                            Text(group.title).lineLimit(1)
-                            Text("\(group.windows.count) windows")
-                                .foregroundColor(.retraceSecondary)
-                            Spacer()
-                            VStack(alignment: .trailing, spacing: 2) {
-                                Text(formatDuration(group.duration))
-                                    .font(layoutSize.windowDurationFont)
-                                Text(String(format: "%.1f%%", group.percentage * 100))
-                                    .foregroundColor(.retraceSecondary)
+                    websiteRow(window: group.isExpandable ? group.summary : group.windows[0],
+                               app: app, appColor: color, layoutSize: layoutSize,
+                               rowIndex: index, prefixGroup: group)
+                    if group.isExpandable && expandedDomainKey == groupKey {
+                        let visibleCount = displayedDomainTabCounts[groupKey] ?? initialDomainTabCount
+                        VStack(spacing: 2) {
+                            ForEach(group.windows.prefix(visibleCount)) { window in
+                                domainTabRow(tab: window, app: app, appColor: color, layoutSize: layoutSize)
                             }
-                            .frame(width: layoutSize.durationWidth, alignment: .trailing)
-                        }
-                        .font(layoutSize.windowNameFont)
-                        .foregroundColor(.retracePrimary)
-                        .padding(.vertical, 10)
-                        .padding(.leading, layoutSize.windowRowIndent)
-                        .padding(.trailing, layoutSize.horizontalPadding)
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("\(group.title), \(group.windows.count) windows, \(formatDuration(group.duration))")
-                    .accessibilityValue(expandedPrefix == group.id ? "Expanded" : "Collapsed")
-                    if expandedPrefix == group.id {
-                        let visibleCount = prefixWindowCounts[group.id] ?? initialWindowCount
-                        ForEach(Array(group.windows.prefix(visibleCount).enumerated()), id: \.element.id) { index, window in
-                            windowRow(window: window, app: app, appColor: color, layoutSize: layoutSize, rowIndex: index)
-                                .padding(.leading, 20)
-                        }
-                        if group.windows.count > visibleCount {
-                            Button("Load More Windows") {
-                                prefixWindowCounts[group.id] = visibleCount + windowLoadIncrement
-                                onGroupingAction?("more_windows", true)
+                            if group.windows.count > visibleCount {
+                                domainTabLoadMoreButton(domainKey: groupKey,
+                                    remainingCount: group.windows.count - visibleCount,
+                                    layoutSize: layoutSize, isPrefixGroup: true)
                             }
-                            .buttonStyle(.plain)
-                            .font(layoutSize.windowNameFont)
-                            .padding(8)
                         }
+                        .padding(.top, 4)
+                        .padding(.bottom, 6)
+                        .transition(.opacity.animation(.easeInOut(duration: 0.15)))
                     }
                 }
             }
             if groups.count > count {
-                Button("Load More Groups") {
-                    displayedWindowCounts[app.appBundleID] = count + windowLoadIncrement
-                    onGroupingAction?("more_groups", true)
-                }
-                .buttonStyle(.plain)
-                .font(layoutSize.windowNameFont)
-                .padding(8)
+                windowLoadMoreButton(for: app, remainingCount: groups.count - count, layoutSize: layoutSize)
             }
         }
     }
@@ -412,6 +369,7 @@ struct AppUsageListView: View {
         let isLoading = loadingWindows.contains(app.appBundleID)
 
         return Button(action: {
+            if !app.isBrowser { onGroupingAction?("more_groups", true) }
             let currentCount = displayedWindowCounts[app.appBundleID] ?? initialWindowCount
             let desiredCount = currentCount + windowLoadIncrement
             let cachedCount = windowUsageCache[app.appBundleID]?.count ?? 0
@@ -591,20 +549,22 @@ struct AppUsageListView: View {
 
     // MARK: - Website Row (Expandable) or Window Fallback Row
 
-    /// Website row in "Websites" mode that can expand to show tabs for that domain
-    /// For window fallbacks (isWebsite=false), shows app icon instead of favicon and doesn't expand
-    private func websiteRow(window: WindowUsageData, app: AppUsageData, appColor: Color, layoutSize: AppUsageLayoutSize, rowIndex: Int) -> some View {
-        let domainKey = "\(app.appBundleID)_\(window.displayName)"
-        let isExpanded = window.isWebsite && expandedDomainKey == domainKey
+    /// Shared expandable row for website domains and window-title prefixes.
+    /// Plain window fallbacks keep their app icon and open directly.
+    private func websiteRow(window: WindowUsageData, app: AppUsageData, appColor: Color, layoutSize: AppUsageLayoutSize, rowIndex: Int, prefixGroup: DashboardWindowGrouping.Group? = nil) -> some View {
+        let domainKey = prefixGroup.map { "\(app.appBundleID)_prefix_\($0.id)" }
+            ?? "\(app.appBundleID)_\(window.displayName)"
+        let isExpandable = prefixGroup?.isExpandable ?? window.isWebsite
+        let isExpanded = isExpandable && expandedDomainKey == domainKey
         let isHovered = hoveredWindowKey == domainKey
-        let displayTitle = DashboardWindowTitleFormatter.displayTitle(
+        let displayTitle = prefixGroup?.title ?? DashboardWindowTitleFormatter.displayTitle(
             for: window.displayName,
             appBundleID: app.appBundleID
         )
 
         return HStack(spacing: layoutSize.rowSpacing) {
-            // Expand/collapse chevron - only show for websites (not window fallbacks)
-            if window.isWebsite {
+            // The same hierarchy for websites and title-prefix groups.
+            if isExpandable {
                 Image(systemName: "chevron.right")
                     .font(.system(size: 8, weight: .semibold))
                     .foregroundColor(.retraceSecondary.opacity(0.5))
@@ -638,7 +598,7 @@ struct AppUsageListView: View {
                     .lineLimit(1)
                     .truncationMode(.tail)
 
-                if window.isWebsite {
+                if isExpandable {
                     if let tabCount = window.tabCount {
                         Text(tabCountLabel(tabCount))
                             .font(.system(size: 10, weight: .medium))
@@ -703,7 +663,13 @@ struct AppUsageListView: View {
             }
         }
         .onTapGesture {
-            if window.isWebsite {
+            if let group = prefixGroup, group.isExpandable {
+                let expanding = expandedDomainKey != domainKey
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    expandedDomainKey = expanding ? domainKey : nil
+                }
+                onGroupingAction?(expanding ? "expanded" : "collapsed", true)
+            } else if window.isWebsite {
                 // Websites expand to show tabs
                 withAnimation(.easeInOut(duration: 0.2)) {
                     if expandedDomainKey == domainKey {
@@ -722,10 +688,13 @@ struct AppUsageListView: View {
             }
         }
         .contextMenu {
-            DashboardUsageMenu(
-                target: window.isWebsite ? .website(app: app, domain: window.displayName) : .window(app: app, window: window),
-                onAction: onUsageAction
-            )
+            // A prefix is a navigation folder; actions keep their original window targets.
+            if prefixGroup?.isExpandable != true {
+                DashboardUsageMenu(
+                    target: window.isWebsite ? .website(app: app, domain: window.displayName) : .window(app: app, window: window),
+                    onAction: onUsageAction
+                )
+            }
         }
     }
 
@@ -836,7 +805,8 @@ struct AppUsageListView: View {
         .buttonStyle(.plain)
         .help("Open details")
         .contextMenu {
-            DashboardUsageMenu(target: .tab(app: app, window: tab), onAction: onUsageAction)
+            DashboardUsageMenu(target: app.isBrowser ? .tab(app: app, window: tab) : .window(app: app, window: tab),
+                               onAction: onUsageAction)
         }
         .contentShape(Rectangle())
         .onHover { hovering in
@@ -852,8 +822,9 @@ struct AppUsageListView: View {
     }
 
     /// Load more button for domain tabs
-    private func domainTabLoadMoreButton(domainKey: String, remainingCount: Int, layoutSize: AppUsageLayoutSize) -> some View {
+    private func domainTabLoadMoreButton(domainKey: String, remainingCount: Int, layoutSize: AppUsageLayoutSize, isPrefixGroup: Bool = false) -> some View {
         Button(action: {
+            if isPrefixGroup { onGroupingAction?("more_windows", true) }
             withAnimation(.easeInOut(duration: 0.2)) {
                 let currentCount = displayedDomainTabCounts[domainKey] ?? initialDomainTabCount
                 displayedDomainTabCounts[domainKey] = currentCount + 5
@@ -1035,12 +1006,10 @@ struct AppUsageListView: View {
     // MARK: - Expansion Logic
 
     private func toggleExpansion(for app: AppUsageData) {
-        expandedPrefix = nil
-        prefixWindowCounts = [:]
         let isExpanded = expandedAppBundleID == app.appBundleID
         let cachedRows = windowUsageCache[app.appBundleID]
         let isLoading = loadingWindows.contains(app.appBundleID)
-        let shouldStartLoad = !isExpanded && !isLoading && (cachedRows == nil || (groupWindowsByHyphen && !app.isBrowser && prefixGroups[app.appBundleID] == nil))
+        let shouldStartLoad = !isExpanded && !isLoading && cachedRows == nil
 
         let applyExpansionChange = {
             if isExpanded {
@@ -1070,18 +1039,15 @@ struct AppUsageListView: View {
         guard let loader = loadWindowUsage, !loadingWindows.contains(app.appBundleID) else { return }
 
         loadingWindows.insert(app.appBundleID)
-        let requestedCount = max(desiredVisibleCount, initialWindowCount)
+        // Non-browser groups need all titles for accurate totals, regardless of visible row count.
+        let requestedCount = app.isBrowser ? max(desiredVisibleCount, initialWindowCount) : Int.max
         Log.info(
             "[Dashboard] Loading paged window usage bundleID=\(app.appBundleID) desiredVisibleCount=\(desiredVisibleCount) requestedCount=\(requestedCount)",
             category: .ui
         )
 
         Task {
-            var page = await loader(app.appBundleID, requestedCount)
-            // Prefix totals must include windows beyond the visible page.
-            if !app.isBrowser && groupWindowsByHyphen && page.totalCount > page.rows.count {
-                page = await loader(app.appBundleID, page.totalCount)
-            }
+            let page = await loader(app.appBundleID, requestedCount)
             let rows = page.rows
             let bundleID = app.appBundleID
             let groups = await Task.detached(priority: .userInitiated) {
@@ -1094,10 +1060,6 @@ struct AppUsageListView: View {
                 windowUsageCache[app.appBundleID] = page.rows
                 windowUsageTotalCounts[app.appBundleID] = page.totalCount
                 loadingWindows.remove(app.appBundleID)
-                // A preference change during the load must join and finish the full load.
-                if groupWindowsByHyphen && !app.isBrowser && page.rows.count < page.totalCount {
-                    loadWindowData(for: app, desiredVisibleCount: page.totalCount)
-                }
                 Log.info(
                     "[Dashboard] Loaded paged window usage bundleID=\(app.appBundleID) cachedRows=\(page.rows.count) totalCount=\(page.totalCount) requestedCount=\(requestedCount)",
                     category: .ui

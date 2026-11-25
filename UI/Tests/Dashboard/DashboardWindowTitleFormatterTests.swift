@@ -21,6 +21,16 @@ final class DashboardWindowTitleFormatterTests: XCTestCase {
         XCTAssertEqual(groups.flatMap(\.windows).count, windows.count)
     }
 
+    func testPlainTitlesStayLeafRowsWhileHyphenPrefixesExpand() {
+        let windows = [
+            WindowUsageData(windowName: "Workspace - Plan", duration: 20, percentage: 0.5),
+            WindowUsageData(windowName: "Music", duration: 20, percentage: 0.5)
+        ]
+        let groups = DashboardWindowGrouping.groups(windows, appBundleID: "com.example.workspace")
+        XCTAssertTrue(groups.first { $0.title == "Workspace" }!.isExpandable)
+        XCTAssertFalse(groups.first { $0.title == "Music" }!.isExpandable)
+    }
+
     func testPrefixUsesOnlyFirstSpacedHyphenAndPreservesOtherHyphens() {
         let titles = ["  Work - Detail - More  ", "check-in", " - Detail", "Work - ", "", "Music"]
         XCTAssertEqual(titles.map(DashboardWindowGrouping.prefix),
