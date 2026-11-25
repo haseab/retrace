@@ -7,6 +7,7 @@ import Processing
 import Search
 import Migration
 import CoreGraphics
+import AppKit
 import ImageIO
 import CryptoKit
 
@@ -335,6 +336,38 @@ public final class PipelineStatusHolder: @unchecked Sendable {
         defer { lock.unlock() }
         _maxPendingRequests = _pendingActorRequests
         _slowResponseCount = 0
+    }
+}
+
+/// Secondary display payload associated with a primary timeline frame.
+/// `videoInfo` is nil when the display was connected but has no prior frame to carry forward yet.
+public struct SecondaryDisplayFrameInfo: Sendable, Equatable {
+    public let displayID: UInt32
+    public let videoInfo: FrameVideoInfo?
+
+    public init(displayID: UInt32, videoInfo: FrameVideoInfo?) {
+        self.displayID = displayID
+        self.videoInfo = videoInfo
+    }
+}
+
+/// Timeline payload with primary frame + embedded secondary display rows.
+public struct TimelineFramePayload: Sendable, Equatable {
+    public let frame: FrameReference
+    public let videoInfo: FrameVideoInfo?
+    public let processingStatus: Int
+    public let secondaryFrames: [SecondaryDisplayFrameInfo]
+
+    public init(
+        frame: FrameReference,
+        videoInfo: FrameVideoInfo?,
+        processingStatus: Int,
+        secondaryFrames: [SecondaryDisplayFrameInfo]
+    ) {
+        self.frame = frame
+        self.videoInfo = videoInfo
+        self.processingStatus = processingStatus
+        self.secondaryFrames = secondaryFrames
     }
 }
 
@@ -778,6 +811,7 @@ public actor AppCoordinator {
 
     private nonisolated let services: ServiceContainer
     private var captureTask: Task<Void, Never>?
+    private var isPipelineLoopActive = false
     // ⚠️ RELEASE 2 ONLY
     // private var audioTask: Task<Void, Never>?
     private var isRunning = false
@@ -790,9 +824,11 @@ public actor AppCoordinator {
     /// Thread-safe status holder for UI polling without actor hop
     public nonisolated let statusHolder = PipelineStatusHolder()
 
-    // Segment tracking (app focus sessions - Rewind compatible)
-    private var currentSegmentID: Int64?
+    // Segment tracking keyed by display ID (one app/session stream per display)
+    private var currentSegmentIDsByDisplay: [UInt32: Int64] = [:]
 
+    // Idle detection per display
+    private var lastFrameTimestampByDisplay: [UInt32: Date] = [:]
     private struct RecentClosedNilBrowserURLSegment: Sendable {
         let segmentID: Int64
         let bundleID: String
@@ -804,7 +840,6 @@ public actor AppCoordinator {
     private let recentClosedSegmentBackfillWindowSeconds: TimeInterval = 3.0
 
     // Idle detection - track last frame timestamp to detect gaps
-    private var lastFrameTimestamp: Date?
 
     // Timeline visibility tracking - pause capture when timeline is open
     private var isTimelineVisible = false
@@ -815,6 +850,7 @@ public actor AppCoordinator {
     // Signal to flush pending frames to the OCR queue
     private var shouldFlushPendingFrames = false
     private var pendingVideoWriterRotationReason: String?
+    private var captureWALJournal: CaptureWALJournal?
 
     // Permission monitoring - stops recording gracefully if permissions are revoked
     private var permissionMonitorSetup = false
@@ -822,6 +858,11 @@ public actor AppCoordinator {
     // Storage health notifications (volume mount, used to trigger cache validation)
     private var storageHealthObserverTokens: [NSObjectProtocol] = []
 
+    // Display topology monitoring (tracks connect/disconnect display sessions)
+    private var displayTopologyObserver: NSObjectProtocol?
+    private var displaySessionFallbackTask: Task<Void, Never>?
+    /// Coalesced cadence for lightweight background maintenance checks (2 minutes).
+    private static let displaySessionMaintenanceInterval: Duration = .seconds(120)
     // Critical crash recovery can start in the background during launch, but capture
     // start must join the same task so WAL recovery and live writes never overlap.
     // Best-effort orphaned-frame re-enqueue is deferred to a separate background task.
@@ -951,7 +992,12 @@ public actor AppCoordinator {
         )
 
         if isRunning {
-            pendingVideoWriterRotationReason = "video_quality_update"
+            if let journal = captureWALJournal {
+                await journal.rotate()
+                pendingVideoWriterRotationReason = nil
+            } else {
+                pendingVideoWriterRotationReason = "video_quality_update"
+            }
             Log.info(
                 "[AppCoordinator] Video quality updated to \(clampedQuality); active video writers will rotate on the next frame",
                 category: .app
@@ -1497,6 +1543,17 @@ public actor AppCoordinator {
             await self.updateConferenceConsentMenuState(with: event)
         }
 
+        // Persist privacy-filtered pixels before capture's delivery queue. The
+        // same writer/record is reused by the encoding consumer.
+        let journal = CaptureWALJournal(storage: services.storage)
+        captureWALJournal = journal
+        await services.capture.setFramePersistenceHandler { [weak self, journal] frame in
+            guard let self, await self.shouldJournalCapturedFrame(frame) else { return nil }
+            return try await journal.persist(frame)
+        }
+        await services.capture.setDisplayJournalRetirementHandler { [journal] displays in
+            await journal.retireDisconnectedDisplays(keeping: displays)
+        }
         // Start screen capture
         try await services.capture.startCapture(config: await services.capture.getConfig())
 
@@ -1528,6 +1585,9 @@ public actor AppCoordinator {
         // Save recording state for persistence across restarts
         saveRecordingState(true)
 
+        // Start display session monitoring and reconcile current connected displays.
+        await startDisplaySegmentMonitoring()
+
         // Start unified storage health monitoring (disk space, I/O latency, volume events, keep-alive)
         startStorageHealthNotifications()
         let storageRoot = await services.storage.getStorageDirectory().path
@@ -1552,21 +1612,31 @@ public actor AppCoordinator {
 
         Log.info("Stopping capture pipeline...", category: .app)
 
-        await suspendPipelineInfrastructure()
+        let drainingTask = captureTask
+        // Mark intentional stop before ending the stream, so a fast drain cannot
+        // be misclassified as an unexpected capture failure.
+        finalizePipelineStopped(persistState: persistState, clearCaptureTask: false, cancelCaptureTask: false)
 
-        // Stop screen capture
-        try await services.capture.stopCapture()
+        // Stop producing, finish the current WAL admission, then drain accepted
+        // frames through encoding/metadata/finalization before closing services.
+        try await services.capture.stopCapture(drain: true)
+        await services.capture.setFramePersistenceHandler(nil)
+        await services.capture.setDisplayJournalRetirementHandler(nil)
+        captureWALJournal = nil
+        await suspendPipelineInfrastructure()
 
         // ⚠️ RELEASE 2 ONLY
         // // Stop audio capture
         // try await services.audioCapture.stopCapture()
 
-        finalizePipelineStopped(persistState: persistState, clearCaptureTask: true)
+        await drainingTask?.value
 
         Log.info("Capture pipeline stopped successfully", category: .app)
     }
 
     private func suspendPipelineInfrastructure() async {
+        await stopDisplaySegmentMonitoring()
+        _ = try? await services.database.closeAllOpenDisplaySegments(disconnectedAt: Date())
         await stopPermissionMonitoring()
         let storageRoot = await services.storage.getStorageDirectory().path
         StorageHealthMonitor.shared.startMonitoring(
@@ -1577,9 +1647,10 @@ public actor AppCoordinator {
 
     private func finalizePipelineStopped(
         persistState: Bool,
-        clearCaptureTask: Bool
+        clearCaptureTask: Bool,
+        cancelCaptureTask: Bool = true
     ) {
-        captureTask?.cancel()
+        if cancelCaptureTask { captureTask?.cancel() }
         if clearCaptureTask {
             captureTask = nil
         }
@@ -1782,6 +1853,136 @@ public actor AppCoordinator {
             "[AppCoordinator] Applied power settings: ocrEnabled=\(ocrEnabled), level=\(processingLevel), workers=\(workerCount), priority=\(taskPriority), maxFPS=\(maxFPS), preferBgProcessing=\(preferBackground), pauseOnBattery=\(pauseOnBattery), pauseOnLowPowerMode=\(pauseOnLowPowerMode), isLowPowerModeEnabled=\(isLowPowerModeEnabled), power=\(powerSource)",
             category: .app
         )
+    }
+
+    // MARK: - Display Session Monitoring
+
+    private func startDisplaySegmentMonitoring() async {
+        await stopDisplaySegmentMonitoring()
+
+        let observer = await MainActor.run { () -> NSObjectProtocol in
+            NotificationCenter.default.addObserver(
+                forName: NSApplication.didChangeScreenParametersNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                guard let self = self else { return }
+                Task { await self.reconcileDisplaySegments(reason: "didChangeScreenParameters") }
+            }
+        }
+        displayTopologyObserver = observer
+
+        startDisplaySessionFallbackMonitoring()
+        await reconcileDisplaySegments(reason: "pipeline-start")
+    }
+
+    private func stopDisplaySegmentMonitoring() async {
+        stopDisplaySessionFallbackMonitoring()
+
+        guard let observer = displayTopologyObserver else { return }
+        await MainActor.run {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        displayTopologyObserver = nil
+    }
+
+    private func startDisplaySessionFallbackMonitoring() {
+        stopDisplaySessionFallbackMonitoring()
+
+        displaySessionFallbackTask = Task { [weak self] in
+            guard let self = self else { return }
+            while !Task.isCancelled {
+                try? await Task.sleep(for: Self.displaySessionMaintenanceInterval, clock: .continuous)
+                guard !Task.isCancelled else { break }
+                await self.reconcileDisplaySegments(reason: "fallback-2m")
+            }
+        }
+        Log.info("[DisplaySession] Fallback reconcile monitor started (120s interval)", category: .app)
+    }
+
+    private func stopDisplaySessionFallbackMonitoring() {
+        displaySessionFallbackTask?.cancel()
+        displaySessionFallbackTask = nil
+    }
+
+    @MainActor
+    private func runtimeDisplayName(for displayID: UInt32) -> String? {
+        for screen in NSScreen.screens {
+            guard
+                let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber,
+                screenNumber.uint32Value == displayID
+            else {
+                continue
+            }
+
+            let localized = screen.localizedName.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !localized.isEmpty else { return nil }
+
+            if CGDisplayIsBuiltin(CGDirectDisplayID(displayID)) != 0 {
+                if let hostName = Host.current().localizedName?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !hostName.isEmpty {
+                    return hostName
+                }
+            }
+
+            return localized
+        }
+        return nil
+    }
+
+    /// Convert runtime CGDirectDisplayID into a stable hardware-derived ID for persistence.
+    /// `displayID` columns keep their name, but this value is stable across runtime ID reuse.
+    private func stableDisplayID(forRuntimeDisplayID runtimeDisplayID: UInt32) -> UInt32 {
+        DisplayIdentityRegistry.shared.displayID(for: runtimeDisplayID)
+    }
+
+    private func reconcileDisplaySegments(reason: String) async {
+        guard isRunning else { return }
+
+        do {
+            let now = Date()
+            let displays = try await services.capture.getAvailableDisplays()
+            let connectedDisplayIDs = Set(displays.map { stableDisplayID(forRuntimeDisplayID: $0.id) })
+            let openDisplayIDs = Set(try await services.database.getOpenDisplaySegmentIDs())
+
+            for display in displays {
+                let stableDisplayID = self.stableDisplayID(forRuntimeDisplayID: display.id)
+                let runtimeName = await runtimeDisplayName(for: display.id)
+                let name = runtimeName ??
+                    display.name.flatMap { $0.isEmpty ? nil : $0 } ??
+                    "Display \(display.id)"
+                try await services.database.upsertDisplayName(
+                    displayID: stableDisplayID,
+                    name: name,
+                    seenAt: now
+                )
+            }
+
+            let displayIDsToOpen = connectedDisplayIDs.subtracting(openDisplayIDs)
+            for displayID in Array(displayIDsToOpen).sorted() {
+                _ = try await services.database.openDisplaySegment(
+                    displayID: displayID,
+                    connectedAt: now
+                )
+            }
+
+            let displayIDsToClose = openDisplayIDs.subtracting(connectedDisplayIDs)
+            for displayID in Array(displayIDsToClose).sorted() {
+                _ = try await services.database.closeOpenDisplaySegment(
+                    displayID: displayID,
+                    disconnectedAt: now
+                )
+            }
+
+            if !displayIDsToOpen.isEmpty || !displayIDsToClose.isEmpty {
+                Log.info(
+                    "[DisplaySession] Reconciled (\(reason)) opened=\(Array(displayIDsToOpen).sorted()) closed=\(Array(displayIDsToClose).sorted())",
+                    category: .app
+                )
+            }
+        } catch {
+            Log.error("[DisplaySession] Failed to reconcile display segments (\(reason)): \(error)", category: .app)
+        }
     }
 
     // MARK: - Storage Health (delegated to StorageHealthMonitor)
@@ -2017,7 +2218,7 @@ public actor AppCoordinator {
         let acceptedAt: Date
     }
 
-    /// State for tracking a video writer by resolution
+    /// State for tracking a video writer by display + resolution
     private struct VideoWriterState {
         var writer: SegmentWriter
         var videoDBID: Int64
@@ -2028,6 +2229,12 @@ public actor AppCoordinator {
         var pendingFrames: [BufferedFrame]
         var width: Int
         var height: Int
+        /// Display ID this writer is associated with (for multi-display support)
+        var displayID: UInt32
+    }
+
+    private func shouldJournalCapturedFrame(_ frame: CapturedFrame) -> Bool {
+        !isTimelineVisible && frame.metadata.appBundleID != "com.apple.loginwindow"
     }
 
     /// Main pipeline: Capture → Storage → Processing → Database → Search
@@ -2036,14 +2243,22 @@ public actor AppCoordinator {
     /// preview-cache writes, or persisted stop notifications.
     func runPipeline(
         frameStream suppliedFrameStream: AsyncStream<CapturedFrame>? = nil,
+        eventStream suppliedEventStream: AsyncStream<CaptureStreamEvent>? = nil,
         cacheCapturedStills: Bool = true,
         reportUnexpectedStops: Bool = true
     ) async {
+        guard !isPipelineLoopActive else { return }
+        isPipelineLoopActive = true
+        defer { isPipelineLoopActive = false }
         Log.info("Pipeline processing started", category: .app)
 
-        let frameStream: AsyncStream<CapturedFrame>
-        if let suppliedFrameStream { frameStream = suppliedFrameStream }
-        else { frameStream = await services.capture.frameStream }
+        let eventStream: AsyncStream<CaptureStreamEvent>
+        if let suppliedEventStream { eventStream = suppliedEventStream }
+        else if let suppliedFrameStream {
+            // The unfolding adapter preserves backpressure without a pump task.
+            let iterator = CaptureFrameStreamIterator(stream: suppliedFrameStream)
+            eventStream = AsyncStream(unfolding: { await iterator.next() })
+        } else { eventStream = await services.capture.eventStream }
         var writersByResolution: [String: VideoWriterState] = [:]
         var pendingUnexpectedStop: PendingUnexpectedRecordingStop?
         var lastPipelineMemoryLogAt = Date.distantPast
@@ -2073,7 +2288,28 @@ public actor AppCoordinator {
             )
         }
 
-        for await frame in frameStream {
+        for await event in eventStream {
+            if Task.isCancelled { break }
+            if case .retainDisplays(let displays) = event {
+                for key in Array(writersByResolution.keys) {
+                    guard var state = writersByResolution[key],
+                          !displays.contains(state.displayID) else { continue }
+                    do {
+                        try await finalizeWriter(&state, processingQueue: await services.processingQueue)
+                    } catch {
+                        totalErrors += 1
+                        statusHolder.incrementErrors()
+                        Log.error("Failed to close disconnected display writer", category: .app, error: error)
+                        // Finalization may already have finished encoding and
+                        // removed its WAL before the database update failed.
+                        // Cancellation deletes that video; preserve both files
+                        // here for recovery instead of discarding durable pixels.
+                    }
+                    writersByResolution.removeValue(forKey: key)
+                }
+                continue
+            }
+            guard case .frame(let frame) = event else { continue }
             Log.verbose("[Pipeline] Received frame from stream: \(frame.width)x\(frame.height), app=\(frame.metadata.appName)", category: .app)
 
             if Task.isCancelled {
@@ -2081,10 +2317,12 @@ public actor AppCoordinator {
                 break
             }
 
-            await rotateActiveVideoWritersIfNeeded(&writersByResolution)
+            if frame.journalReceipt == nil {
+                await rotateActiveVideoWritersIfNeeded(&writersByResolution)
+            }
 
             // Skip frames entirely when loginwindow is frontmost (lock screen, login, etc.)
-            if frame.metadata.appBundleID == "com.apple.loginwindow" {
+            if frame.journalReceipt == nil, frame.metadata.appBundleID == "com.apple.loginwindow" {
                 continue
             }
 
@@ -2112,31 +2350,54 @@ public actor AppCoordinator {
                         }
                     }
                 }
-                continue
+                if frame.journalReceipt == nil { continue }
             }
 
             do {
-                let resolutionKey = "\(frame.width)x\(frame.height)"
+                // Key by displayID + resolution to prevent two same-resolution displays from sharing a video file
+                let displayID = frame.metadata.displayID
+                let resolutionKey = "\(displayID)_\(frame.width)x\(frame.height)"
+                // A display has one resolution at a time. FIFO ordering ensures
+                // all receipts for its previous resolution have already drained.
+                for key in Array(writersByResolution.keys) where key != resolutionKey {
+                    guard var previous = writersByResolution[key], previous.displayID == displayID else { continue }
+                    try await finalizeWriter(&previous, processingQueue: await services.processingQueue)
+                    writersByResolution.removeValue(forKey: key)
+                }
                 var writerState: VideoWriterState
 
-                if var existingState = writersByResolution[resolutionKey] {
+                if let receipt = frame.journalReceipt {
+                    if let existing = writersByResolution[resolutionKey],
+                       await existing.writer.segmentID == receipt.segmentID {
+                        writerState = existing
+                    } else {
+                        if var previous = writersByResolution.removeValue(forKey: resolutionKey) {
+                            try await finalizeWriter(&previous, processingQueue: await services.processingQueue)
+                        }
+                        writerState = try await createNewWriterState(width: frame.width, height: frame.height,
+                            displayID: displayID, journalReceipt: receipt)
+                        writersByResolution[resolutionKey] = writerState
+                    }
+                } else if var existingState = writersByResolution[resolutionKey] {
                     if existingState.frameCount >= maxFramesPerSegment {
                         try await finalizeWriter(&existingState, processingQueue: await services.processingQueue)
                         writersByResolution.removeValue(forKey: resolutionKey)
-                        writerState = try await createNewWriterState(width: frame.width, height: frame.height)
+                        writerState = try await createNewWriterState(width: frame.width, height: frame.height, displayID: displayID)
                         writersByResolution[resolutionKey] = writerState
                     } else {
                         writerState = existingState
                     }
                 } else {
-                    if let unfinalised = try await services.database.getUnfinalisedVideoByResolution(
+                    // Try display-aware lookup first, fall back to resolution-only for legacy
+                    if let unfinalised = try await services.database.getUnfinalisedVideoByDisplayAndResolution(
+                        displayID: displayID,
                         width: frame.width,
                         height: frame.height
                     ), try await shouldResumeUnfinalisedVideo(unfinalised) {
-                        Log.info("Resuming unfinalised video \(unfinalised.id) for resolution \(resolutionKey)", category: .app)
+                        Log.info("Resuming unfinalised video \(unfinalised.id) for display \(displayID)", category: .app)
                         writerState = try await resumeWriterState(from: unfinalised)
                     } else {
-                        writerState = try await createNewWriterState(width: frame.width, height: frame.height)
+                        writerState = try await createNewWriterState(width: frame.width, height: frame.height, displayID: displayID)
                     }
                     writersByResolution[resolutionKey] = writerState
                 }
@@ -2181,10 +2442,8 @@ public actor AppCoordinator {
                     writerState.height = await writerState.writer.frameHeight
                 }
 
-                try await trackSessionChange(frame: frame)
-
-                guard let appSegmentID = currentSegmentID else {
-                    Log.warning("No current app segment ID for frame insertion", category: .app)
+                guard let appSegmentID = try await trackSessionChange(frame: frame) else {
+                    Log.warning("No segment available for frame insertion (display=\(frame.metadata.displayID))", category: .app)
                     writersByResolution[resolutionKey] = writerState
                     continue
                 }
@@ -2270,6 +2529,11 @@ public actor AppCoordinator {
 
                 // Add frame to the pending buffer
                 writerState.pendingFrames.append(bufferedFrame)
+                if isTimelineVisible, frame.journalReceipt != nil {
+                    // This frame was captured before timeline opened. Its WAL
+                    // is readable now, even if the video fragment is not yet.
+                    try await processingQueue.enqueue(frameID: frameID)
+                }
 
                 // Check if first fragment has been written (makes video readable at all)
                 if !writerState.isReadable {
@@ -2369,7 +2633,7 @@ public actor AppCoordinator {
                 // File write failures mean the active writer is no longer trustworthy.
                 // Stop recording instead of pretending capture is still healthy.
                 if case .fileWriteFailed = error {
-                    let resolutionKey = "\(frame.width)x\(frame.height)"
+                    let resolutionKey = "\(frame.metadata.displayID)_\(frame.width)x\(frame.height)"
                     if let brokenWriter = writersByResolution[resolutionKey] {
                         let summary =
                             "File write failed for videoDBID=\(brokenWriter.videoDBID) at \(resolutionKey). " +
@@ -2440,14 +2704,12 @@ public actor AppCoordinator {
             }
         }
 
-        if let segmentID = currentSegmentID {
-            let shutdownEndDate = Self.segmentEndDateForShutdown(
-                lastFrameTimestamp: lastFrameTimestamp,
-                shutdownTimestamp: Date()
-            )
-            try? await services.database.updateSegmentEndDate(id: segmentID, endDate: shutdownEndDate)
-            currentSegmentID = nil
+        for (displayID, segmentID) in currentSegmentIDsByDisplay {
+            let endDate = lastFrameTimestampByDisplay[displayID] ?? Date()
+            try? await services.database.updateSegmentEndDate(id: segmentID, endDate: endDate)
         }
+        currentSegmentIDsByDisplay.removeAll()
+        lastFrameTimestampByDisplay.removeAll()
 
         if let pendingUnexpectedStop, reportUnexpectedStops {
             let state = await recordUnexpectedRecordingStop(pendingUnexpectedStop)
@@ -2625,6 +2887,12 @@ public actor AppCoordinator {
         guard result.affectedFrameCount > 0 else { return .empty }
 
         removeTimelineDiskCacheStills(frameIDs: result.affectedFrameIDs)
+        // Publish persisted deletion intent before waiting for video rewrites.
+        // Queued deletions are already excluded by database display lookups.
+        await MainActor.run {
+            NotificationCenter.default.post(name: FrameDeletionNotification.didDelete, object: self,
+                userInfo: [FrameDeletionNotification.frameIDsKey: Set(result.affectedFrameIDs.map { FrameID(value: $0) })])
+        }
 
         let scheduledFrameIDs = Set(result.scheduledJobs.map(\.frameID))
         var queuedScheduledFrameIDs = Set<Int64>()
@@ -2773,8 +3041,11 @@ public actor AppCoordinator {
         return outputData as Data
     }
 
-    private func createNewWriterState(width: Int, height: Int) async throws -> VideoWriterState {
-        let writer = try await services.storage.createSegmentWriter()
+    private func createNewWriterState(width: Int, height: Int, displayID: UInt32 = 0,
+                                      journalReceipt: CapturedFrameJournalReceipt? = nil) async throws -> VideoWriterState {
+        let writer: any SegmentWriter
+        if let receipt = journalReceipt { writer = receipt.writer }
+        else { writer = try await services.storage.createSegmentWriter() }
         let relativePath = await writer.relativePath
 
         let placeholderSegment = VideoSegment(
@@ -2787,8 +3058,8 @@ public actor AppCoordinator {
             width: width,
             height: height
         )
-        let videoDBID = try await services.database.insertVideoSegment(placeholderSegment)
-        Log.debug("New video segment created with DB ID: \(videoDBID) for resolution \(width)x\(height)", category: .app)
+        let videoDBID = try await services.database.insertVideoSegment(placeholderSegment, displayID: displayID)
+        Log.debug("New video segment created with DB ID: \(videoDBID) for display \(displayID) resolution \(width)x\(height)", category: .app)
 
         return VideoWriterState(
             writer: writer,
@@ -2798,7 +3069,8 @@ public actor AppCoordinator {
             persistedReadableFrameCount: 0,
             pendingFrames: [],
             width: width,
-            height: height
+            height: height,
+            displayID: displayID
         )
     }
 
@@ -2825,7 +3097,7 @@ public actor AppCoordinator {
             width: unfinalised.width,
             height: unfinalised.height
         )
-        let videoDBID = try await services.database.insertVideoSegment(placeholderSegment)
+        let videoDBID = try await services.database.insertVideoSegment(placeholderSegment, displayID: unfinalised.displayID)
 
         return VideoWriterState(
             writer: writer,
@@ -2835,7 +3107,8 @@ public actor AppCoordinator {
             persistedReadableFrameCount: 0,
             pendingFrames: [],
             width: unfinalised.width,
-            height: unfinalised.height
+            height: unfinalised.height,
+            displayID: unfinalised.displayID
         )
     }
 
@@ -3255,12 +3528,15 @@ public actor AppCoordinator {
         }
     }
 
-    /// Track app/window changes and create/close segments accordingly
+    /// Track app/window changes and create/close segments per display accordingly.
     /// Also handles idle detection - if no frames for longer than idleThresholdSeconds,
     /// closes the current segment and creates a new one on the next frame
-    private func trackSessionChange(frame: CapturedFrame) async throws {
+    /// - Returns: The active segment ID for this frame's display, or nil when frame
+    ///   metadata is insufficient to create/resolve a segment.
+    private func trackSessionChange(frame: CapturedFrame) async throws -> Int64? {
         let metadata = frame.metadata
         let captureConfig = await services.capture.getConfig()
+        let displayID = metadata.displayID
         let normalizedBrowserURL: String?
         if let rawBrowserURL = metadata.browserURL?.trimmingCharacters(in: .whitespacesAndNewlines),
            !rawBrowserURL.isEmpty {
@@ -3270,35 +3546,50 @@ public actor AppCoordinator {
         }
         pruneRecentClosedNilBrowserURLSegments(referenceTime: frame.timestamp)
 
-        // Get current segment if exists
+        let trimmedBundleID = metadata.appBundleID?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hasValidBundleID = trimmedBundleID != nil && !(trimmedBundleID?.isEmpty ?? true)
+
+        if !hasValidBundleID {
+            if let existingSegmentID = currentSegmentIDsByDisplay[displayID] {
+                lastFrameTimestampByDisplay[displayID] = frame.timestamp
+                return existingSegmentID
+            }
+
+            Log.warning("[Session] Skipping frame - no app metadata and no existing segment (display=\(displayID))", category: .app)
+            return nil
+        }
+
+        let bundleID = trimmedBundleID!
+
+        // Get current segment for this display if one exists.
         var currentSegment: Segment? = nil
-        if let segID = currentSegmentID {
+        if let segID = currentSegmentIDsByDisplay[displayID] {
             currentSegment = try await services.database.getSegment(id: segID)
         }
 
         // Check if app or window changed
-        let appChanged = currentSegment?.bundleID != metadata.appBundleID
+        let appChanged = currentSegment?.bundleID != bundleID
         let windowChanged = currentSegment?.windowName != metadata.windowName
 
-        // Check for idle gap - if time since last frame exceeds threshold, treat as idle
+        // Check for idle gap on this display.
         var idleDetected = false
-        if let lastTimestamp = lastFrameTimestamp,
+        if let lastTimestamp = lastFrameTimestampByDisplay[displayID],
            captureConfig.idleThresholdSeconds > 0,
            currentSegment != nil {
             let timeSinceLastFrame = frame.timestamp.timeIntervalSince(lastTimestamp)
             if timeSinceLastFrame > captureConfig.idleThresholdSeconds {
                 idleDetected = true
-                Log.info("Idle detected: \(Int(timeSinceLastFrame))s gap (threshold: \(Int(captureConfig.idleThresholdSeconds))s)", category: .app)
+                Log.info("Idle detected on display \(displayID): \(Int(timeSinceLastFrame))s gap (threshold: \(Int(captureConfig.idleThresholdSeconds))s)", category: .app)
             }
         }
 
         if appChanged || windowChanged || currentSegment == nil || idleDetected {
             // Close previous segment
-            if let segID = currentSegmentID {
+            if let segID = currentSegmentIDsByDisplay[displayID] {
                 // If we crossed an idle boundary, close at the last observed frame.
                 // Otherwise close at the current transition frame timestamp.
                 let segmentEndDate = Self.segmentEndDateForSessionTransition(
-                    lastFrameTimestamp: lastFrameTimestamp,
+                    lastFrameTimestamp: lastFrameTimestampByDisplay[displayID],
                     transitionTimestamp: frame.timestamp,
                     idleDetected: idleDetected
                 )
@@ -3319,9 +3610,9 @@ public actor AppCoordinator {
                 }
             }
 
-            // Create new segment
+            // Create new segment for this display.
             let newSegmentID = try await services.database.insertSegment(
-                bundleID: metadata.appBundleID ?? "unknown",
+                bundleID: bundleID,
                 startDate: frame.timestamp,
                 endDate: frame.timestamp,  // Will be updated as frames are captured
                 windowName: metadata.windowName,
@@ -3329,7 +3620,7 @@ public actor AppCoordinator {
                 type: 0  // 0 = screen capture
             )
 
-            currentSegmentID = newSegmentID
+            currentSegmentIDsByDisplay[displayID] = newSegmentID
             Log.debug(
                 "Started segment: \(metadata.appBundleID ?? "unknown") [segmentID=\(newSegmentID), windowToken=\(SegmentLogSanitizer.obfuscatedWindowToken(metadata.windowName)), browserURL=\(normalizedBrowserURL == nil ? "nil" : "present")]",
                 category: .app
@@ -3342,7 +3633,7 @@ public actor AppCoordinator {
                     referenceTime: frame.timestamp
                 )
             }
-        } else if let segID = currentSegmentID,
+        } else if let segID = currentSegmentIDsByDisplay[displayID],
                   let browserURL = normalizedBrowserURL {
             let existingBrowserURL: String?
             if let rawBrowserURL = currentSegment?.browserUrl?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -3384,8 +3675,10 @@ public actor AppCoordinator {
             }
         }
 
-        // Update last frame timestamp for idle detection
-        lastFrameTimestamp = frame.timestamp
+        // Update last frame timestamp for idle detection on this display.
+        lastFrameTimestampByDisplay[displayID] = frame.timestamp
+
+        return currentSegmentIDsByDisplay[displayID]
     }
 
     /// Computes segment end time when transitioning between sessions.
@@ -3676,6 +3969,63 @@ public actor AppCoordinator {
         return try await adapter.getFramesWithVideoInfo(from: startDate, to: endDate, limit: limit, filters: filters)
     }
 
+    /// Get timeline payloads in a time range with embedded secondary display rows.
+    /// Uses a single denormalized query for native multi-display timelines.
+    /// Get the nearest frame for a specific display at or before a given timestamp.
+    /// Used for PIP carry-forward when a secondary display has no exact frame at the current timestamp.
+    public func getNearestFrame(displayID: UInt32, before timestamp: Date) async throws -> FrameWithVideoInfo? {
+        guard let adapter = await services.dataAdapter else {
+            return nil
+        }
+        return try await adapter.getNearestFrame(displayID: displayID, before: timestamp)
+    }
+
+    /// Get distinct display IDs that have frames in the given time range.
+    /// Used to discover which displays were active for PIP display.
+    public func getDistinctDisplayIDs(from startDate: Date, to endDate: Date) async throws -> [UInt32] {
+        guard let adapter = await services.dataAdapter else {
+            return []
+        }
+        return try await adapter.getDistinctDisplayIDs(from: startDate, to: endDate)
+    }
+
+    /// Get distinct displays in a time range, including persisted display names when available.
+    public func getDistinctDisplaysWithNames(from startDate: Date, to endDate: Date) async throws -> [(displayID: UInt32, displayName: String?)] {
+        guard let adapter = await services.dataAdapter else {
+            return []
+        }
+        return try await adapter.getDistinctDisplaysWithNames(from: startDate, to: endDate)
+    }
+
+    /// Get secondary display payloads for a set of primary frame IDs in one database round-trip.
+    /// Rows are grouped by primary frame ID and ordered by secondary display ID.
+    public func getSecondaryDisplayFrames(forPrimaryFrameIDs primaryFrameIDs: [FrameID]) async throws -> [Int64: [SecondaryDisplayFrameInfo]] {
+        guard let adapter = await services.dataAdapter else {
+            return [:]
+        }
+        return try await adapter.getSecondaryDisplayFrames(forPrimaryFrameIDs: primaryFrameIDs)
+    }
+
+    /// Get persisted display names for known display IDs.
+    public func getDisplayNames(displayIDs: [UInt32]) async throws -> [UInt32: String] {
+        try await services.database.getDisplayNames(displayIDs: displayIDs)
+    }
+
+    /// Get display IDs connected at a specific timestamp based on display_session rows.
+    public func getConnectedDisplayIDs(at timestamp: Date) async throws -> [UInt32] {
+        try await services.database.getConnectedDisplayIDs(at: timestamp)
+    }
+
+
+    public func getTimelineFramesWithSecondaries(from startDate: Date, to endDate: Date, limit: Int = 500, filters: FilterCriteria? = nil) async throws -> [TimelineFramePayload] {
+        guard let adapter = await services.dataAdapter else {
+            let frames = try await getFramesWithVideoInfo(from: startDate, to: endDate, limit: limit, filters: filters)
+            return frames.map { TimelineFramePayload(frame: $0.frame, videoInfo: $0.videoInfo, processingStatus: $0.processingStatus, secondaryFrames: []) }
+        }
+
+        return try await adapter.getTimelineFramesWithSecondaries(from: startDate, to: endDate, limit: limit, filters: filters)
+    }
+
     /// Get the most recent frames across all sources
     /// Returns frames sorted by timestamp descending (newest first)
     public func getMostRecentFrames(limit: Int = 500, filters: FilterCriteria? = nil) async throws -> [FrameReference] {
@@ -3696,6 +4046,16 @@ public actor AppCoordinator {
         }
 
         return try await adapter.getMostRecentFramesWithVideoInfo(limit: limit, filters: filters)
+    }
+
+    /// Get most recent timeline payloads with embedded secondary display rows.
+    public func getMostRecentTimelineFramesWithSecondaries(limit: Int = 500, filters: FilterCriteria? = nil) async throws -> [TimelineFramePayload] {
+        guard let adapter = await services.dataAdapter else {
+            let frames = try await getMostRecentFramesWithVideoInfo(limit: limit, filters: filters)
+            return frames.map { TimelineFramePayload(frame: $0.frame, videoInfo: $0.videoInfo, processingStatus: $0.processingStatus, secondaryFrames: []) }
+        }
+
+        return try await adapter.getMostRecentTimelineFramesWithSecondaries(limit: limit, filters: filters)
     }
 
     /// Get frames before a timestamp (for infinite scroll - loading older frames)
@@ -3720,6 +4080,16 @@ public actor AppCoordinator {
         return try await adapter.getFramesWithVideoInfoBefore(timestamp: timestamp, limit: limit, filters: filters)
     }
 
+    /// Get timeline payloads before a timestamp with embedded secondary display rows.
+    public func getTimelineFramesWithSecondariesBefore(timestamp: Date, limit: Int = 300, filters: FilterCriteria? = nil) async throws -> [TimelineFramePayload] {
+        guard let adapter = await services.dataAdapter else {
+            let frames = try await getFramesWithVideoInfoBefore(timestamp: timestamp, limit: limit, filters: filters)
+            return frames.map { TimelineFramePayload(frame: $0.frame, videoInfo: $0.videoInfo, processingStatus: $0.processingStatus, secondaryFrames: []) }
+        }
+
+        return try await adapter.getTimelineFramesWithSecondariesBefore(timestamp: timestamp, limit: limit, filters: filters)
+    }
+
     /// Get frames after a timestamp (for infinite scroll - loading newer frames)
     /// Returns frames sorted by timestamp ascending (oldest first of the newer batch)
     public func getFramesAfter(timestamp: Date, limit: Int = 300, filters: FilterCriteria? = nil) async throws -> [FrameReference] {
@@ -3740,6 +4110,16 @@ public actor AppCoordinator {
         }
 
         return try await adapter.getFramesWithVideoInfoAfter(timestamp: timestamp, limit: limit, filters: filters)
+    }
+
+    /// Get timeline payloads after a timestamp with embedded secondary display rows.
+    public func getTimelineFramesWithSecondariesAfter(timestamp: Date, limit: Int = 300, filters: FilterCriteria? = nil) async throws -> [TimelineFramePayload] {
+        guard let adapter = await services.dataAdapter else {
+            let frames = try await getFramesWithVideoInfoAfter(timestamp: timestamp, limit: limit, filters: filters)
+            return frames.map { TimelineFramePayload(frame: $0.frame, videoInfo: $0.videoInfo, processingStatus: $0.processingStatus, secondaryFrames: []) }
+        }
+
+        return try await adapter.getTimelineFramesWithSecondariesAfter(timestamp: timestamp, limit: limit, filters: filters)
     }
 
     /// Get the timestamp of the most recent frame across all sources
@@ -5407,6 +5787,10 @@ public actor AppCoordinator {
 
     private static func globalMousePosition(in frame: CapturedFrame) -> PendingInPageURLMetadataPoint? {
         guard frame.width > 0, frame.height > 0 else { return nil }
+        if let capturedPosition = frame.metadata.mousePosition {
+            return PendingInPageURLMetadataPoint(x: roundedMetadataCoordinate(capturedPosition.x),
+                                                 y: roundedMetadataCoordinate(capturedPosition.y))
+        }
 
         guard let event = CGEvent(source: nil) else { return nil }
         let location = event.location
@@ -6138,5 +6522,16 @@ private final class MigrationProgressDelegate: MigrationDelegate, @unchecked Sen
 
     func migrationDidFail(error: Error) {
         Log.error("[Migration] Failed", category: .app, error: error)
+    }
+}
+
+// Only the unfolding stream consumer calls next; no producer/prefetch task
+// accesses this iterator. AsyncStream requires the unfolding closure to be Sendable.
+private final class CaptureFrameStreamIterator: @unchecked Sendable {
+    private var iterator: AsyncStream<CapturedFrame>.Iterator
+    init(stream: AsyncStream<CapturedFrame>) { iterator = stream.makeAsyncIterator() }
+    func next() async -> CaptureStreamEvent? {
+        guard let frame = await iterator.next() else { return nil }
+        return .frame(frame)
     }
 }

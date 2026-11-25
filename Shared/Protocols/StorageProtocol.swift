@@ -213,6 +213,9 @@ public protocol SegmentWriter: Actor {
     /// Frames with frameIndex < this value are guaranteed to be readable from the video file
     var framesFlushedToDisk: Int { get }
 
+    /// Persist pixels before capture delivery; returns the exact WAL frame index.
+    func persistFrameToWAL(_ frame: CapturedFrame) async throws -> Int
+
     /// Append a frame to the segment
     func appendFrame(_ frame: CapturedFrame) async throws
 
@@ -222,6 +225,12 @@ public protocol SegmentWriter: Actor {
 
     /// Cancel writing and delete partial file
     func cancel() async throws
+}
+
+public extension SegmentWriter {
+    func persistFrameToWAL(_ frame: CapturedFrame) async throws -> Int {
+        throw StorageError.walUnavailable(reason: "This writer does not support capture-time journaling")
+    }
 }
 
 // MARK: - Video Codec Configuration

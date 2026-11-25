@@ -32,7 +32,7 @@ final class ProcessingStatusIndexTests: XCTestCase {
             try self.execute(db, """
                 DROP INDEX idx_frame_processing_status;
                 CREATE INDEX idx_frame_processing_status ON frame(processingStatus);
-                DELETE FROM schema_migrations WHERE version=20;
+                DELETE FROM schema_migrations WHERE version>=20;
                 """)
             let previousBytes = try self.scalar(db, "SELECT SUM(pgsize) FROM dbstat WHERE name='idx_frame_processing_status';")
             let runner = MigrationRunner(db: db)
@@ -101,7 +101,7 @@ final class ProcessingStatusIndexTests: XCTestCase {
             try self.execute(db, """
                 DROP INDEX idx_frame_processing_status;
                 CREATE INDEX idx_frame_processing_status ON frame(processingStatus);
-                DELETE FROM schema_migrations WHERE version=20;
+                DELETE FROM schema_migrations WHERE version>=20;
                 """)
             sqlite3_set_authorizer(db, { _, action, _, _, _, _ in
                 action == SQLITE_CREATE_INDEX ? SQLITE_DENY : SQLITE_OK

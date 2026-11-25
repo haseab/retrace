@@ -993,7 +993,8 @@ public actor CGWindowListCapture {
                    windowInfo,
                    foregroundPID: foregroundPID,
                    bundleID: bundleID,
-                   displayBounds: displayBounds
+                   displayBounds: displayBounds,
+                   requireForegroundApp: !config.recordAllDisplays
                ) {
                 visibleWindowContext = VisibleWindowContext(
                     windowID: windowID,

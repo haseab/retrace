@@ -305,6 +305,8 @@ public struct TimelineFrame: Identifiable, Equatable {
     public let videoInfo: FrameVideoInfo?
     /// Processing status: 0=pending, 1=processing, 2=completed, 3=failed, 4=not yet readable
     public let processingStatus: Int
+    /// Secondary display payloads associated with this frame's timestamp.
+    public let secondaryFrames: [SecondaryDisplayFrameInfo]
     public let videoCurrentTime: Double?
     public let scrollY: Double?
 
@@ -313,13 +315,15 @@ public struct TimelineFrame: Identifiable, Equatable {
         videoInfo: FrameVideoInfo?,
         processingStatus: Int,
         videoCurrentTime: Double? = nil,
-        scrollY: Double? = nil
+        scrollY: Double? = nil,
+        secondaryFrames: [SecondaryDisplayFrameInfo] = []
     ) {
         self.frame = frame
         self.videoInfo = videoInfo
         self.processingStatus = processingStatus
         self.videoCurrentTime = videoCurrentTime
         self.scrollY = scrollY
+        self.secondaryFrames = secondaryFrames
     }
 
     public init(frameWithVideoInfo: FrameWithVideoInfo) {
@@ -692,10 +696,14 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     /// Current index in the frames array - THE SINGLE SOURCE OF TRUTH
-    /// Everything else (currentFrame, currentVideoInfo, currentTimestamp) derives from this
+    /// Selects the tape anchor; pinned presentation resolves one complete frame at that timestamp.
     @Published public var currentIndex: Int = 0 {
         didSet {
             if currentIndex != oldValue {
+                if isPrimaryDisplayPinned {
+                    invalidatePinnedPrimaryFrame()
+                    schedulePIPUpdate()
+                }
                 resetFrameTextScan()
                 endInPageURLHoverTracking()
                 cancelPresentationOverlayTasks()
@@ -738,6 +746,9 @@ public class SimpleTimelineViewModel: ObservableObject {
                     }
                 }
 
+                // Keep primary display selection aligned with segment boundaries
+                // for all index changes (including direct index assignment paths).
+                syncPrimaryDisplaySelection()
                 updateDeferredTrimAnchorForCurrentSelectionIfNeeded()
             }
         }
@@ -836,6 +847,10 @@ public class SimpleTimelineViewModel: ObservableObject {
             applyDeferredTrimIfNeeded(trigger: "scroll-ended")
         }
     }
+
+    /// Whether the pointer is currently over the floating multi-display stack.
+    /// Used by the window controller to avoid hijacking stack scroll events.
+    @Published public var isDisplayStackHovering = false
 
     /// Currently selected frame index (for deletion, etc.) - nil means no selection
     @Published public var selectedFrameIndex: Int? = nil
@@ -1040,6 +1055,16 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Whether the hint banner has already been shown for the current drag session
     private var hasShownHintThisDrag: Bool = false
 
+    // MARK: - Timeline HUD Toast State
+
+    /// Global top-center HUD toast message (shared feedback channel).
+    @Published public var timelineHUDToastMessage: String?
+
+    /// Controls visibility of the global top-center HUD toast.
+    @Published public var showTimelineHUDToast: Bool = false
+
+    /// Auto-dismiss task for global HUD toast.
+    private var timelineHUDToastDismissTask: Task<Void, Never>?
     // MARK: - Controls Hidden Restore Guidance State
 
     /// Whether to show the top-center restore guidance after hiding controls with Cmd+H.
@@ -1369,6 +1394,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         guard previousSpeed != speed else { return }
 
         playbackSpeed = speed
+        presentTimelineHUDToast(message: "Speed \(speed == 1 ? "1x" : "\(Int(speed))x")")
         if isPlaying {
             // Reschedule timer with new interval
             playbackTimer?.invalidate()
@@ -2100,6 +2126,868 @@ public class SimpleTimelineViewModel: ObservableObject {
         pendingFilterCriteria != filterCriteria
     }
 
+    /// Timeline loads should default to focused stream in native multi-display mode.
+    /// Rewind remains visible because it aliases frames as focused.
+    ///
+    /// In pinned mode we intentionally keep a union timeline (do NOT force displayID)
+    /// so scrubbing span is not reduced to the pinned display's sparse frame count.
+    /// The pinned primary view is resolved via carry-forward nearest-frame logic.
+    private func applyingDisplayPolicy(to filters: FilterCriteria?) -> FilterCriteria {
+        var result = filters ?? FilterCriteria()
+        guard isMultiDisplayEnabled || availableDisplayIDs.count > 1 else { return result }
+        if isPrimaryDisplayPinned, primaryDisplayID != 0 {
+            result.displayID = nil
+            result.focusedOnly = nil
+        } else if result.focusedOnly == nil {
+            result.focusedOnly = true
+        }
+        return result
+    }
+
+    private var effectiveTimelineFilters: FilterCriteria {
+        var effective = filterCriteria
+        if isPrimaryDisplayPinned, primaryDisplayID != 0 {
+            // Keep union tape while pinned, otherwise sparse displays collapse timeline length.
+            // Clearing displayID preserves full scrubbing range across active displays.
+            effective.displayID = nil
+            // Show full stream while pinned (not only globally-focused frames).
+            effective.focusedOnly = nil
+        } else if isMultiDisplayEnabled, effective.focusedOnly == nil {
+            // Default tape remains focused stream only in active multi-display mode.
+            effective.focusedOnly = true
+        }
+        return effective
+    }
+
+    // MARK: - Multi-Display State (PIP for secondary displays)
+
+    /// Display IDs that have frames in the current time range
+    @Published public var availableDisplayIDs: [UInt32] = []
+
+    /// The display ID currently shown fullscreen.
+    /// Default: follows active display for current segment.
+    /// Override: per-segment swap or global pin.
+    @Published public var primaryDisplayID: UInt32 = 0
+
+    /// Whether primary display selection is pinned by user swap (persistent until changed).
+    @Published public var isPrimaryDisplayPinned: Bool = false
+
+    /// Resolve pixels and every frame-scoped action together. The tape keeps its
+    /// union timestamp; a sparse pinned display may carry an older frame forward.
+    @Published private var pinnedPrimaryFrame: TimelineFrame?
+    private var pinnedPrimaryAnchorID: FrameID?
+    private var pinnedPrimaryResolutionGeneration: UInt64 = 0
+
+    private func invalidatePinnedPrimaryFrame() {
+        presentationWorkGeneration &+= 1
+        pinnedPrimaryResolutionGeneration &+= 1
+        pinnedPrimaryFrame = nil
+        pinnedPrimaryAnchorID = nil
+        resetFrameTextScan()
+        cancelPresentationOverlayTasks()
+        cancelForegroundFrameLoad(reason: "primary display changed")
+        clearCurrentFrameOverlayPresentation()
+        clearCurrentImagePresentation()
+        clearWaitingFallbackImage()
+    }
+
+    private func resolvePinnedPrimaryFrame() async {
+        guard isPrimaryDisplayPinned, let anchor = currentTapeFrame else { return }
+        let displayID = primaryDisplayID
+        guard anchor.frame.metadata.displayID != displayID else { return }
+        let generation = pinnedPrimaryResolutionGeneration
+        let resolved: FrameWithVideoInfo?
+        #if DEBUG
+        if let lookup = test_frameOverlayLoadHooks.getNearestDisplayFrame {
+            resolved = try? await lookup(displayID, anchor.frame.timestamp)
+        } else {
+            resolved = try? await coordinator.getNearestFrame(displayID: displayID, before: anchor.frame.timestamp)
+        }
+        #else
+        resolved = try? await coordinator.getNearestFrame(displayID: displayID, before: anchor.frame.timestamp)
+        #endif
+        guard !Task.isCancelled, generation == pinnedPrimaryResolutionGeneration,
+              isPrimaryDisplayPinned, primaryDisplayID == displayID,
+              currentTapeFrame?.frame.id == anchor.frame.id else { return }
+        let next = resolved.flatMap { deletedFrameIDs.contains($0.frame.id) ? nil : TimelineFrame(frameWithVideoInfo: $0) }
+        let changed = pinnedPrimaryAnchorID != anchor.frame.id || pinnedPrimaryFrame != next
+        pinnedPrimaryAnchorID = anchor.frame.id
+        pinnedPrimaryFrame = next
+        if changed {
+            resetFrameTextScan()
+            cancelPresentationOverlayTasks()
+            clearCurrentFrameOverlayPresentation()
+            prepareCurrentFramePresentationState(for: next, previousTimelineFrame: nil)
+            loadImageIfNeeded()
+        }
+    }
+
+    /// Secondary display frames for PIP overlay (one per non-primary display)
+    @Published public var secondaryDisplayFrames: [(displayID: UInt32, videoInfo: FrameVideoInfo?)] = []
+
+    /// Persisted display names loaded from database (fallback when display is currently disconnected).
+    private var persistedDisplayNames: [UInt32: String] = [:]
+
+    /// Signature for the in-memory PIP cache over the current loaded timeline window.
+    private struct PIPDisplayCacheSignature: Equatable {
+        let rangeStartMs: Int64
+        let rangeEndMs: Int64
+        let displayIDs: [UInt32]
+    }
+
+    /// Cached per-display frame stream for PIP carry-forward.
+    private struct PIPDisplayCacheEntry {
+        /// Frames inside the current loaded window, sorted ascending by timestamp.
+        let frames: [FrameWithVideoInfo]
+        /// Seed frame before window start for carry-forward.
+        let frameBeforeWindow: FrameWithVideoInfo?
+        /// True when the range query hit the configured limit.
+        let isTruncated: Bool
+        /// True when the build failed and runtime fallback should be used.
+        let buildFailed: Bool
+    }
+
+    /// Full in-memory cache for all active displays over the loaded window.
+    private struct PIPDisplayFrameCache {
+        let signature: PIPDisplayCacheSignature
+        let rangeStart: Date
+        let rangeEnd: Date
+        let entriesByDisplay: [UInt32: PIPDisplayCacheEntry]
+    }
+
+    /// Result of resolving a display frame from cache.
+    private struct PIPDisplayResolution {
+        let videoInfo: FrameVideoInfo?
+        /// If true, caller should fallback to DB nearest-frame query for correctness.
+        let needsFallbackQuery: Bool
+    }
+
+    /// Whether multi-display recording is enabled (read from settings)
+    private var isMultiDisplayEnabled: Bool {
+        UserDefaults(suiteName: AppPaths.settingsSuiteName)?.bool(forKey: "recordAllDisplays") ?? false
+    }
+
+    /// Last observed multi-display setting value. Used to detect runtime flips while timeline is cached.
+    private var lastKnownMultiDisplayEnabled: Bool
+
+    /// Lower bound for per-display cache build query size.
+    private static let pipPerDisplayQueryMinLimit = WindowConfig.maxFrames
+
+    /// Upper bound for per-display cache build query size.
+    private static let pipPerDisplayQueryMaxLimit = 5_000
+
+    /// Capture cadence estimate used to size cache build queries.
+    private static let pipCaptureIntervalEstimateSeconds: TimeInterval = 2.0
+
+    /// Safety buffer appended to estimated per-display query size.
+    private static let pipPerDisplayQuerySafetyBuffer = 120
+
+    /// A frame is display-identifiable when native multi-display metadata resolved a non-zero display ID.
+    /// Rewind frames are exempt because that source does not carry per-display metadata.
+    private func hasIdentifiableDisplay(_ frame: FrameReference) -> Bool {
+        guard isMultiDisplayEnabled, frame.source == .native else { return true }
+        return frame.metadata.displayID != 0
+    }
+
+    /// Drop native payload rows that do not map to a concrete display in multi-display mode.
+    private func filterTimelinePayloadsWithoutIdentifiableDisplay(
+        _ payloads: [TimelineFramePayload],
+        context: String
+    ) -> [TimelineFramePayload] {
+        let filtered = payloads.filter { hasIdentifiableDisplay($0.frame) }
+        let droppedCount = payloads.count - filtered.count
+        if droppedCount > 0 {
+            Log.warning(
+                "[MultiDisplay] Dropped \(droppedCount) timeline payload(s) without identifiable display in \(context)",
+                category: .ui
+            )
+        }
+        return filtered
+    }
+
+    /// Convert one-query timeline payloads into view-model timeline frames.
+    /// Secondary display payloads are already attached in each payload row.
+    private func makeTimelineFrames(
+        from payloads: [TimelineFramePayload],
+        reverseOrder: Bool = false,
+        context: String
+    ) async -> [TimelineFrame] {
+        let filtered = filterTimelinePayloadsWithoutIdentifiableDisplay(payloads, context: context)
+        let ordered = reverseOrder ? Array(filtered.reversed()) : filtered
+
+        guard !ordered.isEmpty else { return [] }
+
+        return ordered.map {
+            TimelineFrame(
+                frame: $0.frame,
+                videoInfo: $0.videoInfo,
+                processingStatus: $0.processingStatus,
+                secondaryFrames: $0.secondaryFrames
+            )
+        }
+    }
+
+    /// Remove unknown/null display IDs from multi-display UI state.
+    private func filterIdentifiableDisplayIDs(_ displayIDs: [UInt32], context: String) -> [UInt32] {
+        let filtered = displayIDs.filter { $0 != 0 }
+        let droppedCount = displayIDs.count - filtered.count
+        if droppedCount > 0 {
+            Log.warning(
+                "[MultiDisplay] Dropped \(droppedCount) unknown display ID(s) in \(context)",
+                category: .ui
+            )
+        }
+        return filtered
+    }
+
+    /// Current primary display label for UI badges/buttons.
+    public var primaryDisplayLabel: String {
+        displayLabel(for: primaryDisplayID)
+    }
+
+    /// Resolve which display should be shown in the primary area.
+    /// Priority:
+    /// 1) pinned display (global)
+    /// 2) active display from current frame segment
+    /// 3) first available display fallback
+    private func resolvePrimaryDisplayID(for frame: FrameReference?, displayIDs: [UInt32]? = nil) -> UInt32? {
+        let available = displayIDs ?? availableDisplayIDs
+
+        func isAvailable(_ id: UInt32) -> Bool {
+            available.isEmpty || available.contains(id)
+        }
+
+        // User pin is authoritative. Do not auto-remap pinned primary to another
+        // display just because the currently loaded window doesn't include it yet.
+        if isPrimaryDisplayPinned, primaryDisplayID != 0 {
+            return primaryDisplayID
+        }
+
+        if let activeDisplay = frame?.metadata.displayID, activeDisplay != 0, isAvailable(activeDisplay) {
+            return activeDisplay
+        }
+
+        if let first = available.first {
+            return first
+        }
+
+        return primaryDisplayID != 0 ? primaryDisplayID : nil
+    }
+
+    /// Apply resolved primary display selection for current timeline position.
+    private func syncPrimaryDisplaySelection() {
+        guard let resolved = resolvePrimaryDisplayID(for: currentTapeFrame?.frame) else { return }
+        if primaryDisplayID != resolved {
+            primaryDisplayID = resolved
+        }
+    }
+
+    /// Reload the timeline tape after display policy changes (pin/unpin).
+    /// Keeps user near current context when possible.
+    private func reloadTimelineForDisplayPolicyChange() {
+        let anchorTimestamp = currentTimestamp
+        Task { @MainActor in
+            if let anchorTimestamp {
+                await reloadFramesAroundTimestamp(anchorTimestamp)
+            } else {
+                await loadMostRecentFrame()
+            }
+            await updateMultiDisplayState()
+        }
+    }
+
+    /// Pin a specific display globally across the timeline.
+    private func recordMultiDisplayAction(_ action: String) {
+        Task {
+            try? await coordinator.recordMetricEvent(
+                metricType: .multiDisplayAction,
+                metadata: "{\"action\":\"\(action)\"}"
+            )
+        }
+    }
+
+    public func swapToDisplay(_ displayID: UInt32, preferredVideoInfo: FrameVideoInfo? = nil) {
+        recordMultiDisplayAction("switch")
+        guard displayID != 0 else { return }
+        let oldPrimary = primaryDisplayID
+        let wasPinned = isPrimaryDisplayPinned
+        primaryDisplayID = displayID
+        isPrimaryDisplayPinned = true
+        presentTimelineHUDToast(message: "Pinned \(displayLabel(for: displayID))")
+
+        invalidatePinnedPrimaryFrame()
+
+        Log.info(
+            "[MultiDisplay] Pinned display globally: \(oldPrimary) -> \(displayID), wasPinned=\(wasPinned)",
+            category: .ui
+        )
+        reloadTimelineForDisplayPolicyChange()
+    }
+
+    /// Pin the currently shown display globally.
+    /// Kept as a compatibility wrapper for existing UI call sites.
+    public func pinCurrentDisplayAcrossSegments() {
+        guard primaryDisplayID != 0 else { return }
+        swapToDisplay(primaryDisplayID, preferredVideoInfo: currentVideoInfo)
+    }
+
+    /// Pin a specific display globally.
+    /// Kept as a compatibility wrapper for existing UI call sites.
+    public func pinDisplayAcrossSegments(_ displayID: UInt32) {
+        recordMultiDisplayAction("pin")
+        swapToDisplay(displayID)
+    }
+
+    /// Remove global pin and return to active display mode.
+    public func unpinPrimaryDisplay() {
+        recordMultiDisplayAction("unpin")
+        guard isPrimaryDisplayPinned else { return }
+        isPrimaryDisplayPinned = false
+        invalidatePinnedPrimaryFrame()
+        syncPrimaryDisplaySelection()
+        presentTimelineHUDToast(message: "Showing Active Display")
+        Log.info("[MultiDisplay] Unpinned primary display; returning to active display mode", category: .ui)
+        reloadTimelineForDisplayPolicyChange()
+    }
+
+    /// Show a global top-center HUD toast and auto-dismiss shortly after.
+    public func presentTimelineHUDToast(message: String, duration: TimeInterval = 1.4) {
+        timelineHUDToastDismissTask?.cancel()
+
+        timelineHUDToastMessage = message
+        withAnimation(.easeInOut(duration: 0.35)) {
+            showTimelineHUDToast = true
+        }
+
+        timelineHUDToastDismissTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            try? await Task.sleep(for: .seconds(max(duration, 0)), clock: .continuous)
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeInOut(duration: 0.45)) {
+                self.showTimelineHUDToast = false
+            }
+            // Keep the view mounted through fade-out, then clear message.
+            try? await Task.sleep(for: .milliseconds(500), clock: .continuous)
+            guard !Task.isCancelled else { return }
+            if !self.showTimelineHUDToast {
+                self.timelineHUDToastMessage = nil
+            }
+        }
+    }
+
+    /// Update primary override + secondary display frames for the current timestamp (PIP carry-forward).
+    func updateSecondaryDisplayFrames() async {
+        let anchorID = currentTapeFrame?.frame.id
+        let generation = pinnedPrimaryResolutionGeneration
+        await resolvePinnedPrimaryFrame()
+        guard !Task.isCancelled, currentTapeFrame?.frame.id == anchorID,
+              pinnedPrimaryResolutionGeneration == generation else { return }
+        guard availableDisplayIDs.count > 1 else {
+            secondaryDisplayFrames = []
+            clearPIPDisplayFrameCache()
+            return
+        }
+
+        guard let timestamp = currentTapeFrame?.frame.timestamp else {
+            secondaryDisplayFrames = []
+            return
+        }
+
+        syncPrimaryDisplaySelection()
+        let effectivePrimaryDisplayID = primaryDisplayID
+        let allDisplayIDs = availableDisplayIDs.sorted()
+        let connectedDisplayIDs: Set<UInt32>
+        do {
+            connectedDisplayIDs = Set(try await coordinator.getConnectedDisplayIDs(at: timestamp))
+        } catch {
+            Log.error("[MultiDisplay] Failed to resolve connected displays at \(timestamp): \(error)", category: .ui)
+            connectedDisplayIDs = Set(allDisplayIDs)
+        }
+
+        let displayIDs = allDisplayIDs.filter { displayID in
+            // Fallback behavior: if no display segments exist yet, use all displays found in frame data.
+            if connectedDisplayIDs.isEmpty {
+                return true
+            }
+            // Always keep the effective primary display to avoid blank primary playback if metadata lags.
+            return connectedDisplayIDs.contains(displayID) || displayID == effectivePrimaryDisplayID
+        }
+
+        if displayIDs.count <= 1 {
+            secondaryDisplayFrames = []
+            clearPIPDisplayFrameCache()
+            return
+        }
+
+        let cacheSignature = makePIPDisplayCacheSignature(displayIDs: displayIDs)
+
+        if let signature = cacheSignature {
+            schedulePIPDisplayFrameCacheBuildIfNeeded(signature: signature)
+        }
+
+        var resolvedByDisplay: [UInt32: PIPDisplayResolution] = [:]
+        var displaysNeedingDBLookup = Set(displayIDs)
+
+        if let signature = cacheSignature,
+           let cache = pipDisplayFrameCache,
+           cache.signature == signature {
+            for displayID in displayIDs {
+                let resolution = resolvePIPDisplayVideoInfo(
+                    displayID: displayID,
+                    at: timestamp,
+                    cache: cache
+                )
+                if resolution.needsFallbackQuery {
+                    continue
+                }
+                resolvedByDisplay[displayID] = resolution
+                displaysNeedingDBLookup.remove(displayID)
+            }
+        }
+
+        if !displaysNeedingDBLookup.isEmpty {
+            let fallbackOrder = displayIDs.filter { displaysNeedingDBLookup.contains($0) }
+            let fallbackResults = await fetchNearestVideoInfoForDisplays(
+                fallbackOrder,
+                before: timestamp
+            )
+            for displayID in fallbackOrder {
+                resolvedByDisplay[displayID] = fallbackResults[displayID] ??
+                    PIPDisplayResolution(videoInfo: nil, needsFallbackQuery: false)
+            }
+        }
+
+        var newSecondaryFrames: [(displayID: UInt32, videoInfo: FrameVideoInfo?)] = []
+
+        for displayID in displayIDs {
+            let videoInfo = resolvedByDisplay[displayID]?.videoInfo
+
+            if displayID == effectivePrimaryDisplayID {
+                continue
+            } else {
+                newSecondaryFrames.append((displayID: displayID, videoInfo: videoInfo))
+            }
+        }
+
+        guard !Task.isCancelled, currentTapeFrame?.frame.id == anchorID,
+              pinnedPrimaryResolutionGeneration == generation else { return }
+        secondaryDisplayFrames = newSecondaryFrames
+    }
+
+    /// Build a compact signature for the currently loaded timeline window + active displays.
+    private func makePIPDisplayCacheSignature(displayIDs: [UInt32]) -> PIPDisplayCacheSignature? {
+        guard let rangeStart = oldestLoadedTimestamp, let rangeEnd = newestLoadedTimestamp else {
+            return nil
+        }
+
+        return PIPDisplayCacheSignature(
+            rangeStartMs: Int64((rangeStart.timeIntervalSince1970 * 1000).rounded()),
+            rangeEndMs: Int64((rangeEnd.timeIntervalSince1970 * 1000).rounded()),
+            displayIDs: displayIDs.sorted()
+        )
+    }
+
+    /// Estimate a per-display query limit for building the in-memory PIP cache.
+    private func estimatePIPPerDisplayQueryLimit(rangeStart: Date, rangeEnd: Date) -> Int {
+        let durationSeconds = max(0, rangeEnd.timeIntervalSince(rangeStart))
+        let estimatedFrames = Int(ceil(durationSeconds / Self.pipCaptureIntervalEstimateSeconds))
+        let baseLimit = max(
+            Self.pipPerDisplayQueryMinLimit,
+            estimatedFrames + Self.pipPerDisplayQuerySafetyBuffer
+        )
+        return min(baseLimit, Self.pipPerDisplayQueryMaxLimit)
+    }
+
+    /// Start a background cache build if we don't already have a valid one for this signature.
+    private func schedulePIPDisplayFrameCacheBuildIfNeeded(signature: PIPDisplayCacheSignature) {
+        if pipDisplayFrameCache?.signature == signature {
+            return
+        }
+
+        if pipDisplayFrameCacheBuildSignature == signature {
+            return
+        }
+
+        pipDisplayFrameCacheBuildTask?.cancel()
+        pipDisplayFrameCacheBuildSignature = signature
+
+        pipDisplayFrameCacheBuildTask = Task { [weak self] in
+            guard let self else { return }
+
+            let cache = await self.buildPIPDisplayFrameCache(for: signature)
+            guard !Task.isCancelled else { return }
+
+            guard self.pipDisplayFrameCacheBuildSignature == signature else { return }
+
+            self.pipDisplayFrameCache = cache
+            self.pipDisplayFrameCacheBuildTask = nil
+            self.pipDisplayFrameCacheBuildSignature = nil
+
+            // Apply freshly built cache on the next coalesced update.
+            self.schedulePIPUpdate()
+        }
+    }
+
+    /// Build per-display frame streams for the loaded window so scrubbing can resolve in-memory.
+    private func buildPIPDisplayFrameCache(for signature: PIPDisplayCacheSignature) async -> PIPDisplayFrameCache {
+        let rangeStart = Date(timeIntervalSince1970: Double(signature.rangeStartMs) / 1000.0)
+        let rangeEnd = Date(timeIntervalSince1970: Double(signature.rangeEndMs) / 1000.0)
+        let perDisplayLimit = estimatePIPPerDisplayQueryLimit(rangeStart: rangeStart, rangeEnd: rangeEnd)
+
+        typealias BuildResult = (
+            displayID: UInt32,
+            frames: [FrameWithVideoInfo],
+            frameBeforeWindow: FrameWithVideoInfo?,
+            isTruncated: Bool,
+            buildFailed: Bool,
+            errorDescription: String?
+        )
+
+        let coordinator = self.coordinator
+        let buildResults = await withTaskGroup(
+            of: BuildResult.self,
+            returning: [UInt32: BuildResult].self
+        ) { group in
+            for displayID in signature.displayIDs {
+                group.addTask { [coordinator] in
+                    do {
+                        let displayFilter = FilterCriteria(
+                            selectedApps: nil,
+                            appFilterMode: .include,
+                            selectedSources: Set([.native]),
+                            hiddenFilter: .showAll,
+                            selectedTags: nil,
+                            tagFilterMode: .include,
+                            windowNameFilter: nil,
+                            browserUrlFilter: nil,
+                            startDate: nil,
+                            endDate: nil,
+                            displayID: displayID,
+                            focusedOnly: nil
+                        )
+
+                        let framesInRange = try await coordinator.getFramesWithVideoInfo(
+                            from: rangeStart,
+                            to: rangeEnd,
+                            limit: perDisplayLimit,
+                            filters: displayFilter
+                        ).sorted { $0.frame.timestamp < $1.frame.timestamp }
+
+                        let frameBeforeWindow = try? await coordinator.getNearestFrame(
+                            displayID: displayID,
+                            before: rangeStart
+                        )
+
+                        return (
+                            displayID: displayID,
+                            frames: framesInRange,
+                            frameBeforeWindow: frameBeforeWindow,
+                            isTruncated: framesInRange.count >= perDisplayLimit,
+                            buildFailed: false,
+                            errorDescription: nil
+                        )
+                    } catch {
+                        return (
+                            displayID: displayID,
+                            frames: [],
+                            frameBeforeWindow: nil,
+                            isTruncated: false,
+                            buildFailed: true,
+                            errorDescription: String(describing: error)
+                        )
+                    }
+                }
+            }
+
+            var results: [UInt32: BuildResult] = [:]
+            for await result in group {
+                results[result.displayID] = result
+            }
+            return results
+        }
+
+        var entriesByDisplay: [UInt32: PIPDisplayCacheEntry] = [:]
+        for displayID in signature.displayIDs {
+            if let result = buildResults[displayID] {
+                if let errorDescription = result.errorDescription {
+                    Log.error(
+                        "[MultiDisplay] Failed to build PIP cache for display \(displayID): \(errorDescription)",
+                        category: .ui
+                    )
+                }
+
+                entriesByDisplay[displayID] = PIPDisplayCacheEntry(
+                    frames: result.frames,
+                    frameBeforeWindow: result.frameBeforeWindow,
+                    isTruncated: result.isTruncated,
+                    buildFailed: result.buildFailed
+                )
+            } else {
+                entriesByDisplay[displayID] = PIPDisplayCacheEntry(
+                    frames: [],
+                    frameBeforeWindow: nil,
+                    isTruncated: false,
+                    buildFailed: true
+                )
+            }
+        }
+
+        if Self.isVerboseTimelineLoggingEnabled {
+            let totalCachedFrames = entriesByDisplay.values.reduce(0) { $0 + $1.frames.count }
+            Log.debug(
+                "[MultiDisplay] Built PIP cache: displays=\(signature.displayIDs.count), totalFrames=\(totalCachedFrames), range=\(rangeStart)→\(rangeEnd)",
+                category: .ui
+            )
+        }
+
+        return PIPDisplayFrameCache(
+            signature: signature,
+            rangeStart: rangeStart,
+            rangeEnd: rangeEnd,
+            entriesByDisplay: entriesByDisplay
+        )
+    }
+
+    /// Resolve a display's carry-forward frame from the in-memory cache.
+    private func resolvePIPDisplayVideoInfo(
+        displayID: UInt32,
+        at timestamp: Date,
+        cache: PIPDisplayFrameCache
+    ) -> PIPDisplayResolution {
+        guard let entry = cache.entriesByDisplay[displayID] else {
+            return PIPDisplayResolution(videoInfo: nil, needsFallbackQuery: true)
+        }
+
+        if entry.buildFailed {
+            return PIPDisplayResolution(videoInfo: nil, needsFallbackQuery: true)
+        }
+
+        let frames = entry.frames
+        guard !frames.isEmpty else {
+            return PIPDisplayResolution(
+                videoInfo: entry.frameBeforeWindow?.videoInfo,
+                needsFallbackQuery: false
+            )
+        }
+
+        if timestamp < frames[0].frame.timestamp {
+            return PIPDisplayResolution(
+                videoInfo: entry.frameBeforeWindow?.videoInfo,
+                needsFallbackQuery: false
+            )
+        }
+
+        // Upper-bound binary search for the last frame with timestamp <= current timestamp.
+        var low = 0
+        var high = frames.count
+        while low < high {
+            let mid = (low + high) / 2
+            if frames[mid].frame.timestamp <= timestamp {
+                low = mid + 1
+            } else {
+                high = mid
+            }
+        }
+
+        let resolvedIndex = max(0, low - 1)
+        let resolvedVideoInfo = frames[resolvedIndex].videoInfo
+        let isAtTail = resolvedIndex == frames.count - 1
+        let needsFallbackQuery = isAtTail && entry.isTruncated && timestamp < cache.rangeEnd
+
+        return PIPDisplayResolution(
+            videoInfo: resolvedVideoInfo,
+            needsFallbackQuery: needsFallbackQuery
+        )
+    }
+
+    /// Fallback path: fetch nearest frame per display directly from the DB.
+    private func fetchNearestVideoInfoForDisplays(
+        _ displayIDs: [UInt32],
+        before timestamp: Date
+    ) async -> [UInt32: PIPDisplayResolution] {
+        typealias SecondaryFetchResult = (displayID: UInt32, videoInfo: FrameVideoInfo?, errorDescription: String?)
+        let coordinator = self.coordinator
+        let fetchResults = await withTaskGroup(
+            of: SecondaryFetchResult.self,
+            returning: [UInt32: SecondaryFetchResult].self
+        ) { group in
+            for displayID in displayIDs {
+                group.addTask { [coordinator] in
+                    do {
+                        let nearestFrame = try await coordinator.getNearestFrame(
+                            displayID: displayID,
+                            before: timestamp
+                        )
+                        return (displayID: displayID, videoInfo: nearestFrame?.videoInfo, errorDescription: nil)
+                    } catch {
+                        return (
+                            displayID: displayID,
+                            videoInfo: nil,
+                            errorDescription: String(describing: error)
+                        )
+                    }
+                }
+            }
+
+            var results: [UInt32: SecondaryFetchResult] = [:]
+            for await result in group {
+                results[result.displayID] = result
+            }
+            return results
+        }
+
+        var resolved: [UInt32: PIPDisplayResolution] = [:]
+        for displayID in displayIDs {
+            guard let result = fetchResults[displayID] else {
+                resolved[displayID] = PIPDisplayResolution(videoInfo: nil, needsFallbackQuery: false)
+                continue
+            }
+
+            if let errorDescription = result.errorDescription {
+                Log.error(
+                    "[MultiDisplay] Failed to get nearest frame for display \(displayID): \(errorDescription)",
+                    category: .ui
+                )
+            }
+
+            resolved[displayID] = PIPDisplayResolution(
+                videoInfo: result.videoInfo,
+                needsFallbackQuery: false
+            )
+        }
+
+        return resolved
+    }
+
+    /// Clear PIP cache state (called when multi-display mode/window state changes).
+    private func clearPIPDisplayFrameCache() {
+        pinnedPrimaryResolutionGeneration &+= 1
+        secondaryDisplayFrames = []
+        pipDisplayFrameCacheBuildTask?.cancel()
+        pipDisplayFrameCacheBuildTask = nil
+        pipDisplayFrameCacheBuildSignature = nil
+        pipDisplayFrameCache = nil
+    }
+
+    /// Discover which displays are active in the loaded timeline range and auto-set primary.
+    /// This is data-driven from stored frames and should not depend on current capture settings.
+    func updateMultiDisplayState() async {
+        guard let oldest = oldestLoadedTimestamp, let newest = newestLoadedTimestamp else {
+            return
+        }
+
+        do {
+            let displays = try await coordinator.getDistinctDisplaysWithNames(from: oldest, to: newest)
+            let rawDisplayIDs = displays.map(\.displayID)
+            let displayIDs = filterIdentifiableDisplayIDs(rawDisplayIDs, context: "updateMultiDisplayState")
+            availableDisplayIDs = displayIDs
+            persistedDisplayNames = Dictionary(
+                uniqueKeysWithValues: displays.compactMap { entry in
+                    guard displayIDs.contains(entry.displayID),
+                          let name = entry.displayName,
+                          !name.isEmpty else { return nil }
+                    return (entry.displayID, name)
+                }
+            )
+
+            if displayIDs.count <= 1 {
+                secondaryDisplayFrames = []
+                clearPIPDisplayFrameCache()
+                // Keep explicit pin stable; only auto-select when unpinned.
+                if !isPrimaryDisplayPinned {
+                    if let onlyDisplay = displayIDs.first {
+                        primaryDisplayID = onlyDisplay
+                    } else {
+                        primaryDisplayID = 0
+                    }
+                }
+                return
+            }
+
+            syncPrimaryDisplaySelection()
+            await updateSecondaryDisplayFrames()
+        } catch {
+            Log.error("[MultiDisplay] Failed to update display state: \(error)", category: .ui)
+        }
+    }
+
+    /// User-facing display label with stable ordinal ordering.
+    public func displayLabel(for displayID: UInt32) -> String {
+        if let namedLabel = resolvedDisplayName(for: displayID) {
+            return namedLabel
+        }
+        if let persisted = persistedDisplayNames[displayID], !persisted.isEmpty {
+            return persisted
+        }
+
+        let sortedDisplays = availableDisplayIDs.sorted()
+        if let index = sortedDisplays.firstIndex(of: displayID) {
+            return "Display \(index + 1)"
+        }
+        return "Display"
+    }
+
+    /// Resolve a display label from NSScreen metadata, disambiguating duplicate monitor names.
+    private func resolvedDisplayName(for displayID: UInt32) -> String? {
+        let namedDisplays: [(displayID: UInt32, name: String)] = availableDisplayIDs.compactMap { id in
+            guard let name = systemDisplayName(for: id) else { return nil }
+            return (displayID: id, name: name)
+        }
+
+        guard !namedDisplays.isEmpty else { return nil }
+
+        let groupedByName = Dictionary(grouping: namedDisplays, by: { $0.name })
+        guard let entry = namedDisplays.first(where: { $0.displayID == displayID }) else {
+            return nil
+        }
+
+        guard let group = groupedByName[entry.name], group.count > 1 else {
+            return entry.name
+        }
+
+        let sortedIDs = group.map(\.displayID).sorted()
+        guard let duplicateIndex = sortedIDs.firstIndex(of: displayID) else {
+            return entry.name
+        }
+
+        return "\(entry.name) \(duplicateIndex + 1)"
+    }
+
+    /// System-provided display name for a CGDirectDisplayID when available.
+    private func systemDisplayName(for displayID: UInt32) -> String? {
+        for screen in NSScreen.screens {
+            guard
+                let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber,
+                screenNumber.uint32Value == displayID
+            else {
+                continue
+            }
+
+            let trimmed = screen.localizedName.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return nil }
+
+            // For built-in displays, prefer the user's configured computer name.
+            if CGDisplayIsBuiltin(CGDirectDisplayID(displayID)) != 0 {
+                return computerDisplayName() ?? trimmed
+            }
+
+            return trimmed
+        }
+
+        return nil
+    }
+
+    /// User-assigned Mac name from system settings (used for the built-in display label).
+    private func computerDisplayName() -> String? {
+        guard
+            let rawName = Host.current().localizedName?.trimmingCharacters(in: .whitespacesAndNewlines),
+            !rawName.isEmpty
+        else {
+            return nil
+        }
+        return rawName
+    }
+
     // MARK: - Peek Mode State (view full timeline context while filtered)
 
     /// Complete timeline state snapshot for returning from peek mode
@@ -2162,10 +3050,22 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     // MARK: - Derived Properties (computed from currentIndex)
 
-    /// Current timeline frame (frame + video info) - derived from currentIndex
-    public var currentTimelineFrame: TimelineFrame? {
+    /// Union-tape anchor for navigation and pagination, independent of a pinned display.
+    public var currentTapeFrame: TimelineFrame? {
         guard currentIndex >= 0 && currentIndex < frames.count else { return nil }
         return frames[currentIndex]
+    }
+
+    /// The frame actually displayed, including its metadata, OCR identity and video.
+    /// While a different pinned display is resolving, expose no actionable frame.
+    public var currentTimelineFrame: TimelineFrame? {
+        guard let anchor = currentTapeFrame else { return nil }
+        guard isPrimaryDisplayPinned, primaryDisplayID != 0,
+              anchor.frame.metadata.displayID != primaryDisplayID else { return anchor }
+        guard pinnedPrimaryAnchorID == anchor.frame.id,
+              pinnedPrimaryFrame?.frame.metadata.displayID == primaryDisplayID,
+              let frameID = pinnedPrimaryFrame?.frame.id, !deletedFrameIDs.contains(frameID) else { return nil }
+        return pinnedPrimaryFrame
     }
 
     /// Current frame reference - derived from currentIndex
@@ -2306,9 +3206,15 @@ public class SimpleTimelineViewModel: ObservableObject {
         return info
     }
 
-    /// Current timestamp - ALWAYS derived from the current frame
+    /// Video info currently shown in the primary/fullscreen area.
+    /// Uses pinned override when display is pinned; otherwise follows active timeline frame.
+    public var displayedPrimaryVideoInfo: FrameVideoInfo? {
+        currentVideoInfo
+    }
+
+    /// Scrub timestamp comes from the tape, even when a sparse display carries forward.
     public var currentTimestamp: Date? {
-        currentTimelineFrame?.frame.timestamp
+        currentTapeFrame?.frame.timestamp
     }
 
     // MARK: - Computed Properties for Timeline Tape
@@ -2817,6 +3723,27 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Time threshold (in seconds) for considering playhead as "stopped"
     private static let stoppedThresholdSeconds: TimeInterval = 0.35
 
+    /// Debounce task for PIP secondary display frame updates
+    private var pipUpdateTask: Task<Void, Never>?
+
+    /// In-memory carry-forward cache for secondary display PIP frames.
+    private var pipDisplayFrameCache: PIPDisplayFrameCache?
+
+    /// Cache build task (kept separate from scrub update task so it can complete).
+    private var pipDisplayFrameCacheBuildTask: Task<Void, Never>?
+
+    /// Signature currently being built for the PIP cache.
+    private var pipDisplayFrameCacheBuildSignature: PIPDisplayCacheSignature?
+
+    /// Coalesce rapid navigation into latest-only PIP refresh (no artificial delay).
+    private func schedulePIPUpdate() {
+        pipUpdateTask?.cancel()
+        pipUpdateTask = Task { [weak self] in
+            guard !Task.isCancelled else { return }
+            await self?.updateSecondaryDisplayFrames()
+        }
+    }
+
     // MARK: - Dependencies
 
     private let coordinator: AppCoordinator
@@ -2849,6 +3776,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         var getFrameWithVideoInfoByID: ((FrameID) async throws -> FrameWithVideoInfo?)?
     }
     struct FrameOverlayLoadTestHooks {
+        var getNearestDisplayFrame: ((UInt32, Date) async throws -> FrameWithVideoInfo?)?
         var getURLBoundingBox: ((Date, FrameSource) async throws -> URLBoundingBox?)?
         var getOCRStatus: ((FrameID) async throws -> OCRProcessingStatus)?
         var getAllOCRNodes: ((FrameID, FrameSource) async throws -> [OCRNodeWithText])?
@@ -2896,6 +3824,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     public init(coordinator: AppCoordinator) {
         self.coordinator = coordinator
+        self.lastKnownMultiDisplayEnabled = UserDefaults(suiteName: AppPaths.settingsSuiteName)?.bool(forKey: "recordAllDisplays") ?? false
         self.diskFrameBufferDirectoryURL = Self.defaultDiskFrameBufferDirectoryURL()
 
         // Restore search overlay visibility from last session
@@ -2918,6 +3847,9 @@ public class SimpleTimelineViewModel: ObservableObject {
             Task { @MainActor in
                 guard let self else { return }
                 Log.debug("[Timeline-OCR] Invalidating transient scan after redaction", category: .ui)
+                self.invalidatePinnedPrimaryFrame()
+                self.clearPIPDisplayFrameCache()
+                self.schedulePIPUpdate()
                 self.resetFrameTextScan()
                 self.cancelForegroundFrameLoad(reason: "redaction completed")
                 self.cancelCacheExpansion(reason: "redaction completed")
@@ -2934,6 +3866,20 @@ public class SimpleTimelineViewModel: ObservableObject {
                 self.loadImageIfNeeded()
             }
         }
+
+        NotificationCenter.default.publisher(for: FrameDeletionNotification.didDelete)
+            .sink { [weak self] notification in
+                // The coordinator publishes on MainActor after the DB transaction.
+                MainActor.assumeIsolated {
+                    guard let self,
+                          let source = notification.object as? AppCoordinator,
+                          source === self.coordinator,
+                          let ids = notification.userInfo?[FrameDeletionNotification.frameIDsKey] as? Set<FrameID>
+                    else { return }
+                    self.invalidatePersistedDeletions(ids)
+                }
+            }
+            .store(in: &cancellables)
 
         // Listen for data source changes (e.g., Rewind data toggled)
         Log.debug("[SimpleTimelineViewModel] Setting up dataSourceDidChange observer", category: .ui)
@@ -2953,6 +3899,33 @@ public class SimpleTimelineViewModel: ObservableObject {
         setupSearchOverlayPersistence()
         initializeDiskFrameBuffer()
         startDiskFrameBufferMemoryReporting()
+    }
+
+    private func invalidatePersistedDeletions(_ ids: Set<FrameID>) {
+        let anchorID = currentTapeFrame?.frame.id
+        let removed = frames.filter { ids.contains($0.frame.id) }
+        invalidatePinnedPrimaryFrame()
+        clearPIPDisplayFrameCache()
+        cancelCacheExpansion(reason: "frames deleted")
+        cancelBoundaryLoadTasks(reason: "frames deleted")
+        cancelBlockBoundaryLookup(reason: "frames deleted")
+        unavailableFrameDiskLookupTask?.cancel()
+        unavailableFrameDiskLookupTask = nil
+        diskFrameBufferGeneration &+= 1
+        diskFrameBufferEpoch.invalidate()
+        diskFrameBufferEntryEpochs.invalidateAll()
+        diskFrameBufferIndex.removeAll()
+        inMemoryJPEGFrameCache.removeAllObjects()
+        hotWindowRange = nil
+        frames.removeAll { ids.contains($0.frame.id) }
+        currentIndex = anchorID.flatMap { id in frames.firstIndex { $0.frame.id == id } }
+            ?? min(currentIndex, max(0, frames.count - 1))
+        selectedFrameIndex = nil
+        forceVideoReload = true
+        refreshAppBlockSnapshotImmediately(reason: "frames deleted")
+        schedulePIPUpdate()
+        loadImageIfNeeded()
+        scheduleWindowRefillAfterOptimisticDelete(removedFrames: removed, reason: "frames deleted")
     }
 
     /// Persist search overlay visibility state across app launches
@@ -3915,6 +4888,8 @@ public class SimpleTimelineViewModel: ObservableObject {
         filters: FilterCriteria,
         reason: String
     ) async throws -> [FrameWithVideoInfo] {
+        let filters = applyingDisplayPolicy(to: filters)
+
         let requestedLimit = max(1, limit)
         let queryLimit = compensatedFetchLimitForPendingDeletes(requestedLimit)
         let traceID = nextFetchTraceID(prefix: "window")
@@ -3983,6 +4958,8 @@ public class SimpleTimelineViewModel: ObservableObject {
         filters: FilterCriteria,
         reason: String
     ) async throws -> [FrameWithVideoInfo] {
+        let filters = applyingDisplayPolicy(to: filters)
+
         let requestedLimit = max(1, limit)
         let queryLimit = compensatedFetchLimitForPendingDeletes(requestedLimit)
         let traceID = nextFetchTraceID(prefix: "before")
@@ -4052,6 +5029,8 @@ public class SimpleTimelineViewModel: ObservableObject {
         filters: FilterCriteria,
         reason: String
     ) async throws -> [FrameWithVideoInfo] {
+        let filters = applyingDisplayPolicy(to: filters)
+
         let requestedLimit = max(1, limit)
         let queryLimit = compensatedFetchLimitForPendingDeletes(requestedLimit)
         let traceID = nextFetchTraceID(prefix: "after")
@@ -4221,6 +5200,8 @@ public class SimpleTimelineViewModel: ObservableObject {
         filters: FilterCriteria,
         reason: String
     ) async throws -> [FrameWithVideoInfo] {
+        let filters = applyingDisplayPolicy(to: filters)
+
         let requestedLimit = max(1, limit)
         let queryLimit = compensatedFetchLimitForPendingDeletes(requestedLimit)
         let traceID = nextFetchTraceID(prefix: "most-recent")
@@ -4286,6 +5267,8 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Called when data sources change (e.g., Rewind toggled on/off)
     @MainActor
     public func invalidateCachesAndReload() {
+        invalidatePinnedPrimaryFrame()
+        clearPIPDisplayFrameCache()
         Log.info("[DataSourceChange] invalidateCachesAndReload() called", category: .ui)
 
         // Clear disk frame buffer metadata/files
@@ -4504,7 +5487,18 @@ public class SimpleTimelineViewModel: ObservableObject {
             return
         }
 
-        let frameToDelete = frames[index]
+        let frameToDelete: TimelineFrame
+        if isPrimaryDisplayPinned, index == currentIndex {
+            guard let displayed = currentTimelineFrame else {
+                showDeleteConfirmation = false
+                return
+            }
+            frameToDelete = displayed
+        } else {
+            frameToDelete = frames[index]
+        }
+        let removalIndex = frames.firstIndex { $0.frame.id == frameToDelete.frame.id }
+        let removedFrames = removalIndex.map { [frames[$0]] } ?? []
         let frameID = frameToDelete.frame.id
         let frameRef = frameToDelete.frame
         let previousCurrentIndex = currentIndex
@@ -4512,15 +5506,18 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         // Optimistically mark/delete in UI immediately.
         deletedFrameIDs.insert(frameID)
-        frames.remove(at: index)
+        if let removalIndex { frames.remove(at: removalIndex) }
+        invalidatePinnedPrimaryFrame()
+        clearPIPDisplayFrameCache()
+        schedulePIPUpdate()
 
         // Keep block grouping/navigation consistent immediately for optimistic UI.
         refreshAppBlockSnapshotImmediately(reason: "confirmDeleteSelectedFrame")
 
-        // Adjust current index if needed
+        // Adjust only for a frame actually removed from the union tape.
         if currentIndex >= frames.count {
             currentIndex = max(0, frames.count - 1)
-        } else if currentIndex > index {
+        } else if let removalIndex, currentIndex > removalIndex {
             currentIndex -= 1
         }
 
@@ -4531,7 +5528,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         // Load image if needed for new current frame
         loadImageIfNeeded()
         scheduleWindowRefillAfterOptimisticDelete(
-            removedFrames: [frameToDelete],
+            removedFrames: removedFrames,
             reason: "confirmDeleteSelectedFrame"
         )
 
@@ -4541,9 +5538,9 @@ public class SimpleTimelineViewModel: ObservableObject {
             PendingDeleteOperation(
                 id: UUID(),
                 payload: .frame(frameRef),
-                removedFrames: [frameToDelete],
+                removedFrames: removedFrames,
                 removedFrameIDs: [frameID],
-                restoreStartIndex: index,
+                restoreStartIndex: removalIndex ?? index,
                 previousCurrentIndex: previousCurrentIndex,
                 previousSelectedFrameIndex: previousSelectedFrameIndex,
                 undoMessage: "Frame deleted"
@@ -4562,6 +5559,9 @@ public class SimpleTimelineViewModel: ObservableObject {
         guard let operation = pendingDeleteOperation else { return }
         clearPendingDeleteState()
         restoreDeletedOperation(operation, reason: "undo")
+        invalidatePinnedPrimaryFrame()
+        clearPIPDisplayFrameCache()
+        schedulePIPUpdate()
         showToast("Deletion undone", icon: "arrow.uturn.backward.circle.fill")
     }
 
@@ -4577,6 +5577,9 @@ public class SimpleTimelineViewModel: ObservableObject {
     private func stagePendingDelete(_ operation: PendingDeleteOperation) {
         commitPendingDeleteIfNeeded(reason: "superseded")
 
+        invalidatePinnedPrimaryFrame()
+        clearPIPDisplayFrameCache()
+        schedulePIPUpdate()
         pendingDeleteOperation = operation
         pendingDeleteUndoMessage = operation.undoMessage
 
@@ -4632,6 +5635,9 @@ public class SimpleTimelineViewModel: ObservableObject {
                 )
                 Log.debug("[Delete] Committed segment deletion frames=\(frameRefs.count) reason=\(reason)", category: .ui)
             }
+            invalidatePinnedPrimaryFrame()
+            clearPIPDisplayFrameCache()
+            schedulePIPUpdate()
             clearPendingDeletedFrameIDs(operation.removedFrameIDs, reason: "commit-success.\(reason)")
             if result.hasQueuedFrames {
                 showToast(queuedDeletionToastMessage(for: result), icon: "clock.badge.exclamationmark.fill")
@@ -4719,6 +5725,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Get the selected frame (if any)
     public var selectedFrame: TimelineFrame? {
         guard let index = selectedFrameIndex, index >= 0 && index < frames.count else { return nil }
+        if isPrimaryDisplayPinned, index == currentIndex { return currentTimelineFrame }
         return frames[index]
     }
 
@@ -4890,7 +5897,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             return false
         }
 
-        guard currentTimelineFrame?.frame.id == requestedFrameID else {
+        guard currentTapeFrame?.frame.id == requestedFrameID else {
             Log.info(
                 "[TimelineBlocks] Aborting stale lookup reason=\(reason) staleResult=playheadMoved requestedFrameID=\(requestedFrameID.value) currentFrameID=\(currentTimelineFrame?.frame.id.value ?? -1)",
                 category: .ui
@@ -5777,7 +6784,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         Task { @MainActor in
             try? await Task.sleep(for: .nanoseconds(Int64(160_000_000)), clock: .continuous)
 
-            let previousCurrentFrameID = currentTimelineFrame?.frame.id
+            let previousCurrentFrameID = currentTapeFrame?.frame.id
             let beforeCount = frames.count
             frames.removeAll { frame in
                 let segmentID = SegmentID(value: frame.frame.segmentID.value)
@@ -5887,7 +6894,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             Task { @MainActor in
                 try? await Task.sleep(for: .nanoseconds(Int64(160_000_000)), clock: .continuous)
 
-                let previousCurrentFrameID = currentTimelineFrame?.frame.id
+                let previousCurrentFrameID = currentTapeFrame?.frame.id
                 let beforeCount = frames.count
                 frames.removeAll { frame in
                     let segmentID = SegmentID(value: frame.frame.segmentID.value)
@@ -8711,7 +9718,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Load pre-fetched frames directly (used when query runs in parallel with show())
     /// - Parameters:
-    ///   - framesWithVideoInfo: Pre-fetched frames from parallel query
+    ///   - timelinePayloads: Pre-fetched timeline payloads from a single query
     ///   - clickStartTime: Start time for end-to-end timing
     public func loadFramesDirectly(_ framesWithVideoInfo: [FrameWithVideoInfo], clickStartTime _: CFAbsoluteTime? = nil) async {
         // Guard against concurrent calls - use dedicated flag to avoid race conditions
@@ -9235,6 +10242,11 @@ public class SimpleTimelineViewModel: ObservableObject {
         // Load image if this is an image-based frame
         loadImageIfNeeded()
 
+        // Update PIP secondary display frames (latest-only coalescing during scrubbing).
+        if !secondaryDisplayFrames.isEmpty || availableDisplayIDs.count > 1 {
+            schedulePIPUpdate()
+        }
+
         // Check if we need to load more frames (infinite scroll)
         checkAndLoadMoreFrames()
 
@@ -9652,7 +10664,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             let endDate = calendar.date(byAdding: .minute, value: 10, to: timestamp) ?? timestamp
 
 
-            // Fetch all frames in the 20-minute window with video info (single optimized query)
+            // Fetch all timeline payloads in the 20-minute window (single optimized query).
             // Always pass filterCriteria to ensure hidden filter is applied (default: .hide)
             let framesWithVideoInfo = try await fetchFramesWithVideoInfoLogged(
                 from: startDate,
@@ -10461,6 +11473,9 @@ public class SimpleTimelineViewModel: ObservableObject {
         excluding frameID: FrameID,
         around index: Int
     ) -> [UnavailableFrameFallbackCandidate] {
+        // A union-tape neighbor can belong to a different monitor. A pinned
+        // display must wait for its own frame rather than borrow those pixels.
+        guard !isPrimaryDisplayPinned else { return [] }
         guard !frames.isEmpty else { return [] }
         guard index >= 0 && index < frames.count else { return [] }
 
@@ -13897,7 +14912,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         // Track text copy event with the copied text.
         DashboardViewModel.recordTextCopy(coordinator: coordinator, text: text)
-        
+
         // Track shift+drag text copy if this was from a manual selection
         if hasSelection {
             DashboardViewModel.recordShiftDragTextCopy(coordinator: coordinator, copiedText: text)
@@ -14792,8 +15807,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             let startDate = calendar.date(byAdding: .minute, value: -10, to: anchoredTargetDate) ?? anchoredTargetDate
             let endDate = calendar.date(byAdding: .minute, value: 10, to: anchoredTargetDate) ?? anchoredTargetDate
 
-            // Fetch all frames in the 20-minute window
-            // Uses optimized query that JOINs on video table - no N+1 queries!
+            // Fetch all timeline payloads in the 20-minute window.
             // Always pass filterCriteria to ensure hidden filter is applied (default: .hide)
             let framesWithVideoInfo = try await fetchFramesWithVideoInfoLogged(
                 from: startDate,
@@ -16287,8 +17301,20 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Update window boundary timestamps from current frames
     private func updateWindowBoundaries() {
+        let recordedDisplayIDs = Set(frames.filter { $0.frame.source == .native }.map { $0.frame.metadata.displayID }.filter { $0 != 0 })
+        if isMultiDisplayEnabled || availableDisplayIDs.count > 1 || recordedDisplayIDs.count > 1 {
+            Task { await updateMultiDisplayState() }
+        }
+
+        let previousOldest = oldestLoadedTimestamp
+        let previousNewest = newestLoadedTimestamp
+
         oldestLoadedTimestamp = frames.first?.frame.timestamp
         newestLoadedTimestamp = frames.last?.frame.timestamp
+
+        if previousOldest != oldestLoadedTimestamp || previousNewest != newestLoadedTimestamp {
+            clearPIPDisplayFrameCache()
+        }
 
         if let oldest = oldestLoadedTimestamp, let newest = newestLoadedTimestamp {
             Log.debug("[InfiniteScroll] Window boundaries: \(oldest) to \(newest)", category: .ui)
@@ -17073,7 +18099,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     private func updateDeferredTrimAnchorForCurrentSelectionIfNeeded() {
         guard isActivelyScrolling, deferredTrimDirection == .newer else { return }
-        guard let currentFrame = currentTimelineFrame?.frame else { return }
+        guard let currentFrame = currentTapeFrame?.frame else { return }
 
         deferredTrimAnchorFrameID = currentFrame.id
         deferredTrimAnchorTimestamp = currentFrame.timestamp
@@ -17091,8 +18117,8 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         if allowDeferral, preserveDirection == .newer, isActivelyScrolling {
             deferredTrimDirection = preserveDirection
-            deferredTrimAnchorFrameID = anchorFrameID ?? currentTimelineFrame?.frame.id
-            deferredTrimAnchorTimestamp = anchorTimestamp ?? currentTimelineFrame?.frame.timestamp
+            deferredTrimAnchorFrameID = anchorFrameID ?? currentTapeFrame?.frame.id
+            deferredTrimAnchorTimestamp = anchorTimestamp ?? currentTapeFrame?.frame.timestamp
             let anchorIDValue = deferredTrimAnchorFrameID?.value ?? -1
             let anchorTS = deferredTrimAnchorTimestamp.map { Log.timestamp(from: $0) } ?? "nil"
             Log.info(
@@ -17119,8 +18145,8 @@ public class SimpleTimelineViewModel: ObservableObject {
             // User is scrolling toward newer, trim older frames from start
             Log.info("[Memory] TRIMMING \(excessCount) older frames from START (preserving newer) reason=\(reason)", category: .ui)
             let oldIndex = currentIndex
-            let resolvedAnchorFrameID = anchorFrameID ?? currentTimelineFrame?.frame.id
-            let resolvedAnchorTimestamp = anchorTimestamp ?? currentTimelineFrame?.frame.timestamp
+            let resolvedAnchorFrameID = anchorFrameID ?? currentTapeFrame?.frame.id
+            let resolvedAnchorTimestamp = anchorTimestamp ?? currentTapeFrame?.frame.timestamp
             let trimmedFrames = Array(frames.dropFirst(excessCount))
 
             let targetIndexAfterTrim: Int

@@ -40,7 +40,8 @@ public actor WALManager {
     private var debugRawReadOffsetsByVideoID: [Int64: [UInt64]] = [:]
     private static let eagerReadSafetyLimitBytes: Int64 = 512 * 1024 * 1024
     private static let maximumFrameBytes = 256 * 1024 * 1024
-    private static let recordMagic = Data("RTRCWAL2".utf8)
+    private static let legacyRecordMagic = Data("RTRCWAL2".utf8)
+    private static let recordMagic = Data("RTRCWAL3".utf8)
     private static let recordExtensionSize = 48  // magic + codec + decoded size + SHA-256
     // Reconstructible frame counts/dimensions need only occasional sidecar checkpoints.
     // Durable video frontier updates still persist immediately and must never regress.
@@ -200,6 +201,7 @@ public actor WALManager {
             appendLittleEndian(value, to: &headerData)
         }
         for string in strings { appendLittleEndian(UInt16(string.count), to: &headerData) }
+        appendLittleEndian(UInt32(frame.metadata.isFocused ? 1 : 0), to: &headerData)
 
         let fileHandle: FileHandle
         do {
@@ -280,6 +282,15 @@ public actor WALManager {
         } else {
             frameOffsetIndexCache.removeValue(forKey: session.videoID.value)
         }
+    }
+
+    /// Complete capture admission only after the journal bytes have been flushed.
+    public func synchronizeSession(videoID: VideoSegmentID) throws {
+        guard let handle = appendHandles[videoID.value] else {
+            throw StorageError.walUnavailable(reason: "Missing active journal writer")
+        }
+        do { try handle.synchronize() }
+        catch { throw makeStorageWriteError(path: "WAL", error: error, fallback: "Failed to synchronize captured frame") }
     }
 
     /// Persist the readable frontier of the fragmented MP4 so recovery can
@@ -961,7 +972,7 @@ public actor WALManager {
             throw StorageError.fileReadFailed(path: path, underlying: "Incomplete WAL record prefix")
         }
         let record: WALRecordHeader
-        if prefix == Self.recordMagic {
+        if prefix == Self.recordMagic || prefix == Self.legacyRecordMagic {
             let ext = try readExact(fileHandle: fileHandle, count: Self.recordExtensionSize - 8, path: path, label: "V2 record extension")
             let codecValue = ext.withUnsafeBytes { UInt32(littleEndian: $0.loadUnaligned(as: UInt32.self)) }
             guard let codec = WALPayloadCodec(rawValue: codecValue) else {
@@ -972,9 +983,20 @@ public actor WALManager {
                 from: readExact(
                     fileHandle: fileHandle, count: Self.headerSize, path: path, label: "V2 frame header"
                 ))
+            let flags: UInt32
+            if prefix == Self.recordMagic {
+                let bytes = try readExact(fileHandle: fileHandle, count: 4, path: path, label: "V3 focus flags")
+                flags = bytes.withUnsafeBytes { UInt32(littleEndian: $0.loadUnaligned(as: UInt32.self)) }
+                guard flags <= 1 else {
+                    throw StorageError.fileReadFailed(path: path, underlying: "Unsupported WAL focus flags")
+                }
+            } else {
+                flags = 1 // Legacy records predate focus tracking.
+            }
             record = WALRecordHeader(
                 frame: header, codec: codec, decodedSize: decodedSize,
-                checksum: Data(ext[8..<40]), headerByteCount: Self.headerSize + Self.recordExtensionSize
+                checksum: Data(ext[8..<40]), headerByteCount: Self.headerSize + Self.recordExtensionSize + (prefix == Self.recordMagic ? 4 : 0),
+                isFocused: flags == 1
             )
         } else {
             var data = prefix
@@ -1453,7 +1475,8 @@ public actor WALManager {
                 appName: appName,
                 windowName: windowName,
                 browserURL: browserURL,
-                displayID: header.displayID
+                displayID: header.displayID,
+                isFocused: record.isFocused
             )
         )
     }
@@ -1777,6 +1800,7 @@ private struct WALRecordHeader {
     let decodedSize: UInt32
     let checksum: Data?
     let headerByteCount: Int
+    var isFocused: Bool = true
 
     var metadataByteCount: Int {
         Int(frame.appBundleIDLength) + Int(frame.appNameLength)

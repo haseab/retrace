@@ -74,6 +74,7 @@ retrace/
 ├── Shared/                      # CRITICAL: Shared types and protocols
 │   ├── Logging.swift            # Privacy-safe bounded background logging, batching, routine summaries and async flush
 │   ├── AppPaths.swift           # Application path configuration
+│   ├── DisplayIdentity.swift    # Shared UUID identity registry with collision-safe persistence
 │   ├── BGRAImageUtilities.swift # Shared BGRA conversion + patch extraction helpers
 │   ├── MasterKeyManager.swift   # Keychain-backed master key creation + recovery phrase export
 │   ├── ReversibleOCRScrambler.swift # Deterministic reversible OCR patch scrambling + text protection
@@ -108,7 +109,7 @@ retrace/
 │   ├── FTSManager.swift         # Full-text search management
 │   ├── IDMappingService.swift   # ID mapping between sources
 │   ├── Schema.swift             # Current schema definition
-│   ├── Migrations/              # Schema migration scripts
+│   ├── Migrations/              # Schema migration scripts (through V21_MultiDisplaySupport.swift)
 │   ├── Queries/                 # Query implementations, including FrameOCRRegionQueries.swift
 │   └── Tests/                  # Includes RetentionVideoDeletionTests (real SQLite guard/failure cases)
 │
@@ -116,6 +117,7 @@ retrace/
 │   ├── AGENTS.md
 │   ├── StorageManager.swift
 │   ├── ImageExtractor.swift     # Extract frames from video files
+│   ├── CaptureWALJournal.swift   # Capture-time persistence before queued encoding
 │   ├── IncrementalSegmentWriter.swift
 │   ├── SegmentWriterImpl.swift
 │   ├── FileManager/             # File system utilities, including scoped TemporaryVideoLink
@@ -179,6 +181,7 @@ retrace/
 │       ├── ServiceContainerRewindCutoffTests.swift # Rewind cutoff defaults and latest-frame probe coverage
 │       ├── TestLogger.swift
 │       ├── TimelineStillDiskWriterTests.swift
+│       ├── CaptureJournalPipelineTests.swift # WAL-before-encoding and real recovery coverage
 │       ├── RecordingDatabaseFailureTests.swift # Real recording pipeline with an injected metadata insert failure
 │       └── UnexpectedRecordingStopHeuristicTests.swift # Unexpected-stop watchdog heuristic coverage
 │
@@ -199,7 +202,7 @@ retrace/
     │   └── Settings/            # Settings-specific view models and extracted helper logic
     ├── Views/
     │   ├── Dashboard/           # App usage analytics views and confirmed bulk segment hide/delete actions
-    │   ├── FullscreenTimeline/  # Timeline scrubbing & playback (10 views)
+    │   ├── FullscreenTimeline/  # Timeline scrubbing & playback (includes PIPThumbnailView.swift)
     │   ├── Search/              # Search UI (SearchView, ResultRow, FrameViewer)
     │   ├── Settings/            # Settings shell, support components, and extracted section/action files
     │   │   └── Sections/        # Concern-split settings sections, verification flows, and shared actions

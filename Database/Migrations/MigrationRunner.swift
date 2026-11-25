@@ -107,7 +107,8 @@ actor MigrationRunner {
             V17_FrameCaptureTrigger(),
             V18_DailyMetricsRecencyIndex(),
             V19_FrameEncodedAt(),
-            V20_PartialProcessingStatusIndex()
+            V20_PartialProcessingStatusIndex(),
+            V21_MultiDisplaySupport()
         ]
     }
 

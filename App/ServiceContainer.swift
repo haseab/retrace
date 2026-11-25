@@ -792,6 +792,9 @@ extension CaptureConfig {
         let captureOnWindowChange = defaults.object(forKey: "captureOnWindowChange") as? Bool ?? true
         let captureOnMouseClick = defaults.object(forKey: "captureOnMouseClick") as? Bool ?? false
 
+        // Multi-display recording - opt-in via settings
+        let recordAllDisplays = defaults.object(forKey: "recordAllDisplays") as? Bool ?? false
+
         return CaptureConfig(
             captureIntervalSeconds: captureIntervalSeconds,
             adaptiveCaptureEnabled: deleteDuplicateFrames, // Controlled by "Delete duplicate frames" setting
@@ -804,6 +807,7 @@ extension CaptureConfig {
             redactWindowTitlePatterns: redactWindowTitlePatterns,
             redactBrowserURLPatterns: redactBrowserURLPatterns,
             captureOnWindowChange: captureOnWindowChange,
+            recordAllDisplays: recordAllDisplays,
             captureOnMouseClick: captureOnMouseClick
         )
     }

@@ -37,6 +37,7 @@ extension SettingsView {
         case "power.powerEfficiency": powerEfficiencyCard
         case "power.appFilter": appFilterCard
         case "tags.manageTags": manageTagsCard
+        case "advanced.multiMonitorRecording": multiMonitorRecordingCard
         case "advanced.cache": cacheCard
         case "advanced.timeline": timelineCard
         case "advanced.developer": developerCard

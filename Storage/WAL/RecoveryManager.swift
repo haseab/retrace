@@ -266,7 +266,10 @@ public actor RecoveryManager {
                 "[Recovery] WAL session \(frontier.session.videoID.value) has no recoverable WAL frames, but existing video contains \(preservedVideoFrameCount) reusable readable frames; preserved the durable video data and quarantined WAL residue",
                 category: .storage
             )
-        } else if frontier.session.metadata.frameCount > 0 {
+        } else {
+            // Checkpoints can still report zero after capture-time appends.
+            // With no readable video or recoverable WAL pixels, the matching
+            // placeholder must not survive to orphan-video finalization.
             _ = try await discardUnfinalisedDatabaseVideoIfPresent(
                 for: frontier.session,
                 reason: "No recoverable WAL frames found in WAL session"
@@ -525,7 +528,13 @@ public actor RecoveryManager {
             width: session.metadata.width,
             height: session.metadata.height
         )
-        let databaseVideoID = try await database.insertVideoSegment(video)
+        let displayID: UInt32
+        if let first = descriptors.first {
+            displayID = try await walManager.readFrame(videoID: session.videoID, atOffset: first.walOffset).metadata.displayID
+        } else {
+            displayID = 0 // Legacy sessions without any recoverable frame metadata.
+        }
+        let databaseVideoID = try await database.insertVideoSegment(video, displayID: displayID)
         Log.warning(
             "[Recovery] Created DB video row \(databaseVideoID) for readable video \(session.videoID.value) instead of re-encoding the durable prefix",
             category: .storage
@@ -947,7 +956,7 @@ public actor RecoveryManager {
             for: frames,
             initialState: appSegmentState
         )
-        let dbVideoID = try await database.insertVideoSegment(videoSegment)
+        let dbVideoID = try await database.insertVideoSegment(videoSegment, displayID: frames[0].metadata.displayID)
         var commitRollback = RecoveryCommitRollback(
             createdDatabaseVideoID: VideoSegmentID(value: dbVideoID),
             createdPathVideoID: videoSegment.id

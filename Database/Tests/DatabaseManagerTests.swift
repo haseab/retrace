@@ -2744,49 +2744,8 @@ final class DatabaseManagerTests: XCTestCase {
             removeSQLiteTestArtifacts(atPath: dbPath)
         }
 
-        try executeRawSQL(Schema.createSchemaMigrationsTable, db: db)
-        try executeRawSQL(
-            """
-            CREATE TABLE frame (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                imagePath TEXT NOT NULL,
-                timestamp INTEGER NOT NULL,
-                segmentId INTEGER NOT NULL,
-                videoId INTEGER,
-                ocrText TEXT,
-                imageWidth INTEGER NOT NULL,
-                imageHeight INTEGER NOT NULL,
-                isRedacted BOOLEAN DEFAULT 0,
-                redactionConfidence REAL,
-                processingStatus INTEGER DEFAULT 0,
-                processedAt INTEGER,
-                redactionReason INTEGER,
-                metadata TEXT,
-                mousePosition TEXT,
-                scrollPosition TEXT,
-                videoCurrentTime REAL,
-                rewritePurpose INTEGER,
-                rewrittenAt INTEGER
-            );
-            """,
-            db: db
-        )
-        try executeRawSQL(
-            """
-            CREATE TABLE daily_metrics (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp INTEGER NOT NULL,
-                metricType INTEGER NOT NULL,
-                value INTEGER NOT NULL DEFAULT 0,
-                metadata TEXT
-            );
-            """,
-            db: db
-        )
-        try executeRawSQL(
-            "INSERT INTO schema_migrations (version, applied_at) VALUES (16, \(Int64(Date().timeIntervalSince1970 * 1_000)));",
-            db: db
-        )
+        try await runLegacyMigrations(throughVersion: 16, db: db)
+        try executeRawSQL("ALTER TABLE frame DROP COLUMN capture_trigger;", db: db)
 
         var preMigrationStatement: OpaquePointer?
         defer { sqlite3_finalize(preMigrationStatement) }

@@ -223,6 +223,25 @@ extension SettingsView {
         }
     }
 
+    func updateRecordAllDisplaysSetting(enabled: Bool) {
+        Task {
+            await applyCaptureConfigMutation(
+                successLog: "[SettingsView] Record all displays updated",
+                failureLog: "[SettingsView] Failed to update record all displays",
+                transform: { $0.updating(recordAllDisplays: enabled) },
+                onSuccess: { _ in
+                    showCaptureUpdateFeedback()
+                    Task {
+                        try? await coordinatorWrapper.coordinator.recordMetricEvent(
+                            metricType: .multiDisplayAction,
+                            metadata: "{\"action\":\"toggle\",\"enabled\":\(enabled),\"outcome\":\"applied\"}"
+                        )
+                    }
+                }
+            )
+        }
+    }
+
     func updateCaptureOnWindowChangeSetting() {
         if isProgrammaticWindowChangeCaptureToggleChange {
             isProgrammaticWindowChangeCaptureToggleChange = false
@@ -515,6 +534,8 @@ extension SettingsView {
 
     /// Reset all Advanced settings to defaults
     func resetAdvancedSettings() {
+        recordAllDisplays = false
+        updateRecordAllDisplaysSetting(enabled: false)
         showFrameIDs = SettingsDefaults.showFrameIDs
         enableFrameIDSearch = SettingsDefaults.enableFrameIDSearch
         showVideoControls = SettingsDefaults.showVideoControls

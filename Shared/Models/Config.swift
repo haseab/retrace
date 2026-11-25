@@ -157,6 +157,10 @@ public struct CaptureConfig: Codable, Sendable {
     /// Default is true.
     public let captureOnWindowChange: Bool
 
+    /// Whether to record all connected displays simultaneously.
+    /// When false (default), only the active/focused display is recorded (current behavior).
+    /// When true, one capture instance runs per connected display.
+    public let recordAllDisplays: Bool
     /// Whether to capture shortly after a left mouse click.
     /// Default is false until the user enables it and grants Input Monitoring permission.
     public let captureOnMouseClick: Bool
@@ -175,6 +179,7 @@ public struct CaptureConfig: Codable, Sendable {
         redactBrowserURLPatterns: [String] = [],
         idleThresholdSeconds: Double = 120.0,
         captureOnWindowChange: Bool = true,
+        recordAllDisplays: Bool = false,
         captureOnMouseClick: Bool = false
     ) {
         self.captureIntervalSeconds = captureIntervalSeconds
@@ -190,6 +195,7 @@ public struct CaptureConfig: Codable, Sendable {
         self.redactBrowserURLPatterns = redactBrowserURLPatterns
         self.idleThresholdSeconds = idleThresholdSeconds
         self.captureOnWindowChange = captureOnWindowChange
+        self.recordAllDisplays = recordAllDisplays
         self.captureOnMouseClick = captureOnMouseClick
     }
 
@@ -207,6 +213,7 @@ public struct CaptureConfig: Codable, Sendable {
         redactBrowserURLPatterns: [String]? = nil,
         idleThresholdSeconds: Double? = nil,
         captureOnWindowChange: Bool? = nil,
+        recordAllDisplays: Bool? = nil,
         captureOnMouseClick: Bool? = nil
     ) -> Self {
         Self(
@@ -223,6 +230,7 @@ public struct CaptureConfig: Codable, Sendable {
             redactBrowserURLPatterns: redactBrowserURLPatterns ?? self.redactBrowserURLPatterns,
             idleThresholdSeconds: idleThresholdSeconds ?? self.idleThresholdSeconds,
             captureOnWindowChange: captureOnWindowChange ?? self.captureOnWindowChange,
+            recordAllDisplays: recordAllDisplays ?? self.recordAllDisplays,
             captureOnMouseClick: captureOnMouseClick ?? self.captureOnMouseClick
         )
     }

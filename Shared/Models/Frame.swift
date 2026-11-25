@@ -56,6 +56,9 @@ public struct FrameMetadata: Codable, Sendable, Equatable {
     /// Display ID that was captured
     public let displayID: UInt32
 
+    /// Whether this frame was captured from the focused (active) display
+    /// true = user was looking at this display, false = secondary display
+    public let isFocused: Bool
     /// Mouse position in frame pixel coordinates (top-left origin), when captured.
     public let mousePosition: CGPoint?
 
@@ -73,7 +76,8 @@ public struct FrameMetadata: Codable, Sendable, Equatable {
         captureTrigger: FrameCaptureTrigger? = nil,
         displayID: UInt32 = 0,
         mousePosition: CGPoint? = nil,
-        ocrRegions: [CGRect]? = nil
+        ocrRegions: [CGRect]? = nil,
+        isFocused: Bool = true
     ) {
         self.appBundleID = appBundleID
         self.appName = appName
@@ -82,8 +86,30 @@ public struct FrameMetadata: Codable, Sendable, Equatable {
         self.redactionReason = redactionReason
         self.captureTrigger = captureTrigger
         self.displayID = displayID
+        self.isFocused = isFocused
         self.mousePosition = mousePosition
         self.ocrRegions = ocrRegions
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case appBundleID, appName, windowName, browserURL, redactionReason, captureTrigger
+        case displayID, mousePosition, ocrRegions, isFocused
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            appBundleID: try values.decodeIfPresent(String.self, forKey: .appBundleID),
+            appName: try values.decodeIfPresent(String.self, forKey: .appName),
+            windowName: try values.decodeIfPresent(String.self, forKey: .windowName),
+            browserURL: try values.decodeIfPresent(String.self, forKey: .browserURL),
+            redactionReason: try values.decodeIfPresent(String.self, forKey: .redactionReason),
+            captureTrigger: try values.decodeIfPresent(FrameCaptureTrigger.self, forKey: .captureTrigger),
+            displayID: try values.decodeIfPresent(UInt32.self, forKey: .displayID) ?? 0,
+            mousePosition: try values.decodeIfPresent(CGPoint.self, forKey: .mousePosition),
+            ocrRegions: try values.decodeIfPresent([CGRect].self, forKey: .ocrRegions),
+            isFocused: try values.decodeIfPresent(Bool.self, forKey: .isFocused) ?? true
+        )
     }
 
     public static let empty = FrameMetadata()
@@ -91,8 +117,20 @@ public struct FrameMetadata: Codable, Sendable, Equatable {
 
 // MARK: - Captured Frame
 
-/// A captured frame with raw image data - used during capture pipeline
-/// Note: ID is assigned by database on insert (AUTOINCREMENT)
+/// Identifies a capture-time WAL record and the writer that will encode it.
+public struct CapturedFrameJournalReceipt: Sendable {
+    public let writer: any SegmentWriter
+    public let segmentID: VideoSegmentID
+    public let frameIndex: Int
+
+    public init(writer: any SegmentWriter, segmentID: VideoSegmentID, frameIndex: Int) {
+        self.writer = writer
+        self.segmentID = segmentID
+        self.frameIndex = frameIndex
+    }
+}
+
+/// A captured frame with raw pixels; database identity is assigned on insertion.
 public struct CapturedFrame: Sendable {
     public let timestamp: Date
     public let imageData: Data  // Raw pixel data or compressed image
@@ -101,6 +139,7 @@ public struct CapturedFrame: Sendable {
     public let bytesPerRow: Int
     public let metadata: FrameMetadata
     public let accessibilitySnapshot: AccessibilitySnapshot?
+    public let journalReceipt: CapturedFrameJournalReceipt?
 
     public init(
         timestamp: Date = Date(),
@@ -109,7 +148,8 @@ public struct CapturedFrame: Sendable {
         height: Int,
         bytesPerRow: Int,
         metadata: FrameMetadata = .empty,
-        accessibilitySnapshot: AccessibilitySnapshot? = nil
+        accessibilitySnapshot: AccessibilitySnapshot? = nil,
+        journalReceipt: CapturedFrameJournalReceipt? = nil
     ) {
         self.timestamp = timestamp
         self.imageData = imageData
@@ -118,6 +158,7 @@ public struct CapturedFrame: Sendable {
         self.bytesPerRow = bytesPerRow
         self.metadata = metadata
         self.accessibilitySnapshot = accessibilitySnapshot
+        self.journalReceipt = journalReceipt
     }
 }
 
@@ -439,16 +480,42 @@ public struct UnfinalisedVideo: Sendable, Equatable {
     /// Video height in pixels
     public let height: Int
 
-    /// Resolution string for use as dictionary key
+    /// Display ID that produced this video (for multi-display support)
+    public let displayID: UInt32
+
+    /// Writer key combining displayID and resolution for unique video writer lookup
+    public var writerKey: String {
+        "\(displayID)_\(width)x\(height)"
+    }
+
+    /// Legacy resolution-only key (for backward compatibility)
     public var resolutionKey: String {
         "\(width)x\(height)"
     }
 
-    public init(id: Int64, relativePath: String, frameCount: Int, width: Int, height: Int) {
+    public init(id: Int64, relativePath: String, frameCount: Int, width: Int, height: Int, displayID: UInt32 = 0) {
         self.id = id
         self.relativePath = relativePath
         self.frameCount = frameCount
         self.width = width
         self.height = height
+        self.displayID = displayID
     }
+}
+
+/// Lifecycle changes share the screenshot queue so earlier accepted frames drain
+/// before their journal writer is finalized. This stream has one consumer.
+public enum CaptureStreamEvent: Sendable {
+    case frame(CapturedFrame)
+    case retainDisplays(Set<UInt32>)
+
+    public var pixelByteCount: Int {
+        if case .frame(let frame) = self { return frame.imageData.count }
+        return 0
+    }
+}
+
+public enum FrameDeletionNotification {
+    public static let didDelete = Notification.Name("NativeFramesDidDelete")
+    public static let frameIDsKey = "frameIDs"
 }

@@ -81,7 +81,7 @@ final class CaptureTriggerSchedulingTests: XCTestCase {
 
     func testMouseClickSchedulesExactlyOneCaptureAfterMouseUpSettleDelay() async throws {
         let backend = FakeScreenCaptureBackend(
-            frames: [makeFrame(displayID: 7, pixelValue: 10)]
+            frames: [makeFrame(displayID: 7, pixelValue: 10)], captureDelay: .milliseconds(100)
         )
         let displayMonitor = FakeDisplayMonitor(activeDisplayID: 7, hasPermission: true)
         let displaySwitchMonitor = FakeDisplaySwitchMonitor()
@@ -97,26 +97,28 @@ final class CaptureTriggerSchedulingTests: XCTestCase {
         try await manager.startCapture(config: testConfig())
         let stream = await manager.frameStream
         let streamTask = collectFrames(from: stream, into: collector)
-        defer {
+        addTeardownBlock {
             streamTask.cancel()
-            Task { try? await manager.stopCapture() }
+            try await manager.stopCapture()
         }
 
         await mouseClickMonitor.emitMouseDown()
-        try await sleep(milliseconds: 70)
         let captureCountBeforeMouseUp = await backend.captureCount()
         XCTAssertEqual(captureCountBeforeMouseUp, 0)
 
+        let releasedAt = ContinuousClock.now
         await mouseClickMonitor.emitMouseUp()
-        try await sleep(milliseconds: 8)
-        let earlyCaptureCount = await backend.captureCount()
-        XCTAssertEqual(earlyCaptureCount, 0)
-
-        try await sleep(milliseconds: 45)
+        try await waitForOutcome { await collector.count() == 1 }
+        let starts = await backend.captureStartTimes()
+        XCTAssertEqual(starts.count, 1)
+        if let startedAt = starts.first {
+            XCTAssertGreaterThanOrEqual(releasedAt.duration(to: startedAt), .milliseconds(30),
+                "Capture must respect the settle delay; completion can take longer under load")
+        }
         let captureDisplayIDs = await backend.captureDisplayIDs()
-        let collectedFrameCount = await collector.count()
+        let frame = await collector.lastFrame()
         XCTAssertEqual(captureDisplayIDs, [7])
-        XCTAssertEqual(collectedFrameCount, 1)
+        XCTAssertEqual(frame?.metadata.captureTrigger, .mouse)
     }
 
     func testMouseClickSuppressesPendingWindowChangeCapture() async throws {
@@ -186,7 +188,7 @@ final class CaptureTriggerSchedulingTests: XCTestCase {
         )
 
         try await manager.startCapture(
-            config: testConfig(captureIntervalSeconds: 0.05)
+            config: testConfig(captureIntervalSeconds: 1.0)
         )
         let stream = await manager.frameStream
         let streamTask = collectFrames(from: stream, into: collector)
@@ -195,20 +197,24 @@ final class CaptureTriggerSchedulingTests: XCTestCase {
             Task { try? await manager.stopCapture() }
         }
 
-        try await sleep(milliseconds: 40)
+        // Leave ample scheduling headroom instead of racing 10 ms timer gaps.
+        try await sleep(milliseconds: 500)
         await mouseClickMonitor.emitMouseUp()
-
-        try await sleep(milliseconds: 25)
-        let firstCaptureCount = await backend.captureCount()
-        let firstCollectedFrameCount = await collector.count()
-        XCTAssertEqual(firstCaptureCount, 1)
-        XCTAssertEqual(firstCollectedFrameCount, 1)
-
-        try await sleep(milliseconds: 70)
+        try await waitForOutcome { await collector.count() == 1 }
+        let first = await collector.lastFrame()
+        XCTAssertEqual(first?.metadata.captureTrigger, .mouse)
+        try await waitForOutcome { await collector.count() == 2 }
+        let second = await collector.lastFrame()
+        XCTAssertEqual(second?.metadata.captureTrigger, .interval)
+        let receptions = await collector.receptionTimes()
+        XCTAssertEqual(receptions.count, 2)
+        if receptions.count == 2 {
+            // A stale original timer would fire about half a second after the
+            // click. The reset timer must wait the full configured interval.
+            XCTAssertGreaterThanOrEqual(receptions[0].duration(to: receptions[1]), .milliseconds(850))
+        }
         let finalCaptureCount = await backend.captureCount()
-        let finalCollectedFrameCount = await collector.count()
         XCTAssertEqual(finalCaptureCount, 2)
-        XCTAssertEqual(finalCollectedFrameCount, 2)
     }
 
     func testMouseClickWithinRefractoryIsDroppedInsteadOfBuffered() async throws {
@@ -223,6 +229,7 @@ final class CaptureTriggerSchedulingTests: XCTestCase {
         let mouseClickMonitor = FakeMouseClickMonitor(startResult: true)
         let triggerRecorder = MouseClickOutcomeRecorder()
         let collector = FrameCollector()
+        let clock = CaptureTestClock()
         let manager = makeManager(
             backend: backend,
             displayMonitor: displayMonitor,
@@ -233,31 +240,35 @@ final class CaptureTriggerSchedulingTests: XCTestCase {
                 mouseClickSettleDelay: 0.005,
                 windowChangeSettleDelay: 0.03,
                 startWithImmediateIntervalCapture: false
-            )
+            ),
+            now: { clock.now() }
         )
         await manager.setTriggerRecorder(triggerRecorder)
 
-        try await manager.startCapture(config: testConfig())
+        try await manager.startCapture(config: testConfig(captureIntervalSeconds: 0))
         let stream = await manager.frameStream
         let streamTask = collectFrames(from: stream, into: collector)
-        defer {
+        addTeardownBlock {
             streamTask.cancel()
-            Task { try? await manager.stopCapture() }
+            try await manager.stopCapture()
         }
 
         await mouseClickMonitor.emitMouseUp()
-        try await sleep(milliseconds: 15)
+        try await waitForOutcome { await collector.count() == 1 }
+        // Advance the scheduler's injected clock, not a sleep which may resume
+        // after the entire cooldown has elapsed on a loaded host.
+        clock.advance(by: 0.015)
         await mouseClickMonitor.emitMouseUp()
+        try await waitForOutcome { await triggerRecorder.contains(outcome: .debounced) }
+        let countWithinCooldown = await backend.captureCount()
+        XCTAssertEqual(countWithinCooldown, 1)
 
-        try await sleep(milliseconds: 20)
-        let earlyCaptureCount = await backend.captureCount()
-        XCTAssertEqual(earlyCaptureCount, 1)
-
-        try await sleep(milliseconds: 50)
-        let finalCaptureCount = await backend.captureCount()
-        let hasDebouncedOutcome = await triggerRecorder.contains(outcome: .debounced)
-        XCTAssertEqual(finalCaptureCount, 1)
-        XCTAssertTrue(hasDebouncedOutcome)
+        // Suppression must expire: the next click outside the cooldown captures.
+        clock.advance(by: 0.100)
+        await mouseClickMonitor.emitMouseUp()
+        try await waitForOutcome { await collector.count() == 2 }
+        let countAfterCooldown = await backend.captureCount()
+        XCTAssertEqual(countAfterCooldown, 2)
     }
 
     func testMouseMonitorUnavailableDoesNotBlockWindowCapture() async throws {
@@ -286,7 +297,7 @@ final class CaptureTriggerSchedulingTests: XCTestCase {
         }
 
         await displaySwitchMonitor.emitWindowChange()
-        try await sleep(milliseconds: 80)
+        try await waitForOutcome { await collector.count() == 1 }
 
         let captureCount = await backend.captureCount()
         let collectedFrameCount = await collector.count()
@@ -327,7 +338,7 @@ final class CaptureTriggerSchedulingTests: XCTestCase {
         await mouseClickMonitor.setStartResult(true)
         await manager.retryMouseClickMonitoringIfNeeded()
         await mouseClickMonitor.emitMouseUp()
-        try await sleep(milliseconds: 80)
+        try await waitForOutcome { await collector.count() == 1 }
 
         let captureCountAfterRetry = await backend.captureCount()
         let collectedFrameCountAfterRetry = await collector.count()
@@ -366,9 +377,11 @@ final class CaptureTriggerSchedulingTests: XCTestCase {
         }
 
         await mouseClickMonitor.emitMouseUp()
-        try await sleep(milliseconds: 20)
+        try await waitForOutcome { await triggerRecorder.contains(outcome: .captured) }
+        // Distinct clicks must be outside the configured refractory interval.
+        try await sleep(milliseconds: 25)
         await mouseClickMonitor.emitMouseUp()
-        try await sleep(milliseconds: 30)
+        try await waitForOutcome { await triggerRecorder.contains(outcome: .deduped) }
 
         let collectedFrameCount = await collector.count()
         let hasCapturedOutcome = await triggerRecorder.contains(outcome: .captured)
@@ -398,7 +411,7 @@ final class CaptureTriggerSchedulingTests: XCTestCase {
         }
 
         await mouseClickMonitor.emitMouseUp()
-        try await sleep(milliseconds: 80)
+        try await waitForOutcome { await backend.captureCount() == 1 }
 
         let captureDisplayIDs = await backend.captureDisplayIDs()
         XCTAssertEqual(captureDisplayIDs, [22])
@@ -666,7 +679,7 @@ final class CaptureTriggerSchedulingTests: XCTestCase {
             frames: [
                 makeFrame(displayID: 12, pixelValue: 10),
                 makeFrame(displayID: 12, pixelValue: 80)
-            ]
+            ], captureDelay: .milliseconds(100)
         )
         let displayMonitor = FakeDisplayMonitor(activeDisplayID: 12, hasPermission: true)
         let displaySwitchMonitor = FakeDisplaySwitchMonitor()
@@ -688,9 +701,9 @@ final class CaptureTriggerSchedulingTests: XCTestCase {
         try await manager.startCapture(config: testConfig(captureIntervalSeconds: 0))
         let stream = await manager.frameStream
         let streamTask = collectFrames(from: stream, into: collector)
-        defer {
+        addTeardownBlock {
             streamTask.cancel()
-            Task { try? await manager.stopCapture() }
+            try await manager.stopCapture()
         }
 
         try await sleep(milliseconds: 80)
@@ -698,7 +711,9 @@ final class CaptureTriggerSchedulingTests: XCTestCase {
         XCTAssertEqual(captureCountBeforeEvents, 0)
 
         await displaySwitchMonitor.emitWindowChange()
-        try await sleep(milliseconds: 30)
+        try await waitForOutcome { await collector.count() == 1 }
+        let windowFrame = await collector.lastFrame()
+        XCTAssertEqual(windowFrame?.metadata.captureTrigger, .window)
         let captureCountAfterWindowChange = await backend.captureCount()
         XCTAssertEqual(captureCountAfterWindowChange, 1)
 
@@ -707,7 +722,9 @@ final class CaptureTriggerSchedulingTests: XCTestCase {
         XCTAssertEqual(captureCountWithoutPeriodicReschedule, 1)
 
         await mouseClickMonitor.emitMouseUp()
-        try await sleep(milliseconds: 20)
+        try await waitForOutcome { await collector.count() == 2 }
+        let clickFrame = await collector.lastFrame()
+        XCTAssertEqual(clickFrame?.metadata.captureTrigger, .mouse)
         let finalCaptureCount = await backend.captureCount()
         let finalCollectedFrameCount = await collector.count()
         XCTAssertEqual(finalCaptureCount, 2)
@@ -738,6 +755,190 @@ final class CaptureTriggerSchedulingTests: XCTestCase {
         try await manager.stopCapture()
     }
 
+    func testFullQueuePausesCaptureUntilConsumerPullsAndStopReleasesProducer() async throws {
+        let backend = FakeScreenCaptureBackend(frames: (0..<24).map {
+            makeFrame(displayID: 13, pixelValue: UInt8($0), timestamp: Date(timeIntervalSince1970: Double($0)))
+        })
+        let manager = makeManager(backend: backend,
+            displayMonitor: FakeDisplayMonitor(activeDisplayID: 13, hasPermission: true),
+            displaySwitchMonitor: FakeDisplaySwitchMonitor(),
+            mouseClickMonitor: FakeMouseClickMonitor(startResult: true))
+        let config = testConfig(captureIntervalSeconds: 0.04, captureOnWindowChange: false, captureOnMouseClick: false,
+                                adaptiveCaptureEnabled: false)
+        try await manager.startCapture(config: config)
+        let watchdog = Task {
+            do { try await Task.sleep(for: .seconds(10), clock: .continuous) }
+            catch { return }
+            try? await manager.stopCapture()
+        }
+        defer { watchdog.cancel() }
+        let stream = await manager.frameStream
+        let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while await backend.captureCount() < 9, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(5), clock: .continuous)
+        }
+        try await Task.sleep(for: .milliseconds(50), clock: .continuous)
+        let blockedCount = await backend.captureCount()
+        guard blockedCount == 9 else {
+            try await manager.stopCapture()
+            return XCTFail("Expected eight queued frames and one suspended capture; got \(blockedCount) captures")
+        }
+        var iterator = stream.makeAsyncIterator()
+        for sequence in 0..<12 {
+            let frame = await iterator.next()
+            XCTAssertEqual(frame?.timestamp, Date(timeIntervalSince1970: Double(sequence)))
+        }
+        // Fill the queue again and stop with no consumer pulling. This must wake
+        // the producer instead of holding shutdown hostage to storage progress.
+        let secondDeadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while await backend.captureCount() < 21, ContinuousClock.now < secondDeadline {
+            try await Task.sleep(for: .milliseconds(5), clock: .continuous)
+        }
+        let secondBlockedCount = await backend.captureCount()
+        XCTAssertEqual(secondBlockedCount, 21)
+        try await manager.stopCapture()
+        let finished = await iterator.next()
+        XCTAssertNil(finished)
+        // An old suspended producer must not contaminate a restarted stream.
+        try await manager.startCapture(config: config)
+        var restartedIterator = await manager.frameStream.makeAsyncIterator()
+        let restarted = await restartedIterator.next()
+        XCTAssertEqual(restarted?.timestamp, Date(timeIntervalSince1970: 21))
+        try await manager.stopCapture()
+    }
+
+    func testDisplayRetirementEventFollowsAcceptedScreenshotEvenWhenNoNewFrameArrives() async throws {
+        let backend = FakeScreenCaptureBackend(frames: [makeFrame(displayID: 13, pixelValue: 10)])
+        let monitor = FakeDisplayMonitor(activeDisplayID: 13, hasPermission: true)
+        let manager = makeManager(backend: backend, displayMonitor: monitor,
+            displaySwitchMonitor: FakeDisplaySwitchMonitor(), mouseClickMonitor: FakeMouseClickMonitor(startResult: true))
+        let retired = expectation(description: "Capture reconciles an empty display set")
+        await manager.setDisplayJournalRetirementHandler { displays in
+            if displays.isEmpty { retired.fulfill() }
+        }
+        let config = testConfig(captureIntervalSeconds: 0.04, captureOnWindowChange: false, captureOnMouseClick: false)
+        try await manager.startCapture(config: config)
+        let watchdog = Task {
+            do { try await Task.sleep(for: .seconds(5), clock: .continuous) }
+            catch { return }
+            try? await manager.stopCapture()
+        }
+        defer { watchdog.cancel() }
+        var iterator = await manager.eventStream.makeAsyncIterator()
+        guard case .retainDisplays(let connected) = await iterator.next() else {
+            try await manager.stopCapture()
+            return XCTFail("Expected display lifecycle before first frame")
+        }
+        guard case .frame(let accepted) = await iterator.next() else {
+            try await manager.stopCapture()
+            return XCTFail("Expected accepted screenshot")
+        }
+        XCTAssertEqual(connected, [accepted.metadata.displayID])
+        await monitor.setEmptyDisplayList(true)
+        // Empty discovery uses no real screen backend and produces no new pixels.
+        try await manager.updateConfig(config.updating(recordAllDisplays: true))
+        guard case .retainDisplays(let remaining) = await iterator.next() else {
+            try await manager.stopCapture()
+            return XCTFail("Disconnect must wake an idle pipeline")
+        }
+        XCTAssertTrue(remaining.isEmpty)
+        await fulfillment(of: [retired], timeout: 2)
+        try await manager.stopCapture()
+    }
+
+    func testEmptyDisplayDiscoveryKeepsPeriodicRetriesAlive() async throws {
+        let backend = FakeScreenCaptureBackend(frames: [])
+        let monitor = FakeDisplayMonitor(activeDisplayID: 13, hasPermission: true, emptyDisplayList: true)
+        let manager = makeManager(backend: backend, displayMonitor: monitor,
+            displaySwitchMonitor: FakeDisplaySwitchMonitor(), mouseClickMonitor: FakeMouseClickMonitor(startResult: true))
+        let config = testConfig(captureIntervalSeconds: 0.04, captureOnWindowChange: false, captureOnMouseClick: false)
+            .updating(recordAllDisplays: true)
+        try await manager.startCapture(config: config)
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while await monitor.discoveryCount() < 3, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(5), clock: .continuous)
+        }
+        let attempts = await monitor.discoveryCount()
+        try await manager.stopCapture()
+        XCTAssertGreaterThanOrEqual(attempts, 3)
+    }
+
+    func testGracefulStopWaitsForPersistenceAndDrainsTheInFlightScreenshot() async throws {
+        let backend = FakeScreenCaptureBackend(frames: [makeFrame(displayID: 13, pixelValue: 10)])
+        let manager = makeManager(backend: backend,
+            displayMonitor: FakeDisplayMonitor(activeDisplayID: 13, hasPermission: true),
+            displaySwitchMonitor: FakeDisplaySwitchMonitor(), mouseClickMonitor: FakeMouseClickMonitor(startResult: true))
+        let gate = AsyncGate()
+        let persistenceStarted = FrameCollector()
+        await manager.setFramePersistenceHandler { frame in
+            await persistenceStarted.append(frame)
+            await gate.wait()
+            return frame
+        }
+        try await manager.startCapture(config: testConfig(captureIntervalSeconds: 0.04,
+            captureOnWindowChange: false, captureOnMouseClick: false))
+        let stream = await manager.frameStream
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while await persistenceStarted.count() == 0, ContinuousClock.now < deadline { await Task.yield() }
+        let count = await persistenceStarted.count()
+        XCTAssertEqual(count, 1)
+        let stop = Task { try await manager.stopCapture(drain: true) }
+        while await manager.isCapturing { await Task.yield() }
+        await gate.open()
+        try await stop.value
+        var iterator = stream.makeAsyncIterator()
+        let frame = await iterator.next()
+        XCTAssertNotNil(frame)
+        let end = await iterator.next()
+        XCTAssertNil(end)
+    }
+
+    func testPersistenceFailureDoesNotAdmitAnUnjournaledScreenshot() async throws {
+        let backend = FakeScreenCaptureBackend(frames: [makeFrame(displayID: 13, pixelValue: 10)])
+        let manager = makeManager(backend: backend,
+            displayMonitor: FakeDisplayMonitor(activeDisplayID: 13, hasPermission: true),
+            displaySwitchMonitor: FakeDisplaySwitchMonitor(), mouseClickMonitor: FakeMouseClickMonitor(startResult: true))
+        await manager.setFramePersistenceHandler { _ in throw StorageError.insufficientDiskSpace }
+        try await manager.startCapture(config: testConfig(captureIntervalSeconds: 0.04,
+            captureOnWindowChange: false, captureOnMouseClick: false))
+        var iterator = await manager.frameStream.makeAsyncIterator()
+        let frame = await iterator.next()
+        XCTAssertNil(frame)
+        let running = await manager.isCapturing
+        XCTAssertFalse(running)
+    }
+
+    func testEmergencyAbortReleasesAFullQueueDuringNormalDrain() async throws {
+        let backend = FakeScreenCaptureBackend(frames: (0..<12).map {
+            makeFrame(displayID: 13, pixelValue: UInt8($0))
+        })
+        let manager = makeManager(backend: backend,
+            displayMonitor: FakeDisplayMonitor(activeDisplayID: 13, hasPermission: true),
+            displaySwitchMonitor: FakeDisplaySwitchMonitor(), mouseClickMonitor: FakeMouseClickMonitor(startResult: true))
+        try await manager.startCapture(config: testConfig(captureIntervalSeconds: 0.04,
+            captureOnWindowChange: false, captureOnMouseClick: false, adaptiveCaptureEnabled: false))
+        let stream = await manager.frameStream
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while await backend.captureCount() < 9, ContinuousClock.now < deadline { await Task.yield() }
+        let count = await backend.captureCount()
+        XCTAssertEqual(count, 9)
+        let drain = Task { try await manager.stopCapture(drain: true) }
+        while await manager.isCapturing { await Task.yield() }
+        let watchdog = Task {
+            do { try await Task.sleep(for: .seconds(3), clock: .continuous) }
+            catch { return }
+            XCTFail("Emergency abort did not release the draining producer")
+            var fallback = stream.makeAsyncIterator()
+            _ = await fallback.next()
+        }
+        defer { watchdog.cancel() }
+        try await manager.stopCapture() // explicit emergency/abort path
+        try await drain.value
+        var iterator = stream.makeAsyncIterator()
+        let end = await iterator.next()
+        XCTAssertNil(end)
+    }
+
     private func makeManager(
         backend: FakeScreenCaptureBackend,
         displayMonitor: FakeDisplayMonitor,
@@ -756,7 +957,8 @@ final class CaptureTriggerSchedulingTests: XCTestCase {
             mouseClickSettleDelay: 0.03,
             windowChangeSettleDelay: 0.06,
             startWithImmediateIntervalCapture: false
-        )
+        ),
+        now: @escaping @Sendable () -> Date = { Date() }
     ) -> CaptureManager {
         CaptureManager(
             config: testConfig(),
@@ -766,6 +968,7 @@ final class CaptureTriggerSchedulingTests: XCTestCase {
             mouseClickMonitor: mouseClickMonitor,
             appInfoProvider: appInfoProvider,
             schedulingConfiguration: schedulingConfiguration,
+            now: now,
             permissionCheck: { true }
         )
     }
@@ -773,11 +976,12 @@ final class CaptureTriggerSchedulingTests: XCTestCase {
     private func testConfig(
         captureIntervalSeconds: Double = 1.0,
         captureOnWindowChange: Bool = true,
-        captureOnMouseClick: Bool = true
+        captureOnMouseClick: Bool = true,
+        adaptiveCaptureEnabled: Bool = true
     ) -> CaptureConfig {
         CaptureConfig(
             captureIntervalSeconds: captureIntervalSeconds,
-            adaptiveCaptureEnabled: true,
+            adaptiveCaptureEnabled: adaptiveCaptureEnabled,
             deduplicationThreshold: CaptureConfig.defaultDeduplicationThreshold,
             keepFramesOnMouseMovement: false,
             maxResolution: .hd1080,
@@ -825,6 +1029,15 @@ final class CaptureTriggerSchedulingTests: XCTestCase {
                 await collector.append(frame)
             }
         }
+    }
+
+    private func waitForOutcome(_ condition: () async -> Bool, file: StaticString = #filePath, line: UInt = #line) async throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while !(await condition()), ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(5), clock: .continuous)
+        }
+        let completed = await condition()
+        XCTAssertTrue(completed, "Expected capture outcome before deadline", file: file, line: line)
     }
 
     private func sleep(milliseconds: Int) async throws {
@@ -914,18 +1127,23 @@ private actor FakeScreenCaptureBackend: ScreenCaptureBackend {
     private var candidates: [CaptureFrameCandidate] = []
     private var frames: [CapturedFrame]
     private var displayIDs: [UInt32] = []
+    private let captureDelay: Duration
+    private var captureStarts: [ContinuousClock.Instant] = []
 
-    init(frames: [CapturedFrame]) {
+    init(frames: [CapturedFrame], captureDelay: Duration = .zero) {
         self.frames = frames
+        self.captureDelay = captureDelay
     }
 
     init(candidates: [CaptureFrameCandidate]) {
         frames = []
         self.candidates = candidates
+        captureDelay = .zero
     }
 
     func captureCandidate(displayID: CGDirectDisplayID) async -> CaptureFrameCandidate? {
         if !candidates.isEmpty {
+            captureStarts.append(.now)
             displayIDs.append(displayID)
             return candidates.removeFirst()
         }
@@ -941,10 +1159,14 @@ private actor FakeScreenCaptureBackend: ScreenCaptureBackend {
     ) async {}
 
     func captureFrame(displayID: CGDirectDisplayID) async -> CapturedFrame? {
+        captureStarts.append(.now)
+        if captureDelay > .zero { try? await Task.sleep(for: captureDelay, clock: .continuous) }
         displayIDs.append(displayID)
         guard !frames.isEmpty else { return nil }
         return frames.removeFirst()
     }
+
+    func captureStartTimes() -> [ContinuousClock.Instant] { captureStarts }
 
     func captureCount() -> Int {
         displayIDs.count
@@ -958,14 +1180,21 @@ private actor FakeScreenCaptureBackend: ScreenCaptureBackend {
 private actor FakeDisplayMonitor: CaptureDisplayMonitoring {
     private let activeDisplayID: UInt32
     private let hasPermission: Bool
+    private var emptyDisplayList: Bool
+    func setEmptyDisplayList(_ empty: Bool) { emptyDisplayList = empty }
+    private var discoveries = 0
+    func discoveryCount() -> Int { discoveries }
 
-    init(activeDisplayID: UInt32, hasPermission: Bool) {
+    init(activeDisplayID: UInt32, hasPermission: Bool, emptyDisplayList: Bool = false) {
         self.activeDisplayID = activeDisplayID
         self.hasPermission = hasPermission
+        self.emptyDisplayList = emptyDisplayList
     }
 
     func getAvailableDisplays() async throws -> [DisplayInfo] {
-        [
+        discoveries += 1
+        if emptyDisplayList { return [] }
+        return [
             DisplayInfo(
                 id: activeDisplayID,
                 width: 100,
@@ -1120,10 +1349,14 @@ private actor BlockingSequencedFakeAppInfoProvider: CaptureAppInfoProviding {
 
 private actor FrameCollector {
     private var frames: [CapturedFrame] = []
+    private var receptions: [ContinuousClock.Instant] = []
 
     func append(_ frame: CapturedFrame) {
         frames.append(frame)
+        receptions.append(.now)
     }
+
+    func receptionTimes() -> [ContinuousClock.Instant] { receptions }
 
     func count() -> Int {
         frames.count
@@ -1243,5 +1476,23 @@ private final class TestMouseClickTapSession: MouseClickTapSessionControlling, @
         stateLock.unlock()
 
         continuation?.resume(returning: result)
+    }
+}
+
+/// Only tests advance this clock; capture reads it from its actor/executor.
+private final class CaptureTestClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var date = Date(timeIntervalSince1970: 1_700_000_000)
+
+    func now() -> Date {
+        lock.lock()
+        defer { lock.unlock() }
+        return date
+    }
+
+    func advance(by seconds: TimeInterval) {
+        lock.lock()
+        defer { lock.unlock() }
+        date = date.addingTimeInterval(seconds)
     }
 }

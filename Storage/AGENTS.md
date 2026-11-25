@@ -12,6 +12,7 @@ Storage/
 ├── StorageManager.swift         # Main StorageProtocol implementation
 ├── ImageExtractor.swift         # Frame extraction and AVAsset generator caches
 ├── IncrementalSegmentWriter.swift # WAL-first recording and video finalization
+├── CaptureWALJournal.swift       # Capture-time journal admission and shared writer receipts
 ├── SegmentWriterImpl.swift      # SegmentWriter implementation
 ├── StorageModuleError.swift     # Storage-local errors
 ├── FileManager/
@@ -63,7 +64,7 @@ Location: `AppPaths.storageRoot` (default: `~/Library/Application Support/Retrac
 
 ### WAL format and memory rules
 
-- New records begin with `RTRCWAL2`, a UInt32 codec (0 = raw fallback, 1 = LZFSE), a UInt32 decoded size, and a 32-byte SHA-256 pixel digest. The existing 36-byte frame header, metadata strings, and stored payload follow. Integers use little-endian encoding.
+- New records begin with `RTRCWAL3`, a UInt32 codec (0 = raw fallback, 1 = LZFSE), a UInt32 decoded size, and a 32-byte SHA-256 pixel digest. The existing 36-byte frame header, a UInt32 focus flag (0 = secondary, 1 = focused), metadata strings, and stored payload follow. Readers also accept RTRCWAL2 (without flags, default focused) and legacy raw records. Integers use little-endian encoding.
 - Records are independent. Index scans skip payloads, while OCR/recovery decode one frame at a time. Loss of `metadata.json` must not prevent format detection or recovery.
 - Preserve legacy raw record support, exact row stride/padding, and frame-ID offset mappings. Never silently fall back to a different frame index when an ID mapping is missing.
 - Isolate metadata rebuild failures per session. Retain/quarantine unsupported or corrupt journals without deleting their bytes or blocking healthy recovery and recording startup.
@@ -376,3 +377,7 @@ Keep the pre-append existence check for recovery before writing the next frame. 
 ### JPEG frame extraction
 
 `ImageExtractor` implementations and `StorageManager` encode CGImage frames directly with ImageIO at quality 0.8. Do not reintroduce an NSImage/TIFF/NSBitmapImageRep round trip. JPEG conversion telemetry uses the `storage.videoDecoding.jpegEncoding` tag and a one-frame-plus-output-headroom proxy; this is an estimate, not measured allocation or a memory limit. Existing frame reading and real video/redaction regressions exercise decoded JPEGs. The paired encoder comparison used the same native decoded frames as both inputs and verified identical JPEG bytes for the sampled recordings.
+
+### Capture-time journal admission
+
+`CaptureWALJournal` serially persists privacy-filtered screenshots and synchronizes each record before returning a receipt to capture. Receipt-bearing frames use the same incremental writer and WAL index during encoding; never append their pixels twice. Rotate capture journals at the per-segment frame limit or dimension changes. Keep a WAL whenever its journaled count exceeds the encoded prefix, including interrupted finalization. Normal shutdown drains the delivery stream before finalizing writers and closing database/storage services. `CaptureWALJournalTests` and `App/Tests/CaptureJournalPipelineTests.swift` cover pre-encoding recovery and real encoding/database delivery.
