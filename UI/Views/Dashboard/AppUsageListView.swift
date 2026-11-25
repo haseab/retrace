@@ -99,6 +99,17 @@ enum DashboardWindowTitleFormatter {
         return title
     }
 
+    /// Strip the enclosing prefix for display without changing the original window target.
+    static func childDisplayTitle(for rawTitle: String, appBundleID: String, groupPrefix: String? = nil) -> String {
+        let title = displayTitle(for: rawTitle, appBundleID: appBundleID)
+        guard let groupPrefix, let separator = title.range(of: " - "),
+              title[..<separator.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines) == groupPrefix else {
+            return title
+        }
+        let childTitle = String(title[separator.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        return childTitle.isEmpty ? title : childTitle
+    }
+
     private static func isChromePWABundleID(_ bundleID: String) -> Bool {
         chromePWABundlePrefixes.contains { bundleID.hasPrefix($0) }
     }
@@ -342,7 +353,7 @@ struct AppUsageListView: View {
                         let visibleCount = displayedDomainTabCounts[groupKey] ?? initialDomainTabCount
                         VStack(spacing: 2) {
                             ForEach(group.windows.prefix(visibleCount)) { window in
-                                domainTabRow(tab: window, app: app, appColor: color, layoutSize: layoutSize)
+                                domainTabRow(tab: window, app: app, appColor: color, layoutSize: layoutSize, groupPrefix: group.title)
                             }
                             if group.windows.count > visibleCount {
                                 domainTabLoadMoreButton(domainKey: groupKey,
@@ -747,12 +758,13 @@ struct AppUsageListView: View {
     }
 
     /// Single tab row within the domain expansion
-    private func domainTabRow(tab: WindowUsageData, app: AppUsageData, appColor: Color, layoutSize: AppUsageLayoutSize) -> some View {
+    private func domainTabRow(tab: WindowUsageData, app: AppUsageData, appColor: Color, layoutSize: AppUsageLayoutSize, groupPrefix: String? = nil) -> some View {
         let tabKey = "\(app.appBundleID)_domain_\(tab.id)"
         let isHovered = hoveredWindowKey == tabKey
-        let displayTitle = DashboardWindowTitleFormatter.displayTitle(
+        let displayTitle = DashboardWindowTitleFormatter.childDisplayTitle(
             for: tab.displayName,
-            appBundleID: app.appBundleID
+            appBundleID: app.appBundleID,
+            groupPrefix: groupPrefix
         )
 
         return Button {
@@ -798,7 +810,7 @@ struct AppUsageListView: View {
                 .frame(width: 60, alignment: .trailing)
             }
             .padding(.trailing, layoutSize.horizontalPadding)
-            .padding(.vertical, 4)
+            .padding(.vertical, 10)
             .background(
                 RoundedRectangle(cornerRadius: 5)
                     .fill(isHovered ? Color.white.opacity(0.025) : Color.clear)
