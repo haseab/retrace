@@ -1535,6 +1535,13 @@ public struct DashboardView: View {
                     },
                     onUsageAction: { target, action in
                         usageActionRequest = DashboardUsageActionRequest(target: target, action: action)
+                    },
+                    onGroupingAction: { action, enabled in
+                        UIMetricsRecorder.recordDictionary(
+                            coordinator: coordinatorWrapper.coordinator,
+                            type: .dashboardWindowGrouping,
+                            payload: ["action": action, "enabled": enabled]
+                        )
                     }
                 )
                 .id(

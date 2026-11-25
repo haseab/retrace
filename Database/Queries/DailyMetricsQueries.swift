@@ -69,6 +69,8 @@ public enum DailyMetricsQueries {
         // metadata: JSON {source, action: hide|delete, phase: prepared|submitted|succeeded|failed,
         // segmentCount, frameCount, rangeStartMs, rangeEndMs}. No titles or URLs.
         case dashboardUsageAction = "dashboard_usage_action"
+        // metadata: JSON {action: mode_changed|expanded|collapsed|more_windows|more_groups, enabled: Bool}. No titles or URLs.
+        case dashboardWindowGrouping = "dashboard_window_grouping"
         case segmentUnhide = "segment_unhide"
         case tagSubmenuOpen = "tag_submenu_open"
         case tagToggleOnBlock = "tag_toggle_on_block"
