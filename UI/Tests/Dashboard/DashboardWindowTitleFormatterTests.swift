@@ -6,6 +6,18 @@ import App
 @testable import Retrace
 
 final class DashboardWindowTitleFormatterTests: XCTestCase {
+    func testChildTitlesRemoveOnlyTheMatchingGroupPrefix() {
+        XCTAssertEqual(DashboardWindowTitleFormatter.childDisplayTitle(
+            for: "Workspace - Plan - Draft", appBundleID: "com.example.workspace", groupPrefix: "Workspace"),
+            "Plan - Draft")
+        XCTAssertEqual(DashboardWindowTitleFormatter.childDisplayTitle(
+            for: "Messages - Workspace", appBundleID: "com.example.workspace", groupPrefix: "Workspace"),
+            "Messages - Workspace")
+        XCTAssertEqual(DashboardWindowTitleFormatter.childDisplayTitle(
+            for: "Workspace - Plan", appBundleID: "com.example.workspace"),
+            "Workspace - Plan")
+    }
+
     func testPrefixGroupsAggregateEveryWindowAndPreserveOriginalTargets() {
         let windows = [
             WindowUsageData(windowName: "Workspace - Plan - Draft", duration: 30, percentage: 0.3),
