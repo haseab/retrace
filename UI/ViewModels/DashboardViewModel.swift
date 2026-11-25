@@ -2509,7 +2509,7 @@ public struct WindowUsagePage {
     }
 }
 
-public struct WindowUsageData: Identifiable {
+public struct WindowUsageData: Identifiable, Sendable {
     public let id = UUID()
     public let windowName: String?
     public let browserUrl: String?  // Full URL for browser tabs (optional)

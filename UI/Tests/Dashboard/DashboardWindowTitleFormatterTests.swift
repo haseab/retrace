@@ -6,6 +6,27 @@ import App
 @testable import Retrace
 
 final class DashboardWindowTitleFormatterTests: XCTestCase {
+    func testPrefixGroupsAggregateEveryWindowAndPreserveOriginalTargets() {
+        let windows = [
+            WindowUsageData(windowName: "Workspace - Plan - Draft", duration: 30, percentage: 0.3),
+            WindowUsageData(windowName: "Workspace - Review", duration: 20, percentage: 0.2),
+            WindowUsageData(windowName: "Workspace", duration: 10, percentage: 0.1),
+            WindowUsageData(windowName: "Music", duration: 40, percentage: 0.4)
+        ]
+        let groups = DashboardWindowGrouping.groups(windows, appBundleID: "com.example.workspace")
+        XCTAssertEqual(groups.map(\.title), ["Workspace", "Music"])
+        XCTAssertEqual(groups.map(\.duration), [60, 40])
+        XCTAssertEqual(groups[0].percentage, 0.6, accuracy: 0.0001)
+        XCTAssertEqual(groups[0].windows.map(\.id), Array(windows.prefix(3)).map(\.id))
+        XCTAssertEqual(groups.flatMap(\.windows).count, windows.count)
+    }
+
+    func testPrefixUsesOnlyFirstSpacedHyphenAndPreservesOtherHyphens() {
+        let titles = ["  Work - Detail - More  ", "check-in", " - Detail", "Work - ", "", "Music"]
+        XCTAssertEqual(titles.map(DashboardWindowGrouping.prefix),
+                       ["Work", "check-in", "- Detail", "Work -", "Untitled Window", "Music"])
+    }
+
     func testSupportedBrowserBreakdownTreatsCometAsBrowser() {
         let app = AppUsageData(
             appBundleID: "ai.perplexity.comet",

@@ -32,7 +32,7 @@ UI/
 │   │   ├── DashboardView.swift          # Main dashboard
 │   │   ├── DashboardWindowController.swift # Dashboard window lifecycle
 │   │   ├── ChangelogView.swift          # Appcast-powered release notes view
-│   │   ├── AppUsageListView.swift       # App, website, and window usage breakdown
+│   │   ├── AppUsageListView.swift       # App, website, and window usage breakdown with optional expandable hyphen-prefix groups
 │   │   ├── DashboardUsageActions.swift # Native usage context menus, exact grouping targets, and bulk hide/delete confirmations
 │   │   ├── AppUsageHardDriveView.swift  # App usage treemap
 │   │   ├── AppSessionsDetailView.swift # App/window session details

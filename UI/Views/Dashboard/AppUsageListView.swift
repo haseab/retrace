@@ -122,6 +122,38 @@ enum DashboardWindowTitleFormatter {
     }
 }
 
+/// Groups already aggregated windows without changing their original action targets.
+enum DashboardWindowGrouping {
+    struct Group: Identifiable, Sendable {
+        var id: String { title }
+        let title: String
+        let windows: [WindowUsageData]
+        let duration: TimeInterval
+        let percentage: Double
+    }
+
+    static func prefix(_ title: String) -> String {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "Untitled Window" }
+        guard let separator = trimmed.range(of: " - ") else { return trimmed }
+        let prefix = String(trimmed[..<separator.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+        return prefix.isEmpty ? trimmed : prefix
+    }
+
+    static func groups(_ windows: [WindowUsageData], appBundleID: String) -> [Group] {
+        let grouped = Dictionary(grouping: windows) { window in
+            prefix(DashboardWindowTitleFormatter.displayTitle(for: window.displayName, appBundleID: appBundleID))
+        }
+        return grouped.map { title, windows in
+            Group(title: title, windows: windows,
+                  duration: windows.reduce(0) { $0 + $1.duration },
+                  percentage: windows.reduce(0) { $0 + $1.percentage })
+        }.sorted {
+            $0.duration == $1.duration ? $0.title < $1.title : $0.duration > $1.duration
+        }
+    }
+}
+
 /// List-style view for app usage data with expandable window details
 struct AppUsageListView: View {
     let apps: [AppUsageData]
@@ -133,6 +165,12 @@ struct AppUsageListView: View {
     var onWindowTapped: ((AppUsageData, WindowUsageData) -> Void)? = nil
     var onUsageAction: ((DashboardUsageTarget, DashboardUsageAction) -> Void)? = nil
 
+    var onGroupingAction: ((String, Bool) -> Void)? = nil
+
+    @AppStorage("dashboardGroupWindowsByHyphen") private var groupWindowsByHyphen = false
+    @State private var prefixGroups: [String: [DashboardWindowGrouping.Group]] = [:]
+    @State private var expandedPrefix: String? = nil
+    @State private var prefixWindowCounts: [String: Int] = [:]
     @State private var hoveredAppIndex: Int? = nil
     @State private var hoveredWindowKey: String? = nil
     @State private var displayedCount: Int = 20
@@ -157,7 +195,7 @@ struct AppUsageListView: View {
         ZStack {
             ScrollView(showsIndicators: false) {
                 VStack(spacing: 8) {
-                    ForEach(Array(apps.prefix(displayedCount).enumerated()), id: \.offset) { index, app in
+                    ForEach(Array(apps.prefix(displayedCount).enumerated()), id: \.element.appBundleID) { index, app in
                         VStack(spacing: 0) {
                             appUsageRow(index: index, app: app, layoutSize: layoutSize)
 
@@ -181,6 +219,13 @@ struct AppUsageListView: View {
 
             // Inner shadow scroll affordance
             ScrollAffordance(height: 40, color: scrollAffordanceColor)
+        }
+        .onChange(of: groupWindowsByHyphen) { enabled in
+            expandedPrefix = nil
+            onGroupingAction?("mode_changed", enabled)
+            if enabled, let app = apps.first(where: { $0.appBundleID == expandedAppBundleID }), !app.isBrowser {
+                loadWindowData(for: app, desiredVisibleCount: initialWindowCount)
+            }
         }
     }
 
@@ -210,7 +255,16 @@ struct AppUsageListView: View {
         let isLoadingMore = isLoading && !windows.isEmpty
 
         VStack(spacing: 4) {
-            if isLoading && windows.isEmpty {
+            if !isBrowser {
+                Toggle("Group by title prefix ( - )", isOn: $groupWindowsByHyphen)
+                    .toggleStyle(.checkbox)
+                    .font(layoutSize.windowNameFont)
+                    .foregroundColor(.retraceSecondary)
+                    .padding(.leading, layoutSize.windowRowIndent)
+                    .padding(.vertical, 6)
+                    .help("Combine windows with the same title before the first spaced hyphen.")
+            }
+            if isLoading && (windows.isEmpty || (groupWindowsByHyphen && !isBrowser)) {
                 HStack {
                     Spacer()
                     SpinnerView(size: 14, lineWidth: 2, color: .retraceSecondary)
@@ -227,6 +281,8 @@ struct AppUsageListView: View {
                 }
                 .padding(.vertical, 8)
                 .padding(.leading, layoutSize.windowRowIndent)
+            } else if groupWindowsByHyphen && !isBrowser {
+                prefixRows(for: app, layoutSize: layoutSize)
             } else {
                 ForEach(Array(displayedWindows.enumerated()), id: \.element.id) { index, window in
                     // For browsers, show websites view with expandable rows for domain tabs
@@ -281,6 +337,73 @@ struct AppUsageListView: View {
         .clipped()
     }
 
+
+    private func prefixRows(for app: AppUsageData, layoutSize: AppUsageLayoutSize) -> some View {
+        let groups = prefixGroups[app.appBundleID] ?? []
+        let count = displayedWindowCounts[app.appBundleID] ?? initialWindowCount
+        let color = Color.segmentColor(for: app.appBundleID)
+        return VStack(spacing: 4) {
+            ForEach(groups.prefix(count)) { group in
+                VStack(spacing: 0) {
+                    Button {
+                        let expanding = expandedPrefix != group.id
+                        expandedPrefix = expanding ? group.id : nil
+                        onGroupingAction?(expanding ? "expanded" : "collapsed", true)
+                    } label: {
+                        HStack(spacing: 10) {
+                            Image(systemName: expandedPrefix == group.id ? "chevron.down" : "chevron.right")
+                                .frame(width: 12)
+                            Text(group.title).lineLimit(1)
+                            Text("\(group.windows.count) windows")
+                                .foregroundColor(.retraceSecondary)
+                            Spacer()
+                            VStack(alignment: .trailing, spacing: 2) {
+                                Text(formatDuration(group.duration))
+                                    .font(layoutSize.windowDurationFont)
+                                Text(String(format: "%.1f%%", group.percentage * 100))
+                                    .foregroundColor(.retraceSecondary)
+                            }
+                            .frame(width: layoutSize.durationWidth, alignment: .trailing)
+                        }
+                        .font(layoutSize.windowNameFont)
+                        .foregroundColor(.retracePrimary)
+                        .padding(.vertical, 10)
+                        .padding(.leading, layoutSize.windowRowIndent)
+                        .padding(.trailing, layoutSize.horizontalPadding)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("\(group.title), \(group.windows.count) windows, \(formatDuration(group.duration))")
+                    .accessibilityValue(expandedPrefix == group.id ? "Expanded" : "Collapsed")
+                    if expandedPrefix == group.id {
+                        let visibleCount = prefixWindowCounts[group.id] ?? initialWindowCount
+                        ForEach(Array(group.windows.prefix(visibleCount).enumerated()), id: \.element.id) { index, window in
+                            windowRow(window: window, app: app, appColor: color, layoutSize: layoutSize, rowIndex: index)
+                                .padding(.leading, 20)
+                        }
+                        if group.windows.count > visibleCount {
+                            Button("Load More Windows") {
+                                prefixWindowCounts[group.id] = visibleCount + windowLoadIncrement
+                                onGroupingAction?("more_windows", true)
+                            }
+                            .buttonStyle(.plain)
+                            .font(layoutSize.windowNameFont)
+                            .padding(8)
+                        }
+                    }
+                }
+            }
+            if groups.count > count {
+                Button("Load More Groups") {
+                    displayedWindowCounts[app.appBundleID] = count + windowLoadIncrement
+                    onGroupingAction?("more_groups", true)
+                }
+                .buttonStyle(.plain)
+                .font(layoutSize.windowNameFont)
+                .padding(8)
+            }
+        }
+    }
 
     // MARK: - Window Load More Button
 
@@ -912,10 +1035,12 @@ struct AppUsageListView: View {
     // MARK: - Expansion Logic
 
     private func toggleExpansion(for app: AppUsageData) {
+        expandedPrefix = nil
+        prefixWindowCounts = [:]
         let isExpanded = expandedAppBundleID == app.appBundleID
         let cachedRows = windowUsageCache[app.appBundleID]
         let isLoading = loadingWindows.contains(app.appBundleID)
-        let shouldStartLoad = !isExpanded && cachedRows == nil && !isLoading
+        let shouldStartLoad = !isExpanded && !isLoading && (cachedRows == nil || (groupWindowsByHyphen && !app.isBrowser && prefixGroups[app.appBundleID] == nil))
 
         let applyExpansionChange = {
             if isExpanded {
@@ -942,7 +1067,7 @@ struct AppUsageListView: View {
     }
 
     private func loadWindowData(for app: AppUsageData, desiredVisibleCount: Int) {
-        guard let loader = loadWindowUsage else { return }
+        guard let loader = loadWindowUsage, !loadingWindows.contains(app.appBundleID) else { return }
 
         loadingWindows.insert(app.appBundleID)
         let requestedCount = max(desiredVisibleCount, initialWindowCount)
@@ -952,11 +1077,27 @@ struct AppUsageListView: View {
         )
 
         Task {
-            let page = await loader(app.appBundleID, requestedCount)
+            var page = await loader(app.appBundleID, requestedCount)
+            // Prefix totals must include windows beyond the visible page.
+            if !app.isBrowser && groupWindowsByHyphen && page.totalCount > page.rows.count {
+                page = await loader(app.appBundleID, page.totalCount)
+            }
+            let rows = page.rows
+            let bundleID = app.appBundleID
+            let groups = await Task.detached(priority: .userInitiated) {
+                DashboardWindowGrouping.groups(rows, appBundleID: bundleID)
+            }.value
             await MainActor.run {
+                if page.rows.count >= page.totalCount {
+                    prefixGroups[app.appBundleID] = groups
+                }
                 windowUsageCache[app.appBundleID] = page.rows
                 windowUsageTotalCounts[app.appBundleID] = page.totalCount
                 loadingWindows.remove(app.appBundleID)
+                // A preference change during the load must join and finish the full load.
+                if groupWindowsByHyphen && !app.isBrowser && page.rows.count < page.totalCount {
+                    loadWindowData(for: app, desiredVisibleCount: page.totalCount)
+                }
                 Log.info(
                     "[Dashboard] Loaded paged window usage bundleID=\(app.appBundleID) cachedRows=\(page.rows.count) totalCount=\(page.totalCount) requestedCount=\(requestedCount)",
                     category: .ui
