@@ -562,107 +562,7 @@ struct AppUsageListView: View {
             appBundleID: app.appBundleID
         )
 
-        return HStack(spacing: layoutSize.rowSpacing) {
-            // The same hierarchy for websites and title-prefix groups.
-            if isExpandable {
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 8, weight: .semibold))
-                    .foregroundColor(.retraceSecondary.opacity(0.5))
-                    .frame(width: 10)
-                    .rotationEffect(.degrees(isExpanded ? 90 : 0))
-                    .animation(.easeInOut(duration: 0.2), value: isExpanded)
-            } else {
-                // Spacer for alignment when no chevron
-                Spacer()
-                    .frame(width: 10)
-            }
-
-            // Indent spacer + icon (favicon for websites, app icon for window fallbacks)
-            HStack(spacing: 8) {
-                Spacer()
-                    .frame(width: layoutSize.rankWidth - 14)
-
-                if window.isWebsite {
-                    FaviconView(domain: window.displayName, size: 20, fallbackColor: appColor)
-                } else {
-                    // Window fallback: use app icon
-                    AppIconView(bundleID: app.appBundleID, size: 20)
-                }
-            }
-
-            // Domain name or window name with tab count metadata for websites
-            VStack(alignment: .leading, spacing: 2) {
-                Text(displayTitle)
-                    .font(layoutSize.windowNameFont)
-                    .foregroundColor(.retracePrimary.opacity(0.85))
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-
-                if isExpandable {
-                    if let tabCount = window.tabCount {
-                        Text(tabCountLabel(tabCount))
-                            .font(.system(size: 10, weight: .medium))
-                            .foregroundColor(.retraceSecondary.opacity(0.65))
-                    }
-                }
-            }
-
-            Spacer()
-
-            // Use a fixed slot width here instead of GeometryReader to avoid
-            // geometry-driven relayout churn in the animated browser expansion.
-            let progressBarSlotWidth = layoutSize.progressBarWidth * 0.6
-            let progressBarSlotHeight = layoutSize.progressBarHeight - 1
-            let progressBarFillWidth = max(progressBarSlotWidth * window.percentage, 4)
-            ZStack(alignment: .trailing) {
-                RoundedRectangle(cornerRadius: 3)
-                    .fill(Color.white.opacity(0.03))
-
-                RoundedRectangle(cornerRadius: 3)
-                    .fill(appColor.opacity(0.5))
-                    .frame(width: progressBarFillWidth)
-            }
-            .frame(width: progressBarSlotWidth, height: progressBarSlotHeight)
-
-            // Duration and percentage
-            VStack(alignment: .trailing, spacing: 1) {
-                Text(formatDuration(window.duration))
-                    .font(layoutSize.windowDurationFont)
-                    .foregroundColor(.retracePrimary.opacity(0.85))
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.9)
-
-                Text(String(format: "%.1f%%", window.percentage * 100))
-                    .font(.system(size: 9, weight: .medium))
-                    .foregroundColor(.retraceSecondary.opacity(0.7))
-            }
-            .frame(width: layoutSize.durationWidth, alignment: .trailing)
-        }
-        .padding(.horizontal, layoutSize.horizontalPadding)
-        .padding(.vertical, layoutSize.verticalPadding * 0.6)
-        .padding(.leading, layoutSize.windowRowIndent - layoutSize.rankWidth - 14)
-        .background(
-            RoundedRectangle(cornerRadius: 6)
-                .fill(isHovered || isExpanded ? Color.white.opacity(0.03) : Color.clear)
-        )
-        .scaleEffect(isHovered ? 1.01 : 1.0)
-        .animation(.easeInOut(duration: 0.15), value: isHovered)
-        .contentShape(Rectangle())
-        .onHover { hovering in
-            withAnimation(.easeInOut(duration: 0.1)) {
-                hoveredWindowKey = hovering ? domainKey : nil
-            }
-            if hovering {
-                NSCursor.pointingHand.push()
-                // Preload domain tabs on hover (only for websites)
-                if window.isWebsite && domainTabsCache[domainKey] == nil && !loadingDomainTabs.contains(domainKey) {
-                    loadDomainTabs(for: app, domain: window.displayName)
-                }
-            } else {
-                NSCursor.pop()
-            }
-        }
-        .onTapGesture {
+        return Button {
             if let group = prefixGroup, group.isExpandable {
                 let expanding = expandedDomainKey != domainKey
                 withAnimation(.easeInOut(duration: 0.2)) {
@@ -685,6 +585,109 @@ struct AppUsageListView: View {
             } else {
                 // Window fallbacks: trigger tap action to open timeline
                 onWindowTapped?(app, window)
+            }
+        } label: {
+            HStack(spacing: layoutSize.rowSpacing) {
+                // The same hierarchy for websites and title-prefix groups.
+                if isExpandable {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 8, weight: .semibold))
+                        .foregroundColor(.retraceSecondary.opacity(0.5))
+                        .frame(width: 10)
+                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                        .animation(.easeInOut(duration: 0.2), value: isExpanded)
+                } else {
+                    // Spacer for alignment when no chevron
+                    Spacer()
+                        .frame(width: 10)
+                }
+
+                // Indent spacer + icon (favicon for websites, app icon for window fallbacks)
+                HStack(spacing: 8) {
+                    Spacer()
+                        .frame(width: layoutSize.rankWidth - 14)
+
+                    if window.isWebsite {
+                        FaviconView(domain: window.displayName, size: 20, fallbackColor: appColor)
+                    } else {
+                        // Window fallback: use app icon
+                        AppIconView(bundleID: app.appBundleID, size: 20)
+                    }
+                }
+
+                // Domain name or window name with tab count metadata for websites
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(displayTitle)
+                        .font(layoutSize.windowNameFont)
+                        .foregroundColor(.retracePrimary.opacity(0.85))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+
+                    if isExpandable {
+                        if let tabCount = window.tabCount {
+                            Text(tabCountLabel(tabCount))
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundColor(.retraceSecondary.opacity(0.65))
+                        }
+                    }
+                }
+
+                Spacer()
+
+                // Use a fixed slot width here instead of GeometryReader to avoid
+                // geometry-driven relayout churn in the animated browser expansion.
+                let progressBarSlotWidth = layoutSize.progressBarWidth * 0.6
+                let progressBarSlotHeight = layoutSize.progressBarHeight - 1
+                let progressBarFillWidth = max(progressBarSlotWidth * window.percentage, 4)
+                ZStack(alignment: .trailing) {
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(Color.white.opacity(0.03))
+
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(appColor.opacity(0.5))
+                        .frame(width: progressBarFillWidth)
+                }
+                .frame(width: progressBarSlotWidth, height: progressBarSlotHeight)
+
+                // Duration and percentage
+                VStack(alignment: .trailing, spacing: 1) {
+                    Text(formatDuration(window.duration))
+                        .font(layoutSize.windowDurationFont)
+                        .foregroundColor(.retracePrimary.opacity(0.85))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.9)
+
+                    Text(String(format: "%.1f%%", window.percentage * 100))
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundColor(.retraceSecondary.opacity(0.7))
+                }
+                .frame(width: layoutSize.durationWidth, alignment: .trailing)
+            }
+            .padding(.horizontal, layoutSize.horizontalPadding)
+            .padding(.vertical, layoutSize.verticalPadding * 0.6)
+            .padding(.leading, layoutSize.windowRowIndent - layoutSize.rankWidth - 14)
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(isHovered || isExpanded ? Color.white.opacity(0.03) : Color.clear)
+            )
+            .scaleEffect(isHovered ? 1.01 : 1.0)
+            .animation(.easeInOut(duration: 0.15), value: isHovered)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityValue(isExpandable ? (isExpanded ? "Expanded" : "Collapsed") : "")
+        .onHover { hovering in
+            withAnimation(.easeInOut(duration: 0.1)) {
+                hoveredWindowKey = hovering ? domainKey : nil
+            }
+            if hovering {
+                NSCursor.pointingHand.push()
+                // Preload domain tabs on hover (only for websites)
+                if window.isWebsite && domainTabsCache[domainKey] == nil && !loadingDomainTabs.contains(domainKey) {
+                    loadDomainTabs(for: app, domain: window.displayName)
+                }
+            } else {
+                NSCursor.pop()
             }
         }
         .contextMenu {
