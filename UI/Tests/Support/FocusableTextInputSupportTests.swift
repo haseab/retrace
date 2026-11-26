@@ -53,6 +53,41 @@ final class FocusableTextInputSupportTests: XCTestCase {
         }
     }
 
+    func testUnfocusedFieldDoesNotInterceptBrowserURLClipboardShortcuts() throws {
+        let window = KeyableWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 320, height: 120),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        defer { window.close() }
+        let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 120))
+        window.contentView = contentView
+        let titleField = FocusableTextField(frame: NSRect(x: 20, y: 70, width: 240, height: 24))
+        let urlField = FocusableTextField(frame: NSRect(x: 20, y: 30, width: 240, height: 24))
+        contentView.addSubview(titleField)
+        contentView.addSubview(urlField)
+        window.makeKeyAndOrderFront(nil)
+        urlField.stringValue = "https://example.com"
+        urlField.selectText(nil)
+        let editor = try XCTUnwrap(urlField.currentEditor())
+
+        // AppKit visits sibling views when resolving key equivalents.
+        // An earlier field must not claim the focused field's editing commands.
+        for (key, code): (String, UInt16) in [("a", 0), ("c", 8), ("x", 7), ("v", 9)] {
+            let event = try XCTUnwrap(NSEvent.keyEvent(
+                with: .keyDown, location: .zero, modifierFlags: [.command],
+                timestamp: 0, windowNumber: window.windowNumber, context: nil,
+                characters: key, charactersIgnoringModifiers: key,
+                isARepeat: false, keyCode: code
+            ))
+            XCTAssertFalse(titleField.performKeyEquivalent(with: event), "Unfocused field intercepted Cmd+\(key)")
+            XCTAssertTrue(window.firstResponder === editor)
+            XCTAssertTrue(urlField.currentEditor() === editor)
+        }
+    }
+
     private final class ClipboardSpyTextView: NSTextView {
         var didCopy = false
         var didPaste = false

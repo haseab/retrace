@@ -48,6 +48,17 @@ final class FocusableTextField: NSTextField {
             return super.performKeyEquivalent(with: event)
         }
 
+        // AppKit also asks unfocused sibling views to resolve key equivalents.
+        // Only the current input may handle editing shortcuts; otherwise an
+        // earlier field can steal focus and paste into the wrong filter.
+        if ["a", "c", "x", "v"].contains(key) {
+            guard let window,
+                  window.firstResponder === self ||
+                    (currentEditor() != nil && window.firstResponder === currentEditor()) else {
+                return false
+            }
+        }
+
         switch key {
         case "g":
             onCancelCallback?()
