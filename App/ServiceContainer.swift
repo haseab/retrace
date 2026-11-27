@@ -34,6 +34,20 @@ public actor ServiceContainer {
     public var dataAdapter: DataAdapter?
     public var processingQueue: FrameProcessingQueue?
 
+    #if DEBUG
+    /// Supplies the real queue to controlled-stream pipeline tests without
+    /// starting background workers or connecting optional external data sources.
+    func prepareProcessingQueueForTesting() {
+        processingQueue = FrameProcessingQueue(
+            database: database,
+            storage: storage,
+            processing: processing,
+            search: search,
+            config: .default
+        )
+    }
+    #endif
+
     // MARK: - Configuration
 
     private let databasePath: String

@@ -11,7 +11,7 @@ Storage/
 ├── GeneratorCachePolicy.swift   # Shared idle/LRU eviction policy for AVAsset generator caches
 ├── StorageManager.swift         # Main StorageProtocol implementation
 ├── ImageExtractor.swift         # Frame extraction and AVAsset generator caches
-├── IncrementalSegmentWriter.swift # WAL-first recording and video finalization
+├── IncrementalSegmentWriter.swift # WAL-first recording, video finalization, and video/WAL preservation during recovery
 ├── CaptureWALJournal.swift       # Capture-time journal admission and shared writer receipts
 ├── SegmentWriterImpl.swift      # SegmentWriter implementation
 ├── StorageModuleError.swift     # Storage-local errors

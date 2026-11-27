@@ -149,14 +149,14 @@ struct StorageHealthBannerState: Equatable {
         let availableText = String(format: "%.2f", availableGB)
 
         if shouldStop {
-            return "Recording stopped because storage is critically low (\(availableText) GB free). Free up disk space before restarting capture."
+            return "Recording is interrupted because storage is critically low (\(availableText) GB free). Free up disk space; recording will retry automatically."
         }
 
         switch severity {
         case .warning:
             return "Storage is running low (\(availableText) GB free). Free space soon to avoid interrupted recording."
         case .critical:
-            return "Storage is critically low (\(availableText) GB free). Recording may stop soon if space is not freed."
+            return "Storage is critically low (\(availableText) GB free). Recording may be interrupted until space is freed."
         }
     }
 }
@@ -231,6 +231,7 @@ public class DashboardViewModel: ObservableObject {
     @Published var conferencePrivacyBanner: ConferencePrivacyDashboardBannerState?
     @Published var recentCrashReport: DashboardCrashReportSummary?
     @Published var recentWALFailureCrash: WALFailureCrashReportSummary?
+    @Published var isRecordingInterrupted = false
     @Published var unexpectedRecordingStop: UnexpectedRecordingStopState?
 
     // Track user dismissals — re-nag after 30 minutes
@@ -399,7 +400,9 @@ public class DashboardViewModel: ObservableObject {
     private func updateRecordingStatus(force: Bool = false) {
         guard force || !isRecordingToggleInFlight else { return }
         // Read from thread-safe holder to avoid actor hops and keep UI updates responsive.
-        isRecording = coordinator.statusHolder.status.isRunning
+        let status = coordinator.statusHolder.status
+        isRecording = status.isRunning
+        isRecordingInterrupted = status.isInterrupted
     }
 
     private func updatePauseStatus() {

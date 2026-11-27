@@ -1173,6 +1173,116 @@ final class StorageManagerTests: XCTestCase {
         XCTAssertEqual(persisted.durableVideoFileSizeBytes, 888)
     }
 
+    func testRecordingFailureEncoderBlockedParentUsesDifferentErrorType() async throws {
+        let root = makeTempRoot()
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let blocker = root.appendingPathComponent("blocked-parent")
+        try Data("not a directory".utf8).write(to: blocker)
+        let encoder = HEVCEncoder()
+        do {
+            try await encoder.initialize(
+                width: 512, height: 342, config: .default,
+                outputURL: blocker.appendingPathComponent("video.mp4"), segmentStartTime: Date()
+            )
+            await encoder.reset()
+            XCTFail("Expected AVAssetWriter to reject a file as its parent directory")
+        } catch {
+            XCTAssertFalse(error is StorageError)
+            await encoder.reset()
+            print("[FailureProbe] encoder_blocked_parent -> different_error_type; domain=\((error as NSError).domain); code=\((error as NSError).code)")
+        }
+    }
+
+    func testRecordingFailureMissingWALFileProducesFileWriteFailed() async throws {
+        let root = makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let manager = WALManager(walRoot: root)
+        var session = try await manager.createSession(videoID: VideoSegmentID(value: 490))
+        let frame = try makeWALScreenshotFrame()
+        try await manager.appendFrame(frame, to: &session)
+        var evictions: [WALSession] = []
+        for offset in 0..<8 {
+            var other = try await manager.createSession(videoID: VideoSegmentID(value: Int64(9_000_000 + offset)))
+            try await manager.appendFrame(frame, to: &other)
+            evictions.append(other)
+        }
+        for other in evictions { try await manager.finalizeSession(other) }
+        try FileManager.default.removeItem(at: session.framesURL)
+
+        do {
+            try await manager.appendFrame(frame, to: &session)
+            XCTFail("Expected a real filesystem open failure")
+        } catch let error as StorageError {
+            guard case .fileWriteFailed(_, let underlying) = error else {
+                return XCTFail("Unexpected failure: \(error)")
+            }
+            XCTAssertTrue(underlying.contains("Cannot open WAL for appending"))
+            XCTAssertEqual(session.metadata.frameCount, 1)
+            print("[FailureProbe] missing_wal -> file_write_failed; stage=wal_open")
+        }
+    }
+
+    func testRecordingFailureReadOnlyWALFilePreservesReadablePrefix() async throws {
+        let root = makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let manager = WALManager(walRoot: root)
+        var session = try await manager.createSession(videoID: VideoSegmentID(value: 491))
+        let frame = try makeWALScreenshotFrame()
+        try await manager.appendFrame(frame, to: &session)
+        var evictions: [WALSession] = []
+        for offset in 0..<8 {
+            var other = try await manager.createSession(videoID: VideoSegmentID(value: Int64(9_000_000 + offset)))
+            try await manager.appendFrame(frame, to: &other)
+            evictions.append(other)
+        }
+        for other in evictions { try await manager.finalizeSession(other) }
+        try FileManager.default.setAttributes([.posixPermissions: 0o444], ofItemAtPath: session.framesURL.path)
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: session.framesURL.path)
+        }
+        do {
+            try await manager.appendFrame(frame, to: &session)
+            XCTFail("Expected a real filesystem permission failure")
+        } catch let error as StorageError {
+            guard case .fileWriteFailed(_, let underlying) = error else {
+                return XCTFail("Unexpected failure: \(error)")
+            }
+            XCTAssertTrue(underlying.contains("Cannot open WAL for appending"))
+            XCTAssertEqual(session.metadata.frameCount, 1)
+            let recovered = try await manager.readFrame(videoID: session.videoID, frameIndex: 0)
+            XCTAssertEqual(recovered.imageData, frame.imageData)
+            print("[FailureProbe] readonly_wal -> file_write_failed; stage=wal_open; prefix_intact=true")
+        }
+    }
+
+    func testRecordingFailureCancelledWriterProducesSameFileWriteFailed() async throws {
+        let root = makeTempRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let storage = StorageManager(storageRoot: root)
+        try await storage.initialize(config: makeStorageConfig(root: root))
+        let writer = try await storage.createSegmentWriter()
+        let frame = try makeWALScreenshotFrame()
+        try await writer.appendFrame(frame)
+        let incremental = try XCTUnwrap(writer as? IncrementalSegmentWriter)
+        try await incremental.cancelPreservingRecoveryData()
+        do {
+            try await writer.appendFrame(frame)
+            XCTFail("Expected cancelled writer to reject append")
+        } catch let error as StorageError {
+            guard case .fileWriteFailed(_, let underlying) = error else {
+                return XCTFail("Unexpected failure: \(error)")
+            }
+            XCTAssertEqual(underlying, "Writer cancelled")
+            let manager = await storage.getWALManager()
+            let sessions = try await manager.listActiveSessions()
+            XCTAssertEqual(sessions.count, 1)
+            let count = try await manager.recoverableFrameCount(for: XCTUnwrap(sessions.first))
+            XCTAssertEqual(count, 1)
+            print("[FailureProbe] cancelled_writer -> file_write_failed; stage=append_guard; recoverable=1")
+        }
+    }
+
     func testWALCompressesScreenshotLosslesslyAndSupportsMappedRandomAccessAfterRestart() async throws {
         let root = makeTempRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -1744,7 +1854,7 @@ final class StorageManagerTests: XCTestCase {
         try await incrementalWriter.cancelPreservingRecoveryData()
 
         let segmentExists = try await storage.segmentExists(id: segmentID)
-        XCTAssertFalse(segmentExists)
+        XCTAssertTrue(segmentExists)
 
         let activeSessions = try await walManager.listActiveSessions()
         XCTAssertEqual(activeSessions.count, 1)

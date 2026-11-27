@@ -654,7 +654,7 @@ public actor HEVCEncoder {
         Log.info("✅ Encoder recreated successfully, continuing from frame \(frameCount)", category: .storage)
     }
 
-    public func reset() async {
+    public func reset(preserveOutput: Bool = false) async {
         let outputPath = outputURL?.path
         if let writer = assetWriter {
             videoInput?.markAsFinished()
@@ -670,7 +670,7 @@ public actor HEVCEncoder {
         lastLoggedFileSize = 0
         flushedFrameCount = 0
         lastDurableFileSizeBytes = 0
-        if let url = outputURL {
+        if !preserveOutput, let url = outputURL {
             try? FileManager.default.removeItem(at: url)
         }
         outputURL = nil

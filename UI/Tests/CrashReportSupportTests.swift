@@ -387,14 +387,15 @@ final class CrashReportSupportTests: XCTestCase {
         XCTAssertTrue(state.messageText.contains("running low"))
     }
 
-    func testStorageHealthBannerMessageExplainsForcedStop() {
+    func testStorageHealthBannerMessageExplainsAutomaticRetry() {
         let state = StorageHealthBannerState(
             severity: .critical,
             availableGB: 0.42,
             shouldStop: true
         )
 
-        XCTAssertTrue(state.messageText.contains("Recording stopped"))
+        XCTAssertTrue(state.messageText.contains("Recording is interrupted"))
+        XCTAssertTrue(state.messageText.contains("retry automatically"))
         XCTAssertTrue(state.messageText.contains("0.42 GB free"))
     }
 

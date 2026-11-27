@@ -172,8 +172,10 @@ public actor IncrementalSegmentWriter: SegmentWriter {
 
     private func cancelInternal(preserveWALForRecovery: Bool) async throws {
         cancelled = true
-        await encoder.reset()
-        try? FileManager.default.removeItem(at: fileURL)
+        await encoder.reset(preserveOutput: preserveWALForRecovery)
+        if !preserveWALForRecovery {
+            try? FileManager.default.removeItem(at: fileURL)
+        }
 
         guard let session = walSession else {
             return
