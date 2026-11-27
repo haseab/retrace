@@ -143,6 +143,36 @@ final class ForegroundWindowSelectionTests: XCTestCase {
             bundleID: "com.openai.sky.CUAService", requireForegroundApp: false))
     }
 
+    func testAllDisplayAttributionPrefersForegroundOverEarlierBackgroundWindow() {
+        let background = localWindow(id: 1, pid: 202, bounds: CGRect(x: 0, y: 0, width: 800, height: 600))
+        let foreground = localWindow(id: 2, pid: 101, bounds: CGRect(x: 20, y: 20, width: 600, height: 500))
+        let selected = ForegroundWindowSelection.preferredWindowID(
+            in: [background, foreground], foregroundPID: 101,
+            displayBounds: CGRect(x: 0, y: 0, width: 1000, height: 800),
+            allowOtherApps: true, bundleIDForPID: { _ in "com.example.editor" })
+        XCTAssertEqual(selected, 2)
+    }
+
+    func testOtherDisplayStillUsesItsLocalWindow() {
+        let foreground = localWindow(id: 1, pid: 101, bounds: CGRect(x: 0, y: 0, width: 800, height: 600))
+        let local = localWindow(id: 2, pid: 202, bounds: CGRect(x: 1100, y: 0, width: 800, height: 600))
+        let selected = ForegroundWindowSelection.preferredWindowID(
+            in: [foreground, local], foregroundPID: 101,
+            displayBounds: CGRect(x: 1000, y: 0, width: 1000, height: 800),
+            allowOtherApps: true, bundleIDForPID: { _ in "com.example.editor" })
+        XCTAssertEqual(selected, 2)
+    }
+
+    func testForegroundSharingIndicatorDoesNotHideLocalApp() {
+        var indicator = localWindow(id: 1, pid: 101, bounds: CGRect(x: 0, y: 0, width: 66, height: 20))
+        indicator[kCGWindowName as String] = "Window"
+        let local = localWindow(id: 2, pid: 202, bounds: CGRect(x: 10, y: 10, width: 800, height: 600))
+        XCTAssertEqual(ForegroundWindowSelection.preferredWindowID(
+            in: [indicator, local], foregroundPID: 101,
+            displayBounds: CGRect(x: 0, y: 0, width: 1000, height: 800),
+            allowOtherApps: true, bundleIDForPID: { _ in "com.example.editor" }), 2)
+    }
+
     private func localWindow(id: Int, pid: pid_t, bounds: CGRect) -> [String: Any] {
         [kCGWindowNumber as String: id, kCGWindowOwnerPID as String: pid,
          kCGWindowName as String: "Example document", kCGWindowLayer as String: 0,
