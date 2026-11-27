@@ -183,7 +183,7 @@ retrace/
 │       ├── TimelineStillDiskWriterTests.swift
 │       ├── CaptureJournalPipelineTests.swift # WAL-before-encoding and real recovery coverage
 │       ├── RecordingDatabaseFailureTests.swift # Real recording pipeline with an injected metadata insert failure
-│       └── UnexpectedRecordingStopHeuristicTests.swift # Unexpected-stop watchdog heuristic coverage
+│       └── UnexpectedRecordingStopHeuristicTests.swift # Watchdog and automatic write-recovery pipeline integration coverage
 │
 └── UI/                          # SwiftUI interface
     ├── AGENTS.md

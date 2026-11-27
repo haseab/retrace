@@ -257,6 +257,7 @@ private enum SegmentLogSanitizer {
 public final class PipelineStatusHolder: @unchecked Sendable {
     private let lock = NSLock()
     private var _isRunning = false
+    private var _isInterrupted = false
     private var _framesProcessed = 0
     private var _errors = 0
     private var _startTime: Date?
@@ -274,7 +275,8 @@ public final class PipelineStatusHolder: @unchecked Sendable {
             isRunning: _isRunning,
             framesProcessed: _framesProcessed,
             errors: _errors,
-            startTime: _startTime
+            startTime: _startTime,
+            isInterrupted: _isInterrupted
         )
     }
 
@@ -285,10 +287,11 @@ public final class PipelineStatusHolder: @unchecked Sendable {
         return (_pendingActorRequests, _maxPendingRequests, _slowResponseCount)
     }
 
-    func update(isRunning: Bool? = nil, framesProcessed: Int? = nil, errors: Int? = nil, startTime: Date?? = nil) {
+    func update(isRunning: Bool? = nil, isInterrupted: Bool? = nil, framesProcessed: Int? = nil, errors: Int? = nil, startTime: Date?? = nil) {
         lock.lock()
         defer { lock.unlock() }
         if let isRunning = isRunning { _isRunning = isRunning }
+        if let isInterrupted { _isInterrupted = isInterrupted }
         if let framesProcessed = framesProcessed { _framesProcessed = framesProcessed }
         if let errors = errors { _errors = errors }
         if let startTime = startTime { _startTime = startTime }
@@ -887,6 +890,8 @@ public actor AppCoordinator {
     private var latestConferenceConsentMenuState: ConferenceConsentMenuState?
     private var conferenceConsentMenuStateByCallID: [String: ConferenceConsentMenuSelectionCandidate] = [:]
     private var conferencePrivacyMetricState = ConferencePrivacyMetricState()
+    private nonisolated let recordingDefaults: UserDefaults
+    private var captureIngressIsRetrying = false
     private var unexpectedRecordingStopState: UnexpectedRecordingStopState?
     private var hasLoadedUnexpectedRecordingStopState = false
     private var unexpectedRecordingStopCounters = UnexpectedRecordingStopCounters()
@@ -899,12 +904,14 @@ public actor AppCoordinator {
 
     // MARK: - Initialization
 
-    public init(services: ServiceContainer) {
+    public init(services: ServiceContainer, recordingDefaults: UserDefaults? = nil, timelineStillDirectory: URL? = nil) {
         self.services = services
+        self.recordingDefaults = recordingDefaults ?? Self.userDefaultsSuite
         self.timelineStillDiskWriter = TimelineStillDiskWriter(
             bufferLimit: Self.timelineStillWriterBufferLimit,
             destinationResolver: { frameID in
-                Self.timelineDiskFrameBufferURL(for: frameID)
+                if let timelineStillDirectory { return timelineStillDirectory.appendingPathComponent("\(frameID).jpg") }
+                return Self.timelineDiskFrameBufferURL(for: frameID)
             },
             encoder: { frame in
                 try Self.encodeCapturedFrameAsJPEG(frame)
@@ -923,6 +930,7 @@ public actor AppCoordinator {
     public init() {
         let services = ServiceContainer()
         self.services = services
+        self.recordingDefaults = Self.userDefaultsSuite
         self.timelineStillDiskWriter = TimelineStillDiskWriter(
             bufferLimit: Self.timelineStillWriterBufferLimit,
             destinationResolver: { frameID in
@@ -1374,8 +1382,8 @@ public actor AppCoordinator {
 
     /// Save recording state to UserDefaults for persistence across app restarts
     private nonisolated func saveRecordingState(_ isRecording: Bool) {
-        Self.userDefaultsSuite.set(isRecording, forKey: Self.recordingStateKey)
-        Self.userDefaultsSuite.synchronize()  // Force immediate write to disk
+        recordingDefaults.set(isRecording, forKey: Self.recordingStateKey)
+        recordingDefaults.synchronize()  // Force immediate write to disk
         Log.debug("[AppCoordinator] saveRecordingState(\(isRecording)) - saved to UserDefaults", category: .app)
     }
 
@@ -1383,7 +1391,7 @@ public actor AppCoordinator {
         guard !hasLoadedUnexpectedRecordingStopState else { return }
         hasLoadedUnexpectedRecordingStopState = true
 
-        guard let data = Self.userDefaultsSuite.data(
+        guard let data = recordingDefaults.data(
             forKey: Self.unexpectedRecordingStopStateStorageKey
         ) else {
             unexpectedRecordingStopState = nil
@@ -1397,10 +1405,10 @@ public actor AppCoordinator {
             )
         } catch {
             unexpectedRecordingStopState = nil
-            Self.userDefaultsSuite.removeObject(
+            recordingDefaults.removeObject(
                 forKey: Self.unexpectedRecordingStopStateStorageKey
             )
-            Self.userDefaultsSuite.synchronize()
+            recordingDefaults.synchronize()
             Log.warning(
                 "[RECORDING-STOP] Failed to decode persisted unexpected-stop state: \(error.localizedDescription)",
                 category: .app
@@ -1415,7 +1423,7 @@ public actor AppCoordinator {
         if let state {
             do {
                 let data = try JSONEncoder().encode(state)
-                Self.userDefaultsSuite.set(
+                recordingDefaults.set(
                     data,
                     forKey: Self.unexpectedRecordingStopStateStorageKey
                 )
@@ -1426,12 +1434,12 @@ public actor AppCoordinator {
                 )
             }
         } else {
-            Self.userDefaultsSuite.removeObject(
+            recordingDefaults.removeObject(
                 forKey: Self.unexpectedRecordingStopStateStorageKey
             )
         }
 
-        Self.userDefaultsSuite.synchronize()
+        recordingDefaults.synchronize()
     }
 
     public func getUnexpectedRecordingStopState() -> UnexpectedRecordingStopState? {
@@ -1444,6 +1452,23 @@ public actor AppCoordinator {
     }
 
     #if DEBUG
+    /// Runs the production recording loop with a controlled capture source. Tests
+    /// use real storage/encoding while isolating capture permissions and user data.
+    func startPipelineForTesting(frameStream: AsyncStream<CapturedFrame>, journal: CaptureWALJournal? = nil) {
+        captureWALJournal = journal
+        precondition(!isRunning)
+        isRunning = true
+        pipelineStartTime = Date()
+        statusHolder.update(isRunning: true, startTime: pipelineStartTime)
+        resetUnexpectedRecordingProgressTracking()
+        saveRecordingState(true)
+        captureTask = Task { await runPipeline(frameStream: frameStream) }
+    }
+
+    func waitForPipelineForTesting() async {
+        await captureTask?.value
+    }
+
     public func debugInterruptCapturePipeline() async {
         guard isRunning else {
             Log.warning(
@@ -1549,7 +1574,7 @@ public actor AppCoordinator {
         captureWALJournal = journal
         await services.capture.setFramePersistenceHandler { [weak self, journal] frame in
             guard let self, await self.shouldJournalCapturedFrame(frame) else { return nil }
-            return try await journal.persist(frame)
+            return await self.persistCapturedFrameWithRecovery(frame, journal: journal)
         }
         await services.capture.setDisplayJournalRetirementHandler { [journal] displays in
             await journal.retireDisconnectedDisplays(keeping: displays)
@@ -1613,13 +1638,14 @@ public actor AppCoordinator {
         Log.info("Stopping capture pipeline...", category: .app)
 
         let drainingTask = captureTask
+        let cancelRetries = statusHolder.status.isInterrupted
         // Mark intentional stop before ending the stream, so a fast drain cannot
         // be misclassified as an unexpected capture failure.
-        finalizePipelineStopped(persistState: persistState, clearCaptureTask: false, cancelCaptureTask: false)
+        finalizePipelineStopped(persistState: persistState, clearCaptureTask: false, cancelCaptureTask: cancelRetries)
 
         // Stop producing, finish the current WAL admission, then drain accepted
         // frames through encoding/metadata/finalization before closing services.
-        try await services.capture.stopCapture(drain: true)
+        try await services.capture.stopCapture(drain: !cancelRetries)
         await services.capture.setFramePersistenceHandler(nil)
         await services.capture.setDisplayJournalRetirementHandler(nil)
         captureWALJournal = nil
@@ -1662,7 +1688,7 @@ public actor AppCoordinator {
         #endif
 
         isRunning = false
-        statusHolder.update(isRunning: false)
+        statusHolder.update(isRunning: false, isInterrupted: false)
         latestConferenceConsentMenuState = nil
         conferenceConsentMenuStateByCallID.removeAll()
         conferencePrivacyMetricState = ConferencePrivacyMetricState()
@@ -1706,10 +1732,34 @@ public actor AppCoordinator {
         await services.storage.validateCaches()
     }
 
+    /// Fixed diagnostic vocabulary deliberately excludes paths and error messages.
+    private nonisolated static func recordingRecoveryReason(_ error: Error) -> String {
+        if case StorageError.fileWriteFailed(_, let detail) = error {
+            if detail == "Writer cancelled" { return "writer_cancelled" }
+            if detail == "Invalid WAL frame dimensions or metadata" { return "invalid_frame" }
+            if detail.hasPrefix("Cannot open WAL") { return "wal_open_failed" }
+            if detail.hasPrefix("Failed to append frame to WAL") { return "wal_append_failed" }
+            if detail.contains("LZFSE") { return "wal_compression_failed" }
+        }
+        return (error as? StorageError)?.errorCode
+            ?? (error is StorageModuleError ? "encoder_failure" : "system_io_failure")
+    }
+
+    private func setRecordingInterrupted(_ interrupted: Bool, reason: String) async {
+        guard !interrupted || isRunning else { return }
+        guard interrupted || !captureIngressIsRetrying else { return }
+        guard statusHolder.status.isInterrupted != interrupted else { return }
+        statusHolder.update(isInterrupted: interrupted)
+        try? await recordMetricEvent(
+            metricType: .recordingRecoveryAction,
+            metadata: Self.metricMetadata(["action": interrupted ? "interrupted" : "resumed", "reason": reason])
+        )
+    }
+
     private func handleStorageCriticalError() async {
-        Log.error("[AppCoordinator] Storage critical error - invalidating StorageManager caches and stopping pipeline", category: .app)
+        guard isRunning else { return }
+        await setRecordingInterrupted(true, reason: "storage_unavailable")
         await services.storage.invalidateAllCaches()
-        try? await stopPipeline()
     }
 
     /// Shutdown all services
@@ -2233,6 +2283,44 @@ public actor AppCoordinator {
         var displayID: UInt32
     }
 
+    /// Capture ingress and encoding use the same retry policy. Returning nil on
+    /// cancellation/privacy changes keeps intentional stops separate from I/O errors.
+    func persistCapturedFrameWithRecovery(_ frame: CapturedFrame, journal: CaptureWALJournal) async -> CapturedFrame? {
+        var attempt = 0
+        let recordingSession = pipelineStartTime
+        defer { captureIngressIsRetrying = false }
+        while !Task.isCancelled {
+            if attempt > 0 && (!isRunning || pipelineStartTime != recordingSession || Self.shouldSuppressTimelineCapture(
+                capturedAt: frame.timestamp, isTimelineVisible: isTimelineVisible,
+                lastTimelineHiddenAt: lastTimelineHiddenAt
+            )) { return nil }
+            do { return try await journal.persist(frame) }
+            catch {
+                guard isRunning, !Task.isCancelled else { return nil }
+                totalErrors += 1
+                statusHolder.incrementErrors()
+                captureIngressIsRetrying = true
+                await setRecordingInterrupted(true, reason: Self.recordingRecoveryReason(error))
+                await journal.rotate()
+                attempt += 1
+                let delay = min(30.0, 0.25 * pow(2.0, Double(min(attempt - 1, 7))))
+                let message: PrivacyLogMessage = "[RecordingRecovery] captureIngress=true attempt=\(attempt) retrySeconds=\(delay) systemCode=\((error as NSError).code)"
+                Log.warning(message, category: .app)
+                if case StorageError.fileWriteFailed(_, let detail) = error,
+                   detail == "Invalid WAL frame dimensions or metadata" { return nil }
+                do { try await Task.sleep(for: .seconds(delay)) }
+                catch { return nil }
+            }
+        }
+        return nil
+    }
+
+    private nonisolated static func frameWithoutJournalReceipt(_ frame: CapturedFrame) -> CapturedFrame {
+        CapturedFrame(timestamp: frame.timestamp, imageData: frame.imageData, width: frame.width,
+            height: frame.height, bytesPerRow: frame.bytesPerRow, metadata: frame.metadata,
+            accessibilitySnapshot: frame.accessibilitySnapshot)
+    }
+
     private func shouldJournalCapturedFrame(_ frame: CapturedFrame) -> Bool {
         !isTimelineVisible && frame.metadata.appBundleID != "com.apple.loginwindow"
     }
@@ -2265,6 +2353,8 @@ public actor AppCoordinator {
         stalledUnreadableWriterWarningVideoIDs.removeAll()
         let maxFramesPerSegment = 150
         let videoUpdateInterval = 5
+        var failedWriterVideoIDs: Set<Int64> = []
+        var failedJournalSegments: Set<VideoSegmentID> = []
 
         func maybeLogPipelineMemory(reason: String) {
             let now = Date()
@@ -2288,7 +2378,7 @@ public actor AppCoordinator {
             )
         }
 
-        for await event in eventStream {
+        captureLoop: for await event in eventStream {
             if Task.isCancelled { break }
             if case .retainDisplays(let displays) = event {
                 for key in Array(writersByResolution.keys) {
@@ -2309,7 +2399,10 @@ public actor AppCoordinator {
                 }
                 continue
             }
-            guard case .frame(let frame) = event else { continue }
+            guard case .frame(var frame) = event else { continue }
+            if let receipt = frame.journalReceipt, failedJournalSegments.contains(receipt.segmentID) {
+                frame = Self.frameWithoutJournalReceipt(frame)
+            }
             Log.verbose("[Pipeline] Received frame from stream: \(frame.width)x\(frame.height), app=\(frame.metadata.appName)", category: .app)
 
             if Task.isCancelled {
@@ -2353,307 +2446,300 @@ public actor AppCoordinator {
                 if frame.journalReceipt == nil { continue }
             }
 
-            do {
-                // Key by displayID + resolution to prevent two same-resolution displays from sharing a video file
-                let displayID = frame.metadata.displayID
-                let resolutionKey = "\(displayID)_\(frame.width)x\(frame.height)"
-                // A display has one resolution at a time. FIFO ordering ensures
-                // all receipts for its previous resolution have already drained.
-                for key in Array(writersByResolution.keys) where key != resolutionKey {
-                    guard var previous = writersByResolution[key], previous.displayID == displayID else { continue }
-                    try await finalizeWriter(&previous, processingQueue: await services.processingQueue)
-                    writersByResolution.removeValue(forKey: key)
-                }
-                var writerState: VideoWriterState
+            var retryAttempt = 0
+            while !Task.isCancelled && (retryAttempt == 0 || isRunning || !reportUnexpectedStops) {
+                if frame.journalReceipt == nil && Self.shouldSuppressTimelineCapture(
+                    capturedAt: frame.timestamp, isTimelineVisible: isTimelineVisible,
+                    lastTimelineHiddenAt: lastTimelineHiddenAt
+                ) { continue captureLoop }
+                do {
+                    if retryAttempt > 0 { try await services.storage.validateCaptureReadiness() }
+                    // Key by displayID + resolution to prevent two same-resolution displays from sharing a video file
+                    let displayID = frame.metadata.displayID
+                    let resolutionKey = "\(displayID)_\(frame.width)x\(frame.height)"
+                    // A display has one resolution at a time. FIFO ordering ensures
+                    // all receipts for its previous resolution have already drained.
+                    for key in Array(writersByResolution.keys) where key != resolutionKey {
+                        guard var previous = writersByResolution[key], previous.displayID == displayID else { continue }
+                        try await finalizeWriter(&previous, processingQueue: await services.processingQueue)
+                        writersByResolution.removeValue(forKey: key)
+                    }
+                    var writerState: VideoWriterState
 
-                if let receipt = frame.journalReceipt {
-                    if let existing = writersByResolution[resolutionKey],
-                       await existing.writer.segmentID == receipt.segmentID {
-                        writerState = existing
-                    } else {
-                        if var previous = writersByResolution.removeValue(forKey: resolutionKey) {
-                            try await finalizeWriter(&previous, processingQueue: await services.processingQueue)
+                    if let receipt = frame.journalReceipt {
+                        if let existing = writersByResolution[resolutionKey],
+                           await existing.writer.segmentID == receipt.segmentID {
+                            writerState = existing
+                        } else {
+                            if var previous = writersByResolution.removeValue(forKey: resolutionKey) {
+                                try await finalizeWriter(&previous, processingQueue: await services.processingQueue)
+                            }
+                            writerState = try await createNewWriterState(width: frame.width, height: frame.height,
+                                displayID: displayID, journalReceipt: receipt)
+                            writersByResolution[resolutionKey] = writerState
                         }
-                        writerState = try await createNewWriterState(width: frame.width, height: frame.height,
-                            displayID: displayID, journalReceipt: receipt)
+                    } else if var existingState = writersByResolution[resolutionKey] {
+                        if existingState.frameCount >= maxFramesPerSegment {
+                            try await finalizeWriter(&existingState, processingQueue: await services.processingQueue)
+                            writersByResolution.removeValue(forKey: resolutionKey)
+                            writerState = try await createNewWriterState(width: frame.width, height: frame.height, displayID: displayID)
+                            writersByResolution[resolutionKey] = writerState
+                        } else {
+                            writerState = existingState
+                        }
+                    } else {
+                        // Try display-aware lookup first, fall back to resolution-only for legacy
+                        if let unfinalised = try await services.database.getUnfinalisedVideoByDisplayAndResolution(
+                            displayID: displayID,
+                            width: frame.width,
+                            height: frame.height
+                        ), !failedWriterVideoIDs.contains(unfinalised.id), try await shouldResumeUnfinalisedVideo(unfinalised) {
+                            Log.info("Resuming unfinalised video \(unfinalised.id) for display \(displayID)", category: .app)
+                            writerState = try await resumeWriterState(from: unfinalised)
+                        } else {
+                            writerState = try await createNewWriterState(width: frame.width, height: frame.height, displayID: displayID)
+                        }
                         writersByResolution[resolutionKey] = writerState
                     }
-                } else if var existingState = writersByResolution[resolutionKey] {
-                    if existingState.frameCount >= maxFramesPerSegment {
-                        try await finalizeWriter(&existingState, processingQueue: await services.processingQueue)
-                        writersByResolution.removeValue(forKey: resolutionKey)
-                        writerState = try await createNewWriterState(width: frame.width, height: frame.height, displayID: displayID)
-                        writersByResolution[resolutionKey] = writerState
-                    } else {
-                        writerState = existingState
-                    }
-                } else {
-                    // Try display-aware lookup first, fall back to resolution-only for legacy
-                    if let unfinalised = try await services.database.getUnfinalisedVideoByDisplayAndResolution(
-                        displayID: displayID,
-                        width: frame.width,
-                        height: frame.height
-                    ), try await shouldResumeUnfinalisedVideo(unfinalised) {
-                        Log.info("Resuming unfinalised video \(unfinalised.id) for display \(displayID)", category: .app)
-                        writerState = try await resumeWriterState(from: unfinalised)
-                    } else {
-                        writerState = try await createNewWriterState(width: frame.width, height: frame.height, displayID: displayID)
-                    }
-                    writersByResolution[resolutionKey] = writerState
-                }
 
-                #if DEBUG
-                if debugInterruptEncodingOnNextAppend {
-                    debugInterruptEncodingOnNextAppend = false
-                    Log.warning(
-                        "[RECORDING-STOP][DEBUG] Interrupting active writer before append videoDBID=\(writerState.videoDBID) resolution=\(resolutionKey)",
+                    #if DEBUG
+                    if debugInterruptEncodingOnNextAppend {
+                        debugInterruptEncodingOnNextAppend = false
+                        Log.warning(
+                            "[RECORDING-STOP][DEBUG] Interrupting active writer before append videoDBID=\(writerState.videoDBID) resolution=\(resolutionKey)",
+                            category: .app
+                        )
+                        await cancelBrokenWriterPreservingRecoveryData(writerState.writer)
+                    }
+                    #endif
+
+                    try await writerState.writer.appendFrame(frame)
+
+                    // Verify encoder actually wrote the frame by checking its frame count
+                    // This detects if the encoder silently failed or auto-finalized
+                    let actualEncoderFrameCount = await writerState.writer.frameCount
+                    if actualEncoderFrameCount != writerState.frameCount + 1 {
+                        throw StorageModuleError.encodingFailed(underlying: "Encoder frame count mismatch")
+                    }
+
+                    writerState.frameCount += 1
+                    // Encoding already succeeded. Preserve its count and pending work even
+                    // when a later metadata/readability/enqueue operation throws.
+                    defer { writersByResolution[resolutionKey] = writerState }
+
+                    if writerState.width == 0 {
+                        writerState.width = await writerState.writer.frameWidth
+                        writerState.height = await writerState.writer.frameHeight
+                    }
+
+                    guard let appSegmentID = try await trackSessionChange(frame: frame) else {
+                        Log.warning("No segment available for frame insertion (display=\(frame.metadata.displayID))", category: .app)
+                        writersByResolution[resolutionKey] = writerState
+                        continue captureLoop
+                    }
+
+                    let frameIndexInSegment = writerState.frameCount - 1
+                    let frameRef = FrameReference(
+                        id: FrameID(value: 0),
+                        timestamp: frame.timestamp,
+                        segmentID: AppSegmentID(value: appSegmentID),
+                        videoID: VideoSegmentID(value: writerState.videoDBID),
+                        frameIndexInSegment: frameIndexInSegment,
+                        metadata: frame.metadata,
+                        source: .native
+                    )
+                    let frameID = try await services.database.insertFrame(frameRef, accessibilitySnapshot: frame.accessibilitySnapshot)
+                    let acceptedAt = Date()
+                    recordAcceptedFrameProgress(at: acceptedAt)
+                    await persistGlobalMousePositionIfNeeded(
+                        frameID: frameID,
+                        capturedFrame: frame
+                    )
+                    if cacheCapturedStills {
+                        await writeCapturedFrameStillToTimelineDiskCache(frameID: frameID, frame: frame)
+                    }
+                    scheduleInPageURLMetadataCaptureIfNeeded(
+                        frameID: frameID,
+                        frameMetadata: frame.metadata
+                    )
+
+                    // Persist WAL mapping for exact frameID -> raw frame lookup while segment is unfinalized.
+                    if let storageManager = services.storage as? StorageManager {
+                        let walVideoID = await writerState.writer.segmentID
+                        let walManager = await storageManager.getWALManager()
+                        do {
+                            try await walManager.registerFrameID(
+                                videoID: walVideoID,
+                                frameID: frameID,
+                                frameIndex: frameIndexInSegment
+                            )
+                        } catch {
+                            Log.warning(
+                                "[WAL] Failed to register frameID mapping for frame \(frameID) (video \(walVideoID.value), index \(frameIndexInSegment)): \(error)",
+                                category: .app
+                            )
+                        }
+                    }
+
+                    let appNameForLog = frame.metadata.appName ?? "nil"
+                    let appBundleIDForLog = frame.metadata.appBundleID ?? "nil"
+                    let windowNameForLog = Self.privateRedactionTracePreview(frame.metadata.windowName)
+                    let redactionReasonForLog = frame.metadata.redactionReason ?? "none"
+
+                    Log.verbose(
+                        "[CAPTURE-DEBUG] Captured frameID=\(frameID), videoDBID=\(writerState.videoDBID), frameIndexInSegment=\(frameIndexInSegment), bundleID=\(appBundleIDForLog), app=\(appNameForLog), window=\(windowNameForLog), redactionReason=\(redactionReasonForLog)",
                         category: .app
                     )
-                    await cancelBrokenWriterPreservingRecoveryData(writerState.writer)
-                }
-                #endif
 
-                try await writerState.writer.appendFrame(frame)
+                    if writerState.frameCount % videoUpdateInterval == 0 {
+                        let width = await writerState.writer.frameWidth
+                        let height = await writerState.writer.frameHeight
+                        let fileSize = await writerState.writer.currentFileSize
+                        try await services.database.updateVideoSegment(
+                            id: writerState.videoDBID,
+                            width: width,
+                            height: height,
+                            fileSize: fileSize,
+                            frameCount: writerState.frameCount
+                        )
+                    }
 
-                // Verify encoder actually wrote the frame by checking its frame count
-                // This detects if the encoder silently failed or auto-finalized
-                let actualEncoderFrameCount = await writerState.writer.frameCount
-                if actualEncoderFrameCount != writerState.frameCount + 1 {
-                    let summary =
-                        "Encoder frame count \(actualEncoderFrameCount) did not match expected \(writerState.frameCount + 1) " +
-                        "for videoDBID=\(writerState.videoDBID) at \(resolutionKey)."
-                    Log.error("[ENCODER-MISMATCH] \(summary)", category: .app)
-                    requestUnexpectedStop(
-                        reason: .encoderMismatch,
-                        summary: summary
+                    guard let processingQueue = await services.processingQueue else {
+                        Log.error("Processing queue not initialized", category: .app)
+                        writersByResolution[resolutionKey] = writerState
+                        continue captureLoop
+                    }
+
+                    // Track frame in pending buffer until it's confirmed flushed/readable.
+                    let bufferedFrame = BufferedFrame(
+                        frameID: frameID,
+                        frameIndexInSegment: frameIndexInSegment,
+                        acceptedAt: acceptedAt
                     )
-                    await cancelBrokenWriterPreservingRecoveryData(writerState.writer)
-                    writersByResolution.removeValue(forKey: resolutionKey)
-                    break
-                }
 
-                writerState.frameCount += 1
-                // Encoding already succeeded. Preserve its count and pending work even
-                // when a later metadata/readability/enqueue operation throws.
-                defer { writersByResolution[resolutionKey] = writerState }
+                    // Add frame to the pending buffer
+                    writerState.pendingFrames.append(bufferedFrame)
+                    if isTimelineVisible, frame.journalReceipt != nil {
+                        // This frame was captured before timeline opened. Its WAL
+                        // is readable now, even if the video fragment is not yet.
+                        try await processingQueue.enqueue(frameID: frameID)
+                    }
 
-                if writerState.width == 0 {
-                    writerState.width = await writerState.writer.frameWidth
-                    writerState.height = await writerState.writer.frameHeight
-                }
+                    // Check if first fragment has been written (makes video readable at all)
+                    if !writerState.isReadable {
+                        writerState.isReadable = await writerState.writer.hasFragmentWritten
+                        if writerState.isReadable {
+                            Log.info("First video fragment written for \(resolutionKey) - frames now readable from disk", category: .app)
+                        }
+                    }
 
-                guard let appSegmentID = try await trackSessionChange(frame: frame) else {
-                    Log.warning("No segment available for frame insertion (display=\(frame.metadata.displayID))", category: .app)
+                    // Get the count of frames confirmed flushed to disk
+                    // Frames with frameIndex < flushedCount are guaranteed to be readable
+                    let flushedCount = await writerState.writer.framesFlushedToDisk
+
+                    // Mark frames as readable and enqueue for OCR if they've been flushed to disk
+                    while let firstFrame = writerState.pendingFrames.first,
+                          firstFrame.frameIndexInSegment < flushedCount {
+                        let frameToEnqueue = firstFrame
+                        // Keep pending work until both database operations succeed.
+                        try await services.database.markFrameReadable(frameID: frameToEnqueue.frameID)
+                        try await processingQueue.enqueue(frameID: frameToEnqueue.frameID)
+                        recordReadableFrameProgress(at: Date())
+                        writerState.pendingFrames.removeFirst()
+                    }
+
+                    if flushedCount > writerState.persistedReadableFrameCount {
+                        let storageManager = services.storage
+                        let walVideoID = await writerState.writer.segmentID
+                        let walManager = await storageManager.getWALManager()
+                        let durableFileSizeBytes: Int64
+                        if let incrementalWriter = writerState.writer as? IncrementalSegmentWriter {
+                            durableFileSizeBytes = await incrementalWriter.durableFileSizeBytes
+                        } else {
+                            durableFileSizeBytes = await writerState.writer.currentFileSize
+                        }
+
+                        do {
+                            try await walManager.updateDurableVideoState(
+                                videoID: walVideoID,
+                                readableFrameCount: flushedCount,
+                                durableVideoFileSizeBytes: durableFileSizeBytes
+                            )
+                            writerState.persistedReadableFrameCount = flushedCount
+                        } catch {
+                            Log.warning(
+                                "[WAL] Failed to persist durable video frontier for video \(walVideoID.value) at flushedCount=\(flushedCount): \(error)",
+                                category: .app
+                            )
+                        }
+                    }
+
                     writersByResolution[resolutionKey] = writerState
-                    continue
-                }
-
-                let frameIndexInSegment = writerState.frameCount - 1
-                let frameRef = FrameReference(
-                    id: FrameID(value: 0),
-                    timestamp: frame.timestamp,
-                    segmentID: AppSegmentID(value: appSegmentID),
-                    videoID: VideoSegmentID(value: writerState.videoDBID),
-                    frameIndexInSegment: frameIndexInSegment,
-                    metadata: frame.metadata,
-                    source: .native
-                )
-                let frameID = try await services.database.insertFrame(frameRef, accessibilitySnapshot: frame.accessibilitySnapshot)
-                let acceptedAt = Date()
-                recordAcceptedFrameProgress(at: acceptedAt)
-                await persistGlobalMousePositionIfNeeded(
-                    frameID: frameID,
-                    capturedFrame: frame
-                )
-                if cacheCapturedStills {
-                    await writeCapturedFrameStillToTimelineDiskCache(frameID: frameID, frame: frame)
-                }
-                scheduleInPageURLMetadataCaptureIfNeeded(
-                    frameID: frameID,
-                    frameMetadata: frame.metadata
-                )
-
-                // Persist WAL mapping for exact frameID -> raw frame lookup while segment is unfinalized.
-                if let storageManager = services.storage as? StorageManager {
-                    let walVideoID = await writerState.writer.segmentID
-                    let walManager = await storageManager.getWALManager()
-                    do {
-                        try await walManager.registerFrameID(
-                            videoID: walVideoID,
-                            frameID: frameID,
-                            frameIndex: frameIndexInSegment
-                        )
-                    } catch {
-                        Log.warning(
-                            "[WAL] Failed to register frameID mapping for frame \(frameID) (video \(walVideoID.value), index \(frameIndexInSegment)): \(error)",
-                            category: .app
-                        )
+                    if let stalledWriter = Self.stalledUnreadableWriter(
+                        in: Self.unexpectedRecordingStopWriterSnapshots(from: writersByResolution),
+                        now: Date()
+                    ) {
+                        let activeVideoIDs = Set(writersByResolution.values.map(\.videoDBID))
+                        stalledUnreadableWriterWarningVideoIDs.formIntersection(activeVideoIDs)
+                        if !stalledUnreadableWriterWarningVideoIDs.contains(stalledWriter.videoDBID) {
+                            let pendingAgeSeconds = stalledWriter.oldestPendingUnreadableAt.map {
+                                max(0, Int(Date().timeIntervalSince($0)))
+                            } ?? 0
+                            Log.warning(
+                                "[Pipeline] Writer remains unreadable videoDBID=\(stalledWriter.videoDBID) resolution=\(stalledWriter.resolutionKey) " +
+                                    "pendingAgeSeconds=\(pendingAgeSeconds) pendingUnreadableFrames=\(stalledWriter.pendingUnreadableFrameCount); " +
+                                    "keeping writer active because at least one other writer is readable.",
+                                category: .app
+                            )
+                            stalledUnreadableWriterWarningVideoIDs.insert(stalledWriter.videoDBID)
+                        }
                     }
-                }
+                    maybeLogPipelineMemory(reason: "steady-state")
+                    totalFramesProcessed += 1
+                    statusHolder.incrementFrames()
 
-                let appNameForLog = frame.metadata.appName ?? "nil"
-                let appBundleIDForLog = frame.metadata.appBundleID ?? "nil"
-                let windowNameForLog = Self.privateRedactionTracePreview(frame.metadata.windowName)
-                let redactionReasonForLog = frame.metadata.redactionReason ?? "none"
-
-                Log.verbose(
-                    "[CAPTURE-DEBUG] Captured frameID=\(frameID), videoDBID=\(writerState.videoDBID), frameIndexInSegment=\(frameIndexInSegment), bundleID=\(appBundleIDForLog), app=\(appNameForLog), window=\(windowNameForLog), redactionReason=\(redactionReasonForLog)",
-                    category: .app
-                )
-
-                if writerState.frameCount % videoUpdateInterval == 0 {
-                    let width = await writerState.writer.frameWidth
-                    let height = await writerState.writer.frameHeight
-                    let fileSize = await writerState.writer.currentFileSize
-                    try await services.database.updateVideoSegment(
-                        id: writerState.videoDBID,
-                        width: width,
-                        height: height,
-                        fileSize: fileSize,
-                        frameCount: writerState.frameCount
-                    )
-                }
-
-                guard let processingQueue = await services.processingQueue else {
-                    Log.error("Processing queue not initialized", category: .app)
-                    writersByResolution[resolutionKey] = writerState
-                    continue
-                }
-
-                // Track frame in pending buffer until it's confirmed flushed/readable.
-                let bufferedFrame = BufferedFrame(
-                    frameID: frameID,
-                    frameIndexInSegment: frameIndexInSegment,
-                    acceptedAt: acceptedAt
-                )
-
-                // Add frame to the pending buffer
-                writerState.pendingFrames.append(bufferedFrame)
-                if isTimelineVisible, frame.journalReceipt != nil {
-                    // This frame was captured before timeline opened. Its WAL
-                    // is readable now, even if the video fragment is not yet.
-                    try await processingQueue.enqueue(frameID: frameID)
-                }
-
-                // Check if first fragment has been written (makes video readable at all)
-                if !writerState.isReadable {
-                    writerState.isReadable = await writerState.writer.hasFragmentWritten
-                    if writerState.isReadable {
-                        Log.info("First video fragment written for \(resolutionKey) - frames now readable from disk", category: .app)
+                    if totalFramesProcessed % 10 == 0 {
+                        Log.debug("Pipeline processed \(totalFramesProcessed) frames, \(writersByResolution.count) active writers", category: .app)
                     }
-                }
-
-                // Get the count of frames confirmed flushed to disk
-                // Frames with frameIndex < flushedCount are guaranteed to be readable
-                let flushedCount = await writerState.writer.framesFlushedToDisk
-
-                // Mark frames as readable and enqueue for OCR if they've been flushed to disk
-                while let firstFrame = writerState.pendingFrames.first,
-                      firstFrame.frameIndexInSegment < flushedCount {
-                    let frameToEnqueue = firstFrame
-                    // Keep pending work until both database operations succeed.
-                    try await services.database.markFrameReadable(frameID: frameToEnqueue.frameID)
-                    try await processingQueue.enqueue(frameID: frameToEnqueue.frameID)
-                    recordReadableFrameProgress(at: Date())
-                    writerState.pendingFrames.removeFirst()
-                }
-
-                if flushedCount > writerState.persistedReadableFrameCount {
-                    let storageManager = services.storage
-                    let walVideoID = await writerState.writer.segmentID
-                    let walManager = await storageManager.getWALManager()
-                    let durableFileSizeBytes: Int64
-                    if let incrementalWriter = writerState.writer as? IncrementalSegmentWriter {
-                        durableFileSizeBytes = await incrementalWriter.durableFileSizeBytes
-                    } else {
-                        durableFileSizeBytes = await writerState.writer.currentFileSize
+                    await setRecordingInterrupted(false, reason: "writes_resumed")
+                    continue captureLoop
+                } catch {
+                    if Task.isCancelled || (!isRunning && reportUnexpectedStops) { break captureLoop }
+                    totalErrors += 1
+                    statusHolder.incrementErrors()
+                    let systemError = error as NSError
+                    let retryable = error is StorageError || error is StorageModuleError
+                        || [NSCocoaErrorDomain, NSPOSIXErrorDomain, "AVFoundationErrorDomain"].contains(systemError.domain)
+                    guard retryable else {
+                        Log.error("[Pipeline] Error processing frame", category: .app, error: error)
+                        continue captureLoop
                     }
-
-                    do {
-                        try await walManager.updateDurableVideoState(
-                            videoID: walVideoID,
-                            readableFrameCount: flushedCount,
-                            durableVideoFileSizeBytes: durableFileSizeBytes
-                        )
-                        writerState.persistedReadableFrameCount = flushedCount
-                    } catch {
-                        Log.warning(
-                            "[WAL] Failed to persist durable video frontier for video \(walVideoID.value) at flushedCount=\(flushedCount): \(error)",
-                            category: .app
-                        )
-                    }
-                }
-
-                writersByResolution[resolutionKey] = writerState
-                if let stalledWriter = Self.stalledUnreadableWriter(
-                    in: Self.unexpectedRecordingStopWriterSnapshots(from: writersByResolution),
-                    now: Date()
-                ) {
-                    let activeVideoIDs = Set(writersByResolution.values.map(\.videoDBID))
-                    stalledUnreadableWriterWarningVideoIDs.formIntersection(activeVideoIDs)
-                    if !stalledUnreadableWriterWarningVideoIDs.contains(stalledWriter.videoDBID) {
-                        let pendingAgeSeconds = stalledWriter.oldestPendingUnreadableAt.map {
-                            max(0, Int(Date().timeIntervalSince($0)))
-                        } ?? 0
-                        Log.warning(
-                            "[Pipeline] Writer remains unreadable videoDBID=\(stalledWriter.videoDBID) resolution=\(stalledWriter.resolutionKey) " +
-                                "pendingAgeSeconds=\(pendingAgeSeconds) pendingUnreadableFrames=\(stalledWriter.pendingUnreadableFrameCount); " +
-                                "keeping writer active because at least one other writer is readable.",
-                            category: .app
-                        )
-                        stalledUnreadableWriterWarningVideoIDs.insert(stalledWriter.videoDBID)
-                    }
-                }
-                maybeLogPipelineMemory(reason: "steady-state")
-                totalFramesProcessed += 1
-                statusHolder.incrementFrames()
-
-                if totalFramesProcessed % 10 == 0 {
-                    Log.debug("Pipeline processed \(totalFramesProcessed) frames, \(writersByResolution.count) active writers", category: .app)
-                }
-
-            } catch let error as StorageError {
-                totalErrors += 1
-                statusHolder.incrementErrors()
-                Log.error("[Pipeline] Error processing frame", category: .app, error: error)
-
-                if case .insufficientDiskSpace = error {
-                    Task { @MainActor in
-                        NotificationCenter.default.post(
-                            name: .storageCriticalLow,
-                            object: ["availableGB": 0.0, "shouldStop": true]
-                        )
-                    }
-                    Task { [weak self] in
-                        await self?.handleStorageCriticalError()
-                    }
-                    continue
-                }
-
-                // File write failures mean the active writer is no longer trustworthy.
-                // Stop recording instead of pretending capture is still healthy.
-                if case .fileWriteFailed = error {
                     let resolutionKey = "\(frame.metadata.displayID)_\(frame.width)x\(frame.height)"
-                    if let brokenWriter = writersByResolution[resolutionKey] {
-                        let summary =
-                            "File write failed for videoDBID=\(brokenWriter.videoDBID) at \(resolutionKey). " +
-                            "Recording was turned off to avoid claiming capture is healthy."
-                        Log.error("[RECORDING-STOP] \(summary)", category: .app)
-                        requestUnexpectedStop(
-                            reason: .fileWriteFailed,
-                            summary: summary
-                        )
-                        await cancelBrokenWriterPreservingRecoveryData(brokenWriter.writer)
-                        writersByResolution.removeValue(forKey: resolutionKey)
-                        break
+                    if let broken = writersByResolution.removeValue(forKey: resolutionKey) {
+                        failedWriterVideoIDs.insert(broken.videoDBID)
+                        await cancelBrokenWriterPreservingRecoveryData(broken.writer)
                     }
+                    if let receipt = frame.journalReceipt {
+                        failedJournalSegments.insert(receipt.segmentID)
+                        await captureWALJournal?.rotate()
+                        frame = Self.frameWithoutJournalReceipt(frame)
+                    }
+                    await setRecordingInterrupted(true, reason: Self.recordingRecoveryReason(error))
+                    retryAttempt += 1
+                    // Keep one failed frame in memory, not an unbounded outage backlog.
+                    // Cancellation immediately interrupts the delay when the user stops.
+                    let delay = min(30.0, 0.25 * pow(2.0, Double(min(retryAttempt - 1, 7))))
+                    let message: PrivacyLogMessage = "[RecordingRecovery] attempt=\(retryAttempt) retrySeconds=\(delay) systemCode=\(systemError.code)"
+                    Log.warning(message, category: .app)
+                    // Invalid input cannot become valid through retries; allow the next
+                    // capture through while keeping the interrupted status visible.
+                    if case StorageError.fileWriteFailed(_, let detail) = error,
+                       detail == "Invalid WAL frame dimensions or metadata" {
+                        continue captureLoop
+                    }
+                    do { try await Task.sleep(for: .seconds(delay)) }
+                    catch { break captureLoop }
                 }
-                continue
-            } catch {
-                totalErrors += 1
-                statusHolder.incrementErrors()
-                Log.error("[Pipeline] Error processing frame", category: .app, error: error)
-                continue
             }
         }
 
@@ -5437,7 +5523,8 @@ public actor AppCoordinator {
             isRunning: isRunning,
             framesProcessed: totalFramesProcessed,
             errors: totalErrors,
-            startTime: pipelineStartTime
+            startTime: pipelineStartTime,
+            isInterrupted: statusHolder.status.isInterrupted
         )
     }
 
@@ -6352,6 +6439,7 @@ public struct PipelineStatus: Sendable {
     public let framesProcessed: Int
     public let errors: Int
     public let startTime: Date?
+    public var isInterrupted: Bool = false
 }
 
 public struct CleanupResult: Sendable {

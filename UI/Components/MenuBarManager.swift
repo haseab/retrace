@@ -1778,6 +1778,9 @@ public class MenuBarManager: ObservableObject {
     public func syncWithCoordinator() {
         // Read status directly from thread-safe holder - no actor hop needed
         let status = coordinator.statusHolder.status
+        statusItem?.button?.toolTip = status.isInterrupted
+            ? "Recording interrupted, retrying automatically"
+            : (status.isRunning ? "Recording" : "Recording off")
         if status.isRunning {
             isPausedByUser = false
             if scheduledResumeDate != nil {

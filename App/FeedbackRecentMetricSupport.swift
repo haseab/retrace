@@ -237,7 +237,7 @@ enum FeedbackRecentMetricSupport {
                 from: payload,
                 keys: ["action", "reportAgeSeconds"]
             )
-        case .unexpectedRecordingStopAction:
+        case .unexpectedRecordingStopAction, .recordingRecoveryAction:
             return allowlistedDetails(
                 from: payload,
                 keys: [

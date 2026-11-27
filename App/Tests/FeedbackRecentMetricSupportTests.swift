@@ -3,6 +3,17 @@ import Database
 @testable import App
 
 final class FeedbackRecentMetricSupportTests: XCTestCase {
+    func testRecordingRecoveryDiagnosticsSurviveExportWithoutPrivateErrorDetails() {
+        let events = FeedbackRecentMetricSupport.sanitize([
+            .init(
+                metricType: .recordingRecoveryAction,
+                timestamp: Date(timeIntervalSince1970: 1_700_000_000),
+                metadata: #"{"action":"interrupted","reason":"wal_open_failed","path":"/example/private.bin","errorMessage":"private content"}"#
+            )
+        ])
+        XCTAssertEqual(events.first?.details, ["action": "interrupted", "reason": "wal_open_failed"])
+    }
+
     func testConferencePrivacyMetricsExcludeCallIdentityAndWindowContent() {
         let events = FeedbackRecentMetricSupport.sanitize([
             .init(

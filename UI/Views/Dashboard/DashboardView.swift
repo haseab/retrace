@@ -380,6 +380,7 @@ public struct DashboardView: View {
             || viewModel.conferencePrivacyBanner != nil
             || crashRecoveryBannerModel.state != nil
             || viewModel.unexpectedRecordingStop != nil
+            || viewModel.isRecordingInterrupted
             || viewModel.storageHealthBanner != nil
             || viewModel.recentWALFailureCrash != nil
             || viewModel.recentCrashReport != nil
@@ -468,6 +469,16 @@ public struct DashboardView: View {
                                 crashRecoveryBannerModel.dismiss()
                             }
                         )
+                    }
+
+                    if viewModel.isRecordingInterrupted {
+                        Label("Recording interrupted, retrying automatically", systemImage: "arrow.clockwise.circle")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundColor(.orange)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(16)
+                            .background(Color.orange.opacity(0.12))
+                            .clipShape(RoundedRectangle(cornerRadius: 12))
                     }
 
                     if let unexpectedRecordingStop = viewModel.unexpectedRecordingStop {
@@ -1156,7 +1167,7 @@ public struct DashboardView: View {
                         .transition(.opacity)
                 } else {
                     Circle()
-                        .fill(viewModel.isRecording ? Color.retraceDanger : Color.retraceSecondary.opacity(0.5))
+                        .fill(viewModel.isRecordingInterrupted ? Color.orange : (viewModel.isRecording ? Color.retraceDanger : Color.retraceSecondary.opacity(0.5)))
                         .frame(width: 6, height: 6)
                         .transition(.opacity)
                 }
@@ -1193,7 +1204,7 @@ public struct DashboardView: View {
 
     private var recordingIndicatorLabel: String {
         if viewModel.isRecording {
-            return isHoveringRecordingIndicator ? "Pause" : "Recording"
+            return isHoveringRecordingIndicator ? "Pause" : (viewModel.isRecordingInterrupted ? "Retrying" : "Recording")
         } else if let seconds = viewModel.recordingPauseRemainingSeconds {
             return isHoveringRecordingIndicator ? "Start Rec." : formatPauseCountdown(seconds)
         } else if viewModel.isRecordingPaused {
