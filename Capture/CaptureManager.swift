@@ -1318,12 +1318,18 @@ public actor CaptureManager: CaptureProtocol {
             guard let capturedBundleID = frame.metadata.appBundleID else { return true }
             return BrowserURLExtractor.isBrowser(capturedBundleID) || capturedBundleID == "com.apple.finder"
         }()
-        let frontmostMetadata = currentConfig.recordAllDisplays && frame.metadata.displayID != focusedDisplayID
+        let lookupMetadata = currentConfig.recordAllDisplays && frame.metadata.displayID != focusedDisplayID
             ? frame.metadata
             : await appInfoProvider.getFrontmostAppInfo(
             includeBrowserURL: shouldLookupBrowserURL,
             preferredDisplayID: preferredDisplayID
         )
+        // Capture and the later foreground lookup can straddle an app switch.
+        // Keep missing fields empty rather than borrowing another app's title or URL.
+        let frontmostMetadata = frame.metadata.appBundleID == nil ||
+            frame.metadata.appBundleID == lookupMetadata.appBundleID
+            ? lookupMetadata
+            : FrameMetadata(displayID: frame.metadata.displayID)
         let redactionReason = frame.metadata.redactionReason
         let preservedDisplayID = frame.metadata.displayID != 0 ? frame.metadata.displayID : frontmostMetadata.displayID
         let captureTrigger = frame.metadata.captureTrigger ?? Self.storedCaptureTrigger(for: trigger)

@@ -849,6 +849,20 @@ public actor CGWindowListCapture {
         var seenWindowIDs = Set<CGWindowID>()
         let decisionTimestamp = Date()
         let displayBounds = CGDisplayBounds(displayID)
+        let metadataWindowID = ForegroundWindowSelection.preferredWindowID(
+            in: windowList,
+            foregroundPID: foregroundPID,
+            displayBounds: displayBounds,
+            allowOtherApps: config.recordAllDisplays,
+            bundleIDForPID: { pid in
+                if let cached = bundleIDCache[pid] { return cached }
+                guard !pidsWithoutBundleID.contains(pid) else { return nil }
+                let bundleID = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier
+                if let bundleID { bundleIDCache[pid] = bundleID }
+                else { pidsWithoutBundleID.insert(pid) }
+                return bundleID
+            }
+        )
 
         func cachedBrowserURL(
             ownerPID: pid_t,
@@ -988,14 +1002,7 @@ public actor CGWindowListCapture {
                 captureBlockReason = Self.captureBlockReason(ownerName: ownerName, bundleID: bundleID)
             }
 
-            if visibleWindowContext == nil,
-               ForegroundWindowSelection.isEligible(
-                   windowInfo,
-                   foregroundPID: foregroundPID,
-                   bundleID: bundleID,
-                   displayBounds: displayBounds,
-                   requireForegroundApp: !config.recordAllDisplays
-               ) {
+            if visibleWindowContext == nil, windowID == metadataWindowID {
                 visibleWindowContext = VisibleWindowContext(
                     windowID: windowID,
                     ownerPID: ownerPID,

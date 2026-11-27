@@ -939,6 +939,50 @@ final class CaptureTriggerSchedulingTests: XCTestCase {
         XCTAssertNil(end)
     }
 
+    func testMetadataEnrichmentDoesNotCopyAnotherAppsTitleOrURL() async throws {
+        let frame = try await captureWithMetadataFallback(capturedBundleID: "com.example.editor",
+                                                        lookupBundleID: "com.example.messenger")
+        XCTAssertEqual(frame.metadata.appBundleID, "com.example.editor")
+        XCTAssertNil(frame.metadata.appName)
+        XCTAssertNil(frame.metadata.windowName)
+        XCTAssertNil(frame.metadata.browserURL)
+    }
+
+    func testMetadataEnrichmentCanFillMissingFieldsFromTheSameApp() async throws {
+        let frame = try await captureWithMetadataFallback(capturedBundleID: "com.example.editor",
+                                                        lookupBundleID: "com.example.editor")
+        XCTAssertEqual(frame.metadata.windowName, "Example document")
+        XCTAssertEqual(frame.metadata.browserURL, "https://example.com/document")
+    }
+
+    func testMetadataEnrichmentCanSupplyAnEntireMissingAppIdentity() async throws {
+        let frame = try await captureWithMetadataFallback(capturedBundleID: nil,
+                                                        lookupBundleID: "com.example.editor")
+        XCTAssertEqual(frame.metadata.appBundleID, "com.example.editor")
+        XCTAssertEqual(frame.metadata.windowName, "Example document")
+    }
+
+    private func captureWithMetadataFallback(capturedBundleID: String?, lookupBundleID: String) async throws -> CapturedFrame {
+        let mouse = FakeMouseClickMonitor(startResult: true)
+        let collector = FrameCollector()
+        let manager = makeManager(
+            backend: FakeScreenCaptureBackend(frames: [makeFrame(displayID: 1, pixelValue: 20,
+                                                                appBundleID: capturedBundleID)]),
+            displayMonitor: FakeDisplayMonitor(activeDisplayID: 1, hasPermission: true),
+            displaySwitchMonitor: FakeDisplaySwitchMonitor(), mouseClickMonitor: mouse,
+            appInfoProvider: FakeAppInfoProvider(metadata: FrameMetadata(
+                appBundleID: lookupBundleID, appName: "Example app", windowName: "Example document",
+                browserURL: "https://example.com/document", displayID: 1)))
+        try await manager.startCapture(config: testConfig(captureIntervalSeconds: 0))
+        let task = collectFrames(from: await manager.frameStream, into: collector)
+        defer { task.cancel() }
+        await mouse.emitMouseUp()
+        try await waitForOutcome { await collector.count() == 1 }
+        try await manager.stopCapture()
+        let frame = await collector.lastFrame()
+        return try XCTUnwrap(frame)
+    }
+
     private func makeManager(
         backend: FakeScreenCaptureBackend,
         displayMonitor: FakeDisplayMonitor,

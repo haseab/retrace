@@ -33,6 +33,27 @@ enum ForegroundWindowSelection {
         return displayBounds.map { bounds.intersects($0) } ?? true
     }
 
+    /// Prefer the foreground app even when recording every display. A display-local
+    /// fallback is only needed when that app has no eligible window on this display.
+    static func preferredWindowID(
+        in windows: [[String: Any]],
+        foregroundPID: pid_t?,
+        displayBounds: CGRect,
+        allowOtherApps: Bool,
+        bundleIDForPID: (pid_t) -> String?
+    ) -> CGWindowID? {
+        let eligible = windows.filter { window in
+            guard let pid = window[kCGWindowOwnerPID as String] as? pid_t else { return false }
+            return isEligible(window, foregroundPID: foregroundPID,
+                              bundleID: bundleIDForPID(pid), displayBounds: displayBounds,
+                              requireForegroundApp: !allowOtherApps)
+        }
+        let foreground = eligible.first {
+            ($0[kCGWindowOwnerPID as String] as? pid_t) == foregroundPID
+        }
+        return ((foreground ?? eligible.first)?[kCGWindowNumber as String] as? NSNumber)?.uint32Value
+    }
+
     static func isSharingIndicator(title: String?, size: CGSize) -> Bool {
         title?.trimmingCharacters(in: .whitespacesAndNewlines) == "Window" &&
             size.width > 0 && size.width <= 100 &&
